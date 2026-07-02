@@ -12,12 +12,14 @@ path = "src/main.rs"
 
 [dependencies]
 tokenfuse-core.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+async-trait = "0.1.89"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

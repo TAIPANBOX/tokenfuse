@@ -134,6 +134,26 @@ impl Ledger {
         })
     }
 
+    /// Reserve without a budget check. Used in shadow/warn modes, where a breach
+    /// must be *recorded* (so spend and steps stay accurate) but must not block.
+    /// Always succeeds; opens the run at zero budget if it does not exist.
+    pub fn reserve_unchecked(&self, run_id: &str, estimate: Microusd) -> Reservation {
+        let mut runs = self.runs.lock().unwrap();
+        let state = runs.entry(run_id.to_string()).or_insert(RunState {
+            budget: Microusd::ZERO,
+            reserved: Microusd::ZERO,
+            spent: Microusd::ZERO,
+            steps: 0,
+        });
+        state.reserved = state.reserved + estimate;
+        state.steps += 1;
+        Reservation {
+            run_id: run_id.to_string(),
+            amount: estimate,
+            step: state.steps,
+        }
+    }
+
     /// Settle a reservation with the real cost: release the reserved estimate
     /// and add the actual spend. Over- or under-estimates self-correct here.
     pub fn settle(&self, reservation: &Reservation, actual: Microusd) {
@@ -204,6 +224,19 @@ mod tests {
             }
             other => panic!("expected Exceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reserve_unchecked_records_past_budget_without_error() {
+        let ledger = Ledger::new();
+        ledger.open_run("r1", usd(1.0));
+        // Reserve beyond budget: shadow mode records it, does not block.
+        let res = ledger.reserve_unchecked("r1", usd(5.0));
+        assert_eq!(res.step, 1);
+        let snap = ledger.snapshot("r1").unwrap();
+        assert_eq!(snap.reserved, usd(5.0));
+        // The checked path, by contrast, would have refused this.
+        assert!(ledger.reserve("r1", usd(0.1)).is_err());
     }
 
     #[test]

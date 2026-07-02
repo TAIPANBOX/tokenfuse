@@ -7,9 +7,9 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 
 ## Current stage
 
-**Phase 0 → Phase 1 foundation.** Building the domain core and the gateway
-skeleton. No network forwarding yet — that is the next step (Phase 0 spike #1:
-SSE passthrough).
+**Phase 1 foundation landed.** Domain core + a working budget-enforcing gateway
+(against a stub provider). Next: real network forwarding with SSE passthrough
+(Phase 0 spike #1) and swapping the stub for real Anthropic/OpenAI clients.
 
 ## Status by component
 
@@ -20,7 +20,7 @@ SSE passthrough).
 | `crates/core` — pricing | ✅ done | Per-Mtok prices, cache priced separately, overflow-safe, fallback for unknown models |
 | `crates/core` — ledger | ✅ done | Reserve → settle, atomic under concurrency (test proves no oversubscription) |
 | `crates/core` — policy | ✅ done | shadow/warn/enforce modes; per-step + max-steps rules; records "would block" in shadow |
-| `crates/gateway` — HTTP skeleton | 🚧 in progress | axum server, health, request model, budget-enforcing handler with a provider trait + stub |
+| `crates/gateway` — HTTP skeleton | ✅ done | axum server, `/healthz` + `/v1/messages`, estimate → enforce → forward → settle, 402 budget contract, shadow/warn/enforce, unmanaged pass-through, `x-fuse-*` response headers |
 | Gateway — real SSE passthrough | ⬜ next | Phase 0 spike #1: stream to Anthropic/OpenAI, extract usage from final chunk |
 | Loop detection | ⬜ todo | Phase 2 |
 | `tokenfuse top` TUI | ⬜ todo | Phase 1 (W2) |
@@ -29,7 +29,7 @@ SSE passthrough).
 
 ## Test status
 
-`cargo test --all` — core: 18 passing.
+`cargo test --all` — 27 passing (core: 19, gateway: 8). `cargo clippy --all-targets` clean with `-D warnings`. Gateway smoke-tested live (healthz, managed cost accounting, unmanaged pass-through).
 
 ## How to run
 
