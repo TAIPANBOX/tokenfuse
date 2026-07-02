@@ -33,12 +33,13 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | DLP secret scanning (Ring 3.2) | ✅ done | `crates/core/dlp.rs`: pattern detectors (AWS/OpenAI/Anthropic/Google/GitHub/Slack keys, JWT, private key, Bearer) with overlap-dedup + redaction. Gateway scans the outgoing prompt; `TOKENFUSE_DLP=off\|shadow\|mask\|block` → `403 dlp_blocked`, masks to `[REDACTED:kind]`, or flags via `x-fuse-dlp`. SDK gains `DlpBlocked`. Verified live. |
 | OTel export (W9) | ✅ done | `gateway/otel.rs`: one OTLP/JSON span per call over HTTP (`gen_ai.*` + `tokenfuse.*` attrs; one trace per run) to `TOKENFUSE_OTLP_ENDPOINT`. `TeeSink` composes it with the Parquet trace. No heavy OTel deps; default off. Verified live against a mock collector. |
 | WASM policies (W5) | ✅ done | Optional `wasm` cargo feature: custom policy modules run in a `wasmtime` sandbox with a fuel limit. Scalar ABI `evaluate(est,spent,budget,step,taint_bits)->0/1/2`; block → `402 wasm_policy`. `TOKENFUSE_WASM_POLICY=<path>` (.wasm/.wat). Fail-open. Default build excludes it; compiled/tested/clippy-clean + verified live with a `.wat` policy. |
+| MCP scanner + lockfile (Ring 3.3 / S6) | ✅ done | `crates/core/mcp.rs`: parse `tools/list`, fingerprint tools, scan descriptions for poisoning (injection phrases, zero-width chars), and diff vs a lockfile → **rug-pull** detection. `tokenfuse mcp-scan <tools.json> [--lock f] [--write-lock]`. Verified live. (Live credential-broker proxy = follow-up, needs MCP transport.) |
 | Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
 | Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
 
 ## Test status
 
-`cargo test --all` — 87 passing (core: 52, gateway: 35); Python SDK — 11 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: DLP `block` → `403 dlp_blocked`; OTLP span exported to a mock collector (`llm.call`, one trace per run).
+`cargo test --all` — 92 passing (core: 57, gateway: 35); Python SDK — 11 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: `tokenfuse mcp-scan` flags tool poisoning and a rug pull; OTLP span export; DLP `block`; WASM `.wat` policy block (feature).
 
 ## How to run
 
