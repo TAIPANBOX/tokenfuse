@@ -7,6 +7,8 @@ pub mod obs;
 pub mod provider;
 pub mod proxy;
 pub mod settle;
+pub mod sink;
+pub mod sqlq;
 pub mod state;
 pub mod tui;
 

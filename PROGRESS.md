@@ -7,7 +7,7 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 
 ## Current stage
 
-**Phase 1 + Phase 2 core largely in place.** Budget enforcement, real SSE forwarding (~0.4 µs p99 overhead), loop detection, an observability API, and the `tokenfuse top` TUI. Remaining headline items: the Python SDK and the Parquet trace sink (`tokenfuse sql`).
+**Phase 1 complete; Phase 2 core in place.** Budget enforcement, real SSE forwarding (~0.4 µs p99 overhead), loop detection, observability API, `tokenfuse top` TUI, Python SDK, and the Parquet trace sink with `tokenfuse sql`. The entire "90 seconds to wow" demo now runs on real code. Next (later phases): WASM policies, backtesting, hierarchical sub-agent budgets, the semantic cache, then Phase 4 (eBPF Radar, raft cluster, taint/agent-firewall, MCP gateway).
 
 ## Status by component
 
@@ -26,11 +26,11 @@ mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementat
 | Observability API | ✅ done | `GET /v1/runs` (list runs, spend, %, killed) + `POST /v1/runs/{id}/kill` (hard stop, any mode). Backs the TUI + Slack kill-button |
 | `tokenfuse top` TUI | ✅ done | ratatui / crossterm live view: runs table, spend/budget bars, %, steps, select + kill (`k`), refresh, quit. `tokenfuse top` subcommand; polls `/v1/runs` |
 | Python SDK | ✅ done | `sdk/python` — dependency-free helpers: `run_headers`, `gateway_url`, and typed exceptions (`BudgetExceeded`/`LoopDetected`/`PolicyViolation`/`Killed`) via `raise_for_fuse`/`check_response`. Own CI job (pytest, 9 tests) |
-| Parquet trace sink (`tokenfuse sql`) | ⬜ next | Phase 2 (W8) |
+| Parquet trace sink (`tokenfuse sql`) | ✅ done | `sink.rs`: settled calls → rotating Parquet segments (opt-in via `TOKENFUSE_DATA_DIR`; `NullSink` default). `sqlq.rs` + `tokenfuse sql "…"` query the trace with DataFusion. Verified live end-to-end. |
 
 ## Test status
 
-`cargo test --all` — 49 passing (core: 27, gateway: 22); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
+`cargo test --all` — 52 passing (core: 27, gateway: 25); Python SDK — 9 passing. `cargo clippy --all-targets` clean with `-D warnings`. Verified live end-to-end: recorded a trace, then `tokenfuse sql "select run_id, sum(cost_microusd)… group by run_id"` returned per-run spend.
 
 ## How to run
 

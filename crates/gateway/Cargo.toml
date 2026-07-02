@@ -26,6 +26,7 @@ async-stream = "0.3.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "charset"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
+datafusion = { version = "44", default-features = false, features = ["parquet"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

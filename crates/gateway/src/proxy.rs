@@ -161,6 +161,7 @@ fn stream_managed(
     let guard = SettleGuard::new(
         st.ledger.clone(),
         st.prices.clone(),
+        st.sink.clone(),
         model.to_string(),
         resp.usage.clone(),
         reservation.amount,
@@ -228,7 +229,8 @@ async fn buffered_managed(
 
     let usage = resp.usage.lock().unwrap().take();
     let actual = usage
-        .and_then(|u| st.prices.cost(model, &u))
+        .as_ref()
+        .and_then(|u| st.prices.cost(model, u))
         .unwrap_or(reservation.amount);
     st.ledger.settle(&reservation, actual);
     let spent = st
@@ -236,6 +238,18 @@ async fn buffered_managed(
         .snapshot(&reservation.run_id)
         .map(|s| s.spent)
         .unwrap_or(actual);
+
+    let u = usage.unwrap_or_default();
+    st.sink.record(crate::sink::CallRecord {
+        ts_millis: crate::sink::now_millis(),
+        run_id: reservation.run_id.clone(),
+        model: model.to_string(),
+        decision: "allow".into(),
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cost_microusd: actual.0,
+        step: reservation.step,
+    });
 
     let mut builder = Response::builder()
         .status(status)

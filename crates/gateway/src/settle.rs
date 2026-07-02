@@ -10,12 +10,14 @@
 //! block later calls in the same run).
 
 use crate::provider::UsageSlot;
+use crate::sink::{now_millis, CallRecord, EventSink};
 use std::sync::Arc;
 use tokenfuse_core::{Ledger, Microusd, PriceBook, Reservation};
 
 pub struct SettleGuard {
     ledger: Arc<Ledger>,
     prices: Arc<PriceBook>,
+    sink: Arc<dyn EventSink>,
     model: String,
     usage: UsageSlot,
     fallback: Microusd,
@@ -23,9 +25,11 @@ pub struct SettleGuard {
 }
 
 impl SettleGuard {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ledger: Arc<Ledger>,
         prices: Arc<PriceBook>,
+        sink: Arc<dyn EventSink>,
         model: String,
         usage: UsageSlot,
         fallback: Microusd,
@@ -34,6 +38,7 @@ impl SettleGuard {
         SettleGuard {
             ledger,
             prices,
+            sink,
             model,
             usage,
             fallback,
@@ -47,9 +52,22 @@ impl SettleGuard {
         };
         let parsed = self.usage.lock().unwrap().take();
         let actual = parsed
-            .and_then(|u| self.prices.cost(&self.model, &u))
+            .as_ref()
+            .and_then(|u| self.prices.cost(&self.model, u))
             .unwrap_or(self.fallback);
         self.ledger.settle(&reservation, actual);
+
+        let usage = parsed.unwrap_or_default();
+        self.sink.record(CallRecord {
+            ts_millis: now_millis(),
+            run_id: reservation.run_id.clone(),
+            model: self.model.clone(),
+            decision: "allow".into(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_microusd: actual.0,
+            step: reservation.step,
+        });
     }
 
     /// Settle now with the parsed usage (normal end-of-stream). Consumes the
@@ -94,6 +112,7 @@ mod tests {
         let guard = SettleGuard::new(
             ledger.clone(),
             prices,
+            Arc::new(crate::sink::NullSink),
             "m".into(),
             usage,
             Microusd::from_usd(1.0),
@@ -115,6 +134,7 @@ mod tests {
             let _guard = SettleGuard::new(
                 ledger.clone(),
                 prices,
+                Arc::new(crate::sink::NullSink),
                 "m".into(),
                 usage,
                 fallback,

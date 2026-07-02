@@ -1,6 +1,7 @@
 //! Shared application state handed to every request handler.
 
 use crate::provider::Provider;
+use crate::sink::{EventSink, NullSink};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Ledger, Policy, PriceBook};
@@ -21,6 +22,8 @@ pub struct AppState {
     pub provider: Arc<dyn Provider>,
     /// Identifier of the active policy, echoed in the 402 contract.
     pub policy_id: Arc<str>,
+    /// Where settled calls are recorded (Parquet, or a no-op by default).
+    pub sink: Arc<dyn EventSink>,
     history: History,
     killed: Killed,
 }
@@ -39,9 +42,16 @@ impl AppState {
             policy,
             provider,
             policy_id: policy_id.into(),
+            sink: Arc::new(NullSink),
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Attach an event sink (e.g. the Parquet trace). Chainable.
+    pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// Mark a run as killed — subsequent calls are hard-blocked in any mode.

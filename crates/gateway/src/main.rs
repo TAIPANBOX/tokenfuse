@@ -15,16 +15,32 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    // `tokenfuse top` launches the TUI; anything else starts the gateway.
-    if std::env::args().nth(1).as_deref() == Some("top") {
-        let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
-        let base = std::env::var("TOKENFUSE_URL").unwrap_or_else(|_| format!("http://{addr}"));
-        if let Err(e) = tokenfuse_gateway::tui::run(base).await {
-            eprintln!("tui error: {e}");
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        // `tokenfuse top` launches the live TUI.
+        Some("top") => {
+            let addr =
+                std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
+            let base = std::env::var("TOKENFUSE_URL").unwrap_or_else(|_| format!("http://{addr}"));
+            if let Err(e) = tokenfuse_gateway::tui::run(base).await {
+                eprintln!("tui error: {e}");
+            }
         }
-        return;
+        // `tokenfuse sql "<query>"` queries the Parquet trace.
+        Some("sql") => {
+            let query = args.collect::<Vec<_>>().join(" ");
+            if query.trim().is_empty() {
+                eprintln!("usage: tokenfuse sql \"select ... from calls\"");
+                return;
+            }
+            let dir = std::env::var("TOKENFUSE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+            if let Err(e) = tokenfuse_gateway::sqlq::run(&query, &dir).await {
+                eprintln!("sql error: {e}");
+            }
+        }
+        // Anything else starts the gateway.
+        _ => serve().await,
     }
-    serve().await;
 }
 
 async fn serve() {
@@ -78,13 +94,27 @@ async fn serve() {
         ..Policy::default()
     };
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         Arc::new(Ledger::new()),
         Arc::new(prices),
         Arc::new(policy),
         provider,
         "default",
     );
+
+    // Opt in to the Parquet trace with TOKENFUSE_DATA_DIR; query it via
+    // `tokenfuse sql "..."`. Without it, telemetry is a no-op.
+    if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {
+        if !dir.is_empty() {
+            match tokenfuse_gateway::sink::ParquetSink::new(&dir, 256) {
+                Ok(sink) => {
+                    tracing::info!(%dir, "recording trace to Parquet");
+                    state = state.with_sink(Arc::new(sink));
+                }
+                Err(e) => tracing::warn!(%dir, "could not open trace dir: {e}"),
+            }
+        }
+    }
 
     let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
