@@ -181,8 +181,20 @@ pub struct HttpProvider {
 
 impl HttpProvider {
     pub fn new(endpoint: impl Into<String>) -> Self {
+        // A connect timeout bounds how long a stalled upstream can tie up a
+        // request during the TCP+TLS handshake. We deliberately set *no* overall
+        // request timeout: responses stream (SSE) and may legitimately stay open
+        // for minutes, so a whole-request deadline would cut long generations.
+        let connect_secs = std::env::var("TOKENFUSE_UPSTREAM_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(connect_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         HttpProvider {
-            client: reqwest::Client::new(),
+            client,
             endpoint: endpoint.into(),
         }
     }

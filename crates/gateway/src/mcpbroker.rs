@@ -47,10 +47,16 @@ pub struct BrokerState {
 }
 
 pub fn app(state: Arc<BrokerState>) -> Router {
+    // Bound the JSON-RPC body a client can force the broker to buffer.
+    let max_body = std::env::var("TOKENFUSE_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16 * 1024 * 1024);
     Router::new()
         .route("/", post(handle))
         .route("/mcp", post(handle))
         .route("/healthz", get(|| async { "ok" }))
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
 

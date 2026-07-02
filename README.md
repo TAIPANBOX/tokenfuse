@@ -368,6 +368,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | [06 · Semantic cache](docs/06-semantic-cache.md) · [07 · Taint model](docs/07-taint-model.md) | Detailed subsystem designs |
 | [08 · Security extensions](docs/08-security-extensions.md) | MCP broker, RAG scanning, agent identity |
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
+| [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
 
 ---
 

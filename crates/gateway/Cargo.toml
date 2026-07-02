@@ -27,7 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 datafusion = { version = "44", default-features = false, features = ["parquet"] }
-wasmtime = { version = "27", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime = { version = "43", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 fastembed = { version = "4", optional = true }
 # HA: co-locate a raft node so budgets replicate across gateways. Optional — the
 # heavy openraft stack is only pulled in with `--features cluster`. The crate is

@@ -102,6 +102,23 @@ jobs:
         working-directory: crates/cluster
         run: cargo test
 
+  security:
+    name: security (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit workspace
+        run: cargo audit
+      - name: Audit cluster crate
+        working-directory: crates/cluster
+        run: cargo audit
+
   radar:
     name: radar (eBPF build)
     runs-on: ubuntu-latest
