@@ -275,7 +275,7 @@ Not yet — this repository is currently the **design and planning phase**. Foll
 
 ## 📋 Project status & documentation
 
-> **Status:** planning (architecture v0.2, no code written yet). This repo currently holds the full design.
+> **Status:** early implementation. The Rust core (money, pricing, reserve/settle ledger, policy), the budget-enforcing gateway (real SSE passthrough, loop detection, 402 contract), an observability API + `tokenfuse top` TUI, and a Python SDK are built and CI-green — see [PROGRESS.md](PROGRESS.md) and [BENCHMARKS.md](BENCHMARKS.md). Not yet production-ready. The design docs below remain the source of truth for direction.
 
 | Document | What's inside |
 |---|---|
