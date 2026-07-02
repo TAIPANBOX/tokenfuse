@@ -6,6 +6,7 @@ pub mod backtestcli;
 pub mod embedder;
 pub mod estimate;
 pub mod firewall;
+pub mod mcpcli;
 pub mod obs;
 pub mod otel;
 pub mod provider;

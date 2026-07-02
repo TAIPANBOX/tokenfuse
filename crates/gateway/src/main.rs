@@ -48,6 +48,28 @@ async fn main() {
                 eprintln!("backtest error: {e}");
             }
         }
+        // `tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]`
+        Some("mcp-scan") => {
+            let rest: Vec<String> = args.collect();
+            let tools_path = rest.iter().find(|a| !a.starts_with("--")).cloned();
+            let lock_path = rest
+                .iter()
+                .position(|a| a == "--lock")
+                .and_then(|i| rest.get(i + 1).cloned());
+            let write_lock = rest.iter().any(|a| a == "--write-lock");
+            match tools_path {
+                Some(p) => {
+                    if let Err(e) =
+                        tokenfuse_gateway::mcpcli::run(&p, lock_path.as_deref(), write_lock)
+                    {
+                        eprintln!("mcp-scan error: {e}");
+                    }
+                }
+                None => eprintln!(
+                    "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]"
+                ),
+            }
+        }
         // Anything else starts the gateway.
         _ => serve().await,
     }

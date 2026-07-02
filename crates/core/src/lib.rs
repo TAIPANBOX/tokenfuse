@@ -7,6 +7,7 @@ pub mod cache;
 pub mod dlp;
 pub mod ledger;
 pub mod loops;
+pub mod mcp;
 pub mod money;
 pub mod policy;
 pub mod pricing;
