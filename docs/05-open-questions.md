@@ -1,4 +1,4 @@
-# Tokenfuse — Open questions (resolve before starting the code)
+# TokenFuse — Open questions (resolve before starting the code)
 
 ## Resolved
 
@@ -8,13 +8,13 @@
 | Positioning | Start from the FinOps pain point, architecturally build toward an agent runtime firewall | 2026-07-02 |
 | Distribution model | OSS core (Apache-2.0) + Cloud | 2026-07-02 (license to be finally confirmed — see below) |
 | Telemetry storage | Parquet + DataFusion, no separate analytical DBMS | 2026-07-02 |
-| Name and brand | **Tokenfuse** (renamed 2026-07-02 from the working title "TokenGuard") | 2026-07-02 |
+| Name and brand | **TokenFuse** (renamed 2026-07-02 from the working title "TokenGuard") | 2026-07-02 |
 
 ### Naming research (2026-07-02) — why we moved off "TokenGuard"
 
 The original working title "TokenGuard" turned out to be **crowded**: free on crates.io/npm/Docker Hub, but **taken** on PyPI (an adjacent Claude Code tool) and all good domains (.com/.dev/.ai/.io) were registered. GitHub had 12+ repos named `tokenguard`, including `LoveFishoO/TokenGuard` — "Zero-config proxy that stops runaway LLM agents from burning your API" (a near-identical name + concept). Poor discoverability and category-ownership risk.
 
-Chosen name: **`tokenfuse`** — free on crates.io/npm/PyPI, `.dev` domain free, near-empty GitHub namespace, and the "fuse / circuit-breaker" metaphor fits the positioning (we cut the circuit before the burn). Brand display: `Tokenfuse`; CLI/binary/crate/package: `tokenfuse`; attribution headers: `X-Fuse-*`.
+Chosen name: **`tokenfuse`** — free on crates.io/npm/PyPI, `.dev` domain free, near-empty GitHub namespace, and the "fuse / circuit-breaker" metaphor fits the positioning (we cut the circuit before the burn). Brand display: `TokenFuse`; CLI/binary/crate/package: `tokenfuse`; attribution headers: `X-Fuse-*`.
 Rejected alternatives: `fuseguard` (fully free but generic); `burnstop` (already used by direct competitors — `phuryn/burnstop` 8★ + a "pre-flight budget gate for AI agent runaways" repo).
 
 ## Open

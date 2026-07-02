@@ -1,4 +1,4 @@
-# Tokenfuse — Product Strategy: One Product or Separate Ones
+# TokenFuse — Product Strategy: One Product or Separate Ones
 
 > Decision locked in 2026-07-02. VERDICT: one product, one core, modular capability packs under a single brand. NOT separate products.
 

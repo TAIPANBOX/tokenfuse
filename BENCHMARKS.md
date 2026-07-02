@@ -1,11 +1,11 @@
-# Tokenfuse — latency benchmarks
+# TokenFuse — latency benchmarks
 
-The headline claim is that Tokenfuse adds negligible latency to an agent's LLM
+The headline claim is that TokenFuse adds negligible latency to an agent's LLM
 calls. This documents how that is measured and the numbers so far.
 
 ## What is measured
 
-Tokenfuse's **added latency** is the work it does *around* the provider call —
+TokenFuse's **added latency** is the work it does *around* the provider call —
 not the provider's own response time (which dominates real requests and is
 outside our control). The benchmark isolates two layers:
 

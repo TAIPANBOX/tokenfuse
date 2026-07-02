@@ -1,4 +1,4 @@
-//! Tokenfuse gateway binary. Defaults are safe for a drop-in trial: in-process
+//! TokenFuse gateway binary. Defaults are safe for a drop-in trial: in-process
 //! ledger, an illustrative price book, and shadow-mode policy.
 //!
 //! Provider selection:

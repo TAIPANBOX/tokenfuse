@@ -2,7 +2,7 @@
 //!
 //! Two measurements:
 //!
-//! - **Part A — enforcement decision path.** The synchronous work Tokenfuse adds
+//! - **Part A — enforcement decision path.** The synchronous work TokenFuse adds
 //!   to every call: estimate → policy evaluate → reserve → settle. This is the
 //!   honest "added latency" number, independent of the provider round trip.
 //! - **Part B — full in-process request.** A request driven through the whole
@@ -147,7 +147,7 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_000);
 
-    println!("Tokenfuse latency benchmark");
+    println!("TokenFuse latency benchmark");
     println!("(build with --release for meaningful numbers)");
 
     bench_decision_path(iters_a);

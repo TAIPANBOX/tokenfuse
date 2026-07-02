@@ -1,4 +1,4 @@
-# Tokenfuse — Taint Model: Specification
+# TokenFuse — Taint Model: Specification
 
 > Phase 4 (enforcement), but the source_taint field in the trace dates back to Phase 1. Status: designed 2026-07-02. This is the core of the "agent runtime firewall" category.
 
