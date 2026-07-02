@@ -1,4 +1,4 @@
-# TokenGuard — Platform expansion map ("rings")
+# Tokenfuse — Platform expansion map ("rings")
 
 > Selection principle — 4 filters: (1) reuses our existing assets (interception point, ledger, traces, policies+MCP), (2) pain point confirmed by research, (3) same buyer, (4) doesn't pull in a new operational dependency.
 

@@ -1,4 +1,4 @@
-# TokenGuard — Architecture v0.2
+# Tokenfuse — Architecture v0.2
 
 > Ambitious edition: Rust core, flagship features. v0.1 (the conservative Go version) lives in the chat history; the key ADRs from it are preserved here.
 
@@ -16,7 +16,7 @@
 | Policies | CEL/YAML (simple) + WASM sandbox via wasmtime (complex, hot-swap) |
 | Counters | in-process (1 node) → Redis (optional, fleet) → embedded openraft (Phase 4) |
 | Analytics | Apache Arrow + Parquet segments (local/S3) + DataFusion SQL |
-| TUI | ratatui (`tokenguard top`) |
+| TUI | ratatui (`tokenfuse top`) |
 | eBPF | aya (Radar, Linux-only) |
 | Config/policy store | PostgreSQL (configuration only; telemetry lives in Parquet) |
 | Cloud control plane | Go (billing, tenants, SSO, Slack integrations) |
@@ -47,7 +47,7 @@ Language split: Rust — everything in the request path; Go — Cloud services, 
 ## 5. Request flow
 
 ```
-Agent → POST /v1/messages (X-Guard-Run-Id: r42)
+Agent → POST /v1/messages (X-Fuse-Run-Id: r42)
   1. token estimate (local)
   2. check_and_reserve(r42, $est)      ← atomic
   3. clamp max_tokens = min(requested, remaining/price_output)
@@ -63,7 +63,7 @@ Rejection: 402 Payment Required
       "policy_id": "per-run-default", "retryable": false } }
 ```
 
-**Attribution headers:** `X-Guard-Run-Id` (required), `X-Guard-Parent-Run-Id` (sub-agents → hierarchical budgets), `X-Guard-Task-Type`, `X-Guard-Step`, `X-Guard-Tags`.
+**Attribution headers:** `X-Fuse-Run-Id` (required), `X-Fuse-Parent-Run-Id` (sub-agents → hierarchical budgets), `X-Fuse-Task-Type`, `X-Fuse-Step`, `X-Fuse-Tags`.
 
 ## 6. Data model
 
@@ -146,13 +146,13 @@ Tool-call signature: `hash(tool_name + canonicalized args)` (sorted keys, normal
 | # | Feature | What it does | Phase |
 |---|---|---|---|
 | W1 | Radar (eBPF) | uprobe SSL_write/read → auto-discovers LLM traffic/shadow agents with no config; Linux-only (aya, CO-RE); macOS — network heuristics | 4 |
-| W2 | `tokenguard top` | ratatui TUI: live runs, $/min sparklines, k=kill, p=pause. The cheapest "wow" (~a week) | 1 |
+| W2 | `tokenfuse top` | ratatui TUI: live runs, $/min sparklines, k=kill, p=pause. The cheapest "wow" (~a week) | 1 |
 | W3 | Self-aware agents | MCP: budget introspection + request_budget_increase → Slack approve | 2 |
 | W4 | Burn forecast | EWMA + context trend → "blowout at step ~34, 87% confidence" → early alert/soft clamp | 2 |
 | W5 | WASM policies | policy.wasm in wasmtime (fuel limit), any language, hot-swap, community policy marketplace | 3 |
 | W6 | Time machine | policy backtesting against historical traces: "would have blocked 14 runs, -$312, 2 false positives." Trace recording starts in Phase 1 | 3 |
 | W7 | Zero-dep cluster | openraft: 3 nodes form quorum on their own, no Redis/etcd | 4 |
-| W8 | Parquet + DataFusion | `tokenguard sql "..."`; unlimited retention at S3 pricing; data in an open format | 2 |
+| W8 | Parquet + DataFusion | `tokenfuse sql "..."`; unlimited retention at S3 pricing; data in an open format | 2 |
 | W9 | OTel GenAI semconv | spans into the client's existing stack — we don't fight observability | 2 |
 | W10 | Kill-switch in Slack | alert with a [Kill run] button | 1 |
 

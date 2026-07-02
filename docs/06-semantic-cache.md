@@ -1,4 +1,4 @@
-# TokenGuard — Semantic cache: detailed design
+# Tokenfuse — Semantic cache: detailed design
 
 > Phase 2.5. Status: designed 2026-07-02. Headline showcase: "Saved this month: $X" + a "% of savings" pricing model.
 
@@ -50,14 +50,14 @@ Hit latency: embed ~3 ms + HNSW ~0.5 ms + guards ~1 ms ≈ 5 ms versus ~2,000 ms
 1. **Partition-based (free):** a change to the system prompt/tools/model = a different hard key — old entries simply aren't found. The most common case requires no action.
 2. **TTL per policy:** default 24h; per task-type (docs-qa: 7d, support: 1h).
 3. **Epochs:** cache_epoch per partition; a bump = an instant logical flush (lazy eviction).
-4. **Tags:** entries carry tags (X-Guard-Tags, tools). CLI `tokenguard cache invalidate --tag docs-v2` + `POST /v1/cache/invalidate` — a hook for CI/CD.
+4. **Tags:** entries carry tags (X-Fuse-Tags, tools). CLI `tokenfuse cache invalidate --tag docs-v2` + `POST /v1/cache/invalidate` — a hook for CI/CD.
 5. **Temporal classifier:** "today/now/latest/dates" → a short TTL (15 min) or bypass. A keyword list, not ML.
 6. **Feedback:** `POST /v1/cache/report-bad-hit` + a dashboard button → the entry is killed, the partition threshold +0.01 (self-tuning).
 7. **Eviction:** TinyLFU, entries/bytes limits per partition.
 
 ## A.6. Replay and accounting
 
-- A hit = a synthesized SSE stream, header `X-Guard-Cache: hit; similarity=0.984; age=3612s`.
+- A hit = a synthesized SSE stream, header `X-Fuse-Cache: hit; similarity=0.984; age=3612s`.
 - The ledger records saved_microusd = the price of the original call at current pricing.
 - Only stop_reason: end_turn is cached; tool_use responses — L1 only.
 

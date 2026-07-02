@@ -1,4 +1,4 @@
-# TokenGuard — Agent / MCP / RAG Security Extensions
+# Tokenfuse — Agent / MCP / RAG Security Extensions
 
 > Advisory note, locked in 2026-07-02. No code written yet. The throughline idea is a UNIFIED TAINT DOMAIN: a single "untrusted" label flows through web → RAG ingestion → memory → tool call. The uniqueness lies in having all interception points within a single product.
 

@@ -1,4 +1,4 @@
-# TokenGuard — Taint Model: Specification
+# Tokenfuse — Taint Model: Specification
 
 > Phase 4 (enforcement), but the source_taint field in the trace dates back to Phase 1. Status: designed 2026-07-02. This is the core of the "agent runtime firewall" category.
 
@@ -84,8 +84,8 @@ The model REQUESTS a tool call in its response, but the client EXECUTES it. Ther
 
 | Level | Mechanism | Guarantee |
 |---|---|---|
-| 1. LLM proxy (advisory) | the gateway sees tool_use in the response → on violation, replaces it with a `guard_denied` block + alert; the SDK throws an exception | a client without the SDK can ignore this — we document it |
-| 2. SDK hook (hard) | the executor calls `POST /v1/guard/check-tool-call` before execution | hard guarantee, requires our SDK |
+| 1. LLM proxy (advisory) | the gateway sees tool_use in the response → on violation, replaces it with a `fuse_denied` block + alert; the SDK throws an exception | a client without the SDK can ignore this — we document it |
+| 2. SDK hook (hard) | the executor calls `POST /v1/fuse/check-tool-call` before execution | hard guarantee, requires our SDK |
 | 3. MCP gateway (hard, Phase 4) | the tool is invoked through our MCP proxy → blocked at execution time | full guarantee; the main argument for why the MCP gateway is a natural extension of the taint model |
 
 ## B.8. Attack Scenarios This Closes
