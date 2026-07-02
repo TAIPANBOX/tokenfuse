@@ -47,6 +47,23 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
         .unwrap_or(DEFAULT_RUN_BUDGET);
     st.ledger.open_run(&run_id, budget);
 
+    // Operator kill is a hard stop in any mode.
+    if st.is_killed(&run_id) {
+        let spent = st
+            .ledger
+            .snapshot(&run_id)
+            .map(|s| s.spent)
+            .unwrap_or(Microusd::ZERO);
+        return budget_error(
+            "killed",
+            &run_id,
+            budget,
+            spent,
+            &st.policy_id,
+            "run killed by operator",
+        );
+    }
+
     let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
         .unwrap_or(Microusd::ZERO);
 
@@ -464,6 +481,45 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    #[tokio::test]
+    async fn killed_run_is_hard_blocked_and_listed() {
+        let st = state(Mode::Shadow, StubProvider::default());
+
+        // First call establishes the run.
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-k")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st.clone(), req).await.status(), StatusCode::OK);
+
+        // Kill it via the endpoint.
+        let kill = Request::post("/v1/runs/run-k/kill")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(call(st.clone(), kill).await.status(), StatusCode::OK);
+
+        // Next call is hard-blocked even though the policy is shadow.
+        let again = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-k")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st.clone(), again).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "killed");
+
+        // The run shows up in the listing, flagged killed.
+        let list = Request::get("/v1/runs").body(Body::empty()).unwrap();
+        let resp = call(st, list).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let runs: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(runs[0]["run_id"], "run-k");
+        assert_eq!(runs[0]["killed"], true);
     }
 
     #[tokio::test]

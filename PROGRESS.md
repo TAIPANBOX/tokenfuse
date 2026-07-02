@@ -27,13 +27,14 @@ Parquet trace sink.
 | Latency benchmark (p99 < 3 ms) | ✅ done | `examples/bench.rs`; decision path **p99 0.38 µs**, full in-process request **p99 4.67 µs** — ~3 orders under target. See BENCHMARKS.md |
 | Client-cancel settle guard | ✅ done | `SettleGuard` settles on Drop — client cancel or upstream error mid-stream never leaks a reservation |
 | Loop detection | ✅ done | `crates/core/loops.rs`: identical-tool-call + ping-pong (from the request's own message history) + context-growth (per-run tracker). Wired in: enforce → `402 loop_detected`, shadow/warn → `x-fuse-would-block` header. Verified live. |
-| `tokenfuse top` TUI | ⬜ next | Phase 1 (W2) — needs a runs registry + observability endpoint first |
+| Observability API | ✅ done | `GET /v1/runs` (list runs, spend, %, killed) + `POST /v1/runs/{id}/kill` (hard stop, any mode). Backs the TUI + Slack kill-button |
+| `tokenfuse top` TUI | ⬜ next | Phase 1 (W2) — polls /v1/runs |
 | Python SDK | ⬜ todo | Phase 1 |
 | Parquet trace sink | ⬜ todo | Phase 2 (W8) |
 
 ## Test status
 
-`cargo test --all` — 44 passing (core: 27, gateway: 17). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
+`cargo test --all` — 45 passing (core: 27, gateway: 18). `cargo clippy --all-targets` clean with `-D warnings`. Verified live: SSE passthrough to a real upstream, and a looping request surfacing `x-fuse-would-block` in shadow mode.
 
 ## How to run
 

@@ -1,13 +1,16 @@
 //! Shared application state handed to every request handler.
 
 use crate::provider::Provider;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Ledger, Policy, PriceBook};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
 /// detector. Bounded so a long-lived run cannot grow it without limit.
 type History = Arc<Mutex<HashMap<String, Vec<u64>>>>;
+
+/// Set of run ids an operator has killed (hard stop, any mode).
+type Killed = Arc<Mutex<HashSet<String>>>;
 
 /// Cloneable handle to the gateway's shared state (all fields are `Arc`).
 #[derive(Clone)]
@@ -19,6 +22,7 @@ pub struct AppState {
     /// Identifier of the active policy, echoed in the 402 contract.
     pub policy_id: Arc<str>,
     history: History,
+    killed: Killed,
 }
 
 impl AppState {
@@ -36,7 +40,17 @@ impl AppState {
             provider,
             policy_id: policy_id.into(),
             history: Arc::new(Mutex::new(HashMap::new())),
+            killed: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Mark a run as killed — subsequent calls are hard-blocked in any mode.
+    pub fn kill(&self, run_id: &str) {
+        self.killed.lock().unwrap().insert(run_id.to_string());
+    }
+
+    pub fn is_killed(&self, run_id: &str) -> bool {
+        self.killed.lock().unwrap().contains(run_id)
     }
 
     /// Record this step's input size for a run and return the recent history
