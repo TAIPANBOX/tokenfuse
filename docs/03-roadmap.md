@@ -1,4 +1,4 @@
-# Tokenfuse — Roadmap
+# TokenFuse — Roadmap
 
 > Estimates: solo developer, full-time. Each phase = a separate public launch (a series of waves, not a single release).
 
@@ -62,7 +62,7 @@ A stranger goes from README to their first blocked runaway run in 15 minutes.
 - Launch waves: benchmark → MVP+TUI → MCP self-aware → backtesting → Radar (5 news hooks)
 - Channels: Show HN, r/LLMDevs, r/LocalLLaMA (if Ollama support ships)
 - Every integration (Claude Agent SDK, LangGraph, CrewAI, OpenAI Agents SDK) = a guide + example in the repo = content marketing
-- Tokenfuse can sit BEHIND LiteLLM (an enforcement layer, not a routing competitor)
+- TokenFuse can sit BEHIND LiteLLM (an enforcement layer, not a routing competitor)
 
 ## Risks
 

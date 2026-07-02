@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🧯 Tokenfuse
+# 🧯 TokenFuse
 
 ### Runtime control for AI agents — budgets, runaway detection, and a kill-switch.
 
-**Observability shows you the fire. Tokenfuse is the automatic fire extinguisher.**
+**Observability shows you the fire. TokenFuse is the automatic fire extinguisher.**
 
 ![status](https://img.shields.io/badge/status-planning-yellow)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -22,13 +22,13 @@ Modern AI **agents** don't make one call to an AI model — they make *hundreds*
 
 The scary part: your normal monitoring **can't see it**. A looping agent still looks "healthy" — it returns `200 OK`. The bill is the only symptom, and by then it's too late.
 
-> **Tokenfuse sits between your agent and the AI provider like a fuse in an electrical circuit.** It watches every call, adds up the real cost live, and the moment an agent goes rogue — burns through its budget or spins in a loop — it *cuts the circuit* before the damage is done. Then it pings you on Slack with a **[Kill]** button.
+> **TokenFuse sits between your agent and the AI provider like a fuse in an electrical circuit.** It watches every call, adds up the real cost live, and the moment an agent goes rogue — burns through its budget or spins in a loop — it *cuts the circuit* before the damage is done. Then it pings you on Slack with a **[Kill]** button.
 
 <div align="center">
 
 ```mermaid
 flowchart LR
-    A["🤖 Your AI agent"] -->|"just change base_url"| T["🧯 Tokenfuse"]
+    A["🤖 Your AI agent"] -->|"just change base_url"| T["🧯 TokenFuse"]
     T -->|"forwards if OK"| P["☁️ LLM provider<br/>(Anthropic, OpenAI…)"]
     T -.->|"blocks if runaway"| X["🛑 402 stop"]
     T -.-> D["📊 Dashboard · alerts · reports"]
@@ -75,18 +75,18 @@ These figures come from mid-2026 industry reports (DORA, Stack Overflow, GitGuar
 - 🚦 **Gateways** (LiteLLM, Portkey) can cap a key or a user, but have **no idea what a "run" is** and can't detect a loop.
 - 🔕 **Your APM** (Datadog etc.) sees `200 OK` and stays silent while the agent spins.
 
-Tokenfuse is the missing piece: it **stops the bleeding in real time**, not after the invoice.
+TokenFuse is the missing piece: it **stops the bleeding in real time**, not after the invoice.
 
 ---
 
 ## ⚙️ How it works
 
-Every request flows through Tokenfuse. It estimates the cost *before* the call, reserves it against a budget, and only forwards the call if it's safe. After the response, it reconciles the real cost.
+Every request flows through TokenFuse. It estimates the cost *before* the call, reserves it against a budget, and only forwards the call if it's safe. After the response, it reconciles the real cost.
 
 ```mermaid
 sequenceDiagram
     participant A as 🤖 Agent
-    participant T as 🧯 Tokenfuse
+    participant T as 🧯 TokenFuse
     participant L as ☁️ LLM provider
     A->>T: request (tagged with run id)
     T->>T: estimate cost + check budget & loops
@@ -103,8 +103,8 @@ sequenceDiagram
 
 Three ideas make this safe to put in production:
 
-1. **Shadow → Warn → Enforce.** Start in *shadow* mode: Tokenfuse watches and reports what it *would* have blocked, changing nothing. Flip to *enforce* only when you trust it.
-2. **Fail-open by default.** If Tokenfuse itself has a problem, your traffic keeps flowing — it never becomes a single point of failure.
+1. **Shadow → Warn → Enforce.** Start in *shadow* mode: TokenFuse watches and reports what it *would* have blocked, changing nothing. Flip to *enforce* only when you trust it.
+2. **Fail-open by default.** If TokenFuse itself has a problem, your traffic keeps flowing — it never becomes a single point of failure.
 3. **Metadata-only.** It measures cost and behavior; it does **not** store your prompt contents by default.
 
 ### How fast is "in the path"?
@@ -115,7 +115,7 @@ The enforcement decision (estimate → policy → reserve → settle) adds **~0.
 
 ## 🎯 What makes it different
 
-| Capability | 🧯 Tokenfuse | 🪞 Observability<br/>(Langfuse, Helicone) | 🚦 Gateways<br/>(LiteLLM, Portkey) |
+| Capability | 🧯 TokenFuse | 🪞 Observability<br/>(Langfuse, Helicone) | 🚦 Gateways<br/>(LiteLLM, Portkey) |
 |---|:---:|:---:|:---:|
 | Show how much you spent | ✅ | ✅ | ✅ |
 | Per-key / per-user limits | ✅ | ❌ | ✅ |
@@ -125,7 +125,7 @@ The enforcement decision (estimate → policy → reserve → settle) adds **~0.
 | **Burn forecast** ("blowout in ~12 steps") | ✅ | ❌ | ❌ |
 | Live kill-switch (Slack button) | ✅ | ❌ | ❌ |
 
-The one-line summary: **everyone else reports; Tokenfuse acts.**
+The one-line summary: **everyone else reports; TokenFuse acts.**
 
 ---
 
@@ -181,7 +181,7 @@ Built as a **series of public launches**, not one big release — each phase is 
 
 ```mermaid
 timeline
-    title Tokenfuse delivery plan
+    title TokenFuse delivery plan
     Phase 0 Spikes : sub-3ms overhead benchmark
     Phase 1 MVP : budgets + kill-switch + live TUI
     Phase 2 Intelligence : loop detection + forecast + MCP + Show HN
@@ -196,7 +196,7 @@ timeline
 
 ## 🧭 The bigger picture: capability packs
 
-Tokenfuse starts as a cost tool and grows into an **agent runtime firewall** — all under one brand, one install. The parts reinforce each other (that's the moat), so they ship as *packs* you switch on, not separate products.
+TokenFuse starts as a cost tool and grows into an **agent runtime firewall** — all under one brand, one install. The parts reinforce each other (that's the moat), so they ship as *packs* you switch on, not separate products.
 
 ```mermaid
 flowchart LR
@@ -243,7 +243,7 @@ The intended first-run experience (and, not coincidentally, the script for the l
 | **Token** | A chunk of text (~¾ of a word). Billing is per token — more tokens, more cost. |
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
 | **Run** | One complete agent task from start to finish — possibly hundreds of LLM calls. |
-| **Runaway** | An agent stuck looping or exploding in cost — the thing Tokenfuse stops. |
+| **Runaway** | An agent stuck looping or exploding in cost — the thing TokenFuse stops. |
 | **Proxy** | A middleman that sits in the request path. You point your agent at it instead of the provider. |
 | **RAG** | "Retrieval-Augmented Generation" — feeding the AI your own documents so it can answer about them. |
 | **MCP** | A standard way for agents to call external tools/servers. Powerful and a new security surface. |
@@ -254,15 +254,15 @@ The intended first-run experience (and, not coincidentally, the script for the l
 ## ❓ FAQ
 
 **Will it slow my agent down?**
-The target is **under 3 ms** of added latency (p99). Responses stream straight through — Tokenfuse doesn't buffer them.
+The target is **under 3 ms** of added latency (p99). Responses stream straight through — TokenFuse doesn't buffer them.
 
 **Do I have to change my code?**
-No. You change one environment variable (`base_url`) so calls go through Tokenfuse. An optional SDK adds nicer error handling.
+No. You change one environment variable (`base_url`) so calls go through TokenFuse. An optional SDK adds nicer error handling.
 
 **Does it read or store my prompts?**
 No — metadata-only by default. It measures cost and behavior, not content. Prompt inspection is a separate, explicit opt-in.
 
-**What if Tokenfuse itself goes down?**
+**What if TokenFuse itself goes down?**
 It's **fail-open**: your traffic keeps flowing. It's a safety net, never a chokepoint.
 
 **Is it free?**

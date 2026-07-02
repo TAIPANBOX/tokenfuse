@@ -1,4 +1,4 @@
-# Tokenfuse — Architecture v0.2
+# TokenFuse — Architecture v0.2
 
 > Ambitious edition: Rust core, flagship features. v0.1 (the conservative Go version) lives in the chat history; the key ADRs from it are preserved here.
 

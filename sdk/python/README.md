@@ -1,10 +1,10 @@
 # tokenfuse (Python SDK)
 
 Thin, dependency-free helpers to route an agent's LLM calls through the
-[Tokenfuse](https://github.com/TAIPANBOX/tokenfuse) gateway and turn its `402`
+[TokenFuse](https://github.com/TAIPANBOX/tokenfuse) gateway and turn its `402`
 blocks into typed exceptions.
 
-Tokenfuse is a **drop-in proxy** — you don't rewrite your agent, you point your
+TokenFuse is a **drop-in proxy** — you don't rewrite your agent, you point your
 provider client at the gateway and attach a few headers.
 
 ## Install

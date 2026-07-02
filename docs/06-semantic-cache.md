@@ -1,4 +1,4 @@
-# Tokenfuse — Semantic cache: detailed design
+# TokenFuse — Semantic cache: detailed design
 
 > Phase 2.5. Status: designed 2026-07-02. Headline showcase: "Saved this month: $X" + a "% of savings" pricing model.
 

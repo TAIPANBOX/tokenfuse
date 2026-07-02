@@ -1,4 +1,4 @@
-//! Tokenfuse gateway library: the budget-enforcing proxy assembled as an axum
+//! TokenFuse gateway library: the budget-enforcing proxy assembled as an axum
 //! `Router`. The binary (`main.rs`) wires real config around `app()`; tests
 //! drive `app()` directly.
 

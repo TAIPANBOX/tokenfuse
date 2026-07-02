@@ -1,4 +1,4 @@
-# Tokenfuse — build progress
+# TokenFuse — build progress
 
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.

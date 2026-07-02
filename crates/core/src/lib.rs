@@ -1,4 +1,4 @@
-//! Tokenfuse core domain: money, pricing, the reserve/settle ledger, and policy
+//! TokenFuse core domain: money, pricing, the reserve/settle ledger, and policy
 //! evaluation. Pure logic with no I/O — the gateway and future packs build on
 //! this. See `docs/02-architecture.md` for the design and ADRs.
 

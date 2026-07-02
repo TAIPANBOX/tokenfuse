@@ -1,7 +1,7 @@
-"""Tokenfuse Python SDK — thin helpers to route an agent's LLM calls through the
-Tokenfuse gateway and to turn its 402 responses into typed exceptions.
+"""TokenFuse Python SDK — thin helpers to route an agent's LLM calls through the
+TokenFuse gateway and to turn its 402 responses into typed exceptions.
 
-Tokenfuse is a drop-in proxy: you don't rewrite your agent, you just point your
+TokenFuse is a drop-in proxy: you don't rewrite your agent, you just point your
 provider client at the gateway and attach a few headers. This SDK builds those
 headers/URLs and interprets the gateway's stable error contract.
 
@@ -79,7 +79,7 @@ def run_headers(
 
 
 class FuseError(Exception):
-    """Base class for a Tokenfuse 402 block."""
+    """Base class for a TokenFuse 402 block."""
 
     def __init__(
         self,
@@ -136,7 +136,7 @@ def _coerce_body(body: Any) -> dict[str, Any]:
 
 def raise_for_fuse(status_code: int, body: Any) -> None:
     """Raise the appropriate :class:`FuseError` if ``status_code`` is 402 and the
-    body carries a Tokenfuse error. No-op for any other status.
+    body carries a TokenFuse error. No-op for any other status.
 
     ``body`` may be a dict, a JSON string, or raw bytes.
     """
@@ -161,7 +161,7 @@ def raise_for_fuse(status_code: int, body: Any) -> None:
 def check_response(response: Any) -> None:
     """Convenience for ``requests``/``httpx`` responses: inspect a duck-typed
     object with ``.status_code`` and ``.json()``/``.text`` and raise on a
-    Tokenfuse 402.
+    TokenFuse 402.
     """
     status = getattr(response, "status_code", None)
     if status != 402:

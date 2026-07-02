@@ -47,7 +47,7 @@
 |---|---|
 | G1 | Secret remediation (not detection) |
 | G2 | Visibility/governance for MCP and agents |
-| G3 | FinOps for agents (token cost enforcement) ← **chosen: Tokenfuse** |
+| G3 | FinOps for agents (token cost enforcement) ← **chosen: TokenFuse** |
 | G4 | Agent observability (200 OK ≠ success) |
 | G5 | Guardrails against prompt injection in tool-calling |
 | G6 | RAG data freshness/quality |
@@ -55,8 +55,8 @@
 
 ## 7. Tool ideas (prioritization at the time of research)
 
-1. **Agent Token-Budget Guard** ← chosen (Tokenfuse)
-2. MCP Security Scanner / Gateway (the emptiest market; folded into Tokenfuse as Ring 3)
+1. **Agent Token-Budget Guard** ← chosen (TokenFuse)
+2. MCP Security Scanner / Gateway (the emptiest market; folded into TokenFuse as Ring 3)
 3. Secret Remediation Bot (a strong alternative; multi-provider auto-rotation)
 4. RAG Data-Freshness & Quality Linter (partially folded in as Ring 2)
 5. Agent Observability (red ocean — do not pursue)
