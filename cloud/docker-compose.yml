@@ -2,9 +2,9 @@
 #
 #   cd cloud && docker compose up
 #
-# Then open http://localhost:8080, enter the org key `devkey`, and send traffic
-# through the gateway on :4100 — runs and spend show up live in the dashboard.
-# Runs anywhere Docker runs; no dedicated server.
+# Then open the dashboard on http://localhost:3000 (control-plane URL
+# http://localhost:8080, org key `devkey`) and send traffic through the gateway
+# on :4100 — runs and spend show up live. Runs anywhere Docker runs.
 services:
   control-plane:
     image: ghcr.io/taipanbox/tokenfuse-control-plane:latest
@@ -15,6 +15,15 @@ services:
       TOKENFUSE_CLOUD_KEYS: "devkey:demo"
     ports:
       - "8080:8080"
+
+  dashboard:
+    image: ghcr.io/taipanbox/tokenfuse-dashboard:latest
+    # Or build locally: `docker compose build`
+    # build: ./dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - control-plane
 
   gateway:
     image: ghcr.io/taipanbox/tokenfuse:latest

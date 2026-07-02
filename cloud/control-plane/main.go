@@ -161,7 +161,23 @@ func (s *server) routes() http.Handler {
 		w.Header().Set("content-type", "text/html; charset=utf-8")
 		_, _ = w.Write(dashboardHTML)
 	})
-	return mux
+	return cors(mux)
+}
+
+// cors allows the standalone (Next.js) dashboard, served from another origin, to
+// call the API from the browser. Auth is a Bearer token (not cookies), so a
+// wildcard origin is safe.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "authorization, content-type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {

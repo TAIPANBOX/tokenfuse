@@ -103,8 +103,19 @@ run a **budget poller** (`cloudsink::spawn_budget_poller`) that fetches
 `GET /v1/budgets` and applies the overrides. So an operator can tighten (or
 raise) a runaway run's cap centrally without touching the agent.
 
+## Two dashboards
+
+- **Embedded** (`GET /` on the control plane) — dependency-free vanilla JS, zero
+  extra deploy. Good for a quick look.
+- **Next.js app** (`cloud/dashboard`, App Router, TypeScript, static export) —
+  the richer UI: summary cards, a spend-by-run chart, the runs table with kill +
+  budget actions, auto-refresh. Talks to the control plane's API from the
+  browser (a base-URL + org-key connect form); the control plane sends CORS
+  headers so a cross-origin dashboard works. Built to static files and served by
+  nginx — published as `ghcr.io/taipanbox/tokenfuse-dashboard` and wired into
+  `docker compose` on `:3000`.
+
 ## Not yet (follow-ups)
 - **Durable storage** (Postgres/ClickHouse) + retention.
-- **Richer dashboard** — the roadmap's Next.js app (charts, alerts, org/RBAC);
-  today's embedded page is the dependency-free v1.
-- **Auth hardening** — per-org key rotation, TLS, rate limits.
+- **Auth hardening** — per-org key rotation, TLS, rate limits; dashboard
+  org/RBAC and alerts.
