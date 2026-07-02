@@ -40,3 +40,6 @@ __pycache__/
 # radar (Linux eBPF) build artifacts
 crates/radar/target/
 crates/radar/**/target/
+
+# cluster (excluded crate, own target dir)
+crates/cluster/target/
