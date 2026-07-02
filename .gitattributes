@@ -1,0 +1,7 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Treat these as binary
+*.png binary
+*.onnx binary
+*.parquet binary
