@@ -42,6 +42,29 @@ jobs:
         working-directory: sdk/python
         run: python -m pytest -q
 
+  cluster:
+    name: cluster (raft HA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/cluster
+      - name: Format check
+        working-directory: crates/cluster
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        working-directory: crates/cluster
+        run: cargo clippy --all-targets
+      - name: Test
+        working-directory: crates/cluster
+        run: cargo test
+
   radar:
     name: radar (eBPF build)
     runs-on: ubuntu-latest
