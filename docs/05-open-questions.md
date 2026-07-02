@@ -11,7 +11,10 @@
 
 ## Open
 
-1. **Name and brand.** Working name — TokenGuard. For a "wow" brand, look for a shorter one-word name: available domain + crates.io + GitHub org. Run a dedicated naming research pass.
+1. **Name and brand.** Working name — TokenGuard. Naming research done 2026-07-02:
+   - "TokenGuard" is **crowded**: free on crates.io/npm/Docker Hub, but **taken** on PyPI (an adjacent Claude Code tool) and all good domains (.com/.dev/.ai/.io) are registered. GitHub has 12+ repos named tokenguard, including `LoveFishoO/TokenGuard` — "Zero-config proxy that stops runaway LLM agents from burning your API" (near-identical name + concept), plus several other LLM cost/budget repos. Poor discoverability and category-ownership risk.
+   - Best free alternatives checked: **`tokenfuse`** (free on crates.io/npm/PyPI, `.dev` domain free, near-empty GitHub namespace; "fuse/circuit-breaker" metaphor fits the positioning) — **recommended**; `fuseguard` (fully free, slightly generic); `burnstop` — avoid (already used by direct competitors: `phuryn/burnstop` 8★ + a "pre-flight budget gate for AI agent runaways" repo).
+   - **Decision pending:** keep TokenGuard (accept crowding; SDK on PyPI must use a different name) vs rename to `tokenfuse`. Renaming later = find/replace in docs + `gh repo rename`.
 2. **License, final call:** Apache-2.0 (maximum adoption) vs AGPL (protection from cloud clones). Leaning toward Apache-2.0.
 3. **First integration for launch:** Claude Agent SDK or LangGraph? (The Claude Code audience is already burning on this pain point — likely the answer.)
 4. **Ollama/vLLM from Phase 1?** Local models: GPU-time/tokens instead of $. Cheap to add, expands the r/LocalLLaMA audience. Leaning toward "yes, as accounting without enforcement."
