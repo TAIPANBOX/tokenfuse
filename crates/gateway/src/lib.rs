@@ -23,16 +23,27 @@ pub mod state;
 pub mod tui;
 pub mod wasmpolicy;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use state::AppState;
 
+/// Default maximum request-body size (bytes). Bounds memory a single client can
+/// force the gateway to buffer. Generous enough for large prompts; override with
+/// `TOKENFUSE_MAX_BODY_BYTES`.
+const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Build the gateway router from shared state.
 pub fn app(state: AppState) -> Router {
+    let max_body = std::env::var("TOKENFUSE_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
     Router::new()
         .route("/healthz", get(proxy::healthz))
         .route("/v1/messages", post(proxy::messages))
         .route("/v1/runs", get(obs::list_runs))
         .route("/v1/runs/{id}/kill", post(obs::kill_run))
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
