@@ -3,7 +3,7 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-02 (HA membership + durable redb + cloud kill-switch)
+**Last updated:** 2026-07-03 (cloud RBAC + alerts · cluster mTLS · security-hardening pass)
 
 ## Current stage
 
@@ -18,9 +18,13 @@ storage, runtime membership changes), and the **hosted Cloud** (Go control plane
 + dashboard, gateway telemetry, fleet-wide kill-switch).
 
 Shipped as container images on GHCR: `tokenfuse`, `tokenfuse:cluster`,
-`tokenfuse-control-plane` — runs anywhere, no dedicated server. Remaining:
-central budgets from the Cloud, a richer (Next.js) dashboard, linearizable
-follower reads, HTTPS/auth on cluster endpoints, a live MCP credential-broker.
+`tokenfuse-control-plane`, `tokenfuse-dashboard` — runs anywhere, no dedicated
+server. The optional-hardening backlog is now also cleared: **cloud RBAC +
+budget alerts**, **cluster mutual TLS**, and a **security-hardening pass**
+(request-body limits, upstream connect timeout, a `cargo audit` CI gate, and a
+documented threat model in [docs/13](docs/13-security-hardening.md)). What's left
+is genuinely optional scale/ops work (a SQL/columnar Cloud store; automated cert
+rotation) and a formal third-party audit — none of it a blocker.
 
 ## Status by component
 
@@ -68,10 +72,13 @@ follower reads, HTTPS/auth on cluster endpoints, a live MCP credential-broker.
 | Cloud central budgets | ✅ done | Control plane: `POST /v1/runs/{run}/budget {budget_usd}` + `GET /v1/budgets`; dashboard **Budget** button per run. Gateway: `cloudsink::spawn_budget_poller` fetches `/v1/budgets` every 3 s → `AppState.cloud_budgets`; `proxy` `open_run` uses the cloud budget over the `x-fuse-budget-usd` header. Verified e2e: header `$999999` + cloud `$0.0001` → 402. Lets an operator tighten a runaway cap centrally. |
 | Cloud kill-switch (kill from cloud) | ✅ done | Control plane: `POST /v1/runs/{run}/kill` + `GET /v1/kills` (per-org), `RunAgg.killed`; dashboard gains a per-run **Kill** button. Gateway: `cloudsink::spawn_kill_poller` fetches `/v1/kills` every 3 s and applies each id to the local kill set → the run is hard-stopped (`402 killed`) across the whole org fleet. `TOKENFUSE_CLOUD_URL` is now a base URL. Verified e2e: kill in cloud → gateway returns 402 `killed`. |
 | Gateway → Cloud telemetry (`CloudSink`) | ✅ done | `crates/gateway/src/cloudsink.rs`: batches settled `CallRecord`s and POSTs them async (fire-and-forget, periodic flush) to the control plane; `TOKENFUSE_CLOUD_URL` + `TOKENFUSE_CLOUD_KEY`, composed via `TeeSink`. `CallRecord` gained `Serialize`. Verified end-to-end: 3 calls → Cloud shows 3 runs / $0.0315. `cloud/docker-compose.yml` runs the whole stack (`docker compose up`). |
+| Cloud RBAC + budget alerts | ✅ done | Control plane keys are now `key:org[:role]` with roles `admin` (default) / `viewer`; reads + ingest work for any valid key, **mutations** (kill, set-budget) require `admin` → `403` for a viewer, `401` for an unknown key. `GET /v1/alerts` flags runs that spent ≥ a fraction of their central budget (`TOKENFUSE_CLOUD_ALERT_PCT`, default 0.8, or `?pct=`); the embedded dashboard shows an alert count + ⚠ on near-budget rows. Go tests: viewer-403, role parsing, alert detection. (#51) |
+| Cluster mutual TLS | ✅ done | On top of server TLS + bearer token: `TOKENFUSE_CLUSTER_MTLS_CA` makes a node **require** a CA-signed client cert from every peer (rustls `WebPkiClientVerifier`, `server::serve_mtls`); each node presents its own cert via `TOKENFUSE_CLUSTER_CLIENT_CERT/_KEY` (reqwest `Identity`). Cryptographic peer auth — an unauthenticated TCP client can't complete the handshake. Also `serve --mtls-ca …`. Test `serves_over_mutual_tls`. (#52) |
+| Security-hardening pass | ✅ done | Request-body size limit on the gateway + MCP-broker routers (`DefaultBodyLimit`, `TOKENFUSE_MAX_BODY_BYTES`, default 16 MiB); upstream **connect** timeout (`TOKENFUSE_UPSTREAM_CONNECT_TIMEOUT_SECS`, no whole-request timeout so SSE streams aren't cut); a `cargo audit` CI job (workspace + cluster); optional **wasmtime 27→43** clearing 15 advisories (2 critical, `wasm` feature is off by default). Threat model + trust boundaries + the deliberate fail-open rationale documented in [docs/13](docs/13-security-hardening.md). (#53) |
 
 ## Test status
 
-`cargo test --all` — 92 passing (core: 57, gateway: 35); Python SDK — 11 passing; **`tokenfuse-cluster` — 5 integration tests** on live raft clusters (3 in-process + 2 over HTTP sockets; excluded crate, own CI job). `cargo clippy --all-targets` clean with `-D warnings` across the workspace, radar, and cluster. **eBPF Radar built + run live on a Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block.
+`cargo test --all` — 100 passing (core: 60, gateway: 40); Python SDK — 11 passing; **`tokenfuse-cluster` — 12 integration tests** on live raft clusters (in-process + over HTTP sockets, incl. token-auth, HTTPS, **mTLS**, membership, linearizable reads, redb durability; excluded crate, own CI job). `cargo clippy --all-targets --all-features` clean with `-D warnings` across the workspace, radar, and cluster. **`cargo audit` — 0 vulnerabilities** (own CI `security` job; 3 transitive unmaintained warnings only). **eBPF Radar built + run live on a Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block; enforce 402; durable-HA restart persistence; full Cloud stack.
 
 ## How to run
 
@@ -89,12 +96,24 @@ TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages cargo run -p tokenfuse-
 
 ## Next steps
 
-The roadmap (phases 1–4) is implemented and shipped in **v0.2.0**. What remains is
-optional hardening / scale work, sensible to defer for a young project:
+The roadmap (phases 1–4) is implemented and shipped in **v0.2.0**, and the
+optional-hardening backlog that followed it is now cleared too:
 
-1. **mTLS / client-cert** auth between nodes (today: server TLS + shared token).
-2. **Durable Cloud store** — Postgres/ClickHouse behind the control plane's
-   in-memory aggregates, with retention.
-3. **Dashboard org/RBAC + alerting** (today: single org key, live view).
-4. **MCP broker**: response redaction + a stdio transport (today: HTTP JSON-RPC).
-5. A production-hardening pass and a security review before any "GA" claim.
+- ✅ **mTLS / client-cert** auth between nodes (#52)
+- ✅ **Durable Cloud store** — JSON snapshot + autosave (#49); a SQL/columnar
+  backend for scale is a drop-in behind the same `Store` (see below)
+- ✅ **Dashboard RBAC + alerting** (#51)
+- ✅ **MCP broker** response redaction + stdio transport (#50)
+- ✅ **Security-hardening pass** — body limits, connect timeout, `cargo audit`
+  gate, threat model (#53)
+
+What genuinely remains is deferred scale/ops work, not a blocker for a young
+project:
+
+1. **SQL/columnar Cloud store** (Postgres/ClickHouse) for scale + long retention,
+   behind the existing `Store` interface.
+2. **Automated cert rotation / SPIFFE-style identity** for the cluster mesh
+   (today: static PEM files; mTLS itself is done).
+3. An **independent third-party security audit** before any "GA" claim — the
+   in-house hardening pass ([docs/13](docs/13-security-hardening.md)) is explicit
+   that it is *not* a substitute for one.
