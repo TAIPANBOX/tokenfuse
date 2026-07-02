@@ -40,8 +40,17 @@ flowchart LR
 
 ---
 
+> **⚡ Try it in one command** — no signup, no config:
+> ```bash
+> docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+> ```
+> Full walkthrough below: [**🚀 Get started**](#-get-started).
+
+---
+
 ## 📑 Table of contents
 
+- [**🚀 Get started**](#-get-started) ← install & first run
 - [The problem](#-the-problem-in-numbers)
 - [How it works](#-how-it-works)
 - [What makes it different](#-what-makes-it-different)
@@ -113,27 +122,66 @@ The enforcement decision (estimate → policy → reserve → settle) adds **~0.
 
 ---
 
-## 🚀 Run it
+## 🚀 Get started
 
-**Docker (no toolchain needed)** — the image is published to GitHub Container Registry, so it runs on any host or cloud:
+TokenFuse is a **proxy**: you start it, then point your agent at it instead of the provider. Three steps, ~2 minutes. No SDK, no code changes.
+
+### Step 1 — Start TokenFuse
+
+The image is published to GitHub Container Registry, so it runs anywhere with Docker — nothing to compile:
 
 ```bash
-# offline trial (deterministic stub upstream)
 docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+```
 
-# in front of a real provider — just point your agent at http://localhost:4100
+That's a working gateway on **http://localhost:4100** using a built-in fake provider, so you can try it offline.
+
+<details><summary>Prefer to build from source? (needs Rust)</summary>
+
+```bash
+git clone https://github.com/TAIPANBOX/tokenfuse.git
+cd tokenfuse
+cargo run -p tokenfuse-gateway      # gateway on http://localhost:4100
+```
+</details>
+
+### Step 2 — Point it at your real LLM provider
+
+Tell TokenFuse where the real provider is with `TOKENFUSE_UPSTREAM`, then send your agent's traffic to `localhost:4100`. Your provider API key is passed straight through — TokenFuse never needs it.
+
+```bash
 docker run -p 4100:4100 \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   ghcr.io/taipanbox/tokenfuse
 ```
 
-**From source:**
+Then in your app, change **one line** — the base URL:
 
 ```bash
-cargo run -p tokenfuse-gateway         # starts the gateway on :4100
+# Anthropic SDK
+export ANTHROPIC_BASE_URL=http://localhost:4100
+# OpenAI-style SDKs
+export OPENAI_BASE_URL=http://localhost:4100
 ```
 
-Everything the project needs lives on GitHub — source, CI (GitHub Actions), and the container image (GHCR). No dedicated server required.
+Your agent runs exactly as before — TokenFuse just watches every call.
+
+### Step 3 — Give a run a budget
+
+Add two headers to your requests: a **run id** (a name for the whole agent task) and a **budget**. TokenFuse adds up the real cost live and returns **HTTP 402** the moment the task would blow past its cap.
+
+```bash
+curl http://localhost:4100/v1/messages \
+  -H "content-type: application/json" \
+  -H "x-fuse-run-id: my-agent-task-1" \
+  -H "x-fuse-budget-usd: 0.50" \
+  -d '{"model":"claude-sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+- **No `x-fuse-run-id`?** The call is passed through untouched — safe to drop in.
+- **Want the live view?** `docker exec <container> tokenfuse top` (or `cargo run -p tokenfuse-gateway top`) shows every run and its $/min.
+
+> Everything the project needs lives on GitHub — source, CI, and the container image (GHCR). **No dedicated server required.**
 
 ---
 
