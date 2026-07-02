@@ -164,6 +164,24 @@ impl Ledger {
         }
     }
 
+    /// Snapshot every known run (for observability / the `runs` endpoint).
+    pub fn list_runs(&self) -> Vec<(String, RunSnapshot)> {
+        let runs = self.runs.lock().unwrap();
+        runs.iter()
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    RunSnapshot {
+                        budget: s.budget,
+                        reserved: s.reserved,
+                        spent: s.spent,
+                        steps: s.steps,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Remove a run and return its final snapshot.
     pub fn close_run(&self, run_id: &str) -> Option<RunSnapshot> {
         let mut runs = self.runs.lock().unwrap();

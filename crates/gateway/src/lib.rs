@@ -3,6 +3,7 @@
 //! drive `app()` directly.
 
 pub mod estimate;
+pub mod obs;
 pub mod provider;
 pub mod proxy;
 pub mod settle;
@@ -17,5 +18,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(proxy::healthz))
         .route("/v1/messages", post(proxy::messages))
+        .route("/v1/runs", get(obs::list_runs))
+        .route("/v1/runs/{id}/kill", post(obs::kill_run))
         .with_state(state)
 }
