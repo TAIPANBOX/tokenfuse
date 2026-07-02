@@ -105,7 +105,13 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    server::serve(node, addr).await?;
+    match (flags.get("tls-cert"), flags.get("tls-key")) {
+        (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {
+            println!("serving over HTTPS (TLS)");
+            server::serve_tls(node, addr, std::fs::read(c)?, std::fs::read(k)?).await?;
+        }
+        _ => server::serve(node, addr).await?,
+    }
     Ok(())
 }
 

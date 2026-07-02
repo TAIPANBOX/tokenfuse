@@ -52,10 +52,27 @@ impl RaftLedger {
             }
         };
 
-        // Serve peer RPCs + the admin/app API in the background.
+        // Serve peer RPCs + the admin/app API in the background — over HTTPS when
+        // TOKENFUSE_CLUSTER_TLS_CERT + _KEY point at PEM files, else plain HTTP.
         let serve_node = node.clone();
+        let tls = match (
+            std::env::var("TOKENFUSE_CLUSTER_TLS_CERT"),
+            std::env::var("TOKENFUSE_CLUSTER_TLS_KEY"),
+        ) {
+            (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
+                Some((std::fs::read(c)?, std::fs::read(k)?))
+            }
+            _ => None,
+        };
         tokio::spawn(async move {
-            if let Err(e) = server::serve(serve_node, addr).await {
+            let res = match tls {
+                Some((cert, key)) => {
+                    tracing::info!("cluster server: HTTPS (TLS)");
+                    server::serve_tls(serve_node, addr, cert, key).await
+                }
+                None => server::serve(serve_node, addr).await,
+            };
+            if let Err(e) = res {
                 tracing::error!("cluster server exited: {e}");
             }
         });

@@ -250,11 +250,22 @@ writes carry it. Without the env var, auth is off (dev default). The gateway
 passes it through the same variable. Test `cluster_token_secures_endpoints`:
 missing/wrong token → `401`, correct token → `200` and writes succeed.
 
+## TLS (implemented)
+
+Nodes serve **HTTPS** natively. Point `TOKENFUSE_CLUSTER_TLS_CERT` and
+`TOKENFUSE_CLUSTER_TLS_KEY` at PEM files (or `tokenfuse-cluster serve
+--tls-cert … --tls-key …`) and the node terminates TLS via rustls (axum-server).
+Use `https://` in the peer/admin URLs. The client (`HttpNetwork` + admin
+`Client`) speaks rustls; for a self-signed cluster CA, set `TOKENFUSE_CLUSTER_CA`
+to the CA PEM so peers trust each other (public CA certs need no extra config).
+Combine with `TOKENFUSE_CLUSTER_TOKEN` for authenticated, encrypted transport.
+Test `serves_over_https_with_token` (self-signed cert, HTTPS `/healthz` + token-
+gated `/mgmt/metrics`).
+
 ## Not yet (follow-ups)
 
-- **TLS** — put the nodes behind a TLS-terminating proxy/mesh for `https://`
-  today; native in-node TLS termination (cert/key) is the next increment.
 - **Linearizable follower reads** via `ensure_linearizable()` + leader forward
   (reads today are eventually-consistent local reads).
+- **mTLS / client-cert** auth (today: server TLS + shared bearer token).
 
 [openraft]: https://docs.rs/openraft

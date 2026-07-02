@@ -47,10 +47,25 @@ impl HttpNetwork {
     pub fn with_token(peers: Peers, token: Option<String>) -> Self {
         Self {
             peers,
-            client: reqwest::Client::new(),
+            client: build_client(),
             token: token.map(Arc::from),
         }
     }
+}
+
+/// Build a reqwest client (rustls). If `TOKENFUSE_CLUSTER_CA` points at a PEM
+/// file, trust it too — so nodes can use a self-signed cluster CA for `https://`.
+/// Public deployments with CA-signed certs need no extra config.
+pub fn build_client() -> reqwest::Client {
+    let mut b = reqwest::Client::builder();
+    if let Ok(path) = std::env::var("TOKENFUSE_CLUSTER_CA") {
+        if let Ok(pem) = std::fs::read(&path) {
+            if let Ok(cert) = reqwest::Certificate::from_pem(&pem) {
+                b = b.add_root_certificate(cert);
+            }
+        }
+    }
+    b.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 impl RaftNetworkFactory<TypeConfig> for HttpNetwork {

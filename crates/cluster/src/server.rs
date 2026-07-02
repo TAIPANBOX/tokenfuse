@@ -233,6 +233,27 @@ pub async fn serve_on(
     axum::serve(listener, router(node)).await
 }
 
+/// Serve this node over **HTTPS** with the given PEM cert + key. Peer/admin URLs
+/// must then use `https://`; clients trust the cert via a public CA or
+/// `TOKENFUSE_CLUSTER_CA`.
+pub async fn serve_tls(
+    node: Arc<HttpNode>,
+    addr: SocketAddr,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+) -> std::io::Result<()> {
+    // rustls 0.23 needs a process-level crypto provider chosen explicitly when
+    // more than one backend is compiled in.
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+    axum_server::bind_rustls(addr, config)
+        .serve(router(node).into_make_service())
+        .await
+}
+
 // ---- raft RPC endpoints ---------------------------------------------------
 
 async fn r_append(
@@ -332,7 +353,7 @@ impl Client {
     pub fn with_token(base: impl Into<String>, token: Option<String>) -> Self {
         Self {
             base: base.into(),
-            http: reqwest::Client::new(),
+            http: crate::net_http::build_client(),
             token,
         }
     }

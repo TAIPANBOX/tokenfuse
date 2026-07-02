@@ -304,3 +304,56 @@ async fn cluster_token_secures_endpoints() {
         .unwrap();
     assert!(r.accepted);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_over_https_with_token() {
+    let port = 5703u16;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let url = format!("https://127.0.0.1:{port}");
+    let peers: Peers = Arc::new(BTreeMap::from([(1u64, url.clone())]));
+
+    // Self-signed cert for 127.0.0.1.
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+            .unwrap();
+    let cert_pem = ck.cert.pem();
+    let key_pem = ck.key_pair.serialize_pem();
+
+    let node = HttpNode::build(1, peers, Some("s3cret".into()))
+        .await
+        .unwrap();
+    let cp = cert_pem.clone();
+    tokio::spawn(async move {
+        let _ = server::serve_tls(node, addr, cp.into_bytes(), key_pem.into_bytes()).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A client that trusts the self-signed cert.
+    let https = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    // /healthz over HTTPS (public).
+    let hz = https.get(format!("{url}/healthz")).send().await.unwrap();
+    assert!(hz.status().is_success(), "healthz over https");
+
+    // /mgmt/metrics over HTTPS needs the token.
+    assert_eq!(
+        https
+            .get(format!("{url}/mgmt/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert!(https
+        .get(format!("{url}/mgmt/metrics"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
