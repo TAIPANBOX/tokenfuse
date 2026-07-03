@@ -12,6 +12,8 @@ struct RunDetailView: View {
     @State private var busy = false
     @State private var error: String?
     @State private var showBudget = false
+    @State private var series: [SeriesBucket] = []
+    @State private var rate: Double = 0
 
     private var heat: Heat { Heat.of(fraction: run.fraction) }
 
@@ -21,11 +23,16 @@ struct RunDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     gauge
+                    if !series.isEmpty { chartCard }
                     stats
                     if !run.killed { actions }
                 }
                 .padding(20)
             }
+        }
+        .task {
+            series = (try? await account.reads.series(run: run.agg.runId, window: "1h", step: "60s")) ?? []
+            rate = series.burnRatePerMin(stepSeconds: 60)
         }
         .foregroundStyle(Palette.fg)
         .navigationBarTitleDisplayMode(.inline)
@@ -53,15 +60,39 @@ struct RunDetailView: View {
                 .font(.instrument(56)).monospacedDigit()
                 .foregroundStyle(heat == .over && !run.killed ? Palette.ember : Palette.fg)
             if let budget = run.budget {
-                Text("of $\(String(format: "%.2f", budget)) · \(Int((run.fraction * 100).rounded()))%")
+                Text("of $\(String(format: "%.2f", budget)) · \(Int((run.fraction * 100).rounded()))%\(rateSuffix)")
                     .font(.mono).foregroundStyle(Palette.dim)
                 Fuse(fraction: run.fraction, height: 12).padding(.top, 6)
             } else {
-                Text("no cap set").font(.mono).foregroundStyle(Palette.faint)
+                Text("no cap set\(rateSuffix)").font(.mono).foregroundStyle(Palette.faint)
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
+    }
+
+    private var rateSuffix: String {
+        rate > 0 ? " · $\(String(format: "%.2f", rate))/min" : ""
+    }
+
+    private var chartCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("BURN · LAST HOUR")
+                    .font(.system(size: 10, weight: .semibold)).tracking(1.4)
+                    .foregroundStyle(Palette.faint)
+                Spacer()
+                if rate > 0 {
+                    Text("$\(String(format: "%.2f", rate))/min")
+                        .font(.mono).foregroundStyle(Palette.amber)
+                }
+            }
+            BurnChart(buckets: series)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Palette.line))
     }
 
     private var stats: some View {

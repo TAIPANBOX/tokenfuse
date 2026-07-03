@@ -26,8 +26,10 @@ struct APIClient: Sendable {
         }
     }
 
-    private func get<T: Decodable>(_ path: String) async throws -> T {
-        var request = URLRequest(url: baseURL.appending(path: path))
+    private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+        var components = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)!
+        if !query.isEmpty { components.queryItems = query }
+        var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ClientError.notHTTP }
@@ -40,4 +42,11 @@ struct APIClient: Sendable {
     func runs() async throws -> [RunAgg] { try await get("v1/runs") }
     func summary() async throws -> Summary { try await get("v1/summary") }
     func budgets() async throws -> [String: Int64] { try await get("v1/budgets") }
+
+    /// Burn-rate buckets for the whole org (`run == nil`) or a single run.
+    func series(run: String?, window: String, step: String) async throws -> [SeriesBucket] {
+        var query = [URLQueryItem(name: "window", value: window), URLQueryItem(name: "step", value: step)]
+        if let run { query.append(URLQueryItem(name: "run", value: run)) }
+        return try await get("v1/series", query: query)
+    }
 }

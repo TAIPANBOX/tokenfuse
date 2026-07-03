@@ -31,6 +31,8 @@ final class RunsStore {
     private(set) var runs: [RunDisplay] = []
     private(set) var summary: Summary?
     private(set) var totalCapsMicros: Int64 = 0
+    private(set) var fleetSeries: [SeriesBucket] = []
+    private(set) var fleetRate: Double = 0
 
     var totalCaps: Double { totalCapsMicros.usd }
 
@@ -49,10 +51,15 @@ final class RunsStore {
             async let runsReq = client.runs()
             async let summaryReq = client.summary()
             async let budgetsReq = client.budgets()
+            // Series is optional — a failure here shouldn't fail the whole load.
+            async let seriesReq = try? client.series(run: nil, window: "15m", step: "60s")
             let (runs, summary, budgets) = try await (runsReq, summaryReq, budgetsReq)
+            let series = await seriesReq ?? []
 
             self.summary = summary
             self.totalCapsMicros = budgets.values.reduce(0, +)
+            self.fleetSeries = series
+            self.fleetRate = series.burnRatePerMin(stepSeconds: 60)
             self.runs = runs
                 .map { RunDisplay(agg: $0, budgetMicros: budgets[$0.runId]) }
                 .sorted { $0.fraction > $1.fraction }
