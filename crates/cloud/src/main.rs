@@ -5,10 +5,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokenfuse_cloud::{app, parse_keys, AppState, Store};
+use tokenfuse_cloud::{app, openapi_spec, parse_keys, AppState, Store};
 
 #[tokio::main]
 async fn main() {
+    // `tokenfuse-cloud --openapi` prints the API contract and exits — used by CI
+    // to validate the spec and by client codegen (Swift, dashboard TS).
+    if std::env::args().nth(1).as_deref() == Some("--openapi") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&openapi_spec()).expect("serialize openapi")
+        );
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

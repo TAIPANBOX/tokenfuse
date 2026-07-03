@@ -7,6 +7,6 @@ pub mod http;
 pub mod keys;
 pub mod store;
 
-pub use http::{app, AppState};
+pub use http::{app, openapi_spec, AppState};
 pub use keys::{parse_keys, Principal};
 pub use store::{CallRecord, Store};

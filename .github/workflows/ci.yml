@@ -56,6 +56,28 @@ jobs:
         working-directory: sdk/js
         run: node test.js
 
+  openapi:
+    name: openapi spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate spec
+        run: cargo run -q -p tokenfuse-cloud -- --openapi > openapi.json
+      - name: Validate spec
+        run: |
+          pip install openapi-spec-validator
+          openapi-spec-validator openapi.json
+      - name: Upload spec artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-spec
+          path: openapi.json
+
   # The Cloud control plane is now a Rust workspace member (crates/cloud); it is
   # built, clippy-checked and tested by the `fmt · clippy · test` job above. The
   # former Go `cloud` job was removed in the Go→Rust port (ADR-7, PR A5).
