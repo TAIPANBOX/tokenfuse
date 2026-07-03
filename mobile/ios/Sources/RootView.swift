@@ -1,28 +1,30 @@
 import SwiftUI
 
-/// Decides between connecting to a plane and showing the fleet. Config lives in
-/// `@AppStorage` for now; pairing + Keychain replace the org key in B3.
+/// Shows the fleet when a paired session exists, otherwise the pairing screen.
+/// The session (device token + signing key) lives in the Keychain.
 struct RootView: View {
-    @AppStorage("planeURL") private var planeURL = ""
-    @AppStorage("orgKey") private var orgKey = ""
+    @State private var account: Account?
+    @State private var restored = false
 
     var body: some View {
-        if let client {
-            RunsView(client: client, onDisconnect: disconnect)
-        } else {
-            ConnectView()
+        Group {
+            if let account {
+                RunsView(account: account, onUnpair: unpair)
+            } else {
+                PairView { account = $0 }
+            }
+        }
+        .task {
+            guard !restored else { return }
+            restored = true
+            if let (session, key) = SessionStore.load() {
+                account = Account(session: session, key: key)
+            }
         }
     }
 
-    private var client: APIClient? {
-        guard !planeURL.isEmpty, !orgKey.isEmpty,
-              let url = URL(string: planeURL), url.scheme != nil
-        else { return nil }
-        return APIClient(baseURL: url, token: orgKey)
-    }
-
-    private func disconnect() {
-        planeURL = ""
-        orgKey = ""
+    private func unpair() {
+        SessionStore.clear()
+        account = nil
     }
 }
