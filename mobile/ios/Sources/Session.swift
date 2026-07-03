@@ -43,7 +43,7 @@ enum PairingService {
         let errorDescription: String?
     }
 
-    static func pair(planeURL: String, code: String, deviceName: String) async throws -> (DeviceSession, DeviceKey) {
+    static func pair(planeURL: String, code: String, deviceName: String, platform: String = "ios") async throws -> (DeviceSession, DeviceKey) {
         guard let base = URL(string: planeURL), base.scheme != nil else {
             throw PairError(errorDescription: "That doesn't look like a URL.")
         }
@@ -51,7 +51,7 @@ enum PairingService {
         let payload: [String: String] = [
             "code": code,
             "pubkey_b64": key.publicKeyX963.base64EncodedString(),
-            "platform": "ios",
+            "platform": platform,
             "name": deviceName,
         ]
         var request = URLRequest(url: base.appending(path: "v1/pair"))
