@@ -267,7 +267,7 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 
 <img align="right" width="88" src="docs/assets/logo.png" alt="TokenFuse app icon">
 
-A native **iPhone & Apple Watch** command deck for your fleet: pair a device once, watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** — *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Face-ID budgets, live burn charts, and the burn rate in the **Dynamic Island** — with the same on your **Apple Watch**, including a two-tap wrist kill and a face complication. It shares one visual language — *the fuse* — with the [web dashboard](cloud/dashboard).
+A native **iPhone & Apple Watch** command deck for your fleet: pair a device once, watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a **hardware-backed kill switch** that's *signed on-device by the Secure Enclave*, so a stolen token alone can't stop your agents. Face-ID budgets, live burn charts, and the burn rate in the **Dynamic Island**, with the same on your **Apple Watch**, including a two-tap wrist kill and a face complication. It shares one visual language, *the fuse*, with the [web dashboard](cloud/dashboard).
 
 The app has its own repository, with screenshots, a full feature tour, and build instructions:
 
