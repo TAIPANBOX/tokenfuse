@@ -4,7 +4,7 @@ import SwiftUI
 struct TokenFusePocketApp: App {
     var body: some Scene {
         WindowGroup {
-            RunsView()
+            RootView()
                 .preferredColorScheme(.dark)
         }
     }
