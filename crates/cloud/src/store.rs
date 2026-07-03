@@ -9,12 +9,13 @@ use std::path::Path;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// One settled call, pushed by a gateway's `CloudSink`. The wire shape matches
 /// `crates/gateway/src/sink.rs::CallRecord` (kept in sync by hand, exactly as
 /// the Go plane did); a later cleanup can hoist the shared type into
 /// `tokenfuse-core` so producer and consumer derive it from one definition.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct CallRecord {
     #[serde(default)]
     pub ts_millis: i64,
@@ -34,7 +35,7 @@ pub struct CallRecord {
 }
 
 /// The aggregated state of one run within an organization.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RunAgg {
     pub run_id: String,
     pub model: String,
@@ -48,7 +49,7 @@ pub struct RunAgg {
 }
 
 /// Org-wide totals.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct Summary {
     pub runs: u64,
     pub calls: u64,
@@ -56,7 +57,7 @@ pub struct Summary {
 }
 
 /// A run that has spent at or above a fraction of its central budget.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Alert {
     pub run_id: String,
     pub spent_microusd: i64,

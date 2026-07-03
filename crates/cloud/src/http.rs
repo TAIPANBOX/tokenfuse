@@ -1,8 +1,9 @@
 //! HTTP surface for the control plane: `/healthz` + `/v1/ingest` (A2), the read
-//! endpoints `/v1/runs`, `/v1/summary`, `/v1/alerts` + browser CORS (A3), and
-//! the admin-only mutations `kill` / `budget` with their poll endpoints
-//! `/v1/kills`, `/v1/budgets` (A4). The OpenAPI contract lands in a later PR —
-//! see docs/14-mobile-companion.md.
+//! endpoints `/v1/runs`, `/v1/summary`, `/v1/alerts` + browser CORS (A3), the
+//! admin-only mutations `kill` / `budget` with their poll endpoints
+//! `/v1/kills`, `/v1/budgets` (A4), and an OpenAPI contract at `/openapi.json`
+//! (A6) — the single source of truth the Swift and dashboard clients generate
+//! from. See docs/14-mobile-companion.md.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,11 +17,46 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::keys::Principal;
-use crate::store::{CallRecord, Store};
+use crate::store::{Alert, CallRecord, RunAgg, Store, Summary};
+
+/// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
+/// and dumped by `tokenfuse-cloud --openapi`; downstream clients (Swift, the
+/// Next.js dashboard) are generated from it.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "TokenFuse Cloud",
+        description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
+    ),
+    paths(ingest, runs, summary, alerts, kill, kills, set_budget, budgets),
+    components(schemas(
+        CallRecord,
+        RunAgg,
+        Summary,
+        Alert,
+        IngestBody,
+        IngestResponse,
+        BudgetBody,
+        BudgetResponse,
+        KillResponse,
+        ErrorResponse,
+    )),
+    tags(
+        (name = "telemetry", description = "Ingest of gateway call records"),
+        (name = "reads", description = "Aggregated per-org views"),
+        (name = "mutations", description = "Operator actions (admin only)"),
+    )
+)]
+struct ApiDoc;
+
+/// The generated OpenAPI document.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    ApiDoc::openapi()
+}
 
 /// Shared application state. `Clone` is cheap — everything is behind an `Arc`.
 #[derive(Clone)]
@@ -87,6 +123,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/healthz", get(healthz))
+        .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
         .route("/v1/summary", get(summary))
@@ -109,29 +146,86 @@ async fn dashboard() -> Html<&'static str> {
     Html(include_str!("../index.html"))
 }
 
-#[derive(Deserialize)]
+/// `GET /openapi.json` — the API contract. Not itself documented in the spec.
+async fn openapi_doc() -> Json<utoipa::openapi::OpenApi> {
+    Json(openapi_spec())
+}
+
+// ---- request / response bodies -------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
 struct IngestBody {
     #[serde(default)]
     records: Vec<CallRecord>,
 }
 
-/// `POST /v1/ingest` — a gateway pushes a batch of settled calls for its org.
+#[derive(Serialize, ToSchema)]
+struct IngestResponse {
+    accepted: usize,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct BudgetBody {
+    budget_usd: f64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct BudgetResponse {
+    run: String,
+    budget_micros: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct KillResponse {
+    killed: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Deserialize, IntoParams)]
+struct AlertQuery {
+    /// Budget fraction (0..1) to flag at; defaults to the server's `alert_pct`.
+    pct: Option<f64>,
+}
+
+// ---- handlers -------------------------------------------------------------
+
+/// A gateway pushes a batch of settled calls for its org.
+#[utoipa::path(
+    post, path = "/v1/ingest",
+    request_body = IngestBody,
+    responses(
+        (status = 200, description = "records accepted", body = IngestResponse),
+        (status = 400, description = "malformed json", body = ErrorResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "telemetry"
+)]
 async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
     let parsed: IngestBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))).into_response()
-        }
+        Err(_) => return bad_json(),
     };
     let accepted = parsed.records.len();
     st.store.ingest(&org, &parsed.records);
-    (StatusCode::OK, Json(json!({ "accepted": accepted }))).into_response()
+    (StatusCode::OK, Json(IngestResponse { accepted })).into_response()
 }
 
-/// `GET /v1/runs` — the caller org's aggregated runs.
+/// The caller org's aggregated runs.
+#[utoipa::path(
+    get, path = "/v1/runs",
+    responses(
+        (status = 200, description = "aggregated runs", body = Vec<RunAgg>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
 async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
@@ -139,7 +233,15 @@ async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.runs(&org))).into_response()
 }
 
-/// `GET /v1/summary` — org-wide totals.
+/// Org-wide totals.
+#[utoipa::path(
+    get, path = "/v1/summary",
+    responses(
+        (status = 200, description = "org totals", body = Summary),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
 async fn summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
@@ -147,14 +249,16 @@ async fn summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.summary(&org))).into_response()
 }
 
-#[derive(Deserialize)]
-struct AlertQuery {
-    pct: Option<f64>,
-}
-
-/// `GET /v1/alerts` — runs at or above the alert threshold of their budget. The
-/// threshold defaults to the configured `alert_pct` and can be overridden with
-/// `?pct=` (0..1).
+/// Runs at or above the alert threshold of their central budget.
+#[utoipa::path(
+    get, path = "/v1/alerts",
+    params(AlertQuery),
+    responses(
+        (status = 200, description = "runs near or over budget", body = Vec<Alert>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
 async fn alerts(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -170,18 +274,35 @@ async fn alerts(
     (StatusCode::OK, Json(st.store.alerts(&org, pct))).into_response()
 }
 
-/// `POST /v1/runs/{run}/kill` — mark a run killed (admin only). Gateways poll
-/// `/v1/kills` and hard-stop it across the org fleet.
+/// Mark a run killed (admin only). Gateways poll `/v1/kills` and hard-stop it.
+#[utoipa::path(
+    post, path = "/v1/runs/{run}/kill",
+    params(("run" = String, Path, description = "run id")),
+    responses(
+        (status = 200, description = "run killed", body = KillResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
 async fn kill(State(st): State<AppState>, headers: HeaderMap, Path(run): Path<String>) -> Response {
     let org = match st.admin_org(&headers) {
         Ok(o) => o,
         Err(e) => return e.into_response(),
     };
     st.store.kill(&org, &run);
-    (StatusCode::OK, Json(json!({ "killed": run }))).into_response()
+    (StatusCode::OK, Json(KillResponse { killed: run })).into_response()
 }
 
-/// `GET /v1/kills` — run ids this org has killed (gateways poll this).
+/// Run ids this org has killed (gateways poll this).
+#[utoipa::path(
+    get, path = "/v1/kills",
+    responses(
+        (status = 200, description = "killed run ids", body = Vec<String>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
 async fn kills(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
@@ -189,13 +310,19 @@ async fn kills(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.kills(&org))).into_response()
 }
 
-#[derive(Deserialize)]
-struct BudgetBody {
-    budget_usd: f64,
-}
-
-/// `POST /v1/runs/{run}/budget` — set a central budget for a run (admin only),
-/// overriding the client-supplied budget. Gateways poll `/v1/budgets`.
+/// Set a central budget for a run (admin only). Gateways poll `/v1/budgets`.
+#[utoipa::path(
+    post, path = "/v1/runs/{run}/budget",
+    params(("run" = String, Path, description = "run id")),
+    request_body = BudgetBody,
+    responses(
+        (status = 200, description = "budget set", body = BudgetResponse),
+        (status = 400, description = "malformed json", body = ErrorResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
 async fn set_budget(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -208,20 +335,29 @@ async fn set_budget(
     };
     let parsed: BudgetBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad json"}))).into_response()
-        }
+        Err(_) => return bad_json(),
     };
     let micros = (parsed.budget_usd * 1e6) as i64;
     st.store.set_budget(&org, &run, micros);
     (
         StatusCode::OK,
-        Json(json!({ "run": run, "budget_micros": micros })),
+        Json(BudgetResponse {
+            run,
+            budget_micros: micros,
+        }),
     )
         .into_response()
 }
 
-/// `GET /v1/budgets` — this org's run → budget-micros overrides (gateways poll).
+/// This org's run → budget-micros overrides (gateways poll this).
+#[utoipa::path(
+    get, path = "/v1/budgets",
+    responses(
+        (status = 200, description = "run → budget micros"),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "mutations"
+)]
 async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
@@ -229,10 +365,14 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
 }
 
+// ---- shared responses -----------------------------------------------------
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "invalid api key"})),
+        Json(ErrorResponse {
+            error: "invalid api key".into(),
+        }),
     )
         .into_response()
 }
@@ -240,7 +380,19 @@ fn unauthorized() -> Response {
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(json!({"error": "admin role required"})),
+        Json(ErrorResponse {
+            error: "admin role required".into(),
+        }),
+    )
+        .into_response()
+}
+
+fn bad_json() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "bad json".into(),
+        }),
     )
         .into_response()
 }
