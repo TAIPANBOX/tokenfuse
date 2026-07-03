@@ -75,6 +75,7 @@ rotation) and a formal third-party audit — none of it a blocker.
 | Cloud RBAC + budget alerts | ✅ done | Control plane keys are now `key:org[:role]` with roles `admin` (default) / `viewer`; reads + ingest work for any valid key, **mutations** (kill, set-budget) require `admin` → `403` for a viewer, `401` for an unknown key. `GET /v1/alerts` flags runs that spent ≥ a fraction of their central budget (`TOKENFUSE_CLOUD_ALERT_PCT`, default 0.8, or `?pct=`); the embedded dashboard shows an alert count + ⚠ on near-budget rows. Go tests: viewer-403, role parsing, alert detection. (#51) |
 | Cluster mutual TLS | ✅ done | On top of server TLS + bearer token: `TOKENFUSE_CLUSTER_MTLS_CA` makes a node **require** a CA-signed client cert from every peer (rustls `WebPkiClientVerifier`, `server::serve_mtls`); each node presents its own cert via `TOKENFUSE_CLUSTER_CLIENT_CERT/_KEY` (reqwest `Identity`). Cryptographic peer auth — an unauthenticated TCP client can't complete the handshake. Also `serve --mtls-ca …`. Test `serves_over_mutual_tls`. (#52) |
 | Security-hardening pass | ✅ done | Request-body size limit on the gateway + MCP-broker routers (`DefaultBodyLimit`, `TOKENFUSE_MAX_BODY_BYTES`, default 16 MiB); upstream **connect** timeout (`TOKENFUSE_UPSTREAM_CONNECT_TIMEOUT_SECS`, no whole-request timeout so SSE streams aren't cut); a `cargo audit` CI job (workspace + cluster); optional **wasmtime 27→43** clearing 15 advisories (2 critical, `wasm` feature is off by default). Threat model + trust boundaries + the deliberate fail-open rationale documented in [docs/13](docs/13-security-hardening.md). (#53) |
+| Published to package registries | ✅ done | The `tokenfuse` name is claimed and **published** on all three registries (v0.3.0): **npm** `npm install tokenfuse` (`sdk/js`), **crates.io** `cargo add tokenfuse` (umbrella crate `crates/tokenfuse`), **PyPI** `pip install tokenfuse-sdk` (`sdk/python`; the plain `tokenfuse` name is blocked on PyPI by the unrelated existing `token-fuse`, so the distribution is `tokenfuse-sdk` while the import stays `import tokenfuse`). Publish tokens were revoked after use. Domain `tokenfuse.dev` is the only remaining name to claim (owner action). |
 
 ## Test status
 
@@ -106,6 +107,8 @@ optional-hardening backlog that followed it is now cleared too:
 - ✅ **MCP broker** response redaction + stdio transport (#50)
 - ✅ **Security-hardening pass** — body limits, connect timeout, `cargo audit`
   gate, threat model (#53)
+- ✅ **Published to npm / crates.io / PyPI** — the `tokenfuse` name is claimed on
+  all three (PyPI as `tokenfuse-sdk`); publish tokens revoked afterwards.
 
 What genuinely remains is deferred scale/ops work, not a blocker for a young
 project:
