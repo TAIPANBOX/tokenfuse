@@ -24,7 +24,26 @@ struct Summary: Codable, Sendable {
     let spentMicrousd: Int64
 }
 
+/// One time bucket of the burn-rate series (`/v1/series`).
+struct SeriesBucket: Codable, Sendable, Identifiable {
+    let t: Int64  // bucket start, epoch millis
+    let costMicrousd: Int64
+    let calls: Int
+    let blocked: Int
+
+    var id: Int64 { t }
+    var cost: Double { costMicrousd.usd }
+}
+
 extension Int64 {
     /// Microdollars → dollars.
     var usd: Double { Double(self) / 1_000_000 }
+}
+
+extension Array where Element == SeriesBucket {
+    /// Recent burn rate in $/min — the last non-empty bucket, scaled to a minute.
+    func burnRatePerMin(stepSeconds: Double) -> Double {
+        guard let last = last(where: { $0.costMicrousd > 0 }) else { return 0 }
+        return last.cost / (stepSeconds / 60)
+    }
 }

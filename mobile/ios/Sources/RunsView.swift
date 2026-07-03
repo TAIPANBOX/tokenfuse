@@ -126,15 +126,19 @@ struct RunsView: View {
 
     private func heroCard(_ summary: Summary) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("SPENT TODAY")
+            Text("FLEET BURN RATE")
                 .font(.system(size: 10, weight: .semibold)).tracking(2)
                 .foregroundStyle(Palette.faint)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(usd(summary.spentMicrousd.usd))
+                Text(String(format: "%.2f", store.fleetRate))
                     .font(.instrument(46)).monospacedDigit()
+                Text("$/min").font(.mono).foregroundStyle(Palette.amber)
                 Spacer()
-                Text("\(summary.runs) runs · \(summary.calls) calls")
+                Text("spent \(usd(summary.spentMicrousd.usd))")
                     .font(.mono).foregroundStyle(Palette.dim)
+            }
+            if !store.fleetSeries.isEmpty {
+                BurnChart(buckets: store.fleetSeries, compact: true)
             }
             if store.totalCapsMicros > 0 {
                 Fuse(fraction: summary.spentMicrousd.usd / store.totalCaps)
