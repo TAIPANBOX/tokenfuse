@@ -22,12 +22,38 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Allow cleartext HTTP to localhost / .local — dev planes run over HTTP;
+        # production planes use HTTPS. Not arbitrary loads.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "1,2"
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+  TokenFusePocketTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: TokenFusePocket
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.pocket.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  TokenFusePocket:
+    build:
+      targets:
+        TokenFusePocket: all
+    test:
+      targets:
+        - TokenFusePocketTests
