@@ -1,13 +1,18 @@
 import SwiftUI
 
-/// The home deck, live from a control plane: spent-today hero + fuse, then every
-/// run as a fuse — hottest first, the over-cap run in ember. Pull to refresh.
-/// (Per-run and fleet $/min join in B6, once the series endpoint is wired.)
+/// The home deck, live from the paired plane: spent-today hero + fuse, then every
+/// run as a fuse — hottest first, over-cap in ember. Long-press a run to kill it;
+/// the request is signed on this device. (Per-run/fleet $/min join in B6; the
+/// slide-to-arm + Face ID gate is B5.)
 struct RunsView: View {
-    let client: APIClient
-    var onDisconnect: () -> Void
+    let account: Account
+    var onUnpair: () -> Void
 
     @State private var store = RunsStore()
+    @State private var killTarget: RunDisplay?
+    @State private var actionError: String?
+
+    private var client: APIClient { account.reads }
 
     var body: some View {
         ZStack {
@@ -21,7 +26,16 @@ struct RunsView: View {
                     if let summary = store.summary {
                         heroCard(summary)
                     }
-                    ForEach(store.runs) { RunRow(run: $0) }
+                    ForEach(store.runs) { run in
+                        RunRow(run: run)
+                            .contextMenu {
+                                if !run.killed {
+                                    Button(role: .destructive) { killTarget = run } label: {
+                                        Label("Kill run", systemImage: "bolt.slash")
+                                    }
+                                }
+                            }
+                    }
                     footerState
                 }
                 .padding(18)
@@ -29,7 +43,36 @@ struct RunsView: View {
         }
         .task { await store.load(using: client) }
         .refreshable { await store.load(using: client) }
+        .alert("Kill run \(killTarget?.id ?? "")?", isPresented: killAlertBinding, presenting: killTarget) { run in
+            Button("Kill", role: .destructive) { kill(run) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Signed on this iPhone and enforced across every gateway.")
+        }
+        .alert("Couldn't kill the run", isPresented: errorAlertBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
         .foregroundStyle(Palette.fg)
+    }
+
+    private var killAlertBinding: Binding<Bool> {
+        Binding(get: { killTarget != nil }, set: { if !$0 { killTarget = nil } })
+    }
+    private var errorAlertBinding: Binding<Bool> {
+        Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+    }
+
+    private func kill(_ run: RunDisplay) {
+        Task {
+            do {
+                try await account.kill(run: run.id)
+                await store.load(using: client)
+            } catch {
+                actionError = error.localizedDescription
+            }
+        }
     }
 
     private var header: some View {
@@ -39,7 +82,7 @@ struct RunsView: View {
                 HStack(spacing: 7) {
                     Circle().fill(store.phase == .loaded ? Palette.mint : Palette.faint)
                         .frame(width: 6, height: 6)
-                    Text(client.baseURL.host() ?? "plane")
+                    Text("\(account.session.org) · \(client.baseURL.host() ?? "plane")")
                         .font(.mono).foregroundStyle(Palette.dim)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 5)
@@ -47,15 +90,15 @@ struct RunsView: View {
                 .overlay(Capsule().stroke(Palette.line))
             }
             Spacer()
-            Button(action: onDisconnect) {
-                Image(systemName: "arrow.triangle.2.circlepath")
+            Button(action: onUnpair) {
+                Image(systemName: "iphone.slash")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Palette.iris)
                     .padding(9)
                     .background(Palette.panel, in: Circle())
                     .overlay(Circle().stroke(Palette.line))
             }
-            .accessibilityLabel("Change plane")
+            .accessibilityLabel("Unpair this device")
         }
     }
 
