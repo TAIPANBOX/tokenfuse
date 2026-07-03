@@ -172,3 +172,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build + clippy the real APNs sender
         run: cargo clippy -p tokenfuse-cloud --all-targets --features apns -- -D warnings
+
+  ios:
+    name: ios (build)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: mobile/ios
+        run: xcodegen generate
+      - name: Build (simulator · no signing)
+        working-directory: mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project TokenFusePocket.xcodeproj \
+            -scheme TokenFusePocket \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -50
