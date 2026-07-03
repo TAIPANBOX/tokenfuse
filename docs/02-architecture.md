@@ -19,11 +19,12 @@
 | TUI | ratatui (`tokenfuse top`) |
 | eBPF | aya (Radar, Linux-only) |
 | Config/policy store | PostgreSQL (configuration only; telemetry lives in Parquet) |
-| Cloud control plane | Go (billing, tenants, SSO, Slack integrations) |
-| Dashboard | Next.js + live WebSocket |
+| Cloud control plane | Rust: axum + utoipa (OpenAPI) — *superseded from Go, see ADR-7 and [14-mobile-companion.md](14-mobile-companion.md)* |
+| Dashboard | Next.js (client generated from the control-plane OpenAPI spec) |
 | SDK | Python + TypeScript (thin: base_url + headers + typed errors) |
+| Mobile | Swift 6 / SwiftUI (iOS 26 SDK) — TokenFuse Pocket, see [14-mobile-companion.md](14-mobile-companion.md) |
 
-Language split: Rust — everything in the request path; Go — Cloud services, where development speed matters more; Next.js — web without heroics.
+Language split: Rust — everything in the request path **and the Cloud control plane** (one server language, shared `tokenfuse_core` types); Next.js — web without heroics; Swift — the native mobile companion.
 
 ## 3. Key architecture decisions (ADRs)
 
@@ -33,6 +34,7 @@ Language split: Rust — everything in the request path; Go — Cloud services, 
 - **ADR-4. We never tear a stream apart mid-flight** — enforcement happens at step boundaries: clamp `max_tokens` before the call + block the next call. Mid-stream kill is only via the manual kill-switch.
 - **ADR-5. OSS core (Apache-2.0) + Cloud.**
 - **ADR-6. Token estimation is a local approximation** (+15% conservative margin); accuracy is guaranteed by settling against actual usage.
+- **ADR-7. Cloud control plane in Rust, not Go** *(supersedes the "Go — Cloud services" choice above and in v0.1).* The mobile companion (ADR-14.1) forces the question, and consolidation wins: one server language across data plane and control plane, direct reuse of `tokenfuse_core` domain types (`CallRecord` is already `Serialize`), a single OpenAPI contract (`utoipa`) that generates both the Swift and the dashboard TypeScript clients, and SSE reusing the gateway's existing streaming stack. The Go plane was ~540 LoC — the port is cheap. Rationale and the full mobile plan live in [14-mobile-companion.md](14-mobile-companion.md). The original Go plane remains in history until the port lands (Phase A, PR A5).
 
 ## 4. Core components (a single Rust binary)
 
