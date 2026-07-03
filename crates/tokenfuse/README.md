@@ -18,7 +18,7 @@ Then point your provider client at `http://127.0.0.1:4100` and attach a few
 `X-Fuse-*` headers.
 
 - **Source & docs:** https://github.com/TAIPANBOX/tokenfuse
-- **Python SDK:** `pip install tokenfuse`
+- **Python SDK:** `pip install tokenfuse-sdk` (imports as `tokenfuse`)
 - **JS/TS helpers:** `npm install tokenfuse`
 
 Licensed under Apache-2.0.
