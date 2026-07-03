@@ -20,16 +20,6 @@ struct PairView: View {
         ZStack {
             Palette.ink.ignoresSafeArea()
             VStack(spacing: 0) {
-                // Keyboard down: a flexible spacer centres the whole group.
-                // Keyboard up: a small fixed top anchors the emblem near the top
-                // (with breathing room below the Dynamic Island) and the gap
-                // tightens, so the form — including the Pair button — rises just
-                // clear of the keyboard while the emblem stays fully visible.
-                if keyboardUp {
-                    Spacer().frame(height: 20)
-                } else {
-                    Spacer()
-                }
                 BrandMark(size: 107)
                     .padding(.bottom, keyboardUp ? 20 : 64)
                 VStack(alignment: .leading, spacing: 20) {
@@ -56,8 +46,13 @@ struct PairView: View {
 
                     seal
                 }
-                Spacer()
             }
+            // Centre the group when idle; anchor it to the top when the keyboard is
+            // up (only the alignment animates — no view-tree change, so the field
+            // keeps focus and the keyboard stays). Top-anchoring plus the tighter
+            // gap lifts the whole form — including the Pair button — clear of the
+            // keyboard while the emblem stays fully visible below the Dynamic Island.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: keyboardUp ? .top : .center)
             .padding(22)
         }
         .foregroundStyle(Palette.fg)
