@@ -11,19 +11,32 @@ struct PairView: View {
     @State private var code = ""
     @State private var busy = false
     @State private var error: String?
+    @FocusState private var focus: Field?
+    @State private var keyboardUp = false
+
+    private enum Field { case url, code }
 
     var body: some View {
         ZStack {
             Palette.ink.ignoresSafeArea()
             VStack(spacing: 0) {
-                BrandMark(size: 82)
-                    .padding(.top, 12)
-                Spacer()
+                // Keyboard down: a flexible spacer centres the whole group.
+                // Keyboard up: a small fixed top anchors the emblem near the top
+                // (with breathing room below the Dynamic Island) and the gap
+                // tightens, so the form — including the Pair button — rises just
+                // clear of the keyboard while the emblem stays fully visible.
+                if keyboardUp {
+                    Spacer().frame(height: 20)
+                } else {
+                    Spacer()
+                }
+                BrandMark(size: 107)
+                    .padding(.bottom, keyboardUp ? 20 : 64)
                 VStack(alignment: .leading, spacing: 20) {
                     brand
                     VStack(alignment: .leading, spacing: 14) {
-                        field(label: "PLANE URL", text: $url, placeholder: "https://…")
-                        field(label: "PAIRING CODE", text: $code, placeholder: "8-char code")
+                        field(.url, label: "PLANE URL", text: $url, placeholder: "https://…")
+                        field(.code, label: "PAIRING CODE", text: $code, placeholder: "8-char code")
                     }
                     if let error {
                         Text(error).font(.mono).foregroundStyle(Palette.ember)
@@ -38,8 +51,8 @@ struct PairView: View {
                         .background(Palette.iris, in: RoundedRectangle(cornerRadius: 14))
                         .foregroundStyle(.white)
                     }
-                    .disabled(busy || url.isEmpty || code.isEmpty)
-                    .opacity(busy || url.isEmpty || code.isEmpty ? 0.5 : 1)
+                    .disabled(!canPair)
+                    .opacity(canPair ? 1 : 0.5)
 
                     seal
                 }
@@ -48,6 +61,12 @@ struct PairView: View {
             .padding(22)
         }
         .foregroundStyle(Palette.fg)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.25)) { keyboardUp = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.25)) { keyboardUp = false }
+        }
         .task {
             // Screenshot / UI-check hook: pair automatically from launch args.
             if !busy, let u = LaunchArgs.value("-autoPairURL"), let c = LaunchArgs.value("-autoPairCode") {
@@ -55,6 +74,8 @@ struct PairView: View {
                 code = c
                 pair()
             }
+            // Screenshot hook: raise the keyboard to check it doesn't hide the emblem.
+            if LaunchArgs.has("-focusCode") { focus = .code }
         }
     }
 
@@ -72,17 +93,22 @@ struct PairView: View {
                 .font(.system(size: 20)).foregroundStyle(Palette.mint)
             Text("A signing key is generated on this iPhone. Kills are signed here — a stolen token alone can't stop your agents.")
                 .font(.mono).foregroundStyle(Palette.dim)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Palette.mint.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.mint.opacity(0.22)))
     }
 
-    private func field(label: String, text: Binding<String>, placeholder: String) -> some View {
+    private func field(_ which: Field, label: String, text: Binding<String>, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(label).font(.system(size: 10, weight: .semibold)).tracking(1.6)
                 .foregroundStyle(Palette.faint)
             TextField(placeholder, text: text)
+                .focused($focus, equals: which)
+                .submitLabel(which == .code ? .go : .next)
+                .onSubmit { submit(which) }
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .font(.system(.body, design: .monospaced))
@@ -92,7 +118,20 @@ struct PairView: View {
         }
     }
 
+    private var canPair: Bool { !busy && !url.isEmpty && !code.isEmpty }
+
+    /// Return-key behaviour: the URL field advances to the code; the code field
+    /// pairs. Lets you pair straight from the keyboard, without reaching the
+    /// button that the keyboard covers.
+    private func submit(_ which: Field) {
+        switch which {
+        case .url: focus = .code
+        case .code: if canPair { pair() }
+        }
+    }
+
     private func pair() {
+        focus = nil
         error = nil
         busy = true
         let planeURL = url
