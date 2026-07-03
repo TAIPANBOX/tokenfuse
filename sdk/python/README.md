@@ -10,8 +10,11 @@ provider client at the gateway and attach a few headers.
 ## Install
 
 ```bash
-pip install tokenfuse   # (planned; for now: pip install -e sdk/python)
+pip install tokenfuse-sdk
 ```
+
+The distribution is named `tokenfuse-sdk` (the plain `tokenfuse` name was taken on
+PyPI), but you still **import it as `tokenfuse`**.
 
 ## Use
 
