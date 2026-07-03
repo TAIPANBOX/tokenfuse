@@ -76,10 +76,12 @@ Autonomous agents read untrusted web pages, call external **MCP** tools, and hol
 
 ```mermaid
 flowchart LR
-    A["🤖 Your AI agent"] -->|"just change base_url"| T["⚡ TokenFuse"]
+    A["🤖 Your AI agent"] -->|"just change base_url"| T["TokenFuse"]
     T -->|"forwards if OK"| P["☁️ LLM provider<br/>(Anthropic, OpenAI…)"]
     T -.->|"blocks if runaway"| X["🛑 402 stop"]
     T -.-> D["📊 Dashboard · alerts · reports"]
+    classDef brand fill:#F6B740,stroke:#0A0E13,color:#0A0E13,font-weight:bold;
+    class T brand;
 ```
 
 *A drop-in proxy. No SDK required, no rewrite of your agent.*
@@ -164,7 +166,7 @@ Every request flows through TokenFuse. It estimates the cost *before* the call, 
 ```mermaid
 sequenceDiagram
     participant A as 🤖 Agent
-    participant T as ⚡ TokenFuse
+    participant T as TokenFuse
     participant L as ☁️ LLM provider
     A->>T: request (tagged with run id)
     T->>T: estimate cost + check budget & loops
@@ -202,7 +204,7 @@ There are excellent tools *around* this problem. None of them sit in the request
 
 ### Capability matrix
 
-| Capability | ⚡ TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
+| Capability | <img src="docs/assets/logo.png" height="15" align="top"> TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
 |---|:---:|:---:|:---:|:---:|
 | Show how much you spent | ✅ | ✅ | ✅ | — |
 | Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ |
