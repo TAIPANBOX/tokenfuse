@@ -1,4 +1,5 @@
 import SwiftUI
+import WidgetKit
 
 /// The wrist glance: the fleet's burn rate up top, then every run as a fuse —
 /// hottest first, over-cap in ember. Tap a run to open its kill screen. Reads the
@@ -54,6 +55,10 @@ struct WatchFleetView: View {
 
     private func reload() async {
         await store.load(using: client, org: account.session.org, context: nil)
+        // Feed the watch-face complication and ask it to refresh.
+        let overCap = store.runs.contains { !$0.killed && $0.hasBudget && $0.fraction >= 1.0 }
+        FaceStore.save(rate: store.fleetRate, overCap: overCap)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     private var header: some View {

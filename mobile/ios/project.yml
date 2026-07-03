@@ -94,11 +94,13 @@ targets:
       - path: Sources/Crypto.swift
       - path: Sources/Keychain.swift
       - path: Sources/Session.swift
+    dependencies:
+      - target: TokenFuseWatchComplication
     info:
       path: WatchApp/Info.plist
       properties:
         WKApplication: true
-        # Standalone for now — no iPhone companion until W2 wires WatchConnectivity.
+        # Standalone for now — no iPhone companion until W4 wires WatchConnectivity.
         WKWatchOnly: true
         CFBundleDisplayName: TokenFuse
         NSAppTransportSecurity:
@@ -108,6 +110,29 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.watch
         SWIFT_STRICT_CONCURRENCY: complete
         TARGETED_DEVICE_FAMILY: "4"
+        CODE_SIGN_ENTITLEMENTS: WatchApp/TokenFuseWatch.entitlements
+  # Watch-face complication (WidgetKit) — the fleet's burn rate at a glance,
+  # fed by the app over the app group. Embedded in the watch app.
+  TokenFuseWatchComplication:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - path: WatchComplication
+      - path: WatchApp/FaceStore.swift
+      - path: Sources/DesignSystem.swift
+    info:
+      path: WatchComplication/Info.plist
+      properties:
+        CFBundleDisplayName: TokenFuse
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taipanbox.tokenfuse.watch.complication
+        SWIFT_STRICT_CONCURRENCY: complete
+        TARGETED_DEVICE_FAMILY: "4"
+        CODE_SIGN_ENTITLEMENTS: WatchComplication/TokenFuseWatchComplication.entitlements
 schemes:
   TokenFuse:
     build:
