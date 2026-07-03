@@ -186,20 +186,20 @@ jobs:
       - name: Build (simulator · no signing)
         working-directory: mobile/ios
         run: |
-          set -o pipefail
           xcodebuild build \
             -project TokenFusePocket.xcodeproj \
             -scheme TokenFusePocket \
             -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -50
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
       - name: Test (on an available simulator)
         working-directory: mobile/ios
         run: |
-          set -o pipefail
           SIM=$(xcrun simctl list devices available | grep -m1 -oE 'iPhone [0-9]+( Pro)?' || echo 'iPhone 16')
           echo "Testing on: $SIM"
           xcodebuild test \
             -project TokenFusePocket.xcodeproj \
             -scheme TokenFusePocket \
             -destination "platform=iOS Simulator,name=$SIM" \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tail -60
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO

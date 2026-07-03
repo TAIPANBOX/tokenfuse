@@ -6,8 +6,10 @@ import Foundation
 // simulator (the server can't and needn't tell them apart). ES256 signatures
 // (raw r‖s) over the canonical string are what authorize a kill or a budget.
 
-/// A device signing key, abstracting Secure Enclave vs software.
-protocol DeviceKey {
+/// A device signing key, abstracting Secure Enclave vs software. `Sendable` so a
+/// freshly generated key can be returned from the (nonisolated) pairing call to
+/// the main actor under Swift 6 — CryptoKit's P-256 keys are themselves Sendable.
+protocol DeviceKey: Sendable {
     /// Public key, SEC1/X9.63 (65 bytes) — sent at pairing as base64.
     var publicKeyX963: Data { get }
     /// ES256 signature (raw 64-byte r‖s) over `data` (which is SHA-256'd inside).
