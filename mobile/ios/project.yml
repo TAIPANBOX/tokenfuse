@@ -91,6 +91,9 @@ targets:
       - path: Sources/RunsStore.swift
       - path: Sources/CachedRun.swift
       - path: Sources/LaunchArgs.swift
+      - path: Sources/Crypto.swift
+      - path: Sources/Keychain.swift
+      - path: Sources/Session.swift
     info:
       path: WatchApp/Info.plist
       properties:

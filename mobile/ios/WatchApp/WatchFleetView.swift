@@ -1,39 +1,59 @@
 import SwiftUI
 
 /// The wrist glance: the fleet's burn rate up top, then every run as a fuse —
-/// hottest first, over-cap in ember. Reads the live fleet from the plane
-/// (shared `RunsStore`, no on-watch cache in W1).
+/// hottest first, over-cap in ember. Tap a run to open its kill screen. Reads the
+/// live fleet through the paired device session (shared `RunsStore`).
 struct WatchFleetView: View {
-    let client: APIClient
-    let org: String
+    let account: Account
     @State private var store = RunsStore()
+    @State private var path: [RunDisplay] = []
+
+    private var client: APIClient { account.reads }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 9) {
-                header
-                if store.totalCapsMicros > 0, let summary = store.summary {
-                    Fuse(fraction: summary.spentMicrousd.usd / store.totalCaps, height: 7)
-                }
-                if case .failed = store.phase, store.runs.isEmpty {
-                    Text("Can't reach the plane.")
-                        .font(.system(size: 12)).foregroundStyle(Palette.ember)
-                        .padding(.top, 6)
-                } else if store.phase == .loading && store.runs.isEmpty {
-                    ProgressView().tint(Palette.mint)
-                        .frame(maxWidth: .infinity).padding(.top, 12)
-                } else {
-                    ForEach(store.runs) { run in
-                        WatchRunRow(run: run)
+        NavigationStack(path: $path) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 9) {
+                    header
+                    if store.totalCapsMicros > 0, let summary = store.summary {
+                        Fuse(fraction: summary.spentMicrousd.usd / store.totalCaps, height: 7)
+                    }
+                    if case .failed = store.phase, store.runs.isEmpty {
+                        Text("Can't reach the plane.")
+                            .font(.system(size: 12)).foregroundStyle(Palette.ember)
+                            .padding(.top, 6)
+                    } else if store.phase == .loading && store.runs.isEmpty {
+                        ProgressView().tint(Palette.mint)
+                            .frame(maxWidth: .infinity).padding(.top, 12)
+                    } else {
+                        ForEach(store.runs) { run in
+                            NavigationLink(value: run) { WatchRunRow(run: run) }
+                                .buttonStyle(.plain)
+                        }
                     }
                 }
+                .padding(.horizontal, 3)
+                .padding(.bottom, 6)
             }
-            .padding(.horizontal, 3)
-            .padding(.bottom, 6)
+            .navigationDestination(for: RunDisplay.self) { run in
+                WatchRunKillView(run: run, account: account, onKilled: reload)
+            }
+            .containerBackground(Palette.ink.gradient, for: .navigation)
+            .task {
+                await reload()
+                // Screenshot / UI-check hook: open a run's kill screen from a launch arg.
+                if path.isEmpty, let id = LaunchArgs.value("-openRun"),
+                   let run = store.runs.first(where: { $0.id == id }) {
+                    path = [run]
+                }
+            }
+            .refreshable { await reload() }
         }
-        .containerBackground(Palette.ink.gradient, for: .navigation)
-        .task { await store.load(using: client, org: org, context: nil) }
-        .refreshable { await store.load(using: client, org: org, context: nil) }
+        .tint(Palette.mint)
+    }
+
+    private func reload() async {
+        await store.load(using: client, org: account.session.org, context: nil)
     }
 
     private var header: some View {
