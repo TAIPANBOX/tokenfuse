@@ -45,7 +45,7 @@ async fn send(
 #[tokio::test]
 async fn free_key_gets_402_plan_required_on_paid_reads() {
     let state = test_state();
-    for path in ["/v1/runs", "/v1/savings", "/v1/incidents"] {
+    for path in ["/v1/runs", "/v1/savings", "/v1/incidents", "/v1/compliance"] {
         let (status, v) = send(&state, "GET", path, "freekey", None).await;
         assert_eq!(
             status,

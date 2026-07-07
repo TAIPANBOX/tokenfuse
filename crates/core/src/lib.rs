@@ -2,9 +2,11 @@
 //! evaluation. Pure logic with no I/O — the gateway and future packs build on
 //! this. See `docs/02-architecture.md` for the design and ADRs.
 
+pub mod audit;
 pub mod backtest;
 pub mod breaker;
 pub mod cache;
+pub mod compliance;
 pub mod dlp;
 pub mod ledger;
 pub mod loops;
@@ -18,13 +20,18 @@ pub mod savings;
 pub mod secretbroker;
 pub mod taint;
 
+pub use audit::AuditEntry;
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};
 pub use breaker::{BreakerReason, BreakerVerdict};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
+pub use compliance::{
+    compute_compliance, compute_compliance_from_counts, ComplianceReport, ControlEvidence,
+    ControlMapping, Enforcement, CATALOG, DISCLAIMER, FRAMEWORK_VERSIONS,
+};
 pub use dlp::DlpMode;
 pub use ledger::{BudgetError, Ledger, Reservation, RunSnapshot};
 pub use loops::{AnomalyConfig, Growth, Window};
-pub use mcpreport::{Finding, ScanReport, Severity};
+pub use mcpreport::{to_sarif, Finding, ScanReport, Severity};
 pub use money::Microusd;
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
 pub use pricing::{ModelPrice, PriceBook, Usage};

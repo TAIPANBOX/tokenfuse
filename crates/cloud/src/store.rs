@@ -4,11 +4,12 @@
 //! (`Load`/`Save`/autosave) is added in a follow-up — see
 //! docs/14-mobile-companion.md, PR A3.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use tokenfuse_core::audit::{self, AuditEntry};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -291,8 +292,16 @@ struct Inner {
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
     savings: HashMap<String, SavingsAcc>,
+    /// org → wire `decision` string → total occurrences (persisted). Folded in
+    /// [`Store::ingest`] over EVERY record — including blocked ones, since a
+    /// block is compliance *evidence* (the guard fired), not spend. Feeds the
+    /// `/v1/compliance` evidence pack.
+    decision_counts: HashMap<String, HashMap<String, u64>>,
     /// org → incident id → aggregated incident (persisted)
     incidents: HashMap<String, HashMap<String, Incident>>,
+    /// org → append-only, hash-chained audit trail of control-plane mutations
+    /// (persisted). Oldest entry first; the tip is the last element.
+    audit: HashMap<String, Vec<AuditEntry>>,
     /// (org, "{kind}:{run_or_agent}") → recent trigger timestamps, bounded to
     /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
     /// threshold against (ephemeral — the `Incident` is the durable record).
@@ -323,7 +332,9 @@ struct SnapshotRef<'a> {
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
+    decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
+    audit: &'a HashMap<String, Vec<AuditEntry>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -340,10 +351,18 @@ struct SnapshotOwned {
     /// `savings()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
     savings: HashMap<String, SavingsAcc>,
+    /// Missing on pre-compliance snapshots — `default` loads empty, so
+    /// `decision_counts()` reports zeros until fresh telemetry accumulates.
+    #[serde(default)]
+    decision_counts: HashMap<String, HashMap<String, u64>>,
     /// Missing on pre-incident snapshots — `default` loads to no open
     /// incidents (incl. their `last_notified_millis` push-dedup clock).
     #[serde(default)]
     incidents: HashMap<String, HashMap<String, Incident>>,
+    /// Missing on pre-audit snapshots — `default` loads to empty chains, which
+    /// [`audit::verify_chain`] treats as intact.
+    #[serde(default)]
+    audit: HashMap<String, Vec<AuditEntry>>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -406,11 +425,16 @@ impl Store {
             {
                 let runs = inner.orgs.entry(org.to_string()).or_default();
                 let sav = inner.savings.entry(org.to_string()).or_default();
+                let dc = inner.decision_counts.entry(org.to_string()).or_default();
                 for r in records {
                     let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
+                    // Compliance evidence: count EVERY record's decision,
+                    // including blocked ones (a block is a guard firing, not
+                    // spend). `/v1/compliance` reads this per-org tally.
+                    *dc.entry(r.decision.clone()).or_insert(0) += 1;
                     // Blocked calls are stored and counted, but their
                     // cost_microusd (avoided spend, or 0 for security blocks)
                     // must not inflate the org's real spend total.
@@ -710,6 +734,32 @@ impl Store {
         }
     }
 
+    /// An org's per-`decision` occurrence tally (every ingested record's wire
+    /// `decision`, blocked or not). The compliance evidence pack projects the
+    /// control catalog against this. Empty for an org with no telemetry.
+    pub fn decision_counts(&self, org: &str) -> BTreeMap<String, u64> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .decision_counts
+            .get(org)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// An org's open incidents folded by `kind` (one count per distinct
+    /// incident, matching how `incidents()` aggregates them). Feeds the
+    /// incident evidence column of the compliance report.
+    pub fn incident_kind_counts(&self, org: &str) -> BTreeMap<String, u64> {
+        let inner = self.inner.read().unwrap();
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        if let Some(m) = inner.incidents.get(org) {
+            for inc in m.values() {
+                *out.entry(inc.kind.clone()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
     /// An org's open incidents, most-recently-seen first.
     pub fn incidents(&self, org: &str) -> Vec<Incident> {
         let inner = self.inner.read().unwrap();
@@ -753,6 +803,40 @@ impl Store {
             inner.dirty = true;
         }
         notify
+    }
+
+    /// Append a control-plane mutation to `org`'s tamper-evident audit chain,
+    /// linking it to the current tip and stamping it with the store's wall
+    /// clock. In-memory and infallible: callers log the action *after* the
+    /// mutation succeeds, and an append never fails the mutation.
+    pub fn audit_append(&self, org: &str, actor: &str, action: &str, subject: &str, detail: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
+        let chain = inner.audit.entry(org.to_string()).or_default();
+        let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
+        chain.push(entry);
+    }
+
+    /// `org`'s audit chain, oldest first (append order). Empty when the org has
+    /// logged no mutations.
+    pub fn audit(&self, org: &str) -> Vec<AuditEntry> {
+        self.inner
+            .read()
+            .unwrap()
+            .audit
+            .get(org)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Verify `org`'s audit chain end-to-end. `Ok(())` if intact (or empty);
+    /// `Err(index)` at the first broken link.
+    pub fn audit_verify(&self, org: &str) -> Result<(), usize> {
+        let inner = self.inner.read().unwrap();
+        match inner.audit.get(org) {
+            Some(chain) => audit::verify_chain(chain),
+            None => Ok(()),
+        }
     }
 
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
@@ -854,7 +938,9 @@ impl Store {
                 budgets: &inner.budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
+                decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
+                audit: &inner.audit,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -880,7 +966,9 @@ impl Store {
         inner.budgets = snap.budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
+        inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;
+        inner.audit = snap.audit;
         Ok(())
     }
 
@@ -1456,6 +1544,72 @@ mod tests {
     }
 
     #[test]
+    fn decision_counts_accumulate_and_persist() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-decisions.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                block_at("r1", "allow", 1000, 10),
+                block_at("r1", "budget_exceeded", 0, 20),
+                block_at("r2", "budget_exceeded", 0, 30),
+                block_at("r2", "loop_detected", 0, 40),
+                block_at("r3", "allow", 500, 50),
+            ],
+        );
+        // Every decision — blocked or not — is tallied.
+        let dc = s.decision_counts("acme");
+        assert_eq!(dc.get("allow").copied(), Some(2));
+        assert_eq!(dc.get("budget_exceeded").copied(), Some(2));
+        assert_eq!(dc.get("loop_detected").copied(), Some(1));
+        // Orgs are isolated.
+        assert!(s.decision_counts("other").is_empty());
+
+        s.save(&path).expect("save");
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let dc2 = s2.decision_counts("acme");
+        assert_eq!(dc2.get("budget_exceeded").copied(), Some(2));
+        assert_eq!(dc2.get("loop_detected").copied(), Some(1));
+
+        // An old snapshot with no `decision_counts` field loads to empty.
+        let old = dir.join(format!("tf-cloud-{}-olddc.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.decision_counts("acme").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn incident_kind_counts_fold_by_kind() {
+        let s = Store::new();
+        let now = 1_000_000;
+        // Three budget-protection blocks on one run trip a budget_exhausted.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        let counts = s.incident_kind_counts("acme");
+        assert_eq!(counts.get("budget_exhausted").copied(), Some(1));
+        assert!(s.incident_kind_counts("other").is_empty());
+    }
+
+    #[test]
     fn persistence_round_trip() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("tf-cloud-{}-persist.json", std::process::id()));
@@ -1494,6 +1648,54 @@ mod tests {
             .expect("missing file should be ok");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_chain_persists_and_verifies() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-audit.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.audit_append("acme", "key:abc123", "control.kill", "r1", "mode=hard");
+        s.audit_append(
+            "acme",
+            "key:abc123",
+            "control.set_budget",
+            "r1",
+            "budget_micros=2500000",
+        );
+        assert_eq!(s.audit("acme").len(), 2);
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+        s.save(&path).expect("save");
+
+        // Reload: the chain (and its integrity) survives a restart.
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let chain = s2.audit("acme");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].seq, 0);
+        assert_eq!(chain[0].action, "control.kill");
+        assert_eq!(chain[1].seq, 1);
+        assert_eq!(chain[1].action, "control.set_budget");
+        // The second entry links to the first's hash.
+        assert_eq!(chain[1].prev_hash, chain[0].entry_hash);
+        assert_eq!(s2.audit_verify("acme"), Ok(()));
+
+        // An old snapshot with no `audit` field loads to an empty (valid) chain.
+        let old = dir.join(format!("tf-cloud-{}-audit-old.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.audit("acme").is_empty());
+        assert_eq!(s3.audit_verify("acme"), Ok(()));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
     }
 
     #[test]
