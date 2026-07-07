@@ -1,0 +1,89 @@
+name: "TokenFuse mcp-scan"
+description: "Scan an MCP server for tool poisoning, rug-pulls, and unsafe exposure with tokenfuse mcp-scan, and fail CI on findings."
+author: "TAIPANBOX"
+
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  url:
+    description: "The MCP server endpoint to scan (Streamable HTTP or SSE)."
+    required: true
+  lock-path:
+    description: "Path to a rug-pull baseline lockfile, passed through as --lock. Leave unset to skip rug-pull diffing."
+    required: false
+    default: ""
+  fail-on:
+    description: "Minimum finding severity that fails the build (critical|high|medium|low|none). Passed through as --fail-on."
+    required: false
+    default: "high"
+  attempt-call:
+    description: "Set to 'true' to also attempt a live tools/call during the scan (--attempt-call). Only use against a server you own."
+    required: false
+    default: "false"
+  skip-exposure:
+    description: "Set to 'true' to skip the server-exposure checks (--skip-exposure)."
+    required: false
+    default: "false"
+  json-out:
+    description: "Path to write the machine-readable ScanReport JSON to (--json-out). Uploaded as a build artifact even on failure."
+    required: false
+    default: "scan.json"
+
+runs:
+  using: "composite"
+  steps:
+    # There is currently no published prebuilt Linux `tokenfuse` binary release
+    # asset — `.github/workflows/release.yml` only builds & pushes container
+    # images to ghcr.io (tokenfuse, tokenfuse:cluster, tokenfuse-control-plane,
+    # tokenfuse-dashboard), it does not attach a standalone binary to a GitHub
+    # Release. So this action builds from source for correctness in v1.
+    # TODO(PR6+): once release.yml publishes a linux binary release asset,
+    # switch this step to `curl -L` the pinned asset for this action's ref
+    # instead of compiling on every run.
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Build tokenfuse
+      shell: bash
+      run: cargo build --release -p tokenfuse-gateway
+    - name: Run mcp-scan
+      id: scan
+      shell: bash
+      # Inputs are passed via env, never interpolated directly into the script,
+      # so a hostile `url` (e.g. `"; rm -rf / #`) can't break out of the string
+      # and inject shell — `${{ }}` is substituted before bash runs, but a bash
+      # variable is expanded safely at runtime.
+      env:
+        SCAN_URL: ${{ inputs.url }}
+        SCAN_LOCK_PATH: ${{ inputs.lock-path }}
+        SCAN_FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_ATTEMPT_CALL: ${{ inputs.attempt-call }}
+        SCAN_SKIP_EXPOSURE: ${{ inputs.skip-exposure }}
+        SCAN_JSON_OUT: ${{ inputs.json-out }}
+      run: |
+        set +e
+        args=(mcp-scan --url "$SCAN_URL" --json-out "$SCAN_JSON_OUT" --fail-on "$SCAN_FAIL_ON")
+        if [ -n "$SCAN_LOCK_PATH" ]; then
+          args+=(--lock "$SCAN_LOCK_PATH")
+        fi
+        if [ "$SCAN_ATTEMPT_CALL" = "true" ]; then
+          args+=(--attempt-call)
+        fi
+        if [ "$SCAN_SKIP_EXPOSURE" = "true" ]; then
+          args+=(--skip-exposure)
+        fi
+        echo "Running: ./target/release/tokenfuse ${args[*]}"
+        ./target/release/tokenfuse "${args[@]}"
+        status=$?
+        echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+        exit $status
+    - name: Upload scan report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcp-scan-report
+        path: ${{ inputs.json-out }}
+        if-no-files-found: warn

@@ -99,6 +99,29 @@ sandboxing — none of which is implemented today because CLI self-scan has no
 SSRF elevation. See the doc comment at the top of
 `crates/core/src/mcpexposure.rs` for the full writeup.
 
+### CI: scan your MCP server on every PR
+
+The repo root ships a composite GitHub Action (`action.yml`) that runs
+`tokenfuse mcp-scan --url <endpoint>` in CI and fails the build when a
+finding meets or exceeds `--fail-on` (default `high`). It always uploads the
+`ScanReport` JSON as a build artifact, even when the scan fails, so a poisoned
+tool or a rug-pull diff is easy to inspect from the failed run.
+
+```yaml
+- uses: TAIPANBOX/tokenfuse@main   # pin to a tag/SHA in production
+  with:
+    url: https://mcp.example.com/rpc
+    fail-on: high                  # critical|high|medium|low|none
+    # lock-path: .mcp-scan.lock.json   # rug-pull baseline, if you keep one
+    # attempt-call: "true"             # only for a server you own
+```
+
+`attempt-call` makes the scanner issue a live `tools/call`, not just
+`tools/list` — only set it against a server you own, for the same reason the
+CLI itself is self-scan-only (see above). See
+`.github/workflows/mcp-scan-example.yml` in this repo for a full,
+copy-pasteable `workflow_dispatch` template.
+
 ## Not yet (follow-ups)
 
 - Spawning a **child stdio MCP server** (today the broker forwards to an HTTP
