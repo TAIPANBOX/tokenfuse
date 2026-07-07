@@ -21,9 +21,10 @@ const NONCE_CAP: usize = 4096;
 /// not persisted — historical analytics live in the gateway's Parquet sink).
 const SERIES_CAP: usize = 100_000;
 
-/// Whether a call record represents a blocked decision. Gateways currently only
-/// ingest settled calls (`allow`/`cache_hit`); anything else is reserved for
-/// future block telemetry.
+/// Whether a call record represents a blocked decision (as opposed to a
+/// settled call: `allow`/`cache_hit`). Blocked records are still stored and
+/// counted, but their `cost_microusd` — an avoided-spend estimate, or 0 for
+/// security blocks — must never be summed into real spend (see `ingest`).
 fn is_blocked(decision: &str) -> bool {
     !matches!(decision, "allow" | "cache_hit")
 }
@@ -229,7 +230,12 @@ impl Store {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
-                    agg.spent_microusd += r.cost_microusd;
+                    // Blocked calls are stored and counted, but their
+                    // cost_microusd (avoided spend, or 0 for security blocks)
+                    // must not inflate the org's real spend total.
+                    if !is_blocked(&r.decision) {
+                        agg.spent_microusd += r.cost_microusd;
+                    }
                     agg.calls += 1;
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
@@ -647,6 +653,7 @@ mod tests {
     fn rec(run: &str, cost: i64) -> CallRecord {
         CallRecord {
             run_id: run.into(),
+            decision: "allow".into(),
             cost_microusd: cost,
             ..Default::default()
         }
@@ -703,6 +710,61 @@ mod tests {
         assert_eq!(sum.spent_microusd, 1500);
     }
 
+    /// A blocked record's `cost_microusd` (avoided-spend estimate, or 0 for
+    /// security blocks) must be counted/stored but never summed into real
+    /// spend — see `Store::ingest`'s `is_blocked` gate.
+    #[test]
+    fn ingest_excludes_blocked_spend_from_totals() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 1000,
+                    step: 1,
+                    ts_millis: 100,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 750_000, // avoided estimate — not real spend
+                    step: 2,
+                    ts_millis: 200,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "taint_blocked".into(),
+                    cost_microusd: 0,
+                    step: 3,
+                    ts_millis: 300,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let runs = s.runs("acme");
+        assert_eq!(runs.len(), 1);
+        let r1 = &runs[0];
+        // Only the "allow" record's cost counts toward spend.
+        assert_eq!(r1.spent_microusd, 1000);
+        // But every record — blocked or not — is counted and moves `steps`.
+        assert_eq!(r1.calls, 3);
+        assert_eq!(r1.steps, 3);
+        assert_eq!(r1.last_seen, 300);
+
+        let sum = s.summary("acme");
+        assert_eq!(sum.runs, 1);
+        assert_eq!(sum.calls, 3);
+        assert_eq!(sum.spent_microusd, 1000);
+    }
+
     #[test]
     fn orgs_are_isolated() {
         let s = Store::new();
@@ -747,6 +809,7 @@ mod tests {
             &[CallRecord {
                 run_id: "r1".into(),
                 model: "claude".into(),
+                decision: "allow".into(),
                 cost_microusd: 1500,
                 step: 2,
                 ts_millis: 100,
@@ -787,6 +850,7 @@ mod tests {
     fn rec_at(run: &str, cost: i64, ts: i64) -> CallRecord {
         CallRecord {
             run_id: run.into(),
+            decision: "allow".into(),
             cost_microusd: cost,
             ts_millis: ts,
             ..Default::default()

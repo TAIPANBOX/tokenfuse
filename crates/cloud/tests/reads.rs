@@ -88,6 +88,43 @@ async fn ingest_then_query_runs_and_summary() {
 }
 
 #[tokio::test]
+async fn ingest_excludes_blocked_spend_from_summary() {
+    let (state, _store) = test_state();
+
+    // A mix of one settled call and one blocked call (avoided-spend estimate)
+    // for the same run. The blocked call must be stored and counted, but its
+    // cost must not inflate spend.
+    let payload = r#"{"records":[
+        {"ts_millis":10,"run_id":"run-y","model":"claude","decision":"allow","cost_microusd":2000,"step":1},
+        {"ts_millis":20,"run_id":"run-y","model":"claude","decision":"budget_exceeded","cost_microusd":500000,"step":2}
+    ]}"#;
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer devkey")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (status, v) = get(&state, "/v1/runs", Some("devkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = v.as_array().expect("runs is an array");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run_id"], "run-y");
+    // Only the allow record's cost counts — the blocked one is excluded.
+    assert_eq!(runs[0]["spent_microusd"], 2000);
+
+    let (_, s) = get(&state, "/v1/summary", Some("devkey")).await;
+    assert_eq!(s["runs"], 1);
+    // Both calls are still counted.
+    assert_eq!(s["calls"], 2);
+    assert_eq!(s["spent_microusd"], 2000);
+}
+
+#[tokio::test]
 async fn alerts_only_fire_over_threshold() {
     let (state, store) = test_state();
     // Budget r-hot at $1, r-cool at $10; spend $0.90 on each.
@@ -98,12 +135,14 @@ async fn alerts_only_fire_over_threshold() {
         &[
             CallRecord {
                 run_id: "r-hot".into(),
+                decision: "allow".into(),
                 cost_microusd: 900_000,
                 step: 1,
                 ..Default::default()
             },
             CallRecord {
                 run_id: "r-cool".into(),
+                decision: "allow".into(),
                 cost_microusd: 900_000,
                 step: 1,
                 ..Default::default()

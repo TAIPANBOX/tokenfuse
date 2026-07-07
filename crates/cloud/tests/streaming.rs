@@ -50,8 +50,8 @@ async fn series_sums_match_the_summary() {
     // Ingest two calls stamped ~now, over HTTP.
     let payload = format!(
         r#"{{"records":[
-            {{"run_id":"r1","cost_microusd":1000,"ts_millis":{now}}},
-            {{"run_id":"r1","cost_microusd":500,"ts_millis":{ts2}}}
+            {{"run_id":"r1","decision":"allow","cost_microusd":1000,"ts_millis":{now}}},
+            {{"run_id":"r1","decision":"allow","cost_microusd":500,"ts_millis":{ts2}}}
         ]}}"#,
         ts2 = now - 1000
     );
