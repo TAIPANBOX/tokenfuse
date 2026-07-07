@@ -4,9 +4,11 @@
 
 # TokenFuse
 
-### The runtime firewall for AI agents: enforce budgets, stop runaways, keep secrets out of the model.
+### The runtime kill-switch for AI agents: cap their spend, stop runaway loops before they bill you.
 
-**Observability shows you the fire. TokenFuse is the automatic fire extinguisher.**
+**A proxy you drop in front of every LLM call — it also blocks poisoned MCP tools and keeps secrets out of the model.**
+
+> The kill-switch isn't just an API call — it's signed on-device by your iPhone's Secure Enclave, so a stolen API token alone can't stop (or fake-stop) your agents.
 
 ![release](https://img.shields.io/badge/release-v0.3.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
@@ -212,6 +214,7 @@ There are excellent tools *around* this problem. None of them sit in the request
 | **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
 | **Enforce: stop before the damage** | ✅ | ❌ | ⚠️ key caps only | ⚠️ content only |
 | Live kill-switch (from Slack / dashboard) | ✅ | ❌ | ❌ | ❌ |
+| Hardware-signed kill (Secure Enclave) | ✅ | ❌ | ❌ | ❌ |
 | **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ |
 | Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial |
 | Shadow-agent discovery (eBPF) | ✅ | ❌ | ❌ | ❌ |
@@ -244,11 +247,11 @@ Everything below is **implemented and shipped in v0.3.0** (see [PROGRESS.md](PRO
 **Cost & control**
 - 💰 **Per-run budgets**: a hard cap for a whole task, with hierarchical roll-up so a sub-agent's spend counts against its parent.
 - 🔁 **Loop / runaway detection**: identical-call, ping-pong, and context-growth detectors.
-- 🛑 **Kill-switch**: hard-stop a run from the API, the `tokenfuse top` TUI, Slack, or the Cloud dashboard.
+- 🛑 **Breaker**: hard-stop a run (kill-switch) from the API, the `tokenfuse top` TUI, Slack, or the Cloud dashboard.
 - 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed; **backtest** them over past traffic.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
 
-**Security (agent runtime firewall)**
+**Also hardens your agents**
 - 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
 - 🕵️ **DLP**: detect/redact secrets leaving in prompts.
 - 🔑 **MCP credential-broker** + tool-poisoning / rug-pull scanner.
@@ -357,6 +360,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
 | **Run** | One complete agent task, start to finish, possibly hundreds of LLM calls. |
 | **Runaway** | An agent stuck looping or exploding in cost; the thing TokenFuse stops. |
+| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit — exposed as a kill-switch across API, TUI, Slack, Cloud, and the signed mobile control. |
 | **Proxy** | A middleman in the request path. You point your agent at it instead of the provider. |
 | **MCP** | A standard for agents to call external tools/servers; powerful, and a new security surface. |
 | **Prompt injection** | A hidden instruction smuggled into data the agent reads, hijacking its behavior. |
@@ -373,7 +377,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **What if TokenFuse goes down?** It's **fail-open**: traffic keeps flowing. For the opposite guarantee (never losing a budget), run the raft **HA cluster**.
 
-**Is it free?** The core is **open source (Apache-2.0)**. A hosted Cloud and advanced packs are the intended paid tiers.
+**Is it free?** The CLI and local proxy are **free forever** (open source, Apache-2.0, self-host — no seat limits, no time limit). The hosted **Cloud** (fleet-wide dashboard, Slack/mobile kill-switch, central budgets across many gateways) is a paid plan billed at a **flat monthly rate for unlimited seats**, not per-seat or a percentage of spend. Exact pricing isn't finalized yet.
 
 **Is it production-ready?** It's a young v0.3.0: functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
 

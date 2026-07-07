@@ -3,6 +3,7 @@
 //! this. See `docs/02-architecture.md` for the design and ADRs.
 
 pub mod backtest;
+pub mod breaker;
 pub mod cache;
 pub mod dlp;
 pub mod ledger;
@@ -15,6 +16,7 @@ pub mod secretbroker;
 pub mod taint;
 
 pub use backtest::{backtest, BacktestPolicy, BacktestReport};
+pub use breaker::{BreakerReason, BreakerVerdict};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
 pub use dlp::DlpMode;
 pub use ledger::{BudgetError, Ledger, Reservation, RunSnapshot};
