@@ -29,13 +29,10 @@ One brand, one binary, one installation
               Parquet+DataFusion · OTel
 ```
 
-- One installation, one binary, one brand. Packs are enabled via config/license key, not separate downloads.
-- The core is always free (OSS Apache-2.0): interception, ledger, basic budgets. The adoption engine.
-- Pack monetization:
-  - FinOps + Cache → Team tier (the cache pays for itself).
-  - Security (taint, MCP broker, DLP) → Enterprise tier (bought by security teams with a different budget).
-  - Data/RAG → a separate upsell.
-- The roadmap doesn't change — the rings just get commercial packaging: Ring 1 = Cache, Ring 3 = Security, Ring 2 = Data.
+- One installation, one binary, one brand. Packs are enabled via config, not separate downloads.
+- The CLI + local proxy are always free (OSS Apache-2.0), **all packs included**: interception, ledger, budgets, FinOps/Breaker, cache, security (taint, MCP broker, DLP), data/RAG. The adoption engine.
+- Billing lives at the Cloud level, not per-pack: **flat monthly price, unlimited seats** (Aikido-style) for the hosted fleet dashboard, kill-switch, and central budgets. Not usage-based, not a % of spend, not priced per capability pack.
+- The roadmap doesn't change — the rings just get product packaging, not separate pricing: Ring 1 = Cache, Ring 3 = Security, Ring 2 = Data.
 
 ## Technical Form
 

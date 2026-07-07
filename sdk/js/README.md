@@ -27,7 +27,10 @@ const client = new Anthropic({
 
 When a run exceeds its budget (or trips a policy/loop/kill), the gateway returns
 `402` with a stable JSON error contract (`budget_exceeded`, `loop_detected`,
-`policy_violation`, `killed`, …) — inspect the response status/body.
+`policy_violation`, `killed`, `wasm_policy`, …) — inspect the response status/body.
+Two additional block types return `403` instead of `402`: `dlp_blocked` (a
+secret was found in the outgoing prompt) and `taint_blocked` (the model asked
+for a capability denied under the run's taint).
 
 ## API
 

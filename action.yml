@@ -1,0 +1,211 @@
+name: "TokenFuse mcp-scan"
+description: "Scan an MCP server for tool poisoning, rug-pulls, and unsafe exposure with tokenfuse mcp-scan, and fail CI on findings."
+author: "TAIPANBOX"
+
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  url:
+    description: "The MCP server endpoint to scan (Streamable HTTP or SSE)."
+    required: true
+  lock-path:
+    description: "Path to a rug-pull baseline lockfile, passed through as --lock. Leave unset to skip rug-pull diffing."
+    required: false
+    default: ""
+  fail-on:
+    description: "Minimum finding severity that fails the build (critical|high|medium|low|none). Passed through as --fail-on."
+    required: false
+    default: "high"
+  attempt-call:
+    description: "Set to 'true' to also attempt a live tools/call during the scan (--attempt-call). Only use against a server you own."
+    required: false
+    default: "false"
+  skip-exposure:
+    description: "Set to 'true' to skip the server-exposure checks (--skip-exposure)."
+    required: false
+    default: "false"
+  json-out:
+    description: "Path to write the machine-readable ScanReport JSON to (--json-out). Uploaded as a build artifact even on failure."
+    required: false
+    default: "scan.json"
+  github-token:
+    description: "Token used to post/update the PR summary comment (pull_request events only). Needs `pull-requests: write` on the calling workflow."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: "composite"
+  steps:
+    # There is currently no published prebuilt Linux `tokenfuse` binary release
+    # asset — `.github/workflows/release.yml` only builds & pushes container
+    # images to ghcr.io (tokenfuse, tokenfuse:cluster, tokenfuse-control-plane,
+    # tokenfuse-dashboard), it does not attach a standalone binary to a GitHub
+    # Release. So this action builds from source for correctness in v1.
+    # TODO(PR6+): once release.yml publishes a linux binary release asset,
+    # switch this step to `curl -L` the pinned asset for this action's ref
+    # instead of compiling on every run.
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    - name: Build tokenfuse
+      shell: bash
+      run: cargo build --release -p tokenfuse-gateway
+    - name: Run mcp-scan
+      id: scan
+      shell: bash
+      # Inputs are passed via env, never interpolated directly into the script,
+      # so a hostile `url` (e.g. `"; rm -rf / #`) can't break out of the string
+      # and inject shell — `${{ }}` is substituted before bash runs, but a bash
+      # variable is expanded safely at runtime.
+      env:
+        SCAN_URL: ${{ inputs.url }}
+        SCAN_LOCK_PATH: ${{ inputs.lock-path }}
+        SCAN_FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_ATTEMPT_CALL: ${{ inputs.attempt-call }}
+        SCAN_SKIP_EXPOSURE: ${{ inputs.skip-exposure }}
+        SCAN_JSON_OUT: ${{ inputs.json-out }}
+      run: |
+        set +e
+        args=(mcp-scan --url "$SCAN_URL" --json-out "$SCAN_JSON_OUT" --fail-on "$SCAN_FAIL_ON")
+        if [ -n "$SCAN_LOCK_PATH" ]; then
+          args+=(--lock "$SCAN_LOCK_PATH")
+        fi
+        if [ "$SCAN_ATTEMPT_CALL" = "true" ]; then
+          args+=(--attempt-call)
+        fi
+        if [ "$SCAN_SKIP_EXPOSURE" = "true" ]; then
+          args+=(--skip-exposure)
+        fi
+        echo "Running: ./target/release/tokenfuse ${args[*]}"
+        ./target/release/tokenfuse "${args[@]}"
+        status=$?
+        echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+        exit $status
+    - name: Comment scan summary on PR
+      if: always() && github.event_name == 'pull_request'
+      # Best-effort: a missing `pull-requests: write` permission on the
+      # calling workflow, or a transient API error, must never turn an
+      # otherwise-passing scan into a failed job. The `Run mcp-scan` step's
+      # own exit code remains the sole source of truth for pass/fail.
+      continue-on-error: true
+      uses: actions/github-script@v7
+      env:
+        SCAN_JSON_OUT: ${{ inputs.json-out }}
+        SCAN_FAIL_ON: ${{ inputs.fail-on }}
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+
+          // Env vars, not `${{ }}` interpolation, so nothing from the report
+          // path/threshold/exit-code strings can be read as script source.
+          const jsonOut = process.env.SCAN_JSON_OUT;
+          const failOn = process.env.SCAN_FAIL_ON;
+          const exitCode = process.env.SCAN_EXIT_CODE;
+          const marker = '<!-- tokenfuse-mcp-scan -->';
+
+          const severityEmoji = {
+            critical: '🟣',
+            high: '🔴',
+            medium: '🟠',
+            low: '🟡',
+            info: '⚪',
+          };
+
+          let body;
+          let report = null;
+          try {
+            report = JSON.parse(fs.readFileSync(jsonOut, 'utf8'));
+          } catch (err) {
+            body = [
+              marker,
+              '### 🛡️ TokenFuse mcp-scan',
+              '',
+              `Could not read the scan report at \`${jsonOut}\`: ${err.message}`,
+              '',
+              `_fail-on threshold: \`${failOn}\` · scan exit code: \`${exitCode}\`_`,
+            ].join('\n');
+          }
+
+          if (report) {
+            const findings = Array.isArray(report.findings) ? report.findings : [];
+            const summary = report.summary || {};
+            const order = ['critical', 'high', 'medium', 'low', 'info'];
+
+            const summaryLine = order
+              .filter((sev) => summary[sev])
+              .map((sev) => `${severityEmoji[sev] || ''} **${summary[sev]}** ${sev}`)
+              .join(' · ') || 'No findings.';
+
+            const lines = [
+              marker,
+              '### 🛡️ TokenFuse mcp-scan',
+              '',
+              `**Tools scanned:** ${report.tool_count ?? 'n/a'}`,
+              '',
+              summaryLine,
+            ];
+
+            if (findings.length > 0) {
+              const cap = 20;
+              lines.push('', '| kind | severity | tool | message |', '| --- | --- | --- | --- |');
+              for (const f of findings.slice(0, cap)) {
+                const kind = String(f.kind ?? '').replace(/\|/g, '\\|');
+                const severity = `${severityEmoji[f.severity] || ''} ${f.severity ?? ''}`.trim();
+                const tool = String(f.tool ?? '—').replace(/\|/g, '\\|');
+                const message = String(f.message ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+                lines.push(`| ${kind} | ${severity} | ${tool} | ${message} |`);
+              }
+              if (findings.length > cap) {
+                lines.push('', `_…and ${findings.length - cap} more finding(s) — see the \`mcp-scan-report\` build artifact for the full JSON._`);
+              }
+            }
+
+            const failed = exitCode !== '0';
+            lines.push(
+              '',
+              `_fail-on threshold: \`${failOn}\` · scan ${failed ? '**failed the build**' : 'passed'} (exit code \`${exitCode}\`)_`,
+            );
+            body = lines.join('\n');
+          }
+
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+
+          const comments = await github.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number,
+            per_page: 100,
+          });
+          // Match on the marker alone (not on comment author) so this still
+          // upserts correctly when the caller supplies a PAT instead of the
+          // default `github-actions[bot]` token.
+          const existing = comments.data.find((c) => c.body && c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+          }
+    - name: Upload scan report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcp-scan-report
+        path: ${{ inputs.json-out }}
+        if-no-files-found: warn

@@ -1,0 +1,44 @@
+# EXAMPLE / TEMPLATE — not part of this repo's CI.
+#
+# TokenFuse itself has no MCP server for this workflow to scan, so this file
+# is `workflow_dispatch`-only: it never fires on push/PR and cannot break
+# this repo's CI. It exists purely as a copy-paste starting point for a
+# downstream repo that runs an MCP server and wants `tokenfuse mcp-scan` to
+# gate its pull requests.
+#
+# To use in your own repo:
+#   1. Copy this file into `.github/workflows/`.
+#   2. Change `on:` to `pull_request` (or whatever trigger fits your repo).
+#   3. Replace `url` below with your MCP server's endpoint.
+#   4. Replace `uses: ./` with `uses: TAIPANBOX/tokenfuse@main` (pin to a
+#      tag/SHA in production).
+#
+# `permissions` below grants `pull-requests: write` — required for the
+# action's PR-comment step (posts/updates a scan-summary comment on the pull
+# request). Drop it (or leave it at the default `read`) if you don't want
+# that comment; the scan and its pass/fail gate work fine without it, the
+# comment step is best-effort (`continue-on-error: true`) and simply no-ops
+# without the permission.
+
+name: mcp-scan-example
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  scan:
+    name: scan MCP server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan MCP server
+        uses: ./
+        with:
+          url: "https://mcp.example.com/rpc"
+          fail-on: high
+          # attempt-call: "true"   # only for a server you own — see docs
+          # lock-path: ".mcp-scan.lock.json"

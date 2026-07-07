@@ -2,7 +2,7 @@ import "./globals.css";
 
 export const metadata = {
   title: "TokenFuse Cloud",
-  description: "Single pane of glass across your TokenFuse gateways",
+  description: "Enforce budgets and pull the Breaker across every TokenFuse gateway.",
 };
 
 export default function RootLayout({

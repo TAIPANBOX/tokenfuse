@@ -84,6 +84,67 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
   speaks newline-delimited JSON-RPC on stdin/stdout for MCP clients that launch a
   server as a subprocess; logs go to stderr. Both transports share `process()`.
 
+## Related: `mcp-scan --url` exposure checks
+
+`tokenfuse mcp-scan --url <endpoint>` (separate from the broker above) adds
+server-exposure checks on top of the poisoning/rug-pull scan: unauthenticated
+`tools/list`/`tools/call` reachability, plaintext transport, wildcard CORS,
+and SSRF-capable tool detection (`tokenfuse-core::mcpexposure`). **This
+scanner is CLI-first** — built to run against a server you own, from your own
+machine. If a hosted "paste a URL, we'll scan it" service is ever built on
+top of it, the scanner becomes an SSRF oracle and MUST add resolve-then-pin
+IP validation (deny-list loopback/RFC1918/link-local/cloud-metadata
+addresses), no cross-boundary redirect following, and per-tenant egress
+sandboxing — none of which is implemented today because CLI self-scan has no
+SSRF elevation. See the doc comment at the top of
+`crates/core/src/mcpexposure.rs` for the full writeup.
+
+### CI: scan your MCP server on every PR
+
+The repo root ships a composite GitHub Action (`action.yml`) that runs
+`tokenfuse mcp-scan --url <endpoint>` in CI and fails the build when a
+finding meets or exceeds `--fail-on` (default `high`). It always uploads the
+`ScanReport` JSON as a build artifact, even when the scan fails, so a poisoned
+tool or a rug-pull diff is easy to inspect from the failed run.
+
+On `pull_request` runs it also posts (and, on re-runs, updates in place — no
+comment spam) a markdown summary comment on the PR: severity counts, a table
+of findings (kind/severity/tool/message, capped to ~20 rows), and the
+`--fail-on` threshold + pass/fail outcome. That step is best-effort
+(`continue-on-error: true`): it needs `pull-requests: write` on the *calling*
+workflow (not just this action), and if that permission is missing or the
+GitHub API hiccups, it silently no-ops rather than failing the job — the
+scan's own exit code is always the real pass/fail signal.
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write   # needed for the PR-comment summary step
+
+steps:
+  - uses: TAIPANBOX/tokenfuse@main   # pin to a tag/SHA in production
+    with:
+      url: https://mcp.example.com/rpc
+      fail-on: high                  # critical|high|medium|low|none
+      # lock-path: .mcp-scan.lock.json   # rug-pull baseline, if you keep one
+      # attempt-call: "true"             # only for a server you own
+      # github-token: ${{ secrets.GITHUB_TOKEN }}   # defaults to github.token
+```
+
+`attempt-call` makes the scanner issue a live `tools/call`, not just
+`tools/list` — only set it against a server you own, for the same reason the
+CLI itself is self-scan-only (see above). See
+`.github/workflows/mcp-scan-example.yml` in this repo for a full,
+copy-pasteable `workflow_dispatch` template (it also shows the
+`pull-requests: write` permission for the PR-comment step).
+
+## Demo: see a rug pull caught live
+
+[docs/17 · Rug-pull demo](17-rugpull-demo.md) — `cargo run --example
+rugpull_demo -p tokenfuse-gateway` runs the pin-then-diff rug-pull check
+above against a self-contained in-process stub server, end to end, printing
+the `⛔ RUG PULL` / `Critical` output described in this doc.
+
 ## Not yet (follow-ups)
 
 - Spawning a **child stdio MCP server** (today the broker forwards to an HTTP
