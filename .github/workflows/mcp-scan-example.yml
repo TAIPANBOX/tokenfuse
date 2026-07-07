@@ -12,11 +12,22 @@
 #   3. Replace `url` below with your MCP server's endpoint.
 #   4. Replace `uses: ./` with `uses: TAIPANBOX/tokenfuse@main` (pin to a
 #      tag/SHA in production).
+#
+# `permissions` below grants `pull-requests: write` — required for the
+# action's PR-comment step (posts/updates a scan-summary comment on the pull
+# request). Drop it (or leave it at the default `read`) if you don't want
+# that comment; the scan and its pass/fail gate work fine without it, the
+# comment step is best-effort (`continue-on-error: true`) and simply no-ops
+# without the permission.
 
 name: mcp-scan-example
 
 on:
   workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   scan:

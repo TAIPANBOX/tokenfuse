@@ -60,8 +60,9 @@ const MUTATION_VERBS: &[&str] = &[
 ];
 
 /// Is `host` a loopback or private-range literal (`localhost`, `127.0.0.1`,
-/// `::1`, RFC1918 `10.*` / `172.16-31.*` / `192.168.*`, or link-local
-/// `169.254.*` / `fe80::*`)? Pure string/number parsing — no DNS lookup, so a
+/// `::1`, RFC1918 `10.*` / `172.16-31.*` / `192.168.*`, link-local
+/// `169.254.*` / `fe80::*`, or IPv6 unique-local `fc00::/7`)? Pure string/number
+/// parsing — no DNS lookup, so a
 /// hostname that merely *resolves* to a private address (which this PR
 /// can't know without a lookup) is *not* classified as local here; see the
 /// module doc and the follow-up "public bind" heuristic for that case.
@@ -77,6 +78,11 @@ pub fn host_is_local(host: &str) -> bool {
         return true;
     }
     if h.starts_with("fe80:") {
+        return true;
+    }
+    // IPv6 unique-local (fc00::/7 → fc.. / fd..). Require a ':' so a hostname
+    // like "fc-barcelona.com" is not misread as an IPv6 literal.
+    if h.contains(':') && (h.starts_with("fc") || h.starts_with("fd")) {
         return true;
     }
 
@@ -340,6 +346,17 @@ mod tests {
         assert!(!host_is_local("192.169.1.1"));
         assert!(host_is_local("169.254.1.1"));
         assert!(host_is_local("fe80::1"));
+    }
+
+    #[test]
+    fn host_is_local_ipv6_unique_local() {
+        // fc00::/7 (fc.. / fd..) unique-local addresses are local.
+        assert!(host_is_local("fd00::1"));
+        assert!(host_is_local("fc00::1"));
+        // A hostname that merely starts with "fc"/"fd" but has no ':' is not
+        // an IPv6 literal and must not be misclassified as local.
+        assert!(!host_is_local("fc-barcelona.com"));
+        assert!(!host_is_local("fdanythingnocolon.com"));
     }
 
     #[test]
