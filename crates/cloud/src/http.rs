@@ -23,6 +23,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -44,7 +45,8 @@ use crate::store::{
     ),
     paths(
         ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        incidents, ack_incident, pair_new, pair, register_apns, register_activity,
+        incidents, ack_incident, audit, audit_verify, pair_new, pair, register_apns,
+        register_activity,
     ),
     components(schemas(
         CallRecord,
@@ -55,6 +57,8 @@ use crate::store::{
         Alert,
         SeriesBucket,
         Incident,
+        AuditEntrySchema,
+        AuditVerifyResponse,
         IngestBody,
         IngestResponse,
         BudgetBody,
@@ -189,25 +193,35 @@ impl AppState {
     /// Authorize a mutation. Two accepted paths:
     /// 1. an **admin org key** (dashboard/CLI) — no signature; or
     /// 2. a **paired admin device** with a valid Enclave signature.
+    ///
+    /// Returns the org **and** a stable, non-secret [`Mutator::actor`] id for the
+    /// audit trail — captured here, where the principal is known exactly, so the
+    /// wired mutation sites never re-parse the credential.
     fn authorize_mutation(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
         headers: &HeaderMap,
-    ) -> Result<String, AuthError> {
+    ) -> Result<Mutator, AuthError> {
         let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
         if let Some(p) = self.keys.get(token) {
             if p.role != "admin" {
                 return Err(AuthError::Forbidden);
             }
-            return Ok(p.org.clone());
+            return Ok(Mutator {
+                org: p.org.clone(),
+                actor: key_actor(token),
+            });
         }
         let device = self.verify_device_signature(method, path, body, headers)?;
         if device.role != "admin" {
             return Err(AuthError::Forbidden);
         }
-        Ok(device.org)
+        Ok(Mutator {
+            actor: format!("device:{}", device.device_id),
+            org: device.org,
+        })
     }
 
     /// Authorize a device managing **its own** state (APNs token, activities):
@@ -221,6 +235,15 @@ impl AppState {
     ) -> Result<Device, AuthError> {
         self.verify_device_signature(method, path, body, headers)
     }
+}
+
+/// The authenticated principal behind an authorized mutation: the org it acts
+/// on and a stable, non-secret `actor` id for the audit trail.
+struct Mutator {
+    org: String,
+    /// `key:<fingerprint>` for an admin org key, or `device:<id>` for a paired
+    /// admin device. Never the raw bearer secret.
+    actor: String,
 }
 
 /// A mutation authorization failure, small so it doesn't bloat handler `Result`s.
@@ -260,6 +283,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/budgets", get(budgets))
         .route("/v1/incidents", get(incidents))
         .route("/v1/incidents/{id}/ack", post(ack_incident))
+        .route("/v1/audit", get(audit))
+        .route("/v1/audit/verify", get(audit_verify))
         .route("/v1/pair/new", post(pair_new))
         .route("/v1/pair", post(pair))
         .route("/v1/devices/{id}/apns", post(register_apns))
@@ -391,6 +416,33 @@ struct ActivityBody {
 #[derive(Serialize, ToSchema)]
 struct OkResponse {
     ok: bool,
+}
+
+/// Result of an audit-chain integrity check. `ok` is `true` for an intact (or
+/// empty) chain; otherwise `break_index` is the 0-based position of the first
+/// broken link.
+#[derive(Serialize, ToSchema)]
+struct AuditVerifyResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    break_index: Option<usize>,
+}
+
+/// OpenAPI documentation mirror of `tokenfuse_core::audit::AuditEntry` — the
+/// `/v1/audit` handler returns the core type, which serializes identically. It
+/// lives here (rather than deriving `ToSchema` in core) to keep `tokenfuse-core`
+/// free of the web/OpenAPI `utoipa` dependency.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct AuditEntrySchema {
+    seq: u64,
+    ts_millis: i64,
+    actor: String,
+    action: String,
+    subject: String,
+    detail: String,
+    prev_hash: String,
+    entry_hash: String,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -615,14 +667,16 @@ async fn kill(
     uri: Uri,
     Path(run): Path<String>,
 ) -> Response {
-    let org = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
-        Ok(o) => o,
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+        Ok(m) => m,
         Err(e) => return e.into_response(),
     };
     if let Err(d) = gate(st.plan_for_org(&org), Feature::CrossFleetKill) {
         return plan_required(&org, d.feature);
     }
     st.store.kill(&org, &run);
+    st.store
+        .audit_append(&org, &actor, "control.kill", &run, "mode=hard");
     (StatusCode::OK, Json(KillResponse { killed: run })).into_response()
 }
 
@@ -665,8 +719,8 @@ async fn set_budget(
     Path(run): Path<String>,
     body: Bytes,
 ) -> Response {
-    let org = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-        Ok(o) => o,
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
         Err(e) => return e.into_response(),
     };
     if let Err(d) = gate(st.plan_for_org(&org), Feature::CentralBudgets) {
@@ -678,6 +732,13 @@ async fn set_budget(
     };
     let micros = (parsed.budget_usd * 1e6) as i64;
     st.store.set_budget(&org, &run, micros);
+    st.store.audit_append(
+        &org,
+        &actor,
+        "control.set_budget",
+        &run,
+        &format!("budget_micros={micros}"),
+    );
     (
         StatusCode::OK,
         Json(BudgetResponse {
@@ -745,18 +806,70 @@ async fn ack_incident(
     uri: Uri,
     Path(id): Path<String>,
 ) -> Response {
-    let org = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
-        Ok(o) => o,
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+        Ok(m) => m,
         Err(e) => return e.into_response(),
     };
     if let Err(d) = gate(st.plan_for_org(&org), Feature::Incidents) {
         return plan_required(&org, d.feature);
     }
     if st.store.ack_incident(&org, &id) {
+        st.store
+            .audit_append(&org, &actor, "control.incident_ack", &id, "");
         (StatusCode::OK, Json(AckResponse { acknowledged: id })).into_response()
     } else {
         error(StatusCode::NOT_FOUND, "unknown incident")
     }
+}
+
+/// The caller org's tamper-evident audit trail of control-plane mutations,
+/// oldest first. Readable by any role (like the other reads); a paid feature.
+#[utoipa::path(
+    get, path = "/v1/audit",
+    responses(
+        (status = 200, description = "audit chain, oldest first", body = Vec<AuditEntrySchema>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn audit(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+        return plan_required(&org, d.feature);
+    }
+    (StatusCode::OK, Json(st.store.audit(&org))).into_response()
+}
+
+/// Verify the caller org's audit chain end-to-end: `{ok:true}` when intact, else
+/// `{ok:false, break_index:N}` at the first broken link. A paid feature.
+#[utoipa::path(
+    get, path = "/v1/audit/verify",
+    responses(
+        (status = 200, description = "chain integrity", body = AuditVerifyResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn audit_verify(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+        return plan_required(&org, d.feature);
+    }
+    let body = match st.store.audit_verify(&org) {
+        Ok(()) => AuditVerifyResponse {
+            ok: true,
+            break_index: None,
+        },
+        Err(i) => AuditVerifyResponse {
+            ok: false,
+            break_index: Some(i),
+        },
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Issue a one-time pairing code (admin org key). The dashboard renders it as a
@@ -821,16 +934,29 @@ async fn pair(State(st): State<AppState>, body: Bytes) -> Response {
         req.name,
         req.platform,
     ) {
-        Some(dev) => (
-            StatusCode::OK,
-            Json(PairResponse {
-                device_id: dev.device_id,
-                org: dev.org,
-                role: dev.role,
-                device_token,
-            }),
-        )
-            .into_response(),
+        Some(dev) => {
+            // A new device joining the org is a control-plane change. The device
+            // self-redeemed (no bearer auth — the code was the credential), so
+            // the actor is the device itself; the admin authorization happened
+            // earlier at `pair/new`.
+            st.store.audit_append(
+                &dev.org,
+                &format!("device:{}", dev.device_id),
+                "control.pair",
+                &dev.device_id,
+                &format!("role={};platform={}", dev.role, dev.platform),
+            );
+            (
+                StatusCode::OK,
+                Json(PairResponse {
+                    device_id: dev.device_id,
+                    org: dev.org,
+                    role: dev.role,
+                    device_token,
+                }),
+            )
+                .into_response()
+        }
         None => error(StatusCode::BAD_REQUEST, "invalid or expired pairing code"),
     }
 }
@@ -920,6 +1046,20 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get("authorization")?.to_str().ok()?;
     let token = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
     (!token.is_empty()).then_some(token)
+}
+
+/// A stable, non-secret actor id for an API key: `key:` + the first 12 hex
+/// chars of `sha256(token)`. The raw key is a bearer *secret*, so it must never
+/// land in the audit trail; the fingerprint identifies *which* key acted
+/// without leaking it (and is stable across restarts).
+fn key_actor(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::from("key:");
+    for b in digest.iter().take(6) {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// A request header value as a `&str`, if present and valid UTF-8.

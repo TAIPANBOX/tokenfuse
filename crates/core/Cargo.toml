@@ -11,3 +11,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex = "1"
+# Hash-chained, tamper-evident audit trail (crates/core/src/audit.rs). Already a
+# transitive workspace dep (via crates/cloud); pinned here so core can hash the
+# chain without an I/O dependency.
+sha2 = "0.10"

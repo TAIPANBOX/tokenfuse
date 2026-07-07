@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+use tokenfuse_core::audit::{self, AuditEntry};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -293,6 +294,9 @@ struct Inner {
     savings: HashMap<String, SavingsAcc>,
     /// org → incident id → aggregated incident (persisted)
     incidents: HashMap<String, HashMap<String, Incident>>,
+    /// org → append-only, hash-chained audit trail of control-plane mutations
+    /// (persisted). Oldest entry first; the tip is the last element.
+    audit: HashMap<String, Vec<AuditEntry>>,
     /// (org, "{kind}:{run_or_agent}") → recent trigger timestamps, bounded to
     /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
     /// threshold against (ephemeral — the `Incident` is the durable record).
@@ -324,6 +328,7 @@ struct SnapshotRef<'a> {
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
+    audit: &'a HashMap<String, Vec<AuditEntry>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -344,6 +349,10 @@ struct SnapshotOwned {
     /// incidents (incl. their `last_notified_millis` push-dedup clock).
     #[serde(default)]
     incidents: HashMap<String, HashMap<String, Incident>>,
+    /// Missing on pre-audit snapshots — `default` loads to empty chains, which
+    /// [`audit::verify_chain`] treats as intact.
+    #[serde(default)]
+    audit: HashMap<String, Vec<AuditEntry>>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -755,6 +764,40 @@ impl Store {
         notify
     }
 
+    /// Append a control-plane mutation to `org`'s tamper-evident audit chain,
+    /// linking it to the current tip and stamping it with the store's wall
+    /// clock. In-memory and infallible: callers log the action *after* the
+    /// mutation succeeds, and an append never fails the mutation.
+    pub fn audit_append(&self, org: &str, actor: &str, action: &str, subject: &str, detail: &str) {
+        let mut inner = self.inner.write().unwrap();
+        inner.dirty = true;
+        let chain = inner.audit.entry(org.to_string()).or_default();
+        let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
+        chain.push(entry);
+    }
+
+    /// `org`'s audit chain, oldest first (append order). Empty when the org has
+    /// logged no mutations.
+    pub fn audit(&self, org: &str) -> Vec<AuditEntry> {
+        self.inner
+            .read()
+            .unwrap()
+            .audit
+            .get(org)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Verify `org`'s audit chain end-to-end. `Ok(())` if intact (or empty);
+    /// `Err(index)` at the first broken link.
+    pub fn audit_verify(&self, org: &str) -> Result<(), usize> {
+        let inner = self.inner.read().unwrap();
+        match inner.audit.get(org) {
+            Some(chain) => audit::verify_chain(chain),
+            None => Ok(()),
+        }
+    }
+
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
         {
@@ -855,6 +898,7 @@ impl Store {
                 devices: &inner.devices,
                 savings: &inner.savings,
                 incidents: &inner.incidents,
+                audit: &inner.audit,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -881,6 +925,7 @@ impl Store {
         inner.devices = snap.devices;
         inner.savings = snap.savings;
         inner.incidents = snap.incidents;
+        inner.audit = snap.audit;
         Ok(())
     }
 
@@ -1494,6 +1539,54 @@ mod tests {
             .expect("missing file should be ok");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_chain_persists_and_verifies() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-audit.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.audit_append("acme", "key:abc123", "control.kill", "r1", "mode=hard");
+        s.audit_append(
+            "acme",
+            "key:abc123",
+            "control.set_budget",
+            "r1",
+            "budget_micros=2500000",
+        );
+        assert_eq!(s.audit("acme").len(), 2);
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+        s.save(&path).expect("save");
+
+        // Reload: the chain (and its integrity) survives a restart.
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let chain = s2.audit("acme");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].seq, 0);
+        assert_eq!(chain[0].action, "control.kill");
+        assert_eq!(chain[1].seq, 1);
+        assert_eq!(chain[1].action, "control.set_budget");
+        // The second entry links to the first's hash.
+        assert_eq!(chain[1].prev_hash, chain[0].entry_hash);
+        assert_eq!(s2.audit_verify("acme"), Ok(()));
+
+        // An old snapshot with no `audit` field loads to an empty (valid) chain.
+        let old = dir.join(format!("tf-cloud-{}-audit-old.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.audit("acme").is_empty());
+        assert_eq!(s3.audit_verify("acme"), Ok(()));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
     }
 
     #[test]
