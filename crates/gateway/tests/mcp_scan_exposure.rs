@@ -54,7 +54,11 @@ fn unauthorized() -> Response {
         .expect("valid response")
 }
 
-async fn stub(State(cfg): State<StubConfig>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+async fn stub(
+    State(cfg): State<StubConfig>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Response {
     if cfg.require_auth && !headers.contains_key("authorization") {
         return unauthorized();
     }
@@ -122,7 +126,11 @@ async fn unauth_list_on_loopback_is_info_not_high() {
         .iter()
         .find(|f| f.kind == "exposure_unauth_list")
         .expect("expected an exposure_unauth_list finding");
-    assert_eq!(f.severity, Severity::Info, "loopback unauth server must be Info, not High");
+    assert_eq!(
+        f.severity,
+        Severity::Info,
+        "loopback unauth server must be Info, not High"
+    );
 }
 
 /// (b) A stub that 401s every request without an `authorization` header
@@ -195,7 +203,11 @@ async fn attempt_call_against_get_tool_succeeds_and_flags_critical() {
             tool: "get_status".to_string()
         }
     );
-    assert_eq!(*call_hits.lock().unwrap(), 1, "the stub's tools/call must have been hit exactly once");
+    assert_eq!(
+        *call_hits.lock().unwrap(),
+        1,
+        "the stub's tools/call must have been hit exactly once"
+    );
 
     let findings = exposure_findings(&outcome);
     let f = findings

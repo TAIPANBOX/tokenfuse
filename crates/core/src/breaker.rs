@@ -127,12 +127,18 @@ mod tests {
 
     #[test]
     fn wire_str_budget_exceeded() {
-        assert_eq!(BreakerReason::BudgetExceeded.as_wire_str(), "budget_exceeded");
+        assert_eq!(
+            BreakerReason::BudgetExceeded.as_wire_str(),
+            "budget_exceeded"
+        );
     }
 
     #[test]
     fn wire_str_policy_violation() {
-        assert_eq!(BreakerReason::PolicyViolation.as_wire_str(), "policy_violation");
+        assert_eq!(
+            BreakerReason::PolicyViolation.as_wire_str(),
+            "policy_violation"
+        );
     }
 
     #[test]

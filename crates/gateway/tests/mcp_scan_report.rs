@@ -91,14 +91,17 @@ fn poisoning_only_yields_high_max_severity() {
     ]});
     fs::write(&tools_path, poisoned.to_string()).unwrap();
 
-    let report = run(tools_path.to_str().unwrap(), None, false, OutputMode::Json, None)
-        .expect("run should succeed");
+    let report = run(
+        tools_path.to_str().unwrap(),
+        None,
+        false,
+        OutputMode::Json,
+        None,
+    )
+    .expect("run should succeed");
 
     assert_eq!(report.max_severity(), Some(Severity::High));
-    assert!(report
-        .findings
-        .iter()
-        .all(|f| f.severity <= Severity::High));
+    assert!(report.findings.iter().all(|f| f.severity <= Severity::High));
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -113,8 +116,14 @@ fn clean_server_yields_no_max_severity() {
     ]});
     fs::write(&tools_path, clean.to_string()).unwrap();
 
-    let report = run(tools_path.to_str().unwrap(), None, false, OutputMode::Human, None)
-        .expect("run should succeed");
+    let report = run(
+        tools_path.to_str().unwrap(),
+        None,
+        false,
+        OutputMode::Human,
+        None,
+    )
+    .expect("run should succeed");
 
     assert!(report.findings.is_empty());
     assert_eq!(report.max_severity(), None);

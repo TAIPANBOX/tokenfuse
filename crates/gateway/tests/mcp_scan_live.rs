@@ -116,9 +116,7 @@ async fn spawn_stub_ex(
         leading_notification,
     };
     let desc_handle = state.target_description.clone();
-    let router = Router::new()
-        .route("/", post(stub))
-        .with_state(state);
+    let router = Router::new().route("/", post(stub)).with_state(state);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move {

@@ -92,7 +92,10 @@ impl ScanReport {
     /// exposure findings don't change how many tools were scanned.
     pub fn push_findings(&mut self, extra: Vec<Finding>) {
         for f in extra {
-            *self.summary.entry(f.severity.as_str().to_string()).or_insert(0) += 1;
+            *self
+                .summary
+                .entry(f.severity.as_str().to_string())
+                .or_insert(0) += 1;
             self.findings.push(f);
         }
     }
@@ -263,15 +266,27 @@ mod tests {
         let report = ScanReport::from_scan(&tools, &[], &drift);
         assert_eq!(report.findings.len(), 3);
 
-        let changed = report.findings.iter().find(|f| f.tool.as_deref() == Some("a")).unwrap();
+        let changed = report
+            .findings
+            .iter()
+            .find(|f| f.tool.as_deref() == Some("a"))
+            .unwrap();
         assert_eq!(changed.kind, "rug_pull");
         assert_eq!(changed.severity, Severity::Critical);
 
-        let added = report.findings.iter().find(|f| f.tool.as_deref() == Some("b")).unwrap();
+        let added = report
+            .findings
+            .iter()
+            .find(|f| f.tool.as_deref() == Some("b"))
+            .unwrap();
         assert_eq!(added.kind, "new_tool");
         assert_eq!(added.severity, Severity::Medium);
 
-        let removed = report.findings.iter().find(|f| f.tool.as_deref() == Some("c")).unwrap();
+        let removed = report
+            .findings
+            .iter()
+            .find(|f| f.tool.as_deref() == Some("c"))
+            .unwrap();
         assert_eq!(removed.kind, "removed_tool");
         assert_eq!(removed.severity, Severity::Low);
 

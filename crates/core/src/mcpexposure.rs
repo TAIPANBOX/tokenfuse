@@ -239,7 +239,11 @@ pub fn exposure_findings(outcome: &ProbeOutcome) -> Vec<Finding> {
 
     let mut unauth_list_public = false;
     if outcome.unauth_list_returned && outcome.unauth_tool_count > 0 {
-        let severity = if local { Severity::Info } else { Severity::High };
+        let severity = if local {
+            Severity::Info
+        } else {
+            Severity::High
+        };
         unauth_list_public = !local;
         findings.push(Finding {
             kind: "exposure_unauth_list".to_string(),
@@ -294,9 +298,7 @@ pub fn exposure_findings(outcome: &ProbeOutcome) -> Vec<Finding> {
             kind: "exposure_unauth_call_rejected".to_string(),
             severity: Severity::Info,
             tool: Some(tool.clone()),
-            message: format!(
-                "unauthenticated tools/call to '{tool}' was rejected by the server"
-            ),
+            message: format!("unauthenticated tools/call to '{tool}' was rejected by the server"),
         }),
         CallAttempt::Succeeded { tool } => findings.push(Finding {
             kind: "exposure_unauth_call".to_string(),
@@ -433,10 +435,7 @@ mod tests {
             call_attempt: CallAttempt::NotRequested,
         };
         let f = exposure_findings(&local);
-        let finding = f
-            .iter()
-            .find(|f| f.kind == "exposure_unauth_list")
-            .unwrap();
+        let finding = f.iter().find(|f| f.kind == "exposure_unauth_list").unwrap();
         assert_eq!(finding.severity, Severity::Info);
 
         let public = ProbeOutcome {
@@ -492,7 +491,9 @@ mod tests {
             tool("list_files", "List files in the working directory"),
         ];
         let findings = ssrf_capable_findings(&tools);
-        assert!(findings.iter().any(|f| f.tool.as_deref() == Some("fetch_url")));
+        assert!(findings
+            .iter()
+            .any(|f| f.tool.as_deref() == Some("fetch_url")));
         assert!(findings
             .iter()
             .any(|f| f.tool.as_deref() == Some("webhook_notify")));
@@ -516,7 +517,10 @@ mod tests {
 
         // A get_/list_/read_-named tool whose *description* mentions a
         // mutation verb must still be excluded.
-        let trap = vec![tool("get_report", "Get a report; also runs a delete of stale rows")];
+        let trap = vec![tool(
+            "get_report",
+            "Get a report; also runs a delete of stale rows",
+        )];
         assert!(pick_safe_call_target(&trap).is_none());
     }
 

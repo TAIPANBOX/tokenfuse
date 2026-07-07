@@ -71,14 +71,21 @@ pub async fn fetch_tools_list(cfg: &McpClientConfig) -> Result<Value, McpClientE
     let mut session_id: Option<String> = None;
 
     // (a) initialize
-    let (init_resp, sid) = post_rpc(&client, cfg, &initialize_request(), session_id.as_deref()).await?;
+    let (init_resp, sid) =
+        post_rpc(&client, cfg, &initialize_request(), session_id.as_deref()).await?;
     let _ = init_resp; // handshake result body isn't needed beyond a successful round-trip
     if sid.is_some() {
         session_id = sid;
     }
 
     // (b) notifications/initialized — no id, no response body expected.
-    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
+    send_notification(
+        &client,
+        cfg,
+        &initialized_notification(),
+        session_id.as_deref(),
+    )
+    .await?;
 
     // (c) tools/list
     let tools_req = json!({
@@ -191,7 +198,9 @@ pub struct ToolsListProbe {
 /// status/headers alongside its body. The exposure probe calls this with a
 /// `cfg` whose `extra_headers` is empty, to test the unauthenticated path
 /// regardless of whatever auth the "normal" scan connection might carry.
-pub async fn fetch_tools_list_probe(cfg: &McpClientConfig) -> Result<ToolsListProbe, McpClientError> {
+pub async fn fetch_tools_list_probe(
+    cfg: &McpClientConfig,
+) -> Result<ToolsListProbe, McpClientError> {
     let client = build_client(cfg)?;
     let mut session_id: Option<String> = None;
 
@@ -199,7 +208,13 @@ pub async fn fetch_tools_list_probe(cfg: &McpClientConfig) -> Result<ToolsListPr
     if sid.is_some() {
         session_id = sid;
     }
-    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
+    send_notification(
+        &client,
+        cfg,
+        &initialized_notification(),
+        session_id.as_deref(),
+    )
+    .await?;
 
     let tools_req = json!({
         "jsonrpc": "2.0",
@@ -239,7 +254,13 @@ pub async fn probe_tools_call(
     if sid.is_some() {
         session_id = sid;
     }
-    send_notification(&client, cfg, &initialized_notification(), session_id.as_deref()).await?;
+    send_notification(
+        &client,
+        cfg,
+        &initialized_notification(),
+        session_id.as_deref(),
+    )
+    .await?;
 
     let call_req = json!({
         "jsonrpc": "2.0",

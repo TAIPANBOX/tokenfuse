@@ -166,7 +166,11 @@ fn build_scan_report(
 /// to `json_out`, if given. Split out of [`build_scan_report`] so
 /// [`run_live`] can merge exposure findings into the report before either
 /// happens.
-fn emit_report(report: &ScanReport, mode: OutputMode, json_out: Option<&str>) -> Result<(), String> {
+fn emit_report(
+    report: &ScanReport,
+    mode: OutputMode,
+    json_out: Option<&str>,
+) -> Result<(), String> {
     if mode == OutputMode::Json {
         let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
         println!("{json}");
