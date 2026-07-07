@@ -63,14 +63,33 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     let parent = header_str(&headers, "x-fuse-parent-run-id");
     st.ledger.open_run(&run_id, budget, parent.as_deref()).await;
 
+    // Attribution only: which logical agent made this call. Request-scoped like
+    // `model` — it rides along into every CallRecord and never touches the
+    // ledger/budget. Defaults to "" when the header is absent.
+    let agent_id = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
-        let spent = st
-            .ledger
-            .snapshot(&run_id)
-            .await
-            .map(|s| s.spent)
+        let snap = st.ledger.snapshot(&run_id).await;
+        let spent = snap.map(|s| s.spent).unwrap_or(Microusd::ZERO);
+        let step = snap.map(|s| s.steps + 1).unwrap_or(1);
+        // No estimate has been computed yet on this path (it's derived below,
+        // once past the kill/DLP gates) — compute it locally so the avoided
+        // spend is still captured for the trace.
+        let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
             .unwrap_or(Microusd::ZERO);
+        st.sink.record(CallRecord {
+            ts_millis: now_millis(),
+            run_id: run_id.clone(),
+            model: parsed.model.clone(),
+            decision: "killed".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microusd: estimate.0,
+            step,
+            agent_id: agent_id.clone(),
+            saved_microusd: 0,
+        });
         return budget_error(
             "killed",
             &run_id,
@@ -89,7 +108,27 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         if !findings.is_empty() {
             let summary = dlp::summary(&findings);
             match st.dlp {
-                DlpMode::Block => return dlp_block(&run_id, &summary),
+                DlpMode::Block => {
+                    let step = st
+                        .ledger
+                        .snapshot(&run_id)
+                        .await
+                        .map(|s| s.steps + 1)
+                        .unwrap_or(1);
+                    st.sink.record(CallRecord {
+                        ts_millis: now_millis(),
+                        run_id: run_id.clone(),
+                        model: parsed.model.clone(),
+                        decision: "dlp_blocked".into(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cost_microusd: 0,
+                        step,
+                        agent_id: agent_id.clone(),
+                        saved_microusd: 0,
+                    });
+                    return dlp_block(&run_id, &summary);
+                }
                 DlpMode::Mask => {
                     body = Bytes::from(dlp::redact(&text, &findings).into_bytes());
                     dlp_note = Some(format!("masked {summary}"));
@@ -132,6 +171,10 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         output_tokens: 0,
                         cost_microusd: 0,
                         step,
+                        agent_id: agent_id.clone(),
+                        // The only non-zero `saved_microusd` site: a served cache
+                        // hit avoided this much real spend.
+                        saved_microusd: hit.saved_microusd,
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -168,6 +211,18 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // Enforce-mode blocks (step/max-steps first, then loops), before forwarding.
     if st.policy.mode == Mode::Enforce {
         if eval.decision.is_blocking() {
+            st.sink.record(CallRecord {
+                ts_millis: now_millis(),
+                run_id: run_id.clone(),
+                model: parsed.model.clone(),
+                decision: "policy_violation".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: estimate.0,
+                step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
+            });
             return budget_error(
                 "policy_violation",
                 &run_id,
@@ -178,6 +233,18 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             );
         }
         if let Some(reason) = &loop_reason {
+            st.sink.record(CallRecord {
+                ts_millis: now_millis(),
+                run_id: run_id.clone(),
+                model: parsed.model.clone(),
+                decision: "loop_detected".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: estimate.0,
+                step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
+            });
             return budget_error(
                 "loop_detected",
                 &run_id,
@@ -207,6 +274,18 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             taint_bits,
         );
         if decision == 2 {
+            st.sink.record(CallRecord {
+                ts_millis: now_millis(),
+                run_id: run_id.clone(),
+                model: parsed.model.clone(),
+                decision: "wasm_policy".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: estimate.0,
+                step: snapshot.steps + 1,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
+            });
             return budget_error(
                 "wasm_policy",
                 &run_id,
@@ -237,6 +316,18 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 } else {
                     format!("parent run '{hit_run}' budget exceeded")
                 };
+                st.sink.record(CallRecord {
+                    ts_millis: now_millis(),
+                    run_id: run_id.clone(),
+                    model: parsed.model.clone(),
+                    decision: "budget_exceeded".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microusd: estimate.0,
+                    step: snapshot.steps + 1,
+                    agent_id: agent_id.clone(),
+                    saved_microusd: 0,
+                });
                 return budget_error(
                     "budget_exceeded",
                     &run_id,
@@ -277,7 +368,15 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     };
 
     if parsed.stream {
-        stream_managed(resp, reservation, would_block, dlp_note, &parsed.model, &st)
+        stream_managed(
+            resp,
+            reservation,
+            would_block,
+            dlp_note,
+            &parsed.model,
+            &st,
+            agent_id,
+        )
     } else {
         buffered_managed(
             resp,
@@ -289,6 +388,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             cache_ctx,
             cache_note,
             firewall_labels,
+            &agent_id,
         )
         .await
     }
@@ -297,6 +397,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
 /// Streaming managed response: pass chunks through and settle at end-of-stream.
 /// Cost headers are omitted because headers are sent before the body — the
 /// settled figures go to the ledger (and, later, the event sink).
+#[allow(clippy::too_many_arguments)]
 fn stream_managed(
     resp: ProviderResponse,
     reservation: Reservation,
@@ -304,6 +405,7 @@ fn stream_managed(
     dlp_note: Option<String>,
     model: &str,
     st: &AppState,
+    agent_id: String,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -317,6 +419,7 @@ fn stream_managed(
         resp.usage.clone(),
         reservation.amount,
         reservation,
+        agent_id,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -371,6 +474,7 @@ async fn buffered_managed(
     cache_ctx: Option<CacheCtx>,
     cache_note: Option<String>,
     firewall_labels: Labels,
+    agent_id: &str,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -409,6 +513,8 @@ async fn buffered_managed(
         output_tokens: u.output_tokens,
         cost_microusd: actual.0,
         step: reservation.step,
+        agent_id: agent_id.to_string(),
+        saved_microusd: 0,
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -421,6 +527,22 @@ async fn buffered_managed(
         let requested = taint::capabilities_for_tools(&resp_tools, &st.firewall.capabilities);
         if let Some(reason) = taint::evaluate(&firewall_labels, &requested, &st.firewall.rules) {
             if st.firewall.mode == FirewallMode::Enforce {
+                // The call already happened and its real cost was recorded as
+                // "allow" above — this second record is the security verdict
+                // that blocks the *response* from reaching the caller, so it
+                // carries no additional cost (avoids double-counting spend).
+                st.sink.record(CallRecord {
+                    ts_millis: now_millis(),
+                    run_id: reservation.run_id.clone(),
+                    model: model.to_string(),
+                    decision: "taint_blocked".into(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_microusd: 0,
+                    step: reservation.step,
+                    agent_id: agent_id.to_string(),
+                    saved_microusd: 0,
+                });
                 return firewall_block(&reservation.run_id, &reason);
             }
             firewall_note = Some(reason);
@@ -712,11 +834,33 @@ fn mode_str(mode: Mode) -> &'static str {
 mod tests {
     use super::*;
     use crate::provider::StubProvider;
+    use crate::sink::EventSink;
     use axum::body::to_bytes;
     use axum::http::Request;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
     use tower::ServiceExt;
+
+    /// An in-memory `EventSink` test double. Cheap to clone — the clone shares
+    /// the same underlying buffer — so a handle can be kept in the test while
+    /// the sink itself is moved into `AppState`.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        records: Arc<Mutex<Vec<CallRecord>>>,
+    }
+
+    impl RecordingSink {
+        fn snapshot(&self) -> Vec<CallRecord> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn record(&self, rec: CallRecord) {
+            self.records.lock().unwrap().push(rec);
+        }
+        fn flush(&self) {}
+    }
 
     fn state(mode: Mode, provider: StubProvider) -> AppState {
         let prices = PriceBook::new().with(
@@ -802,6 +946,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budget_block_records_avoided_estimate_in_sink() {
+        // A blocked call must still show up in the trace, carrying the
+        // estimate it would have cost as an avoided-spend figure — not zero,
+        // and not silently invisible to the sink.
+        let sink = RecordingSink::default();
+        let st = state(
+            Mode::Enforce,
+            StubProvider {
+                input_tokens: 1_000,
+                output_tokens: 100_000,
+                sse: false,
+                body_override: None,
+            },
+        )
+        .with_sink(Arc::new(sink.clone()));
+        let prices = Arc::clone(&st.prices);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-block")
+            .header("x-fuse-budget-usd", "0.000001")
+            .body(Body::from(body(100_000)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let expected = estimate_cost(&prices, "test-model", body(100_000).len(), Some(100_000))
+            .unwrap_or(Microusd::ZERO);
+        assert!(
+            expected > Microusd::ZERO,
+            "sanity: estimate must be nonzero"
+        );
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "exactly one record for the blocked call");
+        assert_eq!(records[0].decision, "budget_exceeded");
+        assert_eq!(records[0].run_id, "run-block");
+        assert_eq!(records[0].cost_microusd, expected.0);
+    }
+
+    #[tokio::test]
     async fn shadow_over_budget_allows_but_flags_would_block() {
         let mut st = state(Mode::Shadow, StubProvider::default());
         st.policy = Arc::new(Policy {
@@ -844,6 +1028,29 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "dlp_blocked");
+    }
+
+    #[tokio::test]
+    async fn dlp_block_records_zero_cost_in_sink() {
+        // Security blocks are avoided-harm, not avoided-spend: the call never
+        // reached the provider, so cost is 0 — unlike budget-family blocks.
+        let sink = RecordingSink::default();
+        let mut st = state(Mode::Shadow, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        st.dlp = DlpMode::Block;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"my key is AKIA1234567890ABCDEF"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "dlp-sink")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "exactly one record for the blocked call");
+        assert_eq!(records[0].decision, "dlp_blocked");
+        assert_eq!(records[0].run_id, "dlp-sink");
+        assert_eq!(records[0].cost_microusd, 0);
     }
 
     #[tokio::test]
@@ -1069,7 +1276,15 @@ mod tests {
             .await
             .unwrap();
 
-        let response = stream_managed(resp, reservation, None, None, "test-model", &st);
+        let response = stream_managed(
+            resp,
+            reservation,
+            None,
+            None,
+            "test-model",
+            &st,
+            String::new(),
+        );
         {
             // Consume a single chunk, then drop the stream (simulated cancel).
             let mut data = response.into_body().into_data_stream();

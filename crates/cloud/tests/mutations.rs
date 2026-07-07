@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, AppState, Principal, Store};
+use tokenfuse_cloud::{app, AppState, Plan, Principal, Store};
 
 fn test_state() -> AppState {
     let store = Arc::new(Store::new());
@@ -19,6 +19,7 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            plan: Plan::Paid,
         },
     );
     keys.insert(
@@ -26,6 +27,7 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            plan: Plan::Paid,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)
@@ -125,6 +127,59 @@ async fn viewer_can_read_but_not_mutate() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn incident_ack_flow_and_rbac() {
+    let state = test_state();
+
+    // Seed an incident: three budget-protection blocks on run r1.
+    let payload = r#"{"records":[
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000},
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000},
+        {"run_id":"r1","decision":"budget_exceeded","cost_microusd":1000}
+    ]}"#;
+    let (status, _) = send(&state, "POST", "/v1/ingest", Some("devkey"), Some(payload)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A viewer cannot ack (403, before any existence check).
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/incidents/budget_exhausted:r1/ack",
+        Some("viewerkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An admin acks it (200).
+    let (status, v) = send(
+        &state,
+        "POST",
+        "/v1/incidents/budget_exhausted:r1/ack",
+        Some("devkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["acknowledged"], "budget_exhausted:r1");
+
+    // Unknown incident → 404.
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/incidents/nope/ack",
+        Some("devkey"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The acknowledged flag surfaces on the read.
+    let (status, list) = send(&state, "GET", "/v1/incidents", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["acknowledged"], true);
 }
 
 #[tokio::test]

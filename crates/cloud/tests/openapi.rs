@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use tokenfuse_cloud::{app, openapi_spec, AppState, Principal, Store};
+use tokenfuse_cloud::{app, openapi_spec, AppState, Plan, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
@@ -18,6 +18,7 @@ fn state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            plan: Plan::Paid,
         },
     );
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)
@@ -39,6 +40,8 @@ fn spec_covers_every_endpoint() {
         "/v1/kills",
         "/v1/runs/{run}/budget",
         "/v1/budgets",
+        "/v1/incidents",
+        "/v1/incidents/{id}/ack",
     ] {
         assert!(paths.contains_key(p), "spec missing path {p}");
     }
@@ -47,7 +50,7 @@ fn spec_covers_every_endpoint() {
     let schemas = json["components"]["schemas"]
         .as_object()
         .expect("component schemas");
-    for s in ["RunAgg", "Summary", "Alert", "CallRecord"] {
+    for s in ["RunAgg", "Summary", "Alert", "CallRecord", "Incident"] {
         assert!(schemas.contains_key(s), "spec missing schema {s}");
     }
 }

@@ -21,9 +21,10 @@ const NONCE_CAP: usize = 4096;
 /// not persisted — historical analytics live in the gateway's Parquet sink).
 const SERIES_CAP: usize = 100_000;
 
-/// Whether a call record represents a blocked decision. Gateways currently only
-/// ingest settled calls (`allow`/`cache_hit`); anything else is reserved for
-/// future block telemetry.
+/// Whether a call record represents a blocked decision (as opposed to a
+/// settled call: `allow`/`cache_hit`). Blocked records are still stored and
+/// counted, but their `cost_microusd` — an avoided-spend estimate, or 0 for
+/// security blocks — must never be summed into real spend (see `ingest`).
 fn is_blocked(decision: &str) -> bool {
     !matches!(decision, "allow" | "cache_hit")
 }
@@ -49,6 +50,14 @@ pub struct CallRecord {
     pub cost_microusd: i64,
     #[serde(default)]
     pub step: u32,
+    /// Attribution: which logical agent made the call (P2). Accepted for
+    /// forward-compat; aggregation (/v1/agents) lands in a later PR.
+    #[serde(default)]
+    pub agent_id: String,
+    /// Cache-hit savings in microdollars (P2). Accepted for forward-compat;
+    /// aggregation (/v1/savings) lands in a later PR.
+    #[serde(default)]
+    pub saved_microusd: i64,
 }
 
 /// The aggregated state of one run within an organization.
@@ -56,6 +65,11 @@ pub struct CallRecord {
 pub struct RunAgg {
     pub run_id: String,
     pub model: String,
+    /// Which logical agent this run is attributed to (P2). Empty when the
+    /// gateway didn't tag the calls — folded into the "unattributed" bucket by
+    /// [`Store::agents`]. `serde(default)` so pre-P2 snapshots still load.
+    #[serde(default)]
+    pub agent_id: String,
     pub spent_microusd: i64,
     pub calls: u64,
     pub cache_hits: u64,
@@ -71,6 +85,48 @@ pub struct Summary {
     pub runs: u64,
     pub calls: u64,
     pub spent_microusd: i64,
+}
+
+/// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
+/// The empty-string `agent_id` is kept as an explicit "unattributed" bucket.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct AgentAgg {
+    /// The agent this bucket rolls up; `""` for unattributed runs.
+    pub agent_id: String,
+    /// Real spend (blocked/avoided-spend rows already excluded upstream).
+    pub spent_microusd: i64,
+    pub calls: u64,
+    /// Distinct runs attributed to this agent.
+    pub runs: u64,
+    #[serde(rename = "last_seen_millis")]
+    pub last_seen: i64,
+}
+
+/// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
+/// headline: budget-protection blocked spend plus semantic-cache savings.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct SavingsSummary {
+    /// Avoided spend from budget-protection blocks (runaway spend stopped).
+    pub blocked_spend_microusd: i64,
+    /// Dollars served for free by the semantic cache.
+    pub cache_saved_microusd: i64,
+    /// Distinct runs stopped by at least one budget-protection block.
+    pub budget_breaks: u64,
+    /// `blocked_spend_microusd + cache_saved_microusd`.
+    pub total_saved_microusd: i64,
+}
+
+/// The live FinOps savings accumulator for one org, folded incrementally in
+/// [`Store::ingest`] (the control plane is a live rollup, not a Parquet reader).
+/// Persisted in the snapshot so totals survive a restart.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct SavingsAcc {
+    blocked_spend_microusd: i64,
+    cache_saved_microusd: i64,
+    /// Distinct run ids that hit ≥1 budget-protection block — the set makes
+    /// `budget_breaks` distinct-by-run even across restarts (it's persisted).
+    #[serde(default)]
+    breaks: HashSet<String>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -93,6 +149,82 @@ pub struct SeriesBucket {
     pub blocked: u64,
 }
 
+/// An aggregated, first-class anomaly for an org (P2 incidents). Repeated or
+/// severe detections are folded into one `Incident` keyed by a STABLE
+/// [`incident_id`] (`"{kind}:{run_or_agent}"`) so later triggers bump
+/// `occurrences`/`last_seen_millis` in place rather than piling up duplicates.
+/// Persisted in the snapshot so open incidents — and the push-dedup clock
+/// (`last_notified_millis`) — survive a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Incident {
+    /// Stable dedup id, `"{kind}:{run_or_agent}"`.
+    pub id: String,
+    pub org: String,
+    /// The run this incident is scoped to, if run-scoped (`spend_spike` is
+    /// org-scoped and leaves this `None`).
+    pub run_id: Option<String>,
+    /// The agent attributed at trip time, when the gateway tagged the run.
+    pub agent_id: Option<String>,
+    /// Detector kind: `budget_exhausted` | `sustained_loop` | `spend_spike` |
+    /// `fanout_explosion`.
+    pub kind: String,
+    /// Reused from `tokenfuse_core` — rendered as a lowercase string in JSON.
+    #[schema(value_type = String, example = "high")]
+    pub severity: tokenfuse_core::Severity,
+    pub first_seen_millis: i64,
+    pub last_seen_millis: i64,
+    /// How many times this incident's threshold has tripped.
+    pub occurrences: u64,
+    pub acknowledged: bool,
+    /// Epoch millis of the last push fired for this incident — the SINGLE
+    /// source of truth for push dedup (see `push.rs`). `0` until first notified.
+    pub last_notified_millis: i64,
+}
+
+/// Thresholds for the incident detectors, mirroring the `alert_pct` env
+/// precedent. Read from the environment at the composition root (see
+/// `main::main`); [`Default`] carries the documented fallbacks.
+#[derive(Debug, Clone)]
+pub struct IncidentConfig {
+    /// `budget_exhausted` trips at ≥ this many budget-protection blocks per run
+    /// (`TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS`).
+    pub budget_blocks: u64,
+    /// `sustained_loop` trips at ≥ this many `loop_detected` decisions for a run
+    /// within `loop_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS`).
+    pub loop_repeats: u64,
+    /// Window for the `sustained_loop` repeat count.
+    pub loop_window_ms: i64,
+    /// `spend_spike` trips when an org's last-minute burn reaches this rate
+    /// (`TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`, stored as microdollars).
+    pub spend_per_min_micros: i64,
+    /// `fanout_explosion` trips when one `agent_id` drives ≥ this many DISTINCT
+    /// runs within `fanout_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS`).
+    pub fanout_runs: u64,
+    /// Window for the `fanout_explosion` distinct-run count.
+    pub fanout_window_ms: i64,
+}
+
+impl Default for IncidentConfig {
+    fn default() -> Self {
+        Self {
+            budget_blocks: 3,
+            loop_repeats: 3,
+            loop_window_ms: 600_000,
+            spend_per_min_micros: 5_000_000,
+            fanout_runs: 20,
+            fanout_window_ms: 600_000,
+        }
+    }
+}
+
+/// Rolling window used to compute the `spend_spike` burn rate (matches the
+/// per-minute framing of `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`).
+const SPIKE_WINDOW_MS: i64 = 60_000;
+
+/// Cap on each per-(org,key) occurrence tracker deque, so a hot run can't grow
+/// the tracker without bound (the incident itself is the durable record).
+const INCIDENT_TRACKER_CAP: usize = 256;
+
 /// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
 /// to the right subscriber and is not sent in the payload.
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +246,9 @@ pub enum StreamEvent {
         run: String,
         budget_micros: i64,
     },
+    /// A newly-tripped or re-tripped incident. Serialized flat (the internal
+    /// `type` tag plus the incident's own fields, incl. its `org`).
+    Incident(Incident),
 }
 
 impl StreamEvent {
@@ -121,6 +256,7 @@ impl StreamEvent {
     pub(crate) fn org(&self) -> &str {
         match self {
             Self::RunUpdate { org, .. } | Self::Kill { org, .. } | Self::Budget { org, .. } => org,
+            Self::Incident(inc) => &inc.org,
         }
     }
 
@@ -130,6 +266,7 @@ impl StreamEvent {
             Self::RunUpdate { .. } => "run_update",
             Self::Kill { .. } => "kill",
             Self::Budget { .. } => "budget",
+            Self::Incident(_) => "incident",
         }
     }
 }
@@ -152,6 +289,19 @@ struct Inner {
     budgets: HashMap<String, HashMap<String, i64>>,
     /// org → bounded log of recent samples for the burn-rate series
     series: HashMap<String, VecDeque<Sample>>,
+    /// org → live FinOps savings accumulator (persisted)
+    savings: HashMap<String, SavingsAcc>,
+    /// org → incident id → aggregated incident (persisted)
+    incidents: HashMap<String, HashMap<String, Incident>>,
+    /// (org, "{kind}:{run_or_agent}") → recent trigger timestamps, bounded to
+    /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
+    /// threshold against (ephemeral — the `Incident` is the durable record).
+    incident_tracker: HashMap<(String, String), VecDeque<i64>>,
+    /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
+    /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
+    /// the windowed distinct-run count the detector thresholds against
+    /// (ephemeral — the `Incident` is the durable record).
+    fanout_tracker: HashMap<(String, String), VecDeque<(String, i64)>>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -172,6 +322,8 @@ struct SnapshotRef<'a> {
     killed: &'a HashMap<String, HashMap<String, bool>>,
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
+    savings: &'a HashMap<String, SavingsAcc>,
+    incidents: &'a HashMap<String, HashMap<String, Incident>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -184,6 +336,14 @@ struct SnapshotOwned {
     budgets: HashMap<String, HashMap<String, i64>>,
     #[serde(default)]
     devices: HashMap<String, Device>,
+    /// Missing on pre-P2 snapshots — `default` yields an empty map, so
+    /// `savings()` reports zeros until fresh telemetry accumulates.
+    #[serde(default)]
+    savings: HashMap<String, SavingsAcc>,
+    /// Missing on pre-incident snapshots — `default` loads to no open
+    /// incidents (incl. their `last_notified_millis` push-dedup clock).
+    #[serde(default)]
+    incidents: HashMap<String, HashMap<String, Incident>>,
 }
 
 /// A concurrency-safe aggregation keyed by org → run. A SQL/columnar backend
@@ -193,6 +353,8 @@ pub struct Store {
     inner: RwLock<Inner>,
     /// Live change bus for `/v1/stream` subscribers.
     events: broadcast::Sender<StreamEvent>,
+    /// Incident-detector thresholds (env-configured at the composition root).
+    incident_cfg: IncidentConfig,
 }
 
 impl Default for Store {
@@ -203,10 +365,17 @@ impl Default for Store {
 
 impl Store {
     pub fn new() -> Self {
+        Self::with_incident_config(IncidentConfig::default())
+    }
+
+    /// Build with explicit incident thresholds (used by `main` after reading the
+    /// environment, and by unit tests that pin a threshold).
+    pub fn with_incident_config(incident_cfg: IncidentConfig) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: RwLock::new(Inner::default()),
             events,
+            incident_cfg,
         }
     }
 
@@ -216,20 +385,38 @@ impl Store {
     }
 
     /// Fold a batch of records into an org's aggregates, append them to the
-    /// burn-rate series, and broadcast a `run_update` per affected run.
+    /// burn-rate series, run incident detection, and broadcast a `run_update`
+    /// per affected run plus an `incident` per tripped detector. Uses the store's
+    /// own wall clock; see [`Store::ingest_at`] for the testable inner form.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
+        self.ingest_at(org, records, now_millis());
+    }
+
+    /// [`Store::ingest`] with an explicit `now_ms` (the same "now" `series`
+    /// takes), so incident windows are deterministic in tests.
+    pub(crate) fn ingest_at(&self, org: &str, records: &[CallRecord], now_ms: i64) {
         let mut updated: Vec<RunAgg> = Vec::new();
+        let mut fired: HashMap<String, Incident> = HashMap::new();
         {
-            let mut inner = self.inner.write().unwrap();
-            inner.dirty = true;
+            let mut guard = self.inner.write().unwrap();
+            guard.dirty = true;
+            // Reborrow so `orgs` and `savings` can be borrowed as disjoint
+            // fields inside the same loop (a live rollup accumulates both).
+            let inner = &mut *guard;
             {
                 let runs = inner.orgs.entry(org.to_string()).or_default();
+                let sav = inner.savings.entry(org.to_string()).or_default();
                 for r in records {
                     let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
-                    agg.spent_microusd += r.cost_microusd;
+                    // Blocked calls are stored and counted, but their
+                    // cost_microusd (avoided spend, or 0 for security blocks)
+                    // must not inflate the org's real spend total.
+                    if !is_blocked(&r.decision) {
+                        agg.spent_microusd += r.cost_microusd;
+                    }
                     agg.calls += 1;
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
@@ -237,12 +424,25 @@ impl Store {
                     if !r.model.is_empty() {
                         agg.model = r.model.clone();
                     }
+                    if !r.agent_id.is_empty() {
+                        agg.agent_id = r.agent_id.clone();
+                    }
                     if r.step > agg.steps {
                         agg.steps = r.step;
                     }
                     if r.ts_millis > agg.last_seen {
                         agg.last_seen = r.ts_millis;
                     }
+                    // FinOps savings, folded in the same pass. Only the
+                    // budget-protection subset counts as blocked (avoided)
+                    // spend — dlp/taint blocks are security value, not dollars
+                    // (and carry cost 0 anyway). Cache savings sum
+                    // unconditionally: `saved_microusd` is 0 off cache hits.
+                    if tokenfuse_core::savings::is_budget_protection(&r.decision) {
+                        sav.blocked_spend_microusd += r.cost_microusd;
+                        sav.breaks.insert(r.run_id.clone());
+                    }
+                    sav.cache_saved_microusd += r.saved_microusd;
                 }
             }
             {
@@ -270,12 +470,123 @@ impl Store {
                     }
                 }
             }
+
+            // --- Incident detection (same pass, on the just-updated state) ---
+            let cfg = &self.incident_cfg;
+            for r in records {
+                // Effective event time: the record's own stamp, or `now` when
+                // the gateway didn't set one (keeps loop windows sane in tests).
+                let ts = if r.ts_millis > 0 { r.ts_millis } else { now_ms };
+                let agent = (!r.agent_id.is_empty()).then(|| r.agent_id.clone());
+
+                // budget_exhausted (High): ≥ N budget-protection blocks per run.
+                if tokenfuse_core::savings::is_budget_protection(&r.decision) {
+                    let n = bump_tracker(
+                        &mut inner.incident_tracker,
+                        org,
+                        "budget_exhausted",
+                        &r.run_id,
+                        ts,
+                        None,
+                    );
+                    if n >= cfg.budget_blocks {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "budget_exhausted",
+                            tokenfuse_core::Severity::High,
+                            &r.run_id,
+                            Some(r.run_id.clone()),
+                            agent.clone(),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+
+                // sustained_loop (Medium): ≥ N loop_detected for a run in-window.
+                if r.decision == "loop_detected" {
+                    let n = bump_tracker(
+                        &mut inner.incident_tracker,
+                        org,
+                        "sustained_loop",
+                        &r.run_id,
+                        ts,
+                        Some((now_ms, cfg.loop_window_ms)),
+                    );
+                    if n >= cfg.loop_repeats {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "sustained_loop",
+                            tokenfuse_core::Severity::Medium,
+                            &r.run_id,
+                            Some(r.run_id.clone()),
+                            agent.clone(),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+
+                // fanout_explosion (High): one agent driving ≥ N distinct runs
+                // in-window. Only attributed records count — a blank agent_id
+                // isn't "one agent fanning out", so unattributed runs are skipped.
+                if let Some(a) = &agent {
+                    let n = bump_fanout_tracker(
+                        &mut inner.fanout_tracker,
+                        org,
+                        a,
+                        &r.run_id,
+                        ts,
+                        now_ms,
+                        cfg.fanout_window_ms,
+                    );
+                    if n >= cfg.fanout_runs {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "fanout_explosion",
+                            tokenfuse_core::Severity::High,
+                            a,
+                            None,
+                            Some(a.clone()),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+            }
+
+            // spend_spike (High): org burn over the last minute, summed from the
+            // SAME sample log `series()` buckets — not a second time-series.
+            let burn = inner
+                .series
+                .get(org)
+                .map(|log| burn_since(log, now_ms - SPIKE_WINDOW_MS, now_ms))
+                .unwrap_or(0);
+            if burn >= cfg.spend_per_min_micros {
+                let inc = upsert_incident(
+                    &mut inner.incidents,
+                    org,
+                    "spend_spike",
+                    tokenfuse_core::Severity::High,
+                    "",
+                    None,
+                    None,
+                    now_ms,
+                );
+                fired.insert(inc.id.clone(), inc);
+            }
         }
         for run in updated {
             let _ = self.events.send(StreamEvent::RunUpdate {
                 org: org.to_string(),
                 run,
             });
+        }
+        for (_, inc) in fired {
+            let _ = self.events.send(StreamEvent::Incident(inc));
         }
     }
 
@@ -353,6 +664,95 @@ impl Store {
             }
         }
         sum
+    }
+
+    /// An org's per-agent spend rollup, highest spend first. Folds the org's
+    /// [`RunAgg`]s by `agent_id`; the empty-string agent is kept as its own
+    /// (unattributed) bucket. Spend already excludes blocked rows (that gate is
+    /// applied when folding calls into `RunAgg::spent_microusd`).
+    pub fn agents(&self, org: &str) -> Vec<AgentAgg> {
+        let inner = self.inner.read().unwrap();
+        let mut by_agent: HashMap<String, AgentAgg> = HashMap::new();
+        if let Some(runs) = inner.orgs.get(org) {
+            for agg in runs.values() {
+                let a = by_agent
+                    .entry(agg.agent_id.clone())
+                    .or_insert_with(|| AgentAgg {
+                        agent_id: agg.agent_id.clone(),
+                        ..Default::default()
+                    });
+                a.spent_microusd += agg.spent_microusd;
+                a.calls += agg.calls;
+                a.runs += 1;
+                if agg.last_seen > a.last_seen {
+                    a.last_seen = agg.last_seen;
+                }
+            }
+        }
+        let mut out: Vec<AgentAgg> = by_agent.into_values().collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.spent_microusd));
+        out
+    }
+
+    /// An org's live FinOps savings totals (blocked/avoided spend + cache
+    /// savings). Accumulated incrementally in [`Store::ingest`] and persisted.
+    pub fn savings(&self, org: &str) -> SavingsSummary {
+        let inner = self.inner.read().unwrap();
+        let acc = inner.savings.get(org);
+        let blocked = acc.map(|a| a.blocked_spend_microusd).unwrap_or(0);
+        let cache = acc.map(|a| a.cache_saved_microusd).unwrap_or(0);
+        let breaks = acc.map(|a| a.breaks.len() as u64).unwrap_or(0);
+        SavingsSummary {
+            blocked_spend_microusd: blocked,
+            cache_saved_microusd: cache,
+            budget_breaks: breaks,
+            total_saved_microusd: blocked + cache,
+        }
+    }
+
+    /// An org's open incidents, most-recently-seen first.
+    pub fn incidents(&self, org: &str) -> Vec<Incident> {
+        let inner = self.inner.read().unwrap();
+        let mut out: Vec<Incident> = inner
+            .incidents
+            .get(org)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        out.sort_by_key(|i| std::cmp::Reverse(i.last_seen_millis));
+        out
+    }
+
+    /// Acknowledge an incident (admin action). Returns whether it existed.
+    pub fn ack_incident(&self, org: &str, id: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut found = false;
+        if let Some(inc) = inner.incidents.get_mut(org).and_then(|m| m.get_mut(id)) {
+            inc.acknowledged = true;
+            found = true;
+        }
+        if found {
+            inner.dirty = true;
+        }
+        found
+    }
+
+    /// Atomically decide whether to push for an incident and, if so, stamp its
+    /// `last_notified_millis`. This makes that field the SINGLE source of truth
+    /// for push dedup (see `push.rs`): returns `true` only when more than
+    /// `window_ms` has passed since the last push (and then records `now_ms`).
+    pub fn mark_incident_notified(&self, org: &str, id: &str, now_ms: i64, window_ms: i64) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut notify = false;
+        if let Some(inc) = inner.incidents.get_mut(org).and_then(|m| m.get_mut(id)) {
+            if now_ms - inc.last_notified_millis > window_ms {
+                inc.last_notified_millis = now_ms;
+                notify = true;
+            }
+        }
+        if notify {
+            inner.dirty = true;
+        }
+        notify
     }
 
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
@@ -453,6 +853,8 @@ impl Store {
                 killed: &inner.killed,
                 budgets: &inner.budgets,
                 devices: &inner.devices,
+                savings: &inner.savings,
+                incidents: &inner.incidents,
             };
             serde_json::to_vec(&snap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
@@ -477,6 +879,8 @@ impl Store {
         inner.killed = snap.killed;
         inner.budgets = snap.budgets;
         inner.devices = snap.devices;
+        inner.savings = snap.savings;
+        inner.incidents = snap.incidents;
         Ok(())
     }
 
@@ -619,6 +1023,125 @@ impl Store {
     }
 }
 
+/// The store's wall clock in epoch millis — the "now" `ingest` feeds detection
+/// (mirrors the `now_ms` `series` is called with by the HTTP layer).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The stable incident id / dedup key, `"{kind}:{run_or_agent}"`. Org-scoped
+/// detectors (e.g. `spend_spike`) pass an empty scope.
+fn incident_id(kind: &str, scope: &str) -> String {
+    format!("{kind}:{scope}")
+}
+
+/// Push `ts` onto the per-(org,key) occurrence tracker, bound it, and — when a
+/// `(now, window_ms)` is given — drop timestamps older than the window. Returns
+/// the current count the detector thresholds against.
+fn bump_tracker(
+    tracker: &mut HashMap<(String, String), VecDeque<i64>>,
+    org: &str,
+    kind: &str,
+    scope: &str,
+    ts: i64,
+    window: Option<(i64, i64)>,
+) -> u64 {
+    let dq = tracker
+        .entry((org.to_string(), incident_id(kind, scope)))
+        .or_default();
+    dq.push_back(ts);
+    while dq.len() > INCIDENT_TRACKER_CAP {
+        dq.pop_front();
+    }
+    if let Some((now, window_ms)) = window {
+        let cutoff = now - window_ms;
+        while dq.front().is_some_and(|&t| t < cutoff) {
+            dq.pop_front();
+        }
+    }
+    dq.len() as u64
+}
+
+/// Record `(run_id, ts)` on the per-(org,agent) fanout tracker and return the
+/// number of DISTINCT runs seen in-window. Refreshes an existing run's stamp
+/// rather than logging a duplicate (so the deque holds distinct runs and a hot
+/// run can't evict its peers), bounds it to [`INCIDENT_TRACKER_CAP`], and drops
+/// entries older than `window_ms` before `now`.
+fn bump_fanout_tracker(
+    tracker: &mut HashMap<(String, String), VecDeque<(String, i64)>>,
+    org: &str,
+    agent: &str,
+    run_id: &str,
+    ts: i64,
+    now: i64,
+    window_ms: i64,
+) -> u64 {
+    let dq = tracker
+        .entry((org.to_string(), agent.to_string()))
+        .or_default();
+    dq.retain(|(r, _)| r != run_id);
+    dq.push_back((run_id.to_string(), ts));
+    while dq.len() > INCIDENT_TRACKER_CAP {
+        dq.pop_front();
+    }
+    let cutoff = now - window_ms;
+    dq.retain(|(_, t)| *t >= cutoff);
+    dq.len() as u64
+}
+
+/// Upsert the incident for `(org, kind, scope)`: create it on first trip, else
+/// bump `occurrences`/`last_seen_millis` in place. Returns the current state.
+#[allow(clippy::too_many_arguments)]
+fn upsert_incident(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    kind: &str,
+    severity: tokenfuse_core::Severity,
+    scope: &str,
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    ts: i64,
+) -> Incident {
+    let id = incident_id(kind, scope);
+    let per_org = incidents.entry(org.to_string()).or_default();
+    let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {
+        id: id.clone(),
+        org: org.to_string(),
+        run_id: run_id.clone(),
+        agent_id: agent_id.clone(),
+        kind: kind.to_string(),
+        severity,
+        first_seen_millis: ts,
+        last_seen_millis: ts,
+        occurrences: 0,
+        acknowledged: false,
+        last_notified_millis: 0,
+    });
+    inc.occurrences += 1;
+    if ts > inc.last_seen_millis {
+        inc.last_seen_millis = ts;
+    }
+    // Keep the attributed agent fresh if a later trigger carries one.
+    if inc.agent_id.is_none() {
+        if let Some(a) = agent_id {
+            inc.agent_id = Some(a);
+        }
+    }
+    inc.clone()
+}
+
+/// Sum sample cost over `[start, now]` for the org's burn series (the same
+/// accumulation `series()` does within one bucket) — the `spend_spike` rate.
+fn burn_since(log: &VecDeque<Sample>, start: i64, now: i64) -> i64 {
+    log.iter()
+        .filter(|s| s.ts_millis >= start && s.ts_millis <= now)
+        .map(|s| s.cost_microusd)
+        .sum()
+}
+
 /// Write `data` to `path` with owner-only permissions on unix (the snapshot can
 /// hold budget/kill state), a plain write elsewhere.
 fn write_file_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -647,6 +1170,7 @@ mod tests {
     fn rec(run: &str, cost: i64) -> CallRecord {
         CallRecord {
             run_id: run.into(),
+            decision: "allow".into(),
             cost_microusd: cost,
             ..Default::default()
         }
@@ -703,6 +1227,61 @@ mod tests {
         assert_eq!(sum.spent_microusd, 1500);
     }
 
+    /// A blocked record's `cost_microusd` (avoided-spend estimate, or 0 for
+    /// security blocks) must be counted/stored but never summed into real
+    /// spend — see `Store::ingest`'s `is_blocked` gate.
+    #[test]
+    fn ingest_excludes_blocked_spend_from_totals() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 1000,
+                    step: 1,
+                    ts_millis: 100,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 750_000, // avoided estimate — not real spend
+                    step: 2,
+                    ts_millis: 200,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r1".into(),
+                    model: "claude".into(),
+                    decision: "taint_blocked".into(),
+                    cost_microusd: 0,
+                    step: 3,
+                    ts_millis: 300,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let runs = s.runs("acme");
+        assert_eq!(runs.len(), 1);
+        let r1 = &runs[0];
+        // Only the "allow" record's cost counts toward spend.
+        assert_eq!(r1.spent_microusd, 1000);
+        // But every record — blocked or not — is counted and moves `steps`.
+        assert_eq!(r1.calls, 3);
+        assert_eq!(r1.steps, 3);
+        assert_eq!(r1.last_seen, 300);
+
+        let sum = s.summary("acme");
+        assert_eq!(sum.runs, 1);
+        assert_eq!(sum.calls, 3);
+        assert_eq!(sum.spent_microusd, 1000);
+    }
+
     #[test]
     fn orgs_are_isolated() {
         let s = Store::new();
@@ -736,6 +1315,147 @@ mod tests {
     }
 
     #[test]
+    fn agents_roll_up_by_agent_id() {
+        let s = Store::new();
+        let r = |run: &str, agent: &str, decision: &str, cost: i64, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("r1", "planner", "allow", 1000, 10),
+                r("r2", "planner", "allow", 2000, 20),
+                // A budget-protection block for coder — its avoided cost must
+                // NOT count toward the agent's real spend.
+                r("r3", "coder", "allow", 500, 30),
+                r("r3", "coder", "budget_exceeded", 999_999, 40),
+                // Unattributed run (empty agent_id) is kept as its own bucket.
+                r("r4", "", "allow", 250, 50),
+            ],
+        );
+
+        let agents = s.agents("acme");
+        assert_eq!(agents.len(), 3);
+        // Sorted by spend desc: planner (3000) > coder (500) > "" (250).
+        assert_eq!(agents[0].agent_id, "planner");
+        assert_eq!(agents[0].spent_microusd, 3000);
+        assert_eq!(agents[0].calls, 2);
+        assert_eq!(agents[0].runs, 2);
+        assert_eq!(agents[0].last_seen, 20);
+
+        assert_eq!(agents[1].agent_id, "coder");
+        // Blocked/avoided spend excluded — only the $0.0005 allow counts.
+        assert_eq!(agents[1].spent_microusd, 500);
+        assert_eq!(agents[1].calls, 2);
+        assert_eq!(agents[1].runs, 1);
+
+        assert_eq!(agents[2].agent_id, "");
+        assert_eq!(agents[2].spent_microusd, 250);
+        assert_eq!(agents[2].runs, 1);
+    }
+
+    #[test]
+    fn savings_accumulate_across_reasons() {
+        let s = Store::new();
+        let r = |run: &str, decision: &str, cost: i64, saved: i64| CallRecord {
+            run_id: run.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            saved_microusd: saved,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("r1", "allow", 1000, 0),
+                r("r1", "budget_exceeded", 500_000, 0), // avoided spend
+                r("r2", "loop_detected", 200_000, 0),   // avoided spend, 2nd run
+                r("r1", "cache_hit", 0, 30_000),        // cache savings
+                r("r3", "dlp_blocked", 9_000_000, 0),   // security — excluded
+            ],
+        );
+
+        let sav = s.savings("acme");
+        // Only budget-protection cost counts; dlp is excluded.
+        assert_eq!(sav.blocked_spend_microusd, 700_000);
+        assert_eq!(sav.cache_saved_microusd, 30_000);
+        // Distinct blocked runs: r1 and r2 (r3's dlp doesn't count).
+        assert_eq!(sav.budget_breaks, 2);
+        assert_eq!(sav.total_saved_microusd, 730_000);
+    }
+
+    #[test]
+    fn savings_breaks_are_distinct_by_run() {
+        let s = Store::new();
+        let r = |run: &str| CallRecord {
+            run_id: run.into(),
+            decision: "budget_exceeded".into(),
+            cost_microusd: 1_000_000,
+            ..Default::default()
+        };
+        // Same run blocked twice → one break; blocked_spend still sums both.
+        s.ingest("acme", &[r("r1"), r("r1")]);
+        let sav = s.savings("acme");
+        assert_eq!(sav.budget_breaks, 1);
+        assert_eq!(sav.blocked_spend_microusd, 2_000_000);
+    }
+
+    #[test]
+    fn savings_persist_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-savings.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 400_000,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "cache_hit".into(),
+                    saved_microusd: 60_000,
+                    ..Default::default()
+                },
+            ],
+        );
+        s.save(&path).expect("save");
+
+        // Totals — including distinct budget_breaks — survive a reload.
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let sav = s2.savings("acme");
+        assert_eq!(sav.blocked_spend_microusd, 400_000);
+        assert_eq!(sav.cache_saved_microusd, 60_000);
+        assert_eq!(sav.budget_breaks, 1);
+        assert_eq!(sav.total_saved_microusd, 460_000);
+
+        // An old snapshot with no `savings` field loads to zeros, not an error.
+        let old = dir.join(format!("tf-cloud-{}-oldsnap.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert_eq!(s3.savings("acme").total_saved_microusd, 0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
     fn persistence_round_trip() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("tf-cloud-{}-persist.json", std::process::id()));
@@ -747,6 +1467,7 @@ mod tests {
             &[CallRecord {
                 run_id: "r1".into(),
                 model: "claude".into(),
+                decision: "allow".into(),
                 cost_microusd: 1500,
                 step: 2,
                 ts_millis: 100,
@@ -787,6 +1508,7 @@ mod tests {
     fn rec_at(run: &str, cost: i64, ts: i64) -> CallRecord {
         CallRecord {
             run_id: run.into(),
+            decision: "allow".into(),
             cost_microusd: cost,
             ts_millis: ts,
             ..Default::default()
@@ -854,5 +1576,356 @@ mod tests {
             rx.try_recv(),
             Ok(StreamEvent::Kill { org, run }) if org == "acme" && run == "r1"
         ));
+    }
+
+    // ---- incidents ----------------------------------------------------------
+
+    fn block_at(run: &str, decision: &str, cost: i64, ts: i64) -> CallRecord {
+        CallRecord {
+            run_id: run.into(),
+            decision: decision.into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn budget_exhausted_fires_at_threshold_not_under() {
+        let s = Store::new(); // default budget_blocks = 3
+        let now = 1_000_000;
+        // Two budget-protection blocks: under threshold → nothing yet.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+            ],
+            now,
+        );
+        assert!(s.incidents("acme").is_empty(), "under threshold");
+
+        // The third block trips it.
+        s.ingest_at("acme", &[block_at("r1", "budget_exceeded", 1000, now)], now);
+        let incs = s.incidents("acme");
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].id, "budget_exhausted:r1");
+        assert_eq!(incs[0].kind, "budget_exhausted");
+        assert_eq!(incs[0].severity, tokenfuse_core::Severity::High);
+        assert_eq!(incs[0].run_id.as_deref(), Some("r1"));
+        assert_eq!(incs[0].occurrences, 1);
+        assert_eq!(incs[0].first_seen_millis, now);
+
+        // A further block upserts in place (bumps occurrences, no duplicate).
+        s.ingest_at(
+            "acme",
+            &[block_at("r1", "budget_exceeded", 1000, now + 5)],
+            now + 5,
+        );
+        let incs = s.incidents("acme");
+        assert_eq!(incs.len(), 1, "same incident, not a duplicate");
+        assert_eq!(incs[0].occurrences, 2);
+        assert_eq!(incs[0].last_seen_millis, now + 5);
+    }
+
+    #[test]
+    fn sustained_loop_fires_within_window() {
+        let s = Store::new(); // default loop_repeats = 3, window 10 min
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "loop_detected", 0, now - 2),
+                block_at("r1", "loop_detected", 0, now - 1),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "sustained_loop"),
+            "under threshold"
+        );
+
+        s.ingest_at("acme", &[block_at("r1", "loop_detected", 0, now)], now);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "sustained_loop")
+            .expect("sustained_loop incident");
+        assert_eq!(inc.id, "sustained_loop:r1");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Medium);
+        assert_eq!(inc.run_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn sustained_loop_window_prunes_stale_repeats() {
+        let s = Store::new();
+        let now = 10_000_000;
+        // Two loops far outside the 10-minute window, one now → count prunes to 1.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "loop_detected", 0, now - 5_000_000),
+                block_at("r1", "loop_detected", 0, now - 4_000_000),
+                block_at("r1", "loop_detected", 0, now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "sustained_loop"),
+            "stale repeats pruned, under threshold"
+        );
+    }
+
+    #[test]
+    fn spend_spike_fires_over_burn_rate() {
+        let s = Store::new(); // default 5 USD/min = 5_000_000 micros
+        let now = 1_000_000;
+        // 4 USD in the last minute — under the rate.
+        s.ingest_at("acme", &[block_at("r1", "allow", 4_000_000, now)], now);
+        assert!(s.incidents("acme").iter().all(|i| i.kind != "spend_spike"));
+
+        // Another $2 tips the minute's burn over 5 USD.
+        s.ingest_at(
+            "acme",
+            &[block_at("r1", "allow", 2_000_000, now + 1)],
+            now + 1,
+        );
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "spend_spike")
+            .expect("spend_spike incident");
+        assert_eq!(inc.id, "spend_spike:", "org-scoped, empty run scope");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::High);
+        assert!(inc.run_id.is_none());
+    }
+
+    #[test]
+    fn stream_emits_incident_on_trip() {
+        let s = Store::new();
+        let mut rx = s.subscribe();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        let mut saw = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Incident(inc) = ev {
+                assert_eq!(inc.id, "budget_exhausted:r1");
+                saw = true;
+            }
+        }
+        assert!(saw, "expected an incident event on the bus");
+    }
+
+    #[test]
+    fn incidents_persist_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-incidents.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        // Stamp a notify time so we can prove it survives the round-trip.
+        assert!(s.mark_incident_notified("acme", "budget_exhausted:r1", now, 600_000));
+        s.save(&path).expect("save");
+
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let incs = s2.incidents("acme");
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].id, "budget_exhausted:r1");
+        assert_eq!(incs[0].occurrences, 1);
+        assert_eq!(incs[0].last_notified_millis, now, "dedup clock persists");
+        // The persisted clock still dedups after a restart.
+        assert!(!s2.mark_incident_notified("acme", "budget_exhausted:r1", now + 1000, 600_000));
+
+        // An old snapshot with no `incidents` field loads to empty, not an error.
+        let old = dir.join(format!("tf-cloud-{}-oldinc.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.incidents("acme").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn ack_marks_incident_acknowledged() {
+        let s = Store::new();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        assert!(!s.incidents("acme")[0].acknowledged);
+        assert!(s.ack_incident("acme", "budget_exhausted:r1"));
+        assert!(s.incidents("acme")[0].acknowledged);
+        // Unknown id → false.
+        assert!(!s.ack_incident("acme", "nope"));
+    }
+
+    /// One `agent_id` fanning out across many DISTINCT runs opens an
+    /// agent-scoped `fanout_explosion`; a smaller fan-out opens nothing.
+    #[test]
+    fn fanout_explosion_fires_over_distinct_run_threshold() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 1_000_000;
+        let fan = |agent: &str, run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+
+        // Three distinct runs for one agent — under the threshold of 4.
+        s.ingest_at(
+            "acme",
+            &[
+                fan("orchestrator", "r1", now - 3),
+                fan("orchestrator", "r2", now - 2),
+                fan("orchestrator", "r3", now - 1),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "under distinct-run threshold"
+        );
+
+        // A fourth distinct run trips it.
+        s.ingest_at("acme", &[fan("orchestrator", "r4", now)], now);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "fanout_explosion")
+            .expect("fanout_explosion incident");
+        assert_eq!(inc.id, "fanout_explosion:orchestrator");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::High);
+        assert!(inc.run_id.is_none(), "agent-scoped, no run");
+        assert_eq!(inc.agent_id.as_deref(), Some("orchestrator"));
+
+        // Re-driving the SAME run adds no NEW distinct run (the count stays at
+        // 4, not 5), yet still upserts the one incident in place — proving the
+        // tracker is distinct-by-run and dedups rather than piling up.
+        s.ingest_at("acme", &[fan("orchestrator", "r4", now + 1)], now + 1);
+        let fanouts: Vec<_> = s
+            .incidents("acme")
+            .into_iter()
+            .filter(|i| i.kind == "fanout_explosion")
+            .collect();
+        assert_eq!(fanouts.len(), 1, "same incident, not a duplicate");
+        assert_eq!(fanouts[0].occurrences, 2);
+        assert_eq!(fanouts[0].last_seen_millis, now + 1);
+    }
+
+    /// Distinct runs older than `fanout_window_ms` are pruned and don't count
+    /// toward the threshold (mirrors `sustained_loop_window_prunes_stale_repeats`).
+    #[test]
+    fn fanout_window_prunes_stale_runs() {
+        let cfg = IncidentConfig {
+            fanout_runs: 3,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 10_000_000;
+        let fan = |run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: "orchestrator".into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+        // Two distinct runs far outside the 10-minute window, one now → the
+        // in-window distinct count prunes to 1, well under the threshold of 3.
+        s.ingest_at(
+            "acme",
+            &[
+                fan("r1", now - 5_000_000),
+                fan("r2", now - 4_000_000),
+                fan("r3", now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "stale runs pruned, under threshold"
+        );
+    }
+
+    /// Records with an empty `agent_id` never open a fanout incident — a blank
+    /// agent isn't a single agent fanning out.
+    #[test]
+    fn fanout_ignores_unattributed_runs() {
+        let cfg = IncidentConfig {
+            fanout_runs: 3,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 1_000_000;
+        let unattributed = |run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: "".into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+        // Five distinct unattributed runs — far over the threshold, but blank
+        // agent_id must never fan out.
+        s.ingest_at(
+            "acme",
+            &[
+                unattributed("r1", now - 4),
+                unattributed("r2", now - 3),
+                unattributed("r3", now - 2),
+                unattributed("r4", now - 1),
+                unattributed("r5", now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "unattributed runs never fan out"
+        );
     }
 }
