@@ -49,23 +49,42 @@ async fn main() {
             }
         }
         // `tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]`
+        // `tokenfuse mcp-scan --url <endpoint> [--lock <file>] [--write-lock]`
         Some("mcp-scan") => {
             let rest: Vec<String> = args.collect();
-            let tools_path = rest.iter().find(|a| !a.starts_with("--")).cloned();
-            let lock_path = rest
-                .iter()
-                .position(|a| a == "--lock")
-                .and_then(|i| rest.get(i + 1).cloned());
+            let url_idx = rest.iter().position(|a| a == "--url");
+            let url = url_idx.and_then(|i| rest.get(i + 1).cloned());
+            let lock_idx = rest.iter().position(|a| a == "--lock");
+            let lock_path = lock_idx.and_then(|i| rest.get(i + 1).cloned());
             let write_lock = rest.iter().any(|a| a == "--write-lock");
-            match tools_path {
-                Some(p) => {
+            // The bare positional tools-path arg: skip flags and the values
+            // that belong to `--url`/`--lock` so those don't get mistaken for it.
+            let flag_value_idx = [url_idx.map(|i| i + 1), lock_idx.map(|i| i + 1)];
+            let tools_path = rest
+                .iter()
+                .enumerate()
+                .find(|(i, a)| !a.starts_with("--") && !flag_value_idx.contains(&Some(*i)))
+                .map(|(_, a)| a.clone());
+            match (tools_path, url) {
+                (Some(_), Some(_)) => {
+                    eprintln!("mcp-scan error: pass either <tools.json> or --url, not both")
+                }
+                (None, Some(url)) => {
+                    if let Err(e) =
+                        tokenfuse_gateway::mcpcli::run_live(&url, lock_path.as_deref(), write_lock)
+                            .await
+                    {
+                        eprintln!("mcp-scan error: {e}");
+                    }
+                }
+                (Some(p), None) => {
                     if let Err(e) =
                         tokenfuse_gateway::mcpcli::run(&p, lock_path.as_deref(), write_lock)
                     {
                         eprintln!("mcp-scan error: {e}");
                     }
                 }
-                None => eprintln!(
+                (None, None) => eprintln!(
                     "usage: tokenfuse mcp-scan <tools.json> [--lock <file>] [--write-lock]"
                 ),
             }
