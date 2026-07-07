@@ -57,6 +57,8 @@ async fn main() {
             .filter(|p| *p > 0.0)
             .map(|usd| (usd * 1e6) as i64)
             .unwrap_or(defaults.spend_per_min_micros),
+        fanout_runs: env_u64("TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS", defaults.fanout_runs),
+        fanout_window_ms: defaults.fanout_window_ms,
     };
 
     let store = Arc::new(Store::with_incident_config(incident_cfg));

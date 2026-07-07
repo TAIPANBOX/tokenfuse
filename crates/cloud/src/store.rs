@@ -165,7 +165,8 @@ pub struct Incident {
     pub run_id: Option<String>,
     /// The agent attributed at trip time, when the gateway tagged the run.
     pub agent_id: Option<String>,
-    /// Detector kind: `budget_exhausted` | `sustained_loop` | `spend_spike`.
+    /// Detector kind: `budget_exhausted` | `sustained_loop` | `spend_spike` |
+    /// `fanout_explosion`.
     pub kind: String,
     /// Reused from `tokenfuse_core` — rendered as a lowercase string in JSON.
     #[schema(value_type = String, example = "high")]
@@ -196,6 +197,11 @@ pub struct IncidentConfig {
     /// `spend_spike` trips when an org's last-minute burn reaches this rate
     /// (`TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`, stored as microdollars).
     pub spend_per_min_micros: i64,
+    /// `fanout_explosion` trips when one `agent_id` drives ≥ this many DISTINCT
+    /// runs within `fanout_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS`).
+    pub fanout_runs: u64,
+    /// Window for the `fanout_explosion` distinct-run count.
+    pub fanout_window_ms: i64,
 }
 
 impl Default for IncidentConfig {
@@ -205,6 +211,8 @@ impl Default for IncidentConfig {
             loop_repeats: 3,
             loop_window_ms: 600_000,
             spend_per_min_micros: 5_000_000,
+            fanout_runs: 20,
+            fanout_window_ms: 600_000,
         }
     }
 }
@@ -289,6 +297,11 @@ struct Inner {
     /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
     /// threshold against (ephemeral — the `Incident` is the durable record).
     incident_tracker: HashMap<(String, String), VecDeque<i64>>,
+    /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
+    /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
+    /// the windowed distinct-run count the detector thresholds against
+    /// (ephemeral — the `Incident` is the durable record).
+    fanout_tracker: HashMap<(String, String), VecDeque<(String, i64)>>,
     /// device_token → paired device (persisted)
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
@@ -482,6 +495,7 @@ impl Store {
                             org,
                             "budget_exhausted",
                             tokenfuse_core::Severity::High,
+                            &r.run_id,
                             Some(r.run_id.clone()),
                             agent.clone(),
                             ts,
@@ -506,8 +520,37 @@ impl Store {
                             org,
                             "sustained_loop",
                             tokenfuse_core::Severity::Medium,
+                            &r.run_id,
                             Some(r.run_id.clone()),
                             agent.clone(),
+                            ts,
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
+
+                // fanout_explosion (High): one agent driving ≥ N distinct runs
+                // in-window. Only attributed records count — a blank agent_id
+                // isn't "one agent fanning out", so unattributed runs are skipped.
+                if let Some(a) = &agent {
+                    let n = bump_fanout_tracker(
+                        &mut inner.fanout_tracker,
+                        org,
+                        a,
+                        &r.run_id,
+                        ts,
+                        now_ms,
+                        cfg.fanout_window_ms,
+                    );
+                    if n >= cfg.fanout_runs {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "fanout_explosion",
+                            tokenfuse_core::Severity::High,
+                            a,
+                            None,
+                            Some(a.clone()),
                             ts,
                         );
                         fired.insert(inc.id.clone(), inc);
@@ -528,6 +571,7 @@ impl Store {
                     org,
                     "spend_spike",
                     tokenfuse_core::Severity::High,
+                    "",
                     None,
                     None,
                     now_ms,
@@ -1021,6 +1065,33 @@ fn bump_tracker(
     dq.len() as u64
 }
 
+/// Record `(run_id, ts)` on the per-(org,agent) fanout tracker and return the
+/// number of DISTINCT runs seen in-window. Refreshes an existing run's stamp
+/// rather than logging a duplicate (so the deque holds distinct runs and a hot
+/// run can't evict its peers), bounds it to [`INCIDENT_TRACKER_CAP`], and drops
+/// entries older than `window_ms` before `now`.
+fn bump_fanout_tracker(
+    tracker: &mut HashMap<(String, String), VecDeque<(String, i64)>>,
+    org: &str,
+    agent: &str,
+    run_id: &str,
+    ts: i64,
+    now: i64,
+    window_ms: i64,
+) -> u64 {
+    let dq = tracker
+        .entry((org.to_string(), agent.to_string()))
+        .or_default();
+    dq.retain(|(r, _)| r != run_id);
+    dq.push_back((run_id.to_string(), ts));
+    while dq.len() > INCIDENT_TRACKER_CAP {
+        dq.pop_front();
+    }
+    let cutoff = now - window_ms;
+    dq.retain(|(_, t)| *t >= cutoff);
+    dq.len() as u64
+}
+
 /// Upsert the incident for `(org, kind, scope)`: create it on first trip, else
 /// bump `occurrences`/`last_seen_millis` in place. Returns the current state.
 #[allow(clippy::too_many_arguments)]
@@ -1029,11 +1100,11 @@ fn upsert_incident(
     org: &str,
     kind: &str,
     severity: tokenfuse_core::Severity,
+    scope: &str,
     run_id: Option<String>,
     agent_id: Option<String>,
     ts: i64,
 ) -> Incident {
-    let scope = run_id.as_deref().unwrap_or("");
     let id = incident_id(kind, scope);
     let per_org = incidents.entry(org.to_string()).or_default();
     let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {
@@ -1721,5 +1792,140 @@ mod tests {
         assert!(s.incidents("acme")[0].acknowledged);
         // Unknown id → false.
         assert!(!s.ack_incident("acme", "nope"));
+    }
+
+    /// One `agent_id` fanning out across many DISTINCT runs opens an
+    /// agent-scoped `fanout_explosion`; a smaller fan-out opens nothing.
+    #[test]
+    fn fanout_explosion_fires_over_distinct_run_threshold() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 1_000_000;
+        let fan = |agent: &str, run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+
+        // Three distinct runs for one agent — under the threshold of 4.
+        s.ingest_at(
+            "acme",
+            &[
+                fan("orchestrator", "r1", now - 3),
+                fan("orchestrator", "r2", now - 2),
+                fan("orchestrator", "r3", now - 1),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "under distinct-run threshold"
+        );
+
+        // A fourth distinct run trips it.
+        s.ingest_at("acme", &[fan("orchestrator", "r4", now)], now);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "fanout_explosion")
+            .expect("fanout_explosion incident");
+        assert_eq!(inc.id, "fanout_explosion:orchestrator");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::High);
+        assert!(inc.run_id.is_none(), "agent-scoped, no run");
+        assert_eq!(inc.agent_id.as_deref(), Some("orchestrator"));
+
+        // Re-driving the SAME run adds no NEW distinct run (the count stays at
+        // 4, not 5), yet still upserts the one incident in place — proving the
+        // tracker is distinct-by-run and dedups rather than piling up.
+        s.ingest_at("acme", &[fan("orchestrator", "r4", now + 1)], now + 1);
+        let fanouts: Vec<_> = s
+            .incidents("acme")
+            .into_iter()
+            .filter(|i| i.kind == "fanout_explosion")
+            .collect();
+        assert_eq!(fanouts.len(), 1, "same incident, not a duplicate");
+        assert_eq!(fanouts[0].occurrences, 2);
+        assert_eq!(fanouts[0].last_seen_millis, now + 1);
+    }
+
+    /// Distinct runs older than `fanout_window_ms` are pruned and don't count
+    /// toward the threshold (mirrors `sustained_loop_window_prunes_stale_repeats`).
+    #[test]
+    fn fanout_window_prunes_stale_runs() {
+        let cfg = IncidentConfig {
+            fanout_runs: 3,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 10_000_000;
+        let fan = |run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: "orchestrator".into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+        // Two distinct runs far outside the 10-minute window, one now → the
+        // in-window distinct count prunes to 1, well under the threshold of 3.
+        s.ingest_at(
+            "acme",
+            &[
+                fan("r1", now - 5_000_000),
+                fan("r2", now - 4_000_000),
+                fan("r3", now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "stale runs pruned, under threshold"
+        );
+    }
+
+    /// Records with an empty `agent_id` never open a fanout incident — a blank
+    /// agent isn't a single agent fanning out.
+    #[test]
+    fn fanout_ignores_unattributed_runs() {
+        let cfg = IncidentConfig {
+            fanout_runs: 3,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 1_000_000;
+        let unattributed = |run: &str, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: "".into(),
+            decision: "allow".into(),
+            ts_millis: ts,
+            ..Default::default()
+        };
+        // Five distinct unattributed runs — far over the threshold, but blank
+        // agent_id must never fan out.
+        s.ingest_at(
+            "acme",
+            &[
+                unattributed("r1", now - 4),
+                unattributed("r2", now - 3),
+                unattributed("r3", now - 2),
+                unattributed("r4", now - 1),
+                unattributed("r5", now),
+            ],
+            now,
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "unattributed runs never fan out"
+        );
     }
 }
