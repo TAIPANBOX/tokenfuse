@@ -25,8 +25,8 @@ pub use backtest::{backtest, BacktestPolicy, BacktestReport};
 pub use breaker::{BreakerReason, BreakerVerdict};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
 pub use compliance::{
-    compute_compliance, ComplianceReport, ControlEvidence, ControlMapping, Enforcement, CATALOG,
-    DISCLAIMER, FRAMEWORK_VERSIONS,
+    compute_compliance, compute_compliance_from_counts, ComplianceReport, ControlEvidence,
+    ControlMapping, Enforcement, CATALOG, DISCLAIMER, FRAMEWORK_VERSIONS,
 };
 pub use dlp::DlpMode;
 pub use ledger::{BudgetError, Ledger, Reservation, RunSnapshot};

@@ -45,7 +45,7 @@ use crate::store::{
     ),
     paths(
         ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        incidents, ack_incident, audit, audit_verify, pair_new, pair, register_apns,
+        incidents, ack_incident, compliance, audit, audit_verify, pair_new, pair, register_apns,
         register_activity,
     ),
     components(schemas(
@@ -57,6 +57,8 @@ use crate::store::{
         Alert,
         SeriesBucket,
         Incident,
+        ComplianceReportSchema,
+        ControlEvidenceSchema,
         AuditEntrySchema,
         AuditVerifyResponse,
         IngestBody,
@@ -283,6 +285,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/budgets", get(budgets))
         .route("/v1/incidents", get(incidents))
         .route("/v1/incidents/{id}/ack", post(ack_incident))
+        .route("/v1/compliance", get(compliance))
         .route("/v1/audit", get(audit))
         .route("/v1/audit/verify", get(audit_verify))
         .route("/v1/pair/new", post(pair_new))
@@ -443,6 +446,47 @@ struct AuditEntrySchema {
     detail: String,
     prev_hash: String,
     entry_hash: String,
+}
+
+/// OpenAPI mirror of `tokenfuse_core::compliance::ControlEvidence` — one
+/// control's realized evidence. The `/v1/compliance` handler returns the core
+/// type, which serializes identically; the schema lives here (not deriving
+/// `ToSchema` in core) to keep `tokenfuse-core` free of the `utoipa` dependency.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct ControlEvidenceSchema {
+    control_id: String,
+    title: String,
+    /// Honesty classification, serialized lowercase (`enforced`/`partial`/
+    /// `documented`).
+    #[schema(value_type = String, example = "enforced")]
+    enforcement: String,
+    /// Watched wire `decision` -> times it fired.
+    decision_counts: HashMap<String, u64>,
+    /// Watched finding `kind` -> times it appeared.
+    finding_counts: HashMap<String, u64>,
+    /// Cloud incidents aggregating into this control.
+    incident_count: u64,
+    covered: bool,
+    evidence_seen: bool,
+}
+
+/// OpenAPI mirror of `tokenfuse_core::compliance::ComplianceReport` — the full
+/// evidence pack returned by `/v1/compliance`. Mirrors the core shape exactly
+/// (the handler returns the core type). `framework_versions` is a list of
+/// `[framework_id, human_name, version_or_retrieval_date]` triples.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct ComplianceReportSchema {
+    /// Standing disclaimer — this is evidence, not a certification.
+    generated_note: String,
+    /// `[framework_id, human_name, version]` triples the mappings were cited
+    /// against.
+    framework_versions: Vec<Vec<String>>,
+    /// Per-control realized evidence, in catalog order.
+    controls: Vec<ControlEvidenceSchema>,
+    decisions_total: u64,
+    findings_total: u64,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -820,6 +864,42 @@ async fn ack_incident(
     } else {
         error(StatusCode::NOT_FOUND, "unknown incident")
     }
+}
+
+/// The caller org's compliance evidence pack: the control catalog projected
+/// against the org's live decision + incident evidence. Readable by any role
+/// (like the other reads); a paid feature.
+///
+/// The cloud path has **incident** evidence but no **finding** evidence: MCP
+/// scans aren't ingested to the control plane, so the findings map is empty
+/// here. This is the exact mirror of the CLI path (`compute_compliance`), which
+/// has scan findings but no incidents — both are honest partial views, and both
+/// go through the same `compute_compliance_from_counts` kernel.
+#[utoipa::path(
+    get, path = "/v1/compliance",
+    responses(
+        (status = 200, description = "compliance evidence pack", body = ComplianceReportSchema),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 402, description = "plan required", body = PlanRequiredResponse),
+    ),
+    tag = "reads"
+)]
+async fn compliance(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(st.plan_for_org(&org), Feature::Compliance) {
+        return plan_required(&org, d.feature);
+    }
+    // Findings map is intentionally empty: scans aren't ingested to the plane
+    // (see the fn doc). Incident evidence comes from the folded incident kinds.
+    let report = tokenfuse_core::compliance::compute_compliance_from_counts(
+        tokenfuse_core::compliance::CATALOG,
+        &st.store.decision_counts(&org),
+        &std::collections::BTreeMap::new(),
+        &st.store.incident_kind_counts(&org),
+    );
+    (StatusCode::OK, Json(report)).into_response()
 }
 
 /// The caller org's tamper-evident audit trail of control-plane mutations,

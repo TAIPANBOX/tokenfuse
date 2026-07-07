@@ -41,6 +41,9 @@ pub enum Feature {
     DevicePush,
     /// Tamper-evident audit trail of control-plane mutations (read + verify).
     Audit,
+    /// Compliance evidence pack (control catalog projected against the org's
+    /// live decision + incident evidence).
+    Compliance,
 }
 
 impl Feature {
@@ -56,6 +59,7 @@ impl Feature {
             Feature::Incidents => "incidents",
             Feature::DevicePush => "device_push",
             Feature::Audit => "audit",
+            Feature::Compliance => "compliance",
         }
     }
 }
@@ -82,7 +86,7 @@ pub fn gate(plan: Plan, feature: Feature) -> Result<(), Denied> {
 mod tests {
     use super::*;
 
-    const ALL: [Feature; 8] = [
+    const ALL: [Feature; 9] = [
         Feature::FleetReads,
         Feature::CrossFleetKill,
         Feature::CentralBudgets,
@@ -91,6 +95,7 @@ mod tests {
         Feature::Incidents,
         Feature::DevicePush,
         Feature::Audit,
+        Feature::Compliance,
     ];
 
     #[test]

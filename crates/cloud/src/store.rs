@@ -4,7 +4,7 @@
 //! (`Load`/`Save`/autosave) is added in a follow-up — see
 //! docs/14-mobile-companion.md, PR A3.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -292,6 +292,11 @@ struct Inner {
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
     savings: HashMap<String, SavingsAcc>,
+    /// org → wire `decision` string → total occurrences (persisted). Folded in
+    /// [`Store::ingest`] over EVERY record — including blocked ones, since a
+    /// block is compliance *evidence* (the guard fired), not spend. Feeds the
+    /// `/v1/compliance` evidence pack.
+    decision_counts: HashMap<String, HashMap<String, u64>>,
     /// org → incident id → aggregated incident (persisted)
     incidents: HashMap<String, HashMap<String, Incident>>,
     /// org → append-only, hash-chained audit trail of control-plane mutations
@@ -327,6 +332,7 @@ struct SnapshotRef<'a> {
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
+    decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
     audit: &'a HashMap<String, Vec<AuditEntry>>,
 }
@@ -345,6 +351,10 @@ struct SnapshotOwned {
     /// `savings()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
     savings: HashMap<String, SavingsAcc>,
+    /// Missing on pre-compliance snapshots — `default` loads empty, so
+    /// `decision_counts()` reports zeros until fresh telemetry accumulates.
+    #[serde(default)]
+    decision_counts: HashMap<String, HashMap<String, u64>>,
     /// Missing on pre-incident snapshots — `default` loads to no open
     /// incidents (incl. their `last_notified_millis` push-dedup clock).
     #[serde(default)]
@@ -415,11 +425,16 @@ impl Store {
             {
                 let runs = inner.orgs.entry(org.to_string()).or_default();
                 let sav = inner.savings.entry(org.to_string()).or_default();
+                let dc = inner.decision_counts.entry(org.to_string()).or_default();
                 for r in records {
                     let agg = runs.entry(r.run_id.clone()).or_insert_with(|| RunAgg {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
+                    // Compliance evidence: count EVERY record's decision,
+                    // including blocked ones (a block is a guard firing, not
+                    // spend). `/v1/compliance` reads this per-org tally.
+                    *dc.entry(r.decision.clone()).or_insert(0) += 1;
                     // Blocked calls are stored and counted, but their
                     // cost_microusd (avoided spend, or 0 for security blocks)
                     // must not inflate the org's real spend total.
@@ -719,6 +734,32 @@ impl Store {
         }
     }
 
+    /// An org's per-`decision` occurrence tally (every ingested record's wire
+    /// `decision`, blocked or not). The compliance evidence pack projects the
+    /// control catalog against this. Empty for an org with no telemetry.
+    pub fn decision_counts(&self, org: &str) -> BTreeMap<String, u64> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .decision_counts
+            .get(org)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// An org's open incidents folded by `kind` (one count per distinct
+    /// incident, matching how `incidents()` aggregates them). Feeds the
+    /// incident evidence column of the compliance report.
+    pub fn incident_kind_counts(&self, org: &str) -> BTreeMap<String, u64> {
+        let inner = self.inner.read().unwrap();
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        if let Some(m) = inner.incidents.get(org) {
+            for inc in m.values() {
+                *out.entry(inc.kind.clone()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
     /// An org's open incidents, most-recently-seen first.
     pub fn incidents(&self, org: &str) -> Vec<Incident> {
         let inner = self.inner.read().unwrap();
@@ -897,6 +938,7 @@ impl Store {
                 budgets: &inner.budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
+                decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
                 audit: &inner.audit,
             };
@@ -924,6 +966,7 @@ impl Store {
         inner.budgets = snap.budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
+        inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;
         inner.audit = snap.audit;
         Ok(())
@@ -1498,6 +1541,72 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn decision_counts_accumulate_and_persist() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-decisions.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                block_at("r1", "allow", 1000, 10),
+                block_at("r1", "budget_exceeded", 0, 20),
+                block_at("r2", "budget_exceeded", 0, 30),
+                block_at("r2", "loop_detected", 0, 40),
+                block_at("r3", "allow", 500, 50),
+            ],
+        );
+        // Every decision — blocked or not — is tallied.
+        let dc = s.decision_counts("acme");
+        assert_eq!(dc.get("allow").copied(), Some(2));
+        assert_eq!(dc.get("budget_exceeded").copied(), Some(2));
+        assert_eq!(dc.get("loop_detected").copied(), Some(1));
+        // Orgs are isolated.
+        assert!(s.decision_counts("other").is_empty());
+
+        s.save(&path).expect("save");
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        let dc2 = s2.decision_counts("acme");
+        assert_eq!(dc2.get("budget_exceeded").copied(), Some(2));
+        assert_eq!(dc2.get("loop_detected").copied(), Some(1));
+
+        // An old snapshot with no `decision_counts` field loads to empty.
+        let old = dir.join(format!("tf-cloud-{}-olddc.json", std::process::id()));
+        std::fs::write(
+            &old,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{}}"#,
+        )
+        .expect("write old snapshot");
+        let s3 = Store::new();
+        s3.load(&old).expect("load old snapshot");
+        assert!(s3.decision_counts("acme").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&old);
+    }
+
+    #[test]
+    fn incident_kind_counts_fold_by_kind() {
+        let s = Store::new();
+        let now = 1_000_000;
+        // Three budget-protection blocks on one run trip a budget_exhausted.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "budget_exceeded", 1000, now - 2),
+                block_at("r1", "budget_exceeded", 1000, now - 1),
+                block_at("r1", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        let counts = s.incident_kind_counts("acme");
+        assert_eq!(counts.get("budget_exhausted").copied(), Some(1));
+        assert!(s.incident_kind_counts("other").is_empty());
     }
 
     #[test]

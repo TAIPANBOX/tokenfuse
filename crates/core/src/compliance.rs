@@ -456,39 +456,72 @@ pub fn compute_compliance(
     calls: &[savings::Call],
     findings: &[Finding],
 ) -> ComplianceReport {
+    // Aggregate the trace into per-decision / per-finding counts, then delegate
+    // to the shared [`compute_compliance_from_counts`] so the CLI (this path)
+    // and the Cloud `/v1/compliance` endpoint compute coverage identically. The
+    // CLI trace carries no incidents (they live in the cloud store), so the
+    // incident map is empty here — the mirror of the cloud path, which has
+    // incident evidence but no scan findings.
+    let mut decision_counts: BTreeMap<String, u64> = BTreeMap::new();
+    for call in calls {
+        *decision_counts.entry(call.decision.clone()).or_insert(0) += 1;
+    }
+    let mut finding_counts: BTreeMap<String, u64> = BTreeMap::new();
+    for f in findings {
+        *finding_counts.entry(f.kind.clone()).or_insert(0) += 1;
+    }
+    compute_compliance_from_counts(catalog, &decision_counts, &finding_counts, &BTreeMap::new())
+}
+
+/// Project the `catalog` against pre-aggregated evidence counts into a
+/// [`ComplianceReport`]. This is the shared kernel behind both
+/// [`compute_compliance`] (the CLI, which folds a Parquet trace + a scan report
+/// into these maps) and the Cloud `/v1/compliance` endpoint (which folds the
+/// live per-org rollup: ingested `decision` counts + incident-kind counts).
+///
+/// - `decision_counts`: wire `decision` string -> total occurrences observed.
+/// - `finding_counts`: MCP finding `kind` -> total occurrences observed.
+/// - `incident_counts`: Cloud incident `kind` -> count for the org.
+///
+/// Each control's per-key maps are seeded from its `evidence_*` watch-lists (so
+/// a watched key it never saw is reported at `0`, documenting what the control
+/// watches), and its `incident_count` sums `incident_counts` over the control's
+/// `evidence_incident_kinds`. The `covered` / `evidence_seen` rule is exactly
+/// the one documented on [`compute_compliance`].
+pub fn compute_compliance_from_counts(
+    catalog: &[ControlMapping],
+    decision_counts: &BTreeMap<String, u64>,
+    finding_counts: &BTreeMap<String, u64>,
+    incident_counts: &BTreeMap<String, u64>,
+) -> ComplianceReport {
     let controls = catalog
         .iter()
         .map(|c| {
-            // Seed the maps with every watched key at 0 so the report documents
-            // what each control watches even when nothing fired.
-            let mut decision_counts: BTreeMap<String, u64> = c
+            // Seed the maps with every watched key (looking up its observed
+            // count, or 0) so the report documents what each control watches
+            // even when nothing fired.
+            let decision_counts_c: BTreeMap<String, u64> = c
                 .evidence_decisions
                 .iter()
-                .map(|d| (d.to_string(), 0))
+                .map(|d| (d.to_string(), decision_counts.get(*d).copied().unwrap_or(0)))
                 .collect();
-            for call in calls {
-                if let Some(v) = decision_counts.get_mut(&call.decision) {
-                    *v += 1;
-                }
-            }
 
-            let mut finding_counts: BTreeMap<String, u64> = c
+            let finding_counts_c: BTreeMap<String, u64> = c
                 .evidence_finding_kinds
                 .iter()
-                .map(|k| (k.to_string(), 0))
+                .map(|k| (k.to_string(), finding_counts.get(*k).copied().unwrap_or(0)))
                 .collect();
-            for f in findings {
-                if let Some(v) = finding_counts.get_mut(&f.kind) {
-                    *v += 1;
-                }
-            }
 
-            // Incidents are not in the gateway trace — the later cloud endpoint
-            // fills this. Left explicit so the field's origin is unambiguous.
-            let incident_count = 0u64;
+            // Incident evidence: sum the org's incident-kind counts over the
+            // kinds this control aggregates. Empty on the CLI path.
+            let incident_count: u64 = c
+                .evidence_incident_kinds
+                .iter()
+                .map(|k| incident_counts.get(*k).copied().unwrap_or(0))
+                .sum();
 
-            let decisions_seen: u64 = decision_counts.values().sum();
-            let findings_seen: u64 = finding_counts.values().sum();
+            let decisions_seen: u64 = decision_counts_c.values().sum();
+            let findings_seen: u64 = finding_counts_c.values().sum();
             let evidence_seen = decisions_seen > 0 || findings_seen > 0 || incident_count > 0;
 
             // Preventive == blocks on the wire (has decision evidence). Detective
@@ -501,8 +534,8 @@ pub fn compute_compliance(
                 control_id: c.control_id,
                 title: c.title,
                 enforcement: c.enforcement,
-                decision_counts,
-                finding_counts,
+                decision_counts: decision_counts_c,
+                finding_counts: finding_counts_c,
                 incident_count,
                 covered,
                 evidence_seen,
@@ -514,8 +547,8 @@ pub fn compute_compliance(
         generated_note: DISCLAIMER,
         framework_versions: FRAMEWORK_VERSIONS,
         controls,
-        decisions_total: calls.len() as u64,
-        findings_total: findings.len() as u64,
+        decisions_total: decision_counts.values().sum(),
+        findings_total: finding_counts.values().sum(),
     }
 }
 
@@ -894,6 +927,58 @@ mod projection_tests {
         assert_eq!(report.generated_note, DISCLAIMER);
         assert_eq!(report.framework_versions.len(), FRAMEWORK_VERSIONS.len());
         assert_eq!(report.controls.len(), CATALOG.len());
+    }
+
+    #[test]
+    fn compute_compliance_agrees_with_from_counts() {
+        // The two entry points must produce an identical report for the same
+        // data: the CLI folds a trace + scan into counts internally, and
+        // building the same count maps by hand and calling the counts kernel
+        // must agree exactly (the cloud endpoint uses that kernel directly).
+        let calls = vec![
+            call("a", "allow"),
+            call("a", "budget_exceeded"),
+            call("b", "budget_exceeded"),
+            call("b", "loop_detected"),
+            call("c", "allow"),
+        ];
+        let findings = vec![finding("poisoning"), finding("rug_pull")];
+
+        let via_trace = compute_compliance(CATALOG, &calls, &findings);
+
+        // Aggregate the same data into the count maps the kernel consumes.
+        let mut decision_counts: BTreeMap<String, u64> = BTreeMap::new();
+        for c in &calls {
+            *decision_counts.entry(c.decision.clone()).or_insert(0) += 1;
+        }
+        let mut finding_counts: BTreeMap<String, u64> = BTreeMap::new();
+        for f in &findings {
+            *finding_counts.entry(f.kind.clone()).or_insert(0) += 1;
+        }
+        let via_counts = compute_compliance_from_counts(
+            CATALOG,
+            &decision_counts,
+            &finding_counts,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(via_trace, via_counts);
+    }
+
+    #[test]
+    fn from_counts_populates_incident_evidence() {
+        // The cloud-only path: incident-kind counts light up a preventive
+        // control's incident_count (TF.BUDGET watches budget_exhausted +
+        // spend_spike) even with no decisions/findings in the maps.
+        let mut incidents: BTreeMap<String, u64> = BTreeMap::new();
+        incidents.insert("budget_exhausted".into(), 2);
+        incidents.insert("spend_spike".into(), 1);
+        let report =
+            compute_compliance_from_counts(CATALOG, &BTreeMap::new(), &BTreeMap::new(), &incidents);
+        let budget = control(&report, "TF.BUDGET");
+        assert_eq!(budget.incident_count, 3);
+        assert!(budget.evidence_seen);
+        assert!(budget.covered);
     }
 
     #[test]

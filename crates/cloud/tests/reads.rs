@@ -293,6 +293,97 @@ async fn incidents_endpoint_lists_for_viewer_and_rejects_unauth() {
 }
 
 #[tokio::test]
+async fn compliance_reports_decision_and_incident_evidence() {
+    let (state, store) = test_state();
+    // A mix: allows, a budget_exceeded + a loop_detected (each seen once), plus
+    // three more budget_exceeded on one run to trip a budget_exhausted incident
+    // (default threshold 3).
+    store.ingest(
+        "acme",
+        &[
+            CallRecord {
+                run_id: "r1".into(),
+                decision: "allow".into(),
+                cost_microusd: 1000,
+                ts_millis: 10,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r2".into(),
+                decision: "loop_detected".into(),
+                ts_millis: 20,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "hot".into(),
+                decision: "budget_exceeded".into(),
+                ts_millis: 30,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "hot".into(),
+                decision: "budget_exceeded".into(),
+                ts_millis: 40,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "hot".into(),
+                decision: "budget_exceeded".into(),
+                ts_millis: 50,
+                ..Default::default()
+            },
+        ],
+    );
+
+    // A viewer may read the compliance evidence pack.
+    let (status, v) = get(&state, "/v1/compliance", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Disclaimer + framework versions present.
+    assert!(v["generated_note"]
+        .as_str()
+        .unwrap()
+        .contains("not a certification"));
+    assert!(!v["framework_versions"].as_array().unwrap().is_empty());
+    // Every decision was tallied (2 allow-ish? one allow, one loop, three budget).
+    assert_eq!(v["decisions_total"], 5);
+    // No findings on the cloud path.
+    assert_eq!(v["findings_total"], 0);
+
+    let controls = v["controls"].as_array().expect("controls array");
+    let by_id = |id: &str| controls.iter().find(|c| c["control_id"] == id).unwrap();
+
+    // TF.BUDGET watches budget_exceeded (seen 3×) and folds the tripped
+    // budget_exhausted incident.
+    let budget = by_id("TF.BUDGET");
+    assert_eq!(budget["decision_counts"]["budget_exceeded"], 3);
+    assert_eq!(budget["incident_count"], 1);
+    assert_eq!(budget["covered"], true);
+    assert_eq!(budget["evidence_seen"], true);
+
+    // TF.LOOP watches loop_detected (seen 1×); one loop is under the incident
+    // threshold, so no sustained_loop incident.
+    let loops = by_id("TF.LOOP");
+    assert_eq!(loops["decision_counts"]["loop_detected"], 1);
+    assert_eq!(loops["incident_count"], 0);
+    assert_eq!(loops["covered"], true);
+
+    // A detective control with no findings is Enforced but not covered.
+    let poison = by_id("TF.MCP.POISON");
+    assert_eq!(poison["covered"], false);
+    assert_eq!(poison["evidence_seen"], false);
+}
+
+#[tokio::test]
+async fn compliance_requires_a_valid_key() {
+    let (state, _) = test_state();
+    let (no_key, _) = get(&state, "/v1/compliance", None).await;
+    assert_eq!(no_key, StatusCode::UNAUTHORIZED);
+    let (wrong_key, _) = get(&state, "/v1/compliance", Some("nope")).await;
+    assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn reads_require_a_valid_key() {
     let (state, _) = test_state();
     let (no_key, _) = get(&state, "/v1/runs", None).await;
