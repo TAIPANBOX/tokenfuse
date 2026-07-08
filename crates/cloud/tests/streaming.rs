@@ -82,6 +82,22 @@ async fn series_sums_match_the_summary() {
     assert_eq!(calls, 2);
 }
 
+/// A request for an absurd window/step (`?window=2592000s&step=1ms`, which
+/// naively asks for ~2.6 billion buckets) must not crash the process or hang —
+/// the response is capped, not rejected, and stays well under the store's
+/// `MAX_SERIES_BUCKETS`.
+#[tokio::test]
+async fn series_with_absurd_window_and_step_is_capped_not_unbounded() {
+    let state = state();
+    let buckets = get_json(&state, "/v1/series?window=2592000s&step=1ms").await;
+    let arr = buckets.as_array().expect("series is an array");
+    assert!(
+        arr.len() <= 10_000,
+        "expected a capped bucket count, got {}",
+        arr.len()
+    );
+}
+
 #[tokio::test]
 async fn stream_emits_incident_event() {
     use http_body_util::BodyExt;

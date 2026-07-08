@@ -23,12 +23,60 @@ const NONCE_CAP: usize = 4096;
 /// not persisted — historical analytics live in the gateway's Parquet sink).
 const SERIES_CAP: usize = 100_000;
 
+/// Hard cap on the number of buckets [`Store::series`] will ever allocate,
+/// regardless of the requested `window`/`step`. Without this, any
+/// authenticated viewer (`/v1/series` only requires `FleetReads`, so a viewer
+/// key on a Paid org qualifies) could request e.g. `window=2592000s&step=1ms`
+/// and force a ~80GB `Vec` allocation, crashing the shared process for every
+/// org. Enforced here — not just in the HTTP query parsing — so the store is
+/// safe regardless of what calls it.
+const MAX_SERIES_BUCKETS: usize = 10_000;
+
 /// Whether a call record represents a blocked decision (as opposed to a
 /// settled call: `allow`/`cache_hit`). Blocked records are still stored and
 /// counted, but their `cost_microusd` — an avoided-spend estimate, or 0 for
 /// security blocks — must never be summed into real spend (see `ingest`).
 fn is_blocked(decision: &str) -> bool {
     !matches!(decision, "allow" | "cache_hit")
+}
+
+/// True for wire `decision` values ingest evidence is trusted for: the two
+/// non-blocking outcomes (`"allow"`, `"cache_hit"`) plus every
+/// `tokenfuse_core::BreakerReason::as_wire_str()` value (`budget_exceeded`,
+/// `policy_violation`, `loop_detected`, `killed`, `wasm_policy`,
+/// `taint_blocked`, `dlp_blocked` — see `crates/core/src/breaker.rs`).
+///
+/// `/v1/ingest` is intentionally ungated: ANY authenticated org principal,
+/// including a read-only viewer key, may POST a batch (ADR-3, so a gateway
+/// never loses telemetry over a stale/rotated key). That means the
+/// `decision` string in a record is untrusted input from whichever principal
+/// is calling — not necessarily the gateway's own guard firing. Without this
+/// allow-list, a viewer key could POST a fabricated `decision` (e.g.
+/// `"pwned"`) to inflate/pollute `/v1/compliance`'s `decision_counts` or, were
+/// a detector ever loosened to match on an arbitrary string, forge an
+/// incident. An unrecognized decision still updates the run's `calls` (and,
+/// via the existing `is_blocked` gate, is treated as non-spend) so a gateway
+/// shipping a not-yet-adopted decision kind doesn't silently lose accounting
+/// — it just never becomes compliance/incident evidence until this list is
+/// extended for it. This also bounds `decision_counts` to ~9 keys per org.
+///
+/// Hardcoded rather than iterating the enum (Rust has no built-in enum
+/// iteration) — mirrors the same tradeoff `compliance.rs::ALL_REASONS` makes
+/// in `tokenfuse-core`; see `known_decisions_cover_every_breaker_reason` below
+/// for the test that keeps this list honest against `BreakerReason`.
+fn is_known_decision(decision: &str) -> bool {
+    matches!(
+        decision,
+        "allow"
+            | "cache_hit"
+            | "budget_exceeded"
+            | "policy_violation"
+            | "loop_detected"
+            | "killed"
+            | "wasm_policy"
+            | "taint_blocked"
+            | "dlp_blocked"
+    )
 }
 
 /// One settled call, pushed by a gateway's `CloudSink`. The wire shape matches
@@ -408,6 +456,15 @@ impl Store {
     /// burn-rate series, run incident detection, and broadcast a `run_update`
     /// per affected run plus an `incident` per tripped detector. Uses the store's
     /// own wall clock; see [`Store::ingest_at`] for the testable inner form.
+    ///
+    /// Honesty note: `/v1/ingest` authenticates the ORG CREDENTIAL presented on
+    /// the request (any role — an org's own viewer key qualifies, ADR-3), not
+    /// the gateway process cryptographically. There is currently no
+    /// gateway-specific credential, so this store cannot distinguish "the real
+    /// gateway pushed this" from "some holder of an org key pushed this" — a
+    /// gateway-specific credential is future work. `decision` is accordingly
+    /// treated as untrusted per-record input and gated through
+    /// [`is_known_decision`] before it can become compliance/incident evidence.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
         self.ingest_at(org, records, now_millis());
     }
@@ -432,10 +489,15 @@ impl Store {
                         run_id: r.run_id.clone(),
                         ..Default::default()
                     });
-                    // Compliance evidence: count EVERY record's decision,
-                    // including blocked ones (a block is a guard firing, not
-                    // spend). `/v1/compliance` reads this per-org tally.
-                    *dc.entry(r.decision.clone()).or_insert(0) += 1;
+                    // Compliance evidence: count every KNOWN record decision
+                    // (see `is_known_decision`), including blocked ones (a
+                    // block is a guard firing, not spend). `/v1/compliance`
+                    // reads this per-org tally; an unrecognized decision is
+                    // untrusted input (ingest is ungated — any org principal
+                    // can push a batch) and must not land here.
+                    if is_known_decision(&r.decision) {
+                        *dc.entry(r.decision.clone()).or_insert(0) += 1;
+                    }
                     // Blocked calls are stored and counted, but their
                     // cost_microusd (avoided spend, or 0 for security blocks)
                     // must not inflate the org's real spend total.
@@ -504,8 +566,14 @@ impl Store {
                 let ts = if r.ts_millis > 0 { r.ts_millis } else { now_ms };
                 let agent = (!r.agent_id.is_empty()).then(|| r.agent_id.clone());
 
-                // budget_exhausted (High): ≥ N budget-protection blocks per run.
-                if tokenfuse_core::savings::is_budget_protection(&r.decision) {
+                // budget_exhausted (High): ≥ N budget-protection blocks per
+                // run. Gated on `is_known_decision` (belt-and-braces:
+                // `is_budget_protection`'s set is already a subset of known
+                // decisions, but this keeps the detector explicitly immune to
+                // an unrecognized/fabricated decision string).
+                if is_known_decision(&r.decision)
+                    && tokenfuse_core::savings::is_budget_protection(&r.decision)
+                {
                     let n = bump_tracker(
                         &mut inner.incident_tracker,
                         org,
@@ -529,8 +597,10 @@ impl Store {
                     }
                 }
 
-                // sustained_loop (Medium): ≥ N loop_detected for a run in-window.
-                if r.decision == "loop_detected" {
+                // sustained_loop (Medium): ≥ N loop_detected for a run
+                // in-window. `is_known_decision` guard for the same reason as
+                // `budget_exhausted` above.
+                if is_known_decision(&r.decision) && r.decision == "loop_detected" {
                     let n = bump_tracker(
                         &mut inner.incident_tracker,
                         org,
@@ -628,7 +698,10 @@ impl Store {
         let step = step_ms.max(1);
         let window = window_ms.max(step);
         let start = now_ms - window;
-        let n = (window / step).max(1) as usize;
+        // Capped so a caller can never force an unbounded allocation (see
+        // `MAX_SERIES_BUCKETS`); an absurd window/step combo just yields a
+        // truncated series rather than crashing the process.
+        let n = ((window / step).max(1) as usize).min(MAX_SERIES_BUCKETS);
         let mut buckets: Vec<SeriesBucket> = (0..n)
             .map(|i| SeriesBucket {
                 t: start + i as i64 * step,
@@ -787,6 +860,25 @@ impl Store {
         found
     }
 
+    /// [`Store::ack_incident`] plus its `control.incident_ack` audit entry,
+    /// folded into ONE write-lock acquisition (see [`append_audit_locked`]'s
+    /// doc) — the HTTP `ack_incident` handler uses this instead of two separate
+    /// locked calls. Preserves the not-found → `false` behavior: no audit entry
+    /// is written for an unknown incident id.
+    pub fn ack_incident_audited(&self, org: &str, id: &str, actor: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let mut found = false;
+        if let Some(inc) = inner.incidents.get_mut(org).and_then(|m| m.get_mut(id)) {
+            inc.acknowledged = true;
+            found = true;
+        }
+        if found {
+            inner.dirty = true;
+            append_audit_locked(&mut inner, org, actor, "control.incident_ack", id, "");
+        }
+        found
+    }
+
     /// Atomically decide whether to push for an incident and, if so, stamp its
     /// `last_notified_millis`. This makes that field the SINGLE source of truth
     /// for push dedup (see `push.rs`): returns `true` only when more than
@@ -810,12 +902,19 @@ impl Store {
     /// linking it to the current tip and stamping it with the store's wall
     /// clock. In-memory and infallible: callers log the action *after* the
     /// mutation succeeds, and an append never fails the mutation.
+    ///
+    /// Calling this as a SEPARATE step after a mutation (two lock
+    /// acquisitions) leaves a window where a crash, or the periodic autosave,
+    /// can persist the mutation with no matching audit entry — undercutting
+    /// the "tamper-evident audit of every mutation" contract. The HTTP
+    /// mutation handlers (`kill`, `set_budget`, `ack_incident`, `pair`) use the
+    /// `*_audited` store methods below instead, which do the mutation and this
+    /// append under ONE write-lock acquisition. This method remains for
+    /// standalone audit writes (and tests) that have no paired mutation.
     pub fn audit_append(&self, org: &str, actor: &str, action: &str, subject: &str, detail: &str) {
         let mut inner = self.inner.write().unwrap();
         inner.dirty = true;
-        let chain = inner.audit.entry(org.to_string()).or_default();
-        let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
-        chain.push(entry);
+        append_audit_locked(&mut inner, org, actor, action, subject, detail);
     }
 
     /// `org`'s audit chain, oldest first (append order). Empty when the org has
@@ -873,6 +972,27 @@ impl Store {
         });
     }
 
+    /// [`Store::kill`] plus its `control.kill` audit entry, folded into ONE
+    /// write-lock acquisition (see [`append_audit_locked`]'s doc) — the HTTP
+    /// `kill` handler uses this instead of calling `kill` then `audit_append` as
+    /// two separate locked sections.
+    pub fn kill_audited(&self, org: &str, run: &str, actor: &str) {
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.dirty = true;
+            inner
+                .killed
+                .entry(org.to_string())
+                .or_default()
+                .insert(run.to_string(), true);
+            append_audit_locked(&mut inner, org, actor, "control.kill", run, "mode=hard");
+        }
+        let _ = self.events.send(StreamEvent::Kill {
+            org: org.to_string(),
+            run: run.to_string(),
+        });
+    }
+
     /// The run ids an org has killed.
     pub fn kills(&self, org: &str) -> Vec<String> {
         let inner = self.inner.read().unwrap();
@@ -899,6 +1019,34 @@ impl Store {
                 .entry(org.to_string())
                 .or_default()
                 .insert(run.to_string(), micros);
+        }
+        let _ = self.events.send(StreamEvent::Budget {
+            org: org.to_string(),
+            run: run.to_string(),
+            budget_micros: micros,
+        });
+    }
+
+    /// [`Store::set_budget`] plus its `control.set_budget` audit entry, folded
+    /// into ONE write-lock acquisition (see [`append_audit_locked`]'s doc) — the
+    /// HTTP `set_budget` handler uses this instead of two separate locked calls.
+    pub fn set_budget_audited(&self, org: &str, run: &str, micros: i64, actor: &str) {
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.dirty = true;
+            inner
+                .budgets
+                .entry(org.to_string())
+                .or_default()
+                .insert(run.to_string(), micros);
+            append_audit_locked(
+                &mut inner,
+                org,
+                actor,
+                "control.set_budget",
+                run,
+                &format!("budget_micros={micros}"),
+            );
         }
         let _ = self.events.send(StreamEvent::Budget {
             org: org.to_string(),
@@ -1035,6 +1183,51 @@ impl Store {
         Some(device)
     }
 
+    /// [`Store::redeem_pairing`] plus its `control.pair` audit entry, folded
+    /// into ONE write-lock acquisition (see [`append_audit_locked`]'s doc) — the
+    /// HTTP `pair` handler uses this instead of a separate `audit_append` call.
+    /// The device self-redeemed (no bearer auth — the code was the credential,
+    /// checked at `pair/new`), so the audit actor is the device itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redeem_pairing_audited(
+        &self,
+        code: &str,
+        now_unix: i64,
+        device_id: String,
+        token: String,
+        pubkey_b64: String,
+        name: String,
+        platform: String,
+    ) -> Option<Device> {
+        let mut inner = self.inner.write().unwrap();
+        let pairing = inner.pairings.remove(code)?;
+        if pairing.expires_unix < now_unix {
+            return None;
+        }
+        let device = Device {
+            device_id,
+            org: pairing.org,
+            role: pairing.role,
+            name,
+            platform,
+            pubkey_b64,
+            apns_token: None,
+        };
+        inner.dirty = true;
+        inner.devices.insert(token, device.clone());
+        let actor = format!("device:{}", device.device_id);
+        let detail = format!("role={};platform={}", device.role, device.platform);
+        append_audit_locked(
+            &mut inner,
+            &device.org,
+            &actor,
+            "control.pair",
+            &device.device_id,
+            &detail,
+        );
+        Some(device)
+    }
+
     /// The device a bearer `token` maps to, if any.
     pub fn device_by_token(&self, token: &str) -> Option<Device> {
         self.inner.read().unwrap().devices.get(token).cloned()
@@ -1126,6 +1319,23 @@ impl Store {
         inner.dirty = false;
         d
     }
+}
+
+/// Append an audit entry to `org`'s chain given an already-held write guard —
+/// the shared building block for [`Store::audit_append`] and the `*_audited`
+/// mutation methods, which fold a mutation and its audit record into ONE lock
+/// acquisition so the two can never be observed/persisted independently.
+fn append_audit_locked(
+    inner: &mut Inner,
+    org: &str,
+    actor: &str,
+    action: &str,
+    subject: &str,
+    detail: &str,
+) {
+    let chain = inner.audit.entry(org.to_string()).or_default();
+    let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
+    chain.push(entry);
 }
 
 /// The store's wall clock in epoch millis — the "now" `ingest` feeds detection
@@ -1607,6 +1817,85 @@ mod tests {
         let _ = std::fs::remove_file(&old);
     }
 
+    /// `is_known_decision` must accept every real `BreakerReason` wire string
+    /// plus `allow`/`cache_hit`, and reject the rest — the exact list a
+    /// fabricated `decision` (see `ingest_ignores_fabricated_decisions` below)
+    /// must fail to join.
+    #[test]
+    fn known_decisions_cover_every_breaker_reason() {
+        use tokenfuse_core::BreakerReason;
+        // Mirrors `compliance.rs::ALL_REASONS` in `tokenfuse-core`: hardcoded
+        // so a new `BreakerReason` variant doesn't silently slip past this
+        // list unnoticed (it still compiles either way, but a reviewer diffing
+        // this array against the enum will catch it).
+        const ALL: [BreakerReason; 7] = [
+            BreakerReason::BudgetExceeded,
+            BreakerReason::PolicyViolation,
+            BreakerReason::LoopDetected,
+            BreakerReason::Killed,
+            BreakerReason::WasmPolicy,
+            BreakerReason::TaintBlocked,
+            BreakerReason::DlpBlocked,
+        ];
+        for r in ALL {
+            assert!(
+                is_known_decision(r.as_wire_str()),
+                "{} missing from the allow-list",
+                r.as_wire_str()
+            );
+        }
+        assert!(is_known_decision("allow"));
+        assert!(is_known_decision("cache_hit"));
+        assert!(!is_known_decision("pwned"));
+        assert!(!is_known_decision(""));
+    }
+
+    /// A viewer key (or any org principal — `/v1/ingest` is intentionally
+    /// ungated) POSTing a fabricated `decision` string must not be able to
+    /// pollute `/v1/compliance` evidence or forge an incident. A real
+    /// `budget_exceeded`, by contrast, must still do both.
+    #[test]
+    fn ingest_ignores_fabricated_decisions_for_compliance_and_incidents() {
+        let s = Store::new();
+        let now = 1_000_000;
+
+        // A fabricated decision: counted toward calls, but must not appear in
+        // decision_counts or drive any detector.
+        s.ingest_at("acme", &[block_at("r1", "pwned", 0, now)], now);
+        assert!(
+            !s.decision_counts("acme").contains_key("pwned"),
+            "fabricated decision must not appear in decision_counts"
+        );
+        assert!(
+            s.incidents("acme").is_empty(),
+            "fabricated decision must not create an incident"
+        );
+        assert_eq!(s.runs("acme")[0].calls, 1, "calls still accounted for");
+
+        // The real budget_exceeded reason, three times, still trips
+        // budget_exhausted AND lands in decision_counts — proving the
+        // allow-list doesn't just silently swallow everything.
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r2", "budget_exceeded", 1000, now),
+                block_at("r2", "budget_exceeded", 1000, now),
+                block_at("r2", "budget_exceeded", 1000, now),
+            ],
+            now,
+        );
+        assert_eq!(
+            s.decision_counts("acme").get("budget_exceeded").copied(),
+            Some(3)
+        );
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .any(|i| i.id == "budget_exhausted:r2"),
+            "real budget_exceeded must still trip an incident"
+        );
+    }
+
     #[test]
     fn incident_kind_counts_fold_by_kind() {
         let s = Store::new();
@@ -1715,6 +2004,94 @@ mod tests {
         let _ = std::fs::remove_file(&old);
     }
 
+    /// The `*_audited` methods fold a mutation and its audit entry into ONE
+    /// write-lock acquisition, so the two are never observable independently —
+    /// unlike the plain `kill`/`set_budget`/`ack_incident` + a separate
+    /// `audit_append`, which leaves a window where a crash or the periodic
+    /// autosave could persist the mutation with no matching audit entry. This
+    /// proves the mutation effect and its audit entry are always observed (and
+    /// persisted) TOGETHER: after a kill and a set_budget, exactly the expected
+    /// two audit entries exist, the chain verifies, and a single saved snapshot
+    /// carries both the mutation state and the matching audit entries.
+    #[test]
+    fn audited_mutations_are_atomic_with_their_audit_entry() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tf-cloud-{}-atomic.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let s = Store::new();
+        s.kill_audited("acme", "r1", "key:abc123");
+        s.set_budget_audited("acme", "r1", 2_500_000, "key:abc123");
+
+        // The mutation effects are live...
+        assert!(s.runs("acme").is_empty(), "no telemetry ingested yet");
+        assert_eq!(s.kills("acme"), vec!["r1".to_string()]);
+        assert_eq!(s.budgets("acme")["r1"], 2_500_000);
+
+        // ...and exactly the expected audit entries exist, chained and
+        // verifiable — nothing extra, nothing missing.
+        let chain = s.audit("acme");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].action, "control.kill");
+        assert_eq!(chain[0].subject, "r1");
+        assert_eq!(chain[0].actor, "key:abc123");
+        assert_eq!(chain[1].action, "control.set_budget");
+        assert_eq!(chain[1].detail, "budget_micros=2500000");
+        assert_eq!(chain[1].prev_hash, chain[0].entry_hash);
+        assert_eq!(s.audit_verify("acme"), Ok(()));
+
+        // The point: a single snapshot (one save, one load — no window for the
+        // mutation and its audit record to diverge) carries BOTH the mutation
+        // state and its audit entries together.
+        s.save(&path).expect("save");
+        let s2 = Store::new();
+        s2.load(&path).expect("load");
+        assert_eq!(s2.kills("acme"), vec!["r1".to_string()]);
+        assert_eq!(s2.budgets("acme")["r1"], 2_500_000);
+        assert_eq!(s2.audit("acme").len(), 2);
+        assert_eq!(s2.audit_verify("acme"), Ok(()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// [`Store::ack_incident_audited`] preserves the not-found → `false`
+    /// behavior of the plain `ack_incident`, and — unlike a separate
+    /// mutate-then-`audit_append` pair — never writes an audit entry for an
+    /// unknown incident id (there is no mutation to pair it with).
+    #[test]
+    fn ack_incident_audited_writes_no_audit_entry_when_not_found() {
+        let s = Store::new();
+        assert!(!s.ack_incident_audited("acme", "nope", "key:abc123"));
+        assert!(s.audit("acme").is_empty(), "no mutation, no audit entry");
+    }
+
+    /// [`Store::redeem_pairing_audited`] registers the device AND appends the
+    /// `control.pair` audit entry atomically — both observable together.
+    #[test]
+    fn redeem_pairing_audited_registers_device_and_audits_together() {
+        let s = Store::new();
+        s.create_pairing("code-1", "acme", "admin", 9_999_999_999);
+        let dev = s
+            .redeem_pairing_audited(
+                "code-1",
+                0,
+                "dev-1".into(),
+                "tok-1".into(),
+                "pubkey".into(),
+                "iphone".into(),
+                "ios".into(),
+            )
+            .expect("pairing redeemed");
+        assert_eq!(dev.org, "acme");
+
+        let chain = s.audit("acme");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].action, "control.pair");
+        assert_eq!(chain[0].subject, "dev-1");
+        assert_eq!(chain[0].actor, "device:dev-1");
+        assert_eq!(chain[0].detail, "role=admin;platform=ios");
+    }
+
     #[test]
     fn dirty_flag_tracks_mutations() {
         let s = Store::new();
@@ -1769,6 +2146,18 @@ mod tests {
             .map(|b| b.cost_microusd)
             .sum();
         assert_eq!(none, 0);
+    }
+
+    /// A huge window paired with a tiny step must never allocate more than
+    /// [`MAX_SERIES_BUCKETS`] — the DoS this guards against (`?window=2592000s
+    /// &step=1ms` would otherwise ask for ~2.6 billion buckets).
+    #[test]
+    fn series_bucket_count_is_capped() {
+        let s = Store::new();
+        let now = 10_000;
+        let buckets = s.series("acme", None, 2_592_000_000, 1, now);
+        assert_eq!(buckets.len(), MAX_SERIES_BUCKETS);
+        assert!(buckets.len() <= MAX_SERIES_BUCKETS);
     }
 
     #[test]

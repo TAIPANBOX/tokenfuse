@@ -117,3 +117,33 @@ async fn paid_key_is_served_normally() {
     let (status, _) = send(&state, "GET", "/v1/kills", "paidkey", None).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// Plan gating must key off the AUTHENTICATING PRINCIPAL'S OWN plan, not an
+/// org-wide scan for any `:free` key. One org with both a `:free` and a paid
+/// admin key: the paid key still sees 200 on a gated route, and the free key
+/// still sees 402 on that SAME route — a sibling free key must never silently
+/// downgrade a paid key's access (and vice versa).
+#[tokio::test]
+async fn plan_gate_keys_off_the_calling_principal_not_a_sibling_key() {
+    let keys = parse_keys("freekey:mixed-co:admin:free,paidkey:mixed-co:admin:paid");
+    let state = AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8);
+
+    // The paid key on this org is served normally...
+    let (status, v) = send(&state, "GET", "/v1/runs", "paidkey", None).await;
+    assert_eq!(status, StatusCode::OK, "paid key should not be gated");
+    assert!(v.is_array());
+    let (status, _) = send(&state, "POST", "/v1/runs/r1/kill", "paidkey", None).await;
+    assert_eq!(status, StatusCode::OK, "paid key should be able to mutate");
+
+    // ...while the free key for the SAME org is still gated on the same route.
+    let (status, v) = send(&state, "GET", "/v1/runs", "freekey", None).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "free key stays gated");
+    assert_eq!(v["error"]["type"], "plan_required");
+    let (status, v) = send(&state, "POST", "/v1/runs/r2/kill", "freekey", None).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYMENT_REQUIRED,
+        "free key stays gated on mutations too"
+    );
+    assert_eq!(v["error"]["feature"], "cross_fleet_kill");
+}
