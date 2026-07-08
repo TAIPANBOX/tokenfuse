@@ -374,7 +374,9 @@ pub const CATALOG: &[ControlMapping] = &[
 /// opinion does. It is also honest about the fail-open posture documented in
 /// `docs/13-security-hardening.md`.
 pub const DISCLAIMER: &str = "Controls TokenFuse enforces + evidence for your \
-    audit — not a certification. TokenFuse is fail-open by default; see docs/13.";
+    audit — not a certification. TokenFuse is fail-open by default; see docs/13. \
+    Cloud ingest evidence trusts the org credential presented to /v1/ingest, not \
+    the gateway cryptographically — a gateway-specific credential is future work.";
 
 /// One control's realized evidence over a concrete trace + scan: the catalog
 /// [`ControlMapping`] projected against actual `decision`/`finding` counts.

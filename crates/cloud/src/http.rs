@@ -155,46 +155,39 @@ impl AppState {
         self.keys.get(bearer(headers)?)
     }
 
-    /// Resolve the bearer token to an org (any role) — an org key, a paired
-    /// device token, or (when configured) a valid OIDC token. Used by the read
-    /// endpoints; `None` if unauthorized. Keys and devices take precedence; OIDC
-    /// is only tried when neither matched, so keys-only behavior is unchanged.
-    fn org_for(&self, headers: &HeaderMap) -> Option<String> {
+    /// Resolve the bearer token to an org **and the plan governing THIS
+    /// request's own principal** — an org key, a paired device token, or (when
+    /// configured) a valid OIDC token. Used by the read endpoints; `None` if
+    /// unauthorized. Keys and devices take precedence; OIDC is only tried when
+    /// neither matched, so keys-only behavior is unchanged.
+    ///
+    /// The plan is the AUTHENTICATING PRINCIPAL'S OWN plan (an API key's own
+    /// `:plan` segment, default Paid; Paid for a paired device; Paid for OIDC),
+    /// never an org-wide scan — see the module-level note by [`Feature`]'s call
+    /// sites. So a request made with a `:free` key is gated Free even if a
+    /// sibling paid key exists for the same org, and vice versa.
+    fn org_for(&self, headers: &HeaderMap) -> Option<(String, Plan)> {
         let token = bearer(headers)?;
         if let Some(p) = self.keys.get(token) {
-            return Some(p.org.clone());
+            return Some((p.org.clone(), p.plan));
         }
         if let Some(d) = self.store.device_by_token(token) {
-            return Some(d.org);
+            // Paired devices are provisioned by an admin org key (`pair/new`)
+            // and always resolve Paid — there is no `:free` paired-device
+            // concept today.
+            return Some((d.org, Plan::Paid));
         }
-        self.oidc_principal(headers).map(|p| p.org)
-    }
-
-    /// The [`Plan`] governing an org, used by the entitlements gate. An org is
-    /// `Free` iff at least one of its configured org keys is stamped `:free`
-    /// (the hosted SaaS downgrades a free-tier org by stamping its key);
-    /// otherwise `Paid`. Paired device tokens inherit their org's plan. Existing
-    /// deployments carry no `:free` keys, so every org resolves to `Paid` and is
-    /// never gated — preserving today's behavior.
-    fn plan_for_org(&self, org: &str) -> Plan {
-        if self
-            .keys
-            .values()
-            .any(|p| p.org == org && p.plan == Plan::Free)
-        {
-            Plan::Free
-        } else {
-            Plan::Paid
-        }
+        self.oidc_principal(headers).map(|p| (p.org, p.plan))
     }
 
     /// Authorize an admin action by **org key only** (used for pairing, which is
-    /// a dashboard/CLI action). `401` unknown key, `403` non-admin.
-    fn admin_org_key(&self, headers: &HeaderMap) -> Result<String, AuthError> {
+    /// a dashboard/CLI action). `401` unknown key, `403` non-admin. Returns the
+    /// org and the KEY'S OWN plan (see [`Self::org_for`]'s doc).
+    fn admin_org_key(&self, headers: &HeaderMap) -> Result<(String, Plan), AuthError> {
         match self.principal_for(headers) {
             None => Err(AuthError::Unauthorized),
             Some(p) if p.role != "admin" => Err(AuthError::Forbidden),
-            Some(p) => Ok(p.org.clone()),
+            Some(p) => Ok((p.org.clone(), p.plan)),
         }
     }
 
@@ -242,9 +235,10 @@ impl AppState {
     /// 1. an **admin org key** (dashboard/CLI) — no signature; or
     /// 2. a **paired admin device** with a valid Enclave signature.
     ///
-    /// Returns the org **and** a stable, non-secret [`Mutator::actor`] id for the
-    /// audit trail — captured here, where the principal is known exactly, so the
-    /// wired mutation sites never re-parse the credential.
+    /// Returns the org, the KEY/TOKEN'S OWN plan (never an org-wide scan — see
+    /// [`Self::org_for`]'s doc), and a stable, non-secret [`Mutator::actor`] id
+    /// for the audit trail — captured here, where the principal is known
+    /// exactly, so the wired mutation sites never re-parse the credential.
     fn authorize_mutation(
         &self,
         method: &str,
@@ -260,6 +254,7 @@ impl AppState {
             return Ok(Mutator {
                 org: p.org.clone(),
                 actor: key_actor(token),
+                plan: p.plan,
             });
         }
         // OIDC bearer (when configured). Only a *valid* token that maps to a
@@ -272,6 +267,7 @@ impl AppState {
                     return Err(AuthError::Forbidden);
                 }
                 return Ok(Mutator {
+                    plan: v.principal.plan,
                     org: v.principal.org,
                     actor: v.actor,
                 });
@@ -284,6 +280,8 @@ impl AppState {
         Ok(Mutator {
             actor: format!("device:{}", device.device_id),
             org: device.org,
+            // Paired devices always resolve Paid — see `org_for`'s doc.
+            plan: Plan::Paid,
         })
     }
 
@@ -301,12 +299,14 @@ impl AppState {
 }
 
 /// The authenticated principal behind an authorized mutation: the org it acts
-/// on and a stable, non-secret `actor` id for the audit trail.
+/// on, the PRINCIPAL'S OWN plan (never an org-wide scan — see [`AppState::org_for`]'s
+/// doc), and a stable, non-secret `actor` id for the audit trail.
 struct Mutator {
     org: String,
     /// `key:<fingerprint>` for an admin org key, or `device:<id>` for a paired
     /// admin device. Never the raw bearer secret.
     actor: String,
+    plan: Plan,
 }
 
 /// A mutation authorization failure, small so it doesn't bloat handler `Result`s.
@@ -571,7 +571,7 @@ struct AlertQuery {
     tag = "telemetry"
 )]
 async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, _plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
     let parsed: IngestBody = match serde_json::from_slice(&body) {
@@ -593,10 +593,10 @@ async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     tag = "reads"
 )]
 async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+    if let Err(d) = gate(plan, Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.runs(&org))).into_response()
@@ -613,10 +613,10 @@ async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
     tag = "reads"
 )]
 async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Agents) {
+    if let Err(d) = gate(plan, Feature::Agents) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.agents(&org))).into_response()
@@ -633,10 +633,10 @@ async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
     tag = "reads"
 )]
 async fn savings(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Savings) {
+    if let Err(d) = gate(plan, Feature::Savings) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.savings(&org))).into_response()
@@ -652,10 +652,10 @@ async fn savings(State(st): State<AppState>, headers: HeaderMap) -> Response {
     tag = "reads"
 )]
 async fn summary(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+    if let Err(d) = gate(plan, Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.summary(&org))).into_response()
@@ -676,10 +676,10 @@ async fn alerts(
     headers: HeaderMap,
     Query(q): Query<AlertQuery>,
 ) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+    if let Err(d) = gate(plan, Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
     let pct = q
@@ -714,10 +714,10 @@ async fn series(
     headers: HeaderMap,
     Query(q): Query<SeriesQuery>,
 ) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+    if let Err(d) = gate(plan, Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
     // Clamp to sane bounds before the store ever sees them — belt-and-braces
@@ -750,10 +750,10 @@ const MAX_SERIES_WINDOW_MS: i64 = 30 * 24 * 3_600_000;
 /// (`run_update`, `kill`, `budget`), with a 25 s keep-alive. Not in the OpenAPI
 /// document (SSE). Replaces client polling.
 async fn stream(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
+    if let Err(d) = gate(plan, Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
     let events = BroadcastStream::new(st.store.subscribe()).filter_map(move |ev| match ev {
@@ -791,16 +791,19 @@ async fn kill(
     uri: Uri,
     Path(run): Path<String>,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::CrossFleetKill) {
+    let Mutator { org, actor, plan } =
+        match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
+    if let Err(d) = gate(plan, Feature::CrossFleetKill) {
         return plan_required(&org, d.feature);
     }
-    st.store.kill(&org, &run);
-    st.store
-        .audit_append(&org, &actor, "control.kill", &run, "mode=hard");
+    // Mutation + audit entry under ONE store write-lock acquisition — see
+    // `Store::kill_audited`'s doc for why the two-call form (mutate, then
+    // `audit_append`) leaves a window where a crash/autosave can persist the
+    // kill with no matching audit entry.
+    st.store.kill_audited(&org, &run, &actor);
     (StatusCode::OK, Json(KillResponse { killed: run })).into_response()
 }
 
@@ -814,10 +817,10 @@ async fn kill(
     tag = "mutations"
 )]
 async fn kills(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::CrossFleetKill) {
+    if let Err(d) = gate(plan, Feature::CrossFleetKill) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.kills(&org))).into_response()
@@ -843,11 +846,12 @@ async fn set_budget(
     Path(run): Path<String>,
     body: Bytes,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::CentralBudgets) {
+    let Mutator { org, actor, plan } =
+        match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
+    if let Err(d) = gate(plan, Feature::CentralBudgets) {
         return plan_required(&org, d.feature);
     }
     let parsed: BudgetBody = match serde_json::from_slice(&body) {
@@ -855,14 +859,9 @@ async fn set_budget(
         Err(_) => return bad_json(),
     };
     let micros = (parsed.budget_usd * 1e6) as i64;
-    st.store.set_budget(&org, &run, micros);
-    st.store.audit_append(
-        &org,
-        &actor,
-        "control.set_budget",
-        &run,
-        &format!("budget_micros={micros}"),
-    );
+    // Mutation + audit entry under ONE store write-lock acquisition — see
+    // `Store::set_budget_audited`'s doc.
+    st.store.set_budget_audited(&org, &run, micros, &actor);
     (
         StatusCode::OK,
         Json(BudgetResponse {
@@ -883,10 +882,10 @@ async fn set_budget(
     tag = "mutations"
 )]
 async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::CentralBudgets) {
+    if let Err(d) = gate(plan, Feature::CentralBudgets) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.budgets(&org))).into_response()
@@ -903,10 +902,10 @@ async fn budgets(State(st): State<AppState>, headers: HeaderMap) -> Response {
     tag = "reads"
 )]
 async fn incidents(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Incidents) {
+    if let Err(d) = gate(plan, Feature::Incidents) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.incidents(&org))).into_response()
@@ -930,16 +929,18 @@ async fn ack_incident(
     uri: Uri,
     Path(id): Path<String>,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Incidents) {
+    let Mutator { org, actor, plan } =
+        match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
+    if let Err(d) = gate(plan, Feature::Incidents) {
         return plan_required(&org, d.feature);
     }
-    if st.store.ack_incident(&org, &id) {
-        st.store
-            .audit_append(&org, &actor, "control.incident_ack", &id, "");
+    // Mutation + audit entry under ONE store write-lock acquisition — see
+    // `Store::ack_incident_audited`'s doc. Preserves not-found → 404: no audit
+    // entry is written when the incident id doesn't exist.
+    if st.store.ack_incident_audited(&org, &id, &actor) {
         (StatusCode::OK, Json(AckResponse { acknowledged: id })).into_response()
     } else {
         error(StatusCode::NOT_FOUND, "unknown incident")
@@ -965,10 +966,10 @@ async fn ack_incident(
     tag = "reads"
 )]
 async fn compliance(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Compliance) {
+    if let Err(d) = gate(plan, Feature::Compliance) {
         return plan_required(&org, d.feature);
     }
     // Findings map is intentionally empty: scans aren't ingested to the plane
@@ -993,10 +994,10 @@ async fn compliance(State(st): State<AppState>, headers: HeaderMap) -> Response 
     tag = "reads"
 )]
 async fn audit(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+    if let Err(d) = gate(plan, Feature::Audit) {
         return plan_required(&org, d.feature);
     }
     (StatusCode::OK, Json(st.store.audit(&org))).into_response()
@@ -1013,10 +1014,10 @@ async fn audit(State(st): State<AppState>, headers: HeaderMap) -> Response {
     tag = "reads"
 )]
 async fn audit_verify(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+    if let Err(d) = gate(plan, Feature::Audit) {
         return plan_required(&org, d.feature);
     }
     let body = match st.store.audit_verify(&org) {
@@ -1049,10 +1050,10 @@ async fn audit_verify(State(st): State<AppState>, headers: HeaderMap) -> Respons
     tag = "reads"
 )]
 async fn audit_manifest(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(org) = st.org_for(&headers) else {
+    let Some((org, plan)) = st.org_for(&headers) else {
         return unauthorized();
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::Audit) {
+    if let Err(d) = gate(plan, Feature::Audit) {
         return plan_required(&org, d.feature);
     }
     let Some(key) = st.audit_signing_key.as_ref() else {
@@ -1078,11 +1079,11 @@ async fn audit_manifest(State(st): State<AppState>, headers: HeaderMap) -> Respo
     tag = "pairing"
 )]
 async fn pair_new(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let org = match st.admin_org_key(&headers) {
-        Ok(o) => o,
+    let (org, plan) = match st.admin_org_key(&headers) {
+        Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-    if let Err(d) = gate(st.plan_for_org(&org), Feature::DevicePush) {
+    if let Err(d) = gate(plan, Feature::DevicePush) {
         return plan_required(&org, d.feature);
     }
     // Role is optional; default admin, only admin/viewer allowed.
@@ -1118,7 +1119,13 @@ async fn pair(State(st): State<AppState>, body: Bytes) -> Response {
     };
     let device_id = devices::random_hex(16);
     let device_token = devices::random_hex(32);
-    match st.store.redeem_pairing(
+    // A new device joining the org is a control-plane change. The device
+    // self-redeemed (no bearer auth — the code was the credential), so the
+    // actor is the device itself; the admin authorization happened earlier at
+    // `pair/new`. Device registration + its `control.pair` audit entry are
+    // folded into ONE store write-lock acquisition — see
+    // `Store::redeem_pairing_audited`'s doc.
+    match st.store.redeem_pairing_audited(
         &req.code,
         now_unix(),
         device_id,
@@ -1127,29 +1134,16 @@ async fn pair(State(st): State<AppState>, body: Bytes) -> Response {
         req.name,
         req.platform,
     ) {
-        Some(dev) => {
-            // A new device joining the org is a control-plane change. The device
-            // self-redeemed (no bearer auth — the code was the credential), so
-            // the actor is the device itself; the admin authorization happened
-            // earlier at `pair/new`.
-            st.store.audit_append(
-                &dev.org,
-                &format!("device:{}", dev.device_id),
-                "control.pair",
-                &dev.device_id,
-                &format!("role={};platform={}", dev.role, dev.platform),
-            );
-            (
-                StatusCode::OK,
-                Json(PairResponse {
-                    device_id: dev.device_id,
-                    org: dev.org,
-                    role: dev.role,
-                    device_token,
-                }),
-            )
-                .into_response()
-        }
+        Some(dev) => (
+            StatusCode::OK,
+            Json(PairResponse {
+                device_id: dev.device_id,
+                org: dev.org,
+                role: dev.role,
+                device_token,
+            }),
+        )
+            .into_response(),
         None => error(StatusCode::BAD_REQUEST, "invalid or expired pairing code"),
     }
 }
@@ -1178,7 +1172,9 @@ async fn register_apns(
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
-    if let Err(d) = gate(st.plan_for_org(&device.org), Feature::DevicePush) {
+    // Paired devices always resolve Paid (see `AppState::org_for`'s doc) —
+    // there is no `:free` paired-device concept today.
+    if let Err(d) = gate(Plan::Paid, Feature::DevicePush) {
         return plan_required(&device.org, d.feature);
     }
     if device.device_id != id {
@@ -1217,7 +1213,9 @@ async fn register_activity(
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
-    if let Err(d) = gate(st.plan_for_org(&device.org), Feature::DevicePush) {
+    // Paired devices always resolve Paid (see `AppState::org_for`'s doc) —
+    // there is no `:free` paired-device concept today.
+    if let Err(d) = gate(Plan::Paid, Feature::DevicePush) {
         return plan_required(&device.org, d.feature);
     }
     if device.device_id != id {
