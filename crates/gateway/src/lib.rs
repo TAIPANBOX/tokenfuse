@@ -8,6 +8,7 @@ pub mod compliancecli;
 pub mod embedder;
 pub mod estimate;
 pub mod firewall;
+pub mod focusexport;
 pub mod ledger_backend;
 pub mod mcpbroker;
 pub mod mcpcli;
