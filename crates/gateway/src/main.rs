@@ -203,6 +203,19 @@ async fn main() {
             }
             std::process::exit(code);
         }
+        // `tokenfuse focus-export --traces <dir-or-glob> --out <file.csv>`
+        //     `[--from <rfc3339>] [--to <rfc3339>]` exports the Parquet trace as
+        // a FOCUS 1.2-style CSV (FinOps Open Cost & Usage Specification) so a
+        // bank/FinOps team can load LLM agent spend into the same tooling they
+        // use for cloud spend.
+        Some("focus-export") => {
+            let rest: Vec<String> = args.collect();
+            let fargs = tokenfuse_gateway::focusexport::parse_args(&rest);
+            if let Err(e) = tokenfuse_gateway::focusexport::run(&fargs).await {
+                eprintln!("focus-export error: {e}");
+                std::process::exit(1);
+            }
+        }
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
         Some("mcp-broker") => mcp_broker().await,
         // Anything else starts the gateway.
