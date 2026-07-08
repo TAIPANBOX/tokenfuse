@@ -203,9 +203,19 @@ pub fn verify(cfg: &OidcConfig, token: &str) -> Option<Verified> {
     let key = DecodingKey::from_jwk(jwk).ok()?;
 
     // 4-6. Signature + exp + iss + aud, all enforced by `jsonwebtoken`.
+    //
+    // `Validation::set_issuer`/`set_audience` only check `iss`/`aud` *when the
+    // claim is present* in the token — by default `jsonwebtoken` does not
+    // require either claim to exist at all, so a token that simply omits
+    // `iss`/`aud` would sail through unchecked (an audience-confusion /
+    // privilege-escalation risk if an IdP reuses a signing key across
+    // services). `set_required_spec_claims` closes that: a token missing
+    // `exp`, `iss` or `aud` is rejected outright, regardless of signature
+    // validity.
     let mut validation = Validation::new(algorithms[0]);
     validation.algorithms = algorithms;
     validation.validate_exp = true;
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     validation.set_issuer(&[&cfg.issuer]);
     validation.set_audience(&[&cfg.audience]);
     let data = decode::<Claims>(token, &key, &validation).ok()?;

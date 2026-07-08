@@ -303,6 +303,49 @@ async fn rejects_missing_org_claim() {
 }
 
 #[tokio::test]
+async fn rejects_missing_iss_claim() {
+    // `aud` present and correct, `iss` omitted entirely — must not be treated
+    // as "no issuer check configured". Absent `iss` must fail closed.
+    let token = sign(
+        &serde_json::json!({
+            "aud": AUDIENCE, "sub": "u", "org": "acme",
+            "roles": ["admin"], "exp": now() + 3600,
+        }),
+        KEY1_PEM,
+        KID,
+    );
+    assert_rejected("missing_iss", &token).await;
+}
+
+#[tokio::test]
+async fn rejects_missing_aud_claim() {
+    // `iss` present and correct, `aud` omitted entirely — must fail closed
+    // rather than being accepted as audience-agnostic.
+    let token = sign(
+        &serde_json::json!({
+            "iss": ISSUER, "sub": "u", "org": "acme",
+            "roles": ["admin"], "exp": now() + 3600,
+        }),
+        KEY1_PEM,
+        KID,
+    );
+    assert_rejected("missing_aud", &token).await;
+}
+
+#[tokio::test]
+async fn rejects_missing_exp_claim() {
+    let token = sign(
+        &serde_json::json!({
+            "iss": ISSUER, "aud": AUDIENCE, "sub": "u", "org": "acme",
+            "roles": ["admin"],
+        }),
+        KEY1_PEM,
+        KID,
+    );
+    assert_rejected("missing_exp", &token).await;
+}
+
+#[tokio::test]
 async fn rejects_unknown_kid() {
     let token = sign(
         &serde_json::json!({

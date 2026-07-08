@@ -23,6 +23,15 @@ const NONCE_CAP: usize = 4096;
 /// not persisted — historical analytics live in the gateway's Parquet sink).
 const SERIES_CAP: usize = 100_000;
 
+/// Hard cap on the number of buckets [`Store::series`] will ever allocate,
+/// regardless of the requested `window`/`step`. Without this, any
+/// authenticated viewer (`/v1/series` only requires `FleetReads`, so a viewer
+/// key on a Paid org qualifies) could request e.g. `window=2592000s&step=1ms`
+/// and force a ~80GB `Vec` allocation, crashing the shared process for every
+/// org. Enforced here — not just in the HTTP query parsing — so the store is
+/// safe regardless of what calls it.
+const MAX_SERIES_BUCKETS: usize = 10_000;
+
 /// Whether a call record represents a blocked decision (as opposed to a
 /// settled call: `allow`/`cache_hit`). Blocked records are still stored and
 /// counted, but their `cost_microusd` — an avoided-spend estimate, or 0 for
@@ -628,7 +637,10 @@ impl Store {
         let step = step_ms.max(1);
         let window = window_ms.max(step);
         let start = now_ms - window;
-        let n = (window / step).max(1) as usize;
+        // Capped so a caller can never force an unbounded allocation (see
+        // `MAX_SERIES_BUCKETS`); an absurd window/step combo just yields a
+        // truncated series rather than crashing the process.
+        let n = ((window / step).max(1) as usize).min(MAX_SERIES_BUCKETS);
         let mut buckets: Vec<SeriesBucket> = (0..n)
             .map(|i| SeriesBucket {
                 t: start + i as i64 * step,
@@ -810,12 +822,19 @@ impl Store {
     /// linking it to the current tip and stamping it with the store's wall
     /// clock. In-memory and infallible: callers log the action *after* the
     /// mutation succeeds, and an append never fails the mutation.
+    ///
+    /// Calling this as a SEPARATE step after a mutation (two lock
+    /// acquisitions) leaves a window where a crash, or the periodic autosave,
+    /// can persist the mutation with no matching audit entry — undercutting
+    /// the "tamper-evident audit of every mutation" contract. The HTTP
+    /// mutation handlers (`kill`, `set_budget`, `ack_incident`, `pair`) use the
+    /// `*_audited` store methods below instead, which do the mutation and this
+    /// append under ONE write-lock acquisition. This method remains for
+    /// standalone audit writes (and tests) that have no paired mutation.
     pub fn audit_append(&self, org: &str, actor: &str, action: &str, subject: &str, detail: &str) {
         let mut inner = self.inner.write().unwrap();
         inner.dirty = true;
-        let chain = inner.audit.entry(org.to_string()).or_default();
-        let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
-        chain.push(entry);
+        append_audit_locked(&mut inner, org, actor, action, subject, detail);
     }
 
     /// `org`'s audit chain, oldest first (append order). Empty when the org has
@@ -1126,6 +1145,16 @@ impl Store {
         inner.dirty = false;
         d
     }
+}
+
+/// Append an audit entry to `org`'s chain given an already-held write guard —
+/// the shared building block for [`Store::audit_append`] and the `*_audited`
+/// mutation methods, which fold a mutation and its audit record into ONE lock
+/// acquisition so the two can never be observed/persisted independently.
+fn append_audit_locked(inner: &mut Inner, org: &str, actor: &str, action: &str, subject: &str, detail: &str) {
+    let chain = inner.audit.entry(org.to_string()).or_default();
+    let entry = audit::append(chain.last(), now_millis(), actor, action, subject, detail);
+    chain.push(entry);
 }
 
 /// The store's wall clock in epoch millis — the "now" `ingest` feeds detection
@@ -1769,6 +1798,18 @@ mod tests {
             .map(|b| b.cost_microusd)
             .sum();
         assert_eq!(none, 0);
+    }
+
+    /// A huge window paired with a tiny step must never allocate more than
+    /// [`MAX_SERIES_BUCKETS`] — the DoS this guards against (`?window=2592000s
+    /// &step=1ms` would otherwise ask for ~2.6 billion buckets).
+    #[test]
+    fn series_bucket_count_is_capped() {
+        let s = Store::new();
+        let now = 10_000;
+        let buckets = s.series("acme", None, 2_592_000_000, 1, now);
+        assert_eq!(buckets.len(), MAX_SERIES_BUCKETS);
+        assert!(buckets.len() <= MAX_SERIES_BUCKETS);
     }
 
     #[test]

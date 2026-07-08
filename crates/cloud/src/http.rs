@@ -720,13 +720,31 @@ async fn series(
     if let Err(d) = gate(st.plan_for_org(&org), Feature::FleetReads) {
         return plan_required(&org, d.feature);
     }
-    let window = parse_duration_ms(q.window.as_deref()).unwrap_or(3_600_000);
-    let step = parse_duration_ms(q.step.as_deref()).unwrap_or(60_000);
+    // Clamp to sane bounds before the store ever sees them — belt-and-braces
+    // alongside `Store::series`'s own `MAX_SERIES_BUCKETS` cap, so a request
+    // like `?window=2592000s&step=1ms` can't even ask for an absurd bucket
+    // count in the first place.
+    let window = parse_duration_ms(q.window.as_deref())
+        .unwrap_or(3_600_000)
+        .min(MAX_SERIES_WINDOW_MS);
+    let step = parse_duration_ms(q.step.as_deref())
+        .unwrap_or(60_000)
+        .max(MIN_SERIES_STEP_MS);
     let buckets = st
         .store
         .series(&org, q.run.as_deref(), window, step, now_millis());
     (StatusCode::OK, Json(buckets)).into_response()
 }
+
+/// Floor on `/v1/series`'s `step` — a step below one second buys no
+/// meaningful resolution for a burn-rate chart and is exactly the lever the
+/// bucket-explosion DoS pulls (`step=1ms`).
+const MIN_SERIES_STEP_MS: i64 = 1_000;
+
+/// Ceiling on `/v1/series`'s `window` — 30 days comfortably covers any sane
+/// burn-rate lookback; pairing this with the step floor keeps the requested
+/// bucket count in the low thousands, well under `Store::MAX_SERIES_BUCKETS`.
+const MAX_SERIES_WINDOW_MS: i64 = 30 * 24 * 3_600_000;
 
 /// `GET /v1/stream` — Server-Sent Events of live changes for the caller's org
 /// (`run_update`, `kill`, `budget`), with a 25 s keep-alive. Not in the OpenAPI
