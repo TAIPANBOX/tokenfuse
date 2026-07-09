@@ -110,6 +110,25 @@ pub struct CallRecord {
     /// aggregation (/v1/savings) lands in a later PR.
     #[serde(default)]
     pub saved_microusd: i64,
+    /// The run's parent, from `X-Fuse-Parent-Run-Id` (P3, agent-passport).
+    /// `""` when the run has no parent. Matches
+    /// `crates/gateway/src/sink.rs::CallRecord::parent_run_id` on the wire.
+    /// Accepted for forward-compat; no aggregation reads this field yet.
+    #[serde(default)]
+    pub parent_run_id: String,
+    /// Raw, unparsed `X-Fuse-On-Behalf-Of` delegation chain (P3,
+    /// agent-passport SPEC.md §5). `""` when unset. Matches
+    /// `crates/gateway/src/sink.rs::CallRecord::on_behalf_of` on the wire (a
+    /// comma-separated string, not an array). Accepted for forward-compat; no
+    /// aggregation reads this field yet.
+    #[serde(default)]
+    pub on_behalf_of: String,
+    /// Opaque outcome tag, from `X-Fuse-Outcome` (P4, unit economics). `""`
+    /// when unset. Matches `crates/gateway/src/sink.rs::CallRecord::outcome`
+    /// on the wire. Accepted for forward-compat; no aggregation reads this
+    /// field yet.
+    #[serde(default)]
+    pub outcome: String,
 }
 
 /// The aggregated state of one run within an organization.
@@ -2012,6 +2031,34 @@ mod tests {
             cost_microusd: cost,
             ..Default::default()
         }
+    }
+
+    /// Wire-shape parity with `crates/gateway/src/sink.rs::CallRecord`:
+    /// `parent_run_id`/`on_behalf_of`/`outcome` must survive ingest
+    /// deserialization instead of being silently dropped by serde.
+    #[test]
+    fn deserializes_agent_passport_and_outcome_fields() {
+        let json = r#"{
+            "run_id": "r1",
+            "parent_run_id": "r0",
+            "on_behalf_of": "user://alice,agent://planner",
+            "outcome": "case_resolved"
+        }"#;
+        let rec: CallRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.parent_run_id, "r0");
+        assert_eq!(rec.on_behalf_of, "user://alice,agent://planner");
+        assert_eq!(rec.outcome, "case_resolved");
+    }
+
+    /// Older gateways that predate these three fields must still deserialize
+    /// (`#[serde(default)]`), defaulting to empty strings.
+    #[test]
+    fn deserializes_without_agent_passport_fields_for_backward_compat() {
+        let json = r#"{"run_id": "r1"}"#;
+        let rec: CallRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.parent_run_id, "");
+        assert_eq!(rec.on_behalf_of, "");
+        assert_eq!(rec.outcome, "");
     }
 
     #[test]
