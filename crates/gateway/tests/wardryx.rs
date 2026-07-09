@@ -371,3 +371,87 @@ async fn deny_from_a_step_or_domain_rule_still_maps_to_403() {
     assert_eq!(sent["domains"], json!(["api.acme.example"]));
     assert_eq!(sent["steps"], json!(0));
 }
+
+/// Proves the actual bug this feature closes: a decision cache keyed only
+/// on `(agent_id, tool_set_hash)` used to reuse a cached `allow` across
+/// calls whose `steps`/`domains`/`est_cost_usd` had since changed the
+/// answer Wardryx would give. `cacheable: false` on the wire is how Wardryx
+/// now tells the gateway a decision depends on exactly that kind of
+/// per-request state -- so it must reach the PDP on every call, never
+/// served from cache, even well inside the TTL and even for the identical
+/// (agent_id, tool_names) pair every call below uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cacheable_false_is_never_reused_from_cache() {
+    let stub = WardryxStub::new(json!({
+        "decision": "allow",
+        "policy_version": "v1",
+        "cacheable": false
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        // Generous TTL: every call below falls inside the same window, so
+        // a wrongly-cached decision would be served instead of reaching
+        // the stub -- exactly the bug this test exists to catch.
+        Duration::from_secs(30),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    const REQUESTS: usize = 3;
+    for _ in 0..REQUESTS {
+        let resp = app.clone().oneshot(request(&body())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "allow");
+    }
+
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        REQUESTS,
+        "cacheable: false must reach Wardryx on every request; the decision cache must never reuse it"
+    );
+}
+
+/// The mirror image of `cacheable_false_is_never_reused_from_cache`: when
+/// Wardryx marks a decision `cacheable: true` (no matched policy is
+/// request-specific), the gateway's existing repeat-call cache still
+/// applies -- only the first call within the TTL reaches the stub, the
+/// rest are served from cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cacheable_true_is_served_from_cache_within_ttl() {
+    let stub = WardryxStub::new(json!({
+        "decision": "allow",
+        "policy_version": "v1",
+        "cacheable": true
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    const REQUESTS: usize = 3;
+    for _ in 0..REQUESTS {
+        let resp = app.clone().oneshot(request(&body())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "allow");
+    }
+
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        1,
+        "cacheable: true should be cached after the first call: only one upstream hit for {REQUESTS} requests"
+    );
+}

@@ -37,19 +37,33 @@
 //! decisions are never cached, since a cached one would let a caller replay
 //! a stale `approval_id`.
 //!
-//! The cache key is coarser than the full `DecideContext`: `est_cost_usd`,
-//! `steps`, and `domains` all vary call to call and are deliberately NOT
-//! part of the key, so a cache hit inside the TTL window reuses a decision
-//! made against an earlier value of all three, not the current one. This is
-//! the same known, pre-existing tradeoff the policy_version note above
-//! already accepts, now also covering `max_steps`/`allow_domains`: a burst
-//! of calls faster than the TTL (default 3s) can reuse an `allow` cached
-//! before a step count crossed a policy's `max_steps`. Operators for whom
-//! that precision matters more than the round-trip savings should lower
-//! `TOKENFUSE_WARDRYX_CACHE_TTL_MS` (0 disables reuse entirely); making the
-//! cache key `DecideContext`-complete is a larger change than this wave's
-//! scope and would need to weigh the resulting near-zero hit rate on any
-//! run past its first call, since `steps` changes on every call within it.
+//! The cache key is coarser than the full `DecideContext`: it never varies
+//! by `est_cost_usd`, `steps`, or `domains`. That used to be a real gap -- a
+//! cache hit inside the TTL window could reuse a decision made against an
+//! earlier value of all three, so a burst of calls faster than the TTL
+//! (default 3s) could reuse an `allow` cached before a step count crossed a
+//! policy's `max_steps`, before a domain left `allow_domains`, or before a
+//! cost crossed `require_human_above_usd`, quietly bypassing all three caps
+//! for the rest of the window. This is now resolved: every `/v1/decide`
+//! response carries a `cacheable` flag (see `DecideWireResponse`), computed
+//! by Wardryx from the matched policy set, not guessed at here. `cacheable`
+//! is `true` only when the decision is a pure function of `(agent_id,
+//! tool_names)` -- no matched policy sets `max_steps`, `allow_domains`, or
+//! `require_human_above_usd` -- and `false` whenever a matched policy
+//! depends on per-request state that can differ on the very next call, even
+//! if the specific rule that produced this decision was something else
+//! entirely (a `deny_tool` hit, say). `Cache::put` only ever stores a
+//! `cacheable: true` decision; a `false` one is always re-decided against
+//! Wardryx, so a request-specific rule can no longer be bypassed by a stale
+//! hit within the TTL. A response that omits `cacheable` (an older Wardryx
+//! that predates this field) defaults to `false`, the fail-safe reading:
+//! never assume a decision is reusable unless the PDP says so. What remains
+//! coarse is the *cacheable* case: a `deny_tool`/`deny_if_unattested`-only
+//! decision is still keyed just on `(agent_id, tool-set hash)`, so a policy
+//! edit that changes one of those can take up to the TTL to be reflected,
+//! same as the policy_version note above; lower
+//! `TOKENFUSE_WARDRYX_CACHE_TTL_MS` (0 disables reuse entirely) if that
+//! window matters more than the round-trip savings.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -179,6 +193,13 @@ struct DecideWireResponse {
     approval_id: Option<String>,
     #[serde(default)]
     approval_token_required: Option<bool>,
+    /// Whether this decision is safe to store and later serve again for
+    /// another request against the same `(agent_id, tool_names)`, per
+    /// Wardryx's `/v1/decide` contract. Defaults to `false` -- the
+    /// fail-safe reading -- when the response omits it, so an older PDP
+    /// that predates this field is never assumed cacheable by silence.
+    #[serde(default)]
+    cacheable: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -211,7 +232,15 @@ impl WardryxClient {
         }
     }
 
-    async fn decide(&self, req: &DecideWireRequest<'_>) -> Result<WardryxOutcome, WardryxError> {
+    /// Returns the decision alongside whether Wardryx marked it safe to
+    /// cache. `cacheable` is kept out of [`WardryxOutcome`] itself: it is a
+    /// caching concern for [`Cache::put`] to gate on, not part of what a
+    /// block response needs to explain itself to the caller (see
+    /// `WardryxOutcome`'s doc comment).
+    async fn decide(
+        &self,
+        req: &DecideWireRequest<'_>,
+    ) -> Result<(WardryxOutcome, bool), WardryxError> {
         let endpoint = format!("{}/v1/decide", self.base_url.trim_end_matches('/'));
         let payload = serde_json::to_vec(req).map_err(|e| WardryxError::Decode(e.to_string()))?;
         let mut builder = self
@@ -237,13 +266,14 @@ impl WardryxClient {
             serde_json::from_slice(&bytes).map_err(|e| WardryxError::Decode(e.to_string()))?;
         let decision = WardryxDecision::parse(&wire.decision)
             .ok_or(WardryxError::UnknownDecision(wire.decision))?;
-        Ok(WardryxOutcome {
+        let outcome = WardryxOutcome {
             decision,
             policy_version: wire.policy_version,
             reason: wire.reason,
             approval_id: wire.approval_id,
             approval_token_required: wire.approval_token_required.unwrap_or(true),
-        })
+        };
+        Ok((outcome, wire.cacheable))
     }
 }
 
@@ -297,10 +327,30 @@ impl Cache {
         })
     }
 
-    fn put(&self, agent_id: &str, tool_names: &[String], outcome: &WardryxOutcome) {
+    /// Stores `outcome`, unless either guard below says not to. `cacheable`
+    /// comes straight from the PDP's `/v1/decide` response (see
+    /// `DecideWireResponse::cacheable`): Wardryx, not this cache, is the
+    /// source of truth for whether a decision generalizes beyond the one
+    /// request that produced it.
+    fn put(
+        &self,
+        agent_id: &str,
+        tool_names: &[String],
+        outcome: &WardryxOutcome,
+        cacheable: bool,
+    ) {
         // Never cache `hold`: a replayed hit would hand out a stale
         // `approval_id` for what looks like a fresh hold.
         if outcome.decision == WardryxDecision::Hold {
+            return;
+        }
+        // Only store a decision the PDP marked safe to reuse. `cacheable`
+        // is false whenever a matched policy depends on per-request state
+        // (max_steps, allow_domains, require_human_above_usd) that can
+        // differ on the very next call even for this same agent/tool set;
+        // storing it anyway would resurrect the exact stale-cache gap this
+        // flag exists to close.
+        if !cacheable {
             return;
         }
         let key = Self::key(agent_id, tool_names);
@@ -432,8 +482,9 @@ impl Wardryx {
             approval_token: ctx.approval_token.as_deref(),
         };
         match client.decide(&wire).await {
-            Ok(outcome) => {
-                self.cache.put(&ctx.agent_id, &ctx.tool_names, &outcome);
+            Ok((outcome, cacheable)) => {
+                self.cache
+                    .put(&ctx.agent_id, &ctx.tool_names, &outcome, cacheable);
                 outcome
             }
             Err(e) => {
@@ -507,7 +558,7 @@ mod tests {
             approval_id: None,
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome);
+        cache.put("agent-1", &["grep".to_string()], &outcome, true);
         let hit = cache.get("agent-1", &["grep".to_string()]).unwrap();
         assert_eq!(hit.decision, WardryxDecision::Deny);
         assert_eq!(hit.policy_version.as_deref(), Some("v1"));
@@ -523,7 +574,27 @@ mod tests {
             approval_id: Some("appr-1".to_string()),
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome);
+        // cacheable: true here on purpose -- proves the hold guard fires on
+        // its own, independent of the cacheable guard below it.
+        cache.put("agent-1", &["grep".to_string()], &outcome, true);
+        assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
+    }
+
+    #[test]
+    fn cache_never_stores_when_not_cacheable() {
+        // An allow that would otherwise be stored (see
+        // cache_round_trips_allow_and_deny), but arrives with cacheable:
+        // false -- e.g. a matched policy sets max_steps/allow_domains/
+        // require_human_above_usd -- must never be reused for a later call.
+        let cache = Cache::new(Duration::from_secs(60));
+        let outcome = WardryxOutcome {
+            decision: WardryxDecision::Allow,
+            policy_version: Some("v1".to_string()),
+            reason: Some("allowed for now".to_string()),
+            approval_id: None,
+            approval_token_required: true,
+        };
+        cache.put("agent-1", &["grep".to_string()], &outcome, false);
         assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
     }
 
@@ -537,7 +608,7 @@ mod tests {
             approval_id: None,
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome);
+        cache.put("agent-1", &["grep".to_string()], &outcome, true);
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
     }
