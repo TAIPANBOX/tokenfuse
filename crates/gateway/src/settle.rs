@@ -31,6 +31,9 @@ pub struct SettleGuard {
     /// Request-scoped raw `X-Fuse-On-Behalf-Of` value, carried into the
     /// settled `CallRecord` (agent-passport SPEC.md §5). `""` when unset.
     on_behalf_of: String,
+    /// Request-scoped `X-Fuse-Outcome` value, carried into the settled
+    /// `CallRecord` (P4, unit economics). `""` when unset.
+    outcome: String,
 }
 
 impl SettleGuard {
@@ -46,6 +49,7 @@ impl SettleGuard {
         agent_id: String,
         parent_run_id: String,
         on_behalf_of: String,
+        outcome: String,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -58,6 +62,7 @@ impl SettleGuard {
             agent_id,
             parent_run_id,
             on_behalf_of,
+            outcome,
         }
     }
 
@@ -87,6 +92,7 @@ impl SettleGuard {
             saved_microusd: 0,
             parent_run_id: self.parent_run_id.clone(),
             on_behalf_of: self.on_behalf_of.clone(),
+            outcome: self.outcome.clone(),
         });
     }
 
@@ -140,6 +146,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
         );
         guard.complete();
 
@@ -162,6 +169,7 @@ mod tests {
                 usage,
                 fallback,
                 reservation,
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
