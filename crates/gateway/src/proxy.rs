@@ -24,7 +24,7 @@ use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
     dlp, evaluate, BreakerReason, BreakerVerdict, BudgetError, DlpMode, Microusd, Mode,
-    Reservation, SemanticCache,
+    Reservation, RunSnapshot, SemanticCache,
 };
 
 /// Where a non-streaming response should be cached after it settles.
@@ -357,7 +357,31 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
         .unwrap_or(Microusd::ZERO);
 
-    let snapshot = st.ledger.snapshot(&run_id).await.expect("run just opened");
+    // `open_run` above just committed (the in-process ledger applies
+    // synchronously; the raft ledger's write returned only after a majority
+    // commit). But `snapshot()` here is a *local, eventually-consistent* read
+    // (`RaftLedger::snapshot` -> `sm.read_run`, not the linearizable path) —
+    // under burst load on a follower node, this node's own copy of the log
+    // can legitimately still be catching up when the very next line reads it,
+    // so `snapshot()` racing `open_run()` can return `None` for a run that
+    // was just, correctly, opened. That is not a data-loss condition: a run
+    // with no replicated snapshot yet has by definition had nothing reserved
+    // or spent against it, so the accurate state *is* the zero/fresh
+    // snapshot — this isn't a guess, it's the true value for that instant.
+    // Fall back to it instead of panicking the worker (previously `.expect
+    // ("run just opened")`, which dropped the request under exactly this
+    // race). This does not weaken enforcement: the actual budget check is
+    // `st.ledger.reserve()` below, which for the raft backend goes through
+    // consensus against the authoritative committed state, not this local
+    // read — so a stale/missing snapshot here can only affect the
+    // pre-reserve policy pre-check (max-steps / per-step-cost), and for a
+    // just-opened run steps=0 is correct regardless of replication lag.
+    let snapshot = st.ledger.snapshot(&run_id).await.unwrap_or(RunSnapshot {
+        budget,
+        reserved: Microusd::ZERO,
+        spent: Microusd::ZERO,
+        steps: 0,
+    });
     let eval = evaluate(&st.policy, &snapshot, estimate);
 
     // Loop / runaway detection. Signatures come from the request's own message
@@ -1057,6 +1081,7 @@ fn mode_str(mode: Mode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger_backend::{LedgerBackend, LocalLedger};
     use crate::provider::StubProvider;
     use crate::sink::EventSink;
     use axum::body::to_bytes;
@@ -1084,6 +1109,48 @@ mod tests {
             self.records.lock().unwrap().push(rec);
         }
         fn flush(&self) {}
+    }
+
+    /// A `LedgerBackend` that delegates everything to a real in-process
+    /// ledger *except* `snapshot`, which always reports `None` — a
+    /// deterministic stand-in for `RaftLedger::snapshot` racing `open_run`
+    /// under replication lag (see `raft_ledger.rs`: `snapshot` is a local,
+    /// eventually-consistent read; `open_run`'s write only needs a majority
+    /// commit, so this node's own copy can still be catching up when the
+    /// very next request reads it). Reserve/settle still go through the real
+    /// ledger, so this proves the handler's fallback doesn't just avoid a
+    /// panic but still enforces and settles correctly.
+    struct SnapshotLaggingLedger(LocalLedger);
+
+    #[async_trait::async_trait]
+    impl LedgerBackend for SnapshotLaggingLedger {
+        async fn open_run(&self, run_id: &str, budget: Microusd, parent: Option<&str>) {
+            self.0.open_run(run_id, budget, parent).await;
+        }
+
+        async fn reserve(
+            &self,
+            run_id: &str,
+            estimate: Microusd,
+        ) -> Result<Reservation, BudgetError> {
+            self.0.reserve(run_id, estimate).await
+        }
+
+        async fn reserve_unchecked(&self, run_id: &str, estimate: Microusd) -> Reservation {
+            self.0.reserve_unchecked(run_id, estimate).await
+        }
+
+        async fn snapshot(&self, _run_id: &str) -> Option<RunSnapshot> {
+            None
+        }
+
+        async fn list_runs(&self) -> Vec<(String, RunSnapshot)> {
+            self.0.list_runs().await
+        }
+
+        fn settle(&self, reservation: &Reservation, actual: Microusd) {
+            self.0.settle(reservation, actual);
+        }
     }
 
     fn state(mode: Mode, provider: StubProvider) -> AppState {
@@ -1140,6 +1207,37 @@ mod tests {
         let snap = ledger.snapshot("run-1").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.steps, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_none_for_just_opened_run_does_not_panic() {
+        // Regression test for the live cluster bug: `st.ledger.snapshot(&run_id)`
+        // used to be unwrapped with `.expect("run just opened")`, an assumption
+        // that holds for the in-process ledger (open_run applies synchronously,
+        // so a same-task snapshot can never miss it) but is false for the raft
+        // ledger under burst load on a follower node, where `snapshot()` is a
+        // local eventually-consistent read that can race the just-committed
+        // `open_run` write. `SnapshotLaggingLedger` reproduces exactly that:
+        // `snapshot` always returns `None`, deterministically, regardless of
+        // whether the run was actually just opened.
+        let mut st = state(Mode::Enforce, StubProvider::default());
+        st.ledger = Arc::new(SnapshotLaggingLedger(LocalLedger(Arc::new(Ledger::new()))));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-lagging")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        // Before the fix, this call panicked the request's tokio task instead
+        // of returning a response at all.
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a missing snapshot for a just-opened run must fall back to a fresh \
+             snapshot, not panic or otherwise fail the request"
+        );
+        assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
     }
 
     #[tokio::test]
