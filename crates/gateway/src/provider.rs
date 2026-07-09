@@ -160,10 +160,14 @@ fn apply_openai(usage: &mut Usage, u: &serde_json::Value) {
 // Real HTTP provider
 // ---------------------------------------------------------------------------
 
-/// Headers we forward upstream. The `Authorization` header (the provider API
-/// key) is passed through and never stored or logged (privacy by design).
+/// Headers we forward upstream. The provider API key is passed through and
+/// never stored or logged (privacy by design) — either as `Authorization`
+/// (OpenAI-style bearer auth) or as `x-api-key` (Anthropic's native auth
+/// header; without it Anthropic rejects the request with 401 "x-api-key
+/// header is required" even though `anthropic-version` made it through).
 const FORWARD_HEADERS: &[&str] = &[
     "authorization",
+    "x-api-key",
     "anthropic-version",
     "anthropic-beta",
     "openai-organization",
@@ -406,5 +410,74 @@ mod tests {
         let u = resp.usage.lock().unwrap().unwrap();
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
+    }
+
+    #[test]
+    fn forward_headers_allowlist_includes_x_api_key() {
+        // Anthropic's native auth header. Without this, the OpenAI-style
+        // `authorization` header is stripped through fine but Anthropic never
+        // sees a key and answers 401 "x-api-key header is required" — this
+        // pins the regression at the allowlist-definition level.
+        assert!(FORWARD_HEADERS.contains(&"x-api-key"));
+    }
+
+    /// End-to-end proof: spin up a real HTTP upstream, send `HttpProvider` a
+    /// request carrying `x-api-key`, and assert the upstream actually
+    /// received it. This exercises the real header-copy loop in `send`
+    /// (not just the allowlist constant), so it can't pass while the loop
+    /// itself is broken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_provider_forwards_x_api_key_to_upstream() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        // Upstream stub: echoes back whichever auth-shaped headers it saw, so
+        // the test can assert on what actually crossed the wire.
+        async fn echo_auth_headers(headers: HeaderMap) -> Json<Value> {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Json(json!({
+                "x_api_key": get("x-api-key"),
+                "authorization": get("authorization"),
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/", post(echo_auth_headers));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let provider = HttpProvider::new(format!("http://{addr}"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-ant-test-key".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+
+        let resp = provider
+            .send(headers, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let mut body = resp.body;
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        let received: Value = serde_json::from_slice(&collected).unwrap();
+
+        // The whole point of this fix: the upstream must see the key.
+        assert_eq!(received["x_api_key"], "sk-ant-test-key");
+        // No Authorization header was sent in this request, and none should
+        // be fabricated.
+        assert_eq!(received["authorization"], "");
     }
 }
