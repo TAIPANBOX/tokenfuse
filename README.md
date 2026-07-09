@@ -40,6 +40,40 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 ---
 
+## Where this fits in the stack
+
+TokenFuse is the **spend plane and the hot-path spine** of the TAIPANBOX agent-governance stack: every agent LLM call passes through it, where it meters cost, routes to the cheapest model that meets the task tier, asks Wardryx for a per-request policy decision, and enforces the budget Breaker. The other services read the events it emits.
+
+```mermaid
+flowchart TB
+  Agent["AI agent (any framework)"] -->|"LLM call (base-URL swap)"| TF["TokenFuse proxy: spend + enforcement"]
+  TF -->|"POST /v1/decide (PEP)"| WX["Wardryx: policy PDP"]
+  WX -.->|"allow / deny / hold"| TF
+  TF -->|"cheapest model, budget OK"| LLM[("LLM provider")]
+  TF -->|"CallRecords"| CL["TokenFuse Cloud: control plane, incidents, replay, evidence, kill-switch"]
+  TF ==>|"agent-event NDJSON"| BUS{{"agent-event bus + Agent Passport"}}
+  WX ==> BUS
+  ENG["Engram: memory"] -->|"reflect via base_url"| TF
+  ENG ==> BUS
+  BUS ==> IDX["Idryx: identity graph, detectors, Agent-BOM"]
+  BUS ==> QX["Qryx: crypto / PQC, passport + hash-chain scan"]
+  BUS ==> VX["Verdryx: quality / drift"]
+  TF -->|"outcome-tagged traces"| VX
+  MX["Mockryx: pre-prod safety rehearsal"] -->|"hostile scenarios"| TF
+  TFP["terraform-provider-taipan"] -->|"budgets + passports as code"| CL
+  ASG[["agent-stack-go: shared Go contract"]] -.->|imported by| IDX
+  ASG -.->|imported by| WX
+  ASG -.->|imported by| MX
+  ASG -.->|imported by| TFP
+  SPEC[["agent-passport: the spec"]] -.->|governs| BUS
+```
+
+- **Consumes**: agent LLM calls (one base-URL swap); Wardryx decisions (TokenFuse is the enforcement point, the PEP).
+- **Produces**: priced and enforced upstream calls, agent-event NDJSON, CallRecords to its Cloud control plane, and outcome-tagged Parquet traces.
+- **Talks to**: **Wardryx** (per-request policy), its own **Cloud** control plane, and every downstream consumer (**Idryx**, **Qryx**, **Verdryx**) via the event bus. Configured by **terraform-provider-taipan**; rehearsed against by **Mockryx**.
+
+The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan.
+
 ## 📑 Table of contents
 
 - [The problem TokenFuse solves](#-the-problem-tokenfuse-solves)
