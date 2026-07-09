@@ -19,13 +19,13 @@ use datafusion::parquet::arrow::ArrowWriter;
 
 /// One settled call, the unit of the trace.
 ///
-/// Schema evolution note (P2 → P3/agent-passport): `agent_id` and
-/// `saved_microusd` were appended after the first files were written (P2);
-/// `parent_run_id` and `on_behalf_of` follow the exact same pattern (P3). New
-/// fields go at the END and the Parquet schema keeps a stable order (see
-/// [`ParquetSink::schema`]); old files simply lack the trailing columns and
-/// read back as defaults (see `sqlq`). Never reorder or remove a field — that
-/// breaks backward-compatible reads.
+/// Schema evolution note (P2 → P3/agent-passport → P4/outcome-tags): `agent_id`
+/// and `saved_microusd` were appended after the first files were written (P2);
+/// `parent_run_id` and `on_behalf_of` follow the exact same pattern (P3);
+/// `outcome` follows it again (P4). New fields go at the END and the Parquet
+/// schema keeps a stable order (see [`ParquetSink::schema`]); old files simply
+/// lack the trailing columns and read back as defaults (see `sqlq`). Never
+/// reorder or remove a field — that breaks backward-compatible reads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
     pub ts_millis: i64,
@@ -55,6 +55,20 @@ pub struct CallRecord {
     /// not validate, parse, or truncate entries; see `crate::proxy` for the
     /// header's cap/ignore behavior.
     pub on_behalf_of: String,
+    /// Opaque outcome tag from `X-Fuse-Outcome` (P4, unit economics), e.g.
+    /// `case_resolved`, `escalated`, `abandoned`. `""` when unset. Captured
+    /// verbatim, capture-only — no run-level state is built in the proxy (see
+    /// `crate::proxy` for the header's cap/ignore behavior, same shape as
+    /// `on_behalf_of`).
+    ///
+    /// Semantics for consumers: an agent typically tags only its FINAL call of
+    /// a run, but any call in the run may carry the header. A run's outcome is
+    /// the LAST non-empty `outcome` value recorded for its `run_id`, in call
+    /// order — later tags override earlier ones. This trace column is a raw,
+    /// per-call capture; computing "the" outcome of a run is a read-side
+    /// aggregation (see `tokenfuse_core::outcomes`), not something recorded
+    /// here.
+    pub outcome: String,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -134,6 +148,9 @@ impl ParquetSink {
             // order. See [`CallRecord`]'s doc for what each carries.
             Field::new("parent_run_id", DataType::Utf8, false),
             Field::new("on_behalf_of", DataType::Utf8, false),
+            // Appended P4 (outcome-tags) column — same rule: LAST. See
+            // [`CallRecord::outcome`] for what it carries.
+            Field::new("outcome", DataType::Utf8, false),
         ]))
     }
 
@@ -169,6 +186,10 @@ impl ParquetSink {
             // columns null-fill legally; queries `COALESCE` to `''`.
             Field::new("parent_run_id", DataType::Utf8, true),
             Field::new("on_behalf_of", DataType::Utf8, true),
+            // P4 (outcome-tags): same schema-evolution treatment again —
+            // nullable here so a pre-P4 file's missing column null-fills
+            // legally; queries `COALESCE` to `''`.
+            Field::new("outcome", DataType::Utf8, true),
         ]))
     }
 
@@ -226,6 +247,12 @@ impl ParquetSink {
                     records
                         .iter()
                         .map(|r| r.on_behalf_of.clone())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.outcome.clone())
                         .collect::<Vec<_>>(),
                 )),
             ],
@@ -292,6 +319,7 @@ mod tests {
             saved_microusd: 0,
             parent_run_id: String::new(),
             on_behalf_of: String::new(),
+            outcome: String::new(),
         }
     }
 

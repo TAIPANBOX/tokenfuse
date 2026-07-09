@@ -140,6 +140,7 @@ mod tests {
                     saved_microusd: 0,
                     parent_run_id: String::new(),
                     on_behalf_of: String::new(),
+                    outcome: String::new(),
                 });
             }
         }
@@ -246,6 +247,7 @@ mod tests {
                 saved_microusd: 250_000,
                 parent_run_id: String::new(),
                 on_behalf_of: String::new(),
+                outcome: String::new(),
             });
         }
 
@@ -383,6 +385,7 @@ mod tests {
                 saved_microusd: 0,
                 parent_run_id: "parent-run-1".into(),
                 on_behalf_of: "user://acme.example/j.doe,agent://acme.example/orchestrator".into(),
+                outcome: String::new(),
             });
         }
 
@@ -416,6 +419,112 @@ mod tests {
         assert_eq!(rows[1].0, "pre-p3-run");
         assert_eq!(rows[1].1, "", "pre-P3 file's parent_run_id defaults to ''");
         assert_eq!(rows[1].2, "", "pre-P3 file's on_behalf_of defaults to ''");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P4 (outcome-tags): the SAME schema-evolution proof again, one more
+    /// generation later — a trace directory that mixes a PRE-P4 file (12
+    /// columns, written before `outcome` existed) with a NEW file (13
+    /// columns, with it) must read back cleanly, with the old row defaulting
+    /// the new column to `''`.
+    #[tokio::test]
+    async fn mixed_pre_p4_and_p4_schema_files_read_with_defaults() {
+        use datafusion::arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("tf-sql-mixed-p4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // 1) Write a PRE-P4 file by hand: exactly today's 12 columns (P3),
+        //    genuinely lacking `outcome` on disk.
+        let pre_p4_schema = Arc::new(Schema::new(vec![
+            Field::new("ts_millis", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("decision", DataType::Utf8, false),
+            Field::new("input_tokens", DataType::UInt64, false),
+            Field::new("output_tokens", DataType::UInt64, false),
+            Field::new("cost_microusd", DataType::Int64, false),
+            Field::new("step", DataType::UInt32, false),
+            Field::new("agent_id", DataType::Utf8, false),
+            Field::new("saved_microusd", DataType::Int64, false),
+            Field::new("parent_run_id", DataType::Utf8, false),
+            Field::new("on_behalf_of", DataType::Utf8, false),
+        ]));
+        let pre_p4_batch = RecordBatch::try_new(
+            pre_p4_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(StringArray::from(vec!["pre-p4-run"])),
+                Arc::new(StringArray::from(vec!["m"])),
+                Arc::new(StringArray::from(vec!["allow"])),
+                Arc::new(UInt64Array::from(vec![10u64])),
+                Arc::new(UInt64Array::from(vec![5u64])),
+                Arc::new(Int64Array::from(vec![1_000i64])),
+                Arc::new(UInt32Array::from(vec![1u32])),
+                Arc::new(StringArray::from(vec!["agent-old"])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+            ],
+        )
+        .unwrap();
+        {
+            let file = std::fs::File::create(dir.join("calls-pre-p4.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(file, pre_p4_schema, None).unwrap();
+            w.write(&pre_p4_batch).unwrap();
+            w.close().unwrap();
+        }
+
+        // 2) Write a P4-schema file via the current sink (has the new column).
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            sink.record(CallRecord {
+                ts_millis: 2,
+                run_id: "p4-run".into(),
+                model: "m".into(),
+                decision: "allow".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: 1,
+                agent_id: "agent-new".into(),
+                saved_microusd: 0,
+                parent_run_id: String::new(),
+                on_behalf_of: String::new(),
+                outcome: "case_resolved".into(),
+            });
+        }
+
+        // 3) Read via the sqlq path with the robust coalesce the CLIs use.
+        let batches = query(
+            "select run_id, coalesce(outcome, '') as outcome from calls order by run_id",
+            &dir_str,
+        )
+        .await
+        .expect("mixed pre-P4/P4 schema read must succeed");
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for b in &batches {
+            for i in 0..b.num_rows() {
+                rows.push((
+                    str_at(b.column(0).as_ref(), i),
+                    str_at(b.column(1).as_ref(), i),
+                ));
+            }
+        }
+
+        assert_eq!(rows.len(), 2, "both files' rows must be present");
+        assert_eq!(rows[0].0, "p4-run");
+        assert_eq!(rows[0].1, "case_resolved");
+        assert_eq!(rows[1].0, "pre-p4-run");
+        assert_eq!(rows[1].1, "", "pre-P4 file's outcome defaults to ''");
 
         std::fs::remove_dir_all(&dir).ok();
     }

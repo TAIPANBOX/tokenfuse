@@ -87,6 +87,45 @@ fn split_on_behalf_of(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Sanity cap on the raw `X-Fuse-Outcome` header (P4, unit economics): an
+/// opaque tag this long is almost certainly misuse, not a real outcome label
+/// like `case_resolved`/`escalated`/`abandoned`. Mirrors the
+/// `X-Fuse-On-Behalf-Of` handling exactly — over-cap does NOT reject the
+/// request, it ignores the header entirely (as if absent) and counts the
+/// occurrence (see [`OUTCOME_OVERCAP`]).
+const OUTCOME_MAX_BYTES: usize = 128;
+
+/// Count of `X-Fuse-Outcome` headers ignored for exceeding
+/// [`OUTCOME_MAX_BYTES`]. Same "metric" shape as [`ON_BEHALF_OF_OVERCAP`] —
+/// logged on every occurrence via `tracing::warn!` in [`outcome_header`].
+static OUTCOME_OVERCAP: AtomicU64 = AtomicU64::new(0);
+
+/// Parse the raw `X-Fuse-Outcome` header (P4, unit economics): an opaque
+/// caller-supplied tag (e.g. `case_resolved`, `escalated`, `abandoned`),
+/// capture-only — not validated against any fixed vocabulary. Recorded
+/// verbatim into the trace (see `sink::CallRecord::outcome`); no run-level
+/// state is built here, this call's tag is simply what rides into this one
+/// `CallRecord`. Returns `None` for an absent, empty, or over-cap header
+/// (fail-open: an over-cap header is ignored, never a request failure — same
+/// contract as [`on_behalf_of_header`]).
+fn outcome_header(headers: &HeaderMap) -> Option<String> {
+    let raw = header_str(headers, "x-fuse-outcome")?;
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.len() > OUTCOME_MAX_BYTES {
+        let n = OUTCOME_OVERCAP.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            len = raw.len(),
+            cap = OUTCOME_MAX_BYTES,
+            overcap_total = n,
+            "x-fuse-outcome exceeds sanity cap; ignoring header"
+        );
+        return None;
+    }
+    Some(raw)
+}
+
 /// Emit a `breaker_tripped` agent-event for a Breaker 402 (agent-passport
 /// SPEC.md §6.2). Separate from [`breaker_error_response`] so that function
 /// stays byte-for-byte untouched (its wire contract is pinned by
@@ -165,6 +204,13 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         .map(split_on_behalf_of)
         .unwrap_or_default();
 
+    // Outcome tag (P4, unit economics): captured raw for the trace, same
+    // cap/ignore contract as `on_behalf_of` above. No enforcement semantics —
+    // capture only. Named `outcome_tag` (not `outcome`) because `outcome` is
+    // already used locally for the agent-event emit result (see
+    // `st.events.emit` below and in `buffered_managed`).
+    let outcome_tag = outcome_header(&headers).unwrap_or_default();
+
     // Operator kill is a hard stop in any mode.
     if st.is_killed(&run_id) {
         let snap = st.ledger.snapshot(&run_id).await;
@@ -188,6 +234,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             saved_microusd: 0,
             parent_run_id: parent_run_id.clone(),
             on_behalf_of: on_behalf_of.clone(),
+            outcome: outcome_tag.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -228,6 +275,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         saved_microusd: 0,
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
+                        outcome: outcome_tag.clone(),
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -289,6 +337,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         saved_microusd: hit.saved_microusd,
                         parent_run_id: parent_run_id.clone(),
                         on_behalf_of: on_behalf_of.clone(),
+                        outcome: outcome_tag.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -338,6 +387,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 saved_microusd: 0,
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
+                outcome: outcome_tag.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -363,6 +413,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 saved_microusd: 0,
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
+                outcome: outcome_tag.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -407,6 +458,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 saved_microusd: 0,
                 parent_run_id: parent_run_id.clone(),
                 on_behalf_of: on_behalf_of.clone(),
+                outcome: outcome_tag.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -452,6 +504,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     saved_microusd: 0,
                     parent_run_id: parent_run_id.clone(),
                     on_behalf_of: on_behalf_of.clone(),
+                    outcome: outcome_tag.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -504,6 +557,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             agent_id,
             parent_run_id,
             on_behalf_of,
+            outcome_tag,
         )
     } else {
         buffered_managed(
@@ -520,6 +574,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &parent_run_id,
             &on_behalf_of,
             &on_behalf_of_chain,
+            &outcome_tag,
         )
         .await
     }
@@ -539,6 +594,7 @@ fn stream_managed(
     agent_id: String,
     parent_run_id: String,
     on_behalf_of: String,
+    outcome: String,
 ) -> Response {
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
@@ -555,6 +611,7 @@ fn stream_managed(
         agent_id,
         parent_run_id,
         on_behalf_of,
+        outcome,
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -613,6 +670,7 @@ async fn buffered_managed(
     parent_run_id: &str,
     on_behalf_of: &str,
     on_behalf_of_chain: &[String],
+    outcome_tag: &str,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -655,6 +713,7 @@ async fn buffered_managed(
         saved_microusd: 0,
         parent_run_id: parent_run_id.to_string(),
         on_behalf_of: on_behalf_of.to_string(),
+        outcome: outcome_tag.to_string(),
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -684,6 +743,7 @@ async fn buffered_managed(
                     saved_microusd: 0,
                     parent_run_id: parent_run_id.to_string(),
                     on_behalf_of: on_behalf_of.to_string(),
+                    outcome: outcome_tag.to_string(),
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
@@ -1217,6 +1277,112 @@ mod tests {
         assert_eq!(records[0].cost_microusd, 0);
     }
 
+    // -- x-fuse-outcome header parsing (P4, unit economics) -----------------
+
+    #[test]
+    fn outcome_header_absent_is_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(outcome_header(&headers), None);
+    }
+
+    #[test]
+    fn outcome_header_empty_is_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fuse-outcome", "".parse().unwrap());
+        assert_eq!(outcome_header(&headers), None);
+    }
+
+    #[test]
+    fn outcome_header_valid_tag_is_captured_verbatim() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fuse-outcome", "case_resolved".parse().unwrap());
+        assert_eq!(outcome_header(&headers), Some("case_resolved".to_string()));
+    }
+
+    #[test]
+    fn outcome_header_at_exactly_the_cap_is_captured() {
+        let tag = "a".repeat(OUTCOME_MAX_BYTES);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fuse-outcome", tag.parse().unwrap());
+        assert_eq!(outcome_header(&headers), Some(tag));
+    }
+
+    #[test]
+    fn outcome_header_over_cap_is_ignored_not_rejected() {
+        let before = OUTCOME_OVERCAP.load(Ordering::Relaxed);
+        let tag = "a".repeat(OUTCOME_MAX_BYTES + 1);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fuse-outcome", tag.parse().unwrap());
+        // Fail-open: an over-cap header reads as absent, never an error.
+        assert_eq!(outcome_header(&headers), None);
+        // ...but the occurrence is counted (same "metric" shape as
+        // `ON_BEHALF_OF_OVERCAP`).
+        assert_eq!(OUTCOME_OVERCAP.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[tokio::test]
+    async fn outcome_header_is_recorded_verbatim_in_the_sink() {
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-outcome")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-outcome", "case_resolved")
+            .body(Body::from(body(100)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, "case_resolved");
+    }
+
+    #[tokio::test]
+    async fn outcome_header_over_cap_is_dropped_not_recorded() {
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-outcome-overcap")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-outcome", "a".repeat(OUTCOME_MAX_BYTES + 1))
+            .body(Body::from(body(100)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "over-cap header never fails the request"
+        );
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].outcome, "",
+            "over-cap tag is ignored, not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_header_absent_records_empty_string() {
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-no-outcome")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, "");
+    }
+
     #[tokio::test]
     async fn dlp_shadow_flags_but_forwards() {
         let mut st = state(Mode::Shadow, StubProvider::default());
@@ -1447,6 +1613,7 @@ mod tests {
             None,
             "test-model",
             &st,
+            String::new(),
             String::new(),
             String::new(),
             String::new(),

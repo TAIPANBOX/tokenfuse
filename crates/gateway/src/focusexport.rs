@@ -21,6 +21,12 @@
 //!     rows from a pre-P3 trace file that lacks the column (schema
 //!     evolution, same pattern as `agent_id` below) as well as for rows that
 //!     genuinely had no parent.
+//!   - `x_outcome`: sourced from `CallRecord.outcome` (P4, unit economics) —
+//!     the raw, per-call `X-Fuse-Outcome` value. `""` for rows from a pre-P4
+//!     trace file (schema evolution, same `COALESCE` pattern) as well as for
+//!     calls that never set the header. This is the raw per-call capture, not
+//!     the "last non-empty per run" aggregation `tokenfuse outcomes` computes
+//!     — see `tokenfuse_core::outcomes`.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -94,10 +100,11 @@ struct FocusRecord {
     cost_microusd: i64,
     agent_id: String,
     parent_run_id: String,
+    outcome: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 23] = [
+const HEADER: [&str; 24] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -121,6 +128,7 @@ const HEADER: [&str; 23] = [
     "x_tokens_out",
     "x_blocked",
     "x_cost_basis",
+    "x_outcome",
 ];
 
 /// Load, project, and write the FOCUS CSV. Returns `Err` with a clear message
@@ -183,7 +191,8 @@ async fn load_records(
          cast(output_tokens as bigint) as output_tokens, \
          cast(cost_microusd as bigint) as cost_microusd, \
          coalesce(agent_id, '') as agent_id, \
-         coalesce(parent_run_id, '') as parent_run_id \
+         coalesce(parent_run_id, '') as parent_run_id, \
+         coalesce(outcome, '') as outcome \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -233,6 +242,7 @@ async fn load_records(
                 cost_microusd: cost.value(i),
                 agent_id: str_at(b.column(7).as_ref(), i),
                 parent_run_id: str_at(b.column(8).as_ref(), i),
+                outcome: str_at(b.column(9).as_ref(), i),
             });
         }
     }
@@ -288,8 +298,8 @@ fn usd_string(microusd: i64) -> String {
     format!("{:.6}", Microusd(microusd).as_usd())
 }
 
-/// Project one trace row into the 23 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 23] {
+/// Project one trace row into the 24 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 24] {
     let blocked = is_blocked_decision(&rec.decision);
     let (cost_microusd, cost_basis) = if blocked {
         (0i64, "blocked")
@@ -326,6 +336,7 @@ fn to_row(rec: &FocusRecord) -> [String; 23] {
         rec.output_tokens.to_string(),           // x_tokens_out
         blocked.to_string(),                     // x_blocked
         cost_basis.to_string(),                  // x_cost_basis
+        rec.outcome.clone(),                     // x_outcome
     ]
 }
 
@@ -363,7 +374,10 @@ fn render_csv(records: &[FocusRecord]) -> String {
 /// epoch milliseconds, for `--from`/`--to`. Deliberately narrow — no
 /// non-`Z` timezone offsets — good enough for CLI filter flags without a
 /// date-parsing dependency.
-fn parse_rfc3339_millis(s: &str) -> Result<i64, String> {
+///
+/// `pub(crate)` so `tokenfuse outcomes` ([`crate::outcomescli`]) can reuse the
+/// exact same `--from`/`--to` parsing instead of duplicating it.
+pub(crate) fn parse_rfc3339_millis(s: &str) -> Result<i64, String> {
     let s = s.trim();
     let bad = || format!("expected RFC3339 like 2026-01-02T15:04:05Z, got '{s}'");
     let body = s.strip_suffix('Z').ok_or_else(bad)?;
@@ -522,7 +536,7 @@ mod tests {
         cost_microusd: i64,
         agent_id: &str,
     ) -> CallRecord {
-        rec_with_parent(
+        rec_with_parent_and_outcome(
             ts_millis,
             run_id,
             model,
@@ -532,14 +546,15 @@ mod tests {
             cost_microusd,
             agent_id,
             "",
+            "",
         )
     }
 
-    /// Like [`rec`], but also sets `parent_run_id` — exercises P3's
-    /// `x_parent_run_id` sourcing (see
+    /// Like [`rec`], but also sets `parent_run_id` (P3) and `outcome` (P4) —
+    /// exercises both `x_parent_run_id` and `x_outcome` sourcing (see
     /// `exports_a_fixture_trace_to_the_exact_expected_csv`).
     #[allow(clippy::too_many_arguments)]
-    fn rec_with_parent(
+    fn rec_with_parent_and_outcome(
         ts_millis: i64,
         run_id: &str,
         model: &str,
@@ -549,6 +564,7 @@ mod tests {
         cost_microusd: i64,
         agent_id: &str,
         parent_run_id: &str,
+        outcome: &str,
     ) -> CallRecord {
         CallRecord {
             ts_millis,
@@ -563,6 +579,7 @@ mod tests {
             saved_microusd: 0,
             parent_run_id: parent_run_id.into(),
             on_behalf_of: String::new(),
+            outcome: outcome.into(),
         }
     }
 
@@ -575,8 +592,9 @@ mod tests {
         {
             let sink = ParquetSink::new(&dir, 1).unwrap();
             // A: a normal settled allow (real parsed usage), WITH a parent run
-            // — exercises P3's x_parent_run_id sourcing.
-            sink.record(rec_with_parent(
+            // AND an outcome tag — exercises P3's x_parent_run_id sourcing
+            // and P4's x_outcome sourcing together.
+            sink.record(rec_with_parent_and_outcome(
                 0,
                 "run-a",
                 "claude-sonnet",
@@ -586,6 +604,7 @@ mod tests {
                 345_000,
                 "agent-1",
                 "run-parent-a",
+                "case_resolved",
             ));
             // B: SettleGuard-drop-without-complete edge case — allow, zero
             // tokens, non-zero cost (the reserved fallback) -> "estimated".
@@ -628,23 +647,24 @@ mod tests {
             "BilledCost,EffectiveCost,BillingCurrency,ChargePeriodStart,ChargePeriodEnd,",
             "ChargeDescription,ProviderName,PublisherName,InvoiceIssuerName,ServiceName,",
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
-            "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis\n",
+            "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
+            "x_outcome\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled\n",
+            "claude-sonnet,100,50,false,settled,case_resolved\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled\n",
+            "0,0,false,settled,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked\n",
+            "blocked,\n",
         );
         assert_eq!(got, want);
 

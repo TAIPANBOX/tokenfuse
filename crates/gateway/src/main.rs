@@ -216,6 +216,18 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        // `tokenfuse outcomes --traces <dir-or-glob> [--from <rfc3339>]`
+        //     `[--to <rfc3339>] [--json]` — unit economics per `X-Fuse-Outcome`
+        // tag (P4): runs, total settled cost, mean cost per run, total calls,
+        // and blocked calls, using the LAST non-empty tag per run.
+        Some("outcomes") => {
+            let rest: Vec<String> = args.collect();
+            let oargs = tokenfuse_gateway::outcomescli::parse_args(&rest);
+            if let Err(e) = tokenfuse_gateway::outcomescli::run(&oargs).await {
+                eprintln!("outcomes error: {e}");
+                std::process::exit(1);
+            }
+        }
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
         Some("mcp-broker") => mcp_broker().await,
         // Anything else starts the gateway.
