@@ -43,11 +43,16 @@ pub async fn run(dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         report.blocked_calls,
         report.budget_breaks_prevented,
     );
-    // Cache savings are a distinct ROI (spend served for free), reported on its
-    // own line rather than folded into the runaway-spend headline.
+    // Cache and router savings are each a distinct ROI (spend served for free
+    // or avoided by routing to a cheaper model), reported on their own lines
+    // rather than folded into the runaway-spend headline or each other.
     println!(
         "  cache saved:             {}",
         money(report.cache_saved_microusd)
+    );
+    println!(
+        "  router saved:            {}",
+        money(report.router_saved_microusd)
     );
     // Per-reason breakdown, when anything was blocked, so the headline number is
     // attributable (which protection did the saving).
@@ -79,8 +84,10 @@ mod tests {
     #[test]
     fn computes_savings_over_a_mixed_trace() {
         // The pure path the CLI runs after loading: allows + a security block are
-        // ignored; only the budget-protection blocks are summed, and cache hits
-        // contribute their avoided spend on the separate cache-saved line.
+        // ignored for blocked spend; only the budget-protection blocks are
+        // summed, cache hits contribute their avoided spend on the separate
+        // cache-saved line, and a router-routed allow contributes to its own
+        // router-saved line rather than being folded into cache.
         let calls = vec![
             call("a", "allow", 500_000),
             call("a", "budget_exceeded", 1_000_000),
@@ -92,11 +99,18 @@ mod tests {
                 cost_microusd: 0,
                 saved_microusd: 750_000,
             },
+            Call {
+                run_id: "c".into(),
+                decision: "allow".into(),
+                cost_microusd: 400_000,
+                saved_microusd: 100_000,
+            },
         ];
         let report = compute_savings(&calls);
         assert_eq!(report.blocked_spend_microusd, 3_000_000);
         assert_eq!(report.blocked_calls, 2);
         assert_eq!(report.budget_breaks_prevented, 2);
         assert_eq!(report.cache_saved_microusd, 750_000);
+        assert_eq!(report.router_saved_microusd, 100_000);
     }
 }

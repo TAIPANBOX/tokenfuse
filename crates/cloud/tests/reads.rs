@@ -231,14 +231,15 @@ async fn agents_roll_up_and_sort_by_spend() {
 #[tokio::test]
 async fn savings_sum_blocked_cache_and_breaks() {
     let (state, _store) = test_state();
-    // allow + budget_exceeded (avoided) + cache_hit (saved) + dlp (excluded),
-    // over two distinct blocked runs.
+    // allow + budget_exceeded (avoided) + cache_hit (saved) + dlp (excluded)
+    // + a router-routed allow (saved), over two distinct blocked runs.
     let payload = r#"{"records":[
         {"ts_millis":10,"run_id":"r1","decision":"allow","cost_microusd":1000},
         {"ts_millis":20,"run_id":"r1","decision":"budget_exceeded","cost_microusd":500000},
         {"ts_millis":30,"run_id":"r2","decision":"loop_detected","cost_microusd":200000},
         {"ts_millis":40,"run_id":"r1","decision":"cache_hit","saved_microusd":30000},
-        {"ts_millis":50,"run_id":"r3","decision":"dlp_blocked","cost_microusd":9000000}
+        {"ts_millis":50,"run_id":"r3","decision":"dlp_blocked","cost_microusd":9000000},
+        {"ts_millis":60,"run_id":"r4","decision":"allow","cost_microusd":80000,"saved_microusd":15000}
     ]}"#;
     let resp = app(state.clone())
         .oneshot(
@@ -257,9 +258,12 @@ async fn savings_sum_blocked_cache_and_breaks() {
     // Only budget-protection cost; dlp excluded.
     assert_eq!(s["blocked_spend_microusd"], 700_000);
     assert_eq!(s["cache_saved_microusd"], 30_000);
+    // The router-routed allow's saved_microusd lands under its own
+    // dimension, not folded into cache_saved_microusd.
+    assert_eq!(s["router_saved_microusd"], 15_000);
     // Distinct blocked runs r1 + r2.
     assert_eq!(s["budget_breaks"], 2);
-    assert_eq!(s["total_saved_microusd"], 730_000);
+    assert_eq!(s["total_saved_microusd"], 745_000);
 }
 
 #[tokio::test]

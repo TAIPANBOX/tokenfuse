@@ -649,8 +649,8 @@ async fn agents(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.agents(&org))).into_response()
 }
 
-/// The caller org's FinOps savings: budget-protection blocked (avoided) spend
-/// plus semantic-cache savings, and their total.
+/// The caller org's FinOps savings: budget-protection blocked (avoided) spend,
+/// semantic-cache savings, and model-router savings, plus their total.
 #[utoipa::path(
     get, path = "/v1/savings",
     responses(

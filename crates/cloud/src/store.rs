@@ -176,16 +176,23 @@ pub struct AgentAgg {
 }
 
 /// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
-/// headline: budget-protection blocked spend plus semantic-cache savings.
+/// headline: budget-protection blocked spend plus semantic-cache savings plus
+/// model-router savings.
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct SavingsSummary {
     /// Avoided spend from budget-protection blocks (runaway spend stopped).
     pub blocked_spend_microusd: i64,
     /// Dollars served for free by the semantic cache.
     pub cache_saved_microusd: i64,
+    /// Dollars avoided by the model router routing a call to a cheaper model
+    /// than the one requested. A distinct dimension from `cache_saved_microusd`
+    /// even though both ride the same wire `saved_microusd` column: a cache
+    /// hit and a router-routed call are mutually exclusive outcomes for one
+    /// call (see the fold in `ingest_at`).
+    pub router_saved_microusd: i64,
     /// Distinct runs stopped by at least one budget-protection block.
     pub budget_breaks: u64,
-    /// `blocked_spend_microusd + cache_saved_microusd`.
+    /// `blocked_spend_microusd + cache_saved_microusd + router_saved_microusd`.
     pub total_saved_microusd: i64,
 }
 
@@ -205,6 +212,11 @@ pub struct SavingsSummary {
 struct SavingsAcc {
     blocked_spend_microusd: i64,
     cache_saved_microusd: i64,
+    /// Dollars avoided by the model router (see [`SavingsSummary::router_saved_microusd`]).
+    /// `#[serde(default)]` so snapshots taken before this field existed load
+    /// to `0` rather than failing to deserialize.
+    #[serde(default)]
+    router_saved_microusd: i64,
     /// Distinct run ids that hit ≥1 budget-protection block AND are still
     /// within [`MAX_BREAK_KEYS`] — bounded, LRU-evicted dedup memory for
     /// `budget_breaks`, not a durable historical record (that's the counter).
@@ -896,14 +908,28 @@ impl Store {
                         }
                         break_recency.touch(r.run_id.clone());
                     }
-                    // C3: cache savings are a customer-facing headline
-                    // (`/v1/savings.total_saved_microusd`) — only a REAL
-                    // `cache_hit` may contribute (mirrors `agg.cache_hits`'
-                    // own gate above). Without this, any principal could POST
+                    // C3: cache and router savings are a customer-facing
+                    // headline (`/v1/savings.total_saved_microusd`), so only
+                    // the REAL decision each dimension can legitimately carry
+                    // may contribute (mirrors `agg.cache_hits`' own gate
+                    // above). A semantic-cache hit returns early on its own
+                    // `cache_hit` row, so an `allow` row's `saved_microusd`
+                    // can only be the model router's avoided spend; any other
+                    // decision (a block, or an unrecognized string) is
+                    // untrusted here and must not credit either dimension.
+                    // Without this, any principal could POST
                     // `{"decision":"anything","saved_microusd":huge}` and
                     // inflate "Saved this month" for free.
-                    if r.decision == "cache_hit" {
-                        sav.cache_saved_microusd = sav.cache_saved_microusd.saturating_add(saved);
+                    match r.decision.as_str() {
+                        "cache_hit" => {
+                            sav.cache_saved_microusd =
+                                sav.cache_saved_microusd.saturating_add(saved);
+                        }
+                        "allow" => {
+                            sav.router_saved_microusd =
+                                sav.router_saved_microusd.saturating_add(saved);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1227,12 +1253,14 @@ impl Store {
     }
 
     /// An org's live FinOps savings totals (blocked/avoided spend + cache
-    /// savings). Accumulated incrementally in [`Store::ingest`] and persisted.
+    /// savings + router savings). Accumulated incrementally in
+    /// [`Store::ingest`] and persisted.
     pub fn savings(&self, org: &str) -> SavingsSummary {
         let inner = self.inner.read().unwrap();
         let acc = inner.savings.get(org);
         let blocked = acc.map(|a| a.blocked_spend_microusd).unwrap_or(0);
         let cache = acc.map(|a| a.cache_saved_microusd).unwrap_or(0);
+        let router = acc.map(|a| a.router_saved_microusd).unwrap_or(0);
         // C2: read the MONOTONIC counter, not `breaks.len()` — `breaks` is now
         // bounded/LRU-evicted dedup memory (see `SavingsAcc::breaks`), so its
         // length would undercount once eviction has happened.
@@ -1240,8 +1268,9 @@ impl Store {
         SavingsSummary {
             blocked_spend_microusd: blocked,
             cache_saved_microusd: cache,
+            router_saved_microusd: router,
             budget_breaks: breaks,
-            total_saved_microusd: blocked.saturating_add(cache),
+            total_saved_microusd: blocked.saturating_add(cache).saturating_add(router),
         }
     }
 
@@ -2281,6 +2310,7 @@ mod tests {
                 r("r2", "loop_detected", 200_000, 0),   // avoided spend, 2nd run
                 r("r1", "cache_hit", 0, 30_000),        // cache savings
                 r("r3", "dlp_blocked", 9_000_000, 0),   // security — excluded
+                r("r4", "allow", 800_000, 100_000),     // router savings
             ],
         );
 
@@ -2288,9 +2318,12 @@ mod tests {
         // Only budget-protection cost counts; dlp is excluded.
         assert_eq!(sav.blocked_spend_microusd, 700_000);
         assert_eq!(sav.cache_saved_microusd, 30_000);
+        // The router-routed allow's saved_microusd lands under its own
+        // dimension, not folded into cache_saved_microusd.
+        assert_eq!(sav.router_saved_microusd, 100_000);
         // Distinct blocked runs: r1 and r2 (r3's dlp doesn't count).
         assert_eq!(sav.budget_breaks, 2);
-        assert_eq!(sav.total_saved_microusd, 730_000);
+        assert_eq!(sav.total_saved_microusd, 830_000);
     }
 
     #[test]
@@ -2307,6 +2340,48 @@ mod tests {
         let sav = s.savings("acme");
         assert_eq!(sav.budget_breaks, 1);
         assert_eq!(sav.blocked_spend_microusd, 2_000_000);
+    }
+
+    /// The attribution-split regression test: a cache hit, a router-routed
+    /// allow, and a budget-protection block, each ingested once. Every
+    /// dimension must get exactly its own share, none of the others', and
+    /// total_saved_microusd must be their sum.
+    #[test]
+    fn savings_splits_cache_router_and_blocked_into_exact_shares() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "cache_hit".into(),
+                    saved_microusd: 50_000,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 300_000,
+                    saved_microusd: 75_000,
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r3".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 1_000_000,
+                    ..Default::default()
+                },
+            ],
+        );
+        let sav = s.savings("acme");
+        assert_eq!(sav.cache_saved_microusd, 50_000);
+        assert_eq!(sav.router_saved_microusd, 75_000);
+        assert_eq!(sav.blocked_spend_microusd, 1_000_000);
+        assert_eq!(
+            sav.total_saved_microusd,
+            sav.cache_saved_microusd + sav.router_saved_microusd + sav.blocked_spend_microusd
+        );
+        assert_eq!(sav.total_saved_microusd, 1_125_000);
     }
 
     #[test]
@@ -2331,6 +2406,13 @@ mod tests {
                     saved_microusd: 60_000,
                     ..Default::default()
                 },
+                CallRecord {
+                    run_id: "r3".into(),
+                    decision: "allow".into(),
+                    cost_microusd: 900_000,
+                    saved_microusd: 20_000,
+                    ..Default::default()
+                },
             ],
         );
         s.save(&path).expect("save");
@@ -2341,8 +2423,9 @@ mod tests {
         let sav = s2.savings("acme");
         assert_eq!(sav.blocked_spend_microusd, 400_000);
         assert_eq!(sav.cache_saved_microusd, 60_000);
+        assert_eq!(sav.router_saved_microusd, 20_000);
         assert_eq!(sav.budget_breaks, 1);
-        assert_eq!(sav.total_saved_microusd, 460_000);
+        assert_eq!(sav.total_saved_microusd, 480_000);
 
         // An old snapshot with no `savings` field loads to zeros, not an error.
         let old = dir.join(format!("tf-cloud-{}-oldsnap.json", std::process::id()));
@@ -2355,37 +2438,65 @@ mod tests {
         s3.load(&old).expect("load old snapshot");
         assert_eq!(s3.savings("acme").total_saved_microusd, 0);
 
+        // A snapshot whose SavingsAcc predates router_saved_microusd (it only
+        // carries the two original fields) loads router_saved_microusd to 0
+        // via #[serde(default)], not a deserialize error.
+        let pre_router = dir.join(format!(
+            "tf-cloud-{}-preroutersnap.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &pre_router,
+            br#"{"orgs":{},"killed":{},"budgets":{},"devices":{},
+                "savings":{"acme":{"blocked_spend_microusd":400000,
+                "cache_saved_microusd":60000,"breaks":["r1"],"budget_breaks":1}}}"#,
+        )
+        .expect("write pre-router snapshot");
+        let s4 = Store::new();
+        s4.load(&pre_router).expect("load pre-router snapshot");
+        let sav4 = s4.savings("acme");
+        assert_eq!(sav4.blocked_spend_microusd, 400_000);
+        assert_eq!(sav4.cache_saved_microusd, 60_000);
+        assert_eq!(sav4.router_saved_microusd, 0);
+        assert_eq!(sav4.total_saved_microusd, 460_000);
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&old);
+        let _ = std::fs::remove_file(&pre_router);
     }
 
-    /// C3: `cache_saved_microusd` — the source of `/v1/savings`'s
-    /// customer-facing "Saved this month" headline — must only be credited by
-    /// a REAL `cache_hit` record. `/v1/ingest` is ungated (any org principal,
-    /// including a read-only viewer key, may POST a batch), so without this
-    /// gate a viewer could POST `{"decision":"anything","saved_microusd":N}`
-    /// (or even `"allow"`, a real but unrelated outcome) and inflate the
-    /// figure for free.
+    /// C3: `cache_saved_microusd` and `router_saved_microusd` (the source of
+    /// `/v1/savings`'s customer-facing "Saved this month" headline) must each
+    /// only be credited by the one real decision that can legitimately carry
+    /// it: `cache_hit` for cache, `allow` for router. `/v1/ingest` is ungated
+    /// (any org principal, including a read-only viewer key, may POST a
+    /// batch), so without this gate a viewer could POST
+    /// `{"decision":"anything","saved_microusd":N}` and inflate either figure
+    /// for free.
     #[test]
-    fn cache_savings_only_count_on_a_real_cache_hit() {
+    fn savings_dimensions_only_count_on_their_real_decision() {
         let s = Store::new();
         s.ingest(
             "acme",
             &[
-                // Fabricated/irrelevant decisions carrying a huge claimed
-                // saving must contribute ZERO.
+                // A fabricated/unrecognized decision carrying a huge claimed
+                // saving must contribute ZERO to every dimension.
                 CallRecord {
                     run_id: "r1".into(),
                     decision: "pwned".into(),
                     saved_microusd: 999_999_999_999,
                     ..Default::default()
                 },
+                // A real `allow` row's saved_microusd is the model router's
+                // avoided spend: credited to router, never to cache.
                 CallRecord {
                     run_id: "r2".into(),
                     decision: "allow".into(),
                     saved_microusd: 999_999_999_999,
                     ..Default::default()
                 },
+                // A budget-protection block is not a recognized savings
+                // carrier; its saved_microusd must not count either.
                 CallRecord {
                     run_id: "r3".into(),
                     decision: "budget_exceeded".into(),
@@ -2404,9 +2515,13 @@ mod tests {
         let sav = s.savings("acme");
         assert_eq!(
             sav.cache_saved_microusd, 30_000,
-            "only the real cache_hit's saved_microusd may count"
+            "only the real cache_hit's saved_microusd may count as cache"
         );
-        assert_eq!(sav.total_saved_microusd, 30_000);
+        assert_eq!(
+            sav.router_saved_microusd, 999_999_999_999,
+            "the real allow's saved_microusd counts as router, never as cache"
+        );
+        assert_eq!(sav.total_saved_microusd, 1_000_000_029_999);
     }
 
     /// C4: attacker-controlled `cost_microusd`/`saved_microusd` accumulators

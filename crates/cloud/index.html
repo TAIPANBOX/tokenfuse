@@ -99,7 +99,8 @@
       $("c-saved").textContent = usd2(sav.total_saved_microusd);
       $("c-saved").style.color = sav.total_saved_microusd ? "#3fb950" : "";
       $("c-saved-sub").textContent =
-        "blocked " + usd2(sav.blocked_spend_microusd) + " · cache " + usd2(sav.cache_saved_microusd);
+        "blocked " + usd2(sav.blocked_spend_microusd) + " · cache " + usd2(sav.cache_saved_microusd) +
+        " · router " + usd2(sav.router_saved_microusd);
       runs.sort((a, b) => b.spent_microusd - a.spent_microusd);
       $("empty").style.display = runs.length ? "none" : "block";
       $("empty").textContent = "No runs yet — send some traffic through a gateway.";
