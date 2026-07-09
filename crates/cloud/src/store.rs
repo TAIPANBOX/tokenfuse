@@ -1157,6 +1157,25 @@ impl Store {
         out
     }
 
+    /// Whether `run` is a run this org has ingested telemetry for (present in
+    /// the org's live run map). Used to scope a cross-org-guessable path param
+    /// (like `/v1/replay/{run}`) to the caller's own org BEFORE returning
+    /// anything about it, so an unknown-to-this-org run 404s rather than
+    /// leaking whether the id exists for a different org.
+    ///
+    /// Like `runs()`, this only sees runs still retained after
+    /// `MAX_RUNS_PER_ORG` LRU eviction; a long-idle run that was evicted reads
+    /// as not-belonging, the same way it would already be absent from
+    /// `/v1/runs`.
+    pub fn run_belongs_to_org(&self, org: &str, run: &str) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner
+            .orgs
+            .get(org)
+            .map(|runs| runs.contains_key(run))
+            .unwrap_or(false)
+    }
+
     /// Org-wide totals. `calls`/`spent_microusd` are read from the running
     /// [`OrgTotals`] accumulator (exact over the org's full ingest history,
     /// unaffected by [`MAX_RUNS_PER_ORG`] eviction); `runs` reflects the

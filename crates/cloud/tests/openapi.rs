@@ -43,6 +43,10 @@ fn spec_covers_every_endpoint() {
         "/v1/incidents",
         "/v1/incidents/{id}/ack",
         "/v1/compliance",
+        // Wave 2: incident replay + the regulator evidence pack (read-only,
+        // additive; see crates/cloud/src/http.rs's `replay` / `compliance_evidence`).
+        "/v1/replay/{run}",
+        "/v1/compliance/evidence",
     ] {
         assert!(paths.contains_key(p), "spec missing path {p}");
     }
@@ -59,6 +63,11 @@ fn spec_covers_every_endpoint() {
         "Incident",
         "ComplianceReportSchema",
         "ControlEvidenceSchema",
+        "ReplayResponse",
+        "ReplayEvent",
+        "EvidencePackResponse",
+        "EvidenceControl",
+        "EvidenceStatus",
     ] {
         assert!(schemas.contains_key(s), "spec missing schema {s}");
     }

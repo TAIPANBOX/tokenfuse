@@ -119,9 +119,21 @@ async fn main() {
         tracing::info!("audit manifest signing enabled (ES256)");
     }
 
+    // Agent-event NDJSON replay source for `GET /v1/replay/{run}` (read-only,
+    // additive: incident replay). Independent of `TOKENFUSE_EVENTS_PATH` above
+    // (that's a gateway's own export path; this is what the control plane
+    // reads from) so an operator can point it at the same file, a copy, or
+    // leave it unset entirely (the endpoint still returns the store-derived
+    // incidents/audit for a run, just zero events).
+    let replay_events_path = std::env::var("TOKENFUSE_CLOUD_REPLAY_EVENTS").ok();
+    if replay_events_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        tracing::info!("replay events configured for /v1/replay");
+    }
+
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct)
         .with_oidc(oidc)
-        .with_audit_signing_key(audit_signing_key);
+        .with_audit_signing_key(audit_signing_key)
+        .with_replay_events_path(replay_events_path);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)

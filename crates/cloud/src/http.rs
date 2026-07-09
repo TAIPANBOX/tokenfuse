@@ -25,6 +25,10 @@ use axum::{
 use p256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokenfuse_core::audit::AuditEntry;
+use tokenfuse_core::compliance::{
+    compute_compliance_from_counts, ControlEvidence, Enforcement, CATALOG, DISCLAIMER,
+};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -33,6 +37,7 @@ use crate::devices::{self, Device};
 use crate::entitlements::{gate, Feature};
 use crate::keys::{Plan, Principal};
 use crate::oidc::{self, OidcConfig};
+use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
     AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
 };
@@ -48,8 +53,8 @@ use crate::store::{
     ),
     paths(
         ingest, runs, agents, savings, summary, alerts, series, kill, kills, set_budget, budgets,
-        incidents, ack_incident, compliance, audit, audit_verify, audit_manifest, pair_new, pair,
-        register_apns, register_activity,
+        incidents, ack_incident, compliance, compliance_evidence, audit, audit_verify,
+        audit_manifest, replay, pair_new, pair, register_apns, register_activity,
     ),
     components(schemas(
         CallRecord,
@@ -62,9 +67,14 @@ use crate::store::{
         Incident,
         ComplianceReportSchema,
         ControlEvidenceSchema,
+        EvidencePackResponse,
+        EvidenceControl,
+        EvidenceStatus,
         AuditEntrySchema,
         AuditVerifyResponse,
         AuditManifest,
+        ReplayResponse,
+        ReplayEvent,
         IngestBody,
         IngestResponse,
         BudgetBody,
@@ -112,6 +122,11 @@ pub struct AppState {
     /// (`404`); the rest of the audit trail is unaffected. Loaded once at
     /// construction from `TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY`.
     pub audit_signing_key: Option<Arc<SigningKey>>,
+    /// Optional path to the agent-event NDJSON export `GET /v1/replay/{run}`
+    /// reads (wave 2). `None` when unconfigured: the endpoint still returns
+    /// the store-derived incidents/audit for the run, just zero events. Read
+    /// once at construction from `TOKENFUSE_CLOUD_REPLAY_EVENTS`.
+    pub replay_events_path: Option<Arc<String>>,
 }
 
 impl AppState {
@@ -122,6 +137,7 @@ impl AppState {
             alert_pct,
             oidc: None,
             audit_signing_key: None,
+            replay_events_path: None,
         }
     }
 
@@ -140,6 +156,15 @@ impl AppState {
     /// reports not-configured.
     pub fn with_audit_signing_key(mut self, key: Option<SigningKey>) -> Self {
         self.audit_signing_key = key.map(Arc::new);
+        self
+    }
+
+    /// Attach an optional replay-events path (from `TOKENFUSE_CLOUD_REPLAY_EVENTS`).
+    /// Kept off `new` like [`Self::with_oidc`], so existing call sites and
+    /// tests are unchanged; a deployment without the env var simply never
+    /// calls this and `/v1/replay/{run}` reports zero events.
+    pub fn with_replay_events_path(mut self, path: Option<String>) -> Self {
+        self.replay_events_path = path.filter(|p| !p.is_empty()).map(Arc::new);
         self
     }
 
@@ -347,9 +372,11 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/incidents", get(incidents))
         .route("/v1/incidents/{id}/ack", post(ack_incident))
         .route("/v1/compliance", get(compliance))
+        .route("/v1/compliance/evidence", get(compliance_evidence))
         .route("/v1/audit", get(audit))
         .route("/v1/audit/verify", get(audit_verify))
         .route("/v1/audit/manifest", get(audit_manifest))
+        .route("/v1/replay/{run}", get(replay))
         .route("/v1/pair/new", post(pair_new))
         .route("/v1/pair", post(pair))
         .route("/v1/devices/{id}/apns", post(register_apns))
@@ -983,6 +1010,308 @@ async fn compliance(State(st): State<AppState>, headers: HeaderMap) -> Response 
     (StatusCode::OK, Json(report)).into_response()
 }
 
+/// Honesty classification for one control in the regulator evidence pack
+/// (`/v1/compliance/evidence`), decided from THIS org's live data, not a
+/// static catalog claim: `Enforced` only when the org has produced concrete
+/// evidence the control fired; `Partial` when the mechanism is caveated (see
+/// `evidence_status`) or an integrity check itself failed; `Documented`
+/// otherwise (implemented and described, but no evidence yet for this org).
+/// Serialized as the bare variant name (`"Enforced"` / `"Partial"` /
+/// `"Documented"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+enum EvidenceStatus {
+    Enforced,
+    Partial,
+    Documented,
+}
+
+/// One control's entry in a regulator evidence-pack framework section: the
+/// TokenFuse control plus the external clause it is cited against, honestly
+/// graded, and the concrete signal the grade was decided from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct EvidenceControl {
+    control: String,
+    status: EvidenceStatus,
+    evidence: String,
+}
+
+/// A regulator evidence pack: the same live decision/incident/audit data
+/// behind `/v1/compliance`, additionally mapped to three external framework
+/// sections and honestly graded per control (see `EvidenceStatus`). Read-only
+/// and additive: this changes no stored state and does not affect
+/// enforcement; it exists so an operator can hand a regulator a mapped,
+/// evidence-backed view without the `/v1/compliance` contract itself moving.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct EvidencePackResponse {
+    /// Standing disclaimer, shared with `/v1/compliance`: evidence, not a
+    /// certification.
+    generated_note: &'static str,
+    org: String,
+    eu_ai_act: Vec<EvidenceControl>,
+    /// US Federal Reserve SR 11-7 model-risk-management guidance.
+    sr_11_7: Vec<EvidenceControl>,
+    soc2: Vec<EvidenceControl>,
+    /// Whether this org's audit chain verifies end-to-end right now (see
+    /// `Store::audit_verify`).
+    audit_chain_verified: bool,
+    /// 0-based index of the first broken link, when `audit_chain_verified` is
+    /// `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_break_index: Option<usize>,
+    audit_entries: u64,
+    decisions_total: u64,
+    incidents_total: u64,
+}
+
+/// A regulator evidence pack: the org's live decision/incident/audit evidence
+/// mapped to three external framework sections (EU AI Act, US SR 11-7
+/// model-risk guidance, SOC 2) and honestly graded per control. A second view
+/// over data `/v1/compliance` already exposes, never a new signal and never a
+/// mutation; see `EvidenceStatus`'s doc for exactly how a grade is decided.
+/// Readable by any role, like the other reads; a paid feature.
+#[utoipa::path(
+    get, path = "/v1/compliance/evidence",
+    responses(
+        (status = 200, description = "regulator evidence pack", body = EvidencePackResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 402, description = "plan required", body = PlanRequiredResponse),
+    ),
+    tag = "reads"
+)]
+async fn compliance_evidence(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some((org, plan)) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(plan, Feature::Compliance) {
+        return plan_required(&org, d.feature);
+    }
+
+    let decision_counts = st.store.decision_counts(&org);
+    let incident_kind_counts = st.store.incident_kind_counts(&org);
+    // Same kernel `/v1/compliance` uses, so the two endpoints never drift on
+    // what "this control observed evidence" means.
+    let report = compute_compliance_from_counts(
+        CATALOG,
+        &decision_counts,
+        &std::collections::BTreeMap::new(),
+        &incident_kind_counts,
+    );
+    let evidence_by_id: HashMap<&str, &ControlEvidence> =
+        report.controls.iter().map(|c| (c.control_id, c)).collect();
+
+    let audit_entries = st.store.audit(&org);
+    let audit_result = st.store.audit_verify(&org);
+    let (audit_status, audit_evidence) = audit_chain_status(audit_entries.len(), audit_result);
+
+    let mut eu_ai_act = catalog_section("EU-AI-ACT", &evidence_by_id);
+    eu_ai_act.push(audit_control(
+        "Art. 12 (Record-keeping)",
+        audit_status,
+        &audit_evidence,
+    ));
+
+    let mut soc2 = catalog_section("SOC2", &evidence_by_id);
+    soc2.push(audit_control(
+        "CC7.2 (System Monitoring)",
+        audit_status,
+        &audit_evidence,
+    ));
+
+    let sr_11_7 = vec![
+        model_use_controls(&decision_counts),
+        ongoing_monitoring(&incident_kind_counts),
+        audit_control(
+            "Governance, Policies, and Controls",
+            audit_status,
+            &audit_evidence,
+        ),
+    ];
+
+    let (audit_chain_verified, audit_break_index) = match audit_result {
+        Ok(()) => (true, None),
+        Err(i) => (false, Some(i)),
+    };
+
+    let body = EvidencePackResponse {
+        generated_note: DISCLAIMER,
+        org,
+        eu_ai_act,
+        sr_11_7,
+        soc2,
+        audit_chain_verified,
+        audit_break_index,
+        audit_entries: audit_entries.len() as u64,
+        decisions_total: decision_counts.values().sum(),
+        incidents_total: incident_kind_counts.values().sum(),
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Project `CATALOG`'s controls that cite `framework_id` into evidence-pack
+/// entries. A nominally `Enforced` catalog control is honestly downgraded to
+/// `Documented` when this org has produced no concrete evidence for it yet
+/// (see `evidence_status`): the evidence pack cites what actually happened
+/// for THIS org, not what the catalog nominally wires up.
+///
+/// `TF.AUDIT` is skipped here: its catalog entry predates this org's shipped
+/// tamper-evident chain (the catalog text still says the hash chain "is not
+/// yet implemented", which is stale now that `crates/core/src/audit.rs` and
+/// `crates/cloud/src/audit_sign.rs` implement it). Rather than repeat that
+/// stale claim, every section's audit-chain entry is computed straight from
+/// the live chain instead (`audit_control`), which is a strictly stronger,
+/// fresher signal than the static catalog text.
+fn catalog_section(
+    framework_id: &str,
+    evidence_by_id: &HashMap<&str, &ControlEvidence>,
+) -> Vec<EvidenceControl> {
+    let mut out = Vec::new();
+    for c in CATALOG {
+        if c.control_id == "TF.AUDIT" {
+            continue;
+        }
+        for fw in c.frameworks {
+            if fw.0 != framework_id {
+                continue;
+            }
+            let Some(ce) = evidence_by_id.get(c.control_id).copied() else {
+                continue;
+            };
+            out.push(EvidenceControl {
+                control: format!("{} ({}) - {}", c.control_id, c.title, fw.1),
+                status: evidence_status(ce),
+                evidence: control_evidence_text(ce),
+            });
+        }
+    }
+    out
+}
+
+/// Honest per-org status for one catalog control's realized evidence. A
+/// `Partial`/`Documented` catalog classification is never upgraded (this pack
+/// makes no claim the codebase itself doesn't make); an `Enforced`
+/// classification is held down to `Documented` unless this org's live data
+/// actually shows the control firing (`evidence_seen`): wired but silent does
+/// not earn `Enforced` in a pack whose whole point is proving it ran.
+fn evidence_status(ce: &ControlEvidence) -> EvidenceStatus {
+    match ce.enforcement {
+        Enforcement::Documented => EvidenceStatus::Documented,
+        Enforcement::Partial => EvidenceStatus::Partial,
+        Enforcement::Enforced if ce.evidence_seen => EvidenceStatus::Enforced,
+        Enforcement::Enforced => EvidenceStatus::Documented,
+    }
+}
+
+/// Render a control's watched decision/finding/incident counts as a short,
+/// human-readable evidence string, e.g. `"budget_exceeded=3, incidents=1"`.
+fn control_evidence_text(ce: &ControlEvidence) -> String {
+    let mut bits: Vec<String> = ce
+        .decision_counts
+        .iter()
+        .chain(ce.finding_counts.iter())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    if ce.incident_count > 0 {
+        bits.push(format!("incidents={}", ce.incident_count));
+    }
+    if bits.is_empty() {
+        "no watched signal for this org yet".to_string()
+    } else {
+        bits.join(", ")
+    }
+}
+
+/// Live status + evidence text for the tamper-evident audit chain, shared by
+/// all three framework sections' audit-chain entry (only the external
+/// citation differs per section, via `audit_control`'s `citation` argument).
+/// `entries == 0` reads `Documented` (nothing recorded yet, so "verifies"
+/// would be vacuous); a verified, non-empty chain reads `Enforced`; a BROKEN
+/// chain reads `Partial`, never `Enforced` (the assurance failed) and never
+/// silently `Documented` either (the detector did run, and did catch
+/// something, which is itself evidence the control is live).
+fn audit_chain_status(entries: usize, verify: Result<(), usize>) -> (EvidenceStatus, String) {
+    match verify {
+        Ok(()) if entries > 0 => (
+            EvidenceStatus::Enforced,
+            format!("audit chain verifies intact over {entries} entries"),
+        ),
+        Ok(()) => (
+            EvidenceStatus::Documented,
+            "audit chain configured; no mutations recorded yet".to_string(),
+        ),
+        Err(i) => (
+            EvidenceStatus::Partial,
+            format!(
+                "audit chain verification FAILED at entry {i} of {entries}; integrity compromised"
+            ),
+        ),
+    }
+}
+
+/// Build one framework section's audit-chain entry from a precomputed
+/// `audit_chain_status` result, varying only the cited external clause.
+fn audit_control(citation: &str, status: EvidenceStatus, evidence: &str) -> EvidenceControl {
+    EvidenceControl {
+        control: format!("TF.AUDIT (Tamper-evident audit trail) - {citation}"),
+        status,
+        evidence: evidence.to_string(),
+    }
+}
+
+/// SR 11-7 "Model Development, Implementation, and Use": the runtime limits
+/// that bound what a model/agent is allowed to spend or do (budget breaker,
+/// loop breaker, operator kill-switch).
+fn model_use_controls(
+    decision_counts: &std::collections::BTreeMap<String, u64>,
+) -> EvidenceControl {
+    let watched = ["budget_exceeded", "loop_detected", "killed"];
+    let bits: Vec<String> = watched
+        .iter()
+        .map(|k| format!("{k}={}", decision_counts.get(*k).copied().unwrap_or(0)))
+        .collect();
+    let seen = watched
+        .iter()
+        .any(|k| decision_counts.get(*k).copied().unwrap_or(0) > 0);
+    EvidenceControl {
+        control: "SR 11-7 Model Development, Implementation, and Use - runtime spend/behavior \
+                  limits (budget breaker, loop breaker, kill-switch)"
+            .to_string(),
+        status: if seen {
+            EvidenceStatus::Enforced
+        } else {
+            EvidenceStatus::Documented
+        },
+        evidence: bits.join(", "),
+    }
+}
+
+/// SR 11-7 "Model Validation": ongoing performance/anomaly monitoring, from
+/// the cloud's own incident detectors (budget exhaustion, sustained loops,
+/// spend spikes, fanout explosions).
+fn ongoing_monitoring(
+    incident_kind_counts: &std::collections::BTreeMap<String, u64>,
+) -> EvidenceControl {
+    let seen: u64 = incident_kind_counts.values().sum();
+    let bits: Vec<String> = incident_kind_counts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    EvidenceControl {
+        control: "SR 11-7 Model Validation - ongoing performance/anomaly monitoring (cloud \
+                  incident detectors)"
+            .to_string(),
+        status: if seen > 0 {
+            EvidenceStatus::Enforced
+        } else {
+            EvidenceStatus::Documented
+        },
+        evidence: if bits.is_empty() {
+            "no incidents recorded for this org yet".to_string()
+        } else {
+            bits.join(", ")
+        },
+    }
+}
+
 /// The caller org's tamper-evident audit trail of control-plane mutations,
 /// oldest first. Readable by any role (like the other reads); a paid feature.
 #[utoipa::path(
@@ -1064,6 +1393,102 @@ async fn audit_manifest(State(st): State<AppState>, headers: HeaderMap) -> Respo
     };
     let manifest = st.store.audit_manifest(&org, key, now_millis());
     (StatusCode::OK, Json(manifest)).into_response()
+}
+
+/// Replay of one run: its ordered agent-event timeline (if
+/// `TOKENFUSE_CLOUD_REPLAY_EVENTS` is configured), joined with the run's
+/// incidents and any audit-chain entries that reference it. `RunAgg` is an
+/// aggregate only, with no ordered per-call list, so the timeline itself
+/// comes from the append-only agent-event NDJSON export (see
+/// `crate::replay`), not the in-memory store. Read-only: no enforcement or
+/// stored state changes. A paid feature, gated like the rest of the audit
+/// trail; the run must belong to the caller's org or this 404s (never leaks
+/// whether a run id exists for a different org).
+#[utoipa::path(
+    get, path = "/v1/replay/{run}",
+    params(("run" = String, Path, description = "run id")),
+    responses(
+        (status = 200, description = "ordered replay of one run", body = ReplayResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 402, description = "plan required", body = PlanRequiredResponse),
+        (status = 404, description = "unknown run for this org", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn replay(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(run): Path<String>,
+) -> Response {
+    let Some((org, plan)) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    if let Err(d) = gate(plan, Feature::Audit) {
+        return plan_required(&org, d.feature);
+    }
+    // Scope to the caller's own org BEFORE returning anything about `run`, so
+    // a run id belonging to a different org 404s exactly like an unknown one.
+    if !st.store.run_belongs_to_org(&org, &run) {
+        return error(StatusCode::NOT_FOUND, "unknown run");
+    }
+
+    let (events, malformed_skipped) = match st.replay_events_path.as_deref() {
+        Some(path) => read_run_events(path, &run),
+        None => (Vec::new(), 0),
+    };
+    let event_count = events.len();
+
+    let incidents: Vec<Incident> = st
+        .store
+        .incidents(&org)
+        .into_iter()
+        .filter(|i| i.run_id.as_deref() == Some(run.as_str()))
+        .collect();
+
+    // Every audited mutation records what it acted on as `subject` (a kill or
+    // budget change's subject is the run id itself; see `Store::kill_audited`
+    // / `Store::set_budget_audited`).
+    let audit: Vec<AuditEntry> = st
+        .store
+        .audit(&org)
+        .into_iter()
+        .filter(|e| e.subject == run)
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(ReplayResponse {
+            run_id: run,
+            configured: st.replay_events_path.is_some(),
+            events,
+            event_count,
+            malformed_skipped,
+            incidents,
+            audit,
+        }),
+    )
+        .into_response()
+}
+
+/// Response body for `GET /v1/replay/{run}`.
+#[derive(Serialize, ToSchema)]
+struct ReplayResponse {
+    run_id: String,
+    /// Whether `TOKENFUSE_CLOUD_REPLAY_EVENTS` is configured on this server
+    /// (independent of whether any events matched this run).
+    configured: bool,
+    /// This run's agent-events, ts-ascending.
+    events: Vec<ReplayEvent>,
+    event_count: usize,
+    /// NDJSON lines in the configured file that failed to parse (skipped, not
+    /// counted as this run's events).
+    malformed_skipped: usize,
+    /// This run's open incidents (see `Store::incidents`).
+    incidents: Vec<Incident>,
+    /// Audit-chain entries whose subject is this run (e.g. kills, budget
+    /// changes), oldest first.
+    #[schema(value_type = Vec<AuditEntrySchema>)]
+    audit: Vec<AuditEntry>,
 }
 
 /// Issue a one-time pairing code (admin org key). The dashboard renders it as a
