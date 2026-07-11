@@ -29,8 +29,9 @@
 //! which decision is synthesized; the mode above still decides whether that
 //! decision can actually block.
 //!
-//! A short-TTL in-memory cache keyed by `(agent_id, sorted tool-set hash)`
-//! skips the network round trip on repeat calls in a hot loop. It is a
+//! A short-TTL in-memory cache keyed by `(agent_id, sorted tool-set hash,
+//! attestation_method)` skips the network round trip on repeat calls in a hot
+//! loop. It is a
 //! simple time-based cache, not a policy_version-aware invalidation scheme;
 //! a poller that proactively drops cache entries on a policy_version change
 //! is a documented future enhancement, not required for this wave. `hold`
@@ -59,7 +60,9 @@
 //! that predates this field) defaults to `false`, the fail-safe reading:
 //! never assume a decision is reusable unless the PDP says so. What remains
 //! coarse is the *cacheable* case: a `deny_tool`/`deny_if_unattested`-only
-//! decision is still keyed just on `(agent_id, tool-set hash)`, so a policy
+//! decision is keyed on `(agent_id, tool-set hash, attestation_method)` --
+//! attestation is in the key so a `deny_if_unattested` verdict never leaks
+//! across attestation states -- so a policy
 //! edit that changes one of those can take up to the TTL to be reflected,
 //! same as the policy_version note above; lower
 //! `TOKENFUSE_WARDRYX_CACHE_TTL_MS` (0 disables reuse entirely) if that
@@ -301,16 +304,31 @@ impl Cache {
         }
     }
 
-    fn key(agent_id: &str, tool_names: &[String]) -> (String, u64) {
+    fn key(
+        agent_id: &str,
+        tool_names: &[String],
+        attestation_method: Option<&str>,
+    ) -> (String, u64) {
         let mut sorted: Vec<&str> = tool_names.iter().map(String::as_str).collect();
         sorted.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         sorted.hash(&mut hasher);
+        // Attestation is a per-request input that a `deny_if_unattested` policy
+        // decides on, so it must be part of the key. Without it, an attested and
+        // an unattested request for the same (agent, tool-set) collide, and
+        // whichever is cached first wins for the other — letting an unattested
+        // agent inherit an attested "allow" (or vice-versa) inside the TTL.
+        attestation_method.hash(&mut hasher);
         (agent_id.to_string(), hasher.finish())
     }
 
-    fn get(&self, agent_id: &str, tool_names: &[String]) -> Option<WardryxOutcome> {
-        let key = Self::key(agent_id, tool_names);
+    fn get(
+        &self,
+        agent_id: &str,
+        tool_names: &[String],
+        attestation_method: Option<&str>,
+    ) -> Option<WardryxOutcome> {
+        let key = Self::key(agent_id, tool_names, attestation_method);
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&key)?;
         if entry.cached_at.elapsed() >= self.ttl {
@@ -336,6 +354,7 @@ impl Cache {
         &self,
         agent_id: &str,
         tool_names: &[String],
+        attestation_method: Option<&str>,
         outcome: &WardryxOutcome,
         cacheable: bool,
     ) {
@@ -353,7 +372,7 @@ impl Cache {
         if !cacheable {
             return;
         }
-        let key = Self::key(agent_id, tool_names);
+        let key = Self::key(agent_id, tool_names, attestation_method);
         let entry = CacheEntry {
             decision: outcome.decision,
             policy_version: outcome.policy_version.clone(),
@@ -462,7 +481,11 @@ impl Wardryx {
     /// but a missing client still fails safe via `failmode` rather than
     /// panicking, in case a future caller changes that invariant.
     pub async fn decide(&self, ctx: DecideContext) -> WardryxOutcome {
-        if let Some(cached) = self.cache.get(&ctx.agent_id, &ctx.tool_names) {
+        if let Some(cached) = self.cache.get(
+            &ctx.agent_id,
+            &ctx.tool_names,
+            ctx.attestation_method.as_deref(),
+        ) {
             return cached;
         }
         let Some(client) = &self.client else {
@@ -483,8 +506,13 @@ impl Wardryx {
         };
         match client.decide(&wire).await {
             Ok((outcome, cacheable)) => {
-                self.cache
-                    .put(&ctx.agent_id, &ctx.tool_names, &outcome, cacheable);
+                self.cache.put(
+                    &ctx.agent_id,
+                    &ctx.tool_names,
+                    ctx.attestation_method.as_deref(),
+                    &outcome,
+                    cacheable,
+                );
                 outcome
             }
             Err(e) => {
@@ -536,16 +564,30 @@ mod tests {
 
     #[test]
     fn cache_key_is_order_independent() {
-        let a = Cache::key("agent-1", &["b".to_string(), "a".to_string()]);
-        let b = Cache::key("agent-1", &["a".to_string(), "b".to_string()]);
+        let a = Cache::key("agent-1", &["b".to_string(), "a".to_string()], None);
+        let b = Cache::key("agent-1", &["a".to_string(), "b".to_string()], None);
         assert_eq!(a, b, "tool order must not change the cache key");
     }
 
     #[test]
     fn cache_key_differs_by_agent() {
-        let a = Cache::key("agent-1", &["a".to_string()]);
-        let b = Cache::key("agent-2", &["a".to_string()]);
+        let a = Cache::key("agent-1", &["a".to_string()], None);
+        let b = Cache::key("agent-2", &["a".to_string()], None);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cache_key_differs_by_attestation() {
+        // Regression: a `deny_if_unattested` decision must not leak across
+        // attestation states. An attested and an unattested request for the
+        // same agent + tool-set must land on different cache keys, so one can
+        // never inherit the other's cached decision inside the TTL.
+        let unattested = Cache::key("agent-1", &["a".to_string()], None);
+        let attested = Cache::key("agent-1", &["a".to_string()], Some("spiffe"));
+        assert_ne!(
+            unattested, attested,
+            "attestation must be part of the decision-cache key"
+        );
     }
 
     #[test]
@@ -558,8 +600,8 @@ mod tests {
             approval_id: None,
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome, true);
-        let hit = cache.get("agent-1", &["grep".to_string()]).unwrap();
+        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
+        let hit = cache.get("agent-1", &["grep".to_string()], None).unwrap();
         assert_eq!(hit.decision, WardryxDecision::Deny);
         assert_eq!(hit.policy_version.as_deref(), Some("v1"));
     }
@@ -576,8 +618,8 @@ mod tests {
         };
         // cacheable: true here on purpose -- proves the hold guard fires on
         // its own, independent of the cacheable guard below it.
-        cache.put("agent-1", &["grep".to_string()], &outcome, true);
-        assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
+        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
+        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
     }
 
     #[test]
@@ -594,8 +636,8 @@ mod tests {
             approval_id: None,
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome, false);
-        assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
+        cache.put("agent-1", &["grep".to_string()], None, &outcome, false);
+        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
     }
 
     #[test]
@@ -608,9 +650,9 @@ mod tests {
             approval_id: None,
             approval_token_required: true,
         };
-        cache.put("agent-1", &["grep".to_string()], &outcome, true);
+        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
         std::thread::sleep(Duration::from_millis(20));
-        assert!(cache.get("agent-1", &["grep".to_string()]).is_none());
+        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
     }
 
     #[tokio::test]
