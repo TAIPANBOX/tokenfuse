@@ -360,6 +360,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &system_text(&request),
             &tools_text(&request),
             &task_type,
+            // Fixed single-tenant value: this gateway process serves one
+            // tenant/deployment today, so there is no per-request tenant id
+            // to pass here yet. See docs/06-semantic-cache.md ("Current
+            // implementation note") before wiring a real tenant id in for a
+            // shared/hosted multi-tenant gateway mode.
             "default",
         );
         if let Some(hit) = st.cache.get(partition, &core, now_millis()) {
