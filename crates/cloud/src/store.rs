@@ -296,6 +296,19 @@ pub struct Incident {
     /// Epoch millis of the last push fired for this incident — the SINGLE
     /// source of truth for push dedup (see `push.rs`). `0` until first notified.
     pub last_notified_millis: i64,
+    /// Who detected this, when it was not this plane's own detectors. `None`
+    /// means TokenFuse itself tripped a threshold on evidence it received;
+    /// `Some("idryx")` means another service in the stack asserted a finding
+    /// and this plane is carrying it. The distinction is not cosmetic: an
+    /// operator deciding to kill a run is entitled to know whether the money
+    /// plane measured this or was told it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The detector's own sentence, when it has one. TokenFuse's four
+    /// thresholds need no summary because their kind says everything; an
+    /// external finding usually carries the only readable explanation there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Thresholds for the incident detectors, mirroring the `alert_pct` env
@@ -708,6 +721,24 @@ impl Default for Store {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// One externally detected finding, as [`Store::record_external_finding`]
+/// takes it. A struct rather than eight positional arguments: every field here
+/// is a string or a small scalar, and a call site that transposes `detector`
+/// and `subject` would compile and then quietly file every finding under the
+/// wrong name.
+pub struct FindingInput<'a> {
+    /// The reporting service's readable label, e.g. `idryx`.
+    pub source: &'a str,
+    /// The detector that fired, e.g. `agent_shadow_tool`.
+    pub detector: &'a str,
+    pub severity: tokenfuse_core::Severity,
+    /// What it fired about. An `agent://` subject is attributed as the agent.
+    pub subject: &'a str,
+    /// The detector's own sentence, or empty.
+    pub summary: &'a str,
+    pub ts_millis: i64,
 }
 
 impl Store {
@@ -1343,6 +1374,74 @@ impl Store {
             append_audit_locked(&mut inner, org, actor, "control.incident_ack", id, "");
         }
         found
+    }
+
+    /// Record a finding that ANOTHER service in the stack detected, as an
+    /// incident this plane carries but did not measure.
+    ///
+    /// This exists because the phone's behaviour axis was capped at the four
+    /// thresholds TokenFuse trips itself, while the twenty detectors that
+    /// actually watch agent conduct live in Idryx and could reach a SIEM but
+    /// not the operator's pocket. Rather than teach this plane to detect
+    /// shadow tools or exfiltration, it accepts the finding and says who found
+    /// it: `source` is stamped on every incident created here and is never set
+    /// on one of our own, so nothing can quietly present a borrowed detection
+    /// as a measured one.
+    ///
+    /// Deduped exactly like a detector trip, on `(kind, subject)`, so a
+    /// detector that keeps reporting the same finding raises `occurrences`
+    /// instead of a new row. An `agent://` subject is attributed as the agent,
+    /// which is what makes these findings join the per-agent view the money
+    /// screen already draws.
+    pub fn record_external_finding(
+        &self,
+        org: &str,
+        reported_by: &str,
+        f: FindingInput<'_>,
+    ) -> Incident {
+        let FindingInput {
+            source,
+            detector,
+            severity,
+            subject,
+            summary,
+            ts_millis,
+        } = f;
+        let agent_id = subject.starts_with("agent://").then(|| subject.to_string());
+        let mut inner = self.inner.write().unwrap();
+        let inc = upsert_incident(
+            &mut inner.incidents,
+            org,
+            detector,
+            severity,
+            subject,
+            None,
+            agent_id,
+            ts_millis,
+        );
+        if let Some(stored) = inner
+            .incidents
+            .get_mut(org)
+            .and_then(|m| m.get_mut(&inc.id))
+        {
+            stored.source = Some(source.to_string());
+            if !summary.is_empty() {
+                stored.summary = Some(summary.to_string());
+            }
+            let out = stored.clone();
+            append_audit_locked(
+                &mut inner,
+                org,
+                reported_by,
+                "control.finding_recorded",
+                &out.id,
+                source,
+            );
+            inner.dirty = true;
+            return out;
+        }
+        inner.dirty = true;
+        inc
     }
 
     /// Atomically decide whether to push for an incident and, if so, stamp its
@@ -2022,6 +2121,8 @@ fn upsert_incident(
         occurrences: 0,
         acknowledged: false,
         last_notified_millis: 0,
+        source: None,
+        summary: None,
     });
     inc.occurrences += 1;
     if ts > inc.last_seen_millis {
