@@ -20,4 +20,4 @@ pub use keys::{parse_keys, Principal};
 pub use oidc::{verify_id_token, OidcConfig};
 pub use push::{NullSender, PushPipeline, PushSender};
 pub use replay::{read_run_events, ReplayEvent};
-pub use store::{CallRecord, Incident, IncidentConfig, Store};
+pub use store::{CallRecord, FindingInput, Incident, IncidentConfig, Store};

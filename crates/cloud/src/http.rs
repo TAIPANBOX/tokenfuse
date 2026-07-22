@@ -353,6 +353,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/budgets", get(budgets))
         .route("/v1/incidents", get(incidents))
         .route("/v1/incidents/{id}/ack", post(ack_incident))
+        .route("/v1/findings", post(external_findings))
         .route("/v1/compliance", get(compliance))
         .route("/v1/compliance/evidence", get(compliance_evidence))
         .route("/v1/audit", get(audit))
@@ -859,6 +860,158 @@ async fn incidents(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.incidents(&org))).into_response()
+}
+
+/// One finding as another service in the stack reports it. The field names
+/// are Idryx's generic webhook payload verbatim (`internal/sink/webhook.go`),
+/// so that service needs no adapter and no change at all: it is pointed at
+/// this path and keeps posting exactly what it already posts to a SIEM.
+#[derive(Deserialize, ToSchema)]
+struct ExternalFinding {
+    /// The detector that fired, e.g. `agent_shadow_tool`, `data_exfiltration`.
+    detector: String,
+    /// What it fired about. An `agent://` identity is attributed as the agent,
+    /// which is what puts the finding on that agent's row in the pocket app.
+    identity: String,
+    /// `info` | `low` | `medium` | `high` | `critical`. Anything else is
+    /// rejected rather than guessed at: severity decides whether the phone
+    /// treats this as something still running or a soft heads-up, so a typo
+    /// must not silently become the safest-looking answer.
+    severity: String,
+    #[serde(default)]
+    time: Option<String>,
+    #[serde(default)]
+    summary: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ExternalFindingsResponse {
+    accepted: usize,
+}
+
+/// `POST /v1/findings`: accept detections this plane did not make.
+///
+/// Admin-gated through the same `authorize_mutation` every other write uses,
+/// and deliberately NOT ungated like `/v1/ingest`. Ingest submits evidence
+/// that thresholds still have to agree with; this asserts an incident
+/// outright, which is a different authority and must not be reachable with a
+/// viewer key.
+#[utoipa::path(
+    post, path = "/v1/findings",
+    request_body = Vec<ExternalFinding>,
+    responses((status = 200, description = "Findings recorded", body = ExternalFindingsResponse)),
+    tag = "incidents"
+)]
+async fn external_findings(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(params): Query<ExternalFindingParams>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let findings: Vec<ExternalFinding> = match serde_json::from_slice(&body) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("bad findings payload: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let source = sanitize_source(params.source.as_deref());
+    let now = now_millis();
+    let mut accepted = 0usize;
+    for f in findings {
+        let Some(severity) = parse_severity(&f.severity) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown severity {:?}", f.severity)
+                })),
+            )
+                .into_response();
+        };
+        // The detector's own stamp is accepted but deliberately not used. A
+        // finding's clock belongs to whichever service reported it, and
+        // trusting it would let a skewed or hostile reporter place an incident
+        // in the past, ahead of the queue's ordering or outside a dedup
+        // window. Arrival time is a fact this plane knows; `time` stays in the
+        // payload only so a reporter needs no adapter to talk to this route.
+        let _ = &f.time;
+        let ts = now;
+        st.store
+            .record_external_finding(&org, &actor, finding_input(&source, &f, severity, ts));
+        accepted += 1;
+    }
+    (StatusCode::OK, Json(ExternalFindingsResponse { accepted })).into_response()
+}
+
+/// Assemble the store's input from the wire shape, in one place, so the two
+/// never drift apart silently.
+fn finding_input<'a>(
+    source: &'a str,
+    f: &'a ExternalFinding,
+    severity: tokenfuse_core::Severity,
+    ts_millis: i64,
+) -> crate::store::FindingInput<'a> {
+    crate::store::FindingInput {
+        source,
+        detector: &f.detector,
+        severity,
+        subject: &f.identity,
+        summary: &f.summary,
+        ts_millis,
+    }
+}
+
+#[derive(Deserialize)]
+struct ExternalFindingParams {
+    /// Who is reporting, e.g. `?source=idryx`.
+    ///
+    /// It lives in the URL rather than the body precisely so the reporting
+    /// service needs no code change: an operator points Idryx's existing
+    /// webhook sink at `/v1/findings?source=idryx` and that service keeps
+    /// posting exactly what it already posts to a SIEM. It is a LABEL, not a
+    /// credential: the credential is the bearer, and which credential actually
+    /// filed each finding is written to the audit trail, where identity
+    /// belongs. The label only has to be readable, because an operator reading
+    /// "idryx" learns something an opaque key id would never tell them.
+    source: Option<String>,
+}
+
+/// Keep the label short, lowercase and boring: it is rendered on a phone next
+/// to a kill button, and it is attacker-influenced in the sense that anyone
+/// with an admin credential picks it.
+fn sanitize_source(raw: Option<&str>) -> String {
+    let cleaned: String = raw
+        .unwrap_or("external")
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        "external".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn parse_severity(s: &str) -> Option<tokenfuse_core::Severity> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "info" => Some(tokenfuse_core::Severity::Info),
+        "low" => Some(tokenfuse_core::Severity::Low),
+        "medium" => Some(tokenfuse_core::Severity::Medium),
+        "high" => Some(tokenfuse_core::Severity::High),
+        "critical" => Some(tokenfuse_core::Severity::Critical),
+        _ => None,
+    }
 }
 
 /// Acknowledge an incident (admin only). Sets `acknowledged = true`.
