@@ -27,6 +27,15 @@ type Savings = {
   budget_breaks: number;
   total_saved_microusd: number;
 };
+// Per-business-unit spend rollup (docs/20 identity map). Unmapped spend rolls
+// up under the literal id "unassigned".
+type Unit = {
+  unit: string;
+  spent_microusd: number;
+  calls: number;
+  runs: number;
+  last_seen_millis: number;
+};
 
 const usd = (micro: number) => "$" + (micro / 1e6).toFixed(2);
 
@@ -76,6 +85,8 @@ export default function Page() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [summary, setSummary] = useState<Summary>({ runs: 0, calls: 0, spent_microusd: 0 });
   const [budgets, setBudgets] = useState<Record<string, number>>({});
+  const [units, setUnits] = useState<Unit[]>([]);
+  const [unitBudgets, setUnitBudgets] = useState<Record<string, number>>({});
   const [series, setSeries] = useState<Bucket[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [savings, setSavings] = useState<Savings | null>(null);
@@ -112,7 +123,7 @@ export default function Page() {
   const refresh = useCallback(async () => {
     if (!connected || !key) return;
     try {
-      const [runsRes, sumRes, budRes, serRes, alertRes, sav] = await Promise.all([
+      const [runsRes, sumRes, budRes, serRes, alertRes, sav, unitsRes, unitBud] = await Promise.all([
         api("/v1/runs"),
         api("/v1/summary"),
         api("/v1/budgets"),
@@ -123,6 +134,15 @@ export default function Page() {
         api("/v1/savings")
           .then((r) => r.json() as Promise<Savings>)
           .catch(() => null),
+        // Units + their monthly caps (docs/20). Absent on an older plane that
+        // predates the identity map: swallow so the rest still refreshes and
+        // the Business units card simply shows nothing.
+        api("/v1/units")
+          .then((r) => r.json() as Promise<Unit[]>)
+          .catch(() => [] as Unit[]),
+        api("/v1/unit-budgets")
+          .then((r) => r.json() as Promise<Record<string, number>>)
+          .catch(() => ({}) as Record<string, number>),
       ]);
       const rs: Run[] = await runsRes.json();
       const bud: Record<string, number> = await budRes.json();
@@ -133,6 +153,8 @@ export default function Page() {
       });
       setRuns(rs);
       setBudgets(bud);
+      setUnits(unitsRes);
+      setUnitBudgets(unitBud);
       setSummary(await sumRes.json());
       setSeries(await serRes.json());
       setAlerts(await alertRes.json());
@@ -189,6 +211,25 @@ export default function Page() {
       refresh();
     } catch (e) {
       setStatus("set budget failed: " + (e as Error).message);
+    }
+  };
+
+  // A unit's monthly cap (docs/20). The "unassigned" bucket is spend the map
+  // did not attribute; it has no cap to set, so its Budget button is hidden.
+  const setUnitBudget = async (unit: string) => {
+    const v = prompt(`Set monthly budget for unit '${unit}' (USD):`);
+    if (v === null) return;
+    const n = parseFloat(v);
+    if (isNaN(n)) return;
+    try {
+      await api(`/v1/units/${encodeURIComponent(unit)}/budget`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ budget_usd: n }),
+      });
+      refresh();
+    } catch (e) {
+      setStatus("set unit budget failed: " + (e as Error).message);
     }
   };
 
@@ -472,6 +513,83 @@ export default function Page() {
                         </span>
                       </div>
                     ))
+                )}
+              </div>
+
+              <div className="card">
+                <div className="sechead">
+                  <div className="t">Business units</div>
+                  <div className="r">monthly caps</div>
+                </div>
+                {units.length === 0 ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    No units yet. Map keys and agents to units (docs/20), then send traffic.
+                  </div>
+                ) : (
+                  <div className="tablewrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Unit</th>
+                          <th>Spent / cap</th>
+                          <th className="num">Runs</th>
+                          <th className="num">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {units.map((u) => {
+                          const cap = unitBudgets[u.unit] || 0;
+                          const frac = cap > 0 ? u.spent_microusd / cap : 0;
+                          const heat = heatClass(frac, false);
+                          const over = cap > 0 && frac >= 1;
+                          const unassigned = u.unit === "unassigned";
+                          return (
+                            <tr key={u.unit} className={over ? "over" : ""}>
+                              <td>
+                                <span className="rid" style={unassigned ? { color: "var(--dim)" } : undefined}>
+                                  {u.unit}
+                                </span>
+                              </td>
+                              <td className="spentcell">
+                                {cap > 0 ? (
+                                  <>
+                                    <div className="nrow">
+                                      <b style={over ? { color: "var(--ember)" } : undefined}>{usd(u.spent_microusd)}</b>
+                                      <span style={{ color: "var(--dim)" }}>{usd(cap)}/mo</span>
+                                    </div>
+                                    <div className={"fuse " + heat}>
+                                      <i style={{ width: `${Math.min(100, frac * 100)}%` }} />
+                                    </div>
+                                  </>
+                                ) : (
+                                  <>
+                                    <div className="nrow">
+                                      <b>{usd(u.spent_microusd)}</b>
+                                    </div>
+                                    <div className="nocap">no cap set</div>
+                                  </>
+                                )}
+                              </td>
+                              <td className="num">{u.runs}</td>
+                              <td>
+                                <div className="acts">
+                                  {unassigned ? (
+                                    <span className="pill" style={{ color: "var(--dim)" }}>
+                                      unmapped
+                                    </span>
+                                  ) : (
+                                    <button className="mini" onClick={() => setUnitBudget(u.unit)}>
+                                      Budget
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </div>
 
