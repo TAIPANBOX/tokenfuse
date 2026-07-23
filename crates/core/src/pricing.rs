@@ -16,6 +16,13 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Number of tool calls the model emitted in this response (I1, an
+    /// observed metric only - see docs/21-tool-runs.md). `None` only when the
+    /// response body never parsed as JSON at all; a successfully parsed body
+    /// with no tool calls is `Some(0)`, never a guess. Deliberately NOT read
+    /// by [`ModelPrice::cost`]: this rides alongside the priced token counts
+    /// but is not itself priced.
+    pub tool_calls: Option<u32>,
 }
 
 /// Per-model price, in microdollars per million tokens.
@@ -115,6 +122,7 @@ mod tests {
             output_tokens: 1_000_000,
             cache_read_tokens: 1_000_000,
             cache_write_tokens: 1_000_000,
+            ..Default::default()
         };
         // 3 + 15 + 0.30 + 3.75 = 22.05 USD
         assert_eq!(price.cost(&usage), Microusd::from_usd(22.05));
@@ -161,5 +169,26 @@ mod tests {
     fn unknown_model_without_fallback_is_none() {
         let book = PriceBook::new().with("known", sonnet());
         assert!(book.price("mystery-model").is_none());
+    }
+
+    /// I1: `tool_calls` is an observed metric, not a priced dimension - a
+    /// response with many tool calls but the same token counts must cost
+    /// exactly the same as one with none.
+    #[test]
+    fn tool_calls_does_not_affect_cost() {
+        let price = sonnet();
+        let no_tools = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            tool_calls: Some(0),
+            ..Default::default()
+        };
+        let many_tools = Usage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            tool_calls: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(price.cost(&no_tools), price.cost(&many_tools));
     }
 }

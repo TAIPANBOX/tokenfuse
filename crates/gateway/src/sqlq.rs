@@ -143,6 +143,7 @@ mod tests {
                     outcome: String::new(),
                     key_id: String::new(),
                     unit: String::new(),
+                    tool_calls: None,
                 });
             }
         }
@@ -252,6 +253,7 @@ mod tests {
                 outcome: String::new(),
                 key_id: String::new(),
                 unit: String::new(),
+                tool_calls: None,
             });
         }
 
@@ -392,6 +394,7 @@ mod tests {
                 outcome: String::new(),
                 key_id: String::new(),
                 unit: String::new(),
+                tool_calls: None,
             });
         }
 
@@ -507,6 +510,7 @@ mod tests {
                 outcome: "case_resolved".into(),
                 key_id: String::new(),
                 unit: String::new(),
+                tool_calls: None,
             });
         }
 
@@ -623,6 +627,7 @@ mod tests {
                 outcome: String::new(),
                 key_id: String::new(),
                 unit: "treasury".into(),
+                tool_calls: None,
             });
         }
 
@@ -649,6 +654,140 @@ mod tests {
         assert_eq!(rows[0].1, "", "pre-unit file's unit defaults to ''");
         assert_eq!(rows[1].0, "unit-run");
         assert_eq!(rows[1].1, "treasury", "the non-empty unit round-trips");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// I1 (docs/21-tool-runs.md): the SAME schema-evolution proof again, one
+    /// more generation later - a trace directory that mixes a PRE-TOOL-CALLS
+    /// file (15 columns, written before `tool_calls` existed) with a NEW file
+    /// (16 columns, with it) must read back cleanly, with the old row's
+    /// column reading back NULL (not a fabricated 0 - `tool_calls` is a
+    /// genuinely nullable numeric column, unlike the string columns above
+    /// that default to `''`; see `ParquetSink::schema`'s note on this).
+    #[tokio::test]
+    async fn mixed_pre_tool_calls_and_tool_calls_schema_files_read_with_defaults() {
+        use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir =
+            std::env::temp_dir().join(format!("tf-sql-mixed-toolcalls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // 1) Write a PRE-TOOL-CALLS file by hand: exactly today's 15 columns
+        //    (unit identity), genuinely lacking `tool_calls` on disk.
+        let pre_tool_calls_schema = Arc::new(Schema::new(vec![
+            Field::new("ts_millis", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("decision", DataType::Utf8, false),
+            Field::new("input_tokens", DataType::UInt64, false),
+            Field::new("output_tokens", DataType::UInt64, false),
+            Field::new("cost_microusd", DataType::Int64, false),
+            Field::new("step", DataType::UInt32, false),
+            Field::new("agent_id", DataType::Utf8, false),
+            Field::new("saved_microusd", DataType::Int64, false),
+            Field::new("parent_run_id", DataType::Utf8, false),
+            Field::new("on_behalf_of", DataType::Utf8, false),
+            Field::new("outcome", DataType::Utf8, false),
+            Field::new("key_id", DataType::Utf8, false),
+            Field::new("unit", DataType::Utf8, false),
+        ]));
+        let pre_tool_calls_batch = RecordBatch::try_new(
+            pre_tool_calls_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(StringArray::from(vec!["pre-tool-calls-run"])),
+                Arc::new(StringArray::from(vec!["m"])),
+                Arc::new(StringArray::from(vec!["allow"])),
+                Arc::new(UInt64Array::from(vec![10u64])),
+                Arc::new(UInt64Array::from(vec![5u64])),
+                Arc::new(Int64Array::from(vec![1_000i64])),
+                Arc::new(UInt32Array::from(vec![1u32])),
+                Arc::new(StringArray::from(vec!["agent-old"])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+            ],
+        )
+        .unwrap();
+        {
+            let file = std::fs::File::create(dir.join("calls-pre-tool-calls.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(file, pre_tool_calls_schema, None).unwrap();
+            w.write(&pre_tool_calls_batch).unwrap();
+            w.close().unwrap();
+        }
+
+        // 2) Write a tool-calls-schema file via the current sink (has the new
+        //    column), with a NON-null, NON-zero `tool_calls` so the assertion
+        //    below proves a real round-trip, not a coincidental default match.
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            sink.record(CallRecord {
+                ts_millis: 2,
+                run_id: "tool-calls-run".into(),
+                model: "m".into(),
+                decision: "allow".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: 1,
+                agent_id: "agent-new".into(),
+                saved_microusd: 0,
+                parent_run_id: String::new(),
+                on_behalf_of: String::new(),
+                outcome: String::new(),
+                key_id: String::new(),
+                unit: String::new(),
+                tool_calls: Some(4),
+            });
+        }
+
+        // 3) Read via the sqlq path. `tool_calls` has no string-style `''`
+        //    default: an old file's missing column reads back as a genuine
+        //    SQL NULL, which this test surfaces directly (no COALESCE)
+        //    rather than papering over it, unlike the other mixed-schema
+        //    tests above.
+        let batches = query(
+            "select run_id, tool_calls from calls order by run_id",
+            &dir_str,
+        )
+        .await
+        .expect("mixed pre-tool-calls/tool-calls schema read must succeed");
+
+        let mut rows: Vec<(String, Option<u32>)> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("tool_calls column type");
+            for i in 0..b.num_rows() {
+                let v = if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                };
+                rows.push((str_at(b.column(0).as_ref(), i), v));
+            }
+        }
+
+        assert_eq!(rows.len(), 2, "both files' rows must be present");
+        assert_eq!(rows[0].0, "pre-tool-calls-run");
+        assert_eq!(
+            rows[0].1, None,
+            "pre-tool-calls file's tool_calls reads back NULL, not a fabricated 0"
+        );
+        assert_eq!(rows[1].0, "tool-calls-run");
+        assert_eq!(rows[1].1, Some(4), "the non-zero tool_calls round-trips");
 
         std::fs::remove_dir_all(&dir).ok();
     }

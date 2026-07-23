@@ -296,6 +296,51 @@ async fn units_roll_up_and_sort_by_spend() {
     assert_eq!(units[2]["spent_microusd"], 250);
 }
 
+/// I1 (docs/21-tool-runs.md): `tool_calls` shows up on the JSON responses of
+/// `/v1/runs` and `/v1/summary`, folded the same way `spent_microusd` is -
+/// blocked rows excluded.
+#[tokio::test]
+async fn tool_calls_show_up_on_runs_and_summary() {
+    let (state, store) = test_state();
+    store.ingest(
+        "acme",
+        &[
+            CallRecord {
+                run_id: "r1".into(),
+                decision: "allow".into(),
+                tool_calls: Some(2),
+                ts_millis: 10,
+                ..Default::default()
+            },
+            CallRecord {
+                run_id: "r1".into(),
+                decision: "allow".into(),
+                tool_calls: Some(1),
+                ts_millis: 20,
+                ..Default::default()
+            },
+            // A budget-protection block: its tool_calls must not count -
+            // the request never reached the provider.
+            CallRecord {
+                run_id: "r1".into(),
+                decision: "budget_exceeded".into(),
+                tool_calls: Some(9),
+                ts_millis: 30,
+                ..Default::default()
+            },
+        ],
+    );
+
+    let (status, v) = get(&state, "/v1/runs", Some("devkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = v.as_array().expect("runs is an array");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["tool_calls"], 3);
+
+    let (_, s) = get(&state, "/v1/summary", Some("devkey")).await;
+    assert_eq!(s["tool_calls"], 3);
+}
+
 #[tokio::test]
 async fn savings_sum_blocked_cache_and_breaks() {
     let (state, _store) = test_state();

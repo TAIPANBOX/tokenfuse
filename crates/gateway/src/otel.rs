@@ -133,6 +133,7 @@ mod tests {
             outcome: String::new(),
             key_id: String::new(),
             unit: String::new(),
+            tool_calls: None,
         }
     }
 

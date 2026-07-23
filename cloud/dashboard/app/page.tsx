@@ -11,8 +11,10 @@ type Run = {
   steps: number;
   last_seen_millis: number;
   killed: boolean;
+  // Tool calls the model emitted across this run's calls (I1, docs/21-tool-runs.md).
+  tool_calls: number;
 };
-type Summary = { runs: number; calls: number; spent_microusd: number };
+type Summary = { runs: number; calls: number; spent_microusd: number; tool_calls: number };
 type Bucket = { t: number; cost_microusd: number; calls: number; blocked: number };
 type Alert = {
   run_id: string;
@@ -83,7 +85,7 @@ export default function Page() {
   const [key, setKey] = useState("");
   const [connected, setConnected] = useState(false);
   const [runs, setRuns] = useState<Run[]>([]);
-  const [summary, setSummary] = useState<Summary>({ runs: 0, calls: 0, spent_microusd: 0 });
+  const [summary, setSummary] = useState<Summary>({ runs: 0, calls: 0, spent_microusd: 0, tool_calls: 0 });
   const [budgets, setBudgets] = useState<Record<string, number>>({});
   const [units, setUnits] = useState<Unit[]>([]);
   const [unitBudgets, setUnitBudgets] = useState<Record<string, number>>({});
@@ -372,6 +374,11 @@ export default function Page() {
                 <div className="n">{killedRuns}</div>
                 <div className="s">this org</div>
               </div>
+              <div className="card tile" style={{ gridColumn: "1 / -1" }}>
+                <div className="k">Tool runs today</div>
+                <div className="n">{summary.tool_calls}</div>
+                <div className="s">model-emitted, no budget - observed only</div>
+              </div>
               {savings && (
                 <div className="card tile" style={{ gridColumn: "1 / -1" }}>
                   <div className="k">Saved this month</div>
@@ -405,6 +412,7 @@ export default function Page() {
                       <th>Spent / cap</th>
                       <th className="num">Calls</th>
                       <th className="num">Steps</th>
+                      <th className="num">Tool runs</th>
                       <th>Status</th>
                       <th className="num">Actions</th>
                     </tr>
@@ -445,6 +453,7 @@ export default function Page() {
                           </td>
                           <td className="num">{r.calls}</td>
                           <td className="num">{r.steps}</td>
+                          <td className="num">{r.tool_calls}</td>
                           <td>
                             {r.killed ? (
                               <span className="pill dead">killed</span>

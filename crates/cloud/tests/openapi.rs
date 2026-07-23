@@ -80,6 +80,36 @@ fn spec_covers_every_endpoint() {
     }
 }
 
+/// I1 (docs/21-tool-runs.md): the new `tool_calls` field must actually show
+/// up in the generated schema for every response type it was added to - a
+/// derive typo (wrong struct, `#[serde(skip)]`, etc.) would otherwise pass
+/// `spec_covers_every_endpoint` above (which only checks the schema NAMES
+/// exist) while silently omitting the field clients need.
+#[test]
+fn spec_schemas_expose_tool_calls() {
+    let spec = openapi_spec();
+    let json = serde_json::to_value(&spec).expect("spec serializes");
+    let schemas = json["components"]["schemas"]
+        .as_object()
+        .expect("component schemas");
+    for s in [
+        "RunAgg",
+        "AgentAgg",
+        "UnitAgg",
+        "Summary",
+        "SeriesBucket",
+        "CallRecord",
+    ] {
+        let props = schemas[s]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("schema {s} has no properties object"));
+        assert!(
+            props.contains_key("tool_calls"),
+            "schema {s} is missing the tool_calls property"
+        );
+    }
+}
+
 #[tokio::test]
 async fn openapi_json_is_served() {
     let resp = app(state())

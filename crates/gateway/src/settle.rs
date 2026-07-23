@@ -120,6 +120,11 @@ impl SettleGuard {
             outcome: self.outcome.clone(),
             key_id: self.key_id.clone(),
             unit: self.unit.clone(),
+            // The model-emitted tool-call count parsed out of the streamed
+            // response, same source as `input_tokens`/`output_tokens` above
+            // (I1, docs/21-tool-runs.md). `None` on the drop-without-complete
+            // path (cancel/error before any usage was parsed).
+            tool_calls: usage.tool_calls,
         });
     }
 
@@ -253,5 +258,98 @@ mod tests {
         guard.complete();
         // The unit ledger absorbed the same actual cost as the run ledger.
         assert_eq!(units.spent("treasury", now), Microusd::from_usd(3.0));
+    }
+
+    /// A minimal `EventSink` test double that just captures the last
+    /// settled `CallRecord`, so a test can inspect a field `NullSink`
+    /// (used everywhere above) throws away.
+    #[derive(Default)]
+    struct CapturingSink {
+        last: Mutex<Option<CallRecord>>,
+    }
+
+    impl crate::sink::EventSink for CapturingSink {
+        fn record(&self, rec: CallRecord) {
+            *self.last.lock().unwrap() = Some(rec);
+        }
+        fn flush(&self) {}
+    }
+
+    /// I1 (docs/21-tool-runs.md): the streaming settle path carries
+    /// `Usage::tool_calls` through into the settled `CallRecord`, exactly
+    /// like `input_tokens`/`output_tokens` - proven here for the streaming
+    /// path specifically, since `buffered_managed`'s non-streaming path is
+    /// covered separately in `proxy.rs`.
+    #[test]
+    fn complete_settles_with_parsed_tool_calls() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            tool_calls: Some(2),
+            ..Default::default()
+        });
+        let sink = Arc::new(CapturingSink::default());
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger)),
+            prices,
+            sink.clone(),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
+        );
+        guard.complete();
+
+        let rec = sink
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a record was settled");
+        assert_eq!(rec.tool_calls, Some(2));
+    }
+
+    /// The drop-without-complete (cancel/error) path never parsed any usage,
+    /// so `tool_calls` must be `None`, not a fabricated `Some(0)`.
+    #[test]
+    fn drop_without_complete_leaves_tool_calls_none() {
+        let (ledger, prices, usage, reservation) = setup();
+        let sink = Arc::new(CapturingSink::default());
+        {
+            let _guard = SettleGuard::new(
+                Arc::new(crate::ledger_backend::LocalLedger(ledger)),
+                prices,
+                sink.clone(),
+                "m".into(),
+                usage,
+                Microusd::from_usd(1.0),
+                reservation,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                Arc::new(UnitLedger::default()),
+                None,
+            );
+            // dropped here without complete()
+        }
+        let rec = sink
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a record was settled");
+        assert_eq!(rec.tool_calls, None);
     }
 }

@@ -275,6 +275,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     outcome: outcome_tag.clone(),
                     key_id: key_id.clone(),
                     unit: unit.clone(),
+                    // Blocked before the request ever reached the provider -
+                    // no response to observe (I1, docs/21-tool-runs.md).
+                    tool_calls: None,
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -369,6 +372,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             outcome: outcome_tag.clone(),
             key_id: key_id.clone(),
             unit: unit.clone(),
+            // Blocked before the request ever reached the provider (I1).
+            tool_calls: None,
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -419,6 +424,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
                         unit: unit.clone(),
+                        // Blocked before the request ever reached the
+                        // provider (I1).
+                        tool_calls: None,
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -491,6 +499,12 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
                         unit: unit.clone(),
+                        // `Some(0)`, not a guess: `cache_eligible` (below)
+                        // only serves a cached hit for a request that
+                        // declared no `tools` at all, so the model backing
+                        // this cached response structurally could not have
+                        // emitted a tool call (I1).
+                        tool_calls: Some(0),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -567,6 +581,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
                 unit: unit.clone(),
+                // Blocked before the request ever reached the provider (I1).
+                tool_calls: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -602,6 +618,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
                 unit: unit.clone(),
+                // Blocked before the request ever reached the provider (I1).
+                tool_calls: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -656,6 +674,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 outcome: outcome_tag.clone(),
                 key_id: key_id.clone(),
                 unit: unit.clone(),
+                // Blocked before the request ever reached the provider (I1).
+                tool_calls: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -743,6 +763,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
                         unit: unit.clone(),
+                        // Blocked before the request ever reached the
+                        // provider (I1).
+                        tool_calls: None,
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -766,6 +789,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
                         unit: unit.clone(),
+                        // Blocked before the request ever reached the
+                        // provider (I1).
+                        tool_calls: None,
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -808,6 +834,9 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         outcome: outcome_tag.clone(),
                         key_id: key_id.clone(),
                         unit: unit.clone(),
+                        // Blocked before the request ever reached the
+                        // provider (I1).
+                        tool_calls: None,
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -869,6 +898,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     outcome: outcome_tag.clone(),
                     key_id: key_id.clone(),
                     unit: unit.clone(),
+                    // Blocked before the request ever reached the provider (I1).
+                    tool_calls: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -917,6 +948,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     outcome: outcome_tag.clone(),
                     key_id: key_id.clone(),
                     unit: unit.clone(),
+                    // Blocked before the request ever reached the provider (I1).
+                    tool_calls: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -1237,6 +1270,10 @@ async fn buffered_managed(
         outcome: outcome_tag.to_string(),
         key_id: key_id.to_string(),
         unit: unit.to_string(),
+        // The model-emitted tool-call count parsed out of this response's
+        // body, same source as `input_tokens`/`output_tokens` above (I1,
+        // docs/21-tool-runs.md).
+        tool_calls: u.tool_calls,
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -1269,6 +1306,10 @@ async fn buffered_managed(
                     outcome: outcome_tag.to_string(),
                     key_id: key_id.to_string(),
                     unit: unit.to_string(),
+                    // The real observation already landed on the sibling
+                    // "allow" row above; this verdict row isn't a second
+                    // model response, so it carries none of its own (I1).
+                    tool_calls: None,
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
