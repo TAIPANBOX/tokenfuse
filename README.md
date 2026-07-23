@@ -286,6 +286,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
 - 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call — blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend.
+- 🛠️ **Tool-run metric**: counts the tool calls (`tool_use` blocks / `tool_calls` arrays) the model emits per LLM call, for both Anthropic and OpenAI shapes, streaming and non-streaming alike. Rides the trace as a new nullable `tool_calls` column (schema-evolution safe, like every prior addition), as `x_tool_calls` in FOCUS export, and rolls up into the Cloud dashboard's Runs table and summary tile. Observed only in this release: no budget, no enforcement, just a count (see [docs/21](docs/21-tool-runs.md)).
 
 **Also hardens your agents**
 - 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
@@ -644,6 +645,7 @@ Limits, stated plainly: unit counters are in-process and per-gateway - they rese
 | [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` — a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
 | [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
 | [20 · Identity map](docs/20-identity-map.md) | Key ↔ agent ↔ business-unit binding, strict mode, and monthly unit budgets: the design + build plan behind the "Identity map" section above |
+| [21 · Tool runs](docs/21-tool-runs.md) | What counts as a tool run (Anthropic/OpenAI, streaming/non-streaming), the nullable `tool_calls` trace column, and why v1 is observed-only with no budgets |
 
 ---
 

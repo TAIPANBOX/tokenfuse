@@ -31,6 +31,12 @@
 //!     section 4) - the business unit resolved server-side from the identity
 //!     map. `""` for rows from a pre-unit trace file (schema evolution, same
 //!     `COALESCE` pattern) as well as for calls the map did not match.
+//!   - `x_tool_calls`: sourced from `CallRecord.tool_calls` (I1,
+//!     docs/21-tool-runs.md) - the count of tool calls the model emitted in
+//!     that call's response. Blank (not `"0"`) for rows from a pre-I1 trace
+//!     file (schema evolution) as well as for a call whose response body
+//!     never parsed; a real, observed zero renders as `"0"`, distinguishable
+//!     from the blank "we don't know" case.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -62,7 +68,7 @@
 //! everything else lands on `"settled"`.
 
 use crate::sqlq::{query, str_at};
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Array, Int64Array};
 use tokenfuse_core::timefmt::{days_from_civil, ts_millis_to_rfc3339};
 use tokenfuse_core::{BreakerReason, Microusd};
 
@@ -106,10 +112,14 @@ struct FocusRecord {
     parent_run_id: String,
     outcome: String,
     unit: String,
+    /// I1 (docs/21-tool-runs.md): tool calls the model emitted in this
+    /// call's response. `None` for a pre-I1 trace row or an unparseable
+    /// response body - see `x_tool_calls`'s sourcing note above.
+    tool_calls: Option<u32>,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 25] = [
+const HEADER: [&str; 26] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -135,6 +145,7 @@ const HEADER: [&str; 25] = [
     "x_cost_basis",
     "x_outcome",
     "x_unit",
+    "x_tool_calls",
 ];
 
 /// Load, project, and write the FOCUS CSV. Returns `Err` with a clear message
@@ -199,7 +210,8 @@ async fn load_records(
          coalesce(agent_id, '') as agent_id, \
          coalesce(parent_run_id, '') as parent_run_id, \
          coalesce(outcome, '') as outcome, \
-         coalesce(unit, '') as unit \
+         coalesce(unit, '') as unit, \
+         cast(tool_calls as bigint) as tool_calls \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -238,6 +250,11 @@ async fn load_records(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or("cost_microusd column type")?;
+        let tool_calls = b
+            .column(11)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("tool_calls column type")?;
         for i in 0..b.num_rows() {
             out.push(FocusRecord {
                 ts_millis: ts.value(i),
@@ -251,6 +268,15 @@ async fn load_records(
                 parent_run_id: str_at(b.column(8).as_ref(), i),
                 outcome: str_at(b.column(9).as_ref(), i),
                 unit: str_at(b.column(10).as_ref(), i),
+                // Genuinely nullable (unlike the coalesced string columns
+                // above): NULL means "pre-I1 file or unparseable response",
+                // a real 0 means "observed, no tool calls" - see
+                // `FocusRecord::tool_calls`'s doc.
+                tool_calls: if tool_calls.is_null(i) {
+                    None
+                } else {
+                    Some(tool_calls.value(i).max(0) as u32)
+                },
             });
         }
     }
@@ -310,8 +336,8 @@ fn usd_string(microusd: i64) -> String {
     format!("{:.6}", Microusd(microusd).as_usd())
 }
 
-/// Project one trace row into the 25 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 25] {
+/// Project one trace row into the 26 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 26] {
     let blocked = is_blocked_decision(&rec.decision);
     let (cost_microusd, cost_basis) = if blocked {
         (0i64, "blocked")
@@ -325,31 +351,32 @@ fn to_row(rec: &FocusRecord) -> [String; 25] {
     let provider = provider_from_model(&rec.model).to_string();
 
     [
-        billed.clone(),                          // BilledCost
-        billed,                                  // EffectiveCost
-        "USD".to_string(),                       // BillingCurrency
-        ts.clone(),                              // ChargePeriodStart
-        ts,                                      // ChargePeriodEnd
-        format!("LLM call model={}", rec.model), // ChargeDescription
-        provider.clone(),                        // ProviderName
-        provider.clone(),                        // PublisherName
-        provider,                                // InvoiceIssuerName
-        "LLM inference".to_string(),             // ServiceName
-        "AI and Machine Learning".to_string(),   // ServiceCategory
-        rec.agent_id.clone(),                    // ResourceId
-        rec.agent_id.clone(),                    // ResourceName
-        rec.run_id.clone(),                      // SubAccountId
-        rec.run_id.clone(),                      // SubAccountName
-        rec.run_id.clone(),                      // x_run_id
-        rec.parent_run_id.clone(),               // x_parent_run_id
-        rec.agent_id.clone(),                    // x_agent_id
-        rec.model.clone(),                       // x_model
-        rec.input_tokens.to_string(),            // x_tokens_in
-        rec.output_tokens.to_string(),           // x_tokens_out
-        blocked.to_string(),                     // x_blocked
-        cost_basis.to_string(),                  // x_cost_basis
-        rec.outcome.clone(),                     // x_outcome
-        rec.unit.clone(),                        // x_unit
+        billed.clone(),                                            // BilledCost
+        billed,                                                    // EffectiveCost
+        "USD".to_string(),                                         // BillingCurrency
+        ts.clone(),                                                // ChargePeriodStart
+        ts,                                                        // ChargePeriodEnd
+        format!("LLM call model={}", rec.model),                   // ChargeDescription
+        provider.clone(),                                          // ProviderName
+        provider.clone(),                                          // PublisherName
+        provider,                                                  // InvoiceIssuerName
+        "LLM inference".to_string(),                               // ServiceName
+        "AI and Machine Learning".to_string(),                     // ServiceCategory
+        rec.agent_id.clone(),                                      // ResourceId
+        rec.agent_id.clone(),                                      // ResourceName
+        rec.run_id.clone(),                                        // SubAccountId
+        rec.run_id.clone(),                                        // SubAccountName
+        rec.run_id.clone(),                                        // x_run_id
+        rec.parent_run_id.clone(),                                 // x_parent_run_id
+        rec.agent_id.clone(),                                      // x_agent_id
+        rec.model.clone(),                                         // x_model
+        rec.input_tokens.to_string(),                              // x_tokens_in
+        rec.output_tokens.to_string(),                             // x_tokens_out
+        blocked.to_string(),                                       // x_blocked
+        cost_basis.to_string(),                                    // x_cost_basis
+        rec.outcome.clone(),                                       // x_outcome
+        rec.unit.clone(),                                          // x_unit
+        rec.tool_calls.map(|n| n.to_string()).unwrap_or_default(), // x_tool_calls
     ]
 }
 
@@ -561,12 +588,14 @@ mod tests {
             "",
             "",
             "",
+            None,
         )
     }
 
-    /// Like [`rec`], but also sets `parent_run_id` (P3), `outcome` (P4), and
-    /// `unit` (docs/20-identity-map.md) - exercises `x_parent_run_id`,
-    /// `x_outcome`, and `x_unit` sourcing together (see
+    /// Like [`rec`], but also sets `parent_run_id` (P3), `outcome` (P4),
+    /// `unit` (docs/20-identity-map.md), and `tool_calls` (I1,
+    /// docs/21-tool-runs.md) - exercises `x_parent_run_id`, `x_outcome`,
+    /// `x_unit`, and `x_tool_calls` sourcing together (see
     /// `exports_a_fixture_trace_to_the_exact_expected_csv`).
     #[allow(clippy::too_many_arguments)]
     fn rec_with_parent_and_outcome(
@@ -581,6 +610,7 @@ mod tests {
         parent_run_id: &str,
         outcome: &str,
         unit: &str,
+        tool_calls: Option<u32>,
     ) -> CallRecord {
         CallRecord {
             ts_millis,
@@ -598,6 +628,7 @@ mod tests {
             outcome: outcome.into(),
             key_id: String::new(),
             unit: unit.into(),
+            tool_calls,
         }
     }
 
@@ -610,9 +641,10 @@ mod tests {
         {
             let sink = ParquetSink::new(&dir, 1).unwrap();
             // A: a normal settled allow (real parsed usage), WITH a parent run,
-            // an outcome tag, AND a resolved unit - exercises P3's
-            // x_parent_run_id sourcing, P4's x_outcome sourcing, and unit
-            // identity's x_unit sourcing together.
+            // an outcome tag, a resolved unit, AND two observed tool calls -
+            // exercises P3's x_parent_run_id sourcing, P4's x_outcome
+            // sourcing, unit identity's x_unit sourcing, and I1's
+            // x_tool_calls sourcing together.
             sink.record(rec_with_parent_and_outcome(
                 0,
                 "run-a",
@@ -625,6 +657,7 @@ mod tests {
                 "run-parent-a",
                 "case_resolved",
                 "treasury",
+                Some(2),
             ));
             // B: SettleGuard-drop-without-complete edge case — allow, zero
             // tokens, non-zero cost (the reserved fallback) -> "estimated".
@@ -668,23 +701,23 @@ mod tests {
             "ChargeDescription,ProviderName,PublisherName,InvoiceIssuerName,ServiceName,",
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
-            "x_outcome,x_unit\n",
+            "x_outcome,x_unit,x_tool_calls\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled,case_resolved,treasury\n",
+            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled,,\n",
+            "0,0,false,settled,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked,,\n",
+            "blocked,,,\n",
         );
         assert_eq!(got, want);
 

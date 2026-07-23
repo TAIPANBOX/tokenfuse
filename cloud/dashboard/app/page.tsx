@@ -11,8 +11,10 @@ type Run = {
   steps: number;
   last_seen_millis: number;
   killed: boolean;
+  // Tool calls the model emitted across this run's calls (I1, docs/21-tool-runs.md).
+  tool_calls: number;
 };
-type Summary = { runs: number; calls: number; spent_microusd: number };
+type Summary = { runs: number; calls: number; spent_microusd: number; tool_calls: number };
 type Bucket = { t: number; cost_microusd: number; calls: number; blocked: number };
 type Alert = {
   run_id: string;
@@ -83,7 +85,7 @@ export default function Page() {
   const [key, setKey] = useState("");
   const [connected, setConnected] = useState(false);
   const [runs, setRuns] = useState<Run[]>([]);
-  const [summary, setSummary] = useState<Summary>({ runs: 0, calls: 0, spent_microusd: 0 });
+  const [summary, setSummary] = useState<Summary>({ runs: 0, calls: 0, spent_microusd: 0, tool_calls: 0 });
   const [budgets, setBudgets] = useState<Record<string, number>>({});
   const [units, setUnits] = useState<Unit[]>([]);
   const [unitBudgets, setUnitBudgets] = useState<Record<string, number>>({});
@@ -382,6 +384,20 @@ export default function Page() {
                 <div className="n">{killedRuns}</div>
                 <div className="s">this org</div>
               </div>
+              {/* `summary.tool_calls` (like `summary.spent_microusd` in the
+                  "Spent today" tile above, and `summary.calls` in "Active
+                  runs") is `Store::summary`'s org-wide, full-ingest-history
+                  running total - there is no day-boundary reset anywhere in
+                  `OrgTotals`. "Spent today" already carries this same
+                  all-time-mislabeled-as-today pattern (a pre-existing issue,
+                  not introduced here and not fixed here - flagged
+                  separately), so this tile is labeled honestly instead of
+                  quietly repeating it: "Tool runs", not "...today". */}
+              <div className="card tile" style={{ gridColumn: "1 / -1" }}>
+                <div className="k">Tool runs</div>
+                <div className="n">{summary.tool_calls}</div>
+                <div className="s">all time - observed only</div>
+              </div>
               {savings && (
                 <div className="card tile" style={{ gridColumn: "1 / -1" }}>
                   {/* SavingsAcc is the same all-time shape: a persisted,
@@ -418,6 +434,7 @@ export default function Page() {
                       <th>Spent / cap</th>
                       <th className="num">Calls</th>
                       <th className="num">Steps</th>
+                      <th className="num">Tool runs</th>
                       <th>Status</th>
                       <th className="num">Actions</th>
                     </tr>
@@ -458,6 +475,7 @@ export default function Page() {
                           </td>
                           <td className="num">{r.calls}</td>
                           <td className="num">{r.steps}</td>
+                          <td className="num">{r.tool_calls}</td>
                           <td>
                             {r.killed ? (
                               <span className="pill dead">killed</span>

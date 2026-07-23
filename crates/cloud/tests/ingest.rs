@@ -94,6 +94,67 @@ async fn ingest_without_unit_is_additive() {
     assert_eq!(units[0].unit, "unassigned");
 }
 
+/// I1 (docs/21-tool-runs.md): `tool_calls` on the wire (exactly what a
+/// NEW gateway's `CloudSink` would POST) rolls up into the run and the
+/// org-wide summary total.
+#[tokio::test]
+async fn ingest_with_tool_calls_rolls_up_into_runs_and_summary() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1,"tool_calls":2},
+        {"ts_millis":200,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":2,"tool_calls":0}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let runs = store.runs("acme");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].tool_calls, 2);
+    let summary = store.summary("acme");
+    assert_eq!(summary.tool_calls, 2);
+}
+
+/// A gateway that predates I1 simply omits `tool_calls` - additive means the
+/// batch still ingests, and the run's `tool_calls` stays at 0 (an unknown
+/// observation contributes nothing, never a hard error).
+#[tokio::test]
+async fn ingest_without_tool_calls_is_additive() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let runs = store.runs("acme");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].tool_calls, 0);
+}
+
 #[tokio::test]
 async fn ingest_without_a_key_is_unauthorized() {
     let router = app(state_with(Arc::new(Store::new())));

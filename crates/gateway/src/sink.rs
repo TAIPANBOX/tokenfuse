@@ -20,11 +20,12 @@ use datafusion::parquet::arrow::ArrowWriter;
 /// One settled call, the unit of the trace.
 ///
 /// Schema evolution note (P2 → P3/agent-passport → P4/outcome-tags → key
-/// identity → unit identity): `agent_id` and `saved_microusd` were appended
-/// after the first files were written (P2); `parent_run_id` and
+/// identity → unit identity → I1/tool-runs): `agent_id` and `saved_microusd`
+/// were appended after the first files were written (P2); `parent_run_id` and
 /// `on_behalf_of` follow the exact same pattern (P3); `outcome` follows it
 /// again (P4); `key_id` follows it once more; `unit`
-/// (docs/20-identity-map.md section 4) follows it again. New fields go at the
+/// (docs/20-identity-map.md section 4) follows it again; `tool_calls`
+/// (docs/21-tool-runs.md) follows it once more. New fields go at the
 /// END and the Parquet schema keeps a stable order (see
 /// [`ParquetSink::schema`]); old files simply lack the trailing columns and
 /// read back as defaults (see `sqlq`). Never reorder or remove a field - that
@@ -93,6 +94,14 @@ pub struct CallRecord {
     /// Attribution/aggregation only, exactly like `key_id` above - not part
     /// of run-ledger accounting.
     pub unit: String,
+    /// Number of tool calls the model emitted in this response (I1, an
+    /// observed metric only - see docs/21-tool-runs.md and
+    /// `tokenfuse_core::pricing::Usage::tool_calls`, which this is copied
+    /// from at settle time). `None` when the response body never parsed
+    /// (e.g. a blocked call that never reached the provider, or an upstream
+    /// error) - never a guess. Not part of budget/ledger accounting: v1 is
+    /// observed-only, no enforcement on tool calls.
+    pub tool_calls: Option<u32>,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -197,6 +206,14 @@ impl ParquetSink {
             // Appended unit-identity column - same rule: LAST. See
             // [`CallRecord::unit`] (docs/20-identity-map.md section 4).
             Field::new("unit", DataType::Utf8, false),
+            // Appended I1 (tool-runs) column - same rule: LAST. See
+            // [`CallRecord::tool_calls`] (docs/21-tool-runs.md). Unlike every
+            // column above, this one is genuinely nullable in the WRITE
+            // schema too: `None` (an unparseable/never-called response) and
+            // `Some(0)` (a real zero-tool-call response) are different facts,
+            // so we write an actual Parquet NULL for the former rather than a
+            // sentinel default.
+            Field::new("tool_calls", DataType::UInt32, true),
         ]))
     }
 
@@ -242,6 +259,13 @@ impl ParquetSink {
             // Unit identity: same treatment once more, so every trace
             // written before the identity map existed still reads back.
             Field::new("unit", DataType::Utf8, true),
+            // I1 (tool-runs): same treatment once more, so every trace
+            // written before this column existed still reads back. Already
+            // nullable in the write schema above, so this is not a change in
+            // nullability across read/write the way the string columns are -
+            // just the same "declare it nullable so old files' missing
+            // column null-fills legally" rule.
+            Field::new("tool_calls", DataType::UInt32, true),
         ]))
     }
 
@@ -313,6 +337,12 @@ impl ParquetSink {
                 Arc::new(StringArray::from(
                     records.iter().map(|r| r.unit.clone()).collect::<Vec<_>>(),
                 )),
+                // `UInt32Array`'s `FromIterator<Option<u32>>` impl writes a
+                // real null for `None` - exactly what the nullable
+                // `tool_calls` column above needs.
+                Arc::new(UInt32Array::from(
+                    records.iter().map(|r| r.tool_calls).collect::<Vec<_>>(),
+                )),
             ],
         )?;
 
@@ -382,6 +412,7 @@ mod tests {
             outcome: String::new(),
             key_id: String::new(),
             unit: String::new(),
+            tool_calls: None,
         }
     }
 
@@ -470,6 +501,65 @@ mod tests {
                 "ends with the parquet magic"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// I1 (docs/21-tool-runs.md): `tool_calls` round-trips through a single
+    /// Parquet file preserving the THREE-way distinction the type carries -
+    /// `Some(0)` (observed, no tool calls), `Some(n)` (n tool calls), and
+    /// `None` (never parsed) - as a real Parquet NULL, not a sentinel.
+    #[tokio::test]
+    async fn tool_calls_round_trips_including_a_real_null() {
+        use datafusion::arrow::array::Array;
+
+        let dir = std::env::temp_dir().join(format!("tf-sink-toolcalls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            let mut zero = rec("r-zero", 0);
+            zero.tool_calls = Some(0);
+            sink.record(zero);
+            let mut some = rec("r-some", 0);
+            some.tool_calls = Some(3);
+            sink.record(some);
+            let mut none = rec("r-none", 0);
+            none.tool_calls = None;
+            sink.record(none);
+        }
+
+        let batches = crate::sqlq::query(
+            "select run_id, tool_calls from calls order by run_id",
+            dir.to_str().unwrap(),
+        )
+        .await
+        .expect("read back must succeed");
+
+        let mut rows: Vec<(String, Option<u32>)> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("tool_calls column type");
+            for i in 0..b.num_rows() {
+                let v = if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                };
+                rows.push((crate::sqlq::str_at(b.column(0).as_ref(), i), v));
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                ("r-none".to_string(), None),
+                ("r-some".to_string(), Some(3)),
+                ("r-zero".to_string(), Some(0)),
+            ]
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

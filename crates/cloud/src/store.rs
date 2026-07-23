@@ -137,6 +137,18 @@ pub struct CallRecord {
     /// still deserializes.
     #[serde(default)]
     pub unit: String,
+    /// Tool calls the model emitted in this call's response (I1,
+    /// docs/21-tool-runs.md). `None` when the response never parsed (a
+    /// blocked call, or an upstream error). Matches
+    /// `crates/gateway/src/sink.rs::CallRecord::tool_calls` on the wire.
+    /// Additive: `#[serde(default)]` so a pre-I1 gateway that omits the
+    /// field still deserializes (and, symmetrically, a NEW gateway's
+    /// `tool_calls` key is silently ignored by an OLD control plane that
+    /// predates this field - this struct has no `deny_unknown_fields`, and
+    /// nothing else in this crate sets it either, so an extra JSON key is
+    /// always a non-issue in either direction).
+    #[serde(default)]
+    pub tool_calls: Option<u32>,
 }
 
 /// The aggregated state of one run within an organization.
@@ -166,6 +178,12 @@ pub struct RunAgg {
     #[serde(rename = "last_seen_millis")]
     pub last_seen: i64,
     pub killed: bool,
+    /// Sum of `tool_calls` across this run's calls (I1, docs/21-tool-runs.md);
+    /// a record with `tool_calls: None` contributes 0 - not itself trusted
+    /// as an observation, but never blocking the sum. `#[serde(default)]` so
+    /// pre-I1 snapshots still load.
+    #[serde(default)]
+    pub tool_calls: u64,
 }
 
 /// Org-wide totals. `calls`/`spent_microusd` are exact across the org's
@@ -176,6 +194,10 @@ pub struct Summary {
     pub runs: u64,
     pub calls: u64,
     pub spent_microusd: i64,
+    /// Org-wide sum of `tool_calls` across its full ingest history (I1,
+    /// docs/21-tool-runs.md), mirroring `calls`/`spent_microusd` above -
+    /// exact, unaffected by `MAX_RUNS_PER_ORG` eviction.
+    pub tool_calls: u64,
 }
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
@@ -191,6 +213,9 @@ pub struct AgentAgg {
     pub runs: u64,
     #[serde(rename = "last_seen_millis")]
     pub last_seen: i64,
+    /// Sum of `tool_calls` across this agent's runs (I1, docs/21-tool-runs.md),
+    /// folded the same way as `spent_microusd` above.
+    pub tool_calls: u64,
 }
 
 /// Per-unit spend rollup (docs/20-identity-map.md section 4), folded from an
@@ -211,6 +236,9 @@ pub struct UnitAgg {
     pub runs: u64,
     #[serde(rename = "last_seen_millis")]
     pub last_seen: i64,
+    /// Sum of `tool_calls` across this unit's runs (I1, docs/21-tool-runs.md),
+    /// folded the same way as `spent_microusd` above.
+    pub tool_calls: u64,
 }
 
 /// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
@@ -282,6 +310,14 @@ struct OrgTotals {
     /// Real spend only (blocked/avoided-spend rows excluded — the same gate
     /// `RunAgg::spent_microusd` uses; see `is_blocked`).
     spent_microusd: i64,
+    /// Org-wide sum of `tool_calls` (I1, docs/21-tool-runs.md), unaffected by
+    /// `MAX_RUNS_PER_ORG` eviction, mirroring `spent_microusd` above (same
+    /// `is_blocked` gate). `#[serde(default)]` so snapshots taken before this
+    /// field existed load to `0` rather than failing to deserialize - no
+    /// backfill on load, unlike `spent_microusd`/`calls`: there is no prior
+    /// per-run source to recompute this dimension from for old snapshots.
+    #[serde(default)]
+    tool_calls: u64,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -302,6 +338,11 @@ pub struct SeriesBucket {
     pub cost_microusd: i64,
     pub calls: u64,
     pub blocked: u64,
+    /// Sum of `tool_calls` across this bucket's samples (I1,
+    /// docs/21-tool-runs.md), summed the same unconditional way
+    /// `cost_microusd` above is (see `Sample::tool_calls`'s doc for why the
+    /// burn-rate series doesn't gate on `is_blocked` the way real spend does).
+    pub tool_calls: u64,
 }
 
 /// An aggregated, first-class anomaly for an org (P2 incidents). Repeated or
@@ -488,6 +529,13 @@ struct Sample {
     run_id: String,
     cost_microusd: i64,
     blocked: bool,
+    /// Mirrors `cost_microusd` above: summed into the series UNCONDITIONALLY
+    /// (not gated by `is_blocked` the way `RunAgg`/`OrgTotals` gate real
+    /// spend) - the burn-rate series is an activity signal, not a trusted
+    /// accounting total, and a well-behaved gateway only ever sends a real
+    /// `Some(n)` on an `allow`/`cache_hit` row anyway (I1,
+    /// docs/21-tool-runs.md).
+    tool_calls: u64,
 }
 
 /// A least-recently-used index over a set of keys, used to bound the
@@ -877,6 +925,9 @@ impl Store {
                     // accumulator sees it.
                     let cost = r.cost_microusd.max(0);
                     let saved = r.saved_microusd.max(0);
+                    // I1 (docs/21-tool-runs.md): an absent/unparseable
+                    // observation contributes 0, never a guess.
+                    let tool_calls = r.tool_calls.unwrap_or(0) as u64;
 
                     // Bound `runs`' cardinality (see `MAX_RUNS_PER_ORG`):
                     // evict a run before inserting a genuinely NEW run_id that
@@ -935,9 +986,18 @@ impl Store {
                     // `runs` eviction. C4: saturating, so an attacker-supplied
                     // extreme cost can't wrap a release-build i64 into
                     // garbage/negative.
+                    //
+                    // I1 (docs/21-tool-runs.md): `tool_calls` rides the SAME
+                    // gate - a well-behaved gateway only ever reports a real
+                    // observation on an allow/cache_hit row anyway (a blocked
+                    // call never reached the provider), and gating here
+                    // stops an untrusted ingest payload from inflating the
+                    // metric via a fabricated blocked-row value.
                     if !is_blocked(&r.decision) {
                         agg.spent_microusd = agg.spent_microusd.saturating_add(cost);
                         totals.spent_microusd = totals.spent_microusd.saturating_add(cost);
+                        agg.tool_calls = agg.tool_calls.saturating_add(tool_calls);
+                        totals.tool_calls = totals.tool_calls.saturating_add(tool_calls);
                     }
                     agg.calls += 1;
                     totals.calls += 1;
@@ -1031,6 +1091,9 @@ impl Store {
                         // detection.
                         cost_microusd: r.cost_microusd.max(0),
                         blocked: is_blocked(&r.decision),
+                        // I1: unconditional, same as `cost_microusd` above -
+                        // see `Sample::tool_calls`'s doc.
+                        tool_calls: r.tool_calls.unwrap_or(0) as u64,
                     });
                 }
                 while log.len() > SERIES_CAP {
@@ -1225,6 +1288,7 @@ impl Store {
                 cost_microusd: 0,
                 calls: 0,
                 blocked: 0,
+                tool_calls: 0,
             })
             .collect();
         let inner = self.inner.read().unwrap();
@@ -1246,6 +1310,7 @@ impl Store {
                 if s.blocked {
                     b.blocked += 1;
                 }
+                b.tool_calls = b.tool_calls.saturating_add(s.tool_calls);
             }
         }
         buckets
@@ -1303,14 +1368,16 @@ impl Store {
         if let Some(totals) = inner.org_totals.get(org) {
             sum.calls = totals.calls;
             sum.spent_microusd = totals.spent_microusd;
+            sum.tool_calls = totals.tool_calls;
         }
         sum
     }
 
     /// An org's per-agent spend rollup, highest spend first. Folds the org's
     /// [`RunAgg`]s by `agent_id`; the empty-string agent is kept as its own
-    /// (unattributed) bucket. Spend already excludes blocked rows (that gate is
-    /// applied when folding calls into `RunAgg::spent_microusd`).
+    /// (unattributed) bucket. Spend (and `tool_calls`, I1) already exclude
+    /// blocked rows (that gate is applied when folding calls into
+    /// `RunAgg::spent_microusd`/`RunAgg::tool_calls`).
     pub fn agents(&self, org: &str) -> Vec<AgentAgg> {
         let inner = self.inner.read().unwrap();
         let mut by_agent: HashMap<String, AgentAgg> = HashMap::new();
@@ -1332,6 +1399,7 @@ impl Store {
                 if agg.last_seen > a.last_seen {
                     a.last_seen = agg.last_seen;
                 }
+                a.tool_calls = a.tool_calls.saturating_add(agg.tool_calls);
             }
         }
         let mut out: Vec<AgentAgg> = by_agent.into_values().collect();
@@ -1342,9 +1410,9 @@ impl Store {
     /// An org's per-unit spend rollup, highest spend first
     /// (docs/20-identity-map.md section 4). Folds the org's [`RunAgg`]s by
     /// `unit`, mirroring [`Store::agents`]'s fold-by-`agent_id` shape - with
-    /// one deliberate difference at the bucketing key. Spend already excludes
-    /// blocked rows (that gate is applied when folding calls into
-    /// `RunAgg::spent_microusd`).
+    /// one deliberate difference at the bucketing key. Spend (and
+    /// `tool_calls`, I1) already exclude blocked rows (that gate is applied
+    /// when folding calls into `RunAgg::spent_microusd`/`RunAgg::tool_calls`).
     pub fn units(&self, org: &str) -> Vec<UnitAgg> {
         let inner = self.inner.read().unwrap();
         let mut by_unit: HashMap<String, UnitAgg> = HashMap::new();
@@ -1370,6 +1438,7 @@ impl Store {
                 if agg.last_seen > u.last_seen {
                     u.last_seen = agg.last_seen;
                 }
+                u.tool_calls = u.tool_calls.saturating_add(agg.tool_calls);
             }
         }
         let mut out: Vec<UnitAgg> = by_unit.into_values().collect();
@@ -2352,6 +2421,28 @@ mod tests {
         assert_eq!(rec.outcome, "");
     }
 
+    /// I1 (docs/21-tool-runs.md): wire-shape parity with
+    /// `crates/gateway/src/sink.rs::CallRecord::tool_calls` - a NEW
+    /// gateway's `tool_calls` must survive ingest deserialization.
+    #[test]
+    fn deserializes_tool_calls_field() {
+        let json = r#"{"run_id": "r1", "tool_calls": 3}"#;
+        let rec: CallRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.tool_calls, Some(3));
+    }
+
+    /// An OLD gateway that predates I1 simply omits `tool_calls` - additive
+    /// means the batch still ingests, defaulting to `None` (not a fabricated
+    /// `Some(0)`; see `Store::ingest_at`'s `unwrap_or(0)` fold, which is the
+    /// point where "unknown" and "observed zero" both become 0 for the
+    /// aggregates - the DTO itself keeps the distinction).
+    #[test]
+    fn deserializes_without_tool_calls_for_backward_compat() {
+        let json = r#"{"run_id": "r1"}"#;
+        let rec: CallRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.tool_calls, None);
+    }
+
     #[test]
     fn ingest_aggregates() {
         let s = Store::new();
@@ -2583,6 +2674,83 @@ mod tests {
         assert_eq!(units[2].unit, "unassigned");
         assert_eq!(units[2].spent_microusd, 250);
         assert_eq!(units[2].runs, 1);
+    }
+
+    /// I1 (docs/21-tool-runs.md): `tool_calls` rolls up through every
+    /// aggregation the same way `spent_microusd` does - `RunAgg`, `AgentAgg`,
+    /// `UnitAgg`, `Summary`, and the burn-rate series - including the
+    /// blocked-row exclusion gate (except in the series, which is
+    /// unconditional; see `Sample::tool_calls`'s doc).
+    #[test]
+    fn tool_calls_roll_up_across_runs_agents_units_summary_and_series() {
+        let s = Store::new();
+        let r = |run: &str,
+                 agent: &str,
+                 unit: &str,
+                 decision: &str,
+                 tool_calls: Option<u32>,
+                 ts: i64| {
+            CallRecord {
+                run_id: run.into(),
+                agent_id: agent.into(),
+                unit: unit.into(),
+                decision: decision.into(),
+                ts_millis: ts,
+                tool_calls,
+                ..Default::default()
+            }
+        };
+        s.ingest_at(
+            "acme",
+            &[
+                r("r1", "planner", "treasury", "allow", Some(2), 10),
+                r("r1", "planner", "treasury", "allow", Some(1), 20),
+                // A budget-protection block: its (fabricated, in this test)
+                // tool_calls must NOT count toward the real total - it never
+                // reached the provider.
+                r("r1", "planner", "treasury", "budget_exceeded", Some(99), 30),
+                // A real zero (cache_hit, or a text-only call) contributes 0,
+                // same as an absent observation.
+                r("r2", "coder", "", "cache_hit", Some(0), 40),
+                // No observation at all (pre-I1 gateway, or unparseable) also
+                // contributes 0 - indistinguishable from a real zero at the
+                // aggregate level, which is expected (see `CallRecord::tool_calls`'s doc).
+                r("r2", "coder", "", "allow", None, 50),
+            ],
+            1_000,
+        );
+
+        let runs = s.runs("acme");
+        let r1 = runs.iter().find(|r| r.run_id == "r1").unwrap();
+        assert_eq!(
+            r1.tool_calls, 3,
+            "2 + 1 from the two allow rows, block excluded"
+        );
+        let r2 = runs.iter().find(|r| r.run_id == "r2").unwrap();
+        assert_eq!(r2.tool_calls, 0);
+
+        let agents = s.agents("acme");
+        let planner = agents.iter().find(|a| a.agent_id == "planner").unwrap();
+        assert_eq!(planner.tool_calls, 3);
+        let coder = agents.iter().find(|a| a.agent_id == "coder").unwrap();
+        assert_eq!(coder.tool_calls, 0);
+
+        let units = s.units("acme");
+        let treasury = units.iter().find(|u| u.unit == "treasury").unwrap();
+        assert_eq!(treasury.tool_calls, 3);
+        let unassigned = units.iter().find(|u| u.unit == "unassigned").unwrap();
+        assert_eq!(unassigned.tool_calls, 0);
+
+        let sum = s.summary("acme");
+        assert_eq!(sum.tool_calls, 3, "org-wide total across every run");
+
+        // Series: unconditional, so the blocked row's 99 DOES land in the
+        // burn-rate bucket - it's an activity signal, not a trusted total.
+        // (The cache_hit and no-observation rows contribute 0 each, same as
+        // everywhere else - omitted from the sum below, not overlooked.)
+        let buckets = s.series("acme", None, 1_000, 1_000, 1_000);
+        let total_in_series: u64 = buckets.iter().map(|b| b.tool_calls).sum();
+        assert_eq!(total_in_series, 2 + 1 + 99);
     }
 
     /// Central unit-budget overrides round-trip through the store, mirroring

@@ -204,6 +204,7 @@ mod tests {
             outcome: outcome.into(),
             key_id: String::new(),
             unit: String::new(),
+            tool_calls: None,
         }
     }
 

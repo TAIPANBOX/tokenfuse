@@ -81,6 +81,7 @@ impl UsageParser {
         let text = String::from_utf8_lossy(&self.buf);
         let mut usage = Usage::default();
         let mut saw_sse = false;
+        let mut tool_calls = ToolCallCounter::default();
 
         for line in text.lines() {
             if let Some(rest) = line.trim_start().strip_prefix("data:") {
@@ -91,6 +92,7 @@ impl UsageParser {
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
                     merge_usage(&mut usage, &v);
+                    tool_calls.observe_streaming(&v);
                 }
             }
         }
@@ -99,10 +101,113 @@ impl UsageParser {
         if !saw_sse {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
                 merge_usage(&mut usage, &v);
+                tool_calls.observe_non_streaming(&v);
             }
         }
 
+        usage.tool_calls = tool_calls.finish();
         usage
+    }
+}
+
+/// Accumulates the model-emitted tool-call count across a response body (I1,
+/// docs/21-tool-runs.md), for both Anthropic and OpenAI shapes, streaming or
+/// not - the same "inspect the JSON shape, not the endpoint" approach
+/// [`merge_usage`] already uses, since this gateway is provider-agnostic.
+///
+/// `finish()` returns `None` only when nothing in the body ever parsed as
+/// JSON at all; any response we could actually look into resolves to at
+/// least `Some(0)` - "no tool calls" is a real observation, never a guess.
+#[derive(Default)]
+struct ToolCallCounter {
+    /// At least one JSON value from the body was successfully parsed.
+    seen: bool,
+    /// Anthropic: `content_block_start` events announcing a `tool_use` block
+    /// (streaming), or `content[]` blocks of type `tool_use` (non-streaming) -
+    /// counted the same way, since each occurrence is one tool call either way.
+    anthropic: u32,
+    /// OpenAI non-streaming: `choices[].message.tool_calls` length, summed
+    /// across choices (a request can ask for more than one).
+    openai_nonstream: u32,
+    /// OpenAI streaming: distinct `(choice_index, tool_call_index)` pairs
+    /// seen across `choices[].delta.tool_calls[]`. Deltas repeat per
+    /// tool_call index as a call's arguments stream in, so only the count of
+    /// *unique* indexes is the number of tool calls - counting deltas
+    /// directly would overcount. The pairing with `choice_index` matters
+    /// because `n > 1` (multiple choices) is legal on this endpoint: each
+    /// choice's own `tool_calls[].index` restarts from 0 independently, so
+    /// two different choices both streaming a tool call at index 0 are two
+    /// distinct tool calls, not one - a bare `HashSet<u64>` keyed on the
+    /// tool_call index alone would collapse them into one and undercount.
+    /// The choice's own `"index"` defaults to 0 when the key is absent
+    /// (which is every request that didn't ask for `n > 1`), so the common
+    /// single-choice case is unaffected.
+    openai_stream_idx: std::collections::HashSet<(u64, u64)>,
+}
+
+impl ToolCallCounter {
+    /// Anthropic's `content_block_start` events don't have a fixed shape
+    /// contract, we look for the two keys we need and ignore everything else.
+    fn observe_streaming(&mut self, v: &serde_json::Value) {
+        self.seen = true;
+        if v.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
+            let is_tool_use = v
+                .get("content_block")
+                .and_then(|b| b.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("tool_use");
+            if is_tool_use {
+                self.anthropic += 1;
+            }
+        }
+        if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                // Absent (no `n>1` requested) defaults to 0, the same
+                // implicit single-choice index every OpenAI response without
+                // `n` carries.
+                let choice_idx = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let Some(deltas) = choice
+                    .get("delta")
+                    .and_then(|d| d.get("tool_calls"))
+                    .and_then(|t| t.as_array())
+                else {
+                    continue;
+                };
+                for tc in deltas {
+                    if let Some(idx) = tc.get("index").and_then(|i| i.as_u64()) {
+                        self.openai_stream_idx.insert((choice_idx, idx));
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_non_streaming(&mut self, v: &serde_json::Value) {
+        self.seen = true;
+        if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
+            self.anthropic += content
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                .count() as u32;
+        }
+        if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                if let Some(tc) = choice
+                    .get("message")
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(|t| t.as_array())
+                {
+                    self.openai_nonstream += tc.len() as u32;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Option<u32> {
+        if !self.seen {
+            return None;
+        }
+        Some(self.anthropic + self.openai_nonstream + self.openai_stream_idx.len() as u32)
     }
 }
 
@@ -384,6 +489,116 @@ mod tests {
         let u = p.finish();
         assert_eq!(u.input_tokens, 40);
         assert_eq!(u.output_tokens, 15);
+    }
+
+    // -- I1: tool_calls counting (docs/21-tool-runs.md) ---------------------
+
+    #[test]
+    fn counts_anthropic_non_streaming_tool_use_blocks() {
+        let mut p = UsageParser::new();
+        p.feed(
+            br#"{"type":"message","content":[
+            {"type":"text","text":"let me check"},
+            {"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}},
+            {"type":"tool_use","id":"toolu_2","name":"get_time","input":{}}
+        ],"usage":{"input_tokens":10,"output_tokens":5}}"#,
+        );
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(2));
+    }
+
+    #[test]
+    fn counts_anthropic_streaming_content_block_start_tool_use_events() {
+        let mut p = UsageParser::new();
+        p.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        );
+        p.feed(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+        p.feed(b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n");
+        p.feed(b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"get_time\"}}\n\n");
+        p.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(2));
+    }
+
+    #[test]
+    fn counts_openai_non_streaming_tool_calls_summed_across_choices() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"choices":[
+            {"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}},
+                {"id":"call_2","type":"function","function":{"name":"get_time","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"},
+            {"index":1,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_3","type":"function","function":{"name":"get_weather","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}
+        ],"usage":{"prompt_tokens":30,"completion_tokens":12}}"#);
+        let u = p.finish();
+        // 2 tool calls on choice 0 + 1 on choice 1 = 3, summed across choices.
+        assert_eq!(u.tool_calls, Some(3));
+    }
+
+    #[test]
+    fn counts_openai_streaming_distinct_delta_indexes_not_delta_count() {
+        let mut p = UsageParser::new();
+        // Index 0's arguments stream across three deltas (same tool call);
+        // index 1 is a second, distinct tool call. Five deltas total, two
+        // distinct indexes - the count must be 2, not 5.
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n");
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"lat\\\"\"}}]}}]}\n\n");
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}}]}\n\n");
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n");
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n");
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(2));
+    }
+
+    /// Regression: `n>1` (multiple choices) each stream their OWN tool_calls
+    /// index restarting from 0, so index alone is not a globally unique key.
+    /// Two different choices both emitting a tool call at index 0 are two
+    /// distinct tool calls - counting must not collapse them into one.
+    #[test]
+    fn counts_openai_streaming_tool_calls_across_multiple_choices_by_choice_and_index() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}},{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(2));
+    }
+
+    #[test]
+    fn no_tool_calls_in_a_valid_body_is_zero_not_none() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2}}"#);
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(0));
+    }
+
+    #[test]
+    fn no_tool_calls_in_a_text_only_stream_is_zero_not_none() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, Some(0));
+    }
+
+    #[test]
+    fn unparseable_body_leaves_tool_calls_none() {
+        let mut p = UsageParser::new();
+        p.feed(b"not json at all, an upstream error page or a truncated body");
+        let u = p.finish();
+        assert_eq!(u.tool_calls, None);
+    }
+
+    #[test]
+    fn empty_body_leaves_tool_calls_none() {
+        let p = UsageParser::new();
+        let u = p.finish();
+        assert_eq!(u.tool_calls, None);
     }
 
     #[tokio::test]
