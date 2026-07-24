@@ -100,8 +100,31 @@ fn broker_cfg(
         vault,
         scan,
         dlp,
+        // PII masking is a separate, opt-in extension of `dlp` (see
+        // pii_masks_in_tool_args below): every test built through this
+        // helper keeps it Off, same as every other existing test here.
+        dlp_pii: tokenfuse_core::DlpMode::Off,
         lock,
         wardryx: Arc::new(wardryx),
+        client: reqwest::Client::new(),
+        events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+    }))
+}
+
+/// Like `broker_cfg`, but with an explicit `dlp_pii` mode - used only by the
+/// PII-mask test below so every other test's builder stays untouched.
+fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Router {
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    app(Arc::new(BrokerState {
+        upstream,
+        named_upstreams: Default::default(),
+        vault,
+        scan: ScanMode::Off,
+        dlp: tokenfuse_core::DlpMode::Off,
+        dlp_pii,
+        lock: None,
+        wardryx: Arc::new(Wardryx::disabled()),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
     }))
@@ -474,5 +497,40 @@ async fn named_upstream_routes_by_header_and_refuses_unknown() {
         u["error"]["code"],
         json!(-32005),
         "an unknown upstream must be refused: {u}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pii_masks_in_tool_args() {
+    // The stub echoes back whatever params it actually received, so the
+    // echo proves what the broker forwarded - after masking, not before.
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url =
+        spawn_server(broker_with_dlp_pii(upstream, tokenfuse_core::DlpMode::Mask)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "notify", "arguments": { "email": "jane.doe@example.com" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let forwarded_email = resp["result"]["echo"]["arguments"]["email"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !forwarded_email.contains("jane.doe@example.com"),
+        "pii must be masked before forwarding: {resp}"
+    );
+    assert!(
+        forwarded_email.contains("[REDACTED:pii_email]"),
+        "masked args should carry the redaction marker: {resp}"
     );
 }

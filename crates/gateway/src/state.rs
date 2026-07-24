@@ -44,6 +44,12 @@ pub struct AppState {
     pub firewall: Arc<FirewallConfig>,
     /// Secret-scanning (DLP) mode (Off by default).
     pub dlp: DlpMode,
+    /// PII-masking mode: a separate, opt-in extension of the DLP scanner
+    /// (email/card/phone, regex-only, see `tokenfuse_core::dlp`'s module
+    /// doc). Off by default, and switched independently of `dlp` so an
+    /// existing secret-scanning deployment sees no behavior change until an
+    /// operator turns this on too.
+    pub dlp_pii: DlpMode,
     /// Model router: picks the cheapest model that still meets a task's
     /// required quality tier (Off by default). See `crate::router`.
     pub router: Arc<Router>,
@@ -112,6 +118,7 @@ impl AppState {
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
             dlp: DlpMode::Off,
+            dlp_pii: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
             wardryx: Arc::new(Wardryx::disabled()),
@@ -171,6 +178,14 @@ impl AppState {
     /// Set the DLP (secret-scanning) mode. Chainable.
     pub fn with_dlp(mut self, dlp: DlpMode) -> Self {
         self.dlp = dlp;
+        self
+    }
+
+    /// Set the PII-masking mode. Chainable. Independent of `with_dlp`: not
+    /// set means PII scanning stays off, which is what every existing
+    /// deployment gets on upgrade.
+    pub fn with_dlp_pii(mut self, dlp_pii: DlpMode) -> Self {
+        self.dlp_pii = dlp_pii;
         self
     }
 

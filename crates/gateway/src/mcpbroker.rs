@@ -24,8 +24,10 @@
 //! Two transports share [`process`]: HTTP (`app`, default `127.0.0.1:4200`) and
 //! **stdio** (`run_stdio`, for MCP clients that launch a server as a subprocess).
 //! Config: `TOKENFUSE_MCP_UPSTREAM`(S), `_SECRETS` (`name=val,…`), `_SCAN`
-//! (`off|warn|block`), `_DLP` (`off|warn|block`), `_LOCK` (rug-pull baseline),
-//! `_ADDR`, `_STDIO`, plus the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
+//! (`off|warn|block`), `_DLP` (`off|warn|block`), `_DLP_PII` (`off|shadow|
+//! mask|block`, a separate opt-in PII extension of `_DLP`, see
+//! `tokenfuse_core::dlp`'s module doc), `_LOCK` (rug-pull baseline), `_ADDR`,
+//! `_STDIO`, plus the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
 //! Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
 
 use std::collections::BTreeMap;
@@ -67,6 +69,11 @@ pub struct BrokerState {
     /// Scan outgoing tool-call args for raw secrets the agent pasted directly
     /// (not via a `{{secret:}}` handle). Off｜Shadow(=warn)｜Block.
     pub dlp: DlpMode,
+    /// PII masks: a separate, opt-in extension of `dlp` (email/card/phone,
+    /// regex-only, see `tokenfuse_core::dlp`'s module doc). Switches
+    /// independently of `dlp` - Off by default, so an existing deployment
+    /// sees no behavior change until it opts in.
+    pub dlp_pii: DlpMode,
     /// Baseline of pinned tool fingerprints; a changed description on
     /// `tools/list` is a rug-pull. `None` disables the check.
     pub lock: Option<Lock>,
@@ -269,6 +276,9 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
     if method == "tools/call" {
         // DLP: catch raw secrets the agent pasted directly into the args (before
         // injection, so vault-injected secrets aren't flagged).
+        // Kept for the pii section below (secrets win on overlap); empty
+        // when st.dlp is Off, same as if the pii code just never looked.
+        let mut secret_findings_in_args: Vec<dlp::Finding> = Vec::new();
         if st.dlp != DlpMode::Off {
             if let Some(params) = req.get("params") {
                 let findings = dlp::scan(&params.to_string());
@@ -283,6 +293,52 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                                 dlp::summary(&findings)
                             ),
                         );
+                    }
+                }
+                secret_findings_in_args = findings;
+            }
+        }
+
+        // PII masks: a separate, opt-in extension of the same scan, switched
+        // independently of st.dlp above (see tokenfuse_core::dlp's module
+        // doc for the conservative-by-design limits). Unlike the secret
+        // path, Mask here actually redacts the args before forwarding -
+        // there is no existing secret-args-masking behavior to stay
+        // byte-identical with at this site.
+        if st.dlp_pii != DlpMode::Off {
+            if let Some(params_text) = req.get("params").map(|p| p.to_string()) {
+                let pii_findings = dlp::scan_pii(&params_text);
+                if !pii_findings.is_empty() {
+                    let pii_summary = dlp::pii_summary(&pii_findings);
+                    tracing::warn!(pii = %pii_summary, "mcp broker: pii in tool args");
+                    match st.dlp_pii {
+                        DlpMode::Block => {
+                            return rpc_error(
+                                &id,
+                                -32006,
+                                &format!("blocked: pii in tool arguments ({pii_summary})"),
+                            );
+                        }
+                        DlpMode::Mask => {
+                            // Secrets win: never let a pii redaction claim a
+                            // span the secret scan already found.
+                            let to_redact: Vec<dlp::Finding> = pii_findings
+                                .into_iter()
+                                .filter(|p| {
+                                    !secret_findings_in_args
+                                        .iter()
+                                        .any(|f| dlp::spans_overlap(f, p))
+                                })
+                                .collect();
+                            if !to_redact.is_empty() {
+                                if let Ok(redacted) =
+                                    serde_json::from_str(&dlp::redact(&params_text, &to_redact))
+                                {
+                                    req["params"] = redacted;
+                                }
+                            }
+                        }
+                        DlpMode::Shadow | DlpMode::Off => {}
                     }
                 }
             }
@@ -494,14 +550,65 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         }
     }
 
-    // 3. Redact secrets in the response body so a tool result can't leak a
-    //    credential into the model's context.
-    if st.dlp != DlpMode::Off {
+    // 3. Redact secrets (and, if enabled, pii) in the response body so a tool
+    //    result can't leak a credential - or now, PII - into the model's
+    //    context. Guarded so an unused DLP (both modes Off, the default)
+    //    never even serializes `out` to scan it.
+    if st.dlp != DlpMode::Off || st.dlp_pii != DlpMode::Off {
+        // Shadow annotates first (mirrors the wardryx_shadow annotation
+        // above): the redact pass below re-serializes `out` afterward, so
+        // the note is naturally preserved through that round trip instead of
+        // being overwritten by a redact computed from stale offsets.
+        if st.dlp_pii == DlpMode::Shadow {
+            let pii_findings = dlp::scan_pii(&out.to_string());
+            if !pii_findings.is_empty() {
+                let pii_summary = dlp::pii_summary(&pii_findings);
+                tracing::warn!(pii = %pii_summary, "mcp broker: pii in tool response");
+                if let Some(obj) = out.as_object_mut() {
+                    let entry = obj.entry("_tokenfuse").or_insert_with(|| json!({}));
+                    if let Some(t) = entry.as_object_mut() {
+                        t.insert("dlp_pii".into(), json!(format!("found {pii_summary}")));
+                    }
+                }
+            }
+        }
+
         let text = out.to_string();
-        let findings = dlp::scan(&text);
-        if !findings.is_empty() {
-            tracing::warn!(secrets = %dlp::summary(&findings), "mcp broker: redacted secrets in tool response");
-            if let Ok(redacted) = serde_json::from_str(&dlp::redact(&text, &findings)) {
+        let secret_findings = if st.dlp != DlpMode::Off {
+            dlp::scan(&text)
+        } else {
+            Vec::new()
+        };
+        if !secret_findings.is_empty() {
+            tracing::warn!(secrets = %dlp::summary(&secret_findings), "mcp broker: redacted secrets in tool response");
+        }
+
+        let mut to_redact = secret_findings.clone();
+
+        if st.dlp_pii == DlpMode::Block || st.dlp_pii == DlpMode::Mask {
+            let pii_findings = dlp::scan_pii(&text);
+            if !pii_findings.is_empty() {
+                let pii_summary = dlp::pii_summary(&pii_findings);
+                tracing::warn!(pii = %pii_summary, "mcp broker: pii in tool response");
+                if st.dlp_pii == DlpMode::Block {
+                    return rpc_error(
+                        &id,
+                        -32006,
+                        &format!("blocked: pii in tool response ({pii_summary})"),
+                    );
+                }
+                // Mask: secrets win - never let a pii redaction claim a span
+                // the secret scan already found.
+                to_redact.extend(
+                    pii_findings
+                        .into_iter()
+                        .filter(|p| !secret_findings.iter().any(|f| dlp::spans_overlap(f, p))),
+                );
+            }
+        }
+
+        if !to_redact.is_empty() {
+            if let Ok(redacted) = serde_json::from_str(&dlp::redact(&text, &to_redact)) {
                 out = redacted;
             }
         }

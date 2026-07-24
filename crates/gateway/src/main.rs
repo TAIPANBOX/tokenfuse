@@ -310,6 +310,17 @@ async fn mcp_broker() {
         Ok("off") => tokenfuse_core::DlpMode::Off,
         _ => tokenfuse_core::DlpMode::Shadow, // warn
     };
+    // PII masks: a separate, opt-in extension of the same DLP scanner (see
+    // tokenfuse_core::dlp's module doc), switched independently of
+    // TOKENFUSE_MCP_DLP above. Unlike it, this one defaults to Off, not
+    // Shadow: PII masking is new, and every existing mcp-broker deployment
+    // must see zero behavior change until it explicitly opts in.
+    let dlp_pii = match std::env::var("TOKENFUSE_MCP_DLP_PII").as_deref() {
+        Ok("shadow") => tokenfuse_core::DlpMode::Shadow,
+        Ok("mask") => tokenfuse_core::DlpMode::Mask,
+        Ok("block") => tokenfuse_core::DlpMode::Block,
+        _ => tokenfuse_core::DlpMode::Off,
+    };
     // Optional rug-pull baseline: a JSON lockfile of pinned tool fingerprints.
     let lock = std::env::var("TOKENFUSE_MCP_LOCK").ok().and_then(|p| {
         std::fs::read_to_string(&p)
@@ -326,6 +337,7 @@ async fn mcp_broker() {
         vault,
         scan,
         dlp,
+        dlp_pii,
         lock,
         wardryx,
         client: reqwest::Client::new(),
@@ -531,6 +543,20 @@ async fn serve() {
     };
     tracing::info!(?dlp, "secret scanning (DLP)");
     state = state.with_dlp(dlp);
+
+    // PII masks: TOKENFUSE_DLP_PII = off | shadow | mask | block (default
+    // off), same accepted values as TOKENFUSE_DLP above but switched
+    // independently - a separate, opt-in extension of the same scanner (see
+    // tokenfuse_core::dlp's module doc). Leaving this unset keeps every
+    // existing secret-scanning deployment byte-identical.
+    let dlp_pii = match std::env::var("TOKENFUSE_DLP_PII").as_deref() {
+        Ok("shadow") => tokenfuse_core::DlpMode::Shadow,
+        Ok("mask") => tokenfuse_core::DlpMode::Mask,
+        Ok("block") => tokenfuse_core::DlpMode::Block,
+        _ => tokenfuse_core::DlpMode::Off,
+    };
+    tracing::info!(?dlp_pii, "PII masks (DLP extension)");
+    state = state.with_dlp_pii(dlp_pii);
 
     // Model router: TOKENFUSE_ROUTER = off | shadow | on (default off), rules
     // from TOKENFUSE_ROUTER_RULES (optional JSON path; built-in default
