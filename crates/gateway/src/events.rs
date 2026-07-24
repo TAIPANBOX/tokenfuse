@@ -36,7 +36,20 @@ pub fn from_env() -> EventExporter {
     match std::env::var(tokenfuse_core::agent_event::EVENTS_PATH_ENV) {
         Ok(path) if !path.is_empty() => match EventExporter::open(&path) {
             Ok(exp) => {
-                tracing::info!(%path, "agent-event NDJSON export enabled");
+                // Chain continuity is worth one honest startup line (SPEC
+                // §6.5): resumed = one unbroken chain across the restart;
+                // fresh = a new head (empty file, or an unusable tail).
+                match exp.resumed_from() {
+                    Some(h) => tracing::info!(
+                        %path,
+                        resumed_from = %&h[..h.len().min(19)],
+                        "agent-event NDJSON export enabled (prev_hash chain resumed)"
+                    ),
+                    None => tracing::info!(
+                        %path,
+                        "agent-event NDJSON export enabled (fresh prev_hash chain)"
+                    ),
+                }
                 exp
             }
             Err(e) => {

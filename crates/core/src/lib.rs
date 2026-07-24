@@ -9,6 +9,7 @@ pub mod breaker;
 pub mod cache;
 pub mod compliance;
 pub mod dlp;
+pub mod jcs;
 pub mod ledger;
 pub mod loops;
 pub mod mcp;

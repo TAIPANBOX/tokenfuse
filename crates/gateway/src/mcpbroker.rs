@@ -174,7 +174,6 @@ fn emit_tool_call(
         None,
         None,
         json!({ "tool": tool, "upstream": upstream, "decision": decision_str }),
-        None,
     );
     crate::events::log_outcome(EventType::ToolCall, outcome);
 }
@@ -503,7 +502,6 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                     None,
                     None,
                     json!({ "tools_changed": changed }),
-                    None,
                 );
                 crate::events::log_outcome(EventType::McpDrift, outcome);
                 if st.scan == ScanMode::Block {
