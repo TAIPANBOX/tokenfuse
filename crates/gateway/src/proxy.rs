@@ -160,7 +160,6 @@ fn emit_breaker_event(
             // map is off or nothing matched.
             "unit": (!unit.is_empty()).then_some(unit),
         }),
-        None,
     );
     crate::events::log_outcome(EventType::BreakerTripped, outcome);
 }
@@ -302,7 +301,6 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         "reason": mismatch.reason,
                         "unit": (!unit.is_empty()).then_some(&unit),
                     }),
-                    None,
                 );
                 crate::events::log_outcome(EventType::IdentityMismatch, outcome);
                 return identity_block(&run_id, mismatch.reason);
@@ -456,7 +454,6 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         Some(&run_id),
                         (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
                         serde_json::json!({ "summary": summary }),
-                        None,
                     );
                     crate::events::log_outcome(EventType::DlpBlock, outcome);
                     return dlp_block(&run_id, &summary);
@@ -1380,7 +1377,6 @@ async fn buffered_managed(
                     Some(&reservation.run_id),
                     (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
                     serde_json::json!({ "reason": reason }),
-                    None,
                 );
                 crate::events::log_outcome(EventType::TaintBlock, outcome);
                 return firewall_block(&reservation.run_id, &reason);

@@ -168,11 +168,10 @@ pub struct AgentEvent {
 /// empty/absent chain means the agent acts autonomously" — distinct from
 /// serializing an empty JSON array).
 ///
-/// `prev_hash` is a raw pass-through — see `crates/gateway/src/events.rs` and
-/// `crates/cloud/src/store.rs` module docs for why this phase omits it at
-/// every current call site (no existing sha256 chain covers the
-/// enforcement/incident stream; see `tokenfuse_core::audit`'s own scope note).
-#[allow(clippy::too_many_arguments)]
+/// `prev_hash` is deliberately NOT a parameter: the chain link belongs to the
+/// [`Exporter`], the stream's single serialization point, which stamps it
+/// under the same lock that orders the writes (SPEC.md §6.5). A built event
+/// starts unchained; `Exporter::emit` links it.
 pub fn build(
     event_type: EventType,
     ts_millis: i64,
@@ -180,7 +179,6 @@ pub fn build(
     run_id: Option<&str>,
     on_behalf_of: Option<&[String]>,
     data: serde_json::Value,
-    prev_hash: Option<&str>,
 ) -> Option<AgentEvent> {
     let agent_id = agent_id.filter(|s| !s.is_empty())?;
     Some(AgentEvent {
@@ -195,8 +193,37 @@ pub fn build(
             .filter(|chain| !chain.is_empty())
             .map(|chain| chain.to_vec()),
         data: if data.is_null() { None } else { Some(data) },
-        prev_hash: prev_hash.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+        prev_hash: None,
     })
+}
+
+/// The SPEC.md §6.5 chain hash of one event: `"sha256:" + hex(sha256(C))`
+/// where `C` is the RFC 8785 canonical serialization (see [`crate::jcs`]) of
+/// the event with its `prev_hash` field removed. This is the value the NEXT
+/// event in a chained stream carries - and it is independent of the event's
+/// own `prev_hash` by construction, so a chained and an unchained copy of
+/// the same event hash identically.
+pub fn chain_hash(event: &AgentEvent) -> Option<String> {
+    let value = serde_json::to_value(event).ok()?;
+    Some(chain_hash_value(value))
+}
+
+/// [`chain_hash`] over an already-parsed JSON value (used to resume a chain
+/// from a file tail, where the previous event exists only as a line of
+/// JSON). Removes any `prev_hash` member before canonicalizing.
+fn chain_hash_value(mut value: serde_json::Value) -> String {
+    if let Some(map) = value.as_object_mut() {
+        map.remove("prev_hash");
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(crate::jcs::canonicalize(&value).as_bytes());
+    let mut hex = String::with_capacity(7 + 64);
+    hex.push_str("sha256:");
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Serialize one envelope as a single NDJSON line (no trailing newline).
@@ -220,9 +247,20 @@ pub const EVENTS_PATH_ENV: &str = "TOKENFUSE_EVENTS_PATH";
 /// and dropped, never surfaced as a request failure.
 #[derive(Debug)]
 pub struct Exporter {
-    file: Option<std::sync::Mutex<std::fs::File>>,
+    sink: Option<std::sync::Mutex<ChainSink>>,
     skipped: std::sync::atomic::AtomicU64,
     write_errors: std::sync::atomic::AtomicU64,
+}
+
+/// The open file plus the chain state that must advance in lockstep with it
+/// (SPEC.md §6.5: one file = one chain, one serialization point).
+#[derive(Debug)]
+struct ChainSink {
+    file: std::fs::File,
+    /// `prev_hash` for the NEXT event; `None` at a chain head.
+    next: Option<String>,
+    /// What the chain resumed from at open (`None` = started fresh).
+    resumed_from: Option<String>,
 }
 
 /// The outcome of one [`Exporter::emit`] call, for the caller to log (this
@@ -245,27 +283,50 @@ impl Exporter {
     /// a no-op, so a disabled exporter costs nothing on the hot path.
     pub fn disabled() -> Self {
         Exporter {
-            file: None,
+            sink: None,
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Open `path` for append. Returns `Err` with a message the caller should
-    /// log (and then fall back to [`Exporter::disabled`]) — opening the file
-    /// is a one-time startup concern, not a per-request one, so this is the
-    /// one place allowed to return a hard error.
+    /// Open `path` for append and seed the SPEC.md §6.5 chain from the last
+    /// well-formed event line already in the file, so one file stays one
+    /// chain across process restarts. An empty file, or an unreadable or
+    /// malformed tail, starts a FRESH chain rather than refusing to open
+    /// (fail-open, the exporter's standing posture) - `agent-conform -chain`
+    /// then reports the restart honestly instead of the process going quiet.
+    ///
+    /// Returns `Err` with a message the caller should log (and then fall
+    /// back to [`Exporter::disabled`]) - opening the file is a one-time
+    /// startup concern, not a per-request one, so this is the one place
+    /// allowed to return a hard error.
     pub fn open(path: &str) -> Result<Self, String> {
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(path)
             .map_err(|e| format!("could not open '{path}': {e}"))?;
+        let resumed = tail_chain_hash(&mut file);
         Ok(Exporter {
-            file: Some(std::sync::Mutex::new(file)),
+            sink: Some(std::sync::Mutex::new(ChainSink {
+                file,
+                next: resumed.clone(),
+                resumed_from: resumed,
+            })),
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The chain hash this exporter resumed from at open, or `None` when it
+    /// started fresh (disabled exporter, empty file, or an unusable tail).
+    /// For the startup log line, so an operator can see chain continuity.
+    pub fn resumed_from(&self) -> Option<String> {
+        self.sink
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .and_then(|s| s.resumed_from.clone())
     }
 
     /// Read [`EVENTS_PATH_ENV`] ONCE and open it, or return the disabled
@@ -282,14 +343,18 @@ impl Exporter {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.file.is_some()
+        self.sink.is_some()
     }
 
-    /// Build and (best-effort) write one event. Returns what happened so the
-    /// caller can log it (this crate has no logging dependency); every branch
-    /// is fail-open — this call NEVER returns an error the caller must
-    /// propagate.
-    #[allow(clippy::too_many_arguments)]
+    /// Build, chain-link, and (best-effort) write one event. Returns what
+    /// happened so the caller can log it (this crate has no logging
+    /// dependency); every branch is fail-open - this call NEVER returns an
+    /// error the caller must propagate.
+    ///
+    /// The SPEC.md §6.5 link is stamped INSIDE the sink lock, the stream's
+    /// single serialization point, so concurrent emitters cannot fork the
+    /// chain; on a failed write the chain does not advance, and the next
+    /// successful write re-links to the last line actually on disk.
     pub fn emit(
         &self,
         event_type: EventType,
@@ -298,26 +363,21 @@ impl Exporter {
         run_id: Option<&str>,
         on_behalf_of: Option<&[String]>,
         data: serde_json::Value,
-        prev_hash: Option<&str>,
     ) -> EmitOutcome {
-        let Some(file) = &self.file else {
+        let Some(sink) = &self.sink else {
             return EmitOutcome::Disabled;
         };
-        let Some(event) = build(
-            event_type,
-            ts_millis,
-            agent_id,
-            run_id,
-            on_behalf_of,
-            data,
-            prev_hash,
-        ) else {
+        let Some(mut event) = build(event_type, ts_millis, agent_id, run_id, on_behalf_of, data)
+        else {
             let n = self
                 .skipped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
             return EmitOutcome::SkippedNoAgentId { skipped_total: n };
         };
+
+        let mut sink = sink.lock().unwrap();
+        event.prev_hash = sink.next.clone();
         let Some(mut line) = to_ndjson_line(&event) else {
             // Unreachable in practice (see `to_ndjson_line`'s doc); treat as a
             // write error rather than panicking on the hot path.
@@ -332,9 +392,13 @@ impl Exporter {
         };
         line.push('\n');
         use std::io::Write;
-        let result = file.lock().unwrap().write_all(line.as_bytes());
-        match result {
-            Ok(()) => EmitOutcome::Written,
+        match sink.file.write_all(line.as_bytes()) {
+            Ok(()) => {
+                // chain_hash is prev-hash-independent, so this is the same
+                // value a verifier recomputes from the line on disk.
+                sink.next = chain_hash(&event);
+                EmitOutcome::Written
+            }
             Err(e) => {
                 let n = self
                     .write_errors
@@ -355,6 +419,39 @@ impl Exporter {
     pub fn write_error_count(&self) -> u64 {
         self.write_errors.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// The chain hash of the last well-formed JSON line in `file`, reading at
+/// most the final 1 MiB (a real envelope is hundreds of bytes; the window is
+/// orders of magnitude of slack). `None` for an empty file, an I/O error, or
+/// a tail that does not parse - all of which mean "start a fresh chain".
+fn tail_chain_hash(file: &mut std::fs::File) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const WINDOW: u64 = 1 << 20;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(WINDOW);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+
+    let mut last: Option<&[u8]> = None;
+    for (i, line) in buf.split(|b| *b == b'\n').enumerate() {
+        // A mid-file cut leaves the first scanned "line" partial; skip it.
+        if i == 0 && start > 0 {
+            continue;
+        }
+        let trimmed = line.trim_ascii();
+        if !trimmed.is_empty() {
+            last = Some(trimmed);
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(last?).ok()?;
+    value.as_object()?;
+    Some(chain_hash_value(value))
 }
 
 #[cfg(test)]
@@ -422,7 +519,6 @@ mod tests {
             Some("run-1"),
             None,
             serde_json::Value::Null,
-            None,
         )
         .is_none());
         assert!(build(
@@ -432,7 +528,6 @@ mod tests {
             Some("run-1"),
             None,
             serde_json::Value::Null,
-            None,
         )
         .is_none());
     }
@@ -446,7 +541,6 @@ mod tests {
             Some("run-8842"),
             Some(&["user://acme-bank.example/j.doe".to_string()]),
             serde_json::json!({ "budget_usd": 2.00, "spent_usd": 2.00, "action": "blocked_402" }),
-            None,
         )
         .unwrap();
         assert_eq!(ev.schema, SCHEMA);
@@ -472,7 +566,6 @@ mod tests {
             None,
             None,
             serde_json::Value::Null,
-            None,
         )
         .unwrap();
         assert!(ev.on_behalf_of.is_none());
@@ -484,7 +577,6 @@ mod tests {
             None,
             Some(&[]),
             serde_json::Value::Null,
-            None,
         )
         .unwrap();
         assert!(ev2.on_behalf_of.is_none());
@@ -501,7 +593,6 @@ mod tests {
             Some("run-8842"),
             None,
             serde_json::json!({ "reason": "budget_exceeded" }),
-            None,
         )
         .unwrap();
         let line = to_ndjson_line(&ev).unwrap();
@@ -536,7 +627,6 @@ mod tests {
             None,
             None,
             serde_json::Value::Null,
-            None,
         )
         .unwrap();
         let line = to_ndjson_line(&ev).unwrap();
@@ -560,7 +650,6 @@ mod tests {
             None,
             None,
             serde_json::Value::Null,
-            None,
         );
         assert_eq!(outcome, EmitOutcome::Disabled);
         assert_eq!(exp.skipped_count(), 0);
@@ -587,7 +676,6 @@ mod tests {
             Some("run-1"),
             None,
             serde_json::Value::Null,
-            None,
         );
         assert_eq!(outcome, EmitOutcome::SkippedNoAgentId { skipped_total: 1 });
         assert_eq!(exp.skipped_count(), 1);
@@ -613,7 +701,6 @@ mod tests {
                 Some("run-1"),
                 None,
                 serde_json::Value::Null,
-                None,
             );
             assert_eq!(outcome, EmitOutcome::Written);
         }
@@ -632,5 +719,178 @@ mod tests {
     fn open_nonexistent_directory_errors_cleanly() {
         let err = Exporter::open("/nonexistent/tf-agent-event-dir-xyz/events.ndjson").unwrap_err();
         assert!(err.contains("nonexistent"), "{err}");
+    }
+
+    // -- the SPEC §6.5 prev_hash chain ---------------------------------------
+
+    /// The cross-language pinned vectors
+    /// (agent-stack-go/event/testdata/chain-vectors.json): the Go and Python
+    /// implementations pin the SAME canonical bytes and hashes, so the three
+    /// cannot drift silently. Pinned at the JSON-value level because the
+    /// vector events carry other services' source/schema values, which
+    /// `AgentEvent` (source "tokenfuse", schema v0.1) deliberately cannot
+    /// represent - the canonicalize+hash pipeline is what must agree.
+    #[test]
+    fn cross_language_chain_vectors_pin() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "schema": "taipanbox.dev/agent-event/v0.2",
+                    "ts": "2026-07-24T12:00:00Z",
+                    "source": "wardryx",
+                    "type": "policy_deny",
+                    "agent_id": "agent://acme.example/support/tier1-bot",
+                    "severity": "high",
+                    "run_id": "run-0001",
+                    "data": { "policy": "finance-guard", "reason": "deny_tool: shell" }
+                }),
+                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"policy":"finance-guard","reason":"deny_tool: shell"},"run_id":"run-0001","schema":"taipanbox.dev/agent-event/v0.2","severity":"high","source":"wardryx","ts":"2026-07-24T12:00:00Z","type":"policy_deny"}"#,
+                "sha256:b43502c0ed6893238f2635be7a909cde89df1c2eecaef4d84871b83cf21cb31b",
+            ),
+            (
+                serde_json::json!({
+                    "schema": "taipanbox.dev/agent-event/v0.2",
+                    "ts": "2026-07-24T12:00:01Z",
+                    "source": "tokenfuse",
+                    "type": "budget_exhausted",
+                    "agent_id": "agent://acme.example/support/tier1-bot",
+                    "severity": "critical",
+                    "run_id": "run-0001",
+                    "on_behalf_of": ["user://acme.example/alice", "agent://acme.example/orchestrator"],
+                    "data": { "budget_usd": 12.5, "n": 3, "note": "обмеження діє", "nested": { "b": 2, "a": 1 } }
+                }),
+                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"budget_usd":12.5,"n":3,"nested":{"a":1,"b":2},"note":"обмеження діє"},"on_behalf_of":["user://acme.example/alice","agent://acme.example/orchestrator"],"run_id":"run-0001","schema":"taipanbox.dev/agent-event/v0.2","severity":"critical","source":"tokenfuse","ts":"2026-07-24T12:00:01Z","type":"budget_exhausted"}"#,
+                "sha256:488f1017967bf9510c62d7c31b9d5a0086ff2000d90a7d4266f171a131430243",
+            ),
+            (
+                serde_json::json!({
+                    "schema": "taipanbox.dev/agent-event/v0.2",
+                    "ts": "2026-07-24T12:00:02Z",
+                    "source": "qryx",
+                    "type": "evidence_signed",
+                    "agent_id": "agent://acme.example/support/tier1-bot",
+                    "severity": "info",
+                    "data": { "algo": "ML-DSA-87" }
+                }),
+                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"algo":"ML-DSA-87"},"schema":"taipanbox.dev/agent-event/v0.2","severity":"info","source":"qryx","ts":"2026-07-24T12:00:02Z","type":"evidence_signed"}"#,
+                "sha256:998cbc146b07e115318ce378e0579fcd1927066ef4316900ec7d66ba157e7c4b",
+            ),
+        ];
+        for (i, (value, want_canonical, want_hash)) in cases.iter().enumerate() {
+            let got_canonical = crate::jcs::canonicalize(value);
+            assert_eq!(&got_canonical, want_canonical, "vector {} canonical", i + 1);
+            let got_hash = chain_hash_value(value.clone());
+            assert_eq!(&got_hash, want_hash, "vector {} hash", i + 1);
+        }
+    }
+
+    #[test]
+    fn chain_hash_is_independent_of_the_events_own_prev_hash() {
+        let mut ev = build(
+            EventType::BreakerTripped,
+            1_783_566_764_100,
+            Some("agent://acme.example/bot"),
+            Some("run-1"),
+            None,
+            serde_json::json!({ "reason": "budget_exceeded" }),
+        )
+        .unwrap();
+        let unchained = chain_hash(&ev).unwrap();
+        ev.prev_hash = Some(
+            "sha256:ababababababababababababababababababababababababababababababababab".into(),
+        );
+        assert_eq!(chain_hash(&ev).unwrap(), unchained);
+    }
+
+    #[test]
+    fn emit_chains_lines_and_resumes_across_reopen() {
+        let dir = std::env::temp_dir().join(format!("tf-agent-event-{}-c", std::process::id()));
+        let path = dir.join("events.ndjson");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let exp = Exporter::open(path.to_str().unwrap()).unwrap();
+        assert!(exp.resumed_from().is_none(), "fresh file, fresh chain");
+        for i in 0..2 {
+            assert_eq!(
+                exp.emit(
+                    EventType::TaintBlock,
+                    i,
+                    Some("agent://acme.example/bot"),
+                    Some("run-1"),
+                    None,
+                    serde_json::Value::Null,
+                ),
+                EmitOutcome::Written
+            );
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(first.get("prev_hash").is_none(), "head is unchained");
+        assert_eq!(
+            second["prev_hash"].as_str().unwrap(),
+            chain_hash_value(first.clone()),
+            "line 2 links to line 1"
+        );
+
+        // Reopen: the chain resumes from the tail, no second head.
+        let exp2 = Exporter::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            exp2.resumed_from().as_deref(),
+            Some(chain_hash_value(second.clone()).as_str())
+        );
+        assert_eq!(
+            exp2.emit(
+                EventType::TaintBlock,
+                2,
+                Some("agent://acme.example/bot"),
+                Some("run-1"),
+                None,
+                serde_json::Value::Null,
+            ),
+            EmitOutcome::Written
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let third: serde_json::Value =
+            serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            third["prev_hash"].as_str().unwrap(),
+            chain_hash_value(second),
+            "the chain continues across a restart"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_tail_starts_a_fresh_chain_fail_open() {
+        let dir = std::env::temp_dir().join(format!("tf-agent-event-{}-d", std::process::id()));
+        let path = dir.join("events.ndjson");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{not json at all\n").unwrap();
+
+        let exp = Exporter::open(path.to_str().unwrap()).unwrap();
+        assert!(exp.resumed_from().is_none(), "unusable tail = fresh chain");
+        assert_eq!(
+            exp.emit(
+                EventType::DlpBlock,
+                0,
+                Some("agent://acme.example/bot"),
+                None,
+                None,
+                serde_json::Value::Null,
+            ),
+            EmitOutcome::Written
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+        assert!(last.get("prev_hash").is_none(), "fresh head after garbage");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

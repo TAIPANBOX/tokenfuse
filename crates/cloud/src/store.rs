@@ -1402,7 +1402,6 @@ impl Store {
                         "org": inc.org,
                         "occurrences": inc.occurrences,
                     }),
-                    None, // prev_hash: see module doc / phase report
                 );
                 log_event_outcome(event_type, outcome);
             }
