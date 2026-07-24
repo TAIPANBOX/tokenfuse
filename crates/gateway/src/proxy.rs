@@ -406,9 +406,19 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
 
     // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
     let mut dlp_note: Option<String> = None;
-    if st.dlp != DlpMode::Off {
+    if st.dlp != DlpMode::Off || st.dlp_pii != DlpMode::Off {
         let text = String::from_utf8_lossy(&body).into_owned();
-        let findings = dlp::scan(&text);
+        let findings = if st.dlp != DlpMode::Off {
+            dlp::scan(&text)
+        } else {
+            Vec::new()
+        };
+        // Findings actually slated for redaction below - built up by the
+        // secret and pii sections so a Mask+Mask combination does ONE
+        // redact() pass over `text` instead of two sequential ones (a
+        // second pass over an already-redacted string would see stale byte
+        // offsets and corrupt the result).
+        let mut to_redact: Vec<dlp::Finding> = Vec::new();
         if !findings.is_empty() {
             let summary = dlp::summary(&findings);
             match st.dlp {
@@ -452,12 +462,53 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     return dlp_block(&run_id, &summary);
                 }
                 DlpMode::Mask => {
-                    body = Bytes::from(dlp::redact(&text, &findings).into_bytes());
+                    to_redact.extend(findings.iter().cloned());
                     dlp_note = Some(format!("masked {summary}"));
                 }
                 DlpMode::Shadow => dlp_note = Some(format!("found {summary}")),
                 DlpMode::Off => {}
             }
+        }
+
+        // PII masks: a separate, opt-in extension of the scan above (see
+        // dlp::scan_pii's doc comment for its conservative-by-design
+        // limits). Switches independently of st.dlp, so a secret-only
+        // deployment sees no behavior change until it also turns this on.
+        if st.dlp_pii != DlpMode::Off {
+            let pii_findings = dlp::scan_pii(&text);
+            if !pii_findings.is_empty() {
+                let pii_summary = dlp::pii_summary(&pii_findings);
+                match st.dlp_pii {
+                    DlpMode::Block => return dlp_block(&run_id, &pii_summary),
+                    DlpMode::Mask => {
+                        let note = format!("masked {pii_summary}");
+                        dlp_note = Some(match dlp_note.take() {
+                            Some(existing) => format!("{existing}; {note}"),
+                            None => note,
+                        });
+                        // Secrets win: drop any pii span that overlaps a
+                        // secret finding before it joins the shared redact
+                        // list (see the to_redact doc comment above).
+                        to_redact.extend(
+                            pii_findings
+                                .into_iter()
+                                .filter(|p| !findings.iter().any(|f| dlp::spans_overlap(f, p))),
+                        );
+                    }
+                    DlpMode::Shadow => {
+                        let note = format!("found {pii_summary}");
+                        dlp_note = Some(match dlp_note.take() {
+                            Some(existing) => format!("{existing}; {note}"),
+                            None => note,
+                        });
+                    }
+                    DlpMode::Off => {}
+                }
+            }
+        }
+
+        if !to_redact.is_empty() {
+            body = Bytes::from(dlp::redact(&text, &to_redact).into_bytes());
         }
     }
 
@@ -1890,7 +1941,7 @@ fn mode_str(mode: Mode) -> &'static str {
 mod tests {
     use super::*;
     use crate::ledger_backend::{LedgerBackend, LocalLedger};
-    use crate::provider::StubProvider;
+    use crate::provider::{Provider, StubProvider};
     use crate::sink::EventSink;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -1931,6 +1982,27 @@ mod tests {
             self.records.lock().unwrap().push(rec);
         }
         fn flush(&self) {}
+    }
+
+    /// Captures the exact bytes sent to the upstream, then answers with the
+    /// same stub response `StubProvider` would. `StubProvider` itself ignores
+    /// the request body, so a pii-mask test needs a provider that actually
+    /// looks at what left the gateway.
+    #[derive(Clone, Default)]
+    struct CapturingProvider {
+        sent: Arc<Mutex<Option<Bytes>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingProvider {
+        async fn send(
+            &self,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            *self.sent.lock().unwrap() = Some(body.clone());
+            StubProvider::default().send(headers, body).await
+        }
     }
 
     /// A `LedgerBackend` that delegates everything to a real in-process
@@ -2566,6 +2638,100 @@ mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key("x-fuse-dlp"));
+    }
+
+    // -- PII masks (opt-in DLP extension, switched independently of dlp) ----
+
+    #[tokio::test]
+    async fn pii_mask_masks_email_before_forwarding() {
+        let sent = Arc::new(Mutex::new(None));
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        // Swap in a provider that actually records what left the gateway --
+        // StubProvider ignores the body, so it can't prove masking happened.
+        st.provider = Arc::new(CapturingProvider { sent: sent.clone() });
+        st.dlp_pii = DlpMode::Mask;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"email me at jane.doe@example.com ok"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "pii-mask")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let forwarded = sent.lock().unwrap().clone().expect("provider was called");
+        let forwarded = String::from_utf8(forwarded.to_vec()).unwrap();
+        assert!(!forwarded.contains("jane.doe@example.com"));
+        assert!(forwarded.contains("[REDACTED:pii_email]"));
+    }
+
+    #[tokio::test]
+    async fn pii_block_stops_request_with_pii_and_reports_pii_summary() {
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.dlp_pii = DlpMode::Block;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"email me at jane.doe@example.com ok"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "pii-block")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "dlp_blocked");
+        assert!(json["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pii_email"));
+    }
+
+    #[tokio::test]
+    async fn pii_shadow_notes_but_forwards() {
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.dlp_pii = DlpMode::Shadow;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"email me at jane.doe@example.com ok"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "pii-shadow")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let note = resp
+            .headers()
+            .get("x-fuse-dlp")
+            .expect("dlp note header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(note.contains("pii_email"));
+    }
+
+    #[tokio::test]
+    async fn secret_block_unaffected_by_pii_shaped_text_when_pii_mode_is_unset() {
+        // dlp_pii defaults Off (never set here): the secret-block path must
+        // behave exactly like dlp_block_stops_request_with_a_secret above,
+        // even when the same request also carries pii-shaped text.
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.dlp = DlpMode::Block;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"my key is AKIA1234567890ABCDEF, email jane.doe@example.com"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "dlp-pii-unset")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "dlp_blocked");
+        let reason = json["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("aws_access_key"));
+        assert!(
+            !reason.contains("pii_"),
+            "pii must never be considered when dlp_pii is unset: {reason}"
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,30 @@ an authentication provider. The two honest framings:
 | **Secrets kept out of context** | MCP broker + DLP | `{{secret:NAME}}` handles injected only on the wire; raw-secret DLP on args; response redaction. See [12](12-mcp-credential-broker.md). |
 | **Dependency audit** | CI `security` job | `cargo audit` on every push/PR, for both the workspace and `crates/cluster`. |
 
+### PII masks (optional, env-gated)
+
+A separate extension of the same DLP scanner, off by default so an existing
+secret-scanning deployment sees no behavior change until an operator turns it
+on. Gateway: `TOKENFUSE_DLP_PII`. MCP broker: `TOKENFUSE_MCP_DLP_PII`. Both
+accept the same four values as their `_DLP` counterpart: `off` (default),
+`shadow` (flag, forward unchanged), `mask` (replace with
+`[REDACTED:pii_kind]`), `block` (refuse the call/response).
+
+Three kinds, all regex-based:
+
+- **`pii_email`**: a standard email-address shape.
+- **`pii_card`**: a 13 to 19 digit run that also passes the Luhn checksum
+  and is not all the same digit (a common false-positive shape).
+- **`pii_phone`**: international form only (a leading `+`); a bare national
+  number never matches.
+
+Honest limits: regex-only, no ML, no external call. False negatives are
+expected by design, the same way a missed secret pattern is - a compact
+format like `(415) 555-2671` or a national number with no `+` will not be
+caught. When a PII span and a secret span overlap, the secret wins and the
+PII finding is dropped, so masking never corrupts an existing secret
+redaction. See `crates/core/src/dlp.rs`'s module doc for the full writeup.
+
 ## OIDC bearer authentication (optional, offline)
 
 The Cloud control plane authenticates every request at a single chokepoint. The
