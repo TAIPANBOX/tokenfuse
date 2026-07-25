@@ -372,14 +372,55 @@ async fn serve() {
     // rates and units notes. Real prices ship as a versioned price book.
     let prices = default_price_book();
 
-    let provider: Arc<dyn Provider> = match std::env::var("TOKENFUSE_UPSTREAM") {
-        Ok(url) if !url.is_empty() => {
+    // Provider selection, and the one place this binary refuses to start.
+    //
+    // With no upstream the stub answers every call itself and reports a fixed
+    // 1000 input / 500 output tokens, which the ledger then meters as real
+    // spend. That is invaluable for `cargo run` offline and indefensible
+    // anywhere else: a metering proxy that invents usage is not a broken
+    // feature, it is wrong numbers presented as an audit trail. It was found
+    // exactly that way on a live cluster (stack-k8s GOTCHAS 22): a deployment
+    // that forgot the variable served fabricated model answers and billed
+    // $0.0035 a call for them, and everything looked plausible from both ends.
+    //
+    // So the stub is now opt-IN. `TOKENFUSE_ALLOW_STUB=1` keeps the offline
+    // dev loop working and says out loud what it is doing; anything else with
+    // no upstream stops here rather than producing figures nobody should trust.
+    let upstream = std::env::var("TOKENFUSE_UPSTREAM")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+    let allow_stub = std::env::var("TOKENFUSE_ALLOW_STUB")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let provider: Arc<dyn Provider> = match (upstream, allow_stub) {
+        (Some(url), _) => {
             tracing::info!(%url, "forwarding to real upstream");
             Arc::new(HttpProvider::new(url))
         }
-        _ => {
-            tracing::info!("no TOKENFUSE_UPSTREAM set — using stub provider");
+        (None, true) => {
+            tracing::warn!(
+                "TOKENFUSE_ALLOW_STUB=1 with no TOKENFUSE_UPSTREAM: this gateway will ANSWER \
+                 requests itself with a canned body and meter a fixed 1000/500 tokens as spend. \
+                 Every figure it reports from now on is fictional. Never run this against \
+                 anything that reads the numbers."
+            );
             Arc::new(StubProvider::default())
+        }
+        (None, false) => {
+            eprintln!(
+                "tokenfuse: refusing to start: TOKENFUSE_UPSTREAM is not set.\n\
+                 \n\
+                 Without it this gateway would answer every request from a built-in stub and\n\
+                 meter a fixed 1000 input / 500 output tokens as real spend, so both the model\n\
+                 answers and the money would be invented.\n\
+                 \n\
+                 Set the FULL provider endpoint, for example:\n\
+                 \x20 TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages\n\
+                 \n\
+                 Or, for an offline dev loop where fictional numbers are the point:\n\
+                 \x20 TOKENFUSE_ALLOW_STUB=1"
+            );
+            std::process::exit(2);
         }
     };
 
