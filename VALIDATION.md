@@ -72,6 +72,41 @@ multi-agent evidence above, which remains Hetzner-only for now. The cost-per-cal
 apples-to-apples either: the Hetzner number includes router downgrades and cache hits that were
 deliberately left off on AWS/GCP so those two would isolate pure gateway + real-model cost.
 
+**The breaker fired identically on all three: 12 of 12 deliberate budget overruns blocked, no
+exceptions.** That is the portability claim worth carrying out of this run. What differs between the
+clouds is the price of the machine, not the behaviour of the control.
+
+## What the control plane itself costs, at cluster scale
+
+The runs above answer "does the breaker work here". They are one small machine per cloud and under an
+hour, so they say nothing about the cost of running the governance itself. Between 25 and 27 July 2026
+the whole stack came up as a five-node k3s cluster on each of the three clouds, six clusters in all, to
+answer exactly that. Command output is public in
+[stack-k8s](https://github.com/TAIPANBOX/stack-k8s) under `cloud/*/evidence/`; the full sheet is that
+repository's `PORTABILITY.md`. Do not merge these numbers with the 176-call campaign above: different
+experiment, different scale.
+
+| | Hetzner (5 x CPX42) | AWS (5 x `c6a.2xlarge`) | GCP (5 x `c2d-highcpu-8`) |
+|---|---|---|---|
+| cluster burn while running | EUR 0.20/hour | USD 1.836/hour | USD 2.04/hour |
+| five nodes, published monthly rate | EUR 137 | USD 1,487 | USD 1,291 |
+| RWX volume for the shared event log | EUR 0 (Longhorn) | USD 1.80/month (EFS) | USD 194.56/month (Filestore, 1 TiB minimum) |
+| cost per million governed decisions | EUR 0.024 | USD 0.208 | USD 0.229 |
+
+Three FinOps findings, none of which we expected going in:
+
+1. **RWX is where the clouds differ by two orders of magnitude**, not compute. A 5 GiB shared event log
+   costs USD 1.80/month on EFS and USD 194.56/month on Filestore, because Filestore bills a whole TiB.
+   Compute was within 15%; storage was 108x.
+2. **The newest CPU generation is the cheapest per unit of work, not the dearest.** AWS `c7a` (Genoa)
+   costs 37% more per hour than `c6a` (Milan) and returns 64% more throughput, so it is 16% cheaper per
+   governed decision. "Take a smaller instance" quietly raises unit cost on a CPU-bound workload, and a
+   quota that blocks the newest family is therefore a price increase wearing a paperwork costume.
+3. **Metering is cheap in CPU and expensive in gigabytes.** Every governed decision writes about 426
+   bytes of hash-linked audit, and every decision is audited rather than a sample: 614 MB a day at a
+   thousand calls a minute. Retention is a design parameter from day one, and it is the one line of an
+   agent programme that can be forecast exactly, from one number.
+
 ## Real bugs live testing found (and fixed)
 
 All three were invisible on fixtures, the stub provider, and macOS - only real Linux + real traffic

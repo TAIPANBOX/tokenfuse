@@ -90,7 +90,19 @@ Before any public launch, TokenFuse was run on real Linux infrastructure with a 
 
 ![Hetzner vs AWS vs GCP head-to-head: cost per allowed call, latency, and the apples-to-apples caveat](assets/20-cloud-headtohead.png)
 
-Full write-up, all numbers, and the real bugs live testing found (and fixed): [`VALIDATION.md`](VALIDATION.md).
+The breaker fired **12 of 12 deliberate budget overruns on every one of the three clouds**, which is the
+portability claim: what changes between them is the price of the machine, not the behaviour of the
+control.
+
+Then the whole stack ran as a five-node Kubernetes cluster on each of those clouds (six clusters, 25 to
+27 July 2026) to price the governance itself. Three findings, all counter-intuitive: **the clouds differ
+by 108x on the shared RWX volume and by under 15% on compute**; **the newest CPU generation is 16%
+cheaper per unit of work despite costing 37% more per hour**, so "take a smaller instance" quietly raises
+unit cost; and metering is cheap in CPU and expensive in gigabytes, at **426 bytes of audit per governed
+decision, every decision, which is 614 MB a day at a thousand calls a minute**.
+
+Full write-up, all numbers, the cluster-scale costs, and the real bugs live testing found (and fixed):
+[`VALIDATION.md`](VALIDATION.md).
 
 ---
 
