@@ -95,10 +95,13 @@ impl EventSink for CloudSink {
 /// (run id → µUSD), so an operator can set/tighten budgets centrally and every
 /// gateway of the org enforces them. Best-effort; runs until the process exits.
 ///
-/// Resilient to the P2 entitlements gate: a Free/lapsed org gets `402` here.
+/// Defensive against a `402` from any Cloud that still answers with one: the
+/// entitlement gate this handled was removed from Cloud in v0.4.0, so on a
+/// current deployment this branch never fires. It is kept because a gateway
+/// may point at an older Cloud, and a crash there would be worse than a skip.
 /// A non-2xx is treated as "no data this tick" (no crash, no apply); a `402` is
-/// logged **once** at info as a plan hint and then skipped silently, so it never
-/// spams the log every 3 s. Paid (`200`) behavior is unchanged.
+/// logged **once** at info and then skipped silently, so it never
+/// spams the log every 3 s. The `200` path is unchanged.
 pub fn spawn_budget_poller<F>(base: String, key: String, apply: F)
 where
     F: Fn(std::collections::HashMap<String, i64>) + Send + Sync + 'static,
@@ -119,9 +122,7 @@ where
             };
             if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
                 if !plan_warned {
-                    tracing::info!(
-                        "cloud central-budget sync needs a paid plan; skipping (upgrade the org, or drop the `:free` plan on TOKENFUSE_CLOUD_KEYS)"
-                    );
+                    tracing::info!("cloud central-budget sync answered 402; skipping this tick");
                     plan_warned = true;
                 }
                 continue;
@@ -194,10 +195,13 @@ where
 /// org (which then hard-stops that run — `402 killed`). Best-effort; runs until
 /// the process exits.
 ///
-/// Resilient to the P2 entitlements gate: a Free/lapsed org gets `402` here.
+/// Defensive against a `402` from any Cloud that still answers with one: the
+/// entitlement gate this handled was removed from Cloud in v0.4.0, so on a
+/// current deployment this branch never fires. It is kept because a gateway
+/// may point at an older Cloud, and a crash there would be worse than a skip.
 /// A non-2xx is treated as "no data this tick" (no crash, no apply); a `402` is
-/// logged **once** at info as a plan hint and then skipped silently, so it never
-/// spams the log every 3 s. Paid (`200`) behavior is unchanged.
+/// logged **once** at info and then skipped silently, so it never
+/// spams the log every 3 s. The `200` path is unchanged.
 pub fn spawn_kill_poller<F>(base: String, key: String, apply: F)
 where
     F: Fn(&str) + Send + Sync + 'static,
@@ -218,9 +222,7 @@ where
             };
             if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
                 if !plan_warned {
-                    tracing::info!(
-                        "cloud kill-switch sync needs a paid plan; skipping (upgrade the org, or drop the `:free` plan on TOKENFUSE_CLOUD_KEYS)"
-                    );
+                    tracing::info!("cloud kill-switch sync answered 402; skipping this tick");
                     plan_warned = true;
                 }
                 continue;
