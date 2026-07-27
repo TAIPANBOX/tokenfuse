@@ -6,9 +6,9 @@
 
 ### The runtime kill-switch for AI agents: cap their spend, stop runaway loops before they bill you.
 
-**A proxy you drop in front of every LLM call — it also blocks poisoned MCP tools and keeps secrets out of the model.**
+**A proxy you drop in front of every LLM call - it also blocks poisoned MCP tools and keeps secrets out of the model.**
 
-> The kill-switch isn't just an API call — it's signed on-device by your iPhone's Secure Enclave, so a stolen API token alone can't stop (or fake-stop) your agents.
+> The kill-switch isn't just an API call - it's signed on-device by your iPhone's Secure Enclave, so a stolen API token alone can't stop (or fake-stop) your agents.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
@@ -131,7 +131,7 @@ A chatbot makes **one** call to an LLM. An **agent** makes *hundreds*: it thinks
 
 ### 1. Cost runs away silently
 
-Agents burn tokens dramatically faster than a single chatbot turn: one study of agentic **coding** tasks found they can consume up to **1,000× more tokens** than a single code-chat query — driven mostly by growing input context, not output — and that runs on the *same* task can vary by up to **30×** in total tokens depending on how the loop unfolds ([Bai et al., 2026](https://arxiv.org/abs/2604.22750)). The failure mode that hurts most is that **nothing looks wrong**: a looping agent still returns `200 OK`, so your APM stays green while the meter spins. The bill is the first and only symptom, and by then the money is spent.
+Agents burn tokens dramatically faster than a single chatbot turn: one study of agentic **coding** tasks found they can consume up to **1,000× more tokens** than a single code-chat query - driven mostly by growing input context, not output - and that runs on the *same* task can vary by up to **30×** in total tokens depending on how the loop unfolds ([Bai et al., 2026](https://arxiv.org/abs/2604.22750)). The failure mode that hurts most is that **nothing looks wrong**: a looping agent still returns `200 OK`, so your APM stays green while the meter spins. The bill is the first and only symptom, and by then the money is spent.
 
 ### 2. "Per-key" limits don't understand agents
 
@@ -167,7 +167,7 @@ Most of the tooling around AI agents watches, logs, or filters. TokenFuse sits *
 
 ### 1. Enforcement, not observability
 
-That's the dashboard's own tagline, and it's literal, not marketing. TokenFuse doesn't just chart what an agent spent after the fact: it estimates cost *before* the call, checks it against the run's budget and a loop detector, and returns **HTTP 402** the instant a run would go over — cutting the circuit before the provider bills you, not after. `shadow → warn → enforce` lets you prove this against real traffic before you ever let it block anything. A dashboard tells you the fire happened; TokenFuse is the breaker.
+That's the dashboard's own tagline, and it's literal, not marketing. TokenFuse doesn't just chart what an agent spent after the fact: it estimates cost *before* the call, checks it against the run's budget and a loop detector, and returns **HTTP 402** the instant a run would go over - cutting the circuit before the provider bills you, not after. `shadow → warn → enforce` lets you prove this against real traffic before you ever let it block anything. A dashboard tells you the fire happened; TokenFuse is the breaker.
 
 ### 2. A hardware-signed, out-of-band kill switch
 
@@ -175,19 +175,19 @@ Every kill you can trigger from TokenFuse (the API, `tokenfuse top`, Slack, the 
 
 ### 3. Budgets that survive a crash
 
-A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** — a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing — and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and — with durable storage enabled — a budget outlives not just a node crash but a full process restart.
+A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** - a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing - and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and - with durable storage enabled - a budget outlives not just a node crash but a full process restart.
 
 ### 4. Drop-in, fail-open, and fast
 
-Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 — see [BENCHMARKS.md](BENCHMARKS.md)).
+Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 - see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ### 5. Catch a poisoned MCP tool for free, and gate CI on it
 
-`tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks tool descriptions for injection phrases and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch — exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
+`tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks tool descriptions for injection phrases and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch - exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
 
 Also worth knowing, in more detail under [What's inside](#-whats-inside): a semantic cache that serves repeated questions for $0, budget/step policies you can **backtest** against real traffic before turning them on, eBPF-based shadow-agent discovery with zero application changes, and a hosted Cloud fleet view for when one gateway isn't enough.
 
-**Self-funding.** The token blowouts above — a single task's usage swinging by up to 30× depending on how the loop unfolds — are exactly what a per-run budget is built to catch on call one, not on the invoice three days later. Most teams don't need an ROI deck for this: the first runaway TokenFuse blocks tends to cover the bill.
+**Self-funding.** The token blowouts above - a single task's usage swinging by up to 30× depending on how the loop unfolds - are exactly what a per-run budget is built to catch on call one, not on the invoice three days later. Most teams don't need an ROI deck for this: the first runaway TokenFuse blocks tends to cover the bill.
 
 ---
 
@@ -225,7 +225,7 @@ Three properties make this safe in production:
 2. **Fail-open by default.** If TokenFuse itself has trouble, your traffic keeps flowing, so it never becomes a single point of failure. (And for the reverse, never *losing* a budget, it can run as a raft-replicated [HA cluster](docs/10-ha-cluster.md).)
 3. **Metadata-only.** It measures cost and behavior; it does **not** store prompt contents by default.
 
-Because cost is *estimated* before the call and *settled* after it, TokenFuse's numbers are a fast pre-flight approximation reconciled against real usage, not a hard real-time guarantee — see the [FAQ](#-faq) for what that means in practice.
+Because cost is *estimated* before the call and *settled* after it, TokenFuse's numbers are a fast pre-flight approximation reconciled against real usage, not a hard real-time guarantee - see the [FAQ](#-faq) for what that means in practice.
 
 **Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~0.8 ms p50 / ~2 ms p99** over a direct provider call, negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -246,7 +246,7 @@ There are excellent tools *around* this problem. None of the categories below si
 
 | Capability | <img src="docs/assets/logo.png" height="15" align="top"> TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
 |---|:---:|:---:|:---:|:---:|
-| Show how much you spent | ✅ | ✅ | ✅ | – |
+| Show how much you spent | ✅ | ✅ | ✅ | - |
 | Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ |
 | **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial | ❌ |
 | **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
@@ -297,13 +297,13 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed.
 - 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
-- 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call — blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend.
+- 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call - blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend.
 - 🛠️ **Tool-run metric**: counts the tool calls (`tool_use` blocks / `tool_calls` arrays) the model emits per LLM call, for both Anthropic and OpenAI shapes, streaming and non-streaming alike. Rides the trace as a new nullable `tool_calls` column (schema-evolution safe, like every prior addition), as `x_tool_calls` in FOCUS export, and rolls up into the Cloud dashboard's Runs table and summary tile. Observed only in this release: no budget, no enforcement, just a count (see [docs/21](docs/21-tool-runs.md)).
 
 **Also hardens your agents**
 - 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
 - 🕵️ **DLP**: detect/redact secrets leaving in prompts.
-- 🔑 **MCP credential-broker** + a free tool-poisoning / rug-pull scanner, CI-gated — see [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci).
+- 🔑 **MCP credential-broker** + a free tool-poisoning / rug-pull scanner, CI-gated - see [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci).
 - 📡 **eBPF Radar**: discover shadow agents on a host, zero config (Linux).
 
 **Ops & platform**
@@ -315,7 +315,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 📨 **Agent-event NDJSON export** *(opt-in)*: set `TOKENFUSE_EVENTS_PATH=<file>` and every breaker trip, DLP/taint block, and MCP rug-pull is appended as one NDJSON line in the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) event envelope (`taipanbox.dev/agent-event/v0.1`). Unset by default: zero hot-path cost, no file handle opened. Writes are fail-open (a write error is logged, never a request failure), and an event with no `x-fuse-agent-id` on the request is skipped and counted, never fabricated. Every line carries the spec's §6.5 `prev_hash` integrity chain (one file = one chain, resumed across restarts); verify a stream with `agent-conform -chain <file>`. Tamper-evidence, not tamper-proof: a partial edit or truncation no longer passes silently.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images, and published npm / crates.io / PyPI packages.
 
-**Agent Passport.** TokenFuse's `x-fuse-agent-id` / `x-fuse-run-id` / `x-fuse-parent-run-id` headers, the new `x-fuse-on-behalf-of` delegation-chain header (a comma-separated, ordered, root-first list of `agent://` / `user://` URIs, capped at 4 KiB and captured to the trace verbatim, never truncated when forwarded), `parent_run_id` (now its own persisted Parquet trace column, not just an in-memory budget-hierarchy key), and the agent-event envelope above all follow one shared spec — [Agent Passport](https://github.com/TAIPANBOX/agent-passport) — used across the TAIPANBOX agent-governance stack (TokenFuse for spend, Engram for memory, Idryx for access, Qryx for crypto), so the same agent identifier and delegation chain read the same way in every product's traces and events. Idryx, specifically, ingests TokenFuse's agent-events as a behavioral source for identity-graph correlation.
+**Agent Passport.** TokenFuse's `x-fuse-agent-id` / `x-fuse-run-id` / `x-fuse-parent-run-id` headers, the new `x-fuse-on-behalf-of` delegation-chain header (a comma-separated, ordered, root-first list of `agent://` / `user://` URIs, capped at 4 KiB and captured to the trace verbatim, never truncated when forwarded), `parent_run_id` (now its own persisted Parquet trace column, not just an in-memory budget-hierarchy key), and the agent-event envelope above all follow one shared spec - [Agent Passport](https://github.com/TAIPANBOX/agent-passport) - used across the TAIPANBOX agent-governance stack (TokenFuse for spend, Engram for memory, Idryx for access, Qryx for crypto), so the same agent identifier and delegation chain read the same way in every product's traces and events. Idryx, specifically, ingests TokenFuse's agent-events as a behavioral source for identity-graph correlation.
 
 ---
 
@@ -391,7 +391,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 
 ## 🔍 Scan your MCP servers & gate CI
 
-MCP servers are a new, live attack surface: a client typically re-fetches `tools/list` on every connection and trusts whatever comes back, so a tool a human already approved can silently change behavior later, without anyone re-reviewing it. `tokenfuse mcp-scan` is a **free**, standalone CLI — no TokenFuse account, gateway, or Cloud connection required.
+MCP servers are a new, live attack surface: a client typically re-fetches `tools/list` on every connection and trusts whatever comes back, so a tool a human already approved can silently change behavior later, without anyone re-reviewing it. `tokenfuse mcp-scan` is a **free**, standalone CLI - no TokenFuse account, gateway, or Cloud connection required.
 
 **Pin the tool set you trust, then diff every later scan against it:**
 
@@ -410,7 +410,7 @@ tokenfuse mcp-scan --url https://mcp.example.com/rpc \
 
 It runs over **Streamable HTTP or SSE**, scans tool descriptions for injection phrases and hidden Unicode, and (against a server you own, via `--attempt-call`) can also check for unauthenticated exposure, plaintext transport, wildcard CORS, and SSRF-capable tools.
 
-**Gate it in CI** with the repo's own composite GitHub Action — no self-hosted scanning infra:
+**Gate it in CI** with the repo's own composite GitHub Action - no self-hosted scanning infra:
 
 ```yaml
 - uses: TAIPANBOX/tokenfuse@main   # pin to a tag/SHA in production
@@ -422,7 +422,7 @@ It runs over **Streamable HTTP or SSE**, scans tool descriptions for injection p
 
 It uploads the full `ScanReport` JSON as a build artifact on every run, pass or fail, so a finding is easy to inspect straight from the PR check. A full copy-pasteable `workflow_dispatch` template lives at `.github/workflows/mcp-scan-example.yml`.
 
-**See it catch a live rug pull in under a minute** — no external server, safe to run anywhere including CI:
+**See it catch a live rug pull in under a minute** - no external server, safe to run anywhere including CI:
 
 ```bash
 cargo run --example rugpull_demo -p tokenfuse-gateway
@@ -536,12 +536,12 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
 | **Run** | One complete agent task, start to finish, possibly hundreds of LLM calls. |
 | **Runaway** | An agent stuck looping or exploding in cost; the thing TokenFuse stops. |
-| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit — exposed as a kill-switch across API, TUI, Slack, Cloud, and the signed mobile control. |
+| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit - exposed as a kill-switch across API, TUI, Slack, Cloud, and the signed mobile control. |
 | **Proxy** | A middleman in the request path. You point your agent at it instead of the provider. |
 | **MCP** | A standard for agents to call external tools/servers; powerful, and a new security surface. |
 | **Rug pull** | A previously approved MCP tool that silently changes its description or schema on a later fetch. |
 | **Prompt injection** | A hidden instruction smuggled into data the agent reads, hijacking its behavior. |
-| **FOCUS** | The FinOps Open Cost & Usage Specification — a standard CSV shape for cloud/service spend; `tokenfuse focus-export` puts LLM spend into it. |
+| **FOCUS** | The FinOps Open Cost & Usage Specification - a standard CSV shape for cloud/service spend; `tokenfuse focus-export` puts LLM spend into it. |
 | **Agent Passport** | A shared spec (identifier format + delegation chain + event envelope) that TokenFuse and the rest of the TAIPANBOX stack use so an agent's identity reads the same way everywhere. |
 
 ---
@@ -554,7 +554,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Does it read or store my prompts?** No. Metadata-only by default. It measures cost and behavior, not content.
 
-**Is the budget enforcement a hard real-time guarantee?** No — be precise about this. TokenFuse estimates cost *before* forwarding a call and settles the real cost from the response afterward; it's a fast pre-flight approximation reconciled against actual usage, not a guarantee that not one extra cent can ever be spent. It's also **fail-open** by default: if TokenFuse itself has trouble, traffic keeps flowing rather than stalling your agents. That's a deliberate trade-off for availability — run the raft **HA cluster** if you need the opposite guarantee (never losing a budget).
+**Is the budget enforcement a hard real-time guarantee?** No - be precise about this. TokenFuse estimates cost *before* forwarding a call and settles the real cost from the response afterward; it's a fast pre-flight approximation reconciled against actual usage, not a guarantee that not one extra cent can ever be spent. It's also **fail-open** by default: if TokenFuse itself has trouble, traffic keeps flowing rather than stalling your agents. That's a deliberate trade-off for availability - run the raft **HA cluster** if you need the opposite guarantee (never losing a budget).
 
 **Is it free?** Yes, all of it. TokenFuse is open source (Apache-2.0) and free to self-host, with no seat limits and no time limit: the CLI, the local proxy, `tokenfuse mcp-scan` and its GitHub Action, and the **Cloud** control plane and dashboard (fleet spend, alerts, central budgets, the kill-switch). There is no paid TokenFuse tier. A separate commercial product provides the **secured, managed enterprise control room** over the whole stack (authenticated remote access over a tunnel, unified fleet control, hardware-signed actions); TokenFuse itself stays free and open.
 
@@ -654,7 +654,7 @@ Limits, stated plainly: unit counters are in-process and per-gateway - they rese
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
 | [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
-| [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` — a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
+| [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` - a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
 | [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
 | [20 · Identity map](docs/20-identity-map.md) | Key ↔ agent ↔ business-unit binding, strict mode, and monthly unit budgets: the design + build plan behind the "Identity map" section above |
 | [21 · Tool runs](docs/21-tool-runs.md) | What counts as a tool run (Anthropic/OpenAI, streaming/non-streaming), the nullable `tool_calls` trace column, and why v1 is observed-only with no budgets |
