@@ -4,7 +4,7 @@ Thin, dependency-free helpers to route an agent's LLM calls through the
 [TokenFuse](https://github.com/TAIPANBOX/tokenfuse) gateway and turn its `402`
 blocks into typed exceptions.
 
-TokenFuse is a **drop-in proxy** — you don't rewrite your agent, you point your
+TokenFuse is a **drop-in proxy**: you don't rewrite your agent, you point your
 provider client at the gateway and attach a few headers.
 
 ## Install
@@ -42,7 +42,7 @@ after the request, or `tokenfuse.raise_for_fuse(status_code, body)`.
 All inherit `tokenfuse.FuseError` (fields: `run_id`, `budget_usd`, `spent_usd`,
 `policy_id`, `reason`):
 
-- `BudgetExceeded` — the run's budget would be exceeded
-- `LoopDetected` — a runaway loop was detected
-- `PolicyViolation` — a policy limit was hit
-- `Killed` — an operator killed the run
+- `BudgetExceeded`: the run's budget would be exceeded
+- `LoopDetected`: a runaway loop was detected
+- `PolicyViolation`: a policy limit was hit
+- `Killed`: an operator killed the run
