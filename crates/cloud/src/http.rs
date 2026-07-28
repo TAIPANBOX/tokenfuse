@@ -2,8 +2,8 @@
 //! endpoints `/v1/runs`, `/v1/summary`, `/v1/alerts` + browser CORS (A3), the
 //! admin-only mutations `kill` / `budget` with their poll endpoints
 //! `/v1/kills`, `/v1/budgets` (A4), and an OpenAPI contract at `/openapi.json`
-//! (A6) — the single source of truth the Swift and dashboard clients generate
-//! from. See docs/14-mobile-companion.md.
+//! (A6), which is the single source of truth any generated client is built
+//! from.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -710,7 +710,7 @@ struct SeriesQuery {
     step: Option<String>,
 }
 
-/// Burn-rate buckets over a time window — feeds the chart and the Dynamic Island.
+/// Burn-rate buckets over a time window, for whatever renders the burn chart.
 #[utoipa::path(
     get, path = "/v1/series",
     params(SeriesQuery),

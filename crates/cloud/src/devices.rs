@@ -1,9 +1,9 @@
-//! Device pairing + Secure-Enclave-signed mutations. The wire protocol is fixed
-//! in docs/14-mobile-companion.md §4.1–4.2:
+//! Device pairing and hardware-backed signed mutations.
 //!
-//! - Pairing: an admin issues a one-time code; the app generates a P-256 key in
-//!   the Secure Enclave and submits its public key with the code, receiving a
-//!   `device_token` (Bearer, for reads) and being registered for signed writes.
+//! - Pairing: an admin issues a one-time code; the client generates a P-256 key
+//!   in whatever secure storage it has and submits the public half with the
+//!   code, receiving a `device_token` (Bearer, for reads) and being registered
+//!   for signed writes. The private half never reaches this server.
 //! - Signed mutations: each write carries `X-Fuse-{Device,TS,Nonce,Sig}`; the
 //!   server verifies an **ES256** signature (ECDSA P-256 / SHA-256) over the
 //!   canonical string below, against the device's stored public key.

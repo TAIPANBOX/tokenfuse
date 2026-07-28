@@ -69,7 +69,7 @@ async fn pair_device(state: &AppState, pubkey_b64: &str, role: Option<&str>) -> 
     let code = v["code"].as_str().unwrap().to_string();
 
     let pair_body = format!(
-        r#"{{"code":"{code}","pubkey_b64":"{pubkey_b64}","platform":"ios","name":"test iphone"}}"#
+        r#"{{"code":"{code}","pubkey_b64":"{pubkey_b64}","platform":"linux","name":"test device"}}"#
     );
     let (st, v) = send(
         state,

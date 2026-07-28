@@ -1,15 +1,9 @@
 # 16 — Design system: TokenFuse
 
-> 🎨 The **iOS / Apple Watch** implementation of this system now lives in the app
-> repo: [github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile).
-> The web dashboard here derives from the same system.
-
-**Status:** approved direction (2026-07-03). The single source of truth for the
-look of every surface — iOS app, Apple Watch, and the web dashboard. SwiftUI
-(`ios/Sources/DesignSystem.swift` in the app repo) and the Next.js dashboard both
-derive from the tokens here. Interactive reference mockups live in the app repo's
-[`design/`](https://github.com/TAIPANBOX/tokenfuse-mobile/tree/main/design)
-(`iphone.html`, `watch.html`, `web-dashboard.html`).
+**Status:** approved direction (2026-07-03). The single source of truth for how
+TokenFuse looks: the web dashboard derives from the tokens here, and so should
+anything built against the control plane later. Written surface-agnostically on
+purpose, so the tokens outlive whichever client renders them.
 
 ## Concept — "The Fuse Panel"
 
@@ -74,28 +68,24 @@ itself to the top, in ember.
 
 Signature interactions:
 
-- **Kill is a physical breaker, not a button.** iPhone: slide-to-arm →
-  Face ID → fire. Watch: Digital Crown (or Ultra Action Button) to arm → tap.
-  Dashboard: Kill → Confirm (armed). The request is signed on-device (Secure
-  Enclave) — reinforced in copy at every kill.
+- **Kill is a physical breaker, not a button.** Arm, then fire: on the
+  dashboard that is Kill, then Confirm. Never one click, and the copy at every
+  kill says what is about to stop.
 - **Live, not polled.** Burn rate ticks and the event feed streams from the
-  control plane's SSE (`/v1/stream`); the Dynamic Island / Live Activity / Lock
-  Screen carry the burn rate so you glance, not open.
+  control plane's SSE (`/v1/stream`), so a glance is enough.
 
 ## Motion
 
 Restrained and purposeful: the active fuse's live tick, the breaker drag, a scan
-sweep on pairing. Everything honors `prefers-reduced-motion` (and the SwiftUI
-equivalent, `accessibilityReduceMotion`).
+sweep on pairing. Everything honors `prefers-reduced-motion`, or whatever the
+host platform's equivalent is.
 
 ## Surfaces
 
-One product, three surfaces, one identity:
-
-- **iPhone / iPad** — native SwiftUI app (`mobile/ios/`).
-- **Apple Watch** — Series + Ultra (v1.1); the Ultra Action Button arms the kill.
-- **Web dashboard** — `cloud/dashboard` (Next.js), restyled to these tokens.
+- **Web dashboard**, `cloud/dashboard` (Next.js), built on these tokens.
+- **The gateway's own output**, where the same vocabulary shows up in `tokenfuse
+  top` and in the 402 copy: one identity, whatever is rendering it.
 
 The API layer for the app and the dashboard is generated from the same
-`openapi.json` (see [14-mobile-companion.md](14-mobile-companion.md), A6), so the
+`openapi.json` (A6), so the
 data contract is shared just as the visual language is.

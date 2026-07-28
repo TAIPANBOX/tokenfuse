@@ -187,5 +187,3 @@ jobs:
       - name: Build + clippy the real APNs sender
         run: cargo clippy -p tokenfuse-cloud --all-targets --features apns -- -D warnings
 
-  # The iPhone & Apple Watch app moved to its own repository, with its own CI:
-  # https://github.com/TAIPANBOX/tokenfuse-mobile

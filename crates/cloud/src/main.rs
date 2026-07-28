@@ -1,6 +1,6 @@
 //! Control-plane binary. Serves the read + ingest surface (A2/A3) with optional
-//! durable persistence. Mutations, pairing, push and the OpenAPI contract arrive
-//! in later PRs — see docs/14-mobile-companion.md.
+//! durable persistence; mutations, pairing, the alert pipeline and the OpenAPI
+//! contract landed in A4 to A9.
 
 use std::sync::Arc;
 use std::time::Duration;

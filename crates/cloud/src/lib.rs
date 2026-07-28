@@ -1,7 +1,6 @@
-//! TokenFuse Cloud control plane — aggregates the call telemetry many gateways
+//! TokenFuse Cloud control plane: aggregates the call telemetry many gateways
 //! push in into a single per-organization fleet view. The Rust successor to the
-//! original Go control plane (see docs/02-architecture.md, ADR-7, and the full
-//! plan in docs/14-mobile-companion.md).
+//! original Go control plane (see docs/02-architecture.md, ADR-7).
 
 #[cfg(feature = "apns")]
 pub mod apns;

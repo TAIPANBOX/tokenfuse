@@ -49,10 +49,6 @@ Things in it I haven't seen built together elsewhere:
   through a raft state machine (openraft + redb), so two gateways serving the
   same run can't both slip past one ceiling, and a budget outlives a process
   restart.
-- **An out-of-band kill switch.** There's an iPhone/Watch app whose kill
-  request is signed on-device by the Secure Enclave. If the box running your
-  agents is the thing misbehaving, a control path that doesn't live on that
-  box stops being paranoia.
 - **A free MCP rug-pull scanner.** MCP clients re-fetch `tools/list` on every
   connection and trust whatever comes back, so a tool a human approved can
   silently change its description or schema later. `tokenfuse mcp-scan` pins
@@ -118,18 +114,10 @@ own workload first.
 
 **"What's the catch on 'free'?"** There is no catch: the whole thing is free
 and self-hosted, including the Cloud control plane (fleet dashboard, central
-budgets, Slack/mobile kill). No seat limits, no time limit, no paid tier. The
+budgets, the kill switch). No seat limits, no time limit, no paid tier. The
 commercial product is separate: a secured, managed enterprise control room
 over the whole agent-governance stack, for companies that want the stack run
 for them. TokenFuse itself stays free and open.
-
-**"Secure Enclave kill switch sounds like a gimmick."** It's the answer to a
-specific threat: the host running your agents is compromised or looping so
-hard you can't SSH in. Every other kill path (API, TUI, Slack, dashboard)
-ultimately routes through infrastructure the agent host can reach. A phone
-that signs the stop order in hardware is an independent control path, and
-"stolen API token ≠ ability to stop or fake-stop the fleet" falls out of the
-signature check.
 
 **"Does it read my prompts?"** No — metadata-only by default. Cost, token
 counts, timing, fingerprints. The DLP/taint features that do look at content

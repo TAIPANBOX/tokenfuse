@@ -1,8 +1,7 @@
 //! In-memory aggregation store: the per-organization fleet view built from the
 //! call telemetry many gateways push in. A faithful port of the original Go
 //! control plane's `store.go` (in-memory parts). Durable JSON snapshotting
-//! (`Load`/`Save`/autosave) is added in a follow-up — see
-//! docs/14-mobile-companion.md, PR A3.
+//! (`Load`/`Save`/autosave) was added in a follow-up, PR A3.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -3733,8 +3732,8 @@ mod tests {
                 "dev-1".into(),
                 "tok-1".into(),
                 "pubkey".into(),
-                "iphone".into(),
-                "ios".into(),
+                "test device".into(),
+                "linux".into(),
             )
             .expect("pairing redeemed");
         assert_eq!(dev.org, "acme");
@@ -3744,7 +3743,7 @@ mod tests {
         assert_eq!(chain[0].action, "control.pair");
         assert_eq!(chain[0].subject, "dev-1");
         assert_eq!(chain[0].actor, "device:dev-1");
-        assert_eq!(chain[0].detail, "role=admin;platform=ios");
+        assert_eq!(chain[0].detail, "role=admin;platform=linux");
     }
 
     #[test]
