@@ -671,13 +671,13 @@ export default function Page() {
 
       <footer className="foot">
         <span>
-          <b>One identity</b> — the fuse, matching the iOS app
+          <b>One identity</b> - the fuse, from the gateway to this dashboard
         </span>
         <span>
           <b>Live</b> · burn rate + alerts refresh every 3s
         </span>
         <span>
-          <b>Kill</b> — click twice to confirm; enforced across every gateway
+          <b>Kill</b> - click twice to confirm; enforced across every gateway
         </span>
       </footer>
     </div>

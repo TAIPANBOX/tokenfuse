@@ -8,7 +8,7 @@
 
 **A proxy you drop in front of every LLM call - it also blocks poisoned MCP tools and keeps secrets out of the model.**
 
-> The kill-switch isn't just an API call - it's signed on-device by your iPhone's Secure Enclave, so a stolen API token alone can't stop (or fake-stop) your agents.
+> The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
@@ -16,7 +16,6 @@
 ![core](https://img.shields.io/badge/core-Rust-orange)
 ![control%20plane](https://img.shields.io/badge/control%20plane-Rust-DEA584)
 ![dashboard](https://img.shields.io/badge/dashboard-Next.js-black)
-![mobile](https://img.shields.io/badge/mobile-iOS%20·%20watchOS-1a1a1a?logo=apple)
 
 </div>
 
@@ -34,9 +33,17 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 <img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
 
-<sub>The Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, shared with the <a href="#-tokenfuse-for-iphone--apple-watch">iPhone &amp; Apple Watch app</a>. <code>cd cloud && docker compose up</code>.</sub>
+<sub>The Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, runs from the gateway through to this dashboard. <code>cd cloud && docker compose up</code>.</sub>
 
 <sub><a href="https://taipanbox.github.io/tokenfuse/preview/"><b>▶ Live preview</b></a>: the dashboard with sample data, in your browser, no backend and no install.</sub>
+
+</div>
+
+<div align="center">
+
+<img src="assets/diagram.svg" alt="TokenFuse architecture: an agent SDK points at the tokenfuse-gateway, which prices and gates every call in-line, asks Wardryx for a policy decision, replicates budgets through a raft ledger, and streams records to the Cloud dashboard" width="960">
+
+<sub>The same service as its room on <a href="https://it-rat.com/services/tokenfuse.html">it-rat.com</a> draws it, where the diagram sits next to a simulation you can scrub back and forth.</sub>
 
 </div>
 
@@ -116,7 +123,6 @@ Full write-up, all numbers, the cluster-scale costs, and the real bugs live test
 - [What's inside](#-whats-inside)
 - [**🚀 Get started**](#-get-started) ← install & first run
 - [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci) ← free scanner + GitHub Action
-- [TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch) ← the fleet on your phone & wrist
 - [Architecture](#-architecture)
 - [Project status](#-project-status)
 - [The bigger picture](#-the-bigger-picture-a-runtime-firewall)
@@ -163,25 +169,21 @@ flowchart LR
 
 ## 🎯 Why TokenFuse is different
 
-Most of the tooling around AI agents watches, logs, or filters. TokenFuse sits **in the request path** and can actually stop something, in real time, at the layer where the money and the secrets move. Five things about that we haven't found built together anywhere else:
+Most of the tooling around AI agents watches, logs, or filters. TokenFuse sits **in the request path** and can actually stop something, in real time, at the layer where the money and the secrets move. Four things about that we haven't found built together anywhere else:
 
 ### 1. Enforcement, not observability
 
 That's the dashboard's own tagline, and it's literal, not marketing. TokenFuse doesn't just chart what an agent spent after the fact: it estimates cost *before* the call, checks it against the run's budget and a loop detector, and returns **HTTP 402** the instant a run would go over - cutting the circuit before the provider bills you, not after. `shadow → warn → enforce` lets you prove this against real traffic before you ever let it block anything. A dashboard tells you the fire happened; TokenFuse is the breaker.
 
-### 2. A hardware-signed, out-of-band kill switch
-
-Every kill you can trigger from TokenFuse (the API, `tokenfuse top`, Slack, the Cloud dashboard) has a sibling on your iPhone and Apple Watch: a Face-ID-gated Breaker whose kill request is **signed on-device by the Secure Enclave** before it ever reaches your fleet. That matters specifically when the thing running away is the agent host itself: the phone in your pocket is a genuinely independent control path, not another tab on the same machine that might be the one misbehaving.
-
-### 3. Budgets that survive a crash
+### 2. Budgets that survive a crash
 
 A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** - a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing - and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and - with durable storage enabled - a budget outlives not just a node crash but a full process restart.
 
-### 4. Drop-in, fail-open, and fast
+### 3. Drop-in, fail-open, and fast
 
 Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 - see [BENCHMARKS.md](BENCHMARKS.md)).
 
-### 5. Catch a poisoned MCP tool for free, and gate CI on it
+### 4. Catch a poisoned MCP tool for free, and gate CI on it
 
 `tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks tool descriptions for injection phrases and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch - exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
 
@@ -252,7 +254,6 @@ There are excellent tools *around* this problem. None of the categories below si
 | **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
 | **Enforce: stop before the damage** | ✅ | ❌ | ⚠️ key caps only | ⚠️ content only |
 | Live kill-switch (from Slack / dashboard) | ✅ | ❌ | ❌ | ❌ |
-| Hardware-signed kill (Secure Enclave) | ✅ | ❌ | ❌ | ❌ |
 | **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ |
 | Free MCP poisoning / rug-pull scan, CI-gated | ✅ | ❌ | ❌ | ⚠️ partial |
 | Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial |
@@ -264,7 +265,6 @@ TokenFuse's core bet is **enforcement, not observation**, and a few of its capab
 
 - **Loop-aware enforcement at the proxy.** Gateways cap a key; none *detect a runaway loop* and cut it off mid-task.
 - **Per-run budgets linearized across an HA cluster.** Reserve/settle runs through a raft state machine, so several gateways serving the same run can't *both* slip past one ceiling, a distributed no-double-spend guarantee for budgets.
-- **A hardware-signed kill outside the agent host.** A phone or watch that signs the stop request on-device, so the control path doesn't depend on the machine that might be compromised.
 - **MCP credential brokering.** The agent holds only a *handle* (`{{secret:token}}`); the real secret is injected at the boundary, so it never enters the prompt, trace, or the model's memory.
 - **eBPF shadow-agent discovery.** Find agents by the LLM traffic they emit, with zero application changes.
 
@@ -309,8 +309,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 **Ops & platform**
 - 🧬 **HA raft cluster**: replicated budgets, durable storage, runtime membership, token auth + TLS.
 - ☁️ **Hosted Cloud**: Rust control plane + Next.js dashboard: fleet-wide spend, kill-switch, and central budgets across many gateways. Binds to **loopback by default**; a wider bind is an explicit opt-in (`TOKENFUSE_CLOUD_HOST`) meant to sit behind your own TLS or tunnel, never on a raw public IP.
-- 📋 **Compliance evidence pack + audit trail**: `tokenfuse compliance` (CLI, free) and the Cloud `/v1/compliance` / `/v1/compliance/evidence` endpoints project real decision, incident, and MCP-scan evidence onto EU AI Act, US Fed SR 11-7, and SOC 2 controls, each graded `enforced` / `partial` / `documented` rather than over-claimed (a green catalog is not a certification). Every control-plane mutation (kill, budget change, device pairing, incident ack) lands in a hash-chained, ES256-signed audit trail (`/v1/audit`, `/v1/audit/verify`, `/v1/audit/manifest`).
-- 📱 **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)**: pair a phone, watch burn rate live, and pull an Enclave-signed kill from the Dynamic Island.
+- 📋 **Compliance evidence pack + audit trail**: `tokenfuse compliance` (CLI, free) and the Cloud `/v1/compliance` / `/v1/compliance/evidence` endpoints project real decision, incident, and MCP-scan evidence onto EU AI Act, US Fed SR 11-7, and SOC 2 controls, each graded `enforced` / `partial` / `documented` rather than over-claimed (a green catalog is not a certification). Every control-plane mutation (kill, budget change, incident ack) lands in a hash-chained, ES256-signed audit trail (`/v1/audit`, `/v1/audit/verify`, `/v1/audit/manifest`).
 - 🗄️ **Zero-DB analytics**: telemetry in open **Parquet**, queried with `tokenfuse sql "..."`; OTel export; a separate opt-in NDJSON event stream sits alongside it (next bullet).
 - 📨 **Agent-event NDJSON export** *(opt-in)*: set `TOKENFUSE_EVENTS_PATH=<file>` and every breaker trip, DLP/taint block, and MCP rug-pull is appended as one NDJSON line in the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) event envelope (`taipanbox.dev/agent-event/v0.1`). Unset by default: zero hot-path cost, no file handle opened. Writes are fail-open (a write error is logged, never a request failure), and an event with no `x-fuse-agent-id` on the request is skipped and counted, never fabricated. Every line carries the spec's §6.5 `prev_hash` integrity chain (one file = one chain, resumed across restarts); verify a stream with `agent-conform -chain <file>`. Tamper-evidence, not tamper-proof: a partial edit or truncation no longer passes silently.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images, and published npm / crates.io / PyPI packages.
@@ -434,20 +433,6 @@ Scanning catches a poisoned tool before it's approved. The runtime **[MCP creden
 
 ---
 
-## 📱 TokenFuse for iPhone & Apple Watch
-
-<img align="right" width="88" src="docs/assets/logo.png" alt="TokenFuse app icon">
-
-This is the sharpest expression of differentiator #2 above: an independent, hardware-signed control path for your fleet that doesn't depend on the agent host being trustworthy. Pair a device once, watch every agent's **burn rate** live, get alerted the moment one runs hot, and pull a kill switch that's *signed on-device by the Secure Enclave*, so a stolen token alone can't stop (or fake-stop) your agents. Face-ID budgets, live burn charts, and the burn rate in the **Dynamic Island**, with the same on your **Apple Watch**, including a two-tap wrist kill and a face complication. It shares one visual language, *the fuse*, with the [web dashboard](cloud/dashboard).
-
-The app has its own repository, with screenshots, a full feature tour, and build instructions:
-
-### → **[github.com/TAIPANBOX/tokenfuse-mobile](https://github.com/TAIPANBOX/tokenfuse-mobile)**
-
-Its plan & wire protocol and the shared design system still live here: [docs/14](docs/14-mobile-companion.md) · [docs/16](docs/16-design-system.md).
-
----
-
 ## 🏗️ Architecture
 
 <div align="center">
@@ -490,7 +475,7 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-**v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: **[TokenFuse for iPhone & Apple Watch](#-tokenfuse-for-iphone--apple-watch)** (pairing, live fleet, Enclave-signed kill, burn charts, Dynamic Island), the web dashboard restyled to share the app's "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
+**v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
 Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data.
 
@@ -536,7 +521,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
 | **Run** | One complete agent task, start to finish, possibly hundreds of LLM calls. |
 | **Runaway** | An agent stuck looping or exploding in cost; the thing TokenFuse stops. |
-| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit - exposed as a kill-switch across API, TUI, Slack, Cloud, and the signed mobile control. |
+| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit - exposed as a kill-switch across the API, the TUI, Slack, and the Cloud dashboard. |
 | **Proxy** | A middleman in the request path. You point your agent at it instead of the provider. |
 | **MCP** | A standard for agents to call external tools/servers; powerful, and a new security surface. |
 | **Rug pull** | A previously approved MCP tool that silently changes its description or schema on a later fetch. |
@@ -653,7 +638,7 @@ Limits, stated plainly: unit counters are in-process and per-gateway - they rese
 | [08 · Security extensions](docs/08-security-extensions.md) | MCP broker, RAG scanning, agent identity |
 | [10 · HA cluster](docs/10-ha-cluster.md) · [11 · Hosted Cloud](docs/11-hosted-cloud.md) · [12 · MCP credential-broker](docs/12-mcp-credential-broker.md) | The distributed + cloud + security layers |
 | [13 · Security model & hardening](docs/13-security-hardening.md) | Trust boundaries, implemented controls, `cargo audit` gate |
-| [14 · Mobile companion](docs/14-mobile-companion.md) · [16 · Design system](docs/16-design-system.md) | The iPhone & Apple Watch app (TokenFuse) plan + wire protocol, and the shared "fuse" visual identity |
+| [16 · Design system](docs/16-design-system.md) | The "fuse" visual identity: tokens, components, and how the dashboard is put together |
 | [17 · Rug-pull demo](docs/17-rugpull-demo.md) | `cargo run --example rugpull_demo` - a self-contained, lab-only demo of the live rug-pull scanner catching a tool that mutates post-approval |
 | [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
 | [20 · Identity map](docs/20-identity-map.md) | Key ↔ agent ↔ business-unit binding, strict mode, and monthly unit budgets: the design + build plan behind the "Identity map" section above |
