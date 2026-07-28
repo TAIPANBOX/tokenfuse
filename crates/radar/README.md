@@ -1,4 +1,4 @@
-# TokenFuse Radar (eBPF) — W1
+# TokenFuse Radar (eBPF) - W1
 
 Linux-only. Discovers **LLM traffic and shadow agents** on a host with **zero
 config in the apps**: an eBPF program on the `sys_enter_connect` tracepoint
@@ -30,5 +30,5 @@ PID      COMM             DEST                  FLAG
 14117    curl             127.0.0.1:11434         <== local Ollama
 ```
 
-Requires a kernel with BTF (`/sys/kernel/btf/vmlinux`) — standard on modern
+Requires a kernel with BTF (`/sys/kernel/btf/vmlinux`), standard on modern
 Ubuntu. Verified on Ubuntu 24.04, kernel 7.0.

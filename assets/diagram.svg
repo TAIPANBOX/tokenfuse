@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-18 -18 996 366" width="996" height="366" role="img" aria-label="TokenFuse: every agent call priced and gated in-line, budgets replicated by raft">
+  <title>TokenFuse: every agent call priced and gated in-line, budgets replicated by raft</title>
+  <rect x="-18" y="-18" width="996" height="366" rx="16" fill="#0A0E13"/>
+  <rect x="-17.5" y="-17.5" width="995" height="365" rx="15.5" fill="none" stroke="rgba(255,255,255,.09)"/>
+
+        <defs><marker id="a2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#5A6675"/></marker></defs>
+        <g font-family="ui-monospace,Menlo" text-anchor="middle">
+          <rect x="8" y="120" width="136" height="58" rx="12" fill="#141C27" stroke="#2a3547"/>
+          <text x="76" y="146" fill="#E9EFF6" font-size="12.5" font-weight="700">agent SDK</text>
+          <text x="76" y="163" fill="#8A97A6" font-size="10">base_url = tokenfuse</text>
+
+          <rect x="196" y="52" width="300" height="196" rx="16" fill="#10161F" stroke="#F4B23E" stroke-width="1.4"><animate attributeName="stroke-opacity" values="1;.45;1" dur="3.4s" repeatCount="indefinite"/></rect>
+          <text x="346" y="80" fill="#F4B23E" font-size="14" font-weight="700">tokenfuse-gateway :4100</text>
+          <g font-size="10.5" fill="#8A97A6">
+            <rect x="216" y="96" width="125" height="30" rx="8" fill="#141C27" stroke="#2a3547"/><text x="278" y="115" fill="#E9EFF6">budgets &#183; breaker</text>
+            <rect x="352" y="96" width="125" height="30" rx="8" fill="#141C27" stroke="#2a3547"/><text x="414" y="115" fill="#E9EFF6">loop detection</text>
+            <rect x="216" y="134" width="125" height="30" rx="8" fill="#141C27" stroke="#2a3547"/><text x="278" y="153" fill="#E9EFF6">model router</text>
+            <rect x="352" y="134" width="125" height="30" rx="8" fill="#141C27" stroke="#2a3547"/><text x="414" y="153" fill="#E9EFF6">semantic cache</text>
+            <rect x="216" y="172" width="125" height="30" rx="8" fill="#141C27" stroke="#2a3547"/><text x="278" y="191" fill="#E9EFF6">DLP &#183; firewall</text>
+            <rect x="352" y="172" width="125" height="30" rx="8" fill="#141C27" stroke="#2DD4BF"/><text x="414" y="191" fill="#2DD4BF">Wardryx PEP</text>
+            <text x="346" y="228" fill="#5A6675" font-size="10.5">every decision emitted as an agent-event</text>
+          </g>
+
+          <rect x="529" y="120" width="184" height="58" rx="12" fill="#141C27" stroke="#2a3547"/>
+          <text x="621" y="146" fill="#E9EFF6" font-size="12.5" font-weight="700">provider</text>
+          <text x="621" y="163" fill="#8A97A6" font-size="10.5">Anthropic &#183; OpenAI &#183; local</text>
+
+          <rect x="742" y="30" width="200" height="118" rx="14" fill="#10161F" stroke="#2a3547"/>
+          <text x="842" y="56" fill="#E9EFF6" font-size="12.5" font-weight="700">raft spend ledger</text>
+          <g font-size="10.5" fill="#8A97A6">
+            <circle cx="792" cy="92" r="17" fill="#141C27" stroke="#F4B23E"/><text x="792" y="96" fill="#F4B23E">n1</text>
+            <circle cx="842" cy="112" r="17" fill="#141C27" stroke="#2a3547"/><text x="842" y="116">n2</text>
+            <circle cx="892" cy="92" r="17" fill="#141C27" stroke="#2a3547"/><text x="892" y="96">n3</text>
+          </g>
+          <text x="842" y="140" fill="#5A6675" font-size="10.5">no double-spend, ever</text>
+
+          <rect x="742" y="196" width="200" height="86" rx="14" fill="#10161F" stroke="#2a3547"/>
+          <text x="842" y="224" fill="#E9EFF6" font-size="12.5" font-weight="700">Cloud + dashboard</text>
+          <text x="842" y="243" fill="#8A97A6" font-size="10">incidents &#183; savings &#183; evidence</text>
+          <text x="842" y="260" fill="#22D3EE" font-size="10.5">your console &#183; browser</text>
+        </g>
+        <g stroke="#5A6675" stroke-width="1.5" class="flow">
+          <line x1="146" y1="149" x2="188" y2="149" marker-end="url(#a2)"/>
+          <line x1="496" y1="149" x2="523" y2="149" marker-end="url(#a2)"/>
+          <line x1="496" y1="100" x2="734" y2="80" marker-end="url(#a2)"/>
+          <line x1="496" y1="210" x2="734" y2="230" marker-end="url(#a2)"/>
+        </g>
+      
+  <g fill="none">
+  <line x1="146" y1="149" x2="188" y2="149" pathLength="100" stroke="#F4B23E" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="7 100" stroke-dashoffset="7"><animate attributeName="stroke-dashoffset" from="7" to="-100" dur="2.4s" begin="-0.00s" repeatCount="indefinite"/></line>
+  <line x1="496" y1="149" x2="523" y2="149" pathLength="100" stroke="#F4B23E" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="7 100" stroke-dashoffset="7"><animate attributeName="stroke-dashoffset" from="7" to="-100" dur="2.4s" begin="-0.37s" repeatCount="indefinite"/></line>
+  <line x1="496" y1="100" x2="734" y2="80" pathLength="100" stroke="#F4B23E" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="7 100" stroke-dashoffset="7"><animate attributeName="stroke-dashoffset" from="7" to="-100" dur="2.4s" begin="-0.74s" repeatCount="indefinite"/></line>
+  <line x1="496" y1="210" x2="734" y2="230" pathLength="100" stroke="#F4B23E" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="7 100" stroke-dashoffset="7"><animate attributeName="stroke-dashoffset" from="7" to="-100" dur="2.4s" begin="-1.11s" repeatCount="indefinite"/></line>
+  </g>
+</svg>

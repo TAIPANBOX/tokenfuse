@@ -4,7 +4,7 @@
 
 TokenFuse is a drop-in proxy between your agent and its LLM/tool providers. It
 enforces per-run budgets, detects runaway loops, provides a kill-switch, and
-keeps secrets out of the model's context — without rewriting your agent.
+keeps secrets out of the model's context, without rewriting your agent.
 
 TokenFuse runs as a **service**, not a library dependency. This crate is the
 project's umbrella / name anchor; the gateway ships as the `tokenfuse` binary and

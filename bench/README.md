@@ -1,6 +1,6 @@
 # Networked benchmark harness
 
-Reproduce TokenFuse's on-the-wire latency overhead **anywhere** — a laptop, any
+Reproduce TokenFuse's on-the-wire latency overhead **anywhere**: a laptop, any
 Linux box, or GitHub Actions (`.github/workflows/bench.yml`, manual trigger).
 Nothing here depends on a particular server.
 
@@ -25,8 +25,8 @@ DUR=20 CONN=32 THREADS=4 bench/run.sh
 | File | Role |
 |---|---|
 | `mock_upstream.py` | keep-alive HTTP/1.1 mock LLM on `127.0.0.1:9000` |
-| `post_direct.lua` | wrk script — POST straight to the mock (baseline) |
-| `post_gw.lua` | wrk script — POST through the gateway (managed run, huge budget) |
+| `post_direct.lua` | wrk script: POST straight to the mock (baseline) |
+| `post_gw.lua` | wrk script: POST through the gateway (managed run, huge budget) |
 | `run.sh` | builds the release gateway, starts both, runs wrk, prints the delta |
 
 The published numbers live in [`../BENCHMARKS.md`](../BENCHMARKS.md).
