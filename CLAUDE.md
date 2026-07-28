@@ -11,8 +11,9 @@ per-run hierarchical budgets in real time — an over-budget call gets a hard
 `402 Payment Required` ("Breaker"), not a warning after the fact — detects
 loops, runs an agent firewall (taint tracking + DLP), scans and brokers
 credentials for MCP tools, writes zero-DB Parquet analytics, replicates the
-budget ledger across a raft HA cluster, and ships a hosted Cloud plus an
-iPhone/Watch app that can send an Apple Secure Enclave–signed kill.
+budget ledger across a raft HA cluster, and ships a hosted Cloud whose
+privileged mutations can additionally require a hardware-backed ES256
+signature from a separately paired device.
 
 Positioning is FinOps-first: **"enforcement, not observability."** This was a
 deliberate pivot (`docs/09-product-strategy.md`, decided 2026-07-02; reframed

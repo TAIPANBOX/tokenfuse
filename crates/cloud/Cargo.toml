@@ -20,7 +20,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 utoipa = { version = "5", features = ["axum_extras"] }
-# Device pairing + Secure-Enclave-signed mutations, and the signed audit
+# Device pairing + hardware-backed signed mutations, and the signed audit
 # manifest (ES256 = ECDSA P-256/SHA-256). `pkcs8`/`pem` let the audit signing
 # key load from a PKCS#8/SEC1 PEM or DER (see `audit_sign.rs`).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }

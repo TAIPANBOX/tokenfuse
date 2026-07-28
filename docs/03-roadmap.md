@@ -61,7 +61,7 @@ A stranger goes from README to their first blocked runaway run in 15 minutes.
 
 - OSS self-host — free forever (Apache-2.0)
 - CLI + local proxy — free forever, no seat limit, no time limit
-- Cloud (fleet dashboard, Slack/mobile kill-switch, central budgets) — a single **flat monthly price, unlimited seats** (Aikido-style). Not usage-based, not a % of spend under management.
+- Cloud (fleet dashboard, Slack kill-switch, central budgets) — a single **flat monthly price, unlimited seats** (Aikido-style). Not usage-based, not a % of spend under management.
 - Enterprise self-host license — a future direction; not priced on usage or % of spend
 
 ## GTM
