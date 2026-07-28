@@ -27,17 +27,9 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 > ```bash
 > docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
 > ```
-> Full walkthrough: [**🚀 Get started**](#-get-started).
-
-<div align="center">
-
-<img src="docs/assets/dashboard.png" alt="TokenFuse Cloud dashboard: fleet burn rate, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch" width="820">
-
-<sub>The Cloud dashboard: fleet <b>burn rate</b>, per-run spend vs. cap, near-cap alerts, and a per-run kill-switch. Its tagline is literal: <b>enforcement, not observability</b>. One visual identity, <i>the fuse</i>, runs from the gateway through to this dashboard. <code>cd cloud && docker compose up</code>.</sub>
-
-<sub><a href="https://taipanbox.github.io/tokenfuse/preview/"><b>▶ Live preview</b></a>: the dashboard with sample data, in your browser, no backend and no install.</sub>
-
-</div>
+> Full walkthrough: [**🚀 Get started**](#-get-started). Nothing to install at
+> all: the [**live preview**](https://taipanbox.github.io/tokenfuse/preview/)
+> runs the fleet dashboard on sample data in your browser.
 
 <div align="center">
 
