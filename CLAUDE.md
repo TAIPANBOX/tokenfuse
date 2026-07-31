@@ -121,7 +121,12 @@ build)`, `cloud apns (feature build)`.
    `agent_id`; skip the event if the request doesn't carry one.
 
    *(partly gated: the mixed-schema test in `crates/gateway/src/sqlq.rs` covers
-   the read path, nothing covers the exporter's fail-open or zero-cost promise)*
+   the Parquet read path; the exporter's two promises are now held by
+   `a_disabled_exporter_does_no_work_at_all`,
+   `an_unopenable_path_falls_back_to_disabled_rather_than_failing`,
+   `a_directory_as_the_events_path_is_also_fail_open`,
+   `an_empty_path_is_treated_as_unset` and
+   `a_missing_agent_id_is_skipped_and_counted_never_invented`)*
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
@@ -138,10 +143,24 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   top of `ledger_backend.rs` saying a field added here is a raft and
   schema-identity decision would put the warning where the edit happens rather
   than in a file somebody may not have opened.
-- **Invariant 6**'s untested half is the exporter's two promises: zero-cost when
-  `TOKENFUSE_EVENTS_PATH` is unset, and fail-open when it is set. Both are
-  testable and neither is tested. Fail-open in particular is the kind of promise
-  that quietly stops being true.
+- **Invariant 6**'s exporter half is now five tests. Both promises stop being
+  true quietly, which is why they needed tests rather than comments: nothing
+  crashes when a disabled exporter starts doing work, it just gets slower, in
+  production, per request; and nothing warns when a broken path stops being
+  fail-open, the gateway simply refuses to start on somebody else's machine
+  because an optional audit export could not open a file.
+
+  Verified by breaking both: making `emit` build an event before checking
+  whether it is disabled fails three of them, and turning the open error into a
+  panic fails two. The Parquet read path is still the tested part of this
+  invariant, and the write-schema evolution is still not.
+
+  Writing them turned up a latent race worth recording. Every test here mutates
+  one process-wide environment variable, and cargo runs a binary's tests on
+  parallel threads. The two original tests had that race and passed on luck;
+  four more would have made it bite. They now serialise on a mutex, which is
+  std-only, because adding a dev-dependency to this repo is an escalation and a
+  flaky test is worse than no test.
 - **Invariant 4** ("honesty is a feature") is judgement, and stays judgement. It
   is also the one most worth re-reading before writing a README.
 
