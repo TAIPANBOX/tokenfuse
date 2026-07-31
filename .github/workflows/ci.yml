@@ -43,6 +43,8 @@ jobs:
         run: cargo test --all
       - name: Test (cluster feature — raft-backed ledger)
         run: cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
+      - name: tokenfuse-core stays dependency-minimal
+        run: ./scripts/core-deps.sh
 
   python-sdk:
     name: python sdk
