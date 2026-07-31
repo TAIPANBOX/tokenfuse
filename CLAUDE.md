@@ -166,7 +166,12 @@ it, because later is where the drift lives.
   `v1`, bumped 2026-07-09 after a poisoned-cache SIGBUS) to force a fresh
   cache namespace.
 - `core.fileMode` is already set to `false` in this repo's git config, don't
-  re-set it or chase phantom mode-only diffs.
+  re-set it or chase phantom mode-only diffs. **The other half of that: a
+  NEW executable file does not get its bit recorded either.** `chmod +x`
+  succeeds on disk, git ignores it, and the file lands as `100644`, so
+  `./scripts/whatever.sh` fails with permission denied for everyone who
+  clones. Add executables with `git update-index --chmod=+x <path>`. This
+  bit `scripts/core-deps.sh` on the commit that introduced it.
 - **Docs are numbered 01-20** (`docs/`); new design docs continue the
   sequence (next is 21). `docs/09-product-strategy.md` is the one to read
   before touching product framing or positioning.
