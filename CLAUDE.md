@@ -127,6 +127,26 @@ build)`, `cloud apns (feature build)`.
    `a_directory_as_the_events_path_is_also_fail_open`,
    `an_empty_path_is_treated_as_unset` and
    `a_missing_agent_id_is_skipped_and_counted_never_invented`)*
+7. **A level-triggered detector is edge-converted at the source.** Four of the
+   cloud's detectors fire on discrete trips (a block, a loop repeat, a burst),
+   so one trip is one event. `budget_threshold` is not like them: once
+   `spent/budget` is over the line it stays over, because spend never goes
+   down. A condition of that shape must emit on the TRANSITION only, or every
+   later call in the run writes another line into the shared event log, which
+   is the resource that saturates first in this stack (about 0.4 KB per
+   decision, so a busy run fills a volume that CPU never touches). The edge
+   marker is the incident's own existence, which rides in the snapshot, so a
+   restart does not re-notify either. `set_budget` clears it, because a new
+   budget is a new line to cross.
+   *(test: `budget_threshold_is_exported_once_per_crossing`, plus
+   `raising_a_budget_lets_the_threshold_fire_again` for the reset)*
+
+   The same shape check is owed to `spend_spike`, which is also level-triggered
+   (an org's burn rate stays high for as long as it stays high) and does
+   re-emit per ingest batch today. Not changed here: it has shipped that way,
+   and altering when an existing incident reaches the console's stream is a
+   behaviour change that needs its own decision, not a drive-by.
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

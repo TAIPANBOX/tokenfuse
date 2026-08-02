@@ -38,8 +38,11 @@ pub const SOURCE: &str = "tokenfuse";
 pub use crate::mcpreport::Severity;
 
 /// TokenFuse's event-type taxonomy (agent-passport SPEC.md §6.2, `source =
-/// "tokenfuse"` row): the four existing P2 incident kinds plus the four new
-/// per-call kinds this phase wires up.
+/// "tokenfuse"` row): the P2 incident kinds, the per-call kinds the gateway
+/// raises, and the cloud's control-plane signals. Each variant's own doc says
+/// which deployable raises it and why it carries the severity it does. A count
+/// is deliberately not stated here: this list grows, and a number in prose is
+/// the half that goes stale first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     /// Existing cloud incident (P2, PR #90): raised in
@@ -55,6 +58,28 @@ pub enum EventType {
     /// Existing cloud incident (P2, PR #90): raised when one `agent_id`
     /// drives ≥ N distinct runs in-window.
     FanoutExplosion,
+    /// New cloud incident: a run's `spent/budget` crossed the configured
+    /// alert fraction (`TOKENFUSE_CLOUD_ALERT_PCT`, default 0.8). The
+    /// "approaching the line" signal, raised in
+    /// `crates/cloud/src/store.rs::ingest_at`.
+    ///
+    /// This one is deliberately `medium`, not `high`: nothing has gone wrong
+    /// yet, and a consumer that pages on it at the same weight as an
+    /// exhausted budget teaches its operator to ignore both. It exists so a
+    /// consumer OUTSIDE this process can learn about a budget before it is
+    /// gone; `/v1/alerts` has always had the same fact as state, but state is
+    /// not something an alerting pipeline can subscribe to.
+    BudgetThreshold,
+    /// New: a run was killed (`Store::kill`/`kill_audited`, i.e. the
+    /// `/v1/kill` control or an internal stop). The loudest thing the money
+    /// plane does to an agent, and until now the only one visible solely on
+    /// the in-process stream: a reader of the shared event log could not tell
+    /// a killed run from one that simply stopped calling.
+    ///
+    /// `data.actor` carries who asked, when the kill came through the audited
+    /// path, so a consumer can tell an operator's own kill from an automatic
+    /// one instead of paging them about their own click.
+    RunKilled,
     /// New: any Breaker 402 (`tokenfuse_core::breaker::BreakerReason`) —
     /// budget, policy, loop, kill, or WASM-policy trip. Raised at the
     /// gateway's `breaker_error_response` call sites.
@@ -96,6 +121,8 @@ impl EventType {
             EventType::SustainedLoop => "sustained_loop",
             EventType::SpendSpike => "spend_spike",
             EventType::FanoutExplosion => "fanout_explosion",
+            EventType::BudgetThreshold => "budget_threshold",
+            EventType::RunKilled => "run_killed",
             EventType::BreakerTripped => "breaker_tripped",
             EventType::DlpBlock => "dlp_block",
             EventType::TaintBlock => "taint_block",
@@ -109,7 +136,9 @@ impl EventType {
     /// site can misclassify an event. Mapping (from the phase spec):
     /// `budget_exhausted` / `mcp_drift` / `breaker_tripped` = `critical`;
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
-    /// `taint_block` / `identity_mismatch` (docs/20) = `high`.
+    /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` = `high`;
+    /// `budget_threshold` = `medium` (an early warning is not an incident,
+    /// see the variant's own doc).
     ///
     /// Note this is deliberately independent of `cloud::store::Incident`'s
     /// own `severity` field (used for `/v1/incidents` today, e.g.
@@ -126,7 +155,11 @@ impl EventType {
             | EventType::FanoutExplosion
             | EventType::DlpBlock
             | EventType::TaintBlock
-            | EventType::IdentityMismatch => Severity::High,
+            | EventType::IdentityMismatch
+            | EventType::RunKilled => Severity::High,
+            // An early warning, on purpose one band below the incident it
+            // warns about: the run is still inside its budget.
+            EventType::BudgetThreshold => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             EventType::ToolCall => Severity::Low,
@@ -476,9 +509,18 @@ mod tests {
             EventType::DlpBlock,
             EventType::TaintBlock,
             EventType::IdentityMismatch,
+            EventType::RunKilled,
         ] {
             assert_eq!(t.severity(), Severity::High, "{t:?}");
         }
+    }
+
+    #[test]
+    fn budget_threshold_is_one_band_below_the_incident_it_warns_about() {
+        // The early warning must not page at the same weight as the exhausted
+        // budget it precedes, or an operator learns to ignore both.
+        assert_eq!(EventType::BudgetThreshold.severity(), Severity::Medium);
+        assert_eq!(EventType::BudgetExhausted.severity(), Severity::Critical);
     }
 
     #[test]
@@ -494,6 +536,8 @@ mod tests {
             (EventType::McpDrift, "mcp_drift"),
             (EventType::IdentityMismatch, "identity_mismatch"),
             (EventType::ToolCall, "tool_call"),
+            (EventType::BudgetThreshold, "budget_threshold"),
+            (EventType::RunKilled, "run_killed"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
