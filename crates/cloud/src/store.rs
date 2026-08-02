@@ -870,16 +870,18 @@ pub struct Store {
 }
 
 /// Map an `Incident.kind` string to the corresponding agent-event
-/// [`EventType`] — the four P2 incident kinds, verbatim (agent-passport
-/// SPEC.md §6.2). `None` for anything else (defensive: a future incident
-/// kind added here without updating this map is silently NOT exported,
-/// rather than panicking or guessing — see the `unknown_kind` test).
+/// [`EventType`]: the four P2 incident kinds verbatim, plus the
+/// `budget_threshold` early warning (agent-passport SPEC.md §6.2). `None` for
+/// anything else (defensive: a future incident kind added here without
+/// updating this map is silently NOT exported, rather than panicking or
+/// guessing, see the `unknown_kind` test).
 fn agent_event_type_for_incident_kind(kind: &str) -> Option<EventType> {
     match kind {
         "budget_exhausted" => Some(EventType::BudgetExhausted),
         "sustained_loop" => Some(EventType::SustainedLoop),
         "spend_spike" => Some(EventType::SpendSpike),
         "fanout_explosion" => Some(EventType::FanoutExplosion),
+        "budget_threshold" => Some(EventType::BudgetThreshold),
         _ => None,
     }
 }
@@ -1000,6 +1002,10 @@ impl Store {
     pub(crate) fn ingest_at(&self, org: &str, records: &[CallRecord], now_ms: i64) {
         let mut updated: Vec<RunAgg> = Vec::new();
         let mut fired: HashMap<String, Incident> = HashMap::new();
+        // Per-incident extra `data` fields, by incident id: today only
+        // `budget_threshold`'s budget/spend pair, which the generic
+        // `{org, occurrences}` payload has no place for.
+        let mut threshold_extra: HashMap<String, serde_json::Value> = HashMap::new();
         {
             let mut guard = self.inner.write().unwrap();
             guard.dirty = true;
@@ -1352,6 +1358,66 @@ impl Store {
                         fired.insert(inc.id.clone(), inc);
                     }
                 }
+
+                // budget_threshold (Medium): the run's spend crossed
+                // `alert_pct` of its budget: the "approaching the line"
+                // signal `/v1/alerts` has always computed as STATE, raised
+                // here as an EVENT so a consumer outside this process can
+                // subscribe to it instead of polling.
+                //
+                // Unlike the four detectors above, this condition is
+                // LEVEL-triggered: once `spent/budget` is over the line it
+                // stays over for the rest of the run, because spend never goes
+                // down. Firing it the way they fire would write one line per
+                // call into the shared event log for the rest of the run, and
+                // that log is what saturates first in this stack (~0.4 KB per
+                // decision). So the incident's own EXISTENCE is the edge: the
+                // event fires on the transition into the alerting state and
+                // never again, including across a restart, since incidents
+                // ride in the snapshot. `set_budget` clears it, because a new
+                // budget is a new line to cross.
+                let budget = inner
+                    .budgets
+                    .get(org)
+                    .and_then(|b| b.get(&r.run_id))
+                    .copied()
+                    .unwrap_or(0);
+                if budget > 0 {
+                    let spent = inner
+                        .orgs
+                        .get(org)
+                        .and_then(|runs| runs.get(&r.run_id))
+                        .map(|a| a.spent_microusd)
+                        .unwrap_or(0);
+                    let id = incident_id("budget_threshold", &r.run_id);
+                    let already = inner
+                        .incidents
+                        .get(org)
+                        .is_some_and(|m| m.contains_key(&id));
+                    if !already && (spent as f64 / budget as f64) >= self.alert_pct {
+                        let inc = upsert_incident(
+                            &mut inner.incidents,
+                            org,
+                            "budget_threshold",
+                            tokenfuse_core::Severity::Medium,
+                            &r.run_id,
+                            Some(r.run_id.clone()),
+                            agent.clone(),
+                            ts,
+                        );
+                        // The message a consumer writes is "80% of $2.00", so
+                        // the event carries both numbers rather than making
+                        // every reader call back for them.
+                        threshold_extra.insert(
+                            inc.id.clone(),
+                            serde_json::json!({
+                                "budget_micros": budget,
+                                "spent_micros": spent,
+                            }),
+                        );
+                        fired.insert(inc.id.clone(), inc);
+                    }
+                }
             }
 
             // spend_spike (High): org burn over the last minute, summed from the
@@ -1391,16 +1457,25 @@ impl Store {
             // `Exporter::emit` itself; see `crate::events::log_outcome`-style
             // handling below (this crate has `tracing` too).
             if let Some(event_type) = agent_event_type_for_incident_kind(&inc.kind) {
+                let mut data = serde_json::json!({
+                    "org": inc.org,
+                    "occurrences": inc.occurrences,
+                });
+                if let (Some(obj), Some(extra)) = (
+                    data.as_object_mut(),
+                    threshold_extra.get(&inc.id).and_then(|e| e.as_object()),
+                ) {
+                    for (k, v) in extra {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
                 let outcome = self.event_exporter.emit(
                     event_type,
                     inc.last_seen_millis,
                     inc.agent_id.as_deref(),
                     inc.run_id.as_deref(),
                     None, // on_behalf_of: not tracked by the incident aggregator
-                    serde_json::json!({
-                        "org": inc.org,
-                        "occurrences": inc.occurrences,
-                    }),
+                    data,
                 );
                 log_event_outcome(event_type, outcome);
             }
@@ -1863,7 +1938,7 @@ impl Store {
 
     /// Mark a run killed for an org; gateways poll this and hard-stop it.
     pub fn kill(&self, org: &str, run: &str) {
-        {
+        let agent = {
             let mut inner = self.inner.write().unwrap();
             inner.dirty = true;
             inner
@@ -1871,11 +1946,37 @@ impl Store {
                 .entry(org.to_string())
                 .or_default()
                 .insert(run.to_string(), true);
-        }
+            agent_for_run(&inner, org, run)
+        };
+        self.emit_run_killed(org, run, agent.as_deref(), None);
         let _ = self.events.send(StreamEvent::Kill {
             org: org.to_string(),
             run: run.to_string(),
         });
+    }
+
+    /// Export the `run_killed` agent-event (agent-passport SPEC.md §6.2).
+    ///
+    /// Always calls the exporter, even with no attributed agent, so the skip
+    /// is COUNTED by `Exporter::emit` rather than silently dropped at the call
+    /// site, the same rule the incident export path follows for
+    /// `spend_spike`. Emitted outside the write lock: this is file I/O, and
+    /// the exporter is fail-open, so a kill is never delayed or lost because
+    /// the event log is unwritable.
+    fn emit_run_killed(&self, org: &str, run: &str, agent: Option<&str>, actor: Option<&str>) {
+        let data = match actor {
+            Some(actor) => serde_json::json!({ "org": org, "actor": actor }),
+            None => serde_json::json!({ "org": org }),
+        };
+        let outcome = self.event_exporter.emit(
+            EventType::RunKilled,
+            now_millis(),
+            agent,
+            Some(run),
+            None, // on_behalf_of: not tracked per run
+            data,
+        );
+        log_event_outcome(EventType::RunKilled, outcome);
     }
 
     /// [`Store::kill`] plus its `control.kill` audit entry, folded into ONE
@@ -1883,7 +1984,7 @@ impl Store {
     /// `kill` handler uses this instead of calling `kill` then `audit_append` as
     /// two separate locked sections.
     pub fn kill_audited(&self, org: &str, run: &str, actor: &str) {
-        {
+        let agent = {
             let mut inner = self.inner.write().unwrap();
             inner.dirty = true;
             inner
@@ -1892,7 +1993,9 @@ impl Store {
                 .or_default()
                 .insert(run.to_string(), true);
             append_audit_locked(&mut inner, org, actor, "control.kill", run, "mode=hard");
-        }
+            agent_for_run(&inner, org, run)
+        };
+        self.emit_run_killed(org, run, agent.as_deref(), Some(actor));
         let _ = self.events.send(StreamEvent::Kill {
             org: org.to_string(),
             run: run.to_string(),
@@ -1925,6 +2028,7 @@ impl Store {
                 .entry(org.to_string())
                 .or_default()
                 .insert(run.to_string(), micros);
+            clear_budget_threshold_locked(&mut inner, org, run);
         }
         let _ = self.events.send(StreamEvent::Budget {
             org: org.to_string(),
@@ -1953,6 +2057,7 @@ impl Store {
                 run,
                 &format!("budget_micros={micros}"),
             );
+            clear_budget_threshold_locked(&mut inner, org, run);
         }
         let _ = self.events.send(StreamEvent::Budget {
             org: org.to_string(),
@@ -2385,6 +2490,32 @@ fn now_millis() -> i64 {
 /// detectors (e.g. `spend_spike`) pass an empty scope.
 fn incident_id(kind: &str, scope: &str) -> String {
     format!("{kind}:{scope}")
+}
+
+/// The agent a run is attributed to, or `None` when the gateway never tagged
+/// its calls. Never invents one: the agent-event envelope requires a real
+/// `agent_id` (SPEC.md §6.1), so an unattributed run yields a counted skip,
+/// not a placeholder identity.
+fn agent_for_run(inner: &Inner, org: &str, run: &str) -> Option<String> {
+    inner
+        .orgs
+        .get(org)
+        .and_then(|runs| runs.get(run))
+        .map(|agg| agg.agent_id.clone())
+        .filter(|agent| !agent.is_empty())
+}
+
+/// Drop a run's `budget_threshold` incident so the next crossing fires again.
+///
+/// Called when a budget is (re)set. The incident's existence is the edge
+/// marker for a level-triggered detector (see `ingest_at`), and a new budget
+/// is a new line: without this, raising a budget after an alert would mean the
+/// run silently never alerts again. The crossing that already happened is not
+/// lost: it is in the append-only event log, which is the record that counts.
+fn clear_budget_threshold_locked(inner: &mut Inner, org: &str, run: &str) {
+    if let Some(incidents) = inner.incidents.get_mut(org) {
+        incidents.remove(&incident_id("budget_threshold", run));
+    }
 }
 
 /// Push `ts` onto the per-(org,key) occurrence tracker, bound it, and — when a
@@ -4188,6 +4319,207 @@ mod tests {
         // Nothing written — the incident has no agent_id to export.
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(contents, "", "spend_spike has no agent_id; must be skipped");
+        assert_eq!(exporter.skipped_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run that crosses `alert_pct` of its budget raises `budget_threshold`
+    /// the "approaching the line" signal. `/v1/alerts` has always computed
+    /// this as STATE; nothing ever put it on the shared bus as an EVENT, so a
+    /// consumer outside this process could only ever learn about a budget the
+    /// moment it was already exhausted.
+    #[test]
+    fn budget_threshold_fires_on_crossing_not_under() {
+        let s = Store::with_config(IncidentConfig::default(), 0.8);
+        let now = 1_000_000;
+        s.set_budget("acme", "r1", 1_000);
+
+        // 70% of the budget: under the line, nothing raised.
+        s.ingest_at("acme", &[block_at("r1", "allow", 700, now)], now);
+        assert!(
+            !s.incidents("acme")
+                .iter()
+                .any(|i| i.kind == "budget_threshold"),
+            "70% of budget must not raise the threshold incident"
+        );
+
+        // One more call takes it to 80%: the line is crossed.
+        s.ingest_at("acme", &[block_at("r1", "allow", 100, now + 1)], now + 1);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "budget_threshold")
+            .expect("crossing alert_pct raises budget_threshold");
+        assert_eq!(inc.run_id.as_deref(), Some("r1"));
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Medium);
+    }
+
+    /// Raising a budget after an alert must let that run alert again. The
+    /// incident is the edge marker for a level-triggered detector, so
+    /// `set_budget` clears it: otherwise the one action an operator takes in
+    /// response to the alert would permanently silence the next one.
+    #[test]
+    fn raising_a_budget_lets_the_threshold_fire_again() {
+        let s = Store::with_config(IncidentConfig::default(), 0.8);
+        let now = 1_000_000;
+        s.set_budget("acme", "r1", 1_000);
+        s.ingest_at("acme", &[block_at("r1", "allow", 800, now)], now);
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .any(|i| i.kind == "budget_threshold"),
+            "80% of the first budget alerts"
+        );
+
+        // Ten times the budget: the run is far under the new line.
+        s.set_budget("acme", "r1", 10_000);
+        assert!(
+            !s.incidents("acme")
+                .iter()
+                .any(|i| i.kind == "budget_threshold"),
+            "a new budget is a new line to cross"
+        );
+
+        // 8_300 of 10_000 crosses it again.
+        s.ingest_at("acme", &[block_at("r1", "allow", 7_500, now + 1)], now + 1);
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .any(|i| i.kind == "budget_threshold"),
+            "crossing the new line alerts again"
+        );
+    }
+
+    /// A run with no budget set can never cross a fraction of one.
+    #[test]
+    fn budget_threshold_needs_a_budget() {
+        let s = Store::with_config(IncidentConfig::default(), 0.8);
+        let now = 1_000_000;
+        s.ingest_at("acme", &[block_at("r1", "allow", 9_999_999, now)], now);
+        assert!(
+            !s.incidents("acme")
+                .iter()
+                .any(|i| i.kind == "budget_threshold"),
+            "no budget means no threshold to cross"
+        );
+    }
+
+    /// The threshold condition is LEVEL-triggered: once `spent/budget` is over
+    /// the line it STAYS over for the rest of the run, unlike the four
+    /// block/loop/spike detectors whose conditions are discrete trips. So it is
+    /// converted to an EDGE here, at the source: one event on the crossing, not
+    /// one per later call. Without this a busy run writes an NDJSON line per
+    /// call into the shared event log, and that log is the thing that saturates
+    /// first in this stack.
+    #[test]
+    fn budget_threshold_is_exported_once_per_crossing() {
+        let dir = std::env::temp_dir().join(format!("tf-cloud-events-thr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+
+        let s = Store::with_config(IncidentConfig::default(), 0.8)
+            .with_event_exporter(exporter.clone());
+        let now = 1_000_000;
+        let call = |run: &str, cost: i64, ts: i64| CallRecord {
+            run_id: run.into(),
+            agent_id: "agent://acme.example/biller".into(),
+            decision: "allow".into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.set_budget("acme", "r1", 1_000);
+
+        s.ingest_at("acme", &[call("r1", 800, now)], now); // crosses
+        for i in 1..=3 {
+            s.ingest_at("acme", &[call("r1", 50, now + i)], now + i); // stays over
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let crossings = contents
+            .lines()
+            .filter(|l| l.contains(r#""type":"budget_threshold""#))
+            .count();
+        assert_eq!(crossings, 1, "one event per crossing, not per later call");
+
+        let line = contents
+            .lines()
+            .find(|l| l.contains(r#""type":"budget_threshold""#))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["source"], "tokenfuse");
+        assert_eq!(v["severity"], "medium");
+        assert_eq!(v["agent_id"], "agent://acme.example/biller");
+        assert_eq!(v["run_id"], "r1");
+        assert_eq!(v["data"]["org"], "acme");
+        assert_eq!(v["data"]["budget_micros"], 1_000);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Killing a run is the loudest thing this plane does to an agent, and it
+    /// was visible only on the in-process stream: a consumer reading the shared
+    /// event log could not tell a killed run from one that simply stopped.
+    #[test]
+    fn a_kill_is_exported_as_an_agent_event() {
+        let dir = std::env::temp_dir().join(format!("tf-cloud-events-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+
+        let s = Store::new().with_event_exporter(exporter);
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                agent_id: "agent://acme.example/biller".into(),
+                decision: "allow".into(),
+                ts_millis: now,
+                ..Default::default()
+            }],
+            now,
+        );
+        s.kill_audited("acme", "r1", "operator@acme");
+
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = contents
+            .lines()
+            .find(|l| l.contains(r#""type":"run_killed""#))
+            .expect("a kill is exported as an agent-event");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["source"], "tokenfuse");
+        assert_eq!(v["severity"], "high");
+        assert_eq!(v["agent_id"], "agent://acme.example/biller");
+        assert_eq!(v["run_id"], "r1");
+        assert_eq!(v["data"]["org"], "acme");
+        // The actor rides along so a consumer can tell an operator's own kill
+        // from an automatic one and not page them about their own click.
+        assert_eq!(v["data"]["actor"], "operator@acme");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same rule as every other emission site: an unattributed run has no
+    /// `agent_id`, and the envelope requires one, so the event is SKIPPED and
+    /// counted rather than invented (agent-passport SPEC.md §6.1).
+    #[test]
+    fn a_kill_without_an_attributed_agent_is_skipped_never_invented() {
+        let dir =
+            std::env::temp_dir().join(format!("tf-cloud-events-kill-anon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+
+        let s = Store::new().with_event_exporter(exporter.clone());
+        let now = 1_000_000;
+        s.ingest_at("acme", &[block_at("r1", "allow", 1, now)], now); // no agent_id
+        s.kill("acme", "r1");
+
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(contents, "", "an unattributed kill must not be exported");
         assert_eq!(exporter.skipped_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
