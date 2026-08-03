@@ -189,7 +189,10 @@ build)`, `cloud apns (feature build)`.
    do NOT get a second one, since double-reporting would make every count of
    them wrong; plus `both_new_events_outrank_the_generic_one`)*
 
-10. **A spike is a change, and the predicate has to measure one.** `spend_spike`
+10. **A name that promises a change is measured as a change.** Two detectors
+   carry one now, and both used to measure a size instead.
+
+   `spend_spike`
    compares an org's last minute against ITS OWN recent normal: the burn over
    the preceding half hour, per minute, times a configured multiple, with the
    old fixed rate kept as a floor beneath which no multiple counts.
@@ -207,12 +210,33 @@ build)`, `cloud apns (feature build)`.
    arrived. A baseline of zero is deliberately allowed to trip, since idle to
    hot is the runaway case this exists for, and the floor is what keeps that
    honest.
-   *(test: `a_steady_burn_above_the_line_stops_being_a_spike`,
+   `fanout_explosion` is the same shape and was rewritten the same day: an
+   agent's distinct runs this window against its OWN habit, the average of its
+   completed windows, with `fanout_runs` kept as the floor. An agent whose
+   ordinary job is twenty concurrent runs tripped it every window, and one that
+   normally drives two and suddenly drove nineteen tripped nothing.
+
+   Its history is a count per fixed bucket, NOT a longer run-id deque, and that
+   is load-bearing: the deque is capped at `INCIDENT_TRACKER_CAP` distinct runs,
+   so a busy agent stretching it to cover a baseline would evict its own history
+   and then read as an explosion forever. The fault would have come back in the
+   fix for it, at the exact scale where it matters most.
+
+   Both are edge-triggered for invariant 7's reason, and both allow a baseline
+   of zero to trip, because idle-to-hot is the runaway case these exist for and
+   the floor is what keeps that honest.
+   *(test, spike: `a_steady_burn_above_the_line_stops_being_a_spike`,
    `a_jump_over_its_own_normal_is_a_spike`, `a_jump_below_the_floor_is_not_a_spike`,
    `an_org_with_no_history_has_not_spiked`,
    `a_quiet_org_that_suddenly_spends_is_a_spike`,
-   `a_spike_is_reported_once_per_crossing`; the first, the fourth and the last
-   fail on the old predicate, which is how they were checked)*
+   `a_spike_is_reported_once_per_crossing`. Fan-out:
+   `a_steady_fan_out_is_not_an_explosion`,
+   `a_jump_over_its_own_habit_is_an_explosion`,
+   `a_jump_below_the_floor_is_not_an_explosion`,
+   `an_agent_with_no_habit_yet_has_not_exploded`,
+   `an_explosion_is_reported_once_per_crossing`. In each set the steady case,
+   the no-history case and the once-per-crossing case fail on the old
+   predicate, which is how they were checked)*
 
 ## Decisions that have no gate yet
 
@@ -275,8 +299,8 @@ held, and invariant 2 is held by one golden test that must never be deleted.
     the envelope grows a subject kind and every product moves together, which
     is a change to agent-passport, not to this crate.
 
-  `fanout_explosion` is a third, milder case: "explosion" is a fixed count (20
-  distinct runs in a window), so a busy but entirely normal agent trips it.
+  `fanout_explosion` was a third case of the same shape and was fixed the same
+  day; see invariant 10.
 
 ## Standing rule
 

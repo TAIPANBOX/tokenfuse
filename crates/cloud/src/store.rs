@@ -504,9 +504,20 @@ pub struct IncidentConfig {
     /// How far back `spend_spike` looks for "normal", ending where the
     /// measured minute begins.
     pub spike_baseline_ms: i64,
-    /// `fanout_explosion` trips when one `agent_id` drives ≥ this many DISTINCT
-    /// runs within `fanout_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS`).
+    /// The FLOOR under `fanout_explosion`: one `agent_id` driving fewer than
+    /// this many DISTINCT runs within `fanout_window_ms` is never an explosion,
+    /// however far above its own habit it is
+    /// (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS`).
+    ///
+    /// Until 2026-08-03 this was the whole trigger, and "explosion" was a claim
+    /// no predicate supported: an agent whose ordinary job is twenty concurrent
+    /// runs tripped it every window, and an agent that normally drives two and
+    /// suddenly drove nineteen tripped nothing.
     pub fanout_runs: u64,
+    /// How many times its own habit an agent's window has to be before
+    /// `fanout_explosion` calls it an explosion
+    /// (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_MULTIPLE`).
+    pub fanout_multiple: u64,
     /// Window for the `fanout_explosion` distinct-run count.
     pub fanout_window_ms: i64,
 }
@@ -521,6 +532,7 @@ impl Default for IncidentConfig {
             spike_multiple: 4,
             spike_baseline_ms: 1_800_000,
             fanout_runs: 20,
+            fanout_multiple: 4,
             fanout_window_ms: 600_000,
         }
     }
@@ -533,6 +545,17 @@ const SPIKE_WINDOW_MS: i64 = 60_000;
 /// Cap on each per-(org,key) occurrence tracker deque, so a hot run can't grow
 /// the tracker without bound (the incident itself is the durable record).
 const INCIDENT_TRACKER_CAP: usize = 256;
+
+/// How many `fanout_window_ms` buckets of an agent's own history to keep for
+/// the `fanout_explosion` baseline: the current one plus seven completed, so
+/// the default ten-minute window looks back a little over an hour.
+///
+/// Deliberately NOT held in the run-id deque above. That deque is capped at
+/// [`INCIDENT_TRACKER_CAP`] distinct runs, so stretching it to cover a baseline
+/// would let a busy agent evict its OWN history and then read as an explosion
+/// forever, which is the exact fault this baseline exists to fix. A count per
+/// bucket is two numbers, whatever the agent's volume.
+const FANOUT_HISTORY_BUCKETS: usize = 8;
 
 /// Hard cap on the number of distinct run_ids retained per org in
 /// [`Inner::orgs`]. `/v1/ingest` is intentionally ungated (ADR-3 — any
@@ -745,6 +768,15 @@ struct Inner {
     /// gateways poll `GET /v1/unit-budgets` and apply these over the
     /// identity map's own `budget_usd_month`.
     unit_budgets: HashMap<String, HashMap<String, i64>>,
+    /// (org, agent) → recent per-window distinct-run counts, oldest first, for
+    /// the `fanout_explosion` baseline. Bounded by [`FANOUT_HISTORY_BUCKETS`]
+    /// per agent and by the same key cap and recency index as the tracker it
+    /// sits beside.
+    fanout_history: HashMap<(String, String), VecDeque<(i64, u64)>>,
+    /// (org, agent) → whether it is fanning out right now, so the incident is
+    /// reported on the TRANSITION. In memory like the trackers, for the same
+    /// reason as `spike_active`.
+    fanout_active: HashMap<(String, String), bool>,
     /// org → whether it is spiking right now, so `spend_spike` emits on the
     /// TRANSITION rather than on every ingest batch while the condition holds.
     /// In memory like the other trackers here and deliberately not persisted:
@@ -1040,6 +1072,7 @@ impl Store {
         // `{org, occurrences}` payload has no place for.
         let mut threshold_extra: HashMap<String, serde_json::Value> = HashMap::new();
         let mut spike_extra: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut fanout_extra: HashMap<String, serde_json::Value> = HashMap::new();
         {
             let mut guard = self.inner.write().unwrap();
             guard.dirty = true;
@@ -1397,7 +1430,34 @@ impl Store {
                         now_ms,
                         cfg.fanout_window_ms,
                     );
-                    if n >= cfg.fanout_runs {
+
+                    // Against the agent's OWN habit, since 2026-08-03, for the
+                    // reason `spend_spike` was rewritten the same day: a count
+                    // measures a size, and "explosion" promises a change. An
+                    // agent whose ordinary job is twenty concurrent runs tripped
+                    // this every window, and one that normally drives two and
+                    // suddenly drove nineteen tripped nothing at all.
+                    //
+                    // Same three conditions, same reasoning as the spike. The
+                    // floor keeps a jump from one run to four out of the mail;
+                    // the multiple is what makes the word true; and an agent
+                    // with no completed window of its own has not exploded, it
+                    // has started, and nothing here knows its habit yet.
+                    let (baseline, completed) = fanout_baseline(
+                        &mut inner.fanout_history,
+                        org,
+                        a,
+                        ts,
+                        cfg.fanout_window_ms,
+                        n,
+                    );
+                    let exploding = completed >= 2
+                        && n >= cfg.fanout_runs
+                        && n >= baseline.saturating_mul(cfg.fanout_multiple);
+
+                    let key = (org.to_string(), a.clone());
+                    let was = inner.fanout_active.get(&key).copied().unwrap_or(false);
+                    if exploding && !was {
                         let inc = upsert_incident(
                             &mut inner.incidents,
                             org,
@@ -1408,7 +1468,20 @@ impl Store {
                             Some(a.clone()),
                             ts,
                         );
+                        fanout_extra.insert(
+                            inc.id.clone(),
+                            serde_json::json!({
+                                "runs_in_window": n,
+                                "baseline_runs_per_window": baseline,
+                                "multiple": n.checked_div(baseline).unwrap_or(0),
+                                "window_ms": cfg.fanout_window_ms,
+                                "windows_of_history": completed,
+                            }),
+                        );
                         fired.insert(inc.id.clone(), inc);
+                    }
+                    if exploding != was {
+                        inner.fanout_active.insert(key, exploding);
                     }
                 }
 
@@ -1548,11 +1621,7 @@ impl Store {
                     serde_json::json!({
                         "burn_micros": burn,
                         "baseline_micros_per_min": baseline_per_min,
-                        "multiple": if baseline_per_min > 0 {
-                            burn / baseline_per_min
-                        } else {
-                            0
-                        },
+                        "multiple": burn.checked_div(baseline_per_min).unwrap_or(0),
                         "window_ms": SPIKE_WINDOW_MS,
                         "baseline_ms": cfg.spike_baseline_ms,
                     }),
@@ -1583,9 +1652,13 @@ impl Store {
                     "org": inc.org,
                     "occurrences": inc.occurrences,
                 });
-                for extra in [threshold_extra.get(&inc.id), spike_extra.get(&inc.id)]
-                    .into_iter()
-                    .flatten()
+                for extra in [
+                    threshold_extra.get(&inc.id),
+                    spike_extra.get(&inc.id),
+                    fanout_extra.get(&inc.id),
+                ]
+                .into_iter()
+                .flatten()
                 {
                     if let (Some(obj), Some(extra)) = (data.as_object_mut(), extra.as_object()) {
                         for (k, v) in extra {
@@ -2716,6 +2789,45 @@ fn bump_fanout_tracker(
     let cutoff = now - window_ms;
     dq.retain(|(_, t)| *t >= cutoff);
     dq.len() as u64
+}
+
+/// Fold this window's distinct-run count into an agent's own history and
+/// return the average of its COMPLETED buckets, with how many there are.
+///
+/// Buckets are fixed (`ts / window_ms`), not sliding: the live count stays
+/// sliding, and history only has to answer "what is normal for this agent",
+/// which a fixed bucket answers with two numbers instead of a list of run ids.
+/// Within a bucket the MAX observed count is kept, because an agent's habit is
+/// what it reaches, not where it happened to be when a record arrived.
+fn fanout_baseline(
+    history: &mut HashMap<(String, String), VecDeque<(i64, u64)>>,
+    org: &str,
+    agent: &str,
+    ts: i64,
+    window_ms: i64,
+    live: u64,
+) -> (u64, usize) {
+    let bucket = ts / window_ms.max(1);
+    let dq = history
+        .entry((org.to_string(), agent.to_string()))
+        .or_default();
+    match dq.back_mut() {
+        Some((b, c)) if *b == bucket => *c = (*c).max(live),
+        _ => dq.push_back((bucket, live)),
+    }
+    while dq.len() > FANOUT_HISTORY_BUCKETS {
+        dq.pop_front();
+    }
+    let completed: Vec<u64> = dq
+        .iter()
+        .filter(|(b, _)| *b < bucket)
+        .map(|(_, c)| *c)
+        .collect();
+    if completed.is_empty() {
+        return (0, 0);
+    }
+    let sum: u64 = completed.iter().copied().fold(0u64, u64::saturating_add);
+    (sum / completed.len() as u64, completed.len())
 }
 
 /// Upsert the incident for `(org, kind, scope)`: create it on first trip, else
@@ -4485,65 +4597,185 @@ mod tests {
         assert!(!s.ack_incident("acme", "nope"));
     }
 
-    /// One `agent_id` fanning out across many DISTINCT runs opens an
-    /// agent-scoped `fanout_explosion`; a smaller fan-out opens nothing.
-    #[test]
-    fn fanout_explosion_fires_over_distinct_run_threshold() {
-        let cfg = IncidentConfig {
-            fanout_runs: 4,
-            ..Default::default()
-        };
-        let s = Store::with_incident_config(cfg);
-        let now = 1_000_000;
-        let fan = |agent: &str, run: &str, ts: i64| CallRecord {
+    fn fan(agent: &str, run: &str, ts: i64) -> CallRecord {
+        CallRecord {
             run_id: run.into(),
             agent_id: agent.into(),
             decision: "allow".into(),
             ts_millis: ts,
             ..Default::default()
-        };
+        }
+    }
 
-        // Three distinct runs for one agent — under the threshold of 4.
-        s.ingest_at(
-            "acme",
-            &[
-                fan("orchestrator", "r1", now - 3),
-                fan("orchestrator", "r2", now - 2),
-                fan("orchestrator", "r3", now - 1),
-            ],
-            now,
-        );
+    /// Give an agent `windows` completed windows of `per_window` distinct runs
+    /// each, so it has a habit of its own to be judged against.
+    fn fan_history(s: &Store, agent: &str, per_window: u64, windows: i64, now: i64, w: i64) {
+        for k in (1..=windows).rev() {
+            let base = now - k * w;
+            for i in 0..per_window {
+                let ts = base + i as i64;
+                s.ingest_at("acme", &[fan(agent, &format!("w{k}-r{i}"), ts)], ts);
+            }
+        }
+    }
+
+    /// An agent whose ordinary job IS a wide fan-out is not exploding. This is
+    /// the fault the baseline was added for: a count measures a size, and the
+    /// word promises a change.
+    #[test]
+    fn a_steady_fan_out_is_not_an_explosion() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let w = cfg.fanout_window_ms;
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+
+        // Five windows at six runs each: well over the floor of four, and
+        // entirely normal for this agent.
+        fan_history(&s, "orchestrator", 6, 5, now, w);
+        for i in 0..6 {
+            s.ingest_at(
+                "acme",
+                &[fan("orchestrator", &format!("now-r{i}"), now + i)],
+                now + i,
+            );
+        }
+
         assert!(
             s.incidents("acme")
                 .iter()
                 .all(|i| i.kind != "fanout_explosion"),
-            "under distinct-run threshold"
+            "a habit is not an explosion, however wide"
         );
+    }
 
-        // A fourth distinct run trips it.
-        s.ingest_at("acme", &[fan("orchestrator", "r4", now)], now);
+    /// And the case it exists for: the same agent, far past its own habit.
+    #[test]
+    fn a_jump_over_its_own_habit_is_an_explosion() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let w = cfg.fanout_window_ms;
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+
+        fan_history(&s, "orchestrator", 2, 5, now, w); // normally two runs
+        for i in 0..12 {
+            s.ingest_at(
+                "acme",
+                &[fan("orchestrator", &format!("now-r{i}"), now + i)],
+                now + i,
+            );
+        }
+
         let inc = s
             .incidents("acme")
             .into_iter()
             .find(|i| i.kind == "fanout_explosion")
-            .expect("fanout_explosion incident");
+            .expect("six times its own habit, over the floor");
         assert_eq!(inc.id, "fanout_explosion:orchestrator");
         assert_eq!(inc.severity, tokenfuse_core::Severity::High);
         assert!(inc.run_id.is_none(), "agent-scoped, no run");
         assert_eq!(inc.agent_id.as_deref(), Some("orchestrator"));
+    }
 
-        // Re-driving the SAME run adds no NEW distinct run (the count stays at
-        // 4, not 5), yet still upserts the one incident in place — proving the
-        // tracker is distinct-by-run and dedups rather than piling up.
-        s.ingest_at("acme", &[fan("orchestrator", "r4", now + 1)], now + 1);
-        let fanouts: Vec<_> = s
+    /// Four times almost nothing is still almost nothing.
+    #[test]
+    fn a_jump_below_the_floor_is_not_an_explosion() {
+        let cfg = IncidentConfig {
+            fanout_runs: 20,
+            ..Default::default()
+        };
+        let w = cfg.fanout_window_ms;
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+
+        fan_history(&s, "orchestrator", 1, 5, now, w);
+        for i in 0..8 {
+            s.ingest_at(
+                "acme",
+                &[fan("orchestrator", &format!("now-r{i}"), now + i)],
+                now + i,
+            );
+        }
+
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "eight runs is not an explosion when the floor is twenty"
+        );
+    }
+
+    /// An agent with no completed window of its own has not exploded. It has
+    /// started, and nothing here knows its habit yet.
+    #[test]
+    fn an_agent_with_no_habit_yet_has_not_exploded() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+
+        for i in 0..20 {
+            s.ingest_at(
+                "acme",
+                &[fan("newcomer", &format!("r{i}"), now + i)],
+                now + i,
+            );
+        }
+
+        assert!(
+            s.incidents("acme")
+                .iter()
+                .all(|i| i.kind != "fanout_explosion"),
+            "no history means no habit to have departed from"
+        );
+    }
+
+    /// Invariant 7's shape here too: reported on the crossing, not on every
+    /// batch while the fan-out holds.
+    #[test]
+    fn an_explosion_is_reported_once_per_crossing() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let w = cfg.fanout_window_ms;
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+
+        fan_history(&s, "orchestrator", 2, 5, now, w);
+        for i in 0..12 {
+            s.ingest_at(
+                "acme",
+                &[fan("orchestrator", &format!("now-r{i}"), now + i)],
+                now + i,
+            );
+        }
+        // More of the same fan-out, still inside the same window.
+        for i in 12..20 {
+            s.ingest_at(
+                "acme",
+                &[fan("orchestrator", &format!("now-r{i}"), now + i)],
+                now + i,
+            );
+        }
+
+        let inc = s
             .incidents("acme")
             .into_iter()
-            .filter(|i| i.kind == "fanout_explosion")
-            .collect();
-        assert_eq!(fanouts.len(), 1, "same incident, not a duplicate");
-        assert_eq!(fanouts[0].occurrences, 2);
-        assert_eq!(fanouts[0].last_seen_millis, now + 1);
+            .find(|i| i.kind == "fanout_explosion")
+            .expect("the crossing itself");
+        assert_eq!(
+            inc.occurrences, 1,
+            "one crossing reported {} times",
+            inc.occurrences
+        );
     }
 
     /// A tripped `fanout_explosion` incident (which always carries an
@@ -4558,27 +4790,22 @@ mod tests {
 
         let cfg = IncidentConfig {
             fanout_runs: 2,
+            // The smallest multiple the detector accepts, so this test stays
+            // about the EXPORT rather than about how far past its habit an
+            // agent has to go.
+            fanout_multiple: 2,
             ..Default::default()
         };
+        let w = cfg.fanout_window_ms;
         let s = Store::with_incident_config(cfg).with_event_exporter(exporter);
-        let now = 1_000_000;
-        let fan = |agent: &str, run: &str, ts: i64| CallRecord {
-            run_id: run.into(),
-            agent_id: agent.into(),
-            decision: "allow".into(),
-            ts_millis: ts,
-            ..Default::default()
-        };
-        s.ingest_at(
-            "acme",
-            &[fan("agent://acme.example/orchestrator", "r1", now - 1)],
-            now,
-        );
-        s.ingest_at(
-            "acme",
-            &[fan("agent://acme.example/orchestrator", "r2", now)],
-            now,
-        );
+        let now = 100_000_000;
+        let agent = "agent://acme.example/orchestrator";
+        // A habit of one run per window, then two at once: over the floor and
+        // over its own normal, which is what the detector asks for since
+        // 2026-08-03.
+        fan_history(&s, agent, 1, 5, now, w);
+        s.ingest_at("acme", &[fan(agent, "r1", now)], now);
+        s.ingest_at("acme", &[fan(agent, "r2", now + 1)], now + 1);
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
