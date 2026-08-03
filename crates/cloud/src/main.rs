@@ -85,6 +85,16 @@ async fn main() {
             .filter(|p| *p > 0.0)
             .map(|usd| (usd * 1e6) as i64)
             .unwrap_or(defaults.spend_per_min_micros),
+        // How many times its own baseline a minute has to be. Below 2 the word
+        // "spike" stops meaning anything, so a smaller value is refused rather
+        // than honoured: a detector that fires on ordinary variation is the
+        // problem this predicate was rewritten to fix.
+        spike_multiple: env_u64(
+            "TOKENFUSE_CLOUD_INCIDENT_SPIKE_MULTIPLE",
+            defaults.spike_multiple as u64,
+        )
+        .max(2) as i64,
+        spike_baseline_ms: defaults.spike_baseline_ms,
         fanout_runs: env_u64("TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS", defaults.fanout_runs),
         fanout_window_ms: defaults.fanout_window_ms,
     };

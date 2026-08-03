@@ -486,9 +486,24 @@ pub struct IncidentConfig {
     pub loop_repeats: u64,
     /// Window for the `sustained_loop` repeat count.
     pub loop_window_ms: i64,
-    /// `spend_spike` trips when an org's last-minute burn reaches this rate
+    /// The FLOOR under `spend_spike`
     /// (`TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD`, stored as microdollars).
+    ///
+    /// Until 2026-08-03 this was the whole trigger, which made the name a lie:
+    /// an org that steadily burns above the line, entirely normally for them,
+    /// raised a "spike" for as long as it kept working. A spike is a CHANGE, so
+    /// the detector now compares the last minute against the org's own recent
+    /// normal and keeps this value as the floor beneath which no multiple
+    /// counts. Without a floor, a rounding error over near-zero spend is an
+    /// infinite multiple.
     pub spend_per_min_micros: i64,
+    /// How many times its own baseline an org's last minute has to be before
+    /// `spend_spike` calls it a spike
+    /// (`TOKENFUSE_CLOUD_INCIDENT_SPIKE_MULTIPLE`).
+    pub spike_multiple: i64,
+    /// How far back `spend_spike` looks for "normal", ending where the
+    /// measured minute begins.
+    pub spike_baseline_ms: i64,
     /// `fanout_explosion` trips when one `agent_id` drives ≥ this many DISTINCT
     /// runs within `fanout_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS`).
     pub fanout_runs: u64,
@@ -503,6 +518,8 @@ impl Default for IncidentConfig {
             loop_repeats: 3,
             loop_window_ms: 600_000,
             spend_per_min_micros: 5_000_000,
+            spike_multiple: 4,
+            spike_baseline_ms: 1_800_000,
             fanout_runs: 20,
             fanout_window_ms: 600_000,
         }
@@ -728,6 +745,12 @@ struct Inner {
     /// gateways poll `GET /v1/unit-budgets` and apply these over the
     /// identity map's own `budget_usd_month`.
     unit_budgets: HashMap<String, HashMap<String, i64>>,
+    /// org → whether it is spiking right now, so `spend_spike` emits on the
+    /// TRANSITION rather than on every ingest batch while the condition holds.
+    /// In memory like the other trackers here and deliberately not persisted:
+    /// a restart mid-spike costs one extra event, which is cheaper than any
+    /// scheme that would have to delete the incident to re-arm.
+    spike_active: HashMap<String, bool>,
     /// org → bounded log of recent samples for the burn-rate series
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
@@ -1016,6 +1039,7 @@ impl Store {
         // `budget_threshold`'s budget/spend pair, which the generic
         // `{org, occurrences}` payload has no place for.
         let mut threshold_extra: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut spike_extra: HashMap<String, serde_json::Value> = HashMap::new();
         {
             let mut guard = self.inner.write().unwrap();
             guard.dirty = true;
@@ -1449,14 +1473,63 @@ impl Store {
                 }
             }
 
-            // spend_spike (High): org burn over the last minute, summed from the
-            // SAME sample log `series()` buckets — not a second time-series.
-            let burn = inner
+            // spend_spike (High): the org's last minute against ITS OWN recent
+            // normal, from the SAME sample log `series()` buckets, not a second
+            // time-series.
+            //
+            // Until 2026-08-03 this compared the minute against a fixed rate,
+            // which is a LEVEL. An org whose ordinary working day sits above
+            // that line raised a "spike" continuously, and an org whose spend
+            // genuinely jumped tenfold under the line raised nothing. The name
+            // promised a change and the predicate measured a height.
+            //
+            // Three conditions, and each earns its place:
+            //
+            //   - a FLOOR (`spend_per_min_micros`), because without one a jump
+            //     from a rounding error to twice a rounding error is an
+            //     infinite multiple;
+            //   - a MULTIPLE of the org's own baseline, which is what makes the
+            //     word "spike" true;
+            //   - some HISTORY, because an org whose first ever minute is
+            //     expensive has not spiked, it has arrived, and this process
+            //     has no idea what normal is for it yet.
+            //
+            // A baseline of zero is deliberately allowed to trip: an org that
+            // was idle and is suddenly spending IS the runaway case this exists
+            // for, and the floor is what keeps that honest.
+            let (burn, baseline_per_min, has_history) = inner
                 .series
                 .get(org)
-                .map(|log| burn_since(log, now_ms - SPIKE_WINDOW_MS, now_ms))
-                .unwrap_or(0);
-            if burn >= cfg.spend_per_min_micros {
+                .map(|log| {
+                    let burn = burn_since(log, now_ms - SPIKE_WINDOW_MS, now_ms);
+                    let base_start = now_ms - SPIKE_WINDOW_MS - cfg.spike_baseline_ms;
+                    let base = burn_since(log, base_start, now_ms - SPIKE_WINDOW_MS);
+                    let minutes = (cfg.spike_baseline_ms / SPIKE_WINDOW_MS).max(1);
+                    // Samples are pushed in arrival order, so the front is the
+                    // oldest this process still holds. Anything older than the
+                    // measured minute is enough to say we have seen this org
+                    // before now.
+                    let seen_before = log
+                        .front()
+                        .is_some_and(|s| s.ts_millis < now_ms - SPIKE_WINDOW_MS);
+                    (burn, base / minutes, seen_before)
+                })
+                .unwrap_or((0, 0, false));
+
+            let spiking = has_history
+                && burn >= cfg.spend_per_min_micros
+                && burn >= baseline_per_min.saturating_mul(cfg.spike_multiple);
+
+            // Edge-triggered, for the reason invariant 7 gives about
+            // `budget_threshold`: a condition that stays true would otherwise
+            // write a line into the shared event log on every ingest batch, and
+            // that log is the resource this stack saturates first. The marker
+            // is in memory, like the other trackers here, so a restart during a
+            // spike can emit one more event. That is the honest trade: the
+            // alternative is deleting the incident when the spike ends, which
+            // would take it off the console before anyone had seen it.
+            let was_spiking = inner.spike_active.get(org).copied().unwrap_or(false);
+            if spiking && !was_spiking {
                 let inc = upsert_incident(
                     &mut inner.incidents,
                     org,
@@ -1467,7 +1540,27 @@ impl Store {
                     None,
                     now_ms,
                 );
+                // The numbers a human needs to judge it, which the old event
+                // did not carry: what it burned, what it usually burns, and
+                // how many times over that is.
+                spike_extra.insert(
+                    inc.id.clone(),
+                    serde_json::json!({
+                        "burn_micros": burn,
+                        "baseline_micros_per_min": baseline_per_min,
+                        "multiple": if baseline_per_min > 0 {
+                            burn / baseline_per_min
+                        } else {
+                            0
+                        },
+                        "window_ms": SPIKE_WINDOW_MS,
+                        "baseline_ms": cfg.spike_baseline_ms,
+                    }),
+                );
                 fired.insert(inc.id.clone(), inc);
+            }
+            if spiking != was_spiking {
+                inner.spike_active.insert(org.to_string(), spiking);
             }
         }
         for run in updated {
@@ -1490,12 +1583,14 @@ impl Store {
                     "org": inc.org,
                     "occurrences": inc.occurrences,
                 });
-                if let (Some(obj), Some(extra)) = (
-                    data.as_object_mut(),
-                    threshold_extra.get(&inc.id).and_then(|e| e.as_object()),
-                ) {
-                    for (k, v) in extra {
-                        obj.insert(k.clone(), v.clone());
+                for extra in [threshold_extra.get(&inc.id), spike_extra.get(&inc.id)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let (Some(obj), Some(extra)) = (data.as_object_mut(), extra.as_object()) {
+                        for (k, v) in extra {
+                            obj.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 let outcome = self.event_exporter.emit(
@@ -4158,28 +4253,146 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spend_spike_fires_over_burn_rate() {
-        let s = Store::new(); // default 5 USD/min = 5_000_000 micros
-        let now = 1_000_000;
-        // 4 USD in the last minute — under the rate.
-        s.ingest_at("acme", &[block_at("r1", "allow", 4_000_000, now)], now);
-        assert!(s.incidents("acme").iter().all(|i| i.kind != "spend_spike"));
+    /// Feed one org a steady per-minute burn for `minutes`, ending at `now`.
+    fn steady(s: &Store, per_min: i64, minutes: i64, now: i64) {
+        for m in (1..=minutes).rev() {
+            let ts = now - m * 60_000;
+            s.ingest_at("acme", &[block_at("r-base", "allow", per_min, ts)], ts);
+        }
+    }
 
-        // Another $2 tips the minute's burn over 5 USD.
-        s.ingest_at(
-            "acme",
-            &[block_at("r1", "allow", 2_000_000, now + 1)],
-            now + 1,
+    // The rewrite, and the reason for it. An org whose ordinary working day
+    // sits above the configured rate used to raise a "spike" on every ingest
+    // batch, for as long as it kept working: a claim about a CHANGE made by a
+    // predicate that only measured a HEIGHT.
+    //
+    // Observed through the incident rather than the event log, because a
+    // `spend_spike` event never reaches the log at all: it is org-scoped with
+    // no `agent_id`, and the exporter skips those rather than inventing one.
+    #[test]
+    fn a_steady_burn_above_the_line_stops_being_a_spike() {
+        let s = Store::new(); // floor 5 USD/min, multiple 4
+        let now = 100_000_000;
+        // Forty minutes at 8 USD/min: well over the floor, and utterly normal
+        // for this org. Its ramp-up from nothing is a real transition and may
+        // raise one incident; what must NOT happen is that it keeps raising.
+        steady(&s, 8_000_000, 40, now);
+
+        let before = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "spend_spike")
+            .map(|i| (i.occurrences, i.last_seen_millis));
+
+        // Ten more minutes of exactly the same, ending now.
+        steady(&s, 8_000_000, 10, now + 600_000);
+
+        let after = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "spend_spike")
+            .map(|i| (i.occurrences, i.last_seen_millis));
+
+        assert_eq!(
+            before, after,
+            "ten more identical minutes moved the spike incident: a steady burn is being re-reported as a change"
         );
+    }
+
+    // And the case it exists for: the same org, same floor, jumping over its
+    // own normal.
+    #[test]
+    fn a_jump_over_its_own_normal_is_a_spike() {
+        let s = Store::new();
+        let now = 100_000_000;
+        steady(&s, 2_000_000, 40, now); // 2 USD/min is this org's normal
+        s.ingest_at("acme", &[block_at("r1", "allow", 20_000_000, now)], now);
+
         let inc = s
             .incidents("acme")
             .into_iter()
             .find(|i| i.kind == "spend_spike")
-            .expect("spend_spike incident");
+            .expect("ten times its own baseline, over the floor");
         assert_eq!(inc.id, "spend_spike:", "org-scoped, empty run scope");
         assert_eq!(inc.severity, tokenfuse_core::Severity::High);
         assert!(inc.run_id.is_none());
+    }
+
+    // A tenfold jump that is still pocket change is not worth waking anybody.
+    // Without this floor, a rounding error doubling is an infinite multiple.
+    #[test]
+    fn a_jump_below_the_floor_is_not_a_spike() {
+        let s = Store::new();
+        let now = 100_000_000;
+        steady(&s, 1_000, 40, now); // a tenth of a cent a minute
+        s.ingest_at("acme", &[block_at("r1", "allow", 100_000, now)], now);
+
+        assert!(
+            s.incidents("acme").iter().all(|i| i.kind != "spend_spike"),
+            "100x a rounding error is still a rounding error"
+        );
+    }
+
+    // An org whose first ever minute is expensive has not spiked. It has
+    // arrived, and this process has no idea what normal is for it.
+    #[test]
+    fn an_org_with_no_history_has_not_spiked() {
+        let s = Store::new();
+        let now = 100_000_000;
+        s.ingest_at("acme", &[block_at("r1", "allow", 50_000_000, now)], now);
+
+        assert!(
+            s.incidents("acme").iter().all(|i| i.kind != "spend_spike"),
+            "no history means no baseline to have departed from"
+        );
+    }
+
+    // Idle to hot IS the runaway case, and a zero baseline must trip it. The
+    // floor is what keeps that honest.
+    #[test]
+    fn a_quiet_org_that_suddenly_spends_is_a_spike() {
+        let s = Store::new();
+        let now = 100_000_000;
+        // One tiny sample an hour ago: history exists, the last half hour is
+        // empty, so the baseline is zero.
+        let old = now - 3_600_000;
+        s.ingest_at("acme", &[block_at("r-old", "allow", 1_000, old)], old);
+        s.ingest_at("acme", &[block_at("r1", "allow", 30_000_000, now)], now);
+
+        assert!(
+            s.incidents("acme").iter().any(|i| i.kind == "spend_spike"),
+            "idle to 30 USD in a minute is exactly what this detector is for"
+        );
+    }
+
+    // Invariant 7's shape, now owed by this detector too: a condition that
+    // stays true must be reported on the TRANSITION, or every ingest batch
+    // re-reports it. Counted on the incident, since the event for this kind is
+    // skipped for want of an `agent_id` and never reaches the log.
+    #[test]
+    fn a_spike_is_reported_once_per_crossing() {
+        let s = Store::new();
+        let now = 100_000_000;
+        steady(&s, 2_000_000, 40, now);
+
+        for i in 0..3 {
+            s.ingest_at(
+                "acme",
+                &[block_at("r1", "allow", 20_000_000, now + i)],
+                now + i,
+            );
+        }
+
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.kind == "spend_spike")
+            .expect("the crossing itself");
+        assert_eq!(
+            inc.occurrences, 1,
+            "three batches inside one spike reported it {} times",
+            inc.occurrences
+        );
     }
 
     #[test]
@@ -4397,7 +4610,12 @@ mod tests {
             ..Default::default()
         };
         let s = Store::with_incident_config(cfg).with_event_exporter(exporter.clone());
-        let now = 1_000_000;
+        // A spike needs a history to have departed from, since 2026-08-03. One
+        // quiet sample an hour ago is enough to say this org existed and was
+        // not spending, which is what makes the next minute a change.
+        let now = 100_000_000;
+        let old = now - 3_600_000;
+        s.ingest_at("acme", &[block_at("r-old", "allow", 1_000, old)], old);
         s.ingest_at("acme", &[block_at("r1", "allow", 2_000_000, now)], now);
         assert!(s.incidents("acme").iter().any(|i| i.kind == "spend_spike"));
 
