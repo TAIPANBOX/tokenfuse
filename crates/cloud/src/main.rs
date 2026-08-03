@@ -96,6 +96,13 @@ async fn main() {
         .max(2) as i64,
         spike_baseline_ms: defaults.spike_baseline_ms,
         fanout_runs: env_u64("TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS", defaults.fanout_runs),
+        // Same floor as the spike multiple and for the same reason: below 2 the
+        // word stops meaning anything.
+        fanout_multiple: env_u64(
+            "TOKENFUSE_CLOUD_INCIDENT_FANOUT_MULTIPLE",
+            defaults.fanout_multiple,
+        )
+        .max(2),
         fanout_window_ms: defaults.fanout_window_ms,
     };
 
