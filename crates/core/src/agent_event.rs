@@ -98,6 +98,24 @@ pub enum EventType {
     /// Raised at the gateway's identity gate. Severity `high`, the same
     /// auth-family band as `dlp_block`/`taint_block`.
     IdentityMismatch,
+    /// A business unit's MONTHLY cap is gone (docs/20). Every call attributed
+    /// to that unit is refused until somebody raises the cap or the month
+    /// rolls, so the blast radius is wider than the run that happened to hit
+    /// it first.
+    ///
+    /// Exists because `breaker_tripped` dropped to `medium` on 2026-08-03,
+    /// which is right for a refusal whose reason has its own type, and this
+    /// reason did not have one. A unit that has stopped spending for the rest
+    /// of the month is not a per-call audit line.
+    UnitCapExceeded,
+    /// A call refused by the GATEWAY'S OWN policy engine, either the built-in
+    /// evaluator or a wasm module, in enforce mode.
+    ///
+    /// The same wire type wardryx uses for a refusal at the policy plane, on
+    /// purpose: to whoever reads the mail it is the same fact, an action
+    /// refused by policy, and `source` says which plane decided. Added for the
+    /// same reason as [`EventType::UnitCapExceeded`].
+    PolicyDeny,
     /// New (docs/23, mcp-broker v2): one MCP `tools/call` that passed through
     /// the broker's Wardryx policy gate. `data` carries `{tool, upstream,
     /// decision}` where `decision` is the PDP's own `allow|deny|hold` (or
@@ -128,6 +146,8 @@ impl EventType {
             EventType::TaintBlock => "taint_block",
             EventType::McpDrift => "mcp_drift",
             EventType::IdentityMismatch => "identity_mismatch",
+            EventType::UnitCapExceeded => "unit_cap_exceeded",
+            EventType::PolicyDeny => "policy_deny",
             EventType::ToolCall => "tool_call",
         }
     }
@@ -136,7 +156,8 @@ impl EventType {
     /// site can misclassify an event. Mapping:
     /// `budget_exhausted` / `mcp_drift` = `critical`;
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
-    /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` = `high`;
+    /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
+    /// `unit_cap_exceeded` / `policy_deny` = `high`;
     /// `budget_threshold` / `breaker_tripped` = `medium`;
     /// `tool_call` = `low`.
     ///
@@ -171,7 +192,9 @@ impl EventType {
             | EventType::DlpBlock
             | EventType::TaintBlock
             | EventType::IdentityMismatch
-            | EventType::RunKilled => Severity::High,
+            | EventType::RunKilled
+            | EventType::UnitCapExceeded
+            | EventType::PolicyDeny => Severity::High,
             // An early warning, on purpose one band below the incident it
             // warns about: the run is still inside its budget. Beside it, the
             // per-call record of a refusal that already happened, which is the
@@ -523,6 +546,8 @@ mod tests {
             EventType::TaintBlock,
             EventType::IdentityMismatch,
             EventType::RunKilled,
+            EventType::UnitCapExceeded,
+            EventType::PolicyDeny,
         ] {
             assert_eq!(t.severity(), Severity::High, "{t:?}");
         }
@@ -537,6 +562,14 @@ mod tests {
         // a notifier with a `high` floor must leave it in the daily digest
         // rather than mail it. This was `critical` until 2026-08-03.
         assert_eq!(EventType::BreakerTripped.severity(), Severity::Medium);
+        // The two that exist BECAUSE breaker_tripped is medium: a refusal
+        // whose reason has no other event must still be able to reach a
+        // person. See `gateway::proxy::specific_event_for`.
+        assert_eq!(
+            EventType::UnitCapExceeded.as_wire_str(),
+            "unit_cap_exceeded"
+        );
+        assert_eq!(EventType::PolicyDeny.as_wire_str(), "policy_deny");
         assert_eq!(EventType::BudgetExhausted.severity(), Severity::Critical);
     }
 
