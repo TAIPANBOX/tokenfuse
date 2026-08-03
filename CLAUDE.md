@@ -141,11 +141,11 @@ build)`, `cloud apns (feature build)`.
    *(test: `budget_threshold_is_exported_once_per_crossing`, plus
    `raising_a_budget_lets_the_threshold_fire_again` for the reset)*
 
-   The same shape check is owed to `spend_spike`, which is also level-triggered
-   (an org's burn rate stays high for as long as it stays high) and does
-   re-emit per ingest batch today. Not changed here: it has shipped that way,
-   and altering when an existing incident reaches the console's stream is a
-   behaviour change that needs its own decision, not a drive-by.
+   `spend_spike` was the same shape and was left alone here, then rewritten on
+   2026-08-03 (invariant 10): it is now edge-triggered too, on the transition
+   into a spike, with the marker in memory beside the other trackers rather
+   than on the incident. A restart mid-spike therefore costs one extra report,
+   which is the price of not deleting the incident to re-arm it.
 
 8. **An incident's name is a claim, and its trigger has to support that
    claim.** `budget_exhausted` fires on `budget_exceeded` and on nothing else.
@@ -189,6 +189,31 @@ build)`, `cloud apns (feature build)`.
    do NOT get a second one, since double-reporting would make every count of
    them wrong; plus `both_new_events_outrank_the_generic_one`)*
 
+10. **A spike is a change, and the predicate has to measure one.** `spend_spike`
+   compares an org's last minute against ITS OWN recent normal: the burn over
+   the preceding half hour, per minute, times a configured multiple, with the
+   old fixed rate kept as a floor beneath which no multiple counts.
+
+   It used to be the rate alone, which measured a HEIGHT while the name
+   promised a CHANGE. An org whose ordinary working day sat above the line
+   raised a spike on every ingest batch for as long as it kept working, and an
+   org whose spend genuinely jumped tenfold under the line raised nothing. This
+   is invariant 8's shape again, found by the audit invariant 8 asked for.
+
+   Three conditions, each earning its place: the floor, because without one a
+   jump from a rounding error to twice a rounding error is an infinite
+   multiple; the multiple, which is what makes the word true; and some history,
+   because an org whose first ever minute is expensive has not spiked, it has
+   arrived. A baseline of zero is deliberately allowed to trip, since idle to
+   hot is the runaway case this exists for, and the floor is what keeps that
+   honest.
+   *(test: `a_steady_burn_above_the_line_stops_being_a_spike`,
+   `a_jump_over_its_own_normal_is_a_spike`, `a_jump_below_the_floor_is_not_a_spike`,
+   `an_org_with_no_history_has_not_spiked`,
+   `a_quiet_org_that_suddenly_spends_is_a_spike`,
+   `a_spike_is_reported_once_per_crossing`; the first, the fourth and the last
+   fail on the old predicate, which is how they were checked)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
@@ -231,13 +256,7 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   `sustained_loop`, `budget_threshold` and `quality_drift` say what they do.
   Two do not:
 
-  - **`spend_spike` is not a spike.** It fires when the org's burn over the
-    last minute crosses a fixed constant (`spend_per_min_micros`, default
-    5 USD/min). An org that steadily burns above that line raises a "spike"
-    forever. The predicate measures a LEVEL and the name promises a CHANGE,
-    which is exactly the shape invariant 8 is about. Unfixed: renaming a wire
-    type is a spec change and re-basing the predicate on the org's own recent
-    history is a behaviour change, and neither is a drive-by.
+  - ~~**`spend_spike` is not a spike.**~~ Fixed 2026-08-03, invariant 10.
   - **`spend_spike` can never reach a notifier.** It is org-scoped with no
     `agent_id`, and the exporter refuses to invent one (invariant 6, correctly).
     So a `high` incident is visible in the console and structurally invisible
