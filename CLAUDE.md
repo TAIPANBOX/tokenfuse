@@ -147,6 +147,31 @@ build)`, `cloud apns (feature build)`.
    and altering when an existing incident reaches the console's stream is a
    behaviour change that needs its own decision, not a drive-by.
 
+8. **An incident's name is a claim, and its trigger has to support that
+   claim.** `budget_exhausted` fires on `budget_exceeded` and on nothing else.
+   It used to fire on the whole `is_budget_protection` set, which also holds
+   `loop_detected`, `policy_violation`, `wasm_policy` and `killed`. That set is
+   correct where it comes from: all five avoid spend, so all five belong in the
+   savings report. As a trigger for an incident with this name it states
+   something untrue about a run that may have no budget at all, and the stack
+   mails that sentence to a human at three in the morning.
+
+   Measured on a live cluster 2026-08-02: a run blocked three times by the loop
+   detector, no budget ever set, raised a High incident saying its budget was
+   gone, and the notifier delivered exactly that. The two thresholds are both 3
+   by default, so a real `sustained_loop` could not be raised WITHOUT a false
+   `budget_exhausted` beside it, and the fiction outranked the truth on
+   severity. Narrowed by the user's decision the same day.
+
+   The general form, which is the part worth keeping: a set that answers "did
+   this save money" is not a set that answers "did this run out of money", and
+   sharing one predicate between a report and an alert is how the second
+   question quietly inherits the first one's answer.
+   *(test: `budget_exhausted_needs_a_budget_block_not_any_saving_block`, which
+   also asserts the savings figure is unchanged, and
+   `a_looping_run_raises_the_loop_and_nothing_about_money`; both verified by
+   restoring the old predicate, which fails them)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
@@ -183,6 +208,13 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   flaky test is worse than no test.
 - **Invariant 4** ("honesty is a feature") is judgement, and stays judgement. It
   is also the one most worth re-reading before writing a README.
+- **Invariant 8 has a sibling nobody has checked.** The narrowing was found by
+  running one detector and reading its trigger. The other kinds were not
+  re-read against their own names in the same pass: `spend_spike`,
+  `fanout_explosion`, `mcp_drift` and the taint/DLP kinds each assert something
+  specific, and each is triggered by a predicate that was written for its own
+  reasons. One was wrong. That is not evidence the rest are right, and there is
+  no test that would say.
 
 ## Standing rule
 

@@ -65,6 +65,16 @@ fn is_blocked(decision: &str) -> bool {
 /// iteration) — mirrors the same tradeoff `compliance.rs::ALL_REASONS` makes
 /// in `tokenfuse-core`; see `known_decisions_cover_every_breaker_reason` below
 /// for the test that keeps this list honest against `BreakerReason`.
+/// The one decision that means a call was refused because the money ran out.
+///
+/// Named separately from [`tokenfuse_core::savings::BUDGET_PROTECTION_REASONS`]
+/// because the two answer different questions and were conflated once. That set
+/// answers "did this block avoid spend", and all five members do. This constant
+/// answers "was this run stopped by its BUDGET", and only one does. An incident
+/// that says a budget is exhausted has to be triggered by the second question:
+/// the first will happily raise it for a run that never had a budget.
+const BUDGET_BLOCK_DECISION: &str = "budget_exceeded";
+
 fn is_known_decision(decision: &str) -> bool {
     matches!(
         decision,
@@ -1270,14 +1280,33 @@ impl Store {
                 let ts = if r.ts_millis > 0 { r.ts_millis } else { now_ms };
                 let agent = (!r.agent_id.is_empty()).then(|| r.agent_id.clone());
 
-                // budget_exhausted (High): ≥ N budget-protection blocks per
-                // run. Gated on `is_known_decision` (belt-and-braces:
-                // `is_budget_protection`'s set is already a subset of known
-                // decisions, but this keeps the detector explicitly immune to
-                // an unrecognized/fabricated decision string).
-                if is_known_decision(&r.decision)
-                    && tokenfuse_core::savings::is_budget_protection(&r.decision)
-                {
+                // budget_exhausted (High): ≥ N BUDGET blocks per run.
+                //
+                // `budget_exceeded` and nothing else. This used to fire on the
+                // whole `is_budget_protection` set, which also holds
+                // `loop_detected`, `policy_violation`, `wasm_policy` and
+                // `killed`. That set is right where it comes from: all five
+                // avoid spend, so all five belong in the savings report. As
+                // the trigger for an incident named "budget exhausted" it
+                // states something that is simply not true, about a run that
+                // may have no budget at all.
+                //
+                // Measured on a live cluster 2026-08-02: a run blocked three
+                // times by the loop detector, with no budget ever set on it,
+                // raised a High incident saying its budget was gone, and the
+                // notifier mailed an operator exactly that. Worse, the loop
+                // and budget thresholds are both 3 by default, so a genuine
+                // `sustained_loop` could not be raised WITHOUT a false
+                // `budget_exhausted` beside it. Two incidents, one cause, one
+                // of them a fiction, and the fiction outranks the truth on
+                // severity.
+                //
+                // Narrowed by the user's decision 2026-08-02. The other blocks
+                // keep their own kinds: a loop is `sustained_loop`, a kill is
+                // `run_killed`, and a policy block belongs to the policy
+                // plane. `is_known_decision` is gone from this branch because
+                // an exact comparison cannot match an unrecognized string.
+                if r.decision == BUDGET_BLOCK_DECISION {
                     let n = bump_tracker(
                         &mut inner.incident_tracker,
                         &mut inner.tracker_recency,
@@ -4019,6 +4048,62 @@ mod tests {
         assert_eq!(incs.len(), 1, "same incident, not a duplicate");
         assert_eq!(incs[0].occurrences, 2);
         assert_eq!(incs[0].last_seen_millis, now + 5);
+    }
+
+    // The narrowing, and the whole reason for it: an incident that says a
+    // budget is exhausted must be raised by a BUDGET block. Every decision
+    // below avoids spend and belongs in the savings report, and not one of
+    // them says anything about a budget. Two of these runs never had one.
+    #[test]
+    fn budget_exhausted_needs_a_budget_block_not_any_saving_block() {
+        for decision in ["loop_detected", "policy_violation", "wasm_policy", "killed"] {
+            let s = Store::new(); // default budget_blocks = 3
+            let now = 1_000_000;
+            s.ingest_at(
+                "acme",
+                &[
+                    block_at("r1", decision, 1000, now - 2),
+                    block_at("r1", decision, 1000, now - 1),
+                    block_at("r1", decision, 1000, now),
+                ],
+                now,
+            );
+            assert!(
+                s.incidents("acme")
+                    .iter()
+                    .all(|i| i.kind != "budget_exhausted"),
+                "{decision} raised budget_exhausted for a run with no budget"
+            );
+            // What the block DOES mean is unaffected: it still counts as spend
+            // this stack avoided, which is the question the savings set answers.
+            assert_eq!(
+                s.savings("acme").blocked_spend_microusd,
+                3000,
+                "{decision} must still count as avoided spend"
+            );
+        }
+    }
+
+    // The pair that made the old behaviour worst. Both thresholds default to 3,
+    // so a real loop could not be reported WITHOUT a false budget incident
+    // beside it, and the fiction outranked the truth on severity: High against
+    // Medium. An operator paged by that goes looking for a budget that does not
+    // exist.
+    #[test]
+    fn a_looping_run_raises_the_loop_and_nothing_about_money() {
+        let s = Store::new();
+        let now = 1_000_000;
+        s.ingest_at(
+            "acme",
+            &[
+                block_at("r1", "loop_detected", 0, now - 2),
+                block_at("r1", "loop_detected", 0, now - 1),
+                block_at("r1", "loop_detected", 0, now),
+            ],
+            now,
+        );
+        let kinds: Vec<String> = s.incidents("acme").into_iter().map(|i| i.kind).collect();
+        assert_eq!(kinds, vec!["sustained_loop".to_string()]);
     }
 
     #[test]
