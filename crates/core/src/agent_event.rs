@@ -133,12 +133,29 @@ impl EventType {
     }
 
     /// Fixed severity per event type — NOT caller-supplied, so no emission
-    /// site can misclassify an event. Mapping (from the phase spec):
-    /// `budget_exhausted` / `mcp_drift` / `breaker_tripped` = `critical`;
+    /// site can misclassify an event. Mapping:
+    /// `budget_exhausted` / `mcp_drift` = `critical`;
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` = `high`;
-    /// `budget_threshold` = `medium` (an early warning is not an incident,
-    /// see the variant's own doc).
+    /// `budget_threshold` / `breaker_tripped` = `medium`;
+    /// `tool_call` = `low`.
+    ///
+    /// `breaker_tripped` was `critical` until 2026-08-03, which meant every
+    /// enforced 402 paged a human at the top band. A refused call is this
+    /// product working exactly as sold: enforcement, not observability. Paging
+    /// for the design succeeding is how an operator learns to filter the
+    /// sender, and then misses the one that mattered. It also sat a band ABOVE
+    /// `sustained_loop`, which is a genuine anomaly.
+    ///
+    /// Nothing is lost for most refusals, because the reason usually has its
+    /// own type at `high` or above: budget exhaustion, a loop, a kill, a DLP
+    /// or taint block, an identity mismatch. The generic event stays as the
+    /// per-call audit record with the reason in `data`. What this DOES lower
+    /// is the two refusal kinds that have no other type, a unit cap and a
+    /// gateway-local wasm policy; see CLAUDE.md, which records that rather
+    /// than leaving it to be discovered.
+    ///
+    /// Lowered by the user's decision 2026-08-03.
     ///
     /// Note this is deliberately independent of `cloud::store::Incident`'s
     /// own `severity` field (used for `/v1/incidents` today, e.g.
@@ -147,9 +164,7 @@ impl EventType {
     /// its own, newly-specified mapping.
     pub fn severity(self) -> Severity {
         match self {
-            EventType::BudgetExhausted | EventType::McpDrift | EventType::BreakerTripped => {
-                Severity::Critical
-            }
+            EventType::BudgetExhausted | EventType::McpDrift => Severity::Critical,
             EventType::SustainedLoop
             | EventType::SpendSpike
             | EventType::FanoutExplosion
@@ -158,8 +173,10 @@ impl EventType {
             | EventType::IdentityMismatch
             | EventType::RunKilled => Severity::High,
             // An early warning, on purpose one band below the incident it
-            // warns about: the run is still inside its budget.
-            EventType::BudgetThreshold => Severity::Medium,
+            // warns about: the run is still inside its budget. Beside it, the
+            // per-call record of a refusal that already happened, which is the
+            // enforcement path doing its job rather than an incident.
+            EventType::BudgetThreshold | EventType::BreakerTripped => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             EventType::ToolCall => Severity::Low,
@@ -495,11 +512,7 @@ mod tests {
 
     #[test]
     fn severity_mapping_matches_the_documented_table() {
-        for t in [
-            EventType::BudgetExhausted,
-            EventType::McpDrift,
-            EventType::BreakerTripped,
-        ] {
+        for t in [EventType::BudgetExhausted, EventType::McpDrift] {
             assert_eq!(t.severity(), Severity::Critical, "{t:?}");
         }
         for t in [
@@ -520,6 +533,10 @@ mod tests {
         // The early warning must not page at the same weight as the exhausted
         // budget it precedes, or an operator learns to ignore both.
         assert_eq!(EventType::BudgetThreshold.severity(), Severity::Medium);
+        // A refused call is the enforcement path working, not an incident, and
+        // a notifier with a `high` floor must leave it in the daily digest
+        // rather than mail it. This was `critical` until 2026-08-03.
+        assert_eq!(EventType::BreakerTripped.severity(), Severity::Medium);
         assert_eq!(EventType::BudgetExhausted.severity(), Severity::Critical);
     }
 
@@ -645,7 +662,10 @@ mod tests {
             r#""ts":"2026-07-09T03:12:44.100Z","#,
             r#""source":"tokenfuse","#,
             r#""type":"breaker_tripped","#,
-            r#""severity":"critical","#,
+            // Follows the mapping, which this test does not own: `medium`
+            // since 2026-08-03. What is golden here is the SHAPE and the key
+            // order, not this value.
+            r#""severity":"medium","#,
             r#""agent_id":"agent://acme-bank.example/support/tier1-bot","#,
             r#""run_id":"run-8842","#,
             r#""data":{"reason":"budget_exceeded"}}"#,

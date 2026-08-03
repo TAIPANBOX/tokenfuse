@@ -208,13 +208,38 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   flaky test is worse than no test.
 - **Invariant 4** ("honesty is a feature") is judgement, and stays judgement. It
   is also the one most worth re-reading before writing a README.
-- **Invariant 8 has a sibling nobody has checked.** The narrowing was found by
-  running one detector and reading its trigger. The other kinds were not
-  re-read against their own names in the same pass: `spend_spike`,
-  `fanout_explosion`, `mcp_drift` and the taint/DLP kinds each assert something
-  specific, and each is triggered by a predicate that was written for its own
-  reasons. One was wrong. That is not evidence the rest are right, and there is
-  no test that would say.
+- **Two refusals now have no high-severity representation.** `breaker_tripped`
+  dropped to `medium` on 2026-08-03, which is right for a refusal that already
+  has its own type at `high` or above: budget exhaustion, a loop, a kill, a DLP
+  or taint block, an identity mismatch. Two do not have one. A **unit cap**
+  (docs/20) and a **gateway-local wasm policy** are refused with
+  `breaker_tripped` and nothing else, so at a `high` notification floor they
+  now reach the daily digest instead of a person. Recorded rather than left to
+  be discovered: the fix is their own event types, not putting every refusal
+  back at the top band.
+- **Invariant 8's siblings were audited on 2026-08-03, and two are still
+  open.** Every incident kind and every event type was read against its
+  producing code. `mcp_drift`, `dlp_block`, `identity_mismatch`,
+  `sustained_loop`, `budget_threshold` and `quality_drift` say what they do.
+  Two do not:
+
+  - **`spend_spike` is not a spike.** It fires when the org's burn over the
+    last minute crosses a fixed constant (`spend_per_min_micros`, default
+    5 USD/min). An org that steadily burns above that line raises a "spike"
+    forever. The predicate measures a LEVEL and the name promises a CHANGE,
+    which is exactly the shape invariant 8 is about. Unfixed: renaming a wire
+    type is a spec change and re-basing the predicate on the org's own recent
+    history is a behaviour change, and neither is a drive-by.
+  - **`spend_spike` can never reach a notifier.** It is org-scoped with no
+    `agent_id`, and the exporter refuses to invent one (invariant 6, correctly).
+    So a `high` incident is visible in the console and structurally invisible
+    to any consumer of the event log. Measured on a live cluster 2026-08-02:
+    `agent-event skipped: incident has no attributed agent_id,
+    event=spend_spike, skipped_total=6`. Either that is accepted and written
+    down for operators, or the envelope needs an org-scoped subject.
+
+  `fanout_explosion` is a third, milder case: "explosion" is a fixed count (20
+  distinct runs in a window), so a busy but entirely normal agent trips it.
 
 ## Standing rule
 
