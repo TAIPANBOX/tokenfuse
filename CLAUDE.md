@@ -172,6 +172,23 @@ build)`, `cloud apns (feature build)`.
    `a_looping_run_raises_the_loop_and_nothing_about_money`; both verified by
    restoring the old predicate, which fails them)*
 
+9. **A refusal that can wake somebody has a type of its own.** This is what
+   makes `breaker_tripped = medium` honest rather than merely quieter. Every
+   reason the breaker can give either emits its own event where it is decided
+   (DLP, taint, identity) or is raised by the control plane from the settled
+   record (budget exhaustion, loops, kills). The two that had neither, a unit's
+   monthly cap and a refusal by this gateway's own policy or wasm evaluator,
+   now emit `unit_cap_exceeded` and `policy_deny` beside the generic record.
+
+   The rule generalises past these two: lowering the severity of a generic
+   event is only safe when every case it covers is also reported specifically.
+   Otherwise it is not a reduction in noise, it is a hole.
+   *(test: `the_two_refusals_with_no_other_event_get_their_own` and
+   `a_reason_that_already_has_an_event_is_not_reported_twice` in
+   `gateway::proxy`, which also pins that the six reasons with their own events
+   do NOT get a second one, since double-reporting would make every count of
+   them wrong; plus `both_new_events_outrank_the_generic_one`)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
@@ -208,15 +225,6 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   flaky test is worse than no test.
 - **Invariant 4** ("honesty is a feature") is judgement, and stays judgement. It
   is also the one most worth re-reading before writing a README.
-- **Two refusals now have no high-severity representation.** `breaker_tripped`
-  dropped to `medium` on 2026-08-03, which is right for a refusal that already
-  has its own type at `high` or above: budget exhaustion, a loop, a kill, a DLP
-  or taint block, an identity mismatch. Two do not have one. A **unit cap**
-  (docs/20) and a **gateway-local wasm policy** are refused with
-  `breaker_tripped` and nothing else, so at a `high` notification floor they
-  now reach the daily digest instead of a person. Recorded rather than left to
-  be discovered: the fix is their own event types, not putting every refusal
-  back at the top band.
 - **Invariant 8's siblings were audited on 2026-08-03, and two are still
   open.** Every incident kind and every event type was read against its
   producing code. `mcp_drift`, `dlp_block`, `identity_mismatch`,

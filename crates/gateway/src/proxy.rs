@@ -136,6 +136,38 @@ fn outcome_header(headers: &HeaderMap) -> Option<String> {
 /// stays byte-for-byte untouched (its wire contract is pinned by
 /// `breaker_error_response_matches_budget_error_byte_for_byte`) — this is
 /// purely an added side-channel at each of the five call sites.
+/// The specific event a refusal deserves BESIDE the generic `breaker_tripped`
+/// audit line, or `None` when the reason already has its own event emitted at
+/// its own site.
+///
+/// `breaker_tripped` is `medium` since 2026-08-03, on the reasoning that a
+/// refused call is the enforcement path working and that every reason worth
+/// waking somebody for carries its own type. Two did not, and this is the
+/// mapping that makes that reasoning true rather than merely stated:
+///
+/// - a **unit cap** stops a whole business unit for the rest of the month, and
+///   the run that hit it first is incidental;
+/// - a **policy refusal** decided by this gateway's own evaluator or a wasm
+///   module is the same fact wardryx reports as `policy_deny`, so it uses the
+///   same wire type with a different `source`.
+///
+/// Everything else returns `None` on purpose: budget exhaustion, loops and
+/// kills are raised by the control plane from the settled record, and DLP,
+/// taint and identity refusals emit their own events where they are decided.
+/// Emitting a second one here would double-count them.
+fn specific_event_for(reason: Option<BreakerReason>) -> Option<EventType> {
+    match reason? {
+        BreakerReason::UnitBudgetExceeded => Some(EventType::UnitCapExceeded),
+        BreakerReason::WasmPolicy | BreakerReason::PolicyViolation => Some(EventType::PolicyDeny),
+        BreakerReason::BudgetExceeded
+        | BreakerReason::LoopDetected
+        | BreakerReason::Killed
+        | BreakerReason::TaintBlocked
+        | BreakerReason::DlpBlocked
+        | BreakerReason::IdentityMismatch => None,
+    }
+}
+
 fn emit_breaker_event(
     st: &AppState,
     run_id: &str,
@@ -162,6 +194,24 @@ fn emit_breaker_event(
         }),
     );
     crate::events::log_outcome(EventType::BreakerTripped, outcome);
+
+    // The specific one, when the reason has no other event anywhere.
+    if let Some(specific) = specific_event_for(verdict.reason) {
+        let outcome = st.events.emit(
+            specific,
+            now_millis(),
+            Some(agent_id),
+            Some(run_id),
+            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            serde_json::json!({
+                "reason": verdict.reason.map(BreakerReason::as_wire_str),
+                "policy_id": verdict.policy_id,
+                "detail": verdict.detail,
+                "unit": (!unit.is_empty()).then_some(unit),
+            }),
+        );
+        crate::events::log_outcome(specific, outcome);
+    }
 }
 
 pub async fn healthz() -> &'static str {
@@ -1935,6 +1985,57 @@ fn mode_str(mode: Mode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    // -- which refusals get a second, specific event -----------------------
+
+    // The mapping that makes `breaker_tripped = medium` honest. If a reason
+    // has no other event anywhere, dropping the generic one to medium would
+    // silence it, so these two get their own.
+    #[test]
+    fn the_two_refusals_with_no_other_event_get_their_own() {
+        use tokenfuse_core::agent_event::EventType;
+        assert_eq!(
+            specific_event_for(Some(BreakerReason::UnitBudgetExceeded)),
+            Some(EventType::UnitCapExceeded)
+        );
+        for r in [BreakerReason::WasmPolicy, BreakerReason::PolicyViolation] {
+            assert_eq!(
+                specific_event_for(Some(r)),
+                Some(EventType::PolicyDeny),
+                "{r:?}"
+            );
+        }
+    }
+
+    // The other side of the same rule: a reason that already emits its own
+    // event where it is decided must not get a second one here, or every DLP
+    // block is two events and every count of them is wrong.
+    #[test]
+    fn a_reason_that_already_has_an_event_is_not_reported_twice() {
+        for r in [
+            BreakerReason::BudgetExceeded,
+            BreakerReason::LoopDetected,
+            BreakerReason::Killed,
+            BreakerReason::TaintBlocked,
+            BreakerReason::DlpBlocked,
+            BreakerReason::IdentityMismatch,
+        ] {
+            assert_eq!(specific_event_for(Some(r)), None, "{r:?}");
+        }
+        assert_eq!(specific_event_for(None), None);
+    }
+
+    // Severity is the whole point of the exercise: both must outrank the
+    // generic record they sit beside, or nothing changed.
+    #[test]
+    fn both_new_events_outrank_the_generic_one() {
+        use tokenfuse_core::agent_event::EventType;
+        use tokenfuse_core::Severity;
+        assert_eq!(EventType::BreakerTripped.severity(), Severity::Medium);
+        assert_eq!(EventType::UnitCapExceeded.severity(), Severity::High);
+        assert_eq!(EventType::PolicyDeny.severity(), Severity::High);
+    }
+
     use super::*;
     use crate::ledger_backend::{LedgerBackend, LocalLedger};
     use crate::provider::{Provider, StubProvider};
