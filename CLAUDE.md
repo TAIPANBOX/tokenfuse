@@ -257,13 +257,23 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   Two do not:
 
   - ~~**`spend_spike` is not a spike.**~~ Fixed 2026-08-03, invariant 10.
-  - **`spend_spike` can never reach a notifier.** It is org-scoped with no
-    `agent_id`, and the exporter refuses to invent one (invariant 6, correctly).
-    So a `high` incident is visible in the console and structurally invisible
-    to any consumer of the event log. Measured on a live cluster 2026-08-02:
-    `agent-event skipped: incident has no attributed agent_id,
-    event=spend_spike, skipped_total=6`. Either that is accepted and written
-    down for operators, or the envelope needs an org-scoped subject.
+  - ~~**`spend_spike` can never reach a notifier.**~~ Still true, no longer
+    debt: accepted as a BOUNDARY by the user on 2026-08-03 and documented for
+    operators in heraldyx's README, where somebody choosing what to rely on
+    will read it.
+
+    It is org-scoped with no `agent_id`, and the exporter refuses to invent one
+    (invariant 6, correctly), so a `high` incident is visible in the console and
+    structurally invisible to any consumer of the event log. Measured on a live
+    cluster 2026-08-02: `agent-event skipped: incident has no attributed
+    agent_id, event=spend_spike, skipped_total=6`.
+
+    What this forecloses is the tempting fix. Do not give the incident a
+    fallback subject, a "various" agent, or the org id in the `agent_id` field
+    to make it travel: each makes every downstream count wrong and puts a name
+    on a subject line that did not do the thing. Mailing org-wide facts means
+    the envelope grows a subject kind and every product moves together, which
+    is a change to agent-passport, not to this crate.
 
   `fanout_explosion` is a third, milder case: "explosion" is a fixed count (20
   distinct runs in a window), so a busy but entirely normal agent trips it.
