@@ -79,7 +79,7 @@ flowchart TB
 - **Produces**: priced and enforced upstream calls, agent-event NDJSON, CallRecords to its Cloud control plane, and outcome-tagged Parquet traces.
 - **Talks to**: **Wardryx** (per-request policy), its own **Cloud** control plane, and every downstream consumer (**Idryx**, **Qryx**, **Verdryx**) via the event bus. Configured by **terraform-provider-taipan**; rehearsed against by **Mockryx**.
 
-The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan.
+The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod) and heraldyx (the mail out), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan. Trailryx, the record plane, is built and not wired into this yet.
 
 Run the whole open stack locally with one command via [**stack-up**](https://github.com/TAIPANBOX/stack-up); the stack's home on the web is [**it-rat.com**](https://it-rat.com).
 
@@ -213,7 +213,7 @@ sequenceDiagram
         T-->>A: answer (passes straight through)
     else 🛑 over budget / loop detected
         T-->>A: 402 "budget_exceeded" → agent stops cleanly
-        T-->>A: 🔔 Slack alert with a [Kill] button
+        T->>T: raise an incident, export the event
     end
 ```
 
@@ -249,7 +249,7 @@ There are excellent tools *around* this problem. None of the categories below si
 | **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial | ❌ |
 | **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
 | **Enforce: stop before the damage** | ✅ | ❌ | ⚠️ key caps only | ⚠️ content only |
-| Live kill-switch (from Slack / dashboard) | ✅ | ❌ | ❌ | ❌ |
+| Live kill-switch (API, TUI, dashboard) | ✅ | ❌ | ❌ | ❌ |
 | **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ |
 | Free MCP poisoning / rug-pull scan, CI-gated | ✅ | ❌ | ❌ | ⚠️ partial |
 | Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial |
@@ -289,7 +289,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 **Cost & control**
 - 💰 **Per-run budgets**: a hard cap for a whole task, with hierarchical roll-up so a sub-agent's spend counts against its parent.
 - 🔁 **Loop / runaway detection**: identical-call, ping-pong, and context-growth detectors.
-- 🛑 **Breaker**: hard-stop a run (kill-switch) from the API, the `tokenfuse top` TUI, Slack, or the Cloud dashboard.
+- 🛑 **Breaker**: hard-stop a run (kill-switch) from the API (`POST /v1/runs/{id}/kill`), the `tokenfuse top` TUI, or the Cloud dashboard. There is no chat integration in this repository: anything that can call that endpoint can drive it, and nothing here calls Slack.
 - 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed.
 - 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
@@ -310,7 +310,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 📨 **Agent-event NDJSON export** *(opt-in)*: set `TOKENFUSE_EVENTS_PATH=<file>` and every breaker trip, DLP/taint block, and MCP rug-pull is appended as one NDJSON line in the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) event envelope (`taipanbox.dev/agent-event/v0.1`). Unset by default: zero hot-path cost, no file handle opened. Writes are fail-open (a write error is logged, never a request failure), and an event with no `x-fuse-agent-id` on the request is skipped and counted, never fabricated. Every line carries the spec's §6.5 `prev_hash` integrity chain (one file = one chain, resumed across restarts); verify a stream with `agent-conform -chain <file>`. Tamper-evidence, not tamper-proof: a partial edit or truncation no longer passes silently.
 - 🐍 **Python SDK**, sub-µs decision path, four public container images, and published npm / crates.io / PyPI packages.
 
-**Agent Passport.** TokenFuse's `x-fuse-agent-id` / `x-fuse-run-id` / `x-fuse-parent-run-id` headers, the new `x-fuse-on-behalf-of` delegation-chain header (a comma-separated, ordered, root-first list of `agent://` / `user://` URIs, capped at 4 KiB and captured to the trace verbatim, never truncated when forwarded), `parent_run_id` (now its own persisted Parquet trace column, not just an in-memory budget-hierarchy key), and the agent-event envelope above all follow one shared spec - [Agent Passport](https://github.com/TAIPANBOX/agent-passport) - used across the TAIPANBOX agent-governance stack (TokenFuse for spend, Engram for memory, Idryx for access, Qryx for crypto), so the same agent identifier and delegation chain read the same way in every product's traces and events. Idryx, specifically, ingests TokenFuse's agent-events as a behavioral source for identity-graph correlation.
+**Agent Passport.** TokenFuse's `x-fuse-agent-id` / `x-fuse-run-id` / `x-fuse-parent-run-id` headers, the new `x-fuse-on-behalf-of` delegation-chain header (a comma-separated, ordered, root-first list of `agent://` / `user://` URIs, capped at 4 KiB and captured to the trace verbatim, never truncated when forwarded), `parent_run_id` (now its own persisted Parquet trace column, not just an in-memory budget-hierarchy key), and the agent-event envelope above all follow one shared spec - [Agent Passport](https://github.com/TAIPANBOX/agent-passport) - used across the TAIPANBOX agent-governance stack (TokenFuse for spend, Wardryx for policy, Engram for memory, Idryx for access, Qryx for crypto, Verdryx for quality, Mockryx for pre-prod, heraldyx for the mail), so the same agent identifier and delegation chain read the same way in every product's traces and events. Idryx, specifically, ingests TokenFuse's agent-events as a behavioral source for identity-graph correlation.
 
 ---
 
@@ -517,7 +517,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 | **Agent** | An AI that works in a loop: think → act → observe → repeat. Powerful, but can spiral. |
 | **Run** | One complete agent task, start to finish, possibly hundreds of LLM calls. |
 | **Runaway** | An agent stuck looping or exploding in cost; the thing TokenFuse stops. |
-| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit - exposed as a kill-switch across the API, the TUI, Slack, and the Cloud dashboard. |
+| **Breaker** | The mechanism that trips and stops a run when it crosses a budget, loop, taint, DLP, or policy limit - exposed as a kill-switch across the API, the TUI, and the Cloud dashboard. |
 | **Proxy** | A middleman in the request path. You point your agent at it instead of the provider. |
 | **MCP** | A standard for agents to call external tools/servers; powerful, and a new security surface. |
 | **Rug pull** | A previously approved MCP tool that silently changes its description or schema on a later fetch. |

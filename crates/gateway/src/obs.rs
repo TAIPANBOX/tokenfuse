@@ -1,6 +1,6 @@
 //! Observability endpoints: list active runs and kill a runaway.
 //!
-//! These back the `tokenfuse top` TUI and the Slack kill-button. Everything is
+//! These back the `tokenfuse top` TUI and the kill endpoint. Everything is
 //! metadata (ids, budgets, spend, steps) — no prompt contents.
 
 use crate::state::AppState;
