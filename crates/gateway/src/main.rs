@@ -575,6 +575,31 @@ async fn serve() {
     tracing::info!(mode = ?firewall.mode, "agent firewall");
     state = state.with_firewall(Arc::new(firewall));
 
+    // TOKENFUSE_REQUIRE_RUN_ID = 1 refuses calls that carry no run id instead
+    // of passing them through unmetered. Off by default so a drop-in
+    // deployment is unchanged.
+    //
+    // Logged either way, and in the negative case logged as a plain statement
+    // of what will happen rather than as a setting name. An operator reading
+    // the startup lines should not have to know that "pass-through" means
+    // "reaches the provider and is recorded nowhere": on a live deployment on
+    // 2026-08-04 a successful call left the event stream empty for exactly
+    // this reason, and nothing on screen had said it would.
+    let require_run_id = matches!(
+        std::env::var("TOKENFUSE_REQUIRE_RUN_ID").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if require_run_id {
+        tracing::info!("metering required: a call with no x-fuse-run-id is refused");
+    } else {
+        tracing::warn!(
+            "metering is OPT-IN: a call with no x-fuse-run-id reaches the provider \
+             and is recorded in no ledger, trace or event stream \
+             (set TOKENFUSE_REQUIRE_RUN_ID=1 to refuse those calls)"
+        );
+    }
+    state = state.with_require_run_id(require_run_id);
+
     // DLP: TOKENFUSE_DLP = off | shadow | mask | block (default off).
     let dlp = match std::env::var("TOKENFUSE_DLP").as_deref() {
         Ok("shadow") => tokenfuse_core::DlpMode::Shadow,
