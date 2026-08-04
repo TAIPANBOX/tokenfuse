@@ -44,6 +44,17 @@ pub struct AppState {
     pub firewall: Arc<FirewallConfig>,
     /// Secret-scanning (DLP) mode (Off by default).
     pub dlp: DlpMode,
+    /// Refuse a call that carries no `x-fuse-run-id` instead of passing it
+    /// through unmetered (false by default).
+    ///
+    /// The pass-through is what makes this gateway drop-in safe, and it stays
+    /// the default for that reason. What it also means is that the meter is
+    /// switched on by the caller: omit the header and a real call reaches the
+    /// provider with nothing recorded in the ledger, the trace or the event
+    /// stream. That is the right trade for an evaluation and the wrong one for
+    /// a deployment whose whole claim is that every call is accounted for.
+    /// Setting this turns "unmetered" into a 400 rather than a silence.
+    pub require_run_id: bool,
     /// PII-masking mode: a separate, opt-in extension of the DLP scanner
     /// (email/card/phone, regex-only, see `tokenfuse_core::dlp`'s module
     /// doc). Off by default, and switched independently of `dlp` so an
@@ -118,6 +129,9 @@ impl AppState {
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
             dlp: DlpMode::Off,
+            // Off, so an existing drop-in deployment behaves byte for byte as
+            // it did. `with_require_run_id` is how an operator changes that.
+            require_run_id: false,
             dlp_pii: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
@@ -178,6 +192,17 @@ impl AppState {
     /// Set the DLP (secret-scanning) mode. Chainable.
     pub fn with_dlp(mut self, dlp: DlpMode) -> Self {
         self.dlp = dlp;
+        self
+    }
+
+    /// Refuse calls that would not be metered. Chainable.
+    ///
+    /// Not set means the drop-in pass-through stays, which is the historical
+    /// behaviour and the right default. Set means a missing `x-fuse-run-id`
+    /// is an error the caller can see and fix, rather than a call that
+    /// succeeded and left no trace.
+    pub fn with_require_run_id(mut self, require: bool) -> Self {
+        self.require_run_id = require;
         self
     }
 

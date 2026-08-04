@@ -242,8 +242,15 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
     let mut parsed = parse_request(&request);
 
-    // No run id → unmanaged pass-through (drop-in safe).
+    // No run id → unmanaged pass-through (drop-in safe), unless the operator
+    // has said that a call which cannot be metered is not a call this gateway
+    // makes. The refusal is deliberately a 400 and not a 403: nothing is
+    // forbidden here, the request is simply missing the header that would let
+    // it be accounted for, and the caller can fix that.
     let Some(run_id) = header_str(&headers, "x-fuse-run-id") else {
+        if st.require_run_id {
+            return metering_required();
+        }
         return match st.provider.send(headers, body).await {
             Ok(resp) => passthrough(resp, "unmanaged"),
             Err(e) => upstream_error(e),
@@ -811,6 +818,15 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // block/hold the operator's OWN call, it never acts on its behalf. Off
     // (the default) is a true no-op, no allocation and no network call.
     let mut wardryx_header: Option<String> = None;
+    // A policy question with no subject is not a question. Asking it anyway
+    // produces a 400 from the far side, which this gateway then reports as an
+    // unreachable policy plane, and an operator goes to look at a machine that
+    // was healthy all along. Refuse here instead, naming the header that is
+    // missing. Enforce only: shadow mode blocks nothing by definition, so it
+    // keeps observing with whatever attribution it was given.
+    if st.wardryx.mode == WardryxMode::Enforce && agent_id.is_empty() {
+        return identity_required();
+    }
     if st.wardryx.mode != WardryxMode::Off {
         let mut tool_names = taint::tool_names_in(&request);
         // A request-path PEP must also gate on tools the request DECLARES
@@ -1543,6 +1559,49 @@ fn unauthorized(stats: &KeyStats) -> Response {
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "application/json")
         .header("x-fuse", "unauthorized")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// A policy decision was required and the request said nothing about who it is.
+///
+/// Deliberately does not mention the policy plane: it is working, and the fault
+/// is one header away in the caller's own request.
+fn identity_required() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "identity_required",
+            "reason": "policy enforcement is on and this request carries no agent \
+                       identity; send one in `x-fuse-agent-id`",
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// A call this deployment will not make because it could not be accounted for.
+///
+/// Names the header rather than saying "bad request", because the caller can
+/// only fix what they are told about, and the whole point of refusing here is
+/// that the alternative (succeeding quietly, unrecorded) is worse.
+fn metering_required() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "metering_required",
+            "reason": "this gateway is configured to meter every call; \
+                       send the run this call belongs to in `x-fuse-run-id`",
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }
@@ -2558,6 +2617,88 @@ mod tests {
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
+    }
+
+    /// An operator has to be able to say "nothing leaves here unmetered".
+    ///
+    /// The pass-through below is deliberate and stays the default, because
+    /// dropping the gateway in front of an existing client must not break it.
+    /// But it means the meter is switched on by the CALLER: omit one header
+    /// and a real call reaches the provider with nothing recorded anywhere.
+    /// Measured on a live deployment 2026-08-04, where the event stream was
+    /// empty after a successful call for exactly this reason. A deployment
+    /// that has decided every call must be accounted for needs a way to say
+    /// so, and there was none.
+    #[tokio::test]
+    async fn a_deployment_can_refuse_calls_that_would_not_be_metered() {
+        let mut st = state(Mode::Enforce, StubProvider::default());
+        st.require_run_id = true;
+        let req = Request::post("/v1/messages")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a call with no run id must be refused when the deployment requires metering"
+        );
+        assert_eq!(resp.headers().get("x-fuse").unwrap(), "blocked");
+    }
+
+    /// A missing agent identity must not be reported as a broken policy plane.
+    ///
+    /// It was. The gateway read `x-fuse-agent-id` with `unwrap_or_default()`,
+    /// sent the resulting empty string to Wardryx as though it were an
+    /// identity, got the 400 that request deserves, and told the operator
+    /// `wardryx unreachable (response was not valid JSON)`. Measured on a live
+    /// deployment 2026-08-04: the policy plane was entirely healthy and the
+    /// missing header was in the caller's own request. An error that sends
+    /// somebody to the wrong machine costs more than no error.
+    #[tokio::test]
+    async fn a_missing_agent_identity_blames_the_caller_not_the_policy_plane() {
+        let mut st = state(Mode::Enforce, StubProvider::default());
+        // Enforce mode pointing at a port nothing is listening on. If the
+        // gateway reaches this client at all, the failmode turns the result
+        // into a 403 blaming the policy plane, which is the bug. Refusing
+        // earlier is the fix, so this client must never be called.
+        use crate::wardryx::{FailMode, Wardryx};
+        use std::time::Duration;
+        st.wardryx = Arc::new(Wardryx::new(
+            WardryxMode::Enforce,
+            FailMode::Closed,
+            "http://127.0.0.1:1",
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(0),
+        ));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "no-identity")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("x-fuse-agent-id"),
+            "the message must name the header the caller left out, got: {text}"
+        );
+        assert!(
+            !text.contains("wardryx"),
+            "must not point at the policy plane for a fault in the request, got: {text}"
+        );
+    }
+
+    /// The default is unchanged, and this test is what keeps it that way.
+    #[tokio::test]
+    async fn unmetered_pass_through_stays_the_default() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        assert!(
+            !st.require_run_id,
+            "turning this on by default would break every drop-in deployment"
+        );
     }
 
     #[tokio::test]

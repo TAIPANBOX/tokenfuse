@@ -1,0 +1,28 @@
+# cargo-audit configuration.
+#
+# An ignore here is a claim that an advisory does not reach us, and a claim
+# with nothing checking it is how a real exposure gets covered by a decision
+# somebody made about a different situation months earlier. So every entry
+# below names the reason, and `scripts/audit-ignores.sh` re-establishes that
+# reason on every CI run. If the reason stops holding, the script fails and
+# the entry has to be argued again rather than quietly protecting nothing.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0235, rkyv 0.7.46: out-of-bounds reads on archives containing
+  # Rc/Arc. Fixed in rkyv 0.8.17, which nothing here can move to.
+  #
+  # The path is tokenfuse-gateway --features cluster -> tokenfuse-cluster ->
+  # openraft 0.9.24 -> byte-unit 5.2.5 -> rust_decimal 1.42.1 -> rkyv. In
+  # rust_decimal, rkyv is behind an OPTIONAL feature (`rkyv = ["dep:rkyv"]`)
+  # that nothing in this graph enables, so cargo records it in Cargo.lock and
+  # never compiles it. cargo-audit reads the lockfile, not the build, which is
+  # the right default and the reason this entry exists.
+  #
+  # rust_decimal 1.42.1 is the latest published version, so there is no upgrade
+  # that removes the lockfile entry. What can change is the feature: anything
+  # that turns rust_decimal's `rkyv` feature on makes this vulnerability real
+  # and this entry wrong. That is exactly what scripts/audit-ignores.sh checks,
+  # by asserting rkyv is absent from the built dependency graph.
+  "RUSTSEC-2026-0235",
+]

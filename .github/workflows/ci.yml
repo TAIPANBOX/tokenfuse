@@ -149,11 +149,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: Audit workspace
-        run: cargo audit
-      - name: Audit cluster crate
-        working-directory: crates/cluster
-        run: cargo audit
+      # Both lockfiles, one ignore list, and a check that each ignore's reason
+      # still holds. Two bare `cargo audit` calls needed the list in two
+      # places, because cargo-audit reads `.cargo/audit.toml` from the current
+      # directory and does not walk up.
+      - name: Audit both lockfiles
+        run: ./scripts/audit.sh
 
   radar:
     name: radar (eBPF build)

@@ -345,28 +345,206 @@ mod tests {
         assert_eq!(ledger.snapshot("parent").unwrap().reserved, Microusd::ZERO);
     }
 
+    /// How many reservations a budget may grant, and how many racers ask.
+    ///
+    /// Everything is in whole microdollars so the arithmetic is exact: this is
+    /// money, and a test that decided what "correct" means by way of a float
+    /// would be arguing with the type the ledger deliberately uses.
+    struct Race {
+        what: &'static str,
+        budget_micros: i64,
+        unit_micros: i64,
+        threads: usize,
+        expected_grants: usize,
+    }
+
+    /// One budget, many racers, and the only number that may come out.
+    ///
+    /// This used to be a single case: fifty threads against ten dollars at a
+    /// dollar a call, expecting ten. That case is real and it is the easy one,
+    /// because the budget divides exactly and the answer is a round number that
+    /// an off-by-one would still produce half the time. The cases that decide
+    /// whether the accounting is right are the ones where it does not divide,
+    /// where one unit costs more than the whole budget, and where there are far
+    /// more racers than the budget could ever satisfy.
+    ///
+    /// The rule under test is the same in every row and does not mention
+    /// interleaving: **granted is exactly `min(callers, budget / unit)`, and the
+    /// reserved total never exceeds the budget.** Concurrency is what makes it
+    /// hard to hold, not what defines it. Each thread asks exactly once, so the
+    /// `min` matters in both directions: a budget can run out before the crowd
+    /// does, and a crowd can run out before the budget does, and refusing
+    /// somebody in the second case would be just as wrong as granting an
+    /// eleventh call in the first.
     #[test]
-    fn concurrent_reservations_never_oversubscribe_budget() {
+    fn concurrent_reservations_grant_exactly_what_the_budget_covers() {
         use std::sync::Arc;
         use std::thread;
 
+        let races = [
+            Race {
+                what: "the original case: a budget that divides exactly",
+                budget_micros: 10_000_000,
+                unit_micros: 1_000_000,
+                threads: 50,
+                expected_grants: 10,
+            },
+            Race {
+                what: "a remainder too small to buy anything, which must not be spent",
+                budget_micros: 10_500_000,
+                unit_micros: 1_000_000,
+                threads: 50,
+                expected_grants: 10,
+            },
+            Race {
+                what: "a remainder one microdollar short of another call",
+                budget_micros: 10_999_999,
+                unit_micros: 1_000_000,
+                threads: 64,
+                expected_grants: 10,
+            },
+            Race {
+                what: "one call costs more than the whole budget",
+                budget_micros: 1_000_000,
+                unit_micros: 2_000_000,
+                threads: 32,
+                expected_grants: 0,
+            },
+            Race {
+                what: "a budget worth exactly one call, with a crowd asking",
+                budget_micros: 2_000_000,
+                unit_micros: 2_000_000,
+                threads: 128,
+                expected_grants: 1,
+            },
+            Race {
+                what: "far more racers than the budget can ever satisfy",
+                budget_micros: 3,
+                unit_micros: 1,
+                threads: 200,
+                expected_grants: 3,
+            },
+            Race {
+                what: "a single caller asking once, so a failure here is not about racing",
+                budget_micros: 5_000_000,
+                unit_micros: 1_000_000,
+                threads: 1,
+                expected_grants: 1,
+            },
+            Race {
+                what: "budget larger than the crowd, so refusing anybody would be the bug",
+                budget_micros: 100_000_000,
+                unit_micros: 1_000_000,
+                threads: 8,
+                expected_grants: 8,
+            },
+            Race {
+                what: "many racers and a budget large enough for most of them",
+                budget_micros: 100_000_000,
+                unit_micros: 1_000_000,
+                threads: 128,
+                expected_grants: 100,
+            },
+            Race {
+                what: "a unit that divides awkwardly, so every grant carries a remainder",
+                budget_micros: 1_000_000,
+                unit_micros: 300_000,
+                threads: 40,
+                expected_grants: 3,
+            },
+        ];
+
+        for race in races {
+            let ledger = Arc::new(Ledger::new());
+            ledger.open_run("r1", Microusd(race.budget_micros), None);
+
+            let mut handles = Vec::new();
+            for _ in 0..race.threads {
+                let l = Arc::clone(&ledger);
+                handles.push(thread::spawn(move || {
+                    l.reserve("r1", Microusd(race.unit_micros)).is_ok()
+                }));
+            }
+            let granted = handles
+                .into_iter()
+                .map(|h| h.join().expect("no racer panicked"))
+                .filter(|&ok| ok)
+                .count();
+
+            let snapshot = ledger.snapshot("r1").expect("the run exists");
+
+            assert_eq!(
+                granted, race.expected_grants,
+                "{}: {} threads against {} micros at {} each",
+                race.what, race.threads, race.budget_micros, race.unit_micros
+            );
+            assert_eq!(
+                snapshot.reserved,
+                Microusd(race.unit_micros * race.expected_grants as i64),
+                "{}: reserved total does not match the grants handed out",
+                race.what
+            );
+            // The property that matters on its own, stated separately so a
+            // failure says which half broke.
+            assert!(
+                snapshot.reserved.0 <= race.budget_micros,
+                "{}: reserved {} exceeds the budget {}",
+                race.what,
+                snapshot.reserved.0,
+                race.budget_micros
+            );
+        }
+    }
+
+    /// Reserving and settling at the same time, which is the shape production
+    /// actually has: calls finish while others are still starting.
+    ///
+    /// A reservation is an estimate and settlement is the truth, so the two
+    /// numbers move in opposite directions under contention. What must hold
+    /// throughout is that the run never accounts for more than it was given.
+    #[test]
+    fn settling_while_others_reserve_never_exceeds_the_budget() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const UNIT: i64 = 1_000_000;
+        const BUDGET: i64 = 40_000_000;
+
         let ledger = Arc::new(Ledger::new());
-        // Budget for exactly 10 reservations of $1.
-        ledger.open_run("r1", usd(10.0), None);
+        ledger.open_run("r1", Microusd(BUDGET), None);
 
         let mut handles = Vec::new();
-        for _ in 0..50 {
+        for i in 0..64 {
             let l = Arc::clone(&ledger);
-            handles.push(thread::spawn(move || l.reserve("r1", usd(1.0)).is_ok()));
+            handles.push(thread::spawn(move || {
+                if let Ok(reservation) = l.reserve("r1", Microusd(UNIT)) {
+                    // Half the calls come in under their estimate, which is the
+                    // ordinary case and the one that frees budget back up.
+                    let actual = if i % 2 == 0 { UNIT / 2 } else { UNIT };
+                    l.settle(&reservation, Microusd(actual));
+                    true
+                } else {
+                    false
+                }
+            }));
         }
-        let granted = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .filter(|&ok| ok)
-            .count();
+        for h in handles {
+            h.join().expect("no racer panicked");
+        }
 
-        // No matter the interleaving, at most 10 reservations can be granted.
-        assert_eq!(granted, 10);
-        assert_eq!(ledger.snapshot("r1").unwrap().reserved, usd(10.0));
+        let snapshot = ledger.snapshot("r1").expect("the run exists");
+        assert!(
+            snapshot.spent.0 <= BUDGET,
+            "spent {} exceeds the budget {}",
+            snapshot.spent.0,
+            BUDGET
+        );
+        assert!(
+            snapshot.reserved.0 + snapshot.spent.0 <= BUDGET,
+            "reserved {} plus spent {} exceeds the budget {}",
+            snapshot.reserved.0,
+            snapshot.spent.0,
+            BUDGET
+        );
     }
 }
