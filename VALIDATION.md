@@ -127,6 +127,55 @@ A later concurrency run also caught and fixed a real Wardryx enforcement gap (it
 missed `attestation_method` in its key); see Wardryx's own validation notes for that one, since it lives
 in Wardryx's code even though TokenFuse's gateway is what exposed it under load.
 
+## The breaker against a real provider, and what the scanner beside it does not catch
+
+2026-08-04, on a three-node k3s cluster in AWS `eu-central-1`, gateway pointed at
+`https://api.anthropic.com/v1/messages` with a real key. Every earlier guardrail run in this
+repository used a stub provider, which is free and deterministic and cannot answer the one
+question a buyer asks first: does the breaker hold when there is real money on the other side.
+
+**It holds.** A `claude-opus-4-1` request for 2000 tokens against a budget of `0.000001` USD came
+back **HTTP 402**, `type: budget_exceeded`, `spent_usd: 0.0`, and the response body carried **no
+`request_id`**: the provider never saw the request. A managed call with a workable budget went
+through and was metered at `0.000049` USD with `x-fuse-price: known` and a real `allow` from the
+policy plane.
+
+**Under a fleet, the accounting stayed exact.** 100 agents x 3 calls: 18 blocked, and 18 was
+precisely the number the fixture should produce (5 agents priced below one call, x3, plus one
+planted runaway x3). 250 agents x 4 calls: 56 blocked, again exact. No over-permit and no
+over-refuse under contention.
+
+**Throughput, ours versus the provider's.** The same fleet with every budget set below one call
+price never leaves the cluster, so it measures the gateway, the PDP and the ledger alone:
+**1,119 decisions/s** at 250-way concurrency, against **81 calls/s** for the identical fleet with
+the provider in the path. Gateway resident memory 39 MiB, Wardryx 6 MiB. The governance layer is
+not the bottleneck and is not close to being it.
+
+**Where our half breaks, and in which direction.** At 1000-way concurrency, 6 of 2000 calls came
+back `wardryx_denied` rather than `budget_exceeded`: connections to the PDP began failing and
+`failmode=closed` denied them. 0.3% false refusals, and the alternative under `failmode=open`
+would have been 0.3% of calls passing unexamined while the run still looked clean.
+
+**DLP: what it stops and what it does not.** With `TOKENFUSE_DLP=block`, a whole
+`AKIAIOSFODNN7EXAMPLE` in a prompt was refused with `x-fuse-dlp: blocked: 1 secret(s):
+aws_access_key`, and the provider never saw it. Two things did get through, both stated here
+because a buyer will find them in five minutes:
+
+- the 40-character AWS **secret** key on its own (no distinctive prefix to match on), and
+- the same access key **split across the text** (`"part one is AKIAIOSF and part two is
+  ODNN7EXAMPLE"`).
+
+The scanner reads contiguous text. It catches carelessness, an agent that dropped a config into a
+prompt. It does not stop somebody hiding a secret on purpose, and nothing in this repository
+should be worded as though it did.
+
+**Two faults this run found, both since fixed.** A call with no `x-fuse-run-id` reached the
+provider and was recorded in no ledger, trace or event stream (all three NDJSON files at 0 bytes
+after a successful call) - now refusable with `TOKENFUSE_REQUIRE_RUN_ID=1`, and the startup line
+says in words what happens when it is not set. And a missing `x-fuse-agent-id` was passed to the
+PDP as an empty identity, whose rejection the gateway reported as `wardryx unreachable`, sending
+an operator to debug a healthy machine - now a local `identity_required` naming the header.
+
 ## Method
 
 Disposable Hetzner VPS boxes (deleted after each run) and short-lived cloud instances; code delivered as
