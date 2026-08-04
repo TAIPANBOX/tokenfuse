@@ -93,6 +93,12 @@ fn body() -> String {
 fn request_with_headers(body: &str, extra: &[(&str, &str)]) -> Request<Body> {
     let mut builder = Request::post("/v1/messages")
         .header("x-fuse-run-id", "wardryx-test-run")
+        // Enforce mode requires an agent identity before it will ask the PDP
+        // anything, so every test below that is about PDP WIRING has to send
+        // one. The absence of this header is its own case, and it has its own
+        // two tests at the bottom of this file rather than being smuggled into
+        // ten tests that are asking a different question.
+        .header("x-fuse-agent-id", "agent://wardryx-test/caller")
         .header("x-fuse-budget-usd", "5.0");
     for (k, v) in extra {
         builder = builder.header(*k, *v);
@@ -495,5 +501,115 @@ async fn declared_tool_is_forwarded_to_pdp() {
     assert!(
         tools.iter().any(|t| t.as_str() == Some("wire_transfer")),
         "a declared-but-not-invoked tool must be forwarded to the PDP, got {tools:?}"
+    );
+}
+
+/// The same request as everything above, minus the one header that says who
+/// is calling.
+fn request_without_an_agent_id(body: &str) -> Request<Body> {
+    Request::post("/v1/messages")
+        .header("x-fuse-run-id", "wardryx-test-run")
+        .header("x-fuse-budget-usd", "5.0")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Enforce mode with no agent identity is refused here, and the PDP is never
+/// asked.
+///
+/// This is a regression test for a wrong ADDRESS rather than a wrong answer.
+/// The gateway used to read `x-fuse-agent-id` with `unwrap_or_default()` and
+/// send the empty string on as an identity; Wardryx answered 400, which the
+/// gateway reported as `wardryx unreachable (response was not valid JSON)`,
+/// and under `failmode=closed` that is a 403 that sends somebody to debug a
+/// machine that was healthy the whole time.
+///
+/// So the status alone is not the assertion that matters. The two that matter
+/// are that the PDP was never called, and that the body does not mention it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforce_without_an_agent_id_is_refused_without_asking_the_pdp() {
+    let stub = WardryxStub::new(json!({ "decision": "allow" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Enforce,
+        // Fail-open, so a test that passes cannot be passing because the
+        // fallback happened to deny: with this setting an unreachable or
+        // unasked PDP would let the call THROUGH.
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app
+        .oneshot(request_without_an_agent_id(&body()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a policy question with no subject is the caller's error, not a 403 and not a pass"
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"]["type"], "identity_required");
+    let reason = error["error"]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("x-fuse-agent-id"),
+        "the refusal has to name the header that is missing, got {reason:?}"
+    );
+    assert!(
+        !reason.to_lowercase().contains("wardryx"),
+        "the policy plane is healthy and must not be named in this error, got {reason:?}"
+    );
+
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        0,
+        "the PDP must not be asked a question with no subject in it"
+    );
+}
+
+/// The mirror image: shadow mode blocks nothing by definition, so a missing
+/// agent identity must not become a refusal there.
+///
+/// Without this test, "shadow mode is untouched" is a sentence in a commit
+/// message. The observation still has to happen, with whatever attribution it
+/// was given, which is why the decide call is counted rather than ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_without_an_agent_id_still_observes_and_never_blocks() {
+    let stub = WardryxStub::new(json!({ "decision": "deny", "reason": "would deny" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    );
+    let app = tokenfuse_gateway::app(state(wardryx));
+
+    let resp = app
+        .oneshot(request_without_an_agent_id(&body()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-fuse-wardryx").unwrap(), "would-deny");
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        1,
+        "shadow mode observes; refusing here would make it act, which is the one thing it must not do"
     );
 }
