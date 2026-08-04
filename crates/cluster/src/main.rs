@@ -87,7 +87,32 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let peers = parse_peers(flags.get("peers").map(|s| s.as_str()).unwrap_or(""));
     let token = flags.get("token").cloned();
 
-    let node = HttpNode::build(id, peers, token).await?;
+    // `--dir` decides whether this node has a memory. Without it the raft log
+    // and the state machine live in RAM and a restart starts from nothing:
+    // every budget, every reservation, gone, with no error and no warning.
+    //
+    // `build_durable` has existed in the library since the redb store landed,
+    // and until now the only thing that ever called it was a test. The shipped
+    // binary could not persist at all, which made "budgets survive a node
+    // crash" true only in the sense that a quorum of OTHER nodes still had
+    // them. Found 2026-08-04 by killing the process instead of asking it to
+    // stop (`tests/kill_durability.rs`).
+    let node = match flags.get("dir") {
+        Some(dir) if !dir.is_empty() => {
+            println!("node {id} persisting to {dir}");
+            HttpNode::build_durable(id, peers, dir, token).await?
+        }
+        _ => {
+            // Said out loud rather than left to the reader of a flag list: a
+            // node that forgets on restart is a legitimate thing to run for a
+            // demo and a bad surprise in anything else.
+            println!(
+                "node {id} is IN-MEMORY: a restart loses every budget and reservation \
+                 (pass --dir <path> to persist)"
+            );
+            HttpNode::build(id, peers, token).await?
+        }
+    };
     let addr = http.parse()?;
     println!("node {id} serving on http://{http}");
 
