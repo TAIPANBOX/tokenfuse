@@ -238,6 +238,30 @@ build)`, `cloud apns (feature build)`.
    the no-history case and the once-per-crossing case fail on the old
    predicate, which is how they were checked)*
 
+11. **A silenced advisory carries a reason, and the reason is re-established on
+   every run.** `cargo audit` reads the lockfile, which is correct and is why
+   it can flag a crate cargo records but never compiles. Silencing that is
+   sometimes right; silencing it with a sentence in a comment is not, because
+   the sentence stops being true without saying so and the entry then protects
+   nothing while looking like a decision.
+
+   Today's single entry is rkyv (RUSTSEC-2026-0235), which reaches the
+   lockfile through openraft, byte-unit and rust_decimal, sits behind an
+   optional rust_decimal feature nothing enables, and is therefore never built.
+   That is a checkable fact rather than a judgement, so `scripts/audit.sh`
+   asserts it: the crate must be absent from the build graph of both manifests
+   under `--all-features --target all`, and an ignore with no recorded crate is
+   refused outright rather than trusted.
+
+   The same script is also the one caller of both audits, because the ignore
+   list would otherwise need a second copy inside `crates/cluster`:
+   cargo-audit reads `.cargo/audit.toml` from the current directory and does
+   not walk up. This estate has been bitten twice by a check living in two
+   copies.
+   *(gate: `scripts/audit.sh`; verified by pointing the recorded crate at one
+   that IS built, which fails it, and by adding an ignore with no recorded
+   reason, which also fails it)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
