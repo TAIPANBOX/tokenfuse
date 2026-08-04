@@ -20,6 +20,30 @@ increasing realism:
 The 4-node cross-machine and cross-DC runs used the product's actual intended shape - one gateway
 process per host, TLS between nodes off a shared CA, a shared bearer token - not a bespoke test rig.
 
+**A single node surviving on its own, added 2026-08-04, because until that date it did not.**
+Every row above is a QUORUM result: the killed node came back to a consistent state because the
+other two still held it, and that is a different claim from "the ledger is durable". It had to be,
+because the shipped binary had no durable mode at all: `build_durable` existed and its only caller
+was a test, so `serve` always built an in-memory node and a restart of a real server lost every
+budget and every reservation, silently. Restarting the whole cluster would have lost everything.
+
+`--dir <path>` now wires the binary to the redb-backed store, and the in-memory case says so at
+startup in words rather than by the absence of a flag. The test is
+`a_budget_survives_a_process_that_was_killed_rather_than_stopped`
+(`crates/cluster/tests/kill_durability.rs`): it spawns the real binary, `SIGKILL`s it so nothing
+gets a chance to flush or tidy up, and starts it again on the same directory. The budget and the
+reservation are both there afterwards.
+
+Two things that run measured rather than assumed. `/api/write` answers **HTTP 200 with an error
+body** while raft has no leader yet, and `/healthz` answers before `--init` runs, so a client that
+reads the status line believes a write succeeded that stored nothing; the first version of this test
+did exactly that, then blamed the disk. And the readiness worry turned out not to exist: state was
+readable **0 ms** after `/healthz` first answered.
+
+Still not measured here: power loss, where the disk's own cache is allowed to forget what it
+acknowledged. `SIGKILL` leaves the kernel and its page cache alive, so this proves recovery from a
+dead process, not from a dead machine.
+
 ## Enforcement under real load
 
 **A representative real run** (the fleet-summary dashboard referenced from the README): 6 agents, 24
