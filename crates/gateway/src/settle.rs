@@ -8,6 +8,10 @@
 //! with whatever usage was parsed so far, falling back to the reserved estimate
 //! so the budget is never left over-reserved (a leaked reservation would wrongly
 //! block later calls in the same run).
+//!
+//! The fallback is only honest when a completion actually happened, which is
+//! what [`SettleGuard::provider_refused`] decides. Either way the reservation is
+//! released, so neither answer can leak one.
 
 use crate::ledger_backend::LedgerBackend;
 use crate::provider::UsageSlot;
@@ -23,6 +27,30 @@ pub struct SettleGuard {
     model: String,
     usage: UsageSlot,
     fallback: Microusd,
+    /// Whether the upstream answered with a non-2xx, which decides whether
+    /// `fallback` may be charged at all.
+    ///
+    /// On a success the fallback is the conservative estimate it was written
+    /// to be: a completion did happen and we could not measure it, so charging
+    /// what was reserved beats letting an unmeasurable model spend a run's
+    /// budget for free. On a refusal there is no completion to measure, so the
+    /// estimate is not a fallback measurement of anything: it is a number this
+    /// gateway invented and then wrote into the run's budget, the unit's
+    /// monthly cap, the trace, the FOCUS export and the Cloud aggregates as
+    /// money somebody was billed. A provider that 429s a run repeatedly would
+    /// otherwise exhaust that run's budget on calls that cost nothing.
+    ///
+    /// This is a required constructor argument rather than a value folded into
+    /// `fallback` by the caller on purpose. `stream_managed` inherited the
+    /// buffered path's unconditional estimate and kept it through the fix for
+    /// that path (PR #167), because nothing made it answer the question. Now
+    /// nothing can construct this guard without answering it.
+    ///
+    /// Reported usage is settled as itself either way, including on a refusal:
+    /// a provider that generated part of a response and then failed over it
+    /// bills for what it generated, and that is real money rather than an
+    /// estimate. Only the "no usage to price" fallback is affected.
+    provider_refused: bool,
     reservation: Option<Reservation>,
     /// Request-scoped attribution carried into the settled `CallRecord`.
     agent_id: String,
@@ -59,6 +87,7 @@ impl SettleGuard {
         model: String,
         usage: UsageSlot,
         fallback: Microusd,
+        provider_refused: bool,
         reservation: Reservation,
         agent_id: String,
         parent_run_id: String,
@@ -76,6 +105,7 @@ impl SettleGuard {
             model,
             usage,
             fallback,
+            provider_refused,
             reservation: Some(reservation),
             agent_id,
             parent_run_id,
@@ -93,10 +123,18 @@ impl SettleGuard {
             return;
         };
         let parsed = self.usage.lock().unwrap().take();
+        // What to settle when the stream reported no usage we can price. See
+        // `provider_refused`'s doc for why a refusal may not be charged the
+        // estimate; this mirrors `buffered_managed`'s `unmeasured` binding.
+        let unmeasured = if self.provider_refused {
+            Microusd::ZERO
+        } else {
+            self.fallback
+        };
         let actual = parsed
             .as_ref()
             .and_then(|u| self.prices.cost(&self.model, u))
-            .unwrap_or(self.fallback);
+            .unwrap_or(unmeasured);
         self.ledger.settle(&reservation, actual);
         if let Some(ur) = self.unit_reservation.take() {
             self.units.settle(&ur, actual, now_millis());
@@ -174,6 +212,7 @@ mod tests {
             "m".into(),
             usage,
             Microusd::from_usd(1.0),
+            false, // a 200 stream: the estimate is a legitimate fallback
             reservation,
             String::new(),
             String::new(),
@@ -204,6 +243,7 @@ mod tests {
                 "m".into(),
                 usage,
                 fallback,
+                false, // a 200 stream: the estimate is a legitimate fallback
                 reservation,
                 String::new(),
                 String::new(),
@@ -219,6 +259,91 @@ mod tests {
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(snap.reserved, Microusd::ZERO); // reservation released, not leaked
         assert_eq!(snap.spent, fallback); // conservative fallback charge
+    }
+
+    /// The same cancel path, on a stream the provider had already refused.
+    ///
+    /// This is the case no HTTP test can reach: the two in `proxy.rs` drain the
+    /// body, so they exercise `complete()`. A client that gives up on a 429
+    /// before draining it goes through `Drop` instead, and the estimate is
+    /// exactly as invented there. The reservation must still be released, which
+    /// is the guard's whole reason for existing.
+    #[test]
+    fn a_refused_stream_dropped_without_complete_settles_zero_not_the_estimate() {
+        let (ledger, prices, usage, reservation) = setup();
+        {
+            let _guard = SettleGuard::new(
+                Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+                prices,
+                Arc::new(crate::sink::NullSink),
+                "m".into(),
+                usage,
+                Microusd::from_usd(1.0),
+                true, // the provider refused: nothing was generated
+                reservation,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                Arc::new(UnitLedger::default()),
+                None,
+            );
+            // dropped here without complete()
+        }
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(
+            snap.reserved,
+            Microusd::ZERO,
+            "the reservation is still released, refusal or not: leaking one would \
+             wrongly block later calls in the same run"
+        );
+        assert_eq!(
+            snap.spent,
+            Microusd::ZERO,
+            "but nothing is charged for a call the provider never answered"
+        );
+    }
+
+    /// A refusal that DOES report usage is still settled as that usage, on the
+    /// guard as well as through HTTP. Pins the fix as "do not charge an
+    /// estimate for nothing", not "a non-2xx is free".
+    #[test]
+    fn a_refused_stream_that_reported_usage_still_settles_it() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..Default::default()
+        });
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            prices,
+            Arc::new(crate::sink::NullSink),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            true, // refused, but it billed for what it generated
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
+        );
+        guard.complete();
+
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(
+            snap.spent,
+            Microusd::from_usd(3.0),
+            "1M input @ $3/Mtok: real money the provider reported, not zeroed"
+        );
     }
 
     #[test]
@@ -245,6 +370,7 @@ mod tests {
             "m".into(),
             usage,
             Microusd::from_usd(1.0),
+            false, // a 200 stream: the estimate is a legitimate fallback
             reservation,
             String::new(),
             String::new(),
@@ -297,6 +423,7 @@ mod tests {
             "m".into(),
             usage,
             Microusd::from_usd(1.0),
+            false, // a 200 stream: the estimate is a legitimate fallback
             reservation,
             String::new(),
             String::new(),
@@ -332,6 +459,7 @@ mod tests {
                 "m".into(),
                 usage,
                 Microusd::from_usd(1.0),
+                false, // a 200 stream: the estimate is a legitimate fallback
                 reservation,
                 String::new(),
                 String::new(),
