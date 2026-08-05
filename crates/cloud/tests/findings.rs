@@ -156,9 +156,11 @@ async fn the_same_finding_twice_is_one_incident_that_counts() {
 
 #[tokio::test]
 async fn a_viewer_key_cannot_assert_an_incident() {
-    // /v1/ingest is deliberately ungated because it submits evidence that
-    // thresholds still have to agree with. This asserts an incident outright,
-    // which is a different authority.
+    // This asserts an incident outright rather than submitting evidence a
+    // threshold still has to agree with. `/v1/ingest` was the ungated
+    // counter-example cited here until 2026-08-05, when it turned out three
+    // ingested records make the threshold agree; it is admin-gated too now
+    // (see `a_viewer_cannot_manufacture_a_budget_exhausted_incident`).
     let (state, store) = test_state();
     let (status, _) = post(
         &state,
