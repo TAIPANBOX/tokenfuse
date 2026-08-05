@@ -30,11 +30,15 @@ half that is still correct. This one used to say "v0.3.0 released" and "none of
 this has shipped in a tagged release yet" while the v0.4.0 tag had been standing
 since 2026-07-15.
 
-Note a known gap while you are in there: `PROGRESS.md`'s header is current, but
-its "What genuinely remains" section still says it was re-checked against
-#91-#110. PRs have since reached #145. Those four remaining items may well still
-stand, but nothing has re-verified them, so do not quote them as current without
-checking.
+Note the state of that file while you are in there, because its two halves now
+point opposite ways, and they have swapped since this paragraph last said
+otherwise. Its **"What genuinely remains" section can be quoted**: re-verified
+against #111-#170 on 2026-08-05, with the one-command check for each of the four
+items recorded beside it so the next reader repeats the check instead of
+trusting the sentence. Its **header and "Last updated" line cannot**: they stop
+at #139 (2026-07-24) and are around thirty PRs behind, and a track that landed
+after that date is simply absent rather than marked as missing, which is the
+failure mode that reads as "nothing happened".
 
 ## The working loop (this repo uses PR flow - unlike idryx/qryx, which push to main)
 

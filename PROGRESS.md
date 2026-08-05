@@ -164,9 +164,29 @@ see the Status-by-component rows above for the source-file detail):
   [docs/19](docs/19-wave2-governance.md)
 
 What genuinely remains is deferred scale/ops work, not a blocker for a young
-project. Re-checked against #91-#110 (2026-07-07 through 2026-07-11): none of
-the three items below were addressed by the P3/Wave-2 work, so all three still
-stand; one new near-term item is added from Wave-2's own documented follow-up:
+project.
+
+**Re-checked `@claude 2026-08-05` against #111-#170** (the previous check
+covered #91-#110 and was 60 PRs behind). All four items below still stand:
+nothing merged in that range closed any of them. Checked by reading the code
+rather than the PR titles, and each check is one command, so the next re-check
+can repeat it instead of trusting this paragraph:
+
+- **1**: no `postgres`/`clickhouse`/`sqlx` dependency in
+  `crates/cloud/Cargo.toml`, and `crates/cloud/src/store.rs` still persists by
+  JSON snapshot plus autosave.
+- **2**: no `spiffe`, `svid`, rotation, reload or file watcher anywhere in
+  `crates/cluster/src/`; every certificate still arrives as a static PEM path
+  in an env var (`TOKENFUSE_CLUSTER_TLS_CERT/_KEY`, `_MTLS_CA`,
+  `_CLIENT_CERT/_KEY`).
+- **3**: `docs/13-security-hardening.md` still opens by stating it is an
+  engineering hardening pass and not an independent third-party audit.
+- **4**: the Wardryx decision cache still evicts on
+  `cached_at.elapsed() >= self.ttl` and on nothing else
+  (`crates/gateway/src/wardryx.rs`). Worth recording as a change since the last
+  check even though the item is unmoved: `policy_version` is now carried on
+  each cache entry and returned on a hit, so the raw material a version-aware
+  invalidation would need is already in place. Nothing acts on it yet.
 
 1. **SQL/columnar Cloud store** (Postgres/ClickHouse) for scale + long retention,
    behind the existing `Store` interface.
