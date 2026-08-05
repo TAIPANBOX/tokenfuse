@@ -1573,6 +1573,17 @@ fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
 /// response deliberately elides.
 fn unauthorized(stats: &KeyStats) -> Response {
     stats.record_unauthorized();
+    unauthorized_response()
+}
+
+/// The bytes of that 401, without the counter.
+///
+/// Split out for the MCP broker (`crate::mcpbroker`), which has the same door
+/// and no `KeyStats` behind it: the aggregate counter is a feature of the
+/// metered path (docs/22-key-lifecycle.md), not of the refusal. The response
+/// itself is unchanged, which is the point of sharing it rather than writing a
+/// second one that drifts.
+pub(crate) fn unauthorized_response() -> Response {
     let body = serde_json::json!({
         "error": {
             "type": "unauthorized",

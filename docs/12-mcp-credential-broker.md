@@ -78,6 +78,42 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
 - **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
   a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
 
+## The broker's own door
+
+The broker resolves handles against the **whole** vault and forwards to any
+configured upstream, so whatever can reach the port can spend the credentials.
+Two things guard that, and until 2026-08-05 only the first existed:
+
+1. **The loopback default.** `TOKENFUSE_MCP_ADDR` defaults to
+   `127.0.0.1:4200`. Widening it used to be silent; a non-loopback bind now
+   logs a startup warning naming what is exposed, in the same voice as the
+   Cloud's own (`crates/cloud/src/main.rs`). The condition is a pure function,
+   `mcpbroker::bind_exposure_warning`, so it is testable without a listener.
+2. **Optional client credentials.** `TOKENFUSE_MCP_KEYS="secret:key_id,…"`,
+   the same form, the same header (`x-fuse-key`) and the same resolver
+   (`clientkeys.rs`) the gateway uses for `TOKENFUSE_CLIENT_KEYS`, because a
+   second authentication scheme is a second thing to get wrong. That includes
+   inheriting its documented decision to resolve a secret through a plain
+   `HashMap`: moving to a constant-time comparison is a posture change for
+   every plane at once, not something to smuggle into one crate.
+
+   **Unset means the broker authenticates nobody, exactly as before**, so no
+   loopback deployment breaks on upgrade. Set, and every JSON-RPC call must
+   present a known credential or get `401` with the gateway's own body.
+   Set-but-unusable (a typo, an empty interpolated variable) refuses to start
+   rather than reading as "off". `/healthz` stays open: it carries no vault,
+   reaches no upstream, and is what a container runtime probes before it has
+   any credential to present.
+
+   The stdio transport has no header channel and no port; its access control is
+   the operating system's, since the client is the parent process.
+
+**Still open, and deliberately not decided here.** A non-loopback bind with no
+credentials configured currently *warns*. Whether it should REFUSE to start,
+matching this repo's own precedent (commit 4b4b3fd, "gateway: refuse to start
+rather than invent usage"), is a deployment-breaking change and is the
+operator's call, not the fix's.
+
 ## Response redaction + stdio (implemented)
 
 - **Response redaction** — with `TOKENFUSE_MCP_DLP` on, secrets in a tool's

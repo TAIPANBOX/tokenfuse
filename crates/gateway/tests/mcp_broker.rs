@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use tokenfuse_core::SecretVault;
+use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
 use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
 
@@ -127,6 +128,7 @@ fn broker_state(
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock,
         wardryx: Arc::new(wardryx),
+        keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
     })
@@ -146,9 +148,27 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         dlp_pii,
         lock: None,
         wardryx: Arc::new(Wardryx::disabled()),
+        keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
     }))
+}
+
+/// A broker with its own client credentials configured. Everything else is a
+/// default, un-gated broker: the point of these tests is the door, not what is
+/// behind it.
+fn broker_keyed(upstream: String, spec: &str) -> Router {
+    let mut state = broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::disabled(),
+    );
+    let keys = ClientKeys::from_spec(spec).expect("a usable key spec");
+    Arc::get_mut(&mut state).expect("sole owner").keys = keys;
+    app(state)
 }
 
 fn a_wardryx(mode: WardryxMode, pdp_url: String) -> Wardryx {
@@ -714,6 +734,148 @@ async fn named_upstream_routes_by_header_and_refuses_unknown() {
         u["error"]["code"],
         json!(-32005),
         "an unknown upstream must be refused: {u}"
+    );
+}
+
+/// The broker resolves `{{secret:NAME}}` handles against the whole vault and
+/// forwards to any configured upstream. It authenticated nobody: the only
+/// thing between a process on the box and the vault was the default loopback
+/// bind, which `TOKENFUSE_MCP_ADDR` widens with no warning.
+///
+/// With `TOKENFUSE_MCP_KEYS` set, a call must present a known credential. The
+/// assertion that matters is the same one as for the identity gate: a refused
+/// call reaches nothing, so no handle is ever resolved into a real value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_broker_key_is_required_and_a_wrong_one_is_refused() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let broker_url = spawn_server(broker_keyed(upstream, "sk-broker-abc:tool-user")).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let http = reqwest::Client::new();
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+    });
+
+    // No credential at all.
+    let missing = http.post(&broker_url).json(&call).send().await.unwrap();
+    assert_eq!(
+        missing.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a broker with keys configured must not serve an anonymous caller"
+    );
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "unauthorized", "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(CLIENT_KEY_HEADER),
+        "the refusal has to name the header that carries the credential: {body}"
+    );
+
+    // A credential, but not one of ours.
+    let wrong = http
+        .post(&broker_url)
+        .header(CLIENT_KEY_HEADER, "sk-broker-xyz")
+        .json(&call)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an unknown credential is not a credential"
+    );
+
+    // Neither refusal may have touched the upstream or the vault. Scoped so
+    // the guard is gone before the next await, not merely dropped.
+    {
+        let forwarded = seen.lock().expect("upstream log");
+        assert!(
+            forwarded.is_empty(),
+            "a refused caller must reach nothing: {} request(s) were forwarded",
+            forwarded.len()
+        );
+        assert!(
+            !forwarded
+                .iter()
+                .any(|r| r.to_string().contains("ghp_REALSECRET")),
+            "the vault value must never leave the broker for an unauthenticated caller"
+        );
+    }
+
+    // The configured credential works, and is not itself forwarded upstream.
+    let ok: Value = http
+        .post(&broker_url)
+        .header(CLIENT_KEY_HEADER, "sk-broker-abc")
+        .json(&call)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ok.get("error").is_none(),
+        "the configured credential must be accepted: {ok}"
+    );
+    assert_eq!(
+        seen.lock().expect("upstream log").len(),
+        1,
+        "the authenticated call is the only one that reaches the upstream"
+    );
+}
+
+/// The other half, and the reason this is safe to ship: with no keys
+/// configured the broker behaves exactly as it always has. Requiring a
+/// credential by default would break every loopback deployment on upgrade,
+/// which is the same conclusion `clientkeys.rs` reached for the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_broker_keys_configured_nothing_changes() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(broker(upstream, ScanMode::Off)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "an unconfigured broker must not start demanding a credential"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["echo"]["arguments"]["auth"], "Bearer ghp_REALSECRET",
+        "and it must still broker the secret: {body}"
+    );
+}
+
+/// `/healthz` stays open. It carries no vault, reaches no upstream, and is
+/// what a container runtime probes before it has any credential to present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthz_stays_open_when_keys_are_configured() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(broker_keyed(upstream, "sk-broker-abc:tool-user")).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{broker_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a liveness probe has no credential to present"
     );
 }
 
