@@ -34,8 +34,9 @@ default `127.0.0.1:4200`), forwarding to `TOKENFUSE_MCP_UPSTREAM`:
   `{{secret:NAME}}` handle in the params with the vault's value just before
   forwarding. Unknown handles are left verbatim and logged (never silently
   emptied). Secret *values* are never logged — only counts.
-- **`tools/list`** → the existing scanner (`tokenfuse_core::mcp`) checks tool
-  descriptions for injection phrases / hidden characters. `TOKENFUSE_MCP_SCAN`:
+- **`tools/list`** → the existing scanner (`tokenfuse_core::mcp`) checks a
+  tool's description **and every documented parameter in its `inputSchema`**
+  for injection phrases / hidden characters. `TOKENFUSE_MCP_SCAN`:
   `off` · `warn` (log + annotate the response, default) · `block` (refuse the
   list with a JSON-RPC error).
 - everything else is passed through unchanged.
@@ -77,6 +78,39 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
   off unless set) - see [13](13-security-hardening.md) for the full writeup.
 - **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
   a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
+
+### What the poisoning scan reads, and what it chooses to ignore
+
+It used to read a tool's top-level `description` and nothing else. An agent
+reads parameter documentation too, to decide how to fill a call, so text in an
+`inputSchema` property description reaches the model the same way, and hiding
+a payload there is a known and repeatedly demonstrated MCP vector. A
+schema-borne payload was therefore invisible on the first scan; it could only
+ever be caught later, as a rug pull, and then only if the operator happened to
+pin the tool while it was still benign. `parse_tools` had already been folding
+the whole schema into the fingerprint, so the text was right there.
+
+The scan now walks `properties` and `items` (depth- and count-capped, because
+a schema is attacker-controlled) and names the site in every finding:
+`suspicious phrase in parameter "filters.tag" description: "do not mention"`,
+against `suspicious phrase in description: …` for the tool's own text.
+
+**Widening it meant tightening it.** Three markers, `secret`, `api_key` and
+`system prompt`, were matched as bare substrings on lowercased text, which
+makes "The API key to authenticate with" a High-severity finding. That is the
+vocabulary of every honest tool that handles a credential, and parameter
+descriptions are where that vocabulary actually lives, so widening alone would
+have multiplied the false positives on the noisiest markers in the list. Those
+three now need two things: a **word boundary** (so "secretary" and
+"legacy_api_keyring" do not count) and an **instruction-shaped context** in the
+same text, meaning a phrase addressed to the reader ("you must", "do not",
+"before using") or an external destination (an `http://` / `https://` URL).
+
+The cost, stated plainly: a payload that names a credential and gives no
+instruction around it is no longer a finding on its own. That was never much of
+a signal, and a poisoned tool carries an instruction by construction, because
+the instruction is the attack. Everything in the instruction-shaped list is
+matched exactly as before.
 
 ### The fingerprint, and what a lock says about itself
 
