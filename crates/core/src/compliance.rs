@@ -267,10 +267,10 @@ pub const CATALOG: &[ControlMapping] = &[
         title: "MCP tool-drift (rug-pull) lock",
         description: "Pins tool definitions in a lock and flags silent changes, \
                       additions, or removals vs the approved set.",
-        feature: "crate::mcp::diff → mcpreport rug_pull/new_tool/removed_tool",
+        feature: "crate::mcp::diff → mcpreport rug_pull/new_tool/removed_tool/stale_lock",
         enforcement: Enforcement::Enforced,
         evidence_decisions: &[],
-        evidence_finding_kinds: &["rug_pull", "new_tool", "removed_tool"],
+        evidence_finding_kinds: &["rug_pull", "new_tool", "removed_tool", "stale_lock"],
         evidence_incident_kinds: &[],
         frameworks: &[
             (
@@ -610,6 +610,7 @@ mod tests {
             Drift::Changed("a".to_string()),
             Drift::Added("b".to_string()),
             Drift::Removed("c".to_string()),
+            Drift::LockNotComparable("unversioned".to_string()),
         ];
         let report = ScanReport::from_scan(&tools, &injection, &drift);
         for f in &report.findings {

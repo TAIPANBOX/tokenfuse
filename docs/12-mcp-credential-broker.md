@@ -78,6 +78,40 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
 - **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
   a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
 
+### The fingerprint, and what a lock says about itself
+
+A fingerprint is `hex(sha256(domain || len-framed name, description, input
+schema))`, and the lockfile names both the algorithm and its format version:
+
+```json
+{ "algorithm": "sha256", "version": 1, "tools": { "search": "6dbab326…" } }
+```
+
+It used to be `DefaultHasher` truncated to a `u64`, in a lockfile that was a
+bare `{name: number}` map. Two problems, both fixed here (2026-08-05).
+
+It was not a tamper-evidence primitive: `DefaultHasher` is SipHash with a fixed
+zero key, so there is no MAC property, and 64 bits is well under what a control
+marketed as catching a deliberate post-approval change should carry. The audit
+chain in `crate::audit` had already reached SHA-256 for the same reason.
+
+It was also not stable. Rust's standard library does not guarantee
+`DefaultHasher`'s output across releases; `rust-toolchain.toml` here is an
+unpinned `stable`, and `action.yml` builds the scanner from source with
+`dtolnay/rust-toolchain@stable` on every run. One Rust release changing the
+default hasher would have flipped every pinned tool to `Drift::Changed`, which
+this product surfaces as **RUG PULL** at Critical, and `--fail-on high` would
+have turned that into a red check for every consumer at once. The recovery it
+invites (re-pin the lock) is exactly the action that masks a real rug pull.
+
+**An existing lockfile does not read as a rug pull.** A lock whose
+`(algorithm, version)` this build does not know is `Drift::LockNotComparable`,
+reported as finding kind `stale_lock` at **Medium**, with the message that
+rug-pull detection is off until it is re-pinned. Medium sits under the default
+`--fail-on high`, so an old lock does not fail your build, and `mcp-scan --lock
+<file> --write-lock` restores detection. `Added`/`Removed` are still reported
+against such a lock, since those compare names, which every format agreed on.
+
 ## The broker's own door
 
 The broker resolves handles against the **whole** vault and forwards to any

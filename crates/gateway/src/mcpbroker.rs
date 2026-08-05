@@ -653,7 +653,22 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
 
         // Rug-pull: a tool's description/schema changed vs. the pinned lock.
         if let Some(lock) = &st.lock {
-            let changed: Vec<String> = mcp::diff(&tools, lock)
+            let drifts = mcp::diff(&tools, lock);
+            // A lock this build cannot compare is not a rug pull, and must not
+            // be blocked as one. It IS worth saying out loud: the operator
+            // configured TOKENFUSE_MCP_LOCK and is getting no rug-pull
+            // detection from it until they re-pin.
+            for d in &drifts {
+                if let mcp::Drift::LockNotComparable(provenance) = d {
+                    tracing::warn!(
+                        lock = %provenance,
+                        "mcp broker: the pinned lock cannot be compared with this build's \
+                         fingerprints, so rug-pull detection is OFF until it is re-pinned \
+                         (tokenfuse mcp-scan --lock <file> --write-lock)"
+                    );
+                }
+            }
+            let changed: Vec<String> = drifts
                 .into_iter()
                 .filter_map(|d| match d {
                     mcp::Drift::Changed(name) => Some(name),

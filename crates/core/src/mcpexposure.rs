@@ -345,7 +345,7 @@ mod tests {
         McpTool {
             name: name.to_string(),
             description: description.to_string(),
-            fingerprint: 0,
+            fingerprint: String::new(),
         }
     }
 
