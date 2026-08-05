@@ -196,7 +196,7 @@ comparison in #132.
 set here said 100 where the workspace ran 747 and nothing had been watching:
 `cargo test --all` runs **747 passing** (core 218, gateway 345, cloud 183,
 umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/readme-numbers.sh` gates (invariant 12). Python SDK: 11
+states and `scripts/stated-numbers.sh` gates (invariant 12). Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
 **`tokenfuse-cluster`: 13 integration tests** on live raft clusters (in-process
 + over HTTP sockets, incl. token-auth, HTTPS, **mTLS**, membership, linearizable

@@ -46,12 +46,16 @@ jobs:
       - name: tokenfuse-core stays dependency-minimal
         run: ./scripts/core-deps.sh
 
-      # A number in a README is a claim with no owner. The it-rat.com page for
+      # A number in a document is a claim with no owner. The it-rat.com page for
       # this service said 513 tests while the workspace ran 709, and nobody
       # knows for how long. It was not wrong when written; nothing was
       # watching it. This is that check at the source.
-      - name: the README's numbers are true
-        run: ./scripts/readme-numbers.sh
+      #
+      # It covers PROGRESS.md as well as the README, because gating only the
+      # badge left the same figure in prose one file over saying 100 where the
+      # workspace ran 747, and reading is what caught it rather than any check.
+      - name: the numbers this repo states about itself are true
+        run: ./scripts/stated-numbers.sh
 
   python-sdk:
     name: python sdk

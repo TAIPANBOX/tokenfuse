@@ -39,7 +39,7 @@ overtaken while the previous one was being written.
 So the warning that replaces them is about the shape, not the half: **that file
 has no gate.** It is true on a date and starts drifting with the next merge, and
 the only number in it anything holds is the test count, via
-`scripts/readme-numbers.sh` (invariant 12). What it does carry now is dates and
+`scripts/stated-numbers.sh` (invariant 12). What it does carry now is dates and
 checks: claims say when they were established and, where a command establishes
 them, which command. Trust a claim in proportion to the date beside it, and when
 you find one with no date, treat that as the oldest thing in the file rather
@@ -71,11 +71,14 @@ cargo clippy --all-targets          # CI additionally runs --all-features
 cargo test --all
 cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/core-deps.sh
+./scripts/stated-numbers.sh
 ```
 
-The last one is the raft-backed ledger test gated behind the `cluster`
-feature - copy this exact invocation, it's what `.github/workflows/ci.yml`
-runs. CI also runs separate jobs for the Python SDK (`sdk/python`), the JS SDK
+The `--features cluster` line is the raft-backed ledger test; copy that exact
+invocation, it is what `.github/workflows/ci.yml` runs. It is named here rather
+than pointed at as "the last one", which is what this sentence used to say: the
+list has grown twice since, and a positional reference into a list that grows is
+wrong the moment it does. CI also runs separate jobs for the Python SDK (`sdk/python`), the JS SDK
 (`sdk/js`), the OpenAPI spec, the Next.js dashboard, the `crates/cluster`
 workspace (own fmt/clippy/test), `cargo audit` (workspace + cluster), the
 `crates/radar` eBPF build (Linux-only), and a `--features apns` clippy build
@@ -271,9 +274,10 @@ build)`, `cloud apns (feature build)`.
    that IS built, which fails it, and by adding an ignore with no recorded
    reason, which also fails it)*
 
-12. **A number this README states about the repository is checked against the
-   repository.** A figure on a page has no owner and no clock: it is right the
-   day it is written and the suite grows in commits that never open the README.
+12. **A number this repository states about itself is checked against itself,
+   in every file that states it.** A figure on a page has no owner and no clock:
+   it is right the day it is written and the suite grows in commits that never
+   open the page.
    Measured 2026-08-05, this repository was the worst case in the estate: the
    it-rat.com page for TokenFuse said **513 tests where the workspace runs 709**,
    and nobody knows for how long. It was not wrong when written; nothing was
@@ -283,8 +287,21 @@ build)`, `cloud apns (feature build)`.
    deliberately excluded: it is its own workspace behind a feature with its own
    CI job, and folding it in would make the figure irreproducible with the plain
    command the badge implies.
-   *(gate: `scripts/readme-numbers.sh`; verified by moving the badge one test,
-   which fails it and names both figures)*
+
+   **The "in every file" half was added 2026-08-05, and it is the half this
+   estate had to learn twice.** Gating the badge alone left the same figure
+   written in prose one file over: PROGRESS.md said **100 passing (core: 60,
+   gateway: 40)** while the workspace ran 747, a sevenfold error, and it was
+   found by somebody reading rather than by the gate that existed precisely for
+   this. A number is not gated because it is prominent; it is gated because it
+   is stated. PROGRESS.md also breaks the total down per crate, and the check on
+   that is deliberately weaker: the parts must SUM to the measured total, which
+   catches a breakdown drifting out of step and not two compensating errors. The
+   limit is written in the script rather than left to be discovered.
+   *(gate: `scripts/stated-numbers.sh`, which covers README.md and PROGRESS.md;
+   verified against four mutants, each of which fails it and names both figures:
+   the badge off by one, the PROGRESS total off by one, a breakdown that no
+   longer sums, and either figure reworded out of the file entirely)*
 
 13. **A failure nobody else reports is made visible, once per distinct kind.**
    `CloudSink::ship` matched only the transport error `reqwest` returns when a
