@@ -21,6 +21,16 @@ fn state_with(store: Arc<Store>) -> AppState {
             role: "admin".into(),
         },
     );
+    // A read-only credential for the SAME org. Every other test here uses the
+    // admin key; this one exists so the ingest route can be pinned against the
+    // role that must not reach it.
+    keys.insert(
+        "viewerkey".to_string(),
+        Principal {
+            org: "acme".into(),
+            role: "viewer".into(),
+        },
+    );
     AppState::new(store, Arc::new(keys), 0.8)
 }
 
@@ -167,6 +177,114 @@ async fn ingest_without_a_key_is_unauthorized() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A read-only credential may not write telemetry.
+///
+/// Ingest is a WRITE, and it was authorized as a read: `org_for` resolves any
+/// principal that maps to an org, so a viewer key, a paired device token of
+/// any role, and a viewer-scoped OIDC token all reached it. The role exists to
+/// say what a credential may change, and everything this route accepts becomes
+/// state the org is then graded on.
+#[tokio::test]
+async fn a_viewer_key_cannot_ingest() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer viewerkey")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a read-only key must be refused at the ingest route, not merely resolved to an org"
+    );
+    assert!(
+        store.runs("acme").is_empty(),
+        "nothing the refused caller sent may reach the store"
+    );
+}
+
+/// The reason the role matters, end to end.
+///
+/// Ingested records are not inert evidence: three of them, with a decision
+/// this plane recognizes and a `run_id` the caller picked, raise a High
+/// `budget_exhausted` incident (`Store::ingest_at`, `budget_blocks` = 3 by
+/// default). That incident is exported as a Critical agent-event into the
+/// shared NDJSON log and mailed to a human by heraldyx, and the same records
+/// feed the `decision_counts` that `/v1/compliance` grades an org's controls
+/// from. So a read-only credential could wake somebody at three in the morning
+/// about a budget that was never touched, and manufacture regulator-facing
+/// evidence that a control fired.
+///
+/// The admin arm is not decoration: it proves the payload really does trip the
+/// detector, so the viewer arm is refused authorization rather than merely
+/// failing to reach a threshold.
+#[tokio::test]
+async fn a_viewer_cannot_manufacture_a_budget_exhausted_incident() {
+    const BLOCKS: &str = r#"{"records":[
+        {"run_id":"forged","model":"claude","decision":"budget_exceeded","cost_microusd":0,"step":1,"agent_id":"agent://bank.example/treasury/recon"},
+        {"run_id":"forged","model":"claude","decision":"budget_exceeded","cost_microusd":0,"step":2,"agent_id":"agent://bank.example/treasury/recon"},
+        {"run_id":"forged","model":"claude","decision":"budget_exceeded","cost_microusd":0,"step":3,"agent_id":"agent://bank.example/treasury/recon"}
+    ]}"#;
+
+    let store = Arc::new(Store::new());
+    let state = state_with(Arc::clone(&store));
+
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer viewerkey")
+                .header("content-type", "application/json")
+                .body(Body::from(BLOCKS))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        store.incidents("acme").is_empty(),
+        "a read-only credential must not be able to raise an incident that pages a human \
+         and grades a compliance control"
+    );
+
+    // The same batch from an admin credential still does everything it always
+    // did: the route is gated, not broken.
+    let resp = app(state)
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(BLOCKS))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let incidents = store.incidents("acme");
+    assert_eq!(
+        incidents.len(),
+        1,
+        "the payload really does trip a detector"
+    );
+    assert_eq!(incidents[0].kind, "budget_exhausted");
+    assert_eq!(
+        store.decision_counts("acme").get("budget_exceeded"),
+        Some(&3),
+        "and really does land in the counts /v1/compliance grades controls from"
+    );
 }
 
 #[tokio::test]

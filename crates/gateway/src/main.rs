@@ -327,6 +327,36 @@ async fn mcp_broker() {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     });
+    // The broker's own door. Same `secret:key_id,...` form, same resolver and
+    // same header as the gateway's TOKENFUSE_CLIENT_KEYS, because a second
+    // scheme is a second thing to get wrong. Unset means the broker
+    // authenticates nobody, exactly as it always has: requiring a credential
+    // by default would break every loopback deployment on upgrade.
+    //
+    // Set but unusable is NOT "unset": a typo or an empty interpolated
+    // variable would otherwise leave the port open at the moment an operator
+    // believed they had just closed it. Same conclusion clientkeys.rs reached.
+    let keys = match tokenfuse_gateway::clientkeys::ClientKeys::from_spec(
+        &std::env::var("TOKENFUSE_MCP_KEYS").unwrap_or_default(),
+    ) {
+        Ok(keys) => keys,
+        Err(_) => {
+            eprintln!(
+                "tokenfuse: TOKENFUSE_MCP_KEYS is set but contains no usable `secret:key_id` \
+                 entry (expected e.g. `sk-broker-abc:tool-user`); refusing to start rather \
+                 than run the credential-broker with authentication silently off"
+            );
+            std::process::exit(2);
+        }
+    };
+    let keys_enabled = keys.enabled();
+    if keys_enabled {
+        tracing::info!(
+            keys = keys.len(),
+            header = tokenfuse_gateway::clientkeys::CLIENT_KEY_HEADER,
+            "mcp broker auth: ON"
+        );
+    }
     // Agent-event NDJSON export (agent-passport SPEC.md §6): the mcp-broker is
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
@@ -340,6 +370,7 @@ async fn mcp_broker() {
         dlp_pii,
         lock,
         wardryx,
+        keys,
         client: reqwest::Client::new(),
         events,
     });
@@ -350,7 +381,16 @@ async fn mcp_broker() {
         }
         return;
     }
+    // Bind to loopback by DEFAULT, and say so out loud when that default is
+    // widened. Until this warning existed, the default bind was the ONLY thing
+    // between a process on the box and a vault of real credentials, and
+    // TOKENFUSE_MCP_ADDR moved it silently. Same posture, and the same voice,
+    // as the Cloud's own non-loopback warning in crates/cloud/src/main.rs.
     let addr = std::env::var("TOKENFUSE_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:4200".to_string());
+    if let Some(warning) = tokenfuse_gateway::mcpbroker::bind_exposure_warning(&addr, keys_enabled)
+    {
+        tracing::warn!("{warning}");
+    }
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");

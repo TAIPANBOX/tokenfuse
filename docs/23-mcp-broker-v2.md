@@ -61,13 +61,39 @@ The `DecideContext` for a `tools/call` sends `agent_id` (from
 value as "nothing to restrict", never as a denial, so tool and attestation
 rules still apply and the cost/step rules simply do not fire here.
 
-**Honest limits.** Without an `X-Fuse-Agent-Id` (every stdio call, and any
-HTTP call that omits it) the gate is **skipped**, logged, and not fabricated:
-the call cannot be attributed to an agent, and an empty agent id would match
-no policy anyway (an allow), so skipping yields the same result made explicit.
-This is the same documented gap as `mcp_drift` on stdio. The enforced path is
-the HTTP transport carrying `X-Fuse-Agent-Id`. This is stated plainly rather
-than buried, per the "honesty is a feature" invariant.
+**No identity, no call (enforce mode).** Without an `X-Fuse-Agent-Id` (every
+stdio call, and any HTTP call that omits it) an enforcing gate **refuses** the
+`tools/call`. It does not fabricate an id, and it no longer skips.
+
+This is a correction, made 2026-08-05. The gate used to skip, on the stated
+reasoning that "an empty agent id would match no policy anyway (an allow), so
+skipping yields the same result made explicit". That is an assumption about
+another service's behaviour, and it is false for exactly the policy this gate
+was added to enforce: a tool-scoped `deny_tool` denies the TOOL, whoever calls
+it, so dropping one header the caller writes turned the deny into an allow.
+Secret injection then ran anyway, four lines below a comment promising it would
+not.
+
+The refusal matches the LLM path byte for byte, because it is the LLM path's
+own function (`proxy::identity_required`): HTTP `400`, body
+`{"error":{"type":"identity_required","reason":"... send one in
+`x-fuse-agent-id`","retryable":false}}`. Enforce only, also mirroring the LLM
+path: shadow mode blocks nothing by definition and keeps observing with
+whatever attribution it was given, and a broker with no Wardryx configured is
+untouched.
+
+Consequences worth naming rather than burying:
+
+- **stdio + enforce is now a refusal on every `tools/call`.** The transport has
+  no per-message header channel, so it can never carry the subject the policy
+  keys on. The JSON-RPC form of the same decision is error `-32007`, since
+  stdio has no status line. An operator who wants both must use the HTTP
+  transport with `X-Fuse-Agent-Id`, or run the gate in shadow.
+- **`tools/list` is unaffected.** The gate only covers `tools/call`, so the
+  poisoning and rug-pull scan still answers an unidentified caller: refusing it
+  would remove a control that works in the name of adding one.
+- A header that is present but blank names nobody, and is read as absent
+  everywhere here, including for the `agent_id` on an emitted event.
 
 The broker holds no signer and mutates no plane: it can refuse a call, never
 perform one.
@@ -95,6 +121,12 @@ call" signals; they measure different things and neither replaces the other.
 - `-32003` rug-pull: tool definition changed (existing)
 - `-32004` Wardryx denied or held the tool call (new)
 - `-32005` unknown named upstream (new)
+- `-32006` pii in tool arguments or response (`TOKENFUSE_MCP_DLP_PII=block`)
+- `-32007` the call named no agent, so an enforcing gate could not judge it.
+  Distinct from `-32004` on purpose: a refusal because the gate could not RUN
+  is a different fact from one the gate decided, and a client that retries on
+  the second should not retry on the first. The HTTP transport answers this
+  case with `400 identity_required` instead, matching the LLM path.
 
 ## Out of scope for v2 (named, not hidden)
 

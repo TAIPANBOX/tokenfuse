@@ -564,6 +564,28 @@ struct AlertQuery {
 // ---- handlers -------------------------------------------------------------
 
 /// A gateway pushes a batch of settled calls for its org.
+///
+/// Admin-gated through the same [`AppState::authorize_mutation`] every other
+/// write uses. It was authorized with `org_for`, the READ resolver, which
+/// accepts any principal that maps to an org: a viewer org key, a paired
+/// device token of any role, a viewer-scoped OIDC token. Ingest is a write,
+/// and the reason that matters is what the written records then do.
+///
+/// A record is not inert evidence. Three of them carrying `budget_exceeded`
+/// and a `run_id` the caller chose raise a High `budget_exhausted` incident
+/// (`Store::ingest_at`), which is exported as a Critical agent-event into the
+/// shared NDJSON log and mailed to a human. The same records feed
+/// `decision_counts`, which is what `/v1/compliance` and
+/// `/v1/compliance/evidence` grade an org's controls from. So the read-only
+/// role could page an operator about a budget nothing touched, and produce
+/// regulator-facing evidence that a control fired.
+///
+/// The value-level hardening around this (costs clamped at zero, saturating
+/// adds, `is_known_decision`, every map cardinality-bounded) is unchanged and
+/// still load-bearing: it defends against the credential that IS allowed
+/// here. There is still no gateway-specific credential, so a record remains
+/// untrusted input even from an admin (see `Store::ingest`'s honesty note).
+/// This closes the role gap, not the credential gap.
 #[utoipa::path(
     post, path = "/v1/ingest",
     request_body = IngestBody,
@@ -571,12 +593,14 @@ struct AlertQuery {
         (status = 200, description = "records accepted", body = IngestResponse),
         (status = 400, description = "malformed json", body = ErrorResponse),
         (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin role required", body = ErrorResponse),
     ),
     tag = "telemetry"
 )]
-async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(org) = st.org_for(&headers) else {
-        return unauthorized();
+async fn ingest(State(st): State<AppState>, headers: HeaderMap, uri: Uri, body: Bytes) -> Response {
+    let Mutator { org, .. } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
     };
     let parsed: IngestBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
@@ -992,11 +1016,13 @@ struct ExternalFindingsResponse {
 
 /// `POST /v1/findings`: accept detections this plane did not make.
 ///
-/// Admin-gated through the same `authorize_mutation` every other write uses,
-/// and deliberately NOT ungated like `/v1/ingest`. Ingest submits evidence
-/// that thresholds still have to agree with; this asserts an incident
-/// outright, which is a different authority and must not be reachable with a
-/// viewer key.
+/// Admin-gated through the same `authorize_mutation` every other write uses.
+/// This asserts an incident outright, rather than submitting evidence that
+/// thresholds still have to agree with, so it is the higher authority of the
+/// two writes. `/v1/ingest` was the ungated counter-example here until
+/// 2026-08-05; the distinction turned out not to hold, because three ingested
+/// records are enough to make the thresholds agree, so both are admin-gated
+/// now and this route is simply the more direct way to say the same thing.
 #[utoipa::path(
     post, path = "/v1/findings",
     request_body = Vec<ExternalFinding>,

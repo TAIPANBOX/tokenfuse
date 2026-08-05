@@ -185,6 +185,14 @@ fn build_scan_report(
                             }
                             Drift::Added(n) => println!("    + new tool '{n}' (not in lock)"),
                             Drift::Removed(n) => println!("    - tool '{n}' removed"),
+                            // Not a rug pull, and it must not read like one:
+                            // the check could not run, and the fix is to
+                            // re-pin. See `Drift::LockNotComparable`.
+                            Drift::LockNotComparable(p) => println!(
+                                "    ⚠ stale lock: written with {p}, so it cannot be compared \
+                                 with this build. Rug-pull detection is OFF until you re-pin \
+                                 it with --write-lock. This is not evidence a tool changed."
+                            ),
                         }
                     }
                 }

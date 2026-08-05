@@ -47,12 +47,12 @@ fn is_blocked(decision: &str) -> bool {
 /// `policy_violation`, `loop_detected`, `killed`, `wasm_policy`,
 /// `taint_blocked`, `dlp_blocked` — see `crates/core/src/breaker.rs`).
 ///
-/// `/v1/ingest` is intentionally ungated: ANY authenticated org principal,
-/// including a read-only viewer key, may POST a batch (ADR-3, so a gateway
-/// never loses telemetry over a stale/rotated key). That means the
+/// `/v1/ingest` requires an ADMIN org credential, because it is a write. The
+/// plane still has no gateway-specific credential, so it cannot tell the real
+/// gateway from any other holder of an admin key. That means the
 /// `decision` string in a record is untrusted input from whichever principal
-/// is calling — not necessarily the gateway's own guard firing. Without this
-/// allow-list, a viewer key could POST a fabricated `decision` (e.g.
+/// is calling, not necessarily the gateway's own guard firing. Without this
+/// allow-list, that caller could POST a fabricated `decision` (e.g.
 /// `"pwned"`) to inflate/pollute `/v1/compliance`'s `decision_counts` or, were
 /// a detector ever loosened to match on an arbitrary string, forge an
 /// incident. An unrecognized decision still updates the run's `calls` (and,
@@ -308,7 +308,7 @@ pub(crate) fn month_key(ts_millis: i64) -> String {
 /// a new UTC month, exactly like the gateway ledger.
 ///
 /// The window is keyed by the PLANE's clock (`ingest_at`'s `now_ms`), not
-/// the record's own `ts_millis`: `/v1/ingest` is ungated, so a forged
+/// the record's own `ts_millis`: a record is untrusted input, so a forged
 /// timestamp must not be able to reset (or ping-pong) a month window and
 /// hide spend. The cost is that attribution around a month boundary can
 /// drift from the gateway's call-time window by the telemetry batching
@@ -351,7 +351,7 @@ pub struct SavingsSummary {
 ///
 /// `breaks` is a BOUNDED dedup structure (capped at [`MAX_BREAK_KEYS`], LRU
 /// evicted — see `ingest_at`), not an unbounded ledger of every run_id ever
-/// blocked: `/v1/ingest` is intentionally ungated, so one ingest record per
+/// blocked: a `run_id` is caller-chosen, so one ingest record per
 /// unique `run_id` with a budget-protection decision would otherwise grow this
 /// set forever. `budget_breaks` is the durable, MONOTONIC count of distinct
 /// breaks observed — it survives `breaks` eviction (a run whose dedup key was
@@ -558,10 +558,10 @@ const INCIDENT_TRACKER_CAP: usize = 256;
 const FANOUT_HISTORY_BUCKETS: usize = 8;
 
 /// Hard cap on the number of distinct run_ids retained per org in
-/// [`Inner::orgs`]. `/v1/ingest` is intentionally ungated (ADR-3 — any
-/// authenticated org principal, including a read-only viewer key, may push a
-/// batch), so without this a low-privilege credential could grow this map
-/// without bound by posting records with unique `run_id`s. On overflow the
+/// [`Inner::orgs`]. `/v1/ingest` is admin-gated, but the plane cannot tell
+/// the real gateway from any other holder of an admin key, so without this a
+/// caller could grow this map without bound by posting records with unique
+/// `run_id`s. On overflow the
 /// least-recently-touched run is evicted (see [`RecencyIndex`]); eviction
 /// only drops that run's OWN per-run aggregate from `/v1/runs` — the org's
 /// running totals are unaffected (see [`OrgTotals`] / [`Store::summary`]).
@@ -570,7 +570,7 @@ const MAX_RUNS_PER_ORG: usize = 50_000;
 /// Hard cap on the number of distinct keys retained in EACH of
 /// `incident_tracker` and `fanout_tracker` (enforced independently per
 /// tracker). Both are keyed by attacker-influenceable `run_id`/`agent_id`
-/// values reachable through the same ungated `/v1/ingest` path as
+/// values reachable through the same `/v1/ingest` path as
 /// [`MAX_RUNS_PER_ORG`]. These trackers are ephemeral detector state (not
 /// persisted); evicting a long-dormant key just means it won't
 /// retroactively re-trip a detector — the durable [`Incident`] record, once
@@ -579,7 +579,7 @@ const MAX_TRACKER_KEYS: usize = 20_000;
 
 /// Hard cap on the number of distinct incidents retained per org in
 /// [`Inner::incidents`]. Unlike `orgs`/`incident_tracker`/`fanout_tracker`,
-/// this map was NOT bounded by the earlier LRU pass: `/v1/ingest` is ungated,
+/// this map was NOT bounded by the earlier LRU pass: a `run_id` is caller-chosen,
 /// and each unique `run_id` that trips a detector (e.g. `budget_blocks`
 /// budget-protection blocks — 3 by default) becomes one permanent, persisted
 /// `Incident` keyed by that run_id, so an attacker could open unlimited
@@ -590,11 +590,11 @@ const MAX_INCIDENTS_PER_ORG: usize = 10_000;
 
 /// Hard cap on the number of distinct run_ids retained in each org's
 /// [`SavingsAcc::breaks`] dedup set (see that field's doc). Reuses the same
-/// ungated-`/v1/ingest` cardinality concern as [`MAX_RUNS_PER_ORG`].
+/// `/v1/ingest` cardinality concern as [`MAX_RUNS_PER_ORG`].
 const MAX_BREAK_KEYS: usize = 10_000;
 
 /// Hard cap on distinct unit buckets in each org's [`Inner::unit_months`]
-/// map - the same ungated-`/v1/ingest` cardinality concern as
+/// map - the same `/v1/ingest` cardinality concern as
 /// [`MAX_RUNS_PER_ORG`] (`r.unit` is attacker-controlled). Overflow folds
 /// into the "unassigned" bucket rather than LRU-evicting: evicting would
 /// silently zero a real unit's month-to-date counter mid-month, which could
@@ -1051,7 +1051,7 @@ impl Store {
     /// own wall clock; see [`Store::ingest_at`] for the testable inner form.
     ///
     /// Honesty note: `/v1/ingest` authenticates the ORG CREDENTIAL presented on
-    /// the request (any role — an org's own viewer key qualifies, ADR-3), not
+    /// the request (an ADMIN credential, narrowed 2026-08-05), not
     /// the gateway process cryptographically. There is currently no
     /// gateway-specific credential, so this store cannot distinguish "the real
     /// gateway pushed this" from "some holder of an org key pushed this" — a
@@ -1096,7 +1096,7 @@ impl Store {
                 let month_now = month_key(now_ms);
                 for r in records {
                     // C4: `cost_microusd`/`saved_microusd` are attacker-
-                    // controlled (ingest is ungated). A negative value is
+                    // controlled (a record is untrusted input). A negative value is
                     // nonsensical and an attack vector (it could be used to
                     // deflate a total) — clamp to >= 0 once, here, before any
                     // accumulator sees it.
@@ -1151,8 +1151,8 @@ impl Store {
                     // (see `is_known_decision`), including blocked ones (a
                     // block is a guard firing, not spend). `/v1/compliance`
                     // reads this per-org tally; an unrecognized decision is
-                    // untrusted input (ingest is ungated — any org principal
-                    // can push a batch) and must not land here.
+                    // untrusted input (the plane cannot tell the real gateway
+                    // from any other admin-key holder) and must not land here.
                     if is_known_decision(&r.decision) {
                         *dc.entry(r.decision.clone()).or_insert(0) += 1;
                     }
@@ -2845,7 +2845,7 @@ fn upsert_incident(
 ) -> Incident {
     let id = incident_id(kind, scope);
     let per_org = incidents.entry(org.to_string()).or_default();
-    // C1: bound `per_org`'s cardinality — `/v1/ingest` is ungated, so nothing
+    // C1: bound `per_org`'s cardinality: a `run_id` is caller-chosen, so nothing
     // but this cap stops an attacker from opening unlimited distinct
     // `(kind, run_or_agent)` incidents (3 budget-protection blocks on 3
     // unique run_ids = 3 permanent, persisted incidents), which also grows
@@ -3337,7 +3337,7 @@ mod tests {
     /// `now_ms`), rolls over lazily at the UTC month boundary like the
     /// gateway's `unitledger`, reads as zero for a stale window without
     /// mutating stored state, and ignores record timestamps entirely
-    /// (`/v1/ingest` is ungated - a forged `ts_millis` must not be able to
+    /// (a forged `ts_millis` must not be able to
     /// reset a month window).
     #[test]
     fn units_month_to_date_windows_by_plane_clock_and_rolls_over() {
@@ -3686,9 +3686,9 @@ mod tests {
     /// C3: `cache_saved_microusd` and `router_saved_microusd` (the source of
     /// `/v1/savings`'s customer-facing all-time "Saved" headline) must each
     /// only be credited by the one real decision that can legitimately carry
-    /// it: `cache_hit` for cache, `allow` for router. `/v1/ingest` is ungated
-    /// (any org principal, including a read-only viewer key, may POST a
-    /// batch), so without this gate a viewer could POST
+    /// it: `cache_hit` for cache, `allow` for router. A record is untrusted
+    /// input whatever credential posted it, so without this gate a caller
+    /// could POST
     /// `{"decision":"anything","saved_microusd":N}` and inflate either figure
     /// for free.
     #[test]
@@ -3871,9 +3871,9 @@ mod tests {
         assert!(!is_known_decision(""));
     }
 
-    /// A viewer key (or any org principal — `/v1/ingest` is intentionally
-    /// ungated) POSTing a fabricated `decision` string must not be able to
-    /// pollute `/v1/compliance` evidence or forge an incident. A real
+    /// A holder of an ingest credential POSTing a fabricated `decision`
+    /// string must not be able to pollute `/v1/compliance` evidence or forge
+    /// an incident. A real
     /// `budget_exceeded`, by contrast, must still do both.
     #[test]
     fn ingest_ignores_fabricated_decisions_for_compliance_and_incidents() {
@@ -5222,8 +5222,7 @@ mod tests {
 
     // ---- LRU bounds (MAX_RUNS_PER_ORG / MAX_TRACKER_KEYS) -------------------
 
-    /// A low-privilege credential POSTing records with unique `run_id`s
-    /// (`/v1/ingest` is intentionally ungated) must not be able to grow
+    /// A caller POSTing records with unique `run_id`s must not be able to grow
     /// `orgs[org]` without bound. Ingesting far more than `MAX_RUNS_PER_ORG`
     /// distinct runs keeps the retained map capped AND retains the
     /// most-recently-touched runs — but MUST NOT lose any spend: `summary()`
@@ -5289,7 +5288,7 @@ mod tests {
 
     /// `incident_tracker` and `fanout_tracker` are ephemeral detector state
     /// keyed by attacker-influenceable `run_id`/`agent_id` values (same
-    /// ungated ingest path as `MAX_RUNS_PER_ORG`). Pushing far more than
+    /// ingest path as `MAX_RUNS_PER_ORG`). Pushing far more than
     /// `MAX_TRACKER_KEYS` distinct keys through each must keep both maps
     /// bounded.
     #[test]
@@ -5340,7 +5339,7 @@ mod tests {
     }
 
     /// C1: unlike `orgs`/`incident_tracker`/`fanout_tracker`, `Inner::incidents`
-    /// had no cap — `/v1/ingest` is ungated, so 3 budget-protection blocks
+    /// had no cap, and 3 budget-protection blocks
     /// (the default `budget_blocks` threshold) on each of many unique
     /// `run_id`s opens one permanent, persisted `Incident` per run,
     /// unboundedly. Opening far more than `MAX_INCIDENTS_PER_ORG` distinct

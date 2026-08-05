@@ -78,7 +78,11 @@ fn sanitize_field(s: &str) -> String {
 }
 
 /// Lowercase-hex encode bytes (no external `hex` dep in core).
-fn hex_lower(bytes: &[u8]) -> String {
+///
+/// Shared with [`crate::mcp`], which fingerprints tool definitions with the
+/// same `sha2` this module already brings in. One copy, because two would
+/// eventually disagree about case or padding.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
