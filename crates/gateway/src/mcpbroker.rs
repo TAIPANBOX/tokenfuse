@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -178,6 +179,51 @@ fn emit_tool_call(
     crate::events::log_outcome(EventType::ToolCall, outcome);
 }
 
+/// The agent id this request can be attributed to, or `None`.
+///
+/// A header that is present but blank is `None`: an empty string names nobody,
+/// and treating it as an identity would put an empty subject in front of the
+/// PDP and an empty `agent_id` in an audit event. The LLM path reads it the
+/// same way (`proxy::messages` tests `agent_id.is_empty()`).
+fn attributed_agent(ctx: &CallContext) -> Option<&str> {
+    ctx.agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+}
+
+/// Whether this request must be refused for want of an identity: the policy
+/// gate is ENFORCING, the request is a `tools/call` (the only method the gate
+/// covers), and it names no agent.
+///
+/// One predicate, called by both transports, so the two cannot drift. The HTTP
+/// transport answers it with [`crate::proxy::identity_required`], byte for byte
+/// the 400 the LLM path returns for the same missing header; stdio answers with
+/// the JSON-RPC equivalent ([`IDENTITY_RPC_CODE`]), because a subprocess
+/// transport has no status line to carry one.
+///
+/// Enforce only, mirroring the LLM path exactly: shadow mode blocks nothing by
+/// definition, so it keeps observing with whatever attribution it was given,
+/// and a broker with no Wardryx configured (the default) is untouched.
+fn needs_identity(st: &BrokerState, req: &Value, ctx: &CallContext) -> bool {
+    st.wardryx.mode == WardryxMode::Enforce
+        && req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && attributed_agent(ctx).is_none()
+}
+
+/// JSON-RPC code for "this call names no agent, so the policy gate could not
+/// judge it". Distinct from `-32004` (the PDP denied or held) on purpose: a
+/// refusal because the gate could not RUN is a different fact from a refusal
+/// the gate decided, and a client that retries on one should not retry on the
+/// other.
+const IDENTITY_RPC_CODE: i64 = -32007;
+
+/// The stdio wording of the same refusal. Names the header, like the LLM
+/// path's body does, because the caller can only fix what they are told about.
+const IDENTITY_RPC_MESSAGE: &str =
+    "blocked: policy enforcement is on and this call carries no agent identity; \
+     send one in `x-fuse-agent-id`";
+
 /// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
 /// (agent-passport SPEC.md §3.2) so an event raised for this request can carry
@@ -188,7 +234,7 @@ async fn handle(
     State(st): State<Arc<BrokerState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let header = |name: &str| {
         headers
             .get(name)
@@ -210,7 +256,19 @@ async fn handle(
         attestation_method: header("x-fuse-attestation-method"),
         approval_token: header("x-fuse-approval-token"),
     };
-    Json(process(&st, req, &ctx).await)
+    // Refused here rather than inside `process` so the answer is the LLM
+    // path's own 400, produced by the LLM path's own function. `process`
+    // refuses too (it is `pub` and stdio calls it directly); this only
+    // upgrades the refusal to the shape a caller of the HTTP transport
+    // already knows.
+    if needs_identity(&st, &req, &ctx) {
+        tracing::warn!(
+            "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy gate \
+             cannot judge a call it cannot attribute"
+        );
+        return crate::proxy::identity_required();
+    }
+    Json(process(&st, req, &ctx).await).into_response()
 }
 
 /// Resolve which upstream URL this request forwards to. A named upstream
@@ -251,6 +309,12 @@ fn resolve_upstream<'a>(
 /// (agent-passport SPEC.md §6.1 requires `agent_id`; see
 /// `tokenfuse_core::agent_event::build`) and counted - a known, documented
 /// gap rather than a fabricated identity.
+///
+/// With the Wardryx gate ENFORCING, an unattributed `tools/call` is refused
+/// here rather than passed through: see [`needs_identity`]. That makes an
+/// enforcing broker unusable over stdio, which is the honest consequence of
+/// a transport with no identity channel and a policy that keys on identity.
+/// Shadow mode and an unconfigured broker are unaffected.
 pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
@@ -258,7 +322,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let agent_id = ctx.agent_id.as_deref();
+    let agent_id = attributed_agent(ctx);
 
     // Which real MCP server this request forwards to. Resolved up front so an
     // unknown named upstream is refused before any secret is injected.
@@ -428,15 +492,34 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         wardryx_shadow = Some(outcome.decision.as_wire_str());
                     }
                 }
-                None => {
-                    // No agent id (stdio has no per-message header channel):
-                    // the call can't be attributed to an agent, so the
-                    // agent-scoped gate is skipped and logged, never guessed.
-                    // An empty agent id would match no policy anyway (allow), so
-                    // this is the same result, made explicit. Same documented
-                    // gap as mcp_drift on stdio.
+                None if st.wardryx.mode == WardryxMode::Enforce => {
+                    // No agent id, and the gate is enforcing. This used to skip
+                    // the PDP call and carry on into secret injection, on the
+                    // reasoning that an empty agent id would match no policy
+                    // anyway. That is an assumption about another service's
+                    // behaviour, and it is false for exactly the policy this
+                    // gate was added for: a tool-scoped `deny_tool` (docs/23)
+                    // is bypassed by dropping one header the caller writes.
+                    //
+                    // So refuse, the way the LLM path already does
+                    // (`proxy::messages` -> `identity_required`). The HTTP
+                    // transport turns this into that same 400 before we get
+                    // here; this is the answer for stdio, and for any direct
+                    // caller of `process`.
                     tracing::warn!(
-                        "mcp broker: wardryx gate skipped, no x-fuse-agent-id on this tools/call"
+                        "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy \
+                         gate cannot judge a call it cannot attribute"
+                    );
+                    return rpc_error(&id, IDENTITY_RPC_CODE, IDENTITY_RPC_MESSAGE);
+                }
+                None => {
+                    // Shadow: blocks nothing by definition, so an unattributed
+                    // call is observed with whatever attribution it has and
+                    // forwarded. Same posture as the LLM path's shadow mode,
+                    // and the same documented gap as `mcp_drift` on stdio.
+                    tracing::warn!(
+                        "mcp broker: wardryx shadow gate skipped, no x-fuse-agent-id on this \
+                         tools/call"
                     );
                 }
             }
@@ -630,9 +713,10 @@ pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
         }
         let resp = match serde_json::from_str::<Value>(line) {
             // stdio has no per-message header channel, so the CallContext is
-            // empty here: no agent_id (mcp_drift and the Wardryx gate are
-            // skipped, see `process`) and no named upstream (the default one is
-            // always used).
+            // empty here: no agent_id (mcp_drift is skipped, and an ENFORCING
+            // Wardryx gate refuses the call outright rather than skipping,
+            // see `process`) and no named upstream (the default one is always
+            // used).
             Ok(req) => process(&state, req, &CallContext::default()).await,
             Err(e) => rpc_error(&Value::Null, -32700, &format!("parse error: {e}")),
         };

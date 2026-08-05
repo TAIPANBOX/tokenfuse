@@ -1595,7 +1595,13 @@ fn unauthorized(stats: &KeyStats) -> Response {
 ///
 /// Deliberately does not mention the policy plane: it is working, and the fault
 /// is one header away in the caller's own request.
-fn identity_required() -> Response {
+///
+/// Shared with the MCP broker (`crate::mcpbroker`), which is the stack's second
+/// Policy Enforcement Point and used to answer this same missing header by
+/// skipping its gate. Two enforcement points cannot hold opposite postures on
+/// one input, and they cannot drift if they return the same bytes from the same
+/// function.
+pub(crate) fn identity_required() -> Response {
     let body = serde_json::json!({
         "error": {
             "type": "identity_required",
