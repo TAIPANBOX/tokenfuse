@@ -277,6 +277,49 @@ build)`, `cloud apns (feature build)`.
    *(gate: `scripts/readme-numbers.sh`; verified by moving the badge one test,
    which fails it and names both figures)*
 
+13. **A failure nobody else reports is made visible, once per distinct kind.**
+   `CloudSink::ship` matched only the transport error `reqwest` returns when a
+   request never gets an answer at all. `reqwest` answers `Ok(Response)` for
+   every status it DOES get, so a 401, 403 or 500 from `/v1/ingest` went past
+   that arm and left nothing behind: no log line, no counter, no metric. The
+   gateway went on metering locally and answering every call exactly as before,
+   so a gateway whose cloud key is wrong, rotated, or short of the role the
+   endpoint requires was byte for byte a healthy one from both ends while the
+   org's spend never reached the control plane at all. Two deployment repos had
+   already written the symptom into comments (stack-k8s: "the money plane is
+   deaf"; stack-single: "it looks exactly like a working deployment from the
+   outside"), which is what a fault with no signal looks like. It was known well
+   enough to be folklore in two other repositories because the code said
+   nothing.
+
+   A refusal now warns once per distinct status per sink, and the repeats drop
+   to debug. Both halves are the rule and neither survives alone. Raising the
+   level without the gate is invariant 7's failure in another costume: the same
+   wrong key refuses EVERY batch for as long as the process runs, so a
+   per-batch warning writes one configuration fault into the log several times
+   a second and buries the enforcement decisions sharing it. Keeping the gate
+   without the level leaves the fault exactly where it was.
+
+   The boundary is deliberate and is the other half of the claim: a control
+   plane that cannot be REACHED stays at debug, because that fault is usually
+   transient, it clears without anybody editing configuration, and it was
+   logged before. What earns a warning is not "something failed". It is
+   "something failed, it will not clear itself, and no other part of the estate
+   will ever mention it".
+
+   Adopted `@yurii 2026-08-05` ("merge it and add the invariant"); the wording
+   and the general form above are `@claude`.
+   *(test: `a_refused_push_is_visible_to_the_operator`,
+   `a_control_plane_that_refuses_every_batch_is_reported_once`,
+   `a_second_distinct_status_is_reported_again`,
+   `an_accepted_batch_is_never_reported` and
+   `a_control_plane_that_cannot_be_reached_is_not_a_refusal` in
+   `gateway::cloudsink`. Each was checked against a mutant rather than written
+   green: restoring the old `send()` call fails four of the five, a
+   warn-per-batch version fails the once-per-status one, a version that reports
+   successes fails the accepted-batch one, and escalating transport errors
+   fails the unreachable one)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
