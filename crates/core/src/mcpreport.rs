@@ -141,6 +141,25 @@ impl ScanReport {
                     tool: Some(name.clone()),
                     message: "tool in lock no longer offered".to_string(),
                 },
+                // Deliberately NOT Critical, and deliberately not `rug_pull`.
+                // This says the rug-pull check could not run, which is a
+                // different fact from a tool having changed, and reporting it
+                // as the latter would fail every consumer's build the day the
+                // fingerprint or the lock format moved. Medium keeps it under
+                // the default `--fail-on high` threshold (so a toolchain
+                // upgrade does not go red estate-wide) while still putting it
+                // in the report, because a control that is off is worth
+                // knowing about.
+                Drift::LockNotComparable(provenance) => Finding {
+                    kind: "stale_lock".to_string(),
+                    severity: Severity::Medium,
+                    tool: None,
+                    message: format!(
+                        "lock was written with {provenance} and cannot be compared with this \
+                         build's fingerprints; rug-pull detection is OFF until it is re-pinned \
+                         (--write-lock). This is not evidence that a tool changed."
+                    ),
+                },
             };
             findings.push(finding);
         }
@@ -391,6 +410,59 @@ mod tests {
         let injection = scan_injection(&changed_tools);
         let report = ScanReport::from_scan(&changed_tools, &injection, &drift);
         assert_eq!(report.max_severity(), Some(Severity::Critical));
+    }
+
+    /// The outcome for a lock this build cannot read has to be visible AND
+    /// harmless. Reported as a rug pull it would fail every consumer's build
+    /// the day the fingerprint or the lockfile format moved, and the fix it
+    /// implies (re-pin) is the same action that masks a real rug pull, so the
+    /// two must never share a kind or a severity.
+    #[test]
+    fn a_stale_lock_is_reported_but_is_neither_a_rug_pull_nor_critical() {
+        let tools = parse_tools(&json!({"tools":[{"name":"a","description":"d"}]}));
+        let drift = vec![Drift::LockNotComparable("unversioned".to_string())];
+        let report = ScanReport::from_scan(&tools, &[], &drift);
+
+        assert_eq!(report.findings.len(), 1);
+        let f = &report.findings[0];
+        assert_eq!(f.kind, "stale_lock", "its own kind, not rug_pull");
+        assert_eq!(f.severity, Severity::Medium);
+        assert_eq!(
+            f.tool, None,
+            "it is a fact about the lock, not about a tool"
+        );
+        assert!(
+            f.message.contains("--write-lock"),
+            "the finding has to say what to do about it: {}",
+            f.message
+        );
+        assert!(
+            !should_fail(report.max_severity(), Some(Severity::High)),
+            "the default --fail-on high must not go red for a lock that is merely old"
+        );
+        assert!(
+            should_fail(report.max_severity(), Some(Severity::Medium)),
+            "an operator who asked for medium still hears about a control that is off"
+        );
+    }
+
+    /// The same thing end to end, through a real legacy lockfile, mirroring
+    /// `rug_pull_end_to_end_yields_critical` above.
+    #[test]
+    fn a_legacy_lock_end_to_end_is_medium_and_names_no_rug_pull() {
+        let tools = parse_tools(&json!({"tools":[
+            {"name":"search","description":"search the web","inputSchema":{"type":"object"}}
+        ]}));
+        let legacy: Lock =
+            serde_json::from_str(r#"{"tools":{"search":1}}"#).expect("legacy lock parses");
+        let drift = crate::mcp::diff(&tools, &legacy);
+        let report = ScanReport::from_scan(&tools, &[], &drift);
+        assert_eq!(report.max_severity(), Some(Severity::Medium));
+        assert!(
+            !report.findings.iter().any(|f| f.kind == "rug_pull"),
+            "an old lock is not a rug pull: {:?}",
+            report.findings
+        );
     }
 
     #[test]

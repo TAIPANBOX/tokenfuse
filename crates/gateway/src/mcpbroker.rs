@@ -27,13 +27,20 @@
 //! (`off|warn|block`), `_DLP` (`off|warn|block`), `_DLP_PII` (`off|shadow|
 //! mask|block`, a separate opt-in PII extension of `_DLP`, see
 //! `tokenfuse_core::dlp`'s module doc), `_LOCK` (rug-pull baseline), `_ADDR`,
-//! `_STDIO`, plus the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
+//! `_KEYS` (the broker's own client credentials, off unless set), `_STDIO`,
+//! plus the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
 //! Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
+//!
+//! **What is on the door.** Whatever reaches this port can have handles
+//! resolved against the whole vault, so two things guard it: the loopback
+//! default (widening it now warns, see [`bind_exposure_warning`]) and optional
+//! client credentials ([`BrokerState::keys`], off unless configured).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -41,6 +48,7 @@ use tokenfuse_core::agent_event::{EventType, Exporter as EventExporter};
 use tokenfuse_core::mcp::{self, Lock};
 use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
+use crate::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use crate::wardryx::{DecideContext, Wardryx, WardryxDecision, WardryxMode};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,6 +92,19 @@ pub struct BrokerState {
     /// before. The broker holds no signer and never mutates a plane: a deny or
     /// hold is a refusal returned to the caller, nothing more.
     pub wardryx: Arc<Wardryx>,
+    /// Client credentials for the broker's own door (`TOKENFUSE_MCP_KEYS`), in
+    /// the same `secret:key_id,...` form and resolved by the same
+    /// [`ClientKeys`] the gateway uses for `TOKENFUSE_CLIENT_KEYS`. Reused
+    /// rather than re-invented, including its documented decision to look a
+    /// secret up in a plain `HashMap`: moving to a constant-time comparison is
+    /// a posture change that belongs across every plane at once, not smuggled
+    /// into one of them.
+    ///
+    /// Empty (the default) means the broker authenticates nobody, exactly as
+    /// it always has, so no loopback deployment breaks on upgrade. Set, and
+    /// every JSON-RPC call must present a known credential in
+    /// [`CLIENT_KEY_HEADER`].
+    pub keys: ClientKeys,
     pub client: reqwest::Client,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
     /// default; see `crate::events::from_env`. Emits `mcp_drift` (rug-pull) and
@@ -127,6 +148,52 @@ pub fn app(state: Arc<BrokerState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// The startup warning for a bind that is not loopback, or `None` when it is.
+///
+/// The broker's default bind is `127.0.0.1:4200`, and until this existed that
+/// default was the ONLY thing protecting it: `TOKENFUSE_MCP_ADDR` widened the
+/// bind silently, and anything that reached the port could have
+/// `{{secret:NAME}}` handles resolved against the whole vault and forwarded to
+/// any configured upstream.
+///
+/// Deliberately the same shape and voice as the Cloud's own check in
+/// `crates/cloud/src/main.rs`, including its loopback set (`127.0.0.1`,
+/// `localhost`, `::1`) rather than a cleverer one: a bind to `127.0.0.2` warns
+/// although it is also loopback, which costs one false warning, while the two
+/// planes disagreeing about what "exposed" means would cost more than that.
+/// Unlike the Cloud's, this one is a pure function, so the condition is
+/// testable without starting a listener.
+///
+/// `auth_configured` is what makes the warning worth reading twice: a wide bind
+/// is a decision, a wide bind with nothing on the door is a mistake, and an
+/// operator who has configured credentials must not be told to configure them.
+pub fn bind_exposure_warning(addr: &str, auth_configured: bool) -> Option<String> {
+    let addr = addr.trim();
+    // "host:port" -> host, tolerating "[::1]:4200" and bare "::1:4200".
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(addr)
+        .trim_matches(['[', ']']);
+    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return None;
+    }
+    let mut w = format!(
+        "binding the MCP credential-broker to a non-loopback address ({addr}): it is now \
+         reachable from the network, and anything that reaches it can have {{{{secret:NAME}}}} \
+         handles resolved against the whole vault and forwarded to a configured upstream. \
+         Ensure a firewall closes this port and remote access goes through a tunnel, not a \
+         raw open port."
+    );
+    if !auth_configured {
+        w.push_str(
+            " No client credentials are configured either, so this port authenticates \
+             nobody: set TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require one.",
+        );
+    }
+    Some(w)
 }
 
 /// JSON-RPC error response with the same id as the request.
@@ -178,6 +245,51 @@ fn emit_tool_call(
     crate::events::log_outcome(EventType::ToolCall, outcome);
 }
 
+/// The agent id this request can be attributed to, or `None`.
+///
+/// A header that is present but blank is `None`: an empty string names nobody,
+/// and treating it as an identity would put an empty subject in front of the
+/// PDP and an empty `agent_id` in an audit event. The LLM path reads it the
+/// same way (`proxy::messages` tests `agent_id.is_empty()`).
+fn attributed_agent(ctx: &CallContext) -> Option<&str> {
+    ctx.agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+}
+
+/// Whether this request must be refused for want of an identity: the policy
+/// gate is ENFORCING, the request is a `tools/call` (the only method the gate
+/// covers), and it names no agent.
+///
+/// One predicate, called by both transports, so the two cannot drift. The HTTP
+/// transport answers it with [`crate::proxy::identity_required`], byte for byte
+/// the 400 the LLM path returns for the same missing header; stdio answers with
+/// the JSON-RPC equivalent ([`IDENTITY_RPC_CODE`]), because a subprocess
+/// transport has no status line to carry one.
+///
+/// Enforce only, mirroring the LLM path exactly: shadow mode blocks nothing by
+/// definition, so it keeps observing with whatever attribution it was given,
+/// and a broker with no Wardryx configured (the default) is untouched.
+fn needs_identity(st: &BrokerState, req: &Value, ctx: &CallContext) -> bool {
+    st.wardryx.mode == WardryxMode::Enforce
+        && req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && attributed_agent(ctx).is_none()
+}
+
+/// JSON-RPC code for "this call names no agent, so the policy gate could not
+/// judge it". Distinct from `-32004` (the PDP denied or held) on purpose: a
+/// refusal because the gate could not RUN is a different fact from a refusal
+/// the gate decided, and a client that retries on one should not retry on the
+/// other.
+const IDENTITY_RPC_CODE: i64 = -32007;
+
+/// The stdio wording of the same refusal. Names the header, like the LLM
+/// path's body does, because the caller can only fix what they are told about.
+const IDENTITY_RPC_MESSAGE: &str =
+    "blocked: policy enforcement is on and this call carries no agent identity; \
+     send one in `x-fuse-agent-id`";
+
 /// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
 /// (agent-passport SPEC.md §3.2) so an event raised for this request can carry
@@ -188,13 +300,31 @@ async fn handle(
     State(st): State<Arc<BrokerState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let header = |name: &str| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
+    // The broker's own door, before anything else looks at this request. An
+    // unauthenticated caller must reach no vault, no upstream and no scanner.
+    //
+    // Off unless `TOKENFUSE_MCP_KEYS` is configured, so a loopback deployment
+    // is untouched. The body has already been buffered by the time this runs
+    // (the extractor consumes it), which is bounded by the same
+    // `TOKENFUSE_MAX_BODY_BYTES` limit `app` puts on every route; the check
+    // lives here rather than in a `route_layer` so a future route reaching
+    // this handler cannot be added without it.
+    if st.keys.enabled() {
+        let presented = header(CLIENT_KEY_HEADER).unwrap_or_default();
+        if st.keys.resolve(presented.trim()).is_none() {
+            // Never echo the presented value, not even truncated, and never
+            // distinguish "missing" from "wrong": both are the same answer.
+            tracing::warn!("mcp broker: refused a call with no usable client credential");
+            return crate::proxy::unauthorized_response();
+        }
+    }
     let ctx = CallContext {
         agent_id: header("x-fuse-agent-id"),
         upstream: header("x-fuse-mcp-upstream"),
@@ -210,7 +340,19 @@ async fn handle(
         attestation_method: header("x-fuse-attestation-method"),
         approval_token: header("x-fuse-approval-token"),
     };
-    Json(process(&st, req, &ctx).await)
+    // Refused here rather than inside `process` so the answer is the LLM
+    // path's own 400, produced by the LLM path's own function. `process`
+    // refuses too (it is `pub` and stdio calls it directly); this only
+    // upgrades the refusal to the shape a caller of the HTTP transport
+    // already knows.
+    if needs_identity(&st, &req, &ctx) {
+        tracing::warn!(
+            "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy gate \
+             cannot judge a call it cannot attribute"
+        );
+        return crate::proxy::identity_required();
+    }
+    Json(process(&st, req, &ctx).await).into_response()
 }
 
 /// Resolve which upstream URL this request forwards to. A named upstream
@@ -251,6 +393,12 @@ fn resolve_upstream<'a>(
 /// (agent-passport SPEC.md §6.1 requires `agent_id`; see
 /// `tokenfuse_core::agent_event::build`) and counted - a known, documented
 /// gap rather than a fabricated identity.
+///
+/// With the Wardryx gate ENFORCING, an unattributed `tools/call` is refused
+/// here rather than passed through: see [`needs_identity`]. That makes an
+/// enforcing broker unusable over stdio, which is the honest consequence of
+/// a transport with no identity channel and a policy that keys on identity.
+/// Shadow mode and an unconfigured broker are unaffected.
 pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
@@ -258,7 +406,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let agent_id = ctx.agent_id.as_deref();
+    let agent_id = attributed_agent(ctx);
 
     // Which real MCP server this request forwards to. Resolved up front so an
     // unknown named upstream is refused before any secret is injected.
@@ -428,15 +576,34 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         wardryx_shadow = Some(outcome.decision.as_wire_str());
                     }
                 }
-                None => {
-                    // No agent id (stdio has no per-message header channel):
-                    // the call can't be attributed to an agent, so the
-                    // agent-scoped gate is skipped and logged, never guessed.
-                    // An empty agent id would match no policy anyway (allow), so
-                    // this is the same result, made explicit. Same documented
-                    // gap as mcp_drift on stdio.
+                None if st.wardryx.mode == WardryxMode::Enforce => {
+                    // No agent id, and the gate is enforcing. This used to skip
+                    // the PDP call and carry on into secret injection, on the
+                    // reasoning that an empty agent id would match no policy
+                    // anyway. That is an assumption about another service's
+                    // behaviour, and it is false for exactly the policy this
+                    // gate was added for: a tool-scoped `deny_tool` (docs/23)
+                    // is bypassed by dropping one header the caller writes.
+                    //
+                    // So refuse, the way the LLM path already does
+                    // (`proxy::messages` -> `identity_required`). The HTTP
+                    // transport turns this into that same 400 before we get
+                    // here; this is the answer for stdio, and for any direct
+                    // caller of `process`.
                     tracing::warn!(
-                        "mcp broker: wardryx gate skipped, no x-fuse-agent-id on this tools/call"
+                        "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy \
+                         gate cannot judge a call it cannot attribute"
+                    );
+                    return rpc_error(&id, IDENTITY_RPC_CODE, IDENTITY_RPC_MESSAGE);
+                }
+                None => {
+                    // Shadow: blocks nothing by definition, so an unattributed
+                    // call is observed with whatever attribution it has and
+                    // forwarded. Same posture as the LLM path's shadow mode,
+                    // and the same documented gap as `mcp_drift` on stdio.
+                    tracing::warn!(
+                        "mcp broker: wardryx shadow gate skipped, no x-fuse-agent-id on this \
+                         tools/call"
                     );
                 }
             }
@@ -486,7 +653,22 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
 
         // Rug-pull: a tool's description/schema changed vs. the pinned lock.
         if let Some(lock) = &st.lock {
-            let changed: Vec<String> = mcp::diff(&tools, lock)
+            let drifts = mcp::diff(&tools, lock);
+            // A lock this build cannot compare is not a rug pull, and must not
+            // be blocked as one. It IS worth saying out loud: the operator
+            // configured TOKENFUSE_MCP_LOCK and is getting no rug-pull
+            // detection from it until they re-pin.
+            for d in &drifts {
+                if let mcp::Drift::LockNotComparable(provenance) = d {
+                    tracing::warn!(
+                        lock = %provenance,
+                        "mcp broker: the pinned lock cannot be compared with this build's \
+                         fingerprints, so rug-pull detection is OFF until it is re-pinned \
+                         (tokenfuse mcp-scan --lock <file> --write-lock)"
+                    );
+                }
+            }
+            let changed: Vec<String> = drifts
                 .into_iter()
                 .filter_map(|d| match d {
                     mcp::Drift::Changed(name) => Some(name),
@@ -630,9 +812,10 @@ pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
         }
         let resp = match serde_json::from_str::<Value>(line) {
             // stdio has no per-message header channel, so the CallContext is
-            // empty here: no agent_id (mcp_drift and the Wardryx gate are
-            // skipped, see `process`) and no named upstream (the default one is
-            // always used).
+            // empty here: no agent_id (mcp_drift is skipped, and an ENFORCING
+            // Wardryx gate refuses the call outright rather than skipping,
+            // see `process`) and no named upstream (the default one is always
+            // used).
             Ok(req) => process(&state, req, &CallContext::default()).await,
             Err(e) => rpc_error(&Value::Null, -32700, &format!("parse error: {e}")),
         };
@@ -642,4 +825,65 @@ pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
         stdout.flush().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loopback_bind_says_nothing() {
+        for addr in [
+            "127.0.0.1:4200",
+            "localhost:4200",
+            "[::1]:4200",
+            "::1:4200",
+            "127.0.0.1:0",
+            " 127.0.0.1:4200 ",
+        ] {
+            assert_eq!(
+                bind_exposure_warning(addr, false),
+                None,
+                "the default bind is the normal case and must be silent: {addr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_loopback_bind_warns() {
+        for addr in [
+            "0.0.0.0:4200",
+            "[::]:4200",
+            "192.168.1.5:4200",
+            "10.0.0.4:80",
+        ] {
+            let w = bind_exposure_warning(addr, true)
+                .unwrap_or_else(|| panic!("a non-loopback bind must warn: {addr:?}"));
+            assert!(
+                w.contains("firewall"),
+                "the warning must say what to do about it, in the Cloud's voice: {w:?}"
+            );
+        }
+    }
+
+    /// The dangerous combination is not a wide bind, it is a wide bind with
+    /// nothing on the door. The warning has to distinguish them, or an
+    /// operator who HAS configured keys learns to ignore it.
+    #[test]
+    fn the_warning_says_whether_anything_authenticates() {
+        let unauthenticated =
+            bind_exposure_warning("0.0.0.0:4200", false).expect("non-loopback warns");
+        assert!(
+            unauthenticated.contains("TOKENFUSE_MCP_KEYS"),
+            "with no keys configured the warning must name the variable that fixes it: \
+             {unauthenticated:?}"
+        );
+        let authenticated =
+            bind_exposure_warning("0.0.0.0:4200", true).expect("non-loopback still warns");
+        assert!(
+            !authenticated.contains("TOKENFUSE_MCP_KEYS"),
+            "with keys configured, telling the operator to configure keys is noise: \
+             {authenticated:?}"
+        );
+    }
 }

@@ -1583,6 +1583,17 @@ fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
 /// response deliberately elides.
 fn unauthorized(stats: &KeyStats) -> Response {
     stats.record_unauthorized();
+    unauthorized_response()
+}
+
+/// The bytes of that 401, without the counter.
+///
+/// Split out for the MCP broker (`crate::mcpbroker`), which has the same door
+/// and no `KeyStats` behind it: the aggregate counter is a feature of the
+/// metered path (docs/22-key-lifecycle.md), not of the refusal. The response
+/// itself is unchanged, which is the point of sharing it rather than writing a
+/// second one that drifts.
+pub(crate) fn unauthorized_response() -> Response {
     let body = serde_json::json!({
         "error": {
             "type": "unauthorized",
@@ -1605,7 +1616,13 @@ fn unauthorized(stats: &KeyStats) -> Response {
 ///
 /// Deliberately does not mention the policy plane: it is working, and the fault
 /// is one header away in the caller's own request.
-fn identity_required() -> Response {
+///
+/// Shared with the MCP broker (`crate::mcpbroker`), which is the stack's second
+/// Policy Enforcement Point and used to answer this same missing header by
+/// skipping its gate. Two enforcement points cannot hold opposite postures on
+/// one input, and they cannot drift if they return the same bytes from the same
+/// function.
+pub(crate) fn identity_required() -> Response {
     let body = serde_json::json!({
         "error": {
             "type": "identity_required",

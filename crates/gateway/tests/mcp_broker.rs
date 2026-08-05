@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use tokenfuse_core::SecretVault;
+use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
 use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
 
@@ -92,9 +93,30 @@ fn broker_cfg(
     named_upstreams: std::collections::BTreeMap<String, String>,
     wardryx: Wardryx,
 ) -> Router {
+    app(broker_state(
+        upstream,
+        scan,
+        dlp,
+        lock,
+        named_upstreams,
+        wardryx,
+    ))
+}
+
+/// The state behind [`broker_cfg`], exposed on its own so a test can drive
+/// [`tokenfuse_gateway::mcpbroker::process`] directly - which is what the stdio
+/// transport does, and stdio has no HTTP status line to assert against.
+fn broker_state(
+    upstream: String,
+    scan: ScanMode,
+    dlp: tokenfuse_core::DlpMode,
+    lock: Option<tokenfuse_core::mcp::Lock>,
+    named_upstreams: std::collections::BTreeMap<String, String>,
+    wardryx: Wardryx,
+) -> Arc<BrokerState> {
     let mut vault = SecretVault::new();
     vault.insert("gh", "ghp_REALSECRET");
-    app(Arc::new(BrokerState {
+    Arc::new(BrokerState {
         upstream,
         named_upstreams,
         vault,
@@ -106,9 +128,10 @@ fn broker_cfg(
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock,
         wardryx: Arc::new(wardryx),
+        keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
-    }))
+    })
 }
 
 /// Like `broker_cfg`, but with an explicit `dlp_pii` mode - used only by the
@@ -125,9 +148,27 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         dlp_pii,
         lock: None,
         wardryx: Arc::new(Wardryx::disabled()),
+        keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
     }))
+}
+
+/// A broker with its own client credentials configured. Everything else is a
+/// default, un-gated broker: the point of these tests is the door, not what is
+/// behind it.
+fn broker_keyed(upstream: String, spec: &str) -> Router {
+    let mut state = broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::disabled(),
+    );
+    let keys = ClientKeys::from_spec(spec).expect("a usable key spec");
+    Arc::get_mut(&mut state).expect("sole owner").keys = keys;
+    app(state)
 }
 
 fn a_wardryx(mode: WardryxMode, pdp_url: String) -> Wardryx {
@@ -390,11 +431,169 @@ async fn wardryx_enforce_allow_forwards_the_tool_call() {
     );
 }
 
+/// An upstream that records every request it is sent, so a test can prove a
+/// refusal happened BEFORE anything was forwarded - and therefore before any
+/// `{{secret:}}` handle in the params was resolved into a real vault value.
+fn recording_upstream() -> (Arc<std::sync::Mutex<Vec<Value>>>, Router) {
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = Router::new().route(
+        "/",
+        post({
+            let seen = Arc::clone(&seen);
+            move |Json(req): Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    seen.lock().expect("upstream log").push(req);
+                    Json(json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }))
+                }
+            }
+        }),
+    );
+    (seen, router)
+}
+
+/// A `tools/call` that names no agent is refused, and nothing is forwarded.
+///
+/// The gate exists to stop a `deny_tool` policy being bypassed, so skipping it
+/// when the request omits the header it keys on is not "the same result made
+/// explicit": it is the one input that turns enforcement off, chosen by the
+/// caller. The LLM path already decided this the other way
+/// (`proxy::messages` -> `identity_required`, HTTP 400), and two enforcement
+/// points cannot answer the same missing header with opposite postures.
+///
+/// The status and body are the first assertion; the one that matters is the
+/// second, that the upstream saw nothing, because a skipped gate still ran
+/// secret injection four lines later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn wardryx_gate_is_skipped_without_an_agent_id() {
-    // No x-fuse-agent-id: the call cannot be attributed to an agent, so the
-    // gate is skipped (an empty agent id would match no policy anyway) and the
-    // call forwards. A documented gap, asserted so it stays intentional.
+async fn a_tool_call_with_no_agent_id_is_refused_and_no_secret_is_resolved() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    // An ALLOWING PDP, deliberately: a test that passes must not be passing
+    // because the policy happened to deny. If the gate were merely asked with
+    // an empty subject, this call would sail through.
+    let pdp = stub_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+
+    let forwarded = seen.lock().expect("upstream log");
+    assert!(
+        forwarded.is_empty(),
+        "an unidentified call must not reach the upstream, and its secret handle must \
+         never be resolved: {} request(s) were forwarded",
+        forwarded.len()
+    );
+    assert!(
+        !forwarded
+            .iter()
+            .any(|r| r.to_string().contains("ghp_REALSECRET")),
+        "the vault value must never leave the broker on a call the gate could not judge"
+    );
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "the refusal must match the LLM path's shape (proxy::identity_required): {body}"
+    );
+    assert_eq!(
+        body["error"]["type"], "identity_required",
+        "same error type as the LLM path: {body}"
+    );
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("x-fuse-agent-id"),
+        "the refusal has to name the header that is missing, got {reason:?}"
+    );
+    assert_eq!(
+        body["error"]["retryable"],
+        json!(false),
+        "resending the same request cannot help: {body}"
+    );
+}
+
+/// The stdio transport has no header channel, so it can never attribute a
+/// call. With the gate enforcing, that is a refusal, not a pass: the JSON-RPC
+/// shape of the same decision, because a subprocess transport has no status
+/// line to carry the HTTP one.
+///
+/// This is deliberately deployment-breaking for `mcp-broker --stdio` with
+/// `TOKENFUSE_WARDRYX_MODE=enforce`, and it is the honest reading of that
+/// configuration: the operator asked for enforcement on a transport that
+/// cannot carry the subject the policy keys on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_path_refuses_an_unattributed_call_in_json_rpc() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let pdp = stub_pdp("allow").await;
+    let state = broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Exactly what `run_stdio` passes: an empty CallContext.
+    let resp = tokenfuse_gateway::mcpbroker::process(
+        &state,
+        json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }),
+        &tokenfuse_gateway::mcpbroker::CallContext::default(),
+    )
+    .await;
+
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32007),
+        "an unattributed call is refused with its own code, not the PDP's deny code: {resp}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("x-fuse-agent-id"),
+        "the refusal has to name the header that is missing: {resp}"
+    );
+    assert!(
+        seen.lock().expect("upstream log").is_empty(),
+        "nothing may be forwarded, and no secret handle resolved, on a call the gate \
+         could not judge"
+    );
+}
+
+/// The mirror image, and the reason the refusal above is enforce-only: shadow
+/// mode blocks nothing by definition, so a missing agent identity must not
+/// become a refusal there. Same posture the LLM path holds
+/// (`shadow_without_an_agent_id_still_observes_and_never_blocks` in
+/// `tests/wardryx.rs`), so the two enforcement points now agree in both
+/// directions rather than only in one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shadow_without_an_agent_id_still_forwards() {
     let upstream = spawn_server(Router::new().route("/", post(stub))).await;
     let pdp = stub_pdp("deny").await;
     let broker_url = spawn_server(broker_cfg(
@@ -403,7 +602,7 @@ async fn wardryx_gate_is_skipped_without_an_agent_id() {
         tokenfuse_core::DlpMode::Off,
         None,
         Default::default(),
-        a_wardryx(WardryxMode::Enforce, pdp),
+        a_wardryx(WardryxMode::Shadow, pdp),
     ))
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -423,11 +622,49 @@ async fn wardryx_gate_is_skipped_without_an_agent_id() {
 
     assert!(
         resp.get("result").is_some(),
-        "with no agent id the gate is skipped and the call forwards: {resp}"
+        "shadow observes; refusing here would make it act, which is the one thing it must \
+         not do: {resp}"
     );
     assert!(
         resp.get("error").is_none(),
-        "must not be blocked without an agent id: {resp}"
+        "shadow must not block an unattributed call: {resp}"
+    );
+}
+
+/// The other method on the same port. The gate only covers `tools/call`, so an
+/// enforcing broker must still answer `tools/list` without an agent id: that is
+/// the poisoning and rug-pull scan, and refusing it would take a working
+/// control away in the name of adding one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enforcing_broker_still_lists_tools_without_an_agent_id() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let pdp = stub_pdp("deny").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the identity refusal covers tools/call only"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["result"]["tools"].is_array(),
+        "tools/list must still work: {body}"
     );
 }
 
@@ -497,6 +734,148 @@ async fn named_upstream_routes_by_header_and_refuses_unknown() {
         u["error"]["code"],
         json!(-32005),
         "an unknown upstream must be refused: {u}"
+    );
+}
+
+/// The broker resolves `{{secret:NAME}}` handles against the whole vault and
+/// forwards to any configured upstream. It authenticated nobody: the only
+/// thing between a process on the box and the vault was the default loopback
+/// bind, which `TOKENFUSE_MCP_ADDR` widens with no warning.
+///
+/// With `TOKENFUSE_MCP_KEYS` set, a call must present a known credential. The
+/// assertion that matters is the same one as for the identity gate: a refused
+/// call reaches nothing, so no handle is ever resolved into a real value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_broker_key_is_required_and_a_wrong_one_is_refused() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let broker_url = spawn_server(broker_keyed(upstream, "sk-broker-abc:tool-user")).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let http = reqwest::Client::new();
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+    });
+
+    // No credential at all.
+    let missing = http.post(&broker_url).json(&call).send().await.unwrap();
+    assert_eq!(
+        missing.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a broker with keys configured must not serve an anonymous caller"
+    );
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "unauthorized", "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(CLIENT_KEY_HEADER),
+        "the refusal has to name the header that carries the credential: {body}"
+    );
+
+    // A credential, but not one of ours.
+    let wrong = http
+        .post(&broker_url)
+        .header(CLIENT_KEY_HEADER, "sk-broker-xyz")
+        .json(&call)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an unknown credential is not a credential"
+    );
+
+    // Neither refusal may have touched the upstream or the vault. Scoped so
+    // the guard is gone before the next await, not merely dropped.
+    {
+        let forwarded = seen.lock().expect("upstream log");
+        assert!(
+            forwarded.is_empty(),
+            "a refused caller must reach nothing: {} request(s) were forwarded",
+            forwarded.len()
+        );
+        assert!(
+            !forwarded
+                .iter()
+                .any(|r| r.to_string().contains("ghp_REALSECRET")),
+            "the vault value must never leave the broker for an unauthenticated caller"
+        );
+    }
+
+    // The configured credential works, and is not itself forwarded upstream.
+    let ok: Value = http
+        .post(&broker_url)
+        .header(CLIENT_KEY_HEADER, "sk-broker-abc")
+        .json(&call)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ok.get("error").is_none(),
+        "the configured credential must be accepted: {ok}"
+    );
+    assert_eq!(
+        seen.lock().expect("upstream log").len(),
+        1,
+        "the authenticated call is the only one that reaches the upstream"
+    );
+}
+
+/// The other half, and the reason this is safe to ship: with no keys
+/// configured the broker behaves exactly as it always has. Requiring a
+/// credential by default would break every loopback deployment on upgrade,
+/// which is the same conclusion `clientkeys.rs` reached for the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_broker_keys_configured_nothing_changes() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(broker(upstream, ScanMode::Off)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "an unconfigured broker must not start demanding a credential"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["echo"]["arguments"]["auth"], "Bearer ghp_REALSECRET",
+        "and it must still broker the secret: {body}"
+    );
+}
+
+/// `/healthz` stays open. It carries no vault, reaches no upstream, and is
+/// what a container runtime probes before it has any credential to present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthz_stays_open_when_keys_are_configured() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(broker_keyed(upstream, "sk-broker-abc:tool-user")).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{broker_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a liveness probe has no credential to present"
     );
 }
 
