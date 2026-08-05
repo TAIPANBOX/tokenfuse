@@ -1224,10 +1224,19 @@ fn stream_managed(
     router_header: Option<String>,
     wardryx_header: Option<String>,
 ) -> Response {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let inner = resp.body;
     // Capture the header values before `reservation` is moved into the guard.
     let run_id = reservation.run_id.clone();
     let step = reservation.step;
+    // Whether the estimate may be charged when the stream reports no usage,
+    // the same rule PR #167 established for `buffered_managed` one screen
+    // down. A refusal is a refusal whether the client asked to stream it or
+    // not: the provider generated nothing, so there is nothing to fall back
+    // to measuring, and settling the estimate would exhaust a run's budget on
+    // calls nobody was billed for. `SettleGuard` holds the decision because
+    // it owns both the end-of-stream settle and the cancel/error `Drop`.
+    let provider_refused = !status.is_success();
     let guard = SettleGuard::new(
         st.ledger.clone(),
         st.prices.clone(),
@@ -1235,6 +1244,7 @@ fn stream_managed(
         model.to_string(),
         resp.usage.clone(),
         reservation.amount,
+        provider_refused,
         reservation,
         agent_id,
         parent_run_id,
@@ -1264,7 +1274,7 @@ fn stream_managed(
         Box::pin(wrapped);
 
     let mut builder = Response::builder()
-        .status(StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK))
+        .status(status)
         .header(
             "content-type",
             resp.content_type.as_deref().unwrap_or("text/event-stream"),
@@ -4046,6 +4056,183 @@ mod tests {
 
         let snap = ledger
             .snapshot("prov-429-billed")
+            .await
+            .expect("the run was opened");
+        assert_eq!(snap.spent, billed, "the reported usage, priced as itself");
+        assert_eq!(snap.reserved, Microusd::ZERO, "the reservation is released");
+        let records = sink.snapshot();
+        assert_eq!(records[0].cost_microusd, billed.0);
+    }
+
+    // -- the same rule on the streaming path --------------------------------
+    //
+    // PR #167 fixed `buffered_managed` and deliberately left `stream_managed`
+    // out. The streaming path builds its `SettleGuard` with
+    // `fallback = reservation.amount` and never saw the status at all, so a
+    // request the client asked to stream and the provider answered with a 429
+    // settled the pre-flight estimate for exactly the reason the buffered path
+    // no longer does. Mirrored here rather than re-argued: settle the usage the
+    // provider actually reported if there is one, and settle zero only when the
+    // provider refused and reported nothing.
+
+    /// A streamed 429. `x-fuse-stream: passthrough` on the response is what
+    /// proves this went through `stream_managed` and not the buffered path the
+    /// sibling tests above cover.
+    #[tokio::test]
+    async fn a_streaming_429_from_the_provider_settles_nothing_as_spend() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 429,
+            body: RATE_LIMITED,
+            usage: None,
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "stream-429")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the provider's status is passed through, so this really is a refusal"
+        );
+        assert_eq!(
+            resp.headers().get("x-fuse-stream").unwrap(),
+            "passthrough",
+            "and this really is the streaming path, not the buffered one"
+        );
+
+        // Draining the body is what triggers the end-of-stream settle.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let snap = ledger
+            .snapshot("stream-429")
+            .await
+            .expect("the run was opened");
+        assert_eq!(
+            snap.in_flight(),
+            Microusd::ZERO,
+            "the run's remaining budget must be exactly what it was before the call: \
+             nothing settled as spend, nothing left reserved"
+        );
+        assert_eq!(
+            units.spent("treasury", now_millis()),
+            Microusd::ZERO,
+            "the unit's monthly cap must not absorb a call the provider refused either"
+        );
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "one row for the call");
+        assert_eq!(
+            records[0].cost_microusd, 0,
+            "a refused call carries no cost into the trace, the FOCUS export or the Cloud"
+        );
+    }
+
+    /// The 5xx half, streamed.
+    #[tokio::test]
+    async fn a_streaming_500_from_the_provider_settles_nothing_as_spend() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 500,
+            body: UPSTREAM_BROKEN,
+            usage: None,
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "stream-500")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.headers().get("x-fuse-stream").unwrap(), "passthrough");
+
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let snap = ledger
+            .snapshot("stream-500")
+            .await
+            .expect("the run was opened");
+        assert_eq!(
+            snap.in_flight(),
+            Microusd::ZERO,
+            "the run's remaining budget must be exactly what it was before the call"
+        );
+        assert_eq!(units.spent("treasury", now_millis()), Microusd::ZERO);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "one row for the call");
+        assert_eq!(records[0].cost_microusd, 0);
+    }
+
+    /// The other half of the decision on the streaming path, and the reason
+    /// this is not "a non-2xx stream settles zero". A provider that generated
+    /// part of a response and then failed over it reports the usage it intends
+    /// to bill for, and that is real money: settled as itself, neither zeroed
+    /// nor replaced by the pre-flight estimate.
+    ///
+    /// Green before the fix as well as after, like its buffered twin: it is
+    /// here to keep the fix from being widened into a blanket zero.
+    #[tokio::test]
+    async fn a_streaming_refusal_that_reports_usage_settles_that_usage_not_zero() {
+        let reported = tokenfuse_core::Usage {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        let sink = RecordingSink::default();
+        let mut st =
+            state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 429,
+            body: RATE_LIMITED,
+            usage: Some(reported),
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let prices = Arc::clone(&st.prices);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "stream-429-billed")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("x-fuse-stream").unwrap(), "passthrough");
+
+        let billed = prices
+            .cost("test-model", &reported)
+            .expect("test-model is priced");
+        let estimate = estimate_cost(&prices, "test-model", body_stream(500).len(), Some(500))
+            .expect("test-model is priced");
+        assert!(
+            billed > Microusd::ZERO,
+            "sanity: the provider billed for it"
+        );
+        assert_ne!(
+            billed, estimate,
+            "sanity: if the billed figure equalled the estimate this test would prove nothing"
+        );
+
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let snap = ledger
+            .snapshot("stream-429-billed")
             .await
             .expect("the run was opened");
         assert_eq!(snap.spent, billed, "the reported usage, priced as itself");
