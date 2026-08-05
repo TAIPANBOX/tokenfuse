@@ -3,7 +3,63 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-07-24 (**opt-in PII masks in DLP**, #138: `TOKENFUSE_DLP_PII` / `TOKENFUSE_MCP_DLP_PII`, `off\|shadow\|mask\|block` switched independently of the secret scanners, default `off` so behavior is byte-identical until opted in; `pii_email`, Luhn-gated `pii_card`, intl-only `pii_phone`, secrets win on overlap, one merged redact pass. Same day, **the SPEC 6.5 `prev_hash` event chain**, #139: every agent-event NDJSON line is hash-chained over RFC 8785 canonical JSON (hand-rolled JCS in `core/src/jcs.rs`, core's dep list stays closed), one file = one chain resumed across restarts by the Exporter inside its existing lock, fail-open; verify with `agent-conform -chain`. Earlier 2026-07-23: **month-to-date unit spend**, #132 - the units-card member of the time-window honesty class: `/v1/units` rows gain `month`/`month_spent_microusd`/`month_calls` - a persisted, ingest-time UTC-month fold mirroring the gateway `unitledger` window - and the dashboard's Business units card now compares the MONTHLY caps against month-to-date spend instead of all-time, falling back to an explicitly-labeled all-time figure on older planes. Same day, Tool runs metric, #130: model-emitted tool calls counted per call through the whole accounting pipeline (gateway -> traces/Cloud -> dashboard tile + per-run column), docs/21; plus a follow-up sync of the Tool runs tile comment after the #130 x #131 cross-merge. Same day, dashboard time-window honesty, #131: "Spent today" / "Saved this month" / "Spend by run · today" relabeled to the all-time / run-lifetime figures they actually render (Store::summary / SavingsAcc have no day- or month-boundary reset); an honest daily number needs a plane-side day-windowed rollup first, see the comment at the tiles. Same day, identity map: key<->agent<->unit binding, strict mode, monthly unit budgets, Cloud unit aggregation + central unit-cap overrides, docs/20);
+**Last updated:** 2026-08-05, covering #134-#170. Four tracks, and none of them
+a new capability: this stretch was spent making the capabilities already listed
+below actually true.
+
+**Correctness on the money path** (#141, #162, #163, #167-#170). The gateway now
+refuses to start rather than answer from `StubProvider` and meter its canned
+1000/500 tokens as real spend; `TOKENFUSE_ALLOW_STUB=1` keeps the offline loop
+and says in the log that every figure after it is fictional. Found on a live
+five-node Kubernetes cluster whose manifest had simply not set
+`TOKENFUSE_UPSTREAM`: every call returned 200, each was billed $0.0035, and
+nothing warned (#141). The cluster binary gained a durable mode it never had:
+`build_durable` had existed since the redb store landed with a test as its only
+caller, so `serve` always built an in-memory node and a restart of a real server
+lost every budget and every reservation, silently. `--dir <path>` wires it, and
+`VALIDATION.md`'s durability rows now say which of them were quorum results
+rather than single-node ones (#162, #163). A call the provider REFUSED settled
+the pre-flight estimate as spend, first on the buffered path (#167) and then on
+the streaming one (#168, which also stopped `POST /v1/ingest` accepting a
+read-only key). Four defects on the MCP surface: a policy gate switched off by
+omitting one header, an open broker bind, a fingerprint std does not promise,
+and a scan that read half the tool (#169). A telemetry push the control plane
+refused was reported nowhere, so a gateway with a wrong cloud key looked healthy
+from both ends (#170, invariant 13).
+
+**The incident layer says what it means** (#152-#158, CLAUDE.md invariants
+7-10). `budget_threshold` and `run_killed` reach the shared bus (#152);
+`budget_exhausted` fires on a budget block rather than on any spend-avoiding
+block, which had it telling a human at 3am that a run with no budget had run out
+of it (#153); a working breaker stopped being a critical event (#154); the two
+refusals with no event of their own got one (#155); `spend_spike` and
+`fanout_explosion` now measure a CHANGE against the subject's own history
+instead of a fixed level, so a busy org stopped tripping on every batch and a
+genuine tenfold jump under the old line stopped being invisible (#156, #158);
+and an org-scoped incident that structurally cannot reach a notifier is recorded
+as a boundary rather than given a fabricated `agent_id` to make it travel
+(#157).
+
+**Gates that actually run** (#146-#151, #164). CI runs the gates it claimed to
+(#149); the `core-deps` gate had been committed non-executable, so it could not
+run for anyone who cloned (#148); the agent-event exporter's two promises got
+tests, and the latent env-var race between them got a mutex (#150); first-party
+actions moved off the Node 20 runtime (#151); the README's test count is now
+computed and gated (#164, invariant 12); CLAUDE.md dropped its status section in
+favour of enforcement markers (#146); and wasmtime 43 -> 47.0.3 closed
+RUSTSEC-2026-0222 in the off-by-default wasm sandbox (#147).
+
+**The written record stops describing what does not exist** (#142-#145,
+#159-#161, #165, #166): a paid-plan upgrade prompt this free product cannot
+honour, an OpenAI endpoint the gateway does not serve, a phone app, a Slack
+kill-switch, a Cloud dashboard screenshot, and several stack-diagram edges that
+were missing, one-way, or naming seven services and no console.
+
+Also landed in this range and not previously recorded here: the key lifecycle
+report at `GET /v1/keys` (#134), mcp-broker v2 with named upstreams, a Wardryx
+policy gate and a `tool_call` audit (#135), and the complete GenAI semconv
+attribute set on the OTel LLM-call span (#137);
+earlier 2026-07-24 (**opt-in PII masks in DLP**, #138: `TOKENFUSE_DLP_PII` / `TOKENFUSE_MCP_DLP_PII`, `off\|shadow\|mask\|block` switched independently of the secret scanners, default `off` so behavior is byte-identical until opted in; `pii_email`, Luhn-gated `pii_card`, intl-only `pii_phone`, secrets win on overlap, one merged redact pass. Same day, **the SPEC 6.5 `prev_hash` event chain**, #139: every agent-event NDJSON line is hash-chained over RFC 8785 canonical JSON (hand-rolled JCS in `core/src/jcs.rs`, core's dep list stays closed), one file = one chain resumed across restarts by the Exporter inside its existing lock, fail-open; verify with `agent-conform -chain`. Earlier 2026-07-23: **month-to-date unit spend**, #132 - the units-card member of the time-window honesty class: `/v1/units` rows gain `month`/`month_spent_microusd`/`month_calls` - a persisted, ingest-time UTC-month fold mirroring the gateway `unitledger` window - and the dashboard's Business units card now compares the MONTHLY caps against month-to-date spend instead of all-time, falling back to an explicitly-labeled all-time figure on older planes. Same day, Tool runs metric, #130: model-emitted tool calls counted per call through the whole accounting pipeline (gateway -> traces/Cloud -> dashboard tile + per-run column), docs/21; plus a follow-up sync of the Tool runs tile comment after the #130 x #131 cross-merge. Same day, dashboard time-window honesty, #131: "Spent today" / "Saved this month" / "Spend by run · today" relabeled to the all-time / run-lifetime figures they actually render (Store::summary / SavingsAcc have no day- or month-boundary reset); an honest daily number needs a plane-side day-windowed rollup first, see the comment at the tiles. Same day, identity map: key<->agent<->unit binding, strict mode, monthly unit budgets, Cloud unit aggregation + central unit-cap overrides, docs/20);
 earlier 2026-07-12 (P3 enterprise/compliance track: machine-readable control catalog, `tokenfuse compliance` CLI + SARIF export, Cloud `/v1/compliance`, minimal OIDC bearer auth, #91; tamper-evident audit trail + ES256-signed manifest + dashboard savings tile, #92; FinOps reporting: `tokenfuse focus-export` #97, the agent-event NDJSON exporter + `x-fuse-on-behalf-of` + `parent_run_id` #98, outcome tags + `tokenfuse outcomes` #99; post-launch fixes for the Anthropic auth header, a raft-follower snapshot panic, and 2026 model pricing, #100-#102; the **Wave-2 governance plane** (model router, the Wardryx PEP/PDP policy hook, Cloud incident replay + regulator evidence pack, per-instance Parquet trace segments), landed and hardened across #103, #104, #106, #110, see [docs/19](docs/19-wave2-governance.md). None of this is in a tagged release yet)
 
 **Earlier:** 2026-07-03 (the web dashboard restyled to the fuse identity; the bolt emblem unified across README, dashboard and showcase as an amber→ember tile with a black-keyline bolt; README visuals refreshed)
@@ -29,8 +85,8 @@ documented threat model in [docs/13](docs/13-security-hardening.md)). What's lef
 is genuinely optional scale/ops work (a SQL/columnar Cloud store; automated cert
 rotation) and a formal third-party audit — none of it a blocker.
 
-**Budgets above the run: slice 2, the identity map, is on this branch**
-(docs/20, `feat/identity-map`). Slice 1 (#119) established the server-resolved
+**Budgets above the run: slice 2, the identity map, landed in #128**
+(docs/20). Slice 1 (#119) established the server-resolved
 `key_id`; this slice binds it: a declarative JSON map
 (`TOKENFUSE_IDENTITY_MAP`) links `key_id -> business unit -> allowed
 `agent://` ids, `TOKENFUSE_IDENTITY_STRICT=off|warn|enforce` gates the
@@ -47,8 +103,12 @@ server-resolved `unit` column (nullable-evolution), `focus-export` gains
 stated in docs/20 and the README: unit counters are per-gateway-process
 (restart resets them; the raft ledger deliberately does not grow this
 dimension), and with client keys off the strict check has nothing
-authenticated to gate. Still next: per-key budgets, threshold alerts per
-unit, dashboard grouping by unit, fleet-consistent unit caps.
+authenticated to gate. Still next, re-checked 2026-08-05: per-key budgets
+(nothing in `crates/` keys a budget on `key_id`; #134's `GET /v1/keys` is a
+lifecycle report, not a cap), threshold alerts per unit (#152 put a threshold on
+the bus for RUNS only), and fleet-consistent unit caps. Dashboard grouping by
+unit is done: the Business units card landed in #129 and gained month-to-date
+comparison in #132.
 
 ## Status by component
 
@@ -113,7 +173,24 @@ unit, dashboard grouping by unit, fleet-consistent unit caps.
 
 ## Test status
 
-`cargo test --all` — 100 passing (core: 60, gateway: 40); Python SDK — 11 passing; **`tokenfuse-cluster` — 12 integration tests** on live raft clusters (in-process + over HTTP sockets, incl. token-auth, HTTPS, **mTLS**, membership, linearizable reads, redb durability; excluded crate, own CI job). `cargo clippy --all-targets --all-features` clean with `-D warnings` across the workspace, radar, and cluster. **`cargo audit` — 0 vulnerabilities** (own CI `security` job; 3 transitive unmaintained warnings only). **eBPF Radar built + run live on a Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block; enforce 402; durable-HA restart persistence; full Cloud stack.
+**Counts re-measured 2026-08-05**, each by the command named, because the last
+set here said 100 where the workspace ran 747 and nothing had been watching:
+`cargo test --all` runs **747 passing** (core 218, gateway 345, cloud 183,
+umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/readme-numbers.sh` gates (invariant 12). Python SDK: 11
+passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
+**`tokenfuse-cluster`: 13 integration tests** on live raft clusters (in-process
++ over HTTP sockets, incl. token-auth, HTTPS, **mTLS**, membership, linearizable
+reads, redb durability; excluded crate, own CI job). `cargo clippy
+--all-targets --all-features` clean with `-D warnings` across the workspace,
+radar, and cluster. **`cargo audit` via `scripts/audit.sh`: 0 vulnerabilities**
+across both manifests, unmaintained-crate warnings only (`number_prefix`,
+`paste`, `rustls-pemfile`), plus one recorded ignore (rkyv, RUSTSEC-2026-0235)
+whose justification the script re-establishes on every run (invariant 11).
+
+The live-verification claims below were NOT re-checked in that pass and are
+kept as written, with their original scope: **eBPF Radar built + run live on a
+Linux VPS** (flags real LLM traffic). **Networked benchmark (release, 2-vCPU VPS):** the gateway adds **+0.82 ms p50 / +2.0 ms p99** over a direct socket to the upstream (see BENCHMARKS.md). Verified live: mcp-scan poisoning/rug-pull; OTLP export; DLP block; WASM policy block; enforce 402; durable-HA restart persistence; full Cloud stack.
 
 ## How to run
 
