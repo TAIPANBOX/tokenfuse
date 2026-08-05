@@ -262,6 +262,21 @@ build)`, `cloud apns (feature build)`.
    that IS built, which fails it, and by adding an ignore with no recorded
    reason, which also fails it)*
 
+12. **A number this README states about the repository is checked against the
+   repository.** A figure on a page has no owner and no clock: it is right the
+   day it is written and the suite grows in commits that never open the README.
+   Measured 2026-08-05, this repository was the worst case in the estate: the
+   it-rat.com page for TokenFuse said **513 tests where the workspace runs 709**,
+   and nobody knows for how long. It was not wrong when written; nothing was
+   watching it. The badge counts every `test result:` line `cargo test --all`
+   prints, which is the whole workspace and exactly what a contributor sees at
+   the end of a run, so it is reproducible in one command. `crates/cluster` is
+   deliberately excluded: it is its own workspace behind a feature with its own
+   CI job, and folding it in would make the figure irreproducible with the plain
+   command the badge implies.
+   *(gate: `scripts/readme-numbers.sh`; verified by moving the badge one test,
+   which fails it and names both figures)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
