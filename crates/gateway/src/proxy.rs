@@ -1338,10 +1338,38 @@ async fn buffered_managed(
     };
 
     let usage = resp.usage.lock().unwrap().take();
+
+    // What to settle when the response reports no usage we can price.
+    //
+    // On a 2xx that is the conservative fallback it has always been: a
+    // completion did happen, we simply could not measure it, so charging what
+    // was reserved beats charging nothing and letting an unmeasurable model
+    // spend a run's budget for free.
+    //
+    // On a non-2xx it is wrong, and wrongly expensive. The provider refused:
+    // there is no completion to measure, so the pre-flight estimate is not a
+    // fallback measurement of anything, it is a number this gateway invented
+    // and then wrote into the run's budget, the trace, the FOCUS export and
+    // the Cloud aggregates as money somebody was billed. The transport-error
+    // paths beside this one settle `ZERO` for exactly this reason ("failed
+    // call cost us nothing"): a 4xx/5xx is the same fact arriving with a
+    // status line instead of a broken socket, and a provider that 429s a run
+    // repeatedly would otherwise exhaust that run's budget on calls that cost
+    // nothing.
+    //
+    // Reported usage is still settled as itself either way, including on a
+    // refusal: a provider that generated part of a response and then failed
+    // over it bills for what it generated, and that is real money rather than
+    // an estimate.
+    let unmeasured = if status.is_success() {
+        reservation.amount
+    } else {
+        Microusd::ZERO
+    };
     let actual = usage
         .as_ref()
         .and_then(|u| st.prices.cost(model, u))
-        .unwrap_or(reservation.amount);
+        .unwrap_or(unmeasured);
     st.ledger.settle(&reservation, actual);
     if let Some(ur) = &unit_reservation {
         st.units.settle(ur, actual, now_millis());
@@ -2160,6 +2188,48 @@ mod tests {
             StubProvider::default().send(headers, body).await
         }
     }
+
+    /// An upstream that refuses the call: a non-2xx status with a
+    /// provider-shaped JSON error body. `StubProvider` and every other double
+    /// in this workspace answer `200`, so before this nothing could reach the
+    /// non-2xx half of `buffered_managed`'s settle.
+    ///
+    /// `usage` is what the provider left in the slot. `None` is the ordinary
+    /// refusal: nothing was generated, so there is nothing to report and
+    /// nothing to price. `Some(..)` is the provider that charges for a partial
+    /// generation it then failed to deliver, which is a different fact and is
+    /// settled as the real money it is.
+    struct RefusingProvider {
+        status: u16,
+        body: &'static str,
+        usage: Option<tokenfuse_core::Usage>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RefusingProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let chunk = Bytes::from_static(self.body.as_bytes());
+            Ok(ProviderResponse {
+                status: self.status,
+                content_type: Some("application/json".to_string()),
+                body: Box::pin(futures::stream::once(async move { Ok(chunk) })),
+                usage: Arc::new(Mutex::new(self.usage)),
+            })
+        }
+    }
+
+    /// Anthropic's own 429 body shape. It carries no `usage` block, which is
+    /// the point: there is no completion to bill for.
+    const RATE_LIMITED: &str =
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+
+    /// A 5xx body, same shape, same absence.
+    const UPSTREAM_BROKEN: &str =
+        r#"{"type":"error","error":{"type":"api_error","message":"internal server error"}}"#;
 
     /// A `LedgerBackend` that delegates everything to a real in-process
     /// ledger *except* `snapshot`, which always reports `None` — a
@@ -3816,5 +3886,171 @@ mod tests {
         assert!(units
             .try_reserve("treasury", Microusd::from_usd(0.99), now_millis())
             .is_ok());
+    }
+
+    // -- a call the provider refused is not spend ---------------------------
+
+    /// A 429 is not a completion. Nothing was generated, so nothing may be
+    /// settled: not against the run's budget, not against the unit's monthly
+    /// cap, not into the trace as an allowed call's cost. Before the fix this
+    /// settled `reservation.amount`, the pre-flight estimate, so a provider
+    /// rate-limiting a run repeatedly drained that run's budget with calls
+    /// nobody was billed for and reported the drain as spend everywhere
+    /// downstream.
+    #[tokio::test]
+    async fn a_429_from_the_provider_settles_nothing_as_spend() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 429,
+            body: RATE_LIMITED,
+            usage: None,
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "prov-429")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the provider's status is passed through, so this really is the non-2xx path"
+        );
+
+        let snap = ledger
+            .snapshot("prov-429")
+            .await
+            .expect("the run was opened");
+        assert_eq!(
+            snap.in_flight(),
+            Microusd::ZERO,
+            "the run's remaining budget must be exactly what it was before the call: \
+             nothing settled as spend, nothing left reserved"
+        );
+        assert_eq!(
+            units.spent("treasury", now_millis()),
+            Microusd::ZERO,
+            "the unit's monthly cap must not absorb a call the provider refused either"
+        );
+
+        // The row still says `allow`, which is a separate question from the
+        // money and is deliberately left alone here: changing it moves
+        // `focus-export`, the compliance counts and the Cloud's
+        // decision_counts together. What must be true today is that the cost
+        // on it is zero.
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "one row for the call");
+        assert_eq!(
+            records[0].cost_microusd, 0,
+            "a refused call carries no cost into the trace, the FOCUS export or the Cloud"
+        );
+    }
+
+    /// The 5xx half of the same rule: a provider that broke mid-request billed
+    /// nothing either, and the estimate is not evidence that it did.
+    #[tokio::test]
+    async fn a_500_from_the_provider_settles_nothing_as_spend() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 500,
+            body: UPSTREAM_BROKEN,
+            usage: None,
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "prov-500")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let snap = ledger
+            .snapshot("prov-500")
+            .await
+            .expect("the run was opened");
+        assert_eq!(
+            snap.in_flight(),
+            Microusd::ZERO,
+            "the run's remaining budget must be exactly what it was before the call"
+        );
+        assert_eq!(units.spent("treasury", now_millis()), Microusd::ZERO);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "one row for the call");
+        assert_eq!(records[0].cost_microusd, 0);
+    }
+
+    /// The other half of the decision, and the reason the fix is not "a
+    /// non-2xx settles zero". A provider that generated part of a response and
+    /// then failed over it reports the usage it intends to bill for, and that
+    /// is real money: it is settled as itself, neither zeroed (which would
+    /// under-count a real invoice) nor replaced by the pre-flight estimate
+    /// (which nobody was ever billed).
+    ///
+    /// Green before the fix as well as after: it is here to keep the fix from
+    /// being widened into a blanket zero. Verified by writing that blanket
+    /// version, which fails it.
+    #[tokio::test]
+    async fn a_refusal_that_reports_usage_settles_that_usage_not_zero() {
+        let reported = tokenfuse_core::Usage {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        let sink = RecordingSink::default();
+        let mut st =
+            state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(RefusingProvider {
+            status: 429,
+            body: RATE_LIMITED,
+            usage: Some(reported),
+        });
+        let ledger = Arc::clone(&st.ledger);
+        let prices = Arc::clone(&st.prices);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "prov-429-billed")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let billed = prices
+            .cost("test-model", &reported)
+            .expect("test-model is priced");
+        let estimate = estimate_cost(&prices, "test-model", body(500).len(), Some(500))
+            .expect("test-model is priced");
+        assert!(
+            billed > Microusd::ZERO,
+            "sanity: the provider billed for it"
+        );
+        assert_ne!(
+            billed, estimate,
+            "sanity: if the billed figure equalled the estimate this test would prove nothing"
+        );
+
+        let snap = ledger
+            .snapshot("prov-429-billed")
+            .await
+            .expect("the run was opened");
+        assert_eq!(snap.spent, billed, "the reported usage, priced as itself");
+        assert_eq!(snap.reserved, Microusd::ZERO, "the reservation is released");
+        let records = sink.snapshot();
+        assert_eq!(records[0].cost_microusd, billed.0);
     }
 }
