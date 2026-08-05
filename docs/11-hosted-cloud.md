@@ -32,7 +32,9 @@ enforcement.
 ### Control plane (`crates/cloud`, Rust/axum, single static binary)
 
 - **`POST /v1/ingest`** — a gateway pushes a batch of `CallRecord`s; the org is
-  resolved from the `Authorization: Bearer <key>` header.
+  resolved from the `Authorization: Bearer <key>` header, which must be an
+  **admin** credential (it is a write, and what it writes raises incidents and
+  grades compliance controls).
 - **`GET /v1/runs`** — the caller org's per-run aggregates (spend, calls, cache
   hits, steps, last-seen).
 - **`GET /v1/summary`** — org totals (runs, calls, spend).
@@ -49,9 +51,20 @@ backend (Postgres/ClickHouse) for scale + retention is a drop-in behind the same
 **Auth + RBAC.** Org API keys come from
 `TOKENFUSE_CLOUD_KEYS="key:org[:role][:plan],…"`. The optional role is `admin`
 (default) or `viewer`. Reads (`/v1/runs`, `/v1/summary`, `/v1/kills`,
-`/v1/budgets`, `/v1/alerts`, ingest) work for any valid key of the org;
-**mutations** (`POST …/kill`, `POST …/budget`) require `admin`: a viewer key
-gets `403`. A missing/unknown key gets `401`. Keys never cross orgs.
+`/v1/budgets`, `/v1/alerts`) work for any valid key of the org; **writes**
+(`POST …/kill`, `POST …/budget`, `POST /v1/findings`, `POST /v1/ingest`)
+require `admin`: a viewer key gets `403`. A missing/unknown key gets `401`.
+Keys never cross orgs.
+
+Ingest sat in the read list until 2026-08-05, on the reasoning that telemetry
+should never be lost over a credential. What that overlooked is that ingested
+records are not inert: three carrying `budget_exceeded` raise a High incident
+that is mailed to a human, and every record feeds the `decision_counts`
+`/v1/compliance` grades controls from. A read-only role could therefore page
+an operator and manufacture evidence. Note what this does NOT fix: there is
+still no gateway-specific credential, so the plane cannot tell the real
+gateway from any other holder of an admin org key, and records stay untrusted
+input (see the `DISCLAIMER` in `tokenfuse_core::compliance`).
 
 **Fails closed when unconfigured.** If `TOKENFUSE_CLOUD_KEYS` is unset, empty,
 or every entry is malformed, the control plane starts with **no valid keys**,
