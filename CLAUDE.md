@@ -30,18 +30,20 @@ half that is still correct. This one used to say "v0.3.0 released" and "none of
 this has shipped in a tagged release yet" while the v0.4.0 tag had been standing
 since 2026-07-15.
 
-Note which parts of that file carry a date, because they are not the same parts.
-As of 2026-08-05 its **header is current through #170** and its **"What
-genuinely remains" section was re-verified against #111-#170**, with the
-one-command check for each of the four items recorded beside it, so the next
-reader repeats the check instead of trusting the sentence.
+**All of it was brought current on 2026-08-05, through #170**: the header, the
+Status-by-component table, the re-verified remaining-work list, and the test
+counts, which had said 100 where the workspace runs 747. Three separate warnings
+used to live in this paragraph, each naming a different stale half, and each was
+overtaken while the previous one was being written.
 
-Its **Status-by-component table stops at #110** and is the half to distrust now.
-Every row there is accurate, which is exactly the problem: a capability that
-landed after Wave-2 has no row at all, so the table reads as a complete
-inventory while being roughly sixty PRs short of one. Anything from #114 onward
-is described in the header paragraph only. Read both, or you will conclude that
-work does not exist rather than that it is unrecorded.
+So the warning that replaces them is about the shape, not the half: **that file
+has no gate.** It is true on a date and starts drifting with the next merge, and
+the only number in it anything holds is the test count, via
+`scripts/readme-numbers.sh` (invariant 12). What it does carry now is dates and
+checks: claims say when they were established and, where a command establishes
+them, which command. Trust a claim in proportion to the date beside it, and when
+you find one with no date, treat that as the oldest thing in the file rather
+than the safest.
 
 ## The working loop (this repo uses PR flow - unlike idryx/qryx, which push to main)
 
