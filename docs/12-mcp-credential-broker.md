@@ -153,10 +153,15 @@ configured upstream, so whatever can reach the port can spend the credentials.
 Two things guard that, and until 2026-08-05 only the first existed:
 
 1. **The loopback default.** `TOKENFUSE_MCP_ADDR` defaults to
-   `127.0.0.1:4200`. Widening it used to be silent; a non-loopback bind now
-   logs a startup warning naming what is exposed, in the same voice as the
-   Cloud's own (`crates/cloud/src/main.rs`). The condition is a pure function,
-   `mcpbroker::bind_exposure_warning`, so it is testable without a listener.
+   `127.0.0.1:4200`. Widening it with credentials configured logs a startup
+   warning naming what is exposed, in the same voice as the Cloud's own
+   (`crates/cloud/src/main.rs`); widening it with nothing else configured
+   REFUSES to start (below). Both conditions are pure functions,
+   `mcpbroker::bind_exposure_warning` and `mcpbroker::refuse_open_bind`, so
+   each is testable without a listener. Loopback itself is asked of the
+   standard library (`IpAddr::is_loopback`) for the refusal rather than
+   matched as a string, so the whole of `127.0.0.0/8` counts as loopback, not
+   only `127.0.0.1`.
 2. **Optional client credentials.** `TOKENFUSE_MCP_KEYS="secret:key_id,…"`,
    the same form, the same header (`x-fuse-key`) and the same resolver
    (`clientkeys.rs`) the gateway uses for `TOKENFUSE_CLIENT_KEYS`, because a
@@ -176,11 +181,26 @@ Two things guard that, and until 2026-08-05 only the first existed:
    The stdio transport has no header channel and no port; its access control is
    the operating system's, since the client is the parent process.
 
-**Still open, and deliberately not decided here.** A non-loopback bind with no
-credentials configured currently *warns*. Whether it should REFUSE to start,
-matching this repo's own precedent (commit 4b4b3fd, "gateway: refuse to start
-rather than invent usage"), is a deployment-breaking change and is the
-operator's call, not the fix's.
+**Decided 2026-08-06: a non-loopback bind with no credentials configured now
+REFUSES to start.** The 2026-08-05 audit that added the warning above
+deliberately left this open (matching this repo's own precedent, commit
+4b4b3fd, "gateway: refuse to start rather than invent usage"): it breaks a
+running deployment at boot, and that call belonged to the operator, not the
+fix. The operator has made it.
+
+**Upgrade consequence, stated plainly: a deployment that binds the broker to
+a non-loopback address with no `TOKENFUSE_MCP_KEYS` configured will not start
+after this change.** It used to print a warning and keep running; now it
+exits non-zero with an error naming the address, `TOKENFUSE_MCP_KEYS`, and the
+opt-out. Fix it one of three ways: configure
+`TOKENFUSE_MCP_KEYS="secret:key_id,…"`, bind to loopback instead (the
+default, `TOKENFUSE_MCP_ADDR=127.0.0.1:4200`), or, for an operator who has
+genuinely decided to run the broker open, set
+`TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` (only `1` or `true` count, matching
+`TOKENFUSE_ALLOW_STUB`'s own parsing) to keep the warning without the
+refusal. A non-loopback bind WITH credentials configured is unaffected either
+way: that combination still only warns, since it is a posture this repository
+already lets an operator choose, not a mistake.
 
 ## Response redaction + stdio (implemented)
 

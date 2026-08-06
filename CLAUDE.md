@@ -683,6 +683,41 @@ build)`, `cloud apns (feature build)`.
    `an_unreachable_pdp_never_counts_as_an_allow`. Every one was checked against
    its own mutant)*
 
+20. **A door with nothing behind it does not open onto the network.** The MCP
+   credential-broker resolves `{{secret:NAME}}` handles against the whole
+   vault and forwards to any configured upstream, so anything that reaches
+   its port can spend every credential in it. Until 2026-08-05 the only guard
+   was the loopback default; #169 then added optional client credentials and
+   a startup warning on a wider bind, but deliberately stopped short of
+   refusing to start, because that breaks a running deployment at boot and is
+   a decision, not a fix (docs/12's "still open" note).
+
+   That decision is now made. A non-loopback bind with no `TOKENFUSE_MCP_KEYS`
+   configured refuses to start (`mcpbroker::refuse_open_bind`), naming the
+   address, the missing configuration, and the opt-out in the same error: an
+   operator who has deliberately decided to run the broker open sets
+   `TOKENFUSE_MCP_ALLOW_OPEN_BIND=1`, parsed exactly like `TOKENFUSE_ALLOW_STUB`
+   (only `1` or `true` count, not any other non-empty string). Two cases are
+   unaffected either way, on purpose: a wide bind WITH credentials configured,
+   which is a posture this repository already lets an operator choose and
+   keeps only warning (`bind_exposure_warning`, unchanged); and the loopback
+   default itself, which must not get harder for the common local case.
+
+   Loopback for the refusal is asked of the standard library
+   (`IpAddr::is_loopback`), not matched as a string. `bind_exposure_warning`
+   deliberately keeps a narrower, Cloud-matching string set, because there a
+   false warning on `127.0.0.2` costs one extra line an operator reads past;
+   here the same gap would either refuse to start a deployment that was never
+   exposed, or start one that is, and both cost more than a warning does.
+   *(test: `an_open_bind_with_no_keys_refuses_to_start`,
+   `a_loopback_bind_is_never_refused`,
+   `configured_auth_avoids_the_refusal_leaving_only_the_warning`,
+   `the_operator_can_opt_out_of_the_refusal`,
+   `opting_out_of_the_refusal_does_not_silence_the_warning` and
+   `loopback_is_the_standard_librarys_answer_not_a_string_match`, all in
+   `gateway::mcpbroker`. The first five were run against the unfixed code
+   first: `refuse_open_bind` did not exist, so the suite failed to compile)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

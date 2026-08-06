@@ -28,13 +28,17 @@
 //! mask|block`, a separate opt-in PII extension of `_DLP`, see
 //! `tokenfuse_core::dlp`'s module doc), `_LOCK` (rug-pull baseline), `_ADDR`,
 //! `_KEYS` (the broker's own client credentials, off unless set), `_STDIO`,
-//! plus the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
+//! `_ALLOW_OPEN_BIND` (opt out of the refusal below, off unless set), plus
+//! the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
 //! Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
 //!
 //! **What is on the door.** Whatever reaches this port can have handles
 //! resolved against the whole vault, so two things guard it: the loopback
-//! default (widening it now warns, see [`bind_exposure_warning`]) and optional
-//! client credentials ([`BrokerState::keys`], off unless configured).
+//! default and optional client credentials ([`BrokerState::keys`], off
+//! unless configured). Widening the bind with credentials configured warns
+//! (see [`bind_exposure_warning`]); widening it with NOTHING configured
+//! REFUSES to start (see [`refuse_open_bind`]), unless the operator opts in
+//! with `TOKENFUSE_MCP_ALLOW_OPEN_BIND`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -169,6 +173,12 @@ pub fn app(state: Arc<BrokerState>) -> Router {
 /// `auth_configured` is what makes the warning worth reading twice: a wide bind
 /// is a decision, a wide bind with nothing on the door is a mistake, and an
 /// operator who has configured credentials must not be told to configure them.
+///
+/// This is now only HALF of what guards a non-loopback bind: it still fires,
+/// unchanged, whenever the process is allowed to start at all with one (auth
+/// configured, or [`refuse_open_bind`] below was opted out of). The harder
+/// case, nothing on the door and no opt-out, is [`refuse_open_bind`]'s to
+/// decide, and it runs first.
 pub fn bind_exposure_warning(addr: &str, auth_configured: bool) -> Option<String> {
     let addr = addr.trim();
     // "host:port" -> host, tolerating "[::1]:4200" and bare "::1:4200".
@@ -194,6 +204,74 @@ pub fn bind_exposure_warning(addr: &str, auth_configured: bool) -> Option<String
         );
     }
     Some(w)
+}
+
+/// Whether `addr` ("host:port") names a loopback interface, for the startup
+/// refusal below.
+///
+/// Deliberately NOT [`bind_exposure_warning`]'s host set. That set is a
+/// pure string match, chosen there to agree with the Cloud plane's own check
+/// byte for byte, at the cost of one false warning on `127.0.0.2` (loopback,
+/// but not `127.0.0.1`) -- a cost worth paying for a message that only ever
+/// says more than it needs to. A REFUSAL is not a message, it is whether the
+/// process runs at all, and it is wrong in both directions: undercounting
+/// loopback (treating `127.0.0.2` or a bare `::1` as "exposed") breaks a
+/// deployment that was never reachable from the network, and overcounting it
+/// would start one that is. So this asks the standard library instead:
+/// `IpAddr::is_loopback` knows the whole of `127.0.0.0/8` is loopback, not
+/// just the one address a string match would name, and knows `::1` without
+/// having to spell it out beside "localhost", which is handled separately
+/// because it is a name, not something `IpAddr::parse` accepts.
+fn is_loopback(addr: &str) -> bool {
+    let addr = addr.trim();
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(addr)
+        .trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Whether the broker must refuse to start for this bind, or `None` to
+/// proceed exactly as before (which may still print
+/// [`bind_exposure_warning`]).
+///
+/// Decided 2026-08-05 (audit) / 2026-08-06 (the call): a non-loopback bind
+/// with no broker authentication configured refuses to start, because that
+/// is the one combination with nothing at all guarding the vault, not a
+/// wide-bind warning an operator can read and keep going. A wide bind WITH
+/// credentials configured is unaffected, a decision this repository already
+/// lets an operator make; see [`bind_exposure_warning`]. The explicit
+/// opt-out, `TOKENFUSE_MCP_ALLOW_OPEN_BIND`, is for the operator who has
+/// made the open-bind decision anyway; it silences the refusal, not the
+/// warning, see `opting_out_of_the_refusal_does_not_silence_the_warning`
+/// below.
+///
+/// This is a breaking change for a deployment that was relying on the
+/// silent widen, which is exactly why it stayed a warning until the owner
+/// made the call: see docs/12's "still open" note, now closed.
+pub fn refuse_open_bind(
+    addr: &str,
+    auth_configured: bool,
+    allow_open_bind: bool,
+) -> Option<String> {
+    if auth_configured || allow_open_bind || is_loopback(addr) {
+        return None;
+    }
+    Some(format!(
+        "refusing to start: the MCP credential-broker is bound to {addr}, which is not \
+         loopback, and no client credentials are configured (TOKENFUSE_MCP_KEYS is unset). \
+         Anything that reaches this address could have {{{{secret:NAME}}}} handles resolved \
+         against the whole vault and forwarded to a configured upstream. Set \
+         TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require a credential, bind to loopback \
+         instead (TOKENFUSE_MCP_ADDR=127.0.0.1:4200, the default), or, if you have \
+         deliberately decided to run the broker open, set TOKENFUSE_MCP_ALLOW_OPEN_BIND=1."
+    ))
 }
 
 /// JSON-RPC error response with the same id as the request.
@@ -885,5 +963,114 @@ mod tests {
             "with keys configured, telling the operator to configure keys is noise: \
              {authenticated:?}"
         );
+    }
+
+    // --- refuse_open_bind ---------------------------------------------
+    //
+    // The owner decided (2026-08-05 audit, decided 2026-08-06) that a
+    // non-loopback bind with no broker authentication must REFUSE to start,
+    // not just warn: the warning above was recommended but deliberately not
+    // turned into a refusal, because that breaks a running deployment at
+    // boot and is a decision, not a fix. It has now been made.
+
+    /// `is_loopback` answers the harder question `bind_exposure_warning`
+    /// deliberately does not: a REFUSAL is consequential in both directions
+    /// (undercounting loopback breaks a deployment that was never exposed;
+    /// overcounting it starts one that is), so it asks the standard library
+    /// rather than matching a fixed set of strings. 127.0.0.1 is not the
+    /// whole of 127.0.0.0/8, and ::1 is a literal a string match has to
+    /// spell out separately from "localhost".
+    #[test]
+    fn loopback_is_the_standard_librarys_answer_not_a_string_match() {
+        for addr in ["127.0.0.1:4200", "127.0.0.2:4200", "127.255.255.255:4200"] {
+            assert!(
+                is_loopback(addr),
+                "the whole of 127.0.0.0/8 is loopback: {addr:?}"
+            );
+        }
+        for addr in ["[::1]:4200", "::1:4200", "localhost:4200", "LOCALHOST:4200"] {
+            assert!(is_loopback(addr), "{addr:?} is loopback");
+        }
+        for addr in [
+            "0.0.0.0:4200",
+            "[::]:4200",
+            "192.168.1.5:4200",
+            "10.0.0.4:80",
+        ] {
+            assert!(
+                !is_loopback(addr),
+                "{addr:?} is the unspecified address or a LAN address, not loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_bind_is_never_refused() {
+        for auth_configured in [false, true] {
+            for allow_open_bind in [false, true] {
+                assert_eq!(
+                    refuse_open_bind("127.0.0.1:4200", auth_configured, allow_open_bind),
+                    None,
+                    "the default bind must start exactly as it does today regardless of \
+                     auth_configured={auth_configured} or allow_open_bind={allow_open_bind}"
+                );
+            }
+        }
+    }
+
+    /// The decided behaviour: a wide-open bind with nothing on the door
+    /// refuses to start, naming the address, the missing configuration, and
+    /// the opt-out, so an operator reading the error can act on it without
+    /// reading source code.
+    #[test]
+    fn an_open_bind_with_no_keys_refuses_to_start() {
+        let refusal = refuse_open_bind("0.0.0.0:4200", false, false)
+            .expect("a non-loopback bind with no auth and no opt-out must refuse to start");
+        assert!(
+            refusal.contains("0.0.0.0:4200"),
+            "the refusal must name the address that was bound: {refusal:?}"
+        );
+        assert!(
+            refusal.contains("TOKENFUSE_MCP_KEYS"),
+            "the refusal must name the missing configuration: {refusal:?}"
+        );
+        assert!(
+            refusal.contains("TOKENFUSE_MCP_ALLOW_OPEN_BIND"),
+            "the refusal must name the opt-out: {refusal:?}"
+        );
+    }
+
+    /// The case the existing warning already covers must stay a warning, not
+    /// become a refusal: a wide bind WITH credentials configured is a
+    /// decision, not a mistake.
+    #[test]
+    fn configured_auth_avoids_the_refusal_leaving_only_the_warning() {
+        assert_eq!(
+            refuse_open_bind("0.0.0.0:4200", true, false),
+            None,
+            "auth configured must not refuse to start"
+        );
+    }
+
+    /// The explicit opt-out for an operator who genuinely wants an open
+    /// bind: TOKENFUSE_MCP_ALLOW_OPEN_BIND lets the broker start anyway.
+    #[test]
+    fn the_operator_can_opt_out_of_the_refusal() {
+        assert_eq!(
+            refuse_open_bind("0.0.0.0:4200", false, true),
+            None,
+            "TOKENFUSE_MCP_ALLOW_OPEN_BIND must let a deliberately open bind start"
+        );
+    }
+
+    /// Opting out of the refusal is not the same as opting out of the
+    /// warning: an operator who has decided to run the broker open still
+    /// needs to be told what that means every time the process starts.
+    #[test]
+    fn opting_out_of_the_refusal_does_not_silence_the_warning() {
+        assert_eq!(refuse_open_bind("0.0.0.0:4200", false, true), None);
+        let warning = bind_exposure_warning("0.0.0.0:4200", false)
+            .expect("the warning still fires once the refusal is opted out of");
+        assert!(warning.contains("TOKENFUSE_MCP_KEYS"));
     }
 }
