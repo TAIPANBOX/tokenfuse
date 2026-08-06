@@ -15,8 +15,10 @@ export interface RunHeaderOptions {
 }
 
 /**
- * Build the `X-Fuse-*` attribution headers for a run. Only `runId` is required;
- * without it the gateway treats a call as an unmanaged pass-through.
+ * Build the `X-Fuse-*` attribution headers for a run. Only `runId` is required,
+ * and it is required: a gateway refuses a call it cannot account for with
+ * `400 metering_required` unless the operator set `TOKENFUSE_REQUIRE_RUN_ID=0`,
+ * which restores the old unmanaged pass-through.
  */
 export declare function runHeaders(
   runId: string,

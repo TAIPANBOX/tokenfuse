@@ -342,9 +342,14 @@ async fn absent_task_type_falls_back_to_the_default_class() {
 async fn unmanaged_passthrough_without_run_id_is_never_routed() {
     // No `x-fuse-run-id` header: the router must not engage at all, matching
     // DLP/cache/kill, which are all also gated on having a managed run.
+    //
+    // `with_require_run_id(false)` because the default flipped on 2026-08-06
+    // and an unmetered call is now refused before it reaches any of this. The
+    // rule this test pins is about the router, so it opts back into the
+    // pass-through rather than being deleted with the default that carried it.
     let captured = CapturedBody::default();
     let sink = RecordingSink::default();
-    let st = state(RouterMode::On, captured.clone(), sink.clone());
+    let st = state(RouterMode::On, captured.clone(), sink.clone()).with_require_run_id(false);
 
     let req = Request::post("/v1/messages")
         .body(Body::from(body_with_model("claude-opus-4-5")))

@@ -68,7 +68,9 @@ def run_headers(
 ) -> dict[str, str]:
     """Build the ``X-Fuse-*`` attribution headers for a run.
 
-    Only ``run_id`` is required; without it the gateway treats a call as an
+    Only ``run_id`` is required, and it is required: a gateway refuses a call
+    it cannot account for with ``400 metering_required`` unless the operator set
+    ``TOKENFUSE_REQUIRE_RUN_ID=0``, which restores the old treatment of a call as an
     unmanaged pass-through.
     """
     headers: dict[str, str] = {"X-Fuse-Run-Id": run_id}

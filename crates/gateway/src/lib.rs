@@ -7,6 +7,7 @@ pub mod clientkeys;
 pub mod cloudsink;
 pub mod compliancecli;
 pub mod constants;
+pub mod defaults;
 pub mod embedder;
 pub mod estimate;
 pub mod events;

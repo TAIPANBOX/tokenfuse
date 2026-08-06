@@ -2706,12 +2706,17 @@ mod tests {
         );
     }
 
+    /// The pass-through still works, and is now something the operator asked
+    /// for: `with_require_run_id(false)` is the whole difference between this
+    /// test and `a_call_with_no_run_id_is_refused_by_default`. The line was
+    /// absent here until 2026-08-06, when the default flipped.
     #[tokio::test]
     async fn unmanaged_passthrough_without_run_id() {
+        let st = state(Mode::Enforce, StubProvider::default()).with_require_run_id(false);
         let req = Request::post("/v1/messages")
             .body(Body::from(body(100)))
             .unwrap();
-        let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
+        let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "unmanaged");
     }
@@ -2788,13 +2793,66 @@ mod tests {
         );
     }
 
-    /// The default is unchanged, and this test is what keeps it that way.
+    /// The default CHANGED on 2026-08-06, and this test is what keeps the new
+    /// one in place. It used to assert the opposite, with the reason "turning
+    /// this on by default would break every drop-in deployment", and that
+    /// reason was true about deployments and wrong about the product: the
+    /// 2026-08-04 cloud range found a real call reaching a real provider with
+    /// nothing recorded in any ledger, trace or event stream, and the
+    /// deployment passed every check it had, because the checks read
+    /// configuration. A guarantee nobody switched on is not a guarantee.
+    ///
+    /// The old behaviour is one variable away (`TOKENFUSE_REQUIRE_RUN_ID=0`),
+    /// which is the difference between a default and a prohibition.
     #[tokio::test]
-    async fn unmetered_pass_through_stays_the_default() {
+    async fn metering_is_required_by_default() {
         let st = state(Mode::Enforce, StubProvider::default());
         assert!(
-            !st.require_run_id,
-            "turning this on by default would break every drop-in deployment"
+            st.require_run_id,
+            "a call this gateway cannot account for is not a call it makes by default"
+        );
+    }
+
+    /// The same fault as `metering_is_required_by_default`, seen from the
+    /// request rather than the flag: the default state must refuse, not
+    /// forward-and-forget.
+    #[tokio::test]
+    async fn a_call_with_no_run_id_is_refused_by_default() {
+        let req = Request::post("/v1/messages")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an unmetered call must be refused unless an operator asked for the pass-through"
+        );
+    }
+
+    /// The second half of the same finding: DLP was off unless somebody set a
+    /// variable, so the scanner the product advertises scanned nothing in a
+    /// default deployment. The range had to enable it by hand before it could
+    /// test it at all.
+    #[tokio::test]
+    async fn secret_scanning_is_on_by_default() {
+        let st = state(Mode::Shadow, StubProvider::default());
+        assert_eq!(
+            st.dlp,
+            DlpMode::Block,
+            "a scanner that is off by default protects the deployments that configured it, \
+             which are the ones that needed it least"
+        );
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"my key is AKIA1234567890ABCDEF"}]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "dlp-default")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a whole AWS access key in a prompt must be refused without any configuration"
         );
     }
 

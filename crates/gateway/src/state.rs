@@ -128,10 +128,12 @@ impl AppState {
                 CacheConfig::default(), // Off
             )),
             firewall: Arc::new(FirewallConfig::disabled()),
-            dlp: DlpMode::Off,
-            // Off, so an existing drop-in deployment behaves byte for byte as
-            // it did. `with_require_run_id` is how an operator changes that.
-            require_run_id: false,
+            // On, since 2026-08-06. See `crate::defaults` for the finding that
+            // moved both of these: a guarantee that is off until somebody sets
+            // a variable protects the deployments that already knew, which are
+            // the ones that needed it least.
+            dlp: DlpMode::Block,
+            require_run_id: true,
             dlp_pii: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
@@ -197,10 +199,12 @@ impl AppState {
 
     /// Refuse calls that would not be metered. Chainable.
     ///
-    /// Not set means the drop-in pass-through stays, which is the historical
-    /// behaviour and the right default. Set means a missing `x-fuse-run-id`
-    /// is an error the caller can see and fix, rather than a call that
-    /// succeeded and left no trace.
+    /// On by default since 2026-08-06. `with_require_run_id(false)` restores
+    /// the historical drop-in pass-through, where a missing `x-fuse-run-id`
+    /// means the call reaches the provider and leaves no trace in any ledger,
+    /// trace or event stream. That is a real thing to want in front of an
+    /// existing client, and it is now a thing an operator says rather than a
+    /// thing that happens.
     pub fn with_require_run_id(mut self, require: bool) -> Self {
         self.require_run_id = require;
         self
