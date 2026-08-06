@@ -229,6 +229,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        // `tokenfuse constants` prints the stack constants this repository
+        // publishes (`contracts/tokenfuse-constants.json`), built from the live
+        // Rust definitions rather than from that file. It is what
+        // `scripts/constants.sh` compares the committed copy against, and it is
+        // also the fetch path for a consumer that has the binary but not a
+        // checkout.
+        Some("constants") => print!("{}", tokenfuse_gateway::constants::render()),
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
         Some("mcp-broker") => mcp_broker().await,
         // Anything else starts the gateway.

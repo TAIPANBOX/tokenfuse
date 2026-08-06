@@ -67,6 +67,15 @@ jobs:
       - name: claims about coverage stay recorded
         run: ./scripts/honest-claims.sh
 
+      # The wire strings, severities, trace columns and prices other
+      # repositories read out of this one used to be retyped by hand at the far
+      # end. verdryx's blocked-decision mirror carried seven of nine for eleven
+      # days that way. contracts/tokenfuse-constants.json is generated from the
+      # Rust instead, and this is what keeps "generated" true after the commit
+      # that generated it.
+      - name: the published stack constants match the Rust
+        run: ./scripts/constants.sh
+
       # The gates above parse text with regular expressions, which does not
       # break loudly: it stops matching and reports success. This breaks each
       # of them on purpose and requires the failure, so a gate that has quietly

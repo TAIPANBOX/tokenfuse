@@ -136,9 +136,17 @@ run_case "replicated-shape: a type renamed, so it measured nothing" fail \
 
 # --- invariant 12: stated numbers match the repository ---------------------
 
+# The mutant reads the badge and adds one, rather than naming today's figure.
+# It used to name it, and that made this case break every time the suite grew:
+# the count moved to 757, the pattern stopped matching, and the harness reported
+# BROKEN on a gate that was working. A case that has to be edited whenever the
+# thing it watches changes is a case somebody deletes.
+badge_now=$(grep -o 'badge/tests-[0-9]*-' README.md | head -1)
+badge_next="badge/tests-$(($(printf '%s' "$badge_now" | tr -dc '0-9') + 1))-"
+
 run_case "stated-numbers: the badge disagrees with the suite" fail \
 	"./scripts/stated-numbers.sh" \
-	"$(py 'edit("README.md", "badge/tests-749-", "badge/tests-750-")')"
+	"$(py "edit(\"README.md\", \"$badge_now\", \"$badge_next\")")"
 
 # The one case that must NOT fail. PROGRESS.md is prose that will keep quoting
 # older counts while explaining how they drifted, and reading the whole file
@@ -163,6 +171,23 @@ run_case "honest-claims: the catalog parse broke, so it measured nothing" fail \
 	"./scripts/honest-claims.sh" \
 	"$(py 'edit_all("crates/core/src/compliance.rs", "control_id:", "control_ident:")')" \
 	"measured nothing"
+
+# --- the published stack constants match the Rust --------------------------
+#
+# The odd one out among the gates: it BUILDS instead of parsing text, so this
+# case costs a recompile of core and the gateway. That is the right price for
+# the one check whose whole job is that a published value is what the code says
+# it is, and no regex can ask `EventType::severity` what it returns.
+#
+# The mutation is the fault this exists for, in the form it actually arrives:
+# somebody edits a wire string and does not regenerate the file other
+# repositories read. The needle keeps a failed BUILD from passing as a caught
+# fault, which would be the toothless case wearing the right exit code.
+
+run_case "constants: a wire string changed without regenerating" fail \
+	"./scripts/constants.sh" \
+	"$(py 'edit("crates/core/src/breaker.rs", "BreakerReason::LoopDetected => \"loop_detected\",", "BreakerReason::LoopDetected => \"loop_detected_v2\",")')" \
+	"disagrees with the Rust"
 
 # --- the harness cleans up after itself ------------------------------------
 

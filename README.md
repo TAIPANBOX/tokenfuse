@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-749-brightgreen)
+![tests](https://img.shields.io/badge/tests-757-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -630,10 +630,42 @@ Limits, stated plainly: unit counters are in-process and per-gateway - they rese
 
 ---
 
+## 🔗 Constants other repositories read
+
+Anything downstream that has to agree with this gateway on a literal value reads
+[`contracts/tokenfuse-constants.json`](contracts/tokenfuse-constants.json)
+rather than retyping it. One versioned file carries the Breaker block-decision
+wire strings with their HTTP statuses, the flat blocked-decision set (whether a
+trace row's `cost_microusd` is avoided spend or real spend), the agent-event
+types with the severity each one always carries, both Parquet trace schemas
+(write and read: the difference between them is the backward-compatibility
+contract), and the default price book in microdollars per Mtok.
+
+It is **generated from the Rust**, never hand-maintained: `tokenfuse constants`
+prints it, `./scripts/constants.sh --write` regenerates the committed copy, and
+CI fails when the file and the source disagree. A hand-written constants file is
+the same defect one level up, a file that can drift from the constants it names,
+which is exactly what happened at the far end of a retyped copy: a downstream
+mirror carried seven block reasons while this repository had nine, for eleven
+days, so avoided estimates were counted as real spend.
+
+Consume it by pinning a tag and reading the path, from a checkout or over raw
+HTTP. `schema_version` is the compatibility signal; the path deliberately
+carries no version, because a versioned filename is how a consumer keeps reading
+the old file forever without noticing there was a new one.
+
+What is **not** here: the stack's fixed local port map. This repository owns only
+its own defaults (`TOKENFUSE_ADDR`, `TOKENFUSE_MCP_ADDR`); the assignments that
+make services agree with each other are decided by the local orchestrators
+(`taipan`, `stack-up`), which is also where collisions get resolved.
+
+---
+
 ## 📚 Documentation
 
 | Document | What's inside |
 |---|---|
+| [contracts/tokenfuse-constants.json](contracts/tokenfuse-constants.json) | The generated, versioned constants above: wire strings, event severities, trace columns, prices. Read this instead of retyping them |
 | [PROGRESS.md](PROGRESS.md) | Live component-by-component build status & tests |
 | [BENCHMARKS.md](BENCHMARKS.md) | Latency methodology + numbers |
 | [01 · Research](docs/01-research.md) | The pain points and hard numbers behind the idea |

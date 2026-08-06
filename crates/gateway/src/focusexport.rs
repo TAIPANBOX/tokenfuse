@@ -288,7 +288,7 @@ async fn load_records(
 /// the wire strings by hand. Includes the identity-map pair (docs/20):
 /// `unit_budget_exceeded` rows carry the avoided estimate and
 /// `identity_mismatch` rows carry zero cost; both stay $0 `x_blocked` rows.
-fn is_blocked_decision(decision: &str) -> bool {
+pub(crate) fn is_blocked_decision(decision: &str) -> bool {
     [
         BreakerReason::BudgetExceeded,
         BreakerReason::PolicyViolation,

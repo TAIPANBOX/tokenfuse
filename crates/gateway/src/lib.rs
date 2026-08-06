@@ -6,6 +6,7 @@ pub mod backtestcli;
 pub mod clientkeys;
 pub mod cloudsink;
 pub mod compliancecli;
+pub mod constants;
 pub mod embedder;
 pub mod estimate;
 pub mod events;

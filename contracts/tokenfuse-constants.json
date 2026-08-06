@@ -1,0 +1,388 @@
+{
+  "agent_events": {
+    "schema": "taipanbox.dev/agent-event/v0.1",
+    "source": "tokenfuse",
+    "types": [
+      {
+        "severity": "critical",
+        "type": "budget_exhausted"
+      },
+      {
+        "severity": "high",
+        "type": "sustained_loop"
+      },
+      {
+        "severity": "high",
+        "type": "spend_spike"
+      },
+      {
+        "severity": "high",
+        "type": "fanout_explosion"
+      },
+      {
+        "severity": "medium",
+        "type": "budget_threshold"
+      },
+      {
+        "severity": "high",
+        "type": "run_killed"
+      },
+      {
+        "severity": "medium",
+        "type": "breaker_tripped"
+      },
+      {
+        "severity": "high",
+        "type": "dlp_block"
+      },
+      {
+        "severity": "high",
+        "type": "taint_block"
+      },
+      {
+        "severity": "critical",
+        "type": "mcp_drift"
+      },
+      {
+        "severity": "high",
+        "type": "identity_mismatch"
+      },
+      {
+        "severity": "high",
+        "type": "unit_cap_exceeded"
+      },
+      {
+        "severity": "high",
+        "type": "policy_deny"
+      },
+      {
+        "severity": "low",
+        "type": "tool_call"
+      }
+    ]
+  },
+  "blocked_decisions": [
+    "budget_exceeded",
+    "policy_violation",
+    "loop_detected",
+    "killed",
+    "wasm_policy",
+    "taint_blocked",
+    "dlp_blocked",
+    "unit_budget_exceeded",
+    "identity_mismatch"
+  ],
+  "breaker_reasons": [
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "budget_exceeded"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "policy_violation"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "loop_detected"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "killed"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "wasm_policy"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 403,
+      "wire": "taint_blocked"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 403,
+      "wire": "dlp_blocked"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 402,
+      "wire": "unit_budget_exceeded"
+    },
+    {
+      "blocked_decision": true,
+      "http_status": 403,
+      "wire": "identity_mismatch"
+    }
+  ],
+  "generated_by": "tokenfuse constants (crates/gateway/src/constants.rs)",
+  "price_book": {
+    "fallback": {
+      "cache_read_per_mtok_microusd": 1500000,
+      "cache_write_per_mtok_microusd": 18750000,
+      "input_per_mtok_microusd": 15000000,
+      "output_per_mtok_microusd": 75000000
+    },
+    "models": [
+      {
+        "cache_read_per_mtok_microusd": 80000,
+        "cache_write_per_mtok_microusd": 1000000,
+        "input_per_mtok_microusd": 800000,
+        "model": "claude-haiku",
+        "output_per_mtok_microusd": 4000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_per_mtok_microusd": 1250000,
+        "input_per_mtok_microusd": 1000000,
+        "model": "claude-haiku-4-5",
+        "output_per_mtok_microusd": 5000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_per_mtok_microusd": 1250000,
+        "input_per_mtok_microusd": 1000000,
+        "model": "claude-haiku-4-5-20251001",
+        "output_per_mtok_microusd": 5000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-4-5",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-4-5-20251101",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "claude-sonnet",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "claude-sonnet-4-5",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "claude-sonnet-4-5-20250929",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 250000,
+        "cache_write_per_mtok_microusd": 3125000,
+        "input_per_mtok_microusd": 2500000,
+        "model": "gpt",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 1250000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2500000,
+        "model": "gpt-4o",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 75000,
+        "cache_write_per_mtok_microusd": 150000,
+        "input_per_mtok_microusd": 150000,
+        "model": "gpt-4o-mini",
+        "output_per_mtok_microusd": 600000
+      },
+      {
+        "cache_read_per_mtok_microusd": 7500000,
+        "cache_write_per_mtok_microusd": 15000000,
+        "input_per_mtok_microusd": 15000000,
+        "model": "o1",
+        "output_per_mtok_microusd": 60000000
+      }
+    ],
+    "units": "microusd_per_mtok"
+  },
+  "regenerate_with": "./scripts/constants.sh --write",
+  "schema": "taipanbox.dev/tokenfuse-constants/v1",
+  "schema_version": 1,
+  "source_repo": "TAIPANBOX/tokenfuse",
+  "trace_parquet": {
+    "read_schema": [
+      {
+        "name": "ts_millis",
+        "nullable": false,
+        "type": "Int64"
+      },
+      {
+        "name": "run_id",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "model",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "decision",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "input_tokens",
+        "nullable": false,
+        "type": "UInt64"
+      },
+      {
+        "name": "output_tokens",
+        "nullable": false,
+        "type": "UInt64"
+      },
+      {
+        "name": "cost_microusd",
+        "nullable": false,
+        "type": "Int64"
+      },
+      {
+        "name": "step",
+        "nullable": false,
+        "type": "UInt32"
+      },
+      {
+        "name": "agent_id",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "saved_microusd",
+        "nullable": true,
+        "type": "Int64"
+      },
+      {
+        "name": "parent_run_id",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "on_behalf_of",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "outcome",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "key_id",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "unit",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "tool_calls",
+        "nullable": true,
+        "type": "UInt32"
+      }
+    ],
+    "write_schema": [
+      {
+        "name": "ts_millis",
+        "nullable": false,
+        "type": "Int64"
+      },
+      {
+        "name": "run_id",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "model",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "decision",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "input_tokens",
+        "nullable": false,
+        "type": "UInt64"
+      },
+      {
+        "name": "output_tokens",
+        "nullable": false,
+        "type": "UInt64"
+      },
+      {
+        "name": "cost_microusd",
+        "nullable": false,
+        "type": "Int64"
+      },
+      {
+        "name": "step",
+        "nullable": false,
+        "type": "UInt32"
+      },
+      {
+        "name": "agent_id",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "saved_microusd",
+        "nullable": false,
+        "type": "Int64"
+      },
+      {
+        "name": "parent_run_id",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "on_behalf_of",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "outcome",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "key_id",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "unit",
+        "nullable": false,
+        "type": "Utf8"
+      },
+      {
+        "name": "tool_calls",
+        "nullable": true,
+        "type": "UInt32"
+      }
+    ]
+  }
+}

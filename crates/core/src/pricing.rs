@@ -100,6 +100,26 @@ impl PriceBook {
         self.prices.contains_key(model)
     }
 
+    /// Every exact entry in the book, sorted by model name.
+    ///
+    /// Sorted rather than left in the `HashMap`'s own order because the caller
+    /// this exists for (`gateway::constants`) serialises the result into a
+    /// committed file that a gate compares byte for byte: an iteration order
+    /// that varies per process would make that file disagree with itself on
+    /// every run, and the gate would then be noise rather than a check.
+    pub fn entries(&self) -> Vec<(&str, ModelPrice)> {
+        let mut out: Vec<(&str, ModelPrice)> =
+            self.prices.iter().map(|(m, p)| (m.as_str(), *p)).collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    /// The conservative fallback applied to models with no exact entry
+    /// (ADR-8), or `None` when the book has none.
+    pub fn fallback(&self) -> Option<ModelPrice> {
+        self.fallback
+    }
+
     pub fn cost(&self, model: &str, usage: &Usage) -> Option<Microusd> {
         self.price(model).map(|p| p.cost(usage))
     }
