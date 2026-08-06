@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-749-brightgreen)
+![tests](https://img.shields.io/badge/tests-767-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -612,7 +612,7 @@ Notes, because the details matter more than the flag:
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `TOKENFUSE_IDENTITY_MAP` | unset ⇒ **off** | Path to a JSON map with three sections: `units` (each optionally carrying `budget_usd_month`), `keys` (which `key_id` belongs to which unit, and which `agent://` ids it may present), `prefixes` (attribution fallback for unkeyed traffic). Set-but-unusable refuses to start, same posture as `TOKENFUSE_CLIENT_KEYS`. |
+| `TOKENFUSE_IDENTITY_MAP` | unset ⇒ **off** | Path to a JSON map with three sections: `units` (each optionally carrying `budget_usd_month`), `keys` (which `key_id` belongs to which unit, and which `agent://` ids it may present), `prefixes` (attribution fallback for unkeyed traffic; a caller that DID present a known key with no `keys` entry also lands here, and under strict that is refused rather than letting it pick its own unit by header). Set-but-unusable refuses to start, same posture as `TOKENFUSE_CLIENT_KEYS`. |
 | `TOKENFUSE_IDENTITY_STRICT` | `off` | `off \| warn \| enforce`, governing ONLY the key↔agent binding check: `warn` lets the call through with `x-fuse-identity: would-block=<reason>`; `enforce` returns `403` with `"type": "identity_mismatch"`. Unit budgets follow `TOKENFUSE_MODE` like every other budget. |
 
 ```json
@@ -624,9 +624,40 @@ Notes, because the details matter more than the flag:
 }
 ```
 
-This closes the loop the client-credential slice opened: the credential (`key_id`) is bound to the agent ids it may present, agents roll up into a business unit, and the unit gets the first budget **above** the run - a UTC-calendar-month cap enforced with the same reserve-then-settle discipline as run budgets (`402`, `"type": "unit_budget_exceeded"`, with the unit's numbers). Every trace row now carries a server-resolved `unit` column (nullable-evolution, old files keep reading), `focus-export` grows an `x_unit` column so per-unit chargeback is a spreadsheet filter, and the Cloud aggregates per-unit spend (`GET /v1/units`, all-time plus a month-to-date rollup over the same UTC-month window the caps enforce - the figure the dashboard's Business units card compares against the monthly caps) with central per-unit cap overrides (`POST /v1/units/{id}/budget`, polled by every gateway of the org). Unmapped spend stays visible as the `unassigned` bucket, never silently dropped.
+This closes the loop the client-credential slice opened: a credential (`key_id`) listed in `keys` is bound to the agent ids it may present, and under `TOKENFUSE_IDENTITY_STRICT` one that is **not** listed there cannot make up the difference by choosing an agent id (it used to reach the prefix fallback, where an id matching nothing skipped the monthly cap and an id matching another unit's prefix charged that unit; `off`, the default, is unchanged). Agents roll up into a business unit, and the unit gets the first budget **above** the run - a UTC-calendar-month cap enforced with the same reserve-then-settle discipline as run budgets (`402`, `"type": "unit_budget_exceeded"`, with the unit's numbers). Every trace row now carries a server-resolved `unit` column (nullable-evolution, old files keep reading), `focus-export` grows an `x_unit` column so per-unit chargeback is a spreadsheet filter, and the Cloud aggregates per-unit spend (`GET /v1/units`, all-time plus a month-to-date rollup over the same UTC-month window the caps enforce - the figure the dashboard's Business units card compares against the monthly caps) with central per-unit cap overrides (`POST /v1/units/{id}/budget`, polled by every gateway of the org). Unmapped spend stays visible as the `unassigned` bucket, never silently dropped.
 
 Limits, stated plainly: unit counters are in-process and per-gateway - they reset on restart and are not fleet-consistent across gateways (the replicated raft ledger deliberately does not grow this dimension in this change; the durable cross-fleet view of unit spend is the Cloud aggregation). Budgets remain estimate-then-settle. With client keys off, `strict` has nothing authenticated to check: binding checks stay idle and only prefix attribution applies.
+
+---
+
+## 🔗 Constants other repositories read
+
+Anything downstream that has to agree with this gateway on a literal value reads
+[`contracts/tokenfuse-constants.json`](contracts/tokenfuse-constants.json)
+rather than retyping it. One versioned file carries the Breaker block-decision
+wire strings with their HTTP statuses, the flat blocked-decision set (whether a
+trace row's `cost_microusd` is avoided spend or real spend), the agent-event
+types with the severity each one always carries, both Parquet trace schemas
+(write and read: the difference between them is the backward-compatibility
+contract), and the default price book in microdollars per Mtok.
+
+It is **generated from the Rust**, never hand-maintained: `tokenfuse constants`
+prints it, `./scripts/constants.sh --write` regenerates the committed copy, and
+CI fails when the file and the source disagree. A hand-written constants file is
+the same defect one level up, a file that can drift from the constants it names,
+which is exactly what happened at the far end of a retyped copy: a downstream
+mirror carried seven block reasons while this repository had nine, for eleven
+days, so avoided estimates were counted as real spend.
+
+Consume it by pinning a tag and reading the path, from a checkout or over raw
+HTTP. `schema_version` is the compatibility signal; the path deliberately
+carries no version, because a versioned filename is how a consumer keeps reading
+the old file forever without noticing there was a new one.
+
+What is **not** here: the stack's fixed local port map. This repository owns only
+its own defaults (`TOKENFUSE_ADDR`, `TOKENFUSE_MCP_ADDR`); the assignments that
+make services agree with each other are decided by the local orchestrators
+(`taipan`, `stack-up`), which is also where collisions get resolved.
 
 ---
 
@@ -634,6 +665,7 @@ Limits, stated plainly: unit counters are in-process and per-gateway - they rese
 
 | Document | What's inside |
 |---|---|
+| [contracts/tokenfuse-constants.json](contracts/tokenfuse-constants.json) | The generated, versioned constants above: wire strings, event severities, trace columns, prices. Read this instead of retyping them |
 | [PROGRESS.md](PROGRESS.md) | Live component-by-component build status & tests |
 | [BENCHMARKS.md](BENCHMARKS.md) | Latency methodology + numbers |
 | [01 · Research](docs/01-research.md) | The pain points and hard numbers behind the idea |

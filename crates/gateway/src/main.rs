@@ -229,6 +229,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        // `tokenfuse constants` prints the stack constants this repository
+        // publishes (`contracts/tokenfuse-constants.json`), built from the live
+        // Rust definitions rather than from that file. It is what
+        // `scripts/constants.sh` compares the committed copy against, and it is
+        // also the fetch path for a consumer that has the binary but not a
+        // checkout.
+        Some("constants") => print!("{}", tokenfuse_gateway::constants::render()),
         // `tokenfuse mcp-broker` runs the MCP credential-broker proxy.
         Some("mcp-broker") => mcp_broker().await,
         // Anything else starts the gateway.
@@ -581,6 +588,29 @@ async fn serve() {
             eprintln!(
                 "tokenfuse: TOKENFUSE_IDENTITY_STRICT is set but TOKENFUSE_CLIENT_KEYS is not; nothing is authenticated to check, so binding checks stay idle and only prefix attribution applies"
             );
+        }
+        // The mirror of the warning above, and the one that was missing. That
+        // one names a binding that can never match; this names a credential
+        // nothing describes. Such a caller authenticates, reaches the prefix
+        // fallback, and picks its own unit with a header it writes, so under
+        // strict its calls are reported (warn) or refused (enforce). An
+        // operator should learn that here rather than from a 403.
+        if identity_strict != tokenfuse_gateway::identitymap::StrictMode::Off
+            && client_keys.enabled()
+        {
+            let fate = if identity_strict == tokenfuse_gateway::identitymap::StrictMode::Enforce {
+                "refused"
+            } else {
+                "allowed and reported"
+            };
+            for id in client_keys.key_ids() {
+                if identity_map.key_binding(id).is_none() {
+                    eprintln!(
+                        "tokenfuse: client key `{id}` has no keys[] binding in the identity map; under strict={} its calls are {fate}",
+                        identity_strict.as_wire_str(),
+                    );
+                }
+            }
         }
     }
 

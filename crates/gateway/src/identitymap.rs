@@ -198,10 +198,17 @@ pub struct Resolution<'a> {
     /// "unassigned" bucket rather than being dropped
     /// (`docs/20-identity-map.md` section 3).
     pub unit: Option<&'a str>,
-    /// Set only when a key was bound to a unit with a non-empty `agents`
-    /// list and the presented `agent_id` did not satisfy it. Never set on
-    /// the prefix-fallback path: nothing there is authenticated to check
-    /// against.
+    /// Set when the presented credential and the claimed `agent_id` do not
+    /// go together: a bound key whose `agents` list the id fails, or an
+    /// AUTHENTICATED key the map does not bind at all (see
+    /// [`IdentityMap::resolve`]).
+    ///
+    /// Never set for unkeyed traffic, which is the case the prefix fallback
+    /// exists for: with an empty `key_id` nothing is authenticated, so there
+    /// is nothing to check the id against. This field used to say that about
+    /// the whole prefix path, which was true of unkeyed traffic and false of
+    /// an authenticated caller who reached the prefixes because nobody had
+    /// bound its key.
     pub mismatch: Option<Mismatch>,
 }
 
@@ -460,11 +467,42 @@ impl IdentityMap {
     ///    the binding lists `agents` patterns, an empty `agent_id` is
     ///    `"agent_id_missing"`, one that matches no pattern is
     ///    `"agent_id_not_allowed"`, and a match (or an empty/missing
-    ///    `agents` list) is no mismatch.
-    /// 2. Otherwise (no `key_id`, or an unbound one): the first `prefixes[]`
+    ///    `agents` list) is no mismatch. The prefixes are NOT consulted for
+    ///    a bound key, so a caller cannot move its own spend onto another
+    ///    unit by claiming an id that unit's prefix would match.
+    /// 2. A non-empty `key_id` the map does NOT bind: the prefixes still give
+    ///    the unit, unchanged, and it is a mismatch either way, because the
+    ///    unit came from a header the caller wrote. `"key_has_no_unit_binding"`
+    ///    when nothing matched (no unit, so no monthly cap applies to this
+    ///    call at all) and `"unit_chosen_by_agent_id"` when something did (a
+    ///    unit IS charged, and the caller picked which).
+    /// 3. An empty `key_id`, which is unkeyed traffic: the first `prefixes[]`
     ///    entry in document order whose pattern matches `agent_id`. Never a
-    ///    mismatch here: nothing is authenticated to check against.
-    /// 3. No match anywhere: `Resolution { unit: None, mismatch: None }`.
+    ///    mismatch: nothing is authenticated to check against.
+    /// 4. No match anywhere: `unit: None`.
+    ///
+    /// ## Why case 2 exists
+    ///
+    /// It used to be folded into case 3, so the binding check ran only for a
+    /// `key_id` with an explicit `keys[]` entry and every OTHER authenticated
+    /// caller fell through to prefix matching on `x-fuse-agent-id`. That gave
+    /// such a caller two ways out of a cap: an id matching no prefix resolved
+    /// to no unit, which makes `unit_reservation` `None` in the proxy and
+    /// skips the monthly cap entirely; an id matching a different unit's
+    /// prefix charged that unit. `TOKENFUSE_IDENTITY_STRICT` closed neither,
+    /// because it governs the binding check and this path never reached one.
+    ///
+    /// `crate::clientkeys` already states the reason this matters, about the
+    /// header rather than the credential: anything a caller can choose, a
+    /// caller can change, so a cap keyed on something the caller writes is
+    /// bypassed by writing something else, and somebody else's can be burned
+    /// on purpose.
+    ///
+    /// This reports the fact; `TOKENFUSE_IDENTITY_STRICT` decides what to do
+    /// about it, exactly as for the other two reasons. **`unit` is
+    /// deliberately identical to what this returned before**, so `off` mode
+    /// (the default, which ignores `mismatch`) attributes spend exactly as it
+    /// always did and no deployment changes on upgrade.
     #[must_use]
     pub fn resolve(&self, key_id: &str, agent_id: &str) -> Resolution<'_> {
         if !key_id.is_empty() {
@@ -496,19 +534,40 @@ impl IdentityMap {
                     },
                 };
             }
-        }
-        for prefix in &self.prefixes {
-            if prefix.pattern.matches(agent_id) {
-                return Resolution {
-                    unit: Some(prefix.unit.as_str()),
-                    mismatch: None,
-                };
-            }
+            // Authenticated, and the map says nothing about who this is.
+            //
+            // Guarded on `enabled()`, which is load-bearing rather than
+            // defensive. `main.rs` reads `TOKENFUSE_IDENTITY_STRICT` and
+            // `TOKENFUSE_IDENTITY_MAP` independently, so strict WITHOUT a map
+            // is a configuration that exists today and is a no-op today. A
+            // gateway with no map has no bindings for a caller to be missing
+            // from, and without this guard every authenticated call in that
+            // deployment would become a mismatch, which enforce would turn
+            // into a 403 on upgrade. Nothing configured, nothing claimed.
+            let unit = self.prefix_unit(agent_id);
+            let mismatch = self.enabled().then(|| Mismatch {
+                reason: if unit.is_some() {
+                    "unit_chosen_by_agent_id"
+                } else {
+                    "key_has_no_unit_binding"
+                },
+            });
+            return Resolution { unit, mismatch };
         }
         Resolution {
-            unit: None,
+            unit: self.prefix_unit(agent_id),
             mismatch: None,
         }
+    }
+
+    /// The first `prefixes[]` entry in document order whose pattern matches
+    /// `agent_id`. Shared by the two paths that use the fallback so they
+    /// cannot drift into resolving different units for the same id.
+    fn prefix_unit(&self, agent_id: &str) -> Option<&str> {
+        self.prefixes
+            .iter()
+            .find(|p| p.pattern.matches(agent_id))
+            .map(|p| p.unit.as_str())
     }
 
     /// The monthly budget for `unit`, converted to [`Microusd`], or `None` if
@@ -974,23 +1033,30 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_key_falls_through_to_prefixes() {
+    fn an_unbound_key_falls_through_to_prefixes_but_is_reported() {
         let raw = r#"{
             "units": [{"id": "a"}, {"id": "b"}],
             "keys": [{"key_id": "key-a", "unit": "a"}],
             "prefixes": [{"match": "agent://b/*", "unit": "b"}]
         }"#;
         let map = IdentityMap::parse(raw).unwrap();
-        // "key-b" has no keys[] binding, so it falls through to the prefix
-        // that matches the agent id, exactly as an empty key_id would.
-        let r = map.resolve("key-b", "agent://b/bot-1");
+        // "key-b" has no keys[] binding, so it still falls through to the
+        // prefix that matches the agent id and resolves the same unit it
+        // always did. What changed is that this is now REPORTED: the caller
+        // authenticated, and which unit its spend lands on was decided by a
+        // header it wrote. This test asserted `mismatch: None` here until
+        // 2026-08-06, which is the defect written down as an expectation.
         assert_eq!(
-            r,
+            map.resolve("key-b", "agent://b/bot-1"),
             Resolution {
                 unit: Some("b"),
-                mismatch: None
+                mismatch: Some(Mismatch {
+                    reason: "unit_chosen_by_agent_id"
+                }),
             }
         );
+        // The unkeyed half is untouched, and it is the half the fallback was
+        // written for.
         let r_empty = map.resolve("", "agent://b/bot-1");
         assert_eq!(
             r_empty,
@@ -1024,14 +1090,27 @@ mod tests {
     }
 
     #[test]
-    fn nothing_matching_resolves_to_no_unit_and_no_mismatch() {
+    fn nothing_matching_resolves_to_no_unit() {
         let map = IdentityMap::parse(DESIGN_DOC_EXAMPLE).unwrap();
-        let r = map.resolve("unknown-key", "agent://somewhere/else");
+        // Unkeyed and matching nothing: no unit, and nothing to report.
         assert_eq!(
-            r,
+            map.resolve("", "agent://somewhere/else"),
             Resolution {
                 unit: None,
                 mismatch: None
+            }
+        );
+        // The same id from an AUTHENTICATED caller the map does not bind is
+        // the case that skipped the monthly cap: no unit means no unit
+        // reservation, so no cap applies to the call at all. This test
+        // expected `mismatch: None` for it until 2026-08-06.
+        assert_eq!(
+            map.resolve("unknown-key", "agent://somewhere/else"),
+            Resolution {
+                unit: None,
+                mismatch: Some(Mismatch {
+                    reason: "key_has_no_unit_binding"
+                }),
             }
         );
     }
@@ -1040,6 +1119,11 @@ mod tests {
     fn the_default_map_is_disabled_and_resolves_nothing() {
         let map = IdentityMap::default();
         assert!(!map.enabled());
+        // Also pins the guard on the authenticated-but-unbound path: `main.rs`
+        // parses TOKENFUSE_IDENTITY_STRICT whether or not a map is configured,
+        // so strict with no map is a live deployment. There are no bindings to
+        // be missing from, so there is no mismatch to report; without this,
+        // enforce would answer 403 to every authenticated call on upgrade.
         assert_eq!(
             map.resolve("any-key", "any-agent"),
             Resolution {
@@ -1050,6 +1134,120 @@ mod tests {
         assert_eq!(map.unit_budget("any-unit"), None);
         assert!(map.unit_budgets().is_empty());
         assert!(map.key_ids().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // An AUTHENTICATED caller the map does not bind
+    //
+    // The prefix fallback is documented as the path for traffic with no (or
+    // no mapped) key, and "no mismatch is possible on this path (nothing is
+    // authenticated to check against)" was true of the case the doc had in
+    // mind and false of the one it did not: a caller who DID present a known
+    // credential whose key_id has no keys[] entry. That caller reaches the
+    // prefixes too, so the unit its spend lands in is chosen by
+    // `x-fuse-agent-id`, a header it writes itself.
+    // -----------------------------------------------------------------
+
+    /// One unit reachable only through a key binding and one reachable only
+    /// through a prefix, so an unbound credential's two escapes are both
+    /// expressible: point at nothing (no cap applies), or point at somebody
+    /// else's prefix (their cap is charged).
+    const TWO_UNIT_MAP: &str = r#"{
+      "units": [
+        { "id": "treasury", "budget_usd_month": 2000.0 },
+        { "id": "lending", "budget_usd_month": 50.0 }
+      ],
+      "keys": [
+        { "key_id": "treasury-bots", "unit": "treasury",
+          "agents": ["agent://bank.example/treasury/*"] }
+      ],
+      "prefixes": [
+        { "match": "agent://bank.example/lending/*", "unit": "lending" }
+      ]
+    }"#;
+
+    #[test]
+    fn an_authenticated_key_the_map_does_not_bind_is_a_mismatch() {
+        // The worst shape: nothing matches, so the unit is nobody's, so no
+        // unit reservation is taken and the monthly cap is skipped entirely.
+        // Before this, the only signal was silence.
+        let map = IdentityMap::parse(TWO_UNIT_MAP).unwrap();
+        let r = map.resolve("some-other-key", "agent://bank.example/fraud/bot-1");
+        assert_eq!(
+            r,
+            Resolution {
+                unit: None,
+                mismatch: Some(Mismatch {
+                    reason: "key_has_no_unit_binding"
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unbound_key_that_matches_a_prefix_is_a_mismatch_and_still_names_the_unit() {
+        // The other shape, and the one that costs somebody else money: the
+        // credential is real, the map never bound it to `lending`, and the
+        // agent id it wrote itself is what put its spend there.
+        //
+        // `unit` is deliberately unchanged: strict decides what to DO about
+        // this, and off mode must keep attributing exactly as it did.
+        let map = IdentityMap::parse(TWO_UNIT_MAP).unwrap();
+        let r = map.resolve("some-other-key", "agent://bank.example/lending/scorer");
+        assert_eq!(
+            r,
+            Resolution {
+                unit: Some("lending"),
+                mismatch: Some(Mismatch {
+                    reason: "unit_chosen_by_agent_id"
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn unkeyed_traffic_keeps_the_prefix_fallback_with_no_mismatch() {
+        // The case the fallback was written for, unchanged. With client keys
+        // off every call arrives with an empty key_id, so this is also what
+        // keeps "strict has nothing authenticated to check" true.
+        let map = IdentityMap::parse(TWO_UNIT_MAP).unwrap();
+        assert_eq!(
+            map.resolve("", "agent://bank.example/lending/scorer"),
+            Resolution {
+                unit: Some("lending"),
+                mismatch: None
+            }
+        );
+        assert_eq!(
+            map.resolve("", "agent://bank.example/fraud/bot-1"),
+            Resolution {
+                unit: None,
+                mismatch: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_bound_key_is_never_diverted_by_a_prefix_for_another_unit() {
+        // The cross-unit question in its other form: a credential that IS
+        // bound, presenting an agent id that a different unit's prefix would
+        // match. The binding wins and the prefixes are never consulted, so
+        // the agent id cannot move the spend. That is the property the
+        // unbound path was missing, and it is pinned here so a "simplifying"
+        // rewrite that consults prefixes for everyone fails.
+        let raw = r#"{
+          "units": [{ "id": "treasury" }, { "id": "lending" }],
+          "keys": [{ "key_id": "treasury-bots", "unit": "treasury" }],
+          "prefixes": [{ "match": "agent://bank.example/lending/*", "unit": "lending" }]
+        }"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(
+            map.resolve("treasury-bots", "agent://bank.example/lending/scorer"),
+            Resolution {
+                unit: Some("treasury"),
+                mismatch: None
+            }
+        );
     }
 
     // -----------------------------------------------------------------

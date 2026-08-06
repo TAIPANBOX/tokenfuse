@@ -3840,6 +3840,244 @@ mod tests {
         );
     }
 
+    // -- identity map: an AUTHENTICATED caller the map does not bind --------
+    //
+    // `resolve` ran the key<->agent binding check only for a key_id with an
+    // explicit keys[] entry. Any OTHER authenticated caller fell through to
+    // prefix matching on `x-fuse-agent-id`, a header it writes itself, so it
+    // could pick between two outcomes: an id matching no prefix resolved to no
+    // unit at all, which made `unit_reservation` None and skipped the monthly
+    // cap entirely; an id matching somebody else's prefix charged that unit.
+    // TOKENFUSE_IDENTITY_STRICT did not close either, because it governs only
+    // the binding check and this path never reached one.
+
+    /// Two capped units, one reachable only through a prefix, and a client key
+    /// the map never binds. `unmapped-bot` authenticates, so it is not the
+    /// unkeyed traffic the prefix fallback was written for, and nothing in the
+    /// map says which unit its spend belongs to.
+    const UNBOUND_KEY_MAP: &str = r#"{
+        "units": [
+            { "id": "treasury", "budget_usd_month": 1.0 },
+            { "id": "lending", "budget_usd_month": 1.0 }
+        ],
+        "keys": [
+            { "key_id": "treasury-bots", "unit": "treasury",
+              "agents": ["agent://bank.example/treasury/*"] }
+        ],
+        "prefixes": [
+            { "match": "agent://bank.example/lending/*", "unit": "lending" }
+        ]
+    }"#;
+
+    fn unbound_key_state(mode: Mode, strict: crate::identitymap::StrictMode) -> AppState {
+        static NEXT_MAP: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tokenfuse-unbound-idmap-test-{}-{}.json",
+            std::process::id(),
+            NEXT_MAP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, UNBOUND_KEY_MAP).unwrap();
+        let map = crate::identitymap::IdentityMap::from_path(&path).unwrap();
+        let units = Arc::new(crate::unitledger::UnitLedger::new(map.unit_budgets()));
+        state(mode, StubProvider::default())
+            .with_client_keys(Arc::new(
+                crate::clientkeys::ClientKeys::from_spec("sk-t:treasury-bots,sk-x:unmapped-bot")
+                    .unwrap(),
+            ))
+            .with_identity(Arc::new(map), strict, units)
+    }
+
+    #[tokio::test]
+    async fn strict_refuses_an_authenticated_key_the_map_does_not_bind() {
+        let sink = RecordingSink::default();
+        let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-x")
+            .header("x-fuse-run-id", "unbound-nothing")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot-1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get("x-fuse-identity").unwrap(),
+            "blocked=key_has_no_unit_binding"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "identity_mismatch");
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "identity_mismatch");
+        // Nothing matched, so there is no unit to attribute it to. That is the
+        // fault, recorded rather than hidden.
+        assert_eq!(records[0].unit, "");
+    }
+
+    #[tokio::test]
+    async fn strict_refuses_an_unbound_key_that_points_at_another_units_prefix() {
+        // The cross-unit half, and the decision it encodes: under strict, a
+        // credential the map does not bind may not select a unit by writing an
+        // agent id, even one that resolves. `lending`'s cap is somebody else's
+        // money, and the only thing connecting this caller to it is a header.
+        let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce);
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-x")
+            .header("x-fuse-run-id", "unbound-cross-unit")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/lending/scorer")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get("x-fuse-identity").unwrap(),
+            "blocked=unit_chosen_by_agent_id"
+        );
+        assert_eq!(
+            units.spent("lending", now_millis()),
+            Microusd::ZERO,
+            "a unit whose prefix was borrowed must not have been charged"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_still_allows_a_bound_key_and_bills_its_own_unit() {
+        // The other side of the same gate: strict must not become "refuse
+        // everything". A credential the map DOES bind, presenting an agent id
+        // its binding allows, goes through and its spend lands on its own unit.
+        let sink = RecordingSink::default();
+        let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let units = Arc::clone(&st.units);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "bound-ok")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-fuse-identity").is_none());
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "allow");
+        assert_eq!(records[0].unit, "treasury");
+        assert!(
+            units.spent("treasury", now_millis()) > Microusd::ZERO,
+            "the bound caller's spend must land on its own unit"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_key_is_unchanged_when_strict_is_off() {
+        // Off is the default, so this is the upgrade contract: a deployment
+        // that never asked for strict sees exactly what it saw before, both
+        // when the agent id resolves a unit and when it resolves nothing.
+        for (agent_id, want_unit) in [
+            ("agent://bank.example/fraud/bot-1", ""),
+            ("agent://bank.example/lending/scorer", "lending"),
+        ] {
+            let sink = RecordingSink::default();
+            let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Off)
+                .with_sink(Arc::new(sink.clone()));
+            let req = Request::post("/v1/messages")
+                .header("x-fuse-key", "sk-x")
+                .header("x-fuse-run-id", format!("off-{want_unit}"))
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", agent_id)
+                .body(Body::from(body(100)))
+                .unwrap();
+            let resp = call(st, req).await;
+            assert_eq!(resp.status(), StatusCode::OK, "agent id {agent_id}");
+            assert!(
+                resp.headers().get("x-fuse-identity").is_none(),
+                "off mode adds no header"
+            );
+            let records = sink.snapshot();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].decision, "allow");
+            assert_eq!(records[0].unit, want_unit, "agent id {agent_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn warn_reports_an_unbound_key_without_refusing_it() {
+        // The migration path an operator actually uses: warn names every
+        // credential the map forgot, while nothing breaks, so the map can be
+        // fixed before enforce is switched on.
+        let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Warn);
+        let keystats = st.keystats.clone();
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-x")
+            .header("x-fuse-run-id", "unbound-warn")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot-1")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-fuse-identity").unwrap(),
+            "would-block=key_has_no_unit_binding"
+        );
+        let snap = keystats.snapshot();
+        assert_eq!(
+            snap.per_key
+                .get("unmapped-bot")
+                .unwrap()
+                .identity_mismatches,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_monthly_cap_cannot_be_skipped_by_choosing_an_agent_id() {
+        // The money statement, and the one the other tests exist to support:
+        // under strict there is no agent id an authenticated caller can write
+        // that gets a call through with no unit cap behind it. Before this,
+        // the first id in this list did exactly that, every time, for free.
+        for (i, agent_id) in [
+            "agent://bank.example/fraud/bot-1", // matches nothing: no cap at all
+            "agent://bank.example/lending/scorer", // matches someone else's prefix
+            "",                                 // no claim at all
+            "agent://bank.example/treasury/recon", // the capped unit's own shape
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let st = unbound_key_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce);
+            let units = Arc::clone(&st.units);
+            let mut req = Request::post("/v1/messages")
+                .header("x-fuse-key", "sk-x")
+                .header("x-fuse-run-id", format!("cap-skip-{i}"))
+                .header("x-fuse-budget-usd", "5.0");
+            if !agent_id.is_empty() {
+                req = req.header("x-fuse-agent-id", agent_id);
+            }
+            let resp = call(st, req.body(Body::from(body(100))).unwrap()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "agent id {agent_id:?} got a call through without a unit binding"
+            );
+            assert_eq!(
+                units.spent("treasury", now_millis()),
+                Microusd::ZERO,
+                "agent id {agent_id:?} moved spend onto treasury"
+            );
+            assert_eq!(
+                units.spent("lending", now_millis()),
+                Microusd::ZERO,
+                "agent id {agent_id:?} moved spend onto lending"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unit_budget_exceeded_blocks_at_402_with_the_units_numbers() {
         // Estimate for max_tokens=100000 at $15/Mtok output is ~$1.5, past

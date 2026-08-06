@@ -178,7 +178,13 @@ impl ParquetSink {
         })
     }
 
-    fn schema() -> Arc<Schema> {
+    /// The schema every segment this process writes is written with.
+    ///
+    /// Public for the same reason [`read_schema`](Self::read_schema) is: the
+    /// column names and types are a contract other repositories read the trace
+    /// through, and `crate::constants` publishes both halves of it rather than
+    /// leaving each consumer to retype them.
+    pub fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("ts_millis", DataType::Int64, false),
             Field::new("run_id", DataType::Utf8, false),

@@ -67,8 +67,16 @@ artifacts - passports, descriptors - are JSON already):
   parses it as a date or enforces anything from it; a blank/whitespace
   value normalizes to absent. Read by `GET /v1/keys` so an operator can
   compare how old a binding is against how recently it was actually used.
-- `prefixes` is the fallback for traffic with no (or no mapped) key: pure
-  attribution, never a mismatch.
+- `prefixes` is the fallback for traffic with no key: pure attribution, never
+  a mismatch, because nothing is authenticated to check against.
+
+  It also catches a caller who DID present a known credential whose `key_id`
+  has no `keys[]` entry, and for that caller it is not pure attribution: the
+  unit its spend lands in is chosen by `x-fuse-agent-id`, a header the caller
+  writes. This line said "no (or no mapped) key" and called the whole path
+  attribution until 2026-08-06, which was true of the first reading and not
+  the second. Under strict that caller is now a mismatch (section 3); under
+  `off` it resolves exactly as before.
 - Patterns are a literal string or a single trailing `*` (prefix match).
   Anything else is rejected at load - no glob engine, no new dependency.
 - Every `unit` referenced by `keys`/`prefixes` must exist in `units`
@@ -82,11 +90,43 @@ On every managed `/v1/messages` call, after `key_id` and `agent_id` are known:
 1. If `key_id` is non-empty and has a `keys[]` binding: the binding's `unit`
    is the call's unit. If the binding lists `agents` patterns and `agent_id`
    does not match any (or is empty), that is a MISMATCH.
-2. Otherwise: the first matching `prefixes[]` entry gives the unit; no
-   mismatch is possible on this path (nothing is authenticated to check
-   against).
-3. No match anywhere: unit is empty. Spend stays visible under the implicit
+2. A non-empty `key_id` with NO `keys[]` binding: the first matching
+   `prefixes[]` entry still gives the unit, unchanged, and it is a MISMATCH
+   either way, because the caller authenticated and the unit came from a
+   header it wrote. `agent_id_not_allowed`'s two siblings name which shape it
+   is: `key_has_no_unit_binding` when nothing matched (no unit, so no monthly
+   cap applies to the call at all) and `unit_chosen_by_agent_id` when
+   something did (a unit IS charged, and the caller picked which).
+3. An empty `key_id` (unkeyed traffic): the first matching `prefixes[]` entry
+   gives the unit; no mismatch is possible on this path, nothing is
+   authenticated to check against.
+4. No match anywhere: unit is empty. Spend stays visible under the implicit
    "unassigned" bucket in every aggregation (never silently dropped).
+
+Case 2 was folded into case 3 until 2026-08-06, so the binding check ran only
+for a `key_id` with an explicit `keys[]` entry and every other authenticated
+caller fell through to prefix matching on a header it controls. That gave such
+a caller two ways past a unit's monthly cap: an agent id matching no prefix
+resolved to no unit, which makes the proxy's unit reservation `None` and skips
+the cap entirely, and one matching a different unit's prefix charged that unit.
+`TOKENFUSE_IDENTITY_STRICT` closed neither, because it governs the binding check
+and this path never reached one.
+
+The decision for the cross-unit half is that strict refuses it rather than
+attributing it: `crates/gateway/src/clientkeys.rs` exists because anything a
+caller can choose, a caller can change, so a cap keyed on something the caller
+writes is bypassed by writing something else and somebody else's can be burned
+on purpose. A credential the map does not bind may not select a unit under
+strict, even when the id it presents resolves. A credential the map DOES bind
+is unaffected in both directions: the prefixes are never consulted for it, so
+its own agent id cannot move its spend either.
+
+Under `off`, which is the default, nothing about any of this changes: the
+resolved unit is identical to what it was, and `off` never consults the
+mismatch. A map that is not configured at all reports no mismatch either
+(`TOKENFUSE_IDENTITY_STRICT` and `TOKENFUSE_IDENTITY_MAP` are read
+independently, so strict without a map is a real deployment, and there are no
+bindings there for a caller to be missing from).
 
 Mismatch handling by `TOKENFUSE_IDENTITY_STRICT`:
 
