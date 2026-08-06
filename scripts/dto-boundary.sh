@@ -30,23 +30,23 @@
 #
 # A schema type can also reach the OpenAPI document through `body = <name>` on a
 # `#[utoipa::path]` while the handler returns the core type. Nothing is a field
-# of anything, so the scan above never sees it. Two such mirrors remain, both on
-# the compliance endpoints, and this script compares each to its original by
-# field NAME, since names are what a JSON body shows.
+# of anything, so the field scan never sees it. Three such mirrors existed when
+# this script was written, and none exists now.
 #
-# WHY A MIRROR IS THE WEAK FORM, and what replaced it once
+# WHY A MIRROR IS THE WEAK FORM, and what replaced all three
 #
-# `ReplayResponse.audit` and `/v1/audit` used to serialise
-# `Vec<tokenfuse_core::audit::AuditEntry>` while publishing `AuditEntrySchema`.
-# They agreed only while somebody kept them agreeing by hand. Proven rather than
-# feared: a field added to the core struct made `/v1/audit` answer a key the
-# published schema never declared.
+# `/v1/audit`, `ReplayResponse.audit` and `/v1/compliance` published
+# `AuditEntrySchema`, `ControlEvidenceSchema` and `ComplianceReportSchema` while
+# serialising the core types those described. They agreed only while somebody
+# kept them agreeing by hand. Proven rather than feared, twice: a field added to
+# core's `AuditEntry` made `/v1/audit` answer a key its schema never declared,
+# and a field added to core's `ControlEvidence` did the same to
+# `/v1/compliance`.
 #
-# That one is fixed rather than watched. The DTO is serialised now, so core may
-# grow a field without touching the API and a field added to the DTO fails to
-# compile until `From` fills it: the compiler holds it and there is no mirror
-# left to keep. The two below are still watched, which is strictly weaker, and
-# the note in the MIRRORS table says what fixing them would look like.
+# All three are converted. The DTO is what gets serialised, so core may grow a
+# field without touching this API, and a field added to a DTO fails to compile
+# until `From` fills it. The compiler holds both directions and the MIRRORS
+# table below is empty, which is the state to keep it in.
 
 set -uo pipefail
 
@@ -76,24 +76,22 @@ ALLOWED = {
 }
 
 # ---------------------------------------------------------------------------
-# The remaining documentation mirrors.
+# Documentation mirrors: a schema type that reaches the OpenAPI document through
+# `body = <name>` on a `#[utoipa::path]` while the handler returns the core type.
+# Nothing is a field of anything, so the scan above cannot see it, and the first
+# version of this script did not look down that road at all.
 #
-# These never appear as a field of a DTO, so the scan above cannot see them:
-# they reach the OpenAPI document through `body = <name>` on a `#[utoipa::path]`
-# while the handler returns the core type. Same drift, different road, and the
-# first version of this script did not look down it.
+# THIS TABLE IS EMPTY, and keeping it empty is the point. Every mirror this
+# repository had is now the thing serialised, so the compiler holds each one:
+# core may grow a field without touching the API, and a field added to a DTO
+# fails to compile until `From` fills it. AuditEntrySchema went first,
+# ControlEvidenceSchema and ComplianceReportSchema followed.
 #
-# `AuditEntrySchema` used to be one of these and is not any more: it is
-# serialised now, so the compiler holds it and no entry is needed here. These
-# two still describe a core type they do not carry. Field NAMES are what a JSON
-# body shows, so names are what this compares; the types differ by
-# representation on purpose (`&'static str` against `String`, an enum against
-# the string it serialises to).
+# Add an entry here only if a mirror genuinely has to come back. It is the weak
+# form: it compares field NAMES and notices drift after the fact, where the
+# conversion makes drift impossible.
 # ---------------------------------------------------------------------------
-MIRRORS = {
-    "ControlEvidenceSchema": ("ControlEvidence", "compliance.rs"),
-    "ComplianceReportSchema": ("ComplianceReport", "compliance.rs"),
-}
+MIRRORS = {}
 
 problems = []
 
