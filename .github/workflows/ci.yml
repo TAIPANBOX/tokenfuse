@@ -59,6 +59,14 @@ jobs:
       - name: the replicated ledger keeps its recorded shape
         run: ./scripts/replicated-shape.sh
 
+      # The gates above parse text with regular expressions, which does not
+      # break loudly: it stops matching and reports success. This breaks each
+      # of them on purpose and requires the failure, so a gate that has quietly
+      # stopped catching anything cannot keep looking like a gate with nothing
+      # to catch. It mutates tracked files and restores them, so it runs last.
+      - name: the gates still fail on the faults they exist to catch
+        run: ./scripts/gates-have-teeth.sh
+
       # A number in a document is a claim with no owner. The it-rat.com page for
       # this service said 513 tests while the workspace ran 709, and nobody
       # knows for how long. It was not wrong when written; nothing was
