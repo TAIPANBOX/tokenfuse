@@ -173,7 +173,14 @@ if not gateway_blocks:
     )
 for b in gateway_blocks:
     checked += 1
-    if not any(v in b for v in REQUIRED):
+    # Comments are stripped first, and that is the whole difference between
+    # this check working and looking like it works: this file keeps
+    # `# TOKENFUSE_UPSTREAM: ...` commented out beside the live setting as the
+    # instruction for going real, and a substring search reads that as
+    # configured. The first version of this gate did exactly that and reported
+    # a clean run on a service that could not start.
+    live = "\n".join(line.split("#", 1)[0] for line in b.splitlines())
+    if not any(v in live for v in REQUIRED):
         name = b.strip().split(":", 1)[0]
         note(
             f"{compose}: service `{name}` runs the gateway image with neither "
