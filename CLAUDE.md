@@ -123,24 +123,39 @@ build)`, `cloud apns (feature build)`.
    exactly those three, which would have spent a CI run re-proving what `cargo
    check` already refuses.
 
-   **One hole is left, and it is the whole reason the script exists.**
+   **Two holes are left, and they are why the script exists.**
    `#[schema(value_type = ..)]` describes a field as some other type and never
    asks the real one for a schema, so an annotated core type compiles cleanly
-   onto the public surface. Two fields already sit there, both deliberate, both
-   recorded in the script beside the fact that makes each safe:
-   `store.rs::severity` (declared `String`, which every variant of core's
-   `Severity` serialises to) and `http.rs::audit`, which is the one worth
-   understanding. It serialises `Vec<tokenfuse_core::audit::AuditEntry>` while
-   declaring `Vec<AuditEntrySchema>`, a hand-made mirror. They agree today. The
-   day core's struct grows a field, the JSON grows it and the published schema
-   does not, so the OpenAPI document starts lying about a response body with
-   nothing in this repository noticing. The script compares the mirror to the
-   original field by field, so that day fails a gate instead.
-   *(gate: `scripts/dto-boundary.sh`; verified against four mutants, each of
+   onto the public surface. One field sits there deliberately,
+   `store.rs::severity`, declared `String` because every variant of core's
+   `Severity` serialises to one; the script fails if a variant ever carries
+   data. The second road is `body = <name>` on a `#[utoipa::path]`, where the
+   handler returns the core type and the named schema is a hand-written mirror
+   of it. Nothing is a field of anything there, so a field scan cannot see it.
+
+   **A mirror is the weak form, and one of them has been retired to show what
+   the strong form is.** `/v1/audit` and `ReplayResponse.audit` published
+   `AuditEntrySchema` while serialising `tokenfuse_core::audit::AuditEntry`, so
+   the two agreed only while somebody kept them agreeing by hand. Proven rather
+   than feared, 2026-08-06: a field added to the core struct made `/v1/audit`
+   answer a key the published schema never declared. It now serialises the DTO,
+   so core may grow a field without touching this API and a field added to the
+   DTO fails to compile until `From` fills it. The compiler holds it and there
+   is no mirror left to keep.
+
+   Two mirrors remain, both on the compliance endpoints, and they are watched
+   rather than fixed: the script compares each to its original by field NAME,
+   because names are what a JSON body shows. Watching is strictly weaker than
+   the conversion above, and the honest reason it stopped here is scope, not
+   design: those types nest and carry `&'static` data, so converting them is its
+   own change.
+   *(gate: `scripts/dto-boundary.sh`; verified against five mutants, each of
    which fails it: a new core type on a DTO through `value_type`, core's
-   `AuditEntry` growing a field so the mirror drifts, core's `Severity` gaining
-   a data-carrying variant so `value_type = String` stops being true, and an
-   exception that no longer matches anything)*
+   `Severity` gaining a data-carrying variant, an exception that no longer
+   matches anything, core's `ControlEvidence` growing a field so a mirror
+   drifts, and the retired case, where a field added to core's `AuditEntry`
+   fails `the_audit_response_carries_exactly_the_fields_the_schema_declares`
+   against the old handler and passes against the converted one)*
 4. **"Honesty is a feature."** Never over-claim compliance coverage or
    hard-guarantee semantics. Budgets are estimate-then-settle, and the system
    fails open by default - docs and READMEs must state these limitations
