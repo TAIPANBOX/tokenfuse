@@ -70,7 +70,12 @@ run_case() {
 	local rc=$?
 	restore
 
-	if [ -n "$needle" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
+	# Exit code first. A needle checked before the expectation turns "it did not
+	# fail at all" into "it failed for the wrong reason", which is a worse
+	# diagnosis than the fault: it sends the reader looking at wording when the
+	# gate is toothless. This harness reported exactly that on its own new cases.
+	if [ "$expect" = fail ] && [ "$rc" -ne 0 ] && [ -n "$needle" ] &&
+		! printf '%s' "$out" | grep -qF -- "$needle"; then
 		printf 'WRONG REASON  %s\n              it failed, but not saying %s\n' "$name" "$needle"
 		failures=$((failures + 1))
 		return
@@ -88,7 +93,7 @@ run_case() {
 }
 
 # A tiny helper for the edits: replace once, and prove it happened.
-py() { printf 'import sys\ndef edit(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b, 1))\n%s\n' "$1"; }
+py() { printf 'import sys\ndef edit(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b, 1))\ndef edit_all(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b))\n%s\n' "$1"; }
 
 # --- invariant 1: core stays dependency-minimal ----------------------------
 
@@ -141,6 +146,23 @@ run_case "stated-numbers: the badge disagrees with the suite" fail \
 run_case "stated-numbers: an old count quoted in prose elsewhere" pass \
 	"./scripts/stated-numbers.sh" \
 	"$(py 'edit("PROGRESS.md", "## Current stage", "Once **512 passing**, now more.\n\n## Current stage")')"
+
+# --- invariant 4: claims about coverage stay recorded ----------------------
+
+run_case "honest-claims: a control upgraded, which is over-claiming" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "enforcement: Enforcement::Partial", "enforcement: Enforcement::Enforced")')" \
+	"UPGRADED"
+
+run_case "honest-claims: README stops stating a limitation" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit_all("README.md", "fail-open", "resilient-mode"); edit_all("README.md", "Fail-open", "Resilient-mode")')" \
+	"no longer states"
+
+run_case "honest-claims: the catalog parse broke, so it measured nothing" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit_all("crates/core/src/compliance.rs", "control_id:", "control_ident:")')" \
+	"measured nothing"
 
 # --- the harness cleans up after itself ------------------------------------
 
