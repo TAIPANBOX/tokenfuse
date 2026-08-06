@@ -6,6 +6,29 @@
 //! consensus before answering. `settle` stays synchronous and fire-and-forget:
 //! it needs no result and must be callable from `SettleGuard::drop` (which can't
 //! await) — the local backend settles inline, the raft backend spawns the write.
+//!
+//! # Before you add a dimension here
+//!
+//! A new field on the replicated ledger's state is a raft and schema-identity
+//! decision, not a routine edit (CLAUDE.md invariant 5), and the reason is not
+//! visible from this file.
+//!
+//! Adding one compiles, and every test in the workspace passes, because every
+//! test builds a fresh state machine. A deployed node does not: `LedgerState`
+//! is written to redb as `serde_json` and nothing in
+//! `crates/cluster/src/types.rs` carries `#[serde(default)]`, so a node with a
+//! durable store cannot read back what it wrote under the old shape. It comes
+//! up having lost every budget and every reservation, with no error, and the
+//! first symptom anybody sees is a breaker that stopped breaking.
+//!
+//! `scripts/replicated-shape.sh` pins that shape and fails when it moves. It is
+//! not there to refuse the change: it is there so the migration, the defaults
+//! and the snapshot compatibility get chosen deliberately, and so the commit
+//! that changes the schema is the commit that says what happens to a node
+//! holding the old one on disk.
+//!
+//! Adding a METHOD to the trait below needs none of this: it fails to compile
+//! until both backends implement it, which is loud enough on its own.
 
 use async_trait::async_trait;
 use tokenfuse_core::{BudgetError, Ledger, Microusd, Reservation, RunSnapshot};
