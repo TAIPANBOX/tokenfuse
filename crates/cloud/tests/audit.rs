@@ -158,3 +158,54 @@ async fn audit_readable_by_viewer_unauth_rejected() {
     let (wrong_key, _) = send(&state, "GET", "/v1/audit", Some("nope"), None).await;
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
 }
+
+/// The audit surface publishes exactly the fields its OpenAPI schema declares,
+/// and nothing else.
+///
+/// This is the contract the `AuditEntrySchema` mirror existed to describe and
+/// could not hold. The handler used to serialise `tokenfuse_core::audit::
+/// AuditEntry` directly while the published schema named the cloud-local
+/// mirror, so the two agreed only for as long as somebody kept them agreeing by
+/// hand. A field added to the core struct would have appeared in this response
+/// and in no schema, which is an OpenAPI document lying about a response body.
+///
+/// Verified the way that claim deserves: with a field added to core's
+/// `AuditEntry`, this test fails against the old handler (the response grows a
+/// ninth key) and passes against the converted one, because a DTO cannot carry
+/// a field it does not declare.
+#[tokio::test]
+async fn the_audit_response_carries_exactly_the_fields_the_schema_declares() {
+    let state = test_state();
+
+    let (status, _) = send(&state, "POST", "/v1/runs/r1/kill", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = send(&state, "GET", "/v1/audit", Some("devkey"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = v.as_array().expect("audit is an array");
+    assert_eq!(entries.len(), 1);
+
+    let mut keys: Vec<&str> = entries[0]
+        .as_object()
+        .expect("an entry is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+
+    // Exactly the eight fields `AuditEntrySchema` declares, in sorted order.
+    assert_eq!(
+        keys,
+        [
+            "action",
+            "actor",
+            "detail",
+            "entry_hash",
+            "prev_hash",
+            "seq",
+            "subject",
+            "ts_millis",
+        ],
+        "the response body and the published schema have to name the same fields"
+    );
+}

@@ -22,20 +22,31 @@
 # compiles cleanly and lands on the public API surface. Measured the same day:
 # the same field that fails to compile bare, compiles with the annotation.
 #
-# That is the only hole left, it is exactly one grep wide, and two fields in
-# this repository already sit in it. Both are deliberate and both are recorded
-# below with the thing that makes them safe, which this script re-establishes on
-# every run rather than trusting a comment (invariant 11's rule, applied here).
+# One field still sits in it deliberately, recorded below with the fact that
+# makes it safe, which this script re-establishes on every run rather than
+# trusting a comment (invariant 11's rule, applied here).
 #
-# THE FAILURE THIS ACTUALLY PREVENTS
+# THE SECOND ROAD, which the first version of this script did not look down
 #
-# `ReplayResponse.audit` serialises `Vec<tokenfuse_core::audit::AuditEntry>`
-# while declaring `Vec<AuditEntrySchema>` as its schema. The DTO is a hand-made
-# mirror of the core struct, and the two agree today. The day core's `AuditEntry`
-# grows a field, the JSON grows it and the published schema does not: the
-# OpenAPI document starts lying about a response body, silently, and no test in
-# this repository would notice. This script compares the mirror to the original
-# field by field, so that day fails here instead.
+# A schema type can also reach the OpenAPI document through `body = <name>` on a
+# `#[utoipa::path]` while the handler returns the core type. Nothing is a field
+# of anything, so the scan above never sees it. Two such mirrors remain, both on
+# the compliance endpoints, and this script compares each to its original by
+# field NAME, since names are what a JSON body shows.
+#
+# WHY A MIRROR IS THE WEAK FORM, and what replaced it once
+#
+# `ReplayResponse.audit` and `/v1/audit` used to serialise
+# `Vec<tokenfuse_core::audit::AuditEntry>` while publishing `AuditEntrySchema`.
+# They agreed only while somebody kept them agreeing by hand. Proven rather than
+# feared: a field added to the core struct made `/v1/audit` answer a key the
+# published schema never declared.
+#
+# That one is fixed rather than watched. The DTO is serialised now, so core may
+# grow a field without touching the API and a field added to the DTO fails to
+# compile until `From` fills it: the compiler holds it and there is no mirror
+# left to keep. The two below are still watched, which is strictly weaker, and
+# the note in the MIRRORS table says what fixing them would look like.
 
 set -uo pipefail
 
@@ -62,11 +73,26 @@ ALLOWED = {
         "truthful; a Severity that stopped being a plain enum would not.",
         check="severity_is_a_unit_enum",
     ),
-    ("http.rs", "audit"): dict(
-        why="Declared as Vec<AuditEntrySchema>, a cloud-local hand-made mirror "
-        "of core's AuditEntry. Safe exactly while the mirror still mirrors.",
-        check="audit_schema_mirrors_core",
-    ),
+}
+
+# ---------------------------------------------------------------------------
+# The remaining documentation mirrors.
+#
+# These never appear as a field of a DTO, so the scan above cannot see them:
+# they reach the OpenAPI document through `body = <name>` on a `#[utoipa::path]`
+# while the handler returns the core type. Same drift, different road, and the
+# first version of this script did not look down it.
+#
+# `AuditEntrySchema` used to be one of these and is not any more: it is
+# serialised now, so the compiler holds it and no entry is needed here. These
+# two still describe a core type they do not carry. Field NAMES are what a JSON
+# body shows, so names are what this compares; the types differ by
+# representation on purpose (`&'static str` against `String`, an enum against
+# the string it serialises to).
+# ---------------------------------------------------------------------------
+MIRRORS = {
+    "ControlEvidenceSchema": ("ControlEvidence", "compliance.rs"),
+    "ComplianceReportSchema": ("ComplianceReport", "compliance.rs"),
 }
 
 problems = []
@@ -165,25 +191,8 @@ def severity_is_a_unit_enum():
     return "core declares no `pub enum Severity`, so the recorded reason cannot be checked"
 
 
-def audit_schema_mirrors_core():
-    dto = struct_fields(CLOUD / "http.rs", "AuditEntrySchema")
-    core = struct_fields(CORE / "audit.rs", "AuditEntry")
-    if dto is None or core is None:
-        return "AuditEntrySchema or core's AuditEntry could not be read, so the mirror cannot be compared"
-    if dto != core:
-        only_core = [f for f in core if f not in dto]
-        only_dto = [f for f in dto if f not in core]
-        return (
-            "AuditEntrySchema has stopped mirroring tokenfuse_core::audit::AuditEntry, "
-            "so the OpenAPI document now describes a response body that is not the one "
-            f"sent. In core only: {only_core or 'none'}. In the DTO only: {only_dto or 'none'}"
-        )
-    return None
-
-
 CHECKS = {
     "severity_is_a_unit_enum": severity_is_a_unit_enum,
-    "audit_schema_mirrors_core": audit_schema_mirrors_core,
 }
 
 # --- 1: no core type on the schema surface except the recorded ones ---------
@@ -222,6 +231,30 @@ for key, entry in ALLOWED.items():
     failure = CHECKS[entry["check"]]()
     if failure:
         note(f"{key[0]}: `{key[1]}` was allowed because: {entry['why']}\n  That has stopped being true: {failure}")
+
+# --- 3: every documentation mirror still mirrors -----------------------------
+
+for dto_name, (core_name, core_file) in MIRRORS.items():
+    dto = struct_fields(CLOUD / "http.rs", dto_name)
+    core = struct_fields(CORE / core_file, core_name)
+    if dto is None or core is None:
+        note(
+            f"{dto_name}: could not read it or its original `{core_name}`, so the mirror "
+            "cannot be compared. If one of them was renamed or removed, update MIRRORS."
+        )
+        continue
+    dto_names = [f[0] for f in dto]
+    core_names = [f[0] for f in core]
+    if dto_names != core_names:
+        only_core = [n for n in core_names if n not in dto_names]
+        only_dto = [n for n in dto_names if n not in core_names]
+        note(
+            f"{dto_name} has stopped mirroring tokenfuse_core's {core_name}, so the OpenAPI "
+            "document now describes a response body that is not the one sent. In core only: "
+            f"{only_core or 'none'}. In the mirror only: {only_dto or 'none'}. The durable fix "
+            "is the one applied to AuditEntrySchema: serialise the DTO instead of describing "
+            "the core type, and the compiler holds it with no mirror to keep."
+        )
 
 # --- verdict ---------------------------------------------------------------
 

@@ -497,12 +497,20 @@ struct AuditVerifyResponse {
     break_index: Option<usize>,
 }
 
-/// OpenAPI documentation mirror of `tokenfuse_core::audit::AuditEntry` — the
-/// `/v1/audit` handler returns the core type, which serializes identically. It
-/// lives here (rather than deriving `ToSchema` in core) to keep `tokenfuse-core`
-/// free of the web/OpenAPI `utoipa` dependency.
-#[derive(ToSchema)]
-#[allow(dead_code)]
+/// The audit chain as this API publishes it, built from
+/// `tokenfuse_core::audit::AuditEntry` at the boundary.
+///
+/// It used to be a documentation-only mirror: the handlers returned the core
+/// type and this struct existed to give `utoipa` something to describe, so the
+/// published schema and the actual body agreed only while somebody kept them
+/// agreeing by hand. A field added to the core struct appeared in the response
+/// and in no schema. Proven rather than feared: adding one to core made
+/// `/v1/audit` answer a ninth key that `AuditEntrySchema` never declared.
+///
+/// Now it is the thing serialised, so the two cannot disagree. Core may grow a
+/// field without touching this API, which is what the DTO boundary is for; and
+/// a field added HERE fails to compile until `From` fills it.
+#[derive(Serialize, ToSchema)]
 struct AuditEntrySchema {
     seq: u64,
     ts_millis: i64,
@@ -512,6 +520,21 @@ struct AuditEntrySchema {
     detail: String,
     prev_hash: String,
     entry_hash: String,
+}
+
+impl From<&AuditEntry> for AuditEntrySchema {
+    fn from(e: &AuditEntry) -> Self {
+        Self {
+            seq: e.seq,
+            ts_millis: e.ts_millis,
+            actor: e.actor.clone(),
+            action: e.action.clone(),
+            subject: e.subject.clone(),
+            detail: e.detail.clone(),
+            prev_hash: e.prev_hash.clone(),
+            entry_hash: e.entry_hash.clone(),
+        }
+    }
 }
 
 /// OpenAPI mirror of `tokenfuse_core::compliance::ControlEvidence` — one
@@ -1517,7 +1540,8 @@ async fn audit(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
-    (StatusCode::OK, Json(st.store.audit(&org))).into_response()
+    let chain: Vec<AuditEntrySchema> = st.store.audit(&org).iter().map(Into::into).collect();
+    (StatusCode::OK, Json(chain)).into_response()
 }
 
 /// Verify the caller org's audit chain end-to-end: `{ok:true}` when intact, else
@@ -1624,11 +1648,12 @@ async fn replay(
     // Every audited mutation records what it acted on as `subject` (a kill or
     // budget change's subject is the run id itself; see `Store::kill_audited`
     // / `Store::set_budget_audited`).
-    let audit: Vec<AuditEntry> = st
+    let audit: Vec<AuditEntrySchema> = st
         .store
         .audit(&org)
-        .into_iter()
+        .iter()
         .filter(|e| e.subject == run)
+        .map(Into::into)
         .collect();
 
     (
@@ -1663,8 +1688,7 @@ struct ReplayResponse {
     incidents: Vec<Incident>,
     /// Audit-chain entries whose subject is this run (e.g. kills, budget
     /// changes), oldest first.
-    #[schema(value_type = Vec<AuditEntrySchema>)]
-    audit: Vec<AuditEntry>,
+    audit: Vec<AuditEntrySchema>,
 }
 
 /// Issue a one-time pairing code (admin org key). The dashboard renders it as a
