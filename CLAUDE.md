@@ -72,13 +72,16 @@ cargo test --all
 cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/core-deps.sh
 ./scripts/stated-numbers.sh
+./scripts/dto-boundary.sh
 ```
 
 The `--features cluster` line is the raft-backed ledger test; copy that exact
 invocation, it is what `.github/workflows/ci.yml` runs. It is named here rather
 than pointed at as "the last one", which is what this sentence used to say: the
 list has grown twice since, and a positional reference into a list that grows is
-wrong the moment it does. CI also runs separate jobs for the Python SDK (`sdk/python`), the JS SDK
+wrong the moment it does.
+
+CI also runs separate jobs for the Python SDK (`sdk/python`), the JS SDK
 (`sdk/js`), the OpenAPI spec, the Next.js dashboard, the `crates/cluster`
 workspace (own fmt/clippy/test), `cargo audit` (workspace + cluster), the
 `crates/radar` eBPF build (Linux-only), and a `--features apns` clippy build
@@ -110,7 +113,34 @@ build)`, `cloud apns (feature build)`.
    Never derive/expose `tokenfuse-core` types directly on the Cloud API
    surface - the DTO boundary is what lets core evolve without breaking the
    public schema.
-   *(not enforced)*
+
+   **Most of this is held by the compiler, as a consequence of invariant 1**,
+   and that was measured on 2026-08-06 rather than assumed. Core cannot depend
+   on `utoipa`, so no core type can implement `ToSchema`: naming one in
+   `components(schemas(..))` fails to compile, so does using one as a field of a
+   `ToSchema` DTO, and `impl ToSchema for` a core type inside `crates/cloud` is
+   refused by the orphan rule. The debt note this replaces proposed grepping for
+   exactly those three, which would have spent a CI run re-proving what `cargo
+   check` already refuses.
+
+   **One hole is left, and it is the whole reason the script exists.**
+   `#[schema(value_type = ..)]` describes a field as some other type and never
+   asks the real one for a schema, so an annotated core type compiles cleanly
+   onto the public surface. Two fields already sit there, both deliberate, both
+   recorded in the script beside the fact that makes each safe:
+   `store.rs::severity` (declared `String`, which every variant of core's
+   `Severity` serialises to) and `http.rs::audit`, which is the one worth
+   understanding. It serialises `Vec<tokenfuse_core::audit::AuditEntry>` while
+   declaring `Vec<AuditEntrySchema>`, a hand-made mirror. They agree today. The
+   day core's struct grows a field, the JSON grows it and the published schema
+   does not, so the OpenAPI document starts lying about a response body with
+   nothing in this repository noticing. The script compares the mirror to the
+   original field by field, so that day fails a gate instead.
+   *(gate: `scripts/dto-boundary.sh`; verified against four mutants, each of
+   which fails it: a new core type on a DTO through `value_type`, core's
+   `AuditEntry` growing a field so the mirror drifts, core's `Severity` gaining
+   a data-carrying variant so `value_type = String` stops being true, and an
+   exception that no longer matches anything)*
 4. **"Honesty is a feature."** Never over-claim compliance coverage or
    hard-guarantee semantics. Budgets are estimate-then-settle, and the system
    fails open by default - docs and READMEs must state these limitations
@@ -350,13 +380,19 @@ build)`, `cloud apns (feature build)`.
 
 This list is debt, and it is here to stay visible rather than to be tidy.
 
-**Held by this file alone: invariants 3, 4 and 5.** Invariant 6 is only partly
+**Held by this file alone: invariants 4 and 5.** Invariant 6 is only partly
 held, and invariant 2 is held by one golden test that must never be deleted.
 
-- **Invariant 3** (core types reach the Cloud OpenAPI only via cloud-local
-  `*Schema` DTOs) is mechanically checkable: fail if any `utoipa` derive in
-  `crates/cloud` names a `tokenfuse-core` type. That is the exact regression
-  mode, and it is perhaps forty lines.
+- **Invariant 3 came off this list on 2026-08-06**, and how it came off is worth
+  keeping. The note here said it was "mechanically checkable: fail if any
+  `utoipa` derive names a `tokenfuse-core` type. That is the exact regression
+  mode." It was not the exact regression mode. Writing the mutants first showed
+  the compiler already refuses all three shapes that note described, and that
+  the one shape it does NOT refuse, `#[schema(value_type = ..)]`, was already
+  in use on two fields and unmentioned. A gate built from the note would have
+  passed forever while the real hole stayed open. The lesson generalises past
+  this entry: **a debt note is a guess about a regression, and the guess is
+  worth testing before it is worth implementing.**
 - **Invariant 5** (do not thread new dimensions through `LedgerBackend`/raft
   casually) cannot be scripted, but it can be made loud: a comment block at the
   top of `ledger_backend.rs` saying a field added here is a raft and
