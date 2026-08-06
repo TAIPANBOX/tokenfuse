@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-767-brightgreen)
+![tests](https://img.shields.io/badge/tests-791-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -22,15 +22,19 @@
 
 ---
 
-TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers. It watches every call, adds up the real cost as it happens, and, the instant an agent goes rogue (burns through its budget, spins in a loop, or tries to leak a secret), it **cuts the circuit in real time**, before the damage lands. You point your agent at it with a one-line base-URL change; no SDK, no rewrite. It also ships a free scanner that catches a poisoned or "rug-pulled" MCP tool before your agent ever calls it, and a broker that keeps the secrets that tool needs out of the model's context entirely.
+TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers. It watches every call, adds up the real cost as it happens, and, the instant an agent goes rogue (burns through its budget, spins in a loop, or pastes a secret into a prompt), it **cuts the circuit in real time**, before the damage lands. You point your agent at it with a one-line base-URL change; no SDK, no rewrite. It also ships a free scanner that catches a poisoned or "rug-pulled" MCP tool before your agent ever calls it, and a broker that keeps the secrets that tool needs out of the model's context entirely.
 
-> **⚡ Try it in one command**, no signup, no config:
+> **⚡ Try it in one command**, no signup, no account:
 > ```bash
-> docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse
 > ```
-> Full walkthrough: [**🚀 Get started**](#-get-started). Nothing to install at
-> all: the [**live preview**](https://taipanbox.github.io/tokenfuse/preview/)
-> runs the fleet dashboard on sample data in your browser.
+> `TOKENFUSE_ALLOW_STUB=1` is what makes this offline: with no provider behind
+> it, the gateway answers from a built-in stub and meters a fixed 1000/500
+> tokens, so **every figure it shows you is invented**. That flag is how you say
+> you know. Point it at a real provider and the numbers are real: see
+> [**🚀 Get started**](#-get-started). Nothing to install at all: the
+> [**live preview**](https://taipanbox.github.io/tokenfuse/preview/) runs the
+> fleet dashboard on sample data in your browser.
 
 <div align="center">
 
@@ -127,6 +131,7 @@ Full write-up, all numbers, the cluster-scale costs, and the real bugs live test
 - [How TokenFuse compares](#-how-tokenfuse-compares) ← vs. observability, gateways, guardrails
 - [What's inside](#-whats-inside)
 - [**🚀 Get started**](#-get-started) ← install & first run
+- [**Safe by default**](#-safe-by-default) ← what is on without configuration, and what it costs on upgrade
 - [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci) ← free scanner + GitHub Action
 - [Architecture](#-architecture)
 - [Project status](#-project-status)
@@ -186,7 +191,7 @@ A budget only means something if two gateways racing each other can't both spend
 
 ### 3. Drop-in, fail-open, and fast
 
-Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** so it's risk-free to drop in, **fail-open** so it's never a single point of failure, works fully offline against a built-in fake provider, and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 - see [BENCHMARKS.md](BENCHMARKS.md)).
+Point `TOKENFUSE_UPSTREAM` at Anthropic, or at any endpoint that speaks the **Anthropic Messages API** (the gateway serves `/v1/messages`; an OpenAI-compatible `/v1/chat/completions` front is planned but not yet implemented, see [docs/02](docs/02-architecture.md)), and TokenFuse prices and enforces against all of it from the same binary, with a fallback price for models it doesn't recognize rather than silently letting spend go untracked. It's a one-line base-URL swap, **shadow mode first** for the budget so it's risk-free to drop in, **fail-open** so it's never a single point of failure, runs offline against a built-in fake provider (`TOKENFUSE_ALLOW_STUB=1`, which exists so that nobody mistakes invented numbers for measured ones), and it's Rust: the enforcement decision itself adds well under a microsecond in-process (~0.4 µs p99 - see [BENCHMARKS.md](BENCHMARKS.md)).
 
 ### 4. Catch a poisoned MCP tool for free, and gate CI on it
 
@@ -307,7 +312,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 
 **Also hardens your agents**
 - 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
-- 🕵️ **DLP**: detect/redact secrets leaving in prompts.
+- 🕵️ **DLP**: catches a recognisable secret pasted into a prompt and refuses the call before it leaves (`TOKENFUSE_DLP`, `block` by default). It reads contiguous text and matches patterns, so it catches carelessness, not intent: a secret with no distinctive prefix, or one split across the text, goes through. See [Safe by default](#-safe-by-default) for the measured cases.
 - 🔑 **MCP credential-broker** + a free tool-poisoning / rug-pull scanner, CI-gated - see [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci).
 - 📡 **eBPF Radar**: discover shadow agents on a host, zero config (Linux).
 
@@ -332,17 +337,27 @@ TokenFuse is a **proxy**: start it, then point your agent at it instead of the p
 Published to GitHub Container Registry, so it runs anywhere with Docker, nothing to compile:
 
 ```bash
-docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse
 ```
 
-A working gateway on **http://localhost:4100**, using a built-in fake provider so you can try it offline.
+A working gateway on **http://localhost:4100**, answering from a built-in fake
+provider so you can try it offline.
+
+**Why that flag is not optional.** Without a provider the gateway would answer
+every call itself and meter a fixed 1000 input / 500 output tokens as real
+spend, so both the model's answers and the money would be invented, and both
+would look plausible from either end. That happened on a live cluster whose
+manifest simply had not set `TOKENFUSE_UPSTREAM`: every call returned `200`,
+each was billed `$0.0035`, and nothing warned. So the stub is opt-in, and a
+gateway with neither a provider nor this flag refuses to start and prints both
+ways forward.
 
 <details><summary>Prefer to build from source? (needs Rust)</summary>
 
 ```bash
 git clone https://github.com/TAIPANBOX/tokenfuse.git
 cd tokenfuse
-cargo run -p tokenfuse-gateway      # gateway on http://localhost:4100
+TOKENFUSE_ALLOW_STUB=1 cargo run -p tokenfuse-gateway   # gateway on http://localhost:4100
 ```
 </details>
 
@@ -362,7 +377,12 @@ Then change **one line** in your app, the base URL:
 export ANTHROPIC_BASE_URL=http://localhost:4100   # Anthropic SDK
 ```
 
-Your agent runs exactly as before; TokenFuse just watches every call.
+Your agent runs exactly as before, with one thing to know before you point
+production traffic at it: **a call that carries no `x-fuse-run-id` is refused**
+(`400 metering_required`), because a call this gateway cannot account for is one
+it does not make. Add the header (step 3), or set
+`TOKENFUSE_REQUIRE_RUN_ID=0` to restore the unmetered pass-through while you
+wire the header up. See [Safe by default](#-safe-by-default) for both.
 
 > The gateway speaks the **Anthropic Messages API** (`/v1/messages`) today. An OpenAI-compatible `/v1/chat/completions` endpoint is planned but not yet implemented ([docs/02](docs/02-architecture.md)), so OpenAI-style SDKs (and Ollama / vLLM clients) can't point at it yet.
 
@@ -378,10 +398,10 @@ curl http://localhost:4100/v1/messages \
   -d '{"model":"claude-sonnet","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-- **No `x-fuse-run-id`?** The call is passed through untouched, safe to drop in.
+- **No `x-fuse-run-id`?** The call is refused with `400 metering_required`, and `TOKENFUSE_REQUIRE_RUN_ID=0` brings back the old unmetered pass-through.
 - **Live view:** `docker exec <container> tokenfuse top` shows every run and its $/min.
 
-**Observe first, then enforce.** By default TokenFuse runs in **shadow** mode: it records what it *would* block but changes nothing, so you can drop it in risk-free. Flip to **enforce** when you trust it:
+**Observe first, then enforce.** The BUDGET starts in **shadow** mode: it records what it *would* block but changes nothing, so a cap you are still tuning cannot stop a run. Flip to **enforce** when you trust it:
 
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
@@ -390,6 +410,64 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 ```
 
 `TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
+
+---
+
+## 🔒 Safe by default
+
+A cloud range on 2026-08-04 ran this stack against a real provider and found
+that its guarantees were all opt-in: secret scanning was off unless you set a
+variable, a call with no run id reached the provider and was recorded nowhere,
+and the check for "is the policy plane on the data path" read environment
+variables rather than asking whether a decision had ever come back. Separately
+each is defensible. Together they mean a deployment can pass every check it has
+and be **governed on paper**. Three things changed, and the old behaviour is one
+explicit variable away in each case.
+
+| Setting | Default | The old behaviour |
+|---|---|---|
+| `TOKENFUSE_DLP` | **`block`**: prompts are scanned and a call carrying a recognised secret is refused with `403 dlp_blocked` | `TOKENFUSE_DLP=off` |
+| `TOKENFUSE_REQUIRE_RUN_ID` | **on**: a call with no `x-fuse-run-id` is refused with `400 metering_required` rather than reaching the provider unmetered | `TOKENFUSE_REQUIRE_RUN_ID=0` |
+| `GET /v1/policy-plane` | new read-only report: what the policy PDP has actually answered | n/a, there was no such fact |
+
+**What this costs you on upgrade.** Both are behaviour changes on a live path.
+If your prompts legitimately carry things that match a secret pattern, those
+calls now get a `403` where they used to succeed; `TOKENFUSE_DLP=mask` redacts
+instead of refusing, and `off` is unchanged from before. If any of your traffic
+reaches the gateway without a run id, it now gets a `400`; add the header or set
+`TOKENFUSE_REQUIRE_RUN_ID=0`. Neither default changes what `TOKENFUSE_MODE`
+governs: the budget still starts in shadow.
+
+**What the secret scanner does, stated plainly.** It reads contiguous text and
+matches patterns, so it **catches carelessness**: an agent that pasted a config
+file, a key, or a `.env` into a prompt. Measured against a real provider on
+2026-08-04, a whole `AKIAIOSFODNN7EXAMPLE` was refused before it left. Two
+things went through, and both are inherent rather than bugs: the 40-character
+AWS **secret** key on its own, which has no distinctive prefix to match, and the
+same access key **split across the text**. A pattern scanner cannot stop
+somebody who intends to leak a secret, only somebody who did not mean to, and
+nothing here should be read as though it did. Keeping the secret out of the
+model's context entirely is a different control, and that one is the
+[MCP credential-broker](docs/12-mcp-credential-broker.md).
+
+**Whether the policy plane is really there.** `GET /v1/policy-plane` reports
+what the [Wardryx](https://github.com/TAIPANBOX/wardryx) PDP has ANSWERED, not
+what is configured: counts of real `allow` / `deny` / `hold` verdicts, the
+fallbacks this gateway synthesized when the PDP could not be reached (which are
+deliberately not counted as verdicts, since fail-open turns an outage into an
+allow), and two facts a deployment check can act on.
+
+```bash
+curl -s localhost:4100/v1/policy-plane?window_ms=3600000
+```
+
+`on_data_path` is true when a real verdict came back inside the window;
+`allow_and_deny_seen` is true only when a real allow **and** a real deny both
+did. The second is deliberately hard: it stays false until a deployment drill
+sends one call the policy must refuse, which is the point, because a check that
+cannot fail reports zero forever. The endpoint carries no prompt content and
+sits on the same unauthenticated admin surface as `/v1/runs`, so do not expose
+it.
 
 ---
 
@@ -482,13 +560,13 @@ The full request path (budget enforcement, SSE passthrough, loop detection, hier
 
 **v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
-Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data.
+Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the gateway **refuses to start** rather than answer from a stub and meter invented usage as spend (`TOKENFUSE_ALLOW_STUB=1` keeps the offline loop); the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data. Landed after a live cloud range on 2026-08-04: **[safe defaults](#-safe-by-default)** (secret scanning on, unmetered pass-through off), `GET /v1/policy-plane`, and incident severity that comes from the magnitude a detector measured instead of from its name.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
 ```bash
-docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse          # gateway
-cd cloud && docker compose up                                 # + Cloud dashboard (:3000)
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse   # gateway, offline
+cd cloud && docker compose up                                                    # + Cloud dashboard (:3000)
 ```
 
 Images on GHCR: `tokenfuse` · `tokenfuse:cluster` · `tokenfuse-control-plane` · `tokenfuse-dashboard`.

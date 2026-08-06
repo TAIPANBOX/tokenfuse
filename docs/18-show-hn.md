@@ -5,8 +5,10 @@
 > the prepared first comment in immediately after submitting.
 >
 > HN "Show HN" rules require something people can try. We qualify:
-> `docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse` works offline against
-> the built-in fake provider, and the rug-pull demo is one `cargo run`.
+> `docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse`
+> works offline against the built-in fake provider (the flag is required, and
+> says out loud that the numbers it then reports are invented), and the
+> rug-pull demo is one `cargo run`.
 
 ## Title (pick one, ≤80 chars)
 
@@ -77,9 +79,10 @@ Everything is Apache-2.0, self-hosted, and free forever: the proxy, the CLI,
 the scanner and the CI action, and the Cloud control plane with the fleet
 dashboard. No seat limits, no time limit, no paid tier.
 
-Try it (offline, no signup — built-in fake provider):
+Try it (offline, no signup, built-in fake provider; the flag is how the
+gateway makes you say you know its numbers are invented):
 
-    docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
+    docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse
 
 I'd especially value feedback on the loop-detection heuristics (what runaway
 patterns have bitten you that identical-call/ping-pong/context-growth

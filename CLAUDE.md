@@ -75,14 +75,15 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/dto-boundary.sh
 ./scripts/replicated-shape.sh
 ./scripts/honest-claims.sh
-./scripts/constants.sh          # builds, unlike the four above; see invariant 14
+./scripts/runnable-quickstart.sh
+./scripts/constants.sh          # builds, unlike the five above; see invariant 14
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
 `gates-have-teeth.sh` is the odd one out and is listed last on purpose. The
-four gates above it all parse text with regular expressions, and that kind of
+five gates above it all parse text with regular expressions, and that kind of
 parser does not break loudly: it stops matching and reports success. Three of
-the four broke exactly that way while being written, each time caught only
+them broke exactly that way while being written, each time caught only
 because a mutant was supposed to fail and did not. So the mutants stopped being
 prose in commit messages and became a harness: it breaks each gate on purpose,
 requires the failure, and for the diagnosis cases requires the failure to SAY
@@ -568,6 +569,119 @@ build)`, `cloud apns (feature build)`.
    ones was run against the unfixed code first. Two OLD tests asserted the
    defect as expected behaviour and were changed, which is recorded in their
    bodies rather than left to be noticed in a diff)*
+
+16. **A command this repository tells somebody to run can run.** The gateway
+   gained a precondition on 2026-08-05 (no `TOKENFUSE_UPSTREAM` and no
+   `TOKENFUSE_ALLOW_STUB` means it exits 2 rather than metering invented usage
+   as spend, #141). Nothing that advertised the old behaviour moved with it:
+   the README's headline "try it in one command" and its own get-started step,
+   the Dockerfile comment, the crates.io crate's doc, the Show HN draft, and
+   `cloud/docker-compose.yml`, whose gateway service would have crash-looped on
+   the next image build. `grep -r ALLOW_STUB docs/` returned nothing at all.
+
+   The general form is the reason this is an invariant rather than a fix: **code
+   acquires a precondition in a commit that never opens a document.** It is the
+   same shape as invariant 12's stated numbers, and it fails the same way, on
+   somebody else's machine, at the worst possible moment, which for a quickstart
+   is the first thirty seconds a stranger spends on this project.
+
+   What the gate holds is exactly one precondition, the one the binary enforces
+   at startup. It deliberately ignores subcommand invocations (`… -- constants`,
+   `tokenfuse top`), which share the binary and need no provider, because a gate
+   that fires on a correct command gets deleted by whoever is unblocking CI.
+   *(gate: `scripts/runnable-quickstart.sh`; verified against four mutants: the
+   flag removed from the README quickstart, the flag removed from the compose
+   gateway service, a subcommand invocation which must NOT fail it, and the
+   compose image renamed, which fails as "measured nothing" rather than passing
+   because it found nothing to check)*
+
+17. **A guarantee that is off until somebody sets a variable is not a
+   guarantee.** Established on a live cloud range 2026-08-04, where three
+   separately defensible defaults combined into a deployment that could pass
+   every check it had and be governed on paper: `TOKENFUSE_DLP` unset meant
+   `off`, so the scanner this product advertises scanned nothing; a call with no
+   `x-fuse-run-id` reached the provider and was recorded in no ledger, trace or
+   event stream; and the check that would have caught either read environment
+   variables (invariant 19).
+
+   Both defaults now point the other way, and BOTH halves of that are the rule.
+   A default that cannot be turned off is a prohibition, and an operator with a
+   real reason (a prompt corpus full of things that look like keys, a gateway in
+   front of a client that cannot add a header yet) needs one variable, not a
+   fork: `TOKENFUSE_DLP=off` and `TOKENFUSE_REQUIRE_RUN_ID=0`. The upgrade
+   consequence is a `403` and a `400` on paths that used to succeed, which is
+   stated in the README rather than discovered.
+
+   The boundary is deliberate: `TOKENFUSE_DLP_PII` did NOT move. Its false
+   positives are ordinary prose rather than credentials, and the range
+   established nothing about it. Turning something on by default is a claim that
+   its true positives outweigh its false ones, and that claim needs evidence per
+   scanner, not per repository.
+   *(test: `secret_scanning_is_on_by_default`,
+   `a_call_with_no_run_id_is_refused_by_default` and
+   `metering_is_required_by_default` in `gateway::proxy`, each run against the
+   unfixed code first; plus six in `gateway::defaults` pinning the vocabulary,
+   including `a_misspelt_dlp_value_never_reads_as_disabled` and
+   `pii_masks_stay_off_when_nothing_is_configured`. One OLD test asserted the
+   pass-through default as correct and was flipped, with the reason in its body)*
+
+18. **A detector that scales as computation does not automatically scale as an
+   alert.** Measured 2026-08-04: 999 agents produced 3000 alerts, every agent
+   tripping all three detectors that had anything to say about it, with trip
+   counts inside the largest running from 1 to 73, median 2, and the planted
+   runaway at 45. Every one of those alerts carried the same severity. The
+   signal was in the data and printed in the summary line; the field an operator
+   SORTS by was identical on all thousand rows.
+
+   So severity comes from the magnitude a detector measured, not from the name
+   of the detector. Three details are load-bearing. It escalates on a MULTIPLE
+   of the detector's own threshold (four, then sixteen), not on a second fixed
+   threshold, which would measure a size again one level up and put a busy agent
+   permanently at critical: this is invariant 10's lesson applied to severity
+   rather than to triggers. It never falls, because two of these detectors count
+   inside a window, and an incident that downgraded itself would move down a
+   triage list while the run that earned it is still open. And the base severity
+   is the floor, so an incident at the line reads exactly as it did before.
+   *(test: `a_run_blocked_far_past_the_threshold_outranks_one_that_just_crossed`,
+   `a_loop_that_keeps_going_climbs_the_scale`,
+   `severity_records_the_worst_it_reached_and_never_walks_back`,
+   `the_ladder_is_a_multiple_of_the_threshold_not_a_second_threshold` and the
+   overeager guard `a_loop_that_only_just_crossed_keeps_its_base_severity`, in
+   `cloud::store`. Verified against four mutants: severity ignoring the
+   magnitude, escalating on the threshold itself (which fails the guard AND four
+   older tests), and a later trip walking the severity back down. The last one
+   passed the first version of its test, because the magnitude had fallen so far
+   that the detector no longer fired at all, so the test now ages the window out
+   and re-trips at a magnitude that is genuinely lower)*
+
+19. **A check that reads configuration proves nothing about behaviour.** The
+   deployment check for "the policy plane is on the data path" read environment
+   variables, so a plane that had never returned a verdict passed it. The range
+   walked into it: a missing identity header made a healthy PDP answer nothing,
+   the gateway reported `wardryx unreachable`, and an operator would have gone
+   to repair a machine that was fine.
+
+   `GET /v1/policy-plane` reports what the PDP ANSWERED. Two parts of that are
+   the invariant rather than the implementation. A failmode fallback is counted
+   as a fallback and never as a verdict, because fail-open turns an outage into
+   an `allow`, which is the exact state the check exists to distinguish. And the
+   evidence expires: the facts are scoped to a window, so a plane that answered
+   once last March does not report as live.
+
+   `allow_and_deny_seen` is deliberately hard to satisfy, and that is the point.
+   It stays false until a real deny comes back, which normally means a
+   deployment drill that sends one call the policy must refuse. This is the
+   invariant trailryx already carries in another form: **a check that cannot
+   fail reports zero forever**, and it looks exactly like a check with nothing
+   to report.
+   *(test: six in `gateway::policyplane` including
+   `a_failmode_fallback_is_never_evidence_of_a_verdict`,
+   `allows_alone_do_not_prove_the_plane_can_refuse` and
+   `a_zero_timestamp_is_never_read_as_recent`; three in `tests/policy_plane.rs`
+   for the endpoint; and two in `tests/wardryx.rs` for the wiring underneath,
+   which no unit test can see: `a_verdict_off_the_wire_is_recorded_as_one` and
+   `an_unreachable_pdp_never_counts_as_an_allow`. Every one was checked against
+   its own mutant)*
 
 ## Decisions that have no gate yet
 

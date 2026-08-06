@@ -58,7 +58,7 @@ an authentication provider. The two honest framings:
 | **Cluster auth (bearer token)** | `crates/cluster` | Every endpoint except `/healthz` requires `Authorization: Bearer <token>`. |
 | **Cluster mutual TLS** | `server::serve_mtls` | Client-cert peer authentication over rustls `WebPkiClientVerifier`, on top of the token. |
 | **Cloud RBAC** | `crates/cloud` | `admin` vs `viewer` roles; mutations (kill, set-budget) require `admin`. Orgs isolated by key. |
-| **Secrets kept out of context** | MCP broker + DLP | `{{secret:NAME}}` handles injected only on the wire; raw-secret DLP on args; response redaction. See [12](12-mcp-credential-broker.md). |
+| **Secrets kept out of context** | MCP broker + DLP | `{{secret:NAME}}` handles injected only on the wire; raw-secret DLP on args; response redaction. See [12](12-mcp-credential-broker.md). The scanner is pattern-based over contiguous text (`TOKENFUSE_DLP`, `block` when unset since 2026-08-06), so it catches carelessness and not intent: measured against a real provider on 2026-08-04, a whole `AKIA…` key was refused, while the AWS secret key on its own and a key split across the text both passed. The broker is the control that keeps a secret out of the context in the first place; the scanner is the one that catches a mistake. |
 | **Dependency audit** | CI `security` job | `cargo audit` on every push/PR, for both the workspace and `crates/cluster`. |
 
 ### PII masks (optional, env-gated)

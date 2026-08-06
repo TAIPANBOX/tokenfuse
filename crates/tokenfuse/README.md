@@ -11,11 +11,17 @@ project's umbrella / name anchor; the gateway ships as the `tokenfuse` binary an
 as Docker images:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce ghcr.io/taipanbox/tokenfuse
+docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse
 ```
 
 Then point your provider client at `http://127.0.0.1:4100` and attach a few
-`X-Fuse-*` headers.
+`X-Fuse-*` headers. `x-fuse-run-id` is required: a call the gateway cannot
+account for is refused rather than forwarded unmetered. To try it with no
+provider at all, add `-e TOKENFUSE_ALLOW_STUB=1`, which makes the gateway
+answer from a built-in stub and meter invented usage; it is opt-in for exactly
+that reason, and without either variable the process refuses to start.
 
 - **Source & docs:** https://github.com/TAIPANBOX/tokenfuse
 - **Python SDK:** `pip install tokenfuse-sdk` (imports as `tokenfuse`)

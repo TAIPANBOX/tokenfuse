@@ -31,6 +31,14 @@ Wave 2 extended TokenFuse from "meter + breaker" toward a governance plane, with
 - `deny` returns `403` + `x-fuse-wardryx: deny`.
 - `hold` returns `403` + `x-fuse-wardryx: hold` + `x-fuse-approval-id`. The flow is **stateless**: the gateway does not park the connection or poll. The caller obtains an approval out of band (a human, or an automated approver, calls the PDP) and resubmits the identical request carrying `x-fuse-approval-token`. TTL, single-use, and exactly which fields the token binds to are entirely the PDP's responsibility; TokenFuse only forwards the token. The hold response builder never trusts the PDP-supplied `approval_id` into a header without validating it, and never panics the request task on a malformed one (Wave-2 hardening).
 
+**Proving it is actually there (`GET /v1/policy-plane`, added 2026-08-06).** Every check this stack had for "the policy plane is on the data path" read environment variables, so a hook configured against a PDP that had never answered passed all of them, and a live range walked into exactly that: a missing identity header made a healthy PDP answer nothing, the gateway reported `wardryx unreachable`, and an operator would have gone to repair a machine that was fine. The endpoint reports what the PDP has ANSWERED since this process started, scoped to a window the caller chooses (`?window_ms=`, default one hour):
+
+- `verdicts`: real `allow` / `deny` / `hold` counts with the last timestamp of each, and `unreachable_fallbacks` kept separate from all three. A fallback is not a verdict: under `failmode=open` an outage becomes an `allow`, which is the precise state this endpoint exists to distinguish from a governed one. A cache hit is not counted either; it was counted when it came off the wire.
+- `on_data_path`: a real verdict of any kind arrived inside the window.
+- `allow_and_deny_seen`: a real allow **and** a real deny both did. Deliberately hard, and the reason for the whole thing: it stays false until a deployment drill sends one call the policy must refuse, so the check fails until somebody proves the refusal works instead of passing because nothing has gone wrong yet.
+
+Read-only, no prompt content, no run ids, and on the same unauthenticated admin surface as `/v1/runs`, which the README already says not to expose.
+
 ## 3. Cloud replay + regulator evidence (`crates/cloud`)
 
 **Goal.** Turn the agent-event journal into two auditor-facing artifacts without a second data pipeline: a run replay and a compliance evidence pack.

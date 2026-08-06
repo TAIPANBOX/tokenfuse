@@ -203,9 +203,14 @@ pub const CATALOG: &[ControlMapping] = &[
         control_id: "TF.DLP",
         title: "Secret/DLP wire redaction",
         description: "Scans request args and responses for raw secrets and blocks \
-                      the call before they reach the model/tool. Optionally, an \
-                      operator can also enable a separate, env-gated PII mode \
-                      (email/card/phone, regex-only, no ML).",
+                      the call before they reach the model/tool. Pattern-based \
+                      over contiguous text: it catches a recognisable secret \
+                      pasted into a prompt, and not one with no distinctive \
+                      prefix or one split across the text, so it addresses \
+                      carelessness rather than an operator's own intent to \
+                      exfiltrate. Optionally, an operator can also enable a \
+                      separate, env-gated PII mode (email/card/phone, \
+                      regex-only, no ML).",
         feature: "crate::dlp + MCP broker → breaker dlp_blocked",
         enforcement: Enforcement::Enforced,
         evidence_decisions: &["dlp_blocked"],

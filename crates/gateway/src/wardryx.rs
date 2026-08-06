@@ -77,6 +77,16 @@ use std::time::{Duration, Instant};
 /// Default per-call timeout when `TOKENFUSE_WARDRYX_TIMEOUT_MS` is unset.
 const DEFAULT_TIMEOUT_MS: u64 = 50;
 
+/// Wall clock in epoch millis, for stamping verdicts. The cache above uses
+/// `Instant` because it only measures elapsed time; a verdict has to be
+/// comparable against a window an operator asks about from outside.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Default decision-cache TTL when `TOKENFUSE_WARDRYX_CACHE_TTL_MS` is unset.
 const DEFAULT_CACHE_TTL_MS: u64 = 3_000;
 
@@ -129,6 +139,46 @@ impl WardryxDecision {
             WardryxDecision::Hold => "hold",
         }
     }
+}
+
+/// What the PDP has actually ANSWERED, since this process started.
+///
+/// Configuration says a policy plane should be consulted. This says one was,
+/// and what it said. The 2026-08-04 cloud range found the gap between those two
+/// sentences to be the critical one: the deployment check for "the policy plane
+/// is on the data path" read environment variables, so a deployment whose PDP
+/// answered nothing at all passed it, and the same run showed that happening by
+/// accident rather than by malice.
+///
+/// Three things about the shape are load-bearing.
+///
+/// **`unreachable` is not a verdict.** Under `failmode=open` an unreachable PDP
+/// yields a synthesized `allow`, which is exactly the state this report exists
+/// to distinguish from a governed one. Counting it as an allow would rebuild
+/// the fault inside the check meant to catch it.
+///
+/// **A cache hit is not counted either.** It is a real verdict, but it was
+/// counted when it came off the wire, and the cache TTL is measured in seconds.
+/// Counting hits would let one wire call answer for a window of any length.
+///
+/// **Totals are since startup and the timestamps carry the window.** A count
+/// with no clock cannot answer "in the last period", and a restarted gateway
+/// honestly reports that it has seen nothing yet rather than inheriting a
+/// predecessor's evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Verdicts {
+    pub allow: u64,
+    pub deny: u64,
+    pub hold: u64,
+    /// Outcomes this gateway synthesized because the PDP could not be reached.
+    /// Not verdicts, deliberately kept beside them: a plane that is failing
+    /// open looks identical to a healthy one from every other angle.
+    pub unreachable_fallbacks: u64,
+    /// Epoch millis of the last of each, `0` for never.
+    pub last_allow_millis: i64,
+    pub last_deny_millis: i64,
+    pub last_hold_millis: i64,
+    pub last_unreachable_millis: i64,
 }
 
 /// The full result of a `decide` call: what to do, plus everything a block
@@ -391,6 +441,9 @@ pub struct Wardryx {
     failmode: FailMode,
     client: Option<WardryxClient>,
     cache: Cache,
+    /// What the PDP has answered (see [`Verdicts`]). One mutex acquisition per
+    /// wire decision, next to the one `Cache` already takes on the same path.
+    verdicts: Mutex<Verdicts>,
 }
 
 impl Wardryx {
@@ -402,6 +455,7 @@ impl Wardryx {
             failmode: FailMode::Open,
             client: None,
             cache: Cache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
+            verdicts: Mutex::new(Verdicts::default()),
         }
     }
 
@@ -421,6 +475,7 @@ impl Wardryx {
             failmode,
             client: Some(WardryxClient::new(base_url, key, timeout)),
             cache: Cache::new(cache_ttl),
+            verdicts: Mutex::new(Verdicts::default()),
         }
     }
 
@@ -506,6 +561,7 @@ impl Wardryx {
         };
         match client.decide(&wire).await {
             Ok((outcome, cacheable)) => {
+                self.record_verdict_at(outcome.decision, now_millis());
                 self.cache.put(
                     &ctx.agent_id,
                     &ctx.tool_names,
@@ -521,9 +577,47 @@ impl Wardryx {
                     failmode = ?self.failmode,
                     "wardryx decide call failed; applying failmode"
                 );
+                self.record_unreachable_at(now_millis());
                 self.fallback(&e.to_string())
             }
         }
+    }
+
+    /// Record a verdict the PDP itself returned, stamped by the caller.
+    ///
+    /// Public so `tests/policy_plane.rs` can place a verdict at a chosen
+    /// instant without a stub PDP and a sleep; `decide` is the only caller in
+    /// production and passes `now_millis()`. Deliberately NOT called for a
+    /// cache hit or for a failmode fallback, for the reasons in [`Verdicts`].
+    pub fn record_verdict_at(&self, decision: WardryxDecision, at_millis: i64) {
+        let mut v = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        match decision {
+            WardryxDecision::Allow => {
+                v.allow += 1;
+                v.last_allow_millis = v.last_allow_millis.max(at_millis);
+            }
+            WardryxDecision::Deny => {
+                v.deny += 1;
+                v.last_deny_millis = v.last_deny_millis.max(at_millis);
+            }
+            WardryxDecision::Hold => {
+                v.hold += 1;
+                v.last_hold_millis = v.last_hold_millis.max(at_millis);
+            }
+        }
+    }
+
+    /// Record that this gateway had to synthesize an outcome because the PDP
+    /// did not answer. See [`Verdicts::unreachable_fallbacks`].
+    pub fn record_unreachable_at(&self, at_millis: i64) {
+        let mut v = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        v.unreachable_fallbacks += 1;
+        v.last_unreachable_millis = v.last_unreachable_millis.max(at_millis);
+    }
+
+    /// What the PDP has answered since this process started.
+    pub fn verdicts(&self) -> Verdicts {
+        *self.verdicts.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Synthesize an outcome for "the PDP could not be reached", per
