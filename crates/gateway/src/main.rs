@@ -388,12 +388,32 @@ async fn mcp_broker() {
         }
         return;
     }
-    // Bind to loopback by DEFAULT, and say so out loud when that default is
-    // widened. Until this warning existed, the default bind was the ONLY thing
-    // between a process on the box and a vault of real credentials, and
-    // TOKENFUSE_MCP_ADDR moved it silently. Same posture, and the same voice,
-    // as the Cloud's own non-loopback warning in crates/cloud/src/main.rs.
+    // Bind to loopback by DEFAULT. Until 2026-08-05 the default bind was the
+    // ONLY thing between a process on the box and a vault of real
+    // credentials, and TOKENFUSE_MCP_ADDR moved it silently.
     let addr = std::env::var("TOKENFUSE_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:4200".to_string());
+    // The opt-out for an operator who has deliberately decided to run the
+    // broker open. Same parsing this file already uses for TOKENFUSE_ALLOW_STUB
+    // in serve() below: only "1" or "true" (case-insensitive) count, not any
+    // other non-empty string, so a typo reads as "not opted out", never as
+    // "opted out".
+    let allow_open_bind = std::env::var("TOKENFUSE_MCP_ALLOW_OPEN_BIND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // Widening the bind with nothing on the door refuses to start (2026-08-06
+    // decision, following the audit that added the warning below without
+    // this: docs/12's "still open" note). A wide bind WITH credentials
+    // configured, or one the operator opted into with
+    // TOKENFUSE_MCP_ALLOW_OPEN_BIND, is a decision this repository already
+    // lets an operator make, so it only warns, same posture and the same
+    // voice as the Cloud's own non-loopback warning in
+    // crates/cloud/src/main.rs.
+    if let Some(refusal) =
+        tokenfuse_gateway::mcpbroker::refuse_open_bind(&addr, keys_enabled, allow_open_bind)
+    {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
     if let Some(warning) = tokenfuse_gateway::mcpbroker::bind_exposure_warning(&addr, keys_enabled)
     {
         tracing::warn!("{warning}");

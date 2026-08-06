@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-791-brightgreen)
+![tests](https://img.shields.io/badge/tests-797-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -514,6 +514,8 @@ It pins a benign tool, mutates the tool's own description to look poisoned, resc
 
 Scanning catches a poisoned tool before it's approved. The runtime **[MCP credential-broker](docs/12-mcp-credential-broker.md)** (`tokenfuse mcp-broker`) is the complementary live control: point your agent's MCP client at it, and it swaps `{{secret:name}}` handles for real values only at the last hop, so even a tool that slips past review can't exfiltrate a credential it was never given.
 
+Since 2026-08-06, a non-loopback bind with no `TOKENFUSE_MCP_KEYS` configured refuses to start rather than only warn, because anything that reaches an open, unauthenticated port could have `{{secret:name}}` handles resolved against the whole vault. **Upgrade consequence, stated plainly:** a deployment that binds the broker to a non-loopback address with no keys configured will not start after this change. Fix it by configuring `TOKENFUSE_MCP_KEYS="secret:key_id,..."`, by keeping the default loopback bind, or, if the open bind is deliberate, by setting `TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` (full detail, including what still only warns: [docs/12](docs/12-mcp-credential-broker.md)).
+
 ---
 
 ## 🏗️ Architecture
@@ -560,7 +562,7 @@ The full request path (budget enforcement, SSE passthrough, loop detection, hier
 
 **v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
-Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the gateway **refuses to start** rather than answer from a stub and meter invented usage as spend (`TOKENFUSE_ALLOW_STUB=1` keeps the offline loop); the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data. Landed after a live cloud range on 2026-08-04: **[safe defaults](#-safe-by-default)** (secret scanning on, unmetered pass-through off), `GET /v1/policy-plane`, and incident severity that comes from the magnitude a detector measured instead of from its name.
+Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the gateway **refuses to start** rather than answer from a stub and meter invented usage as spend (`TOKENFUSE_ALLOW_STUB=1` keeps the offline loop); the **MCP credential-broker** now refuses to start too, on a non-loopback bind with no `TOKENFUSE_MCP_KEYS` configured (`TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` is the opt-out for a deliberately open bind); the docs stopped claiming an OpenAI-compatible endpoint the gateway doesn't serve yet; and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data. Landed after a live cloud range on 2026-08-04: **[safe defaults](#-safe-by-default)** (secret scanning on, unmetered pass-through off), `GET /v1/policy-plane`, and incident severity that comes from the magnitude a detector measured instead of from its name.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
