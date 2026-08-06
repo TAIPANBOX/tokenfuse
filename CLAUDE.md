@@ -73,6 +73,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/core-deps.sh
 ./scripts/stated-numbers.sh
 ./scripts/dto-boundary.sh
+./scripts/replicated-shape.sh
 ```
 
 The `--features cluster` line is the raft-backed ledger test; copy that exact
@@ -168,7 +169,35 @@ build)`, `cloud apns (feature build)`.
    ledger's replicated state (`crates/gateway/src/ledger_backend.rs`,
    `crates/cluster`) is the thing that has to stay linearizable across nodes;
    a new field there is a raft/schema-identity decision, not a routine edit.
-   *(not enforced)*
+
+   **Why a comment was not enough, which is what this had until 2026-08-06.**
+   Adding a field to `RunState` compiles, and every test in the workspace
+   passes, because every test builds a fresh state machine. A deployed node does
+   not: `LedgerState` goes to redb as `serde_json` and nothing in
+   `crates/cluster/src/types.rs` carries `#[serde(default)]`, so a node with a
+   durable store cannot read back what it wrote under the old shape. It restarts
+   having lost every budget and every reservation, silently, and the first
+   symptom is a breaker that stopped breaking. That is not a hypothesis about
+   this estate's habits: `build_durable` sat behind a test-only caller for
+   months while the shipped binary had no durable mode at all (#162).
+
+   The gate does not refuse the change, and saying so matters, because a check
+   that reads as a prohibition gets worked around. It refuses the change being
+   made SILENTLY: the migration, the defaults and the snapshot compatibility get
+   chosen, the recorded shape is updated in the same commit, and that commit
+   says what happens to a node holding the old shape on disk. The warning also
+   sits at the top of `ledger_backend.rs`, where the edit happens, rather than
+   only in this file.
+
+   The trait's own methods are deliberately NOT pinned: a method added there
+   fails to compile until both backends implement it, so the compiler already
+   holds that half.
+   *(gate: `scripts/replicated-shape.sh`, pinning `Request`'s variants,
+   `Response`, `RunState` and `LedgerState`; verified against five mutants, each
+   of which fails it: a field added to `RunState`, a field added to
+   `Request::Reserve`, a new `Request` variant, a field removed from `Response`,
+   and a type renamed, which fails as "cannot be checked" rather than passing
+   quietly)*
 6. **Telemetry evolves append-only.** Parquet schema changes follow the
    nullable-evolution pattern set by P2/P3/P4 (see the comments in
    `crates/gateway/src/sink.rs` around `read_schema()` and the mixed-schema
@@ -411,11 +440,13 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   passed forever while the real hole stayed open. The lesson generalises past
   this entry: **a debt note is a guess about a regression, and the guess is
   worth testing before it is worth implementing.**
-- **Invariant 5** (do not thread new dimensions through `LedgerBackend`/raft
-  casually) cannot be scripted, but it can be made loud: a comment block at the
-  top of `ledger_backend.rs` saying a field added here is a raft and
-  schema-identity decision would put the warning where the edit happens rather
-  than in a file somebody may not have opened.
+- **Invariant 5 came off this list on 2026-08-06, and the note here was wrong
+  in the same way invariant 3's was.** It said the rule "cannot be scripted" and
+  proposed a comment. The replicated schema is four types in one file, so it
+  pins exactly as mechanically as invariant 1's dependency list does, and the
+  comment went in beside the gate rather than instead of it. Twice now, a debt
+  note has underestimated what was checkable; both times the cost of finding out
+  was half an hour of reading the code the note described.
 - **Invariant 6**'s exporter half is now five tests. Both promises stop being
   true quietly, which is why they needed tests rather than comments: nothing
   crashes when a disabled exporter starts doing work, it just gets slower, in

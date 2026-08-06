@@ -52,6 +52,13 @@ jobs:
       - name: core types stay behind the Cloud DTO boundary
         run: ./scripts/dto-boundary.sh
 
+      # A field added to the replicated ledger compiles and passes every test,
+      # because every test builds a fresh state machine. A node with a durable
+      # store cannot read back what it wrote under the old shape, and comes up
+      # having lost every budget with no error. This makes that a decision.
+      - name: the replicated ledger keeps its recorded shape
+        run: ./scripts/replicated-shape.sh
+
       # A number in a document is a claim with no owner. The it-rat.com page for
       # this service said 513 tests while the workspace ran 709, and nobody
       # knows for how long. It was not wrong when written; nothing was
