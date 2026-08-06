@@ -1378,7 +1378,14 @@ impl Store {
                             &mut inner.incidents,
                             org,
                             "budget_exhausted",
-                            tokenfuse_core::Severity::High,
+                            // A run refused three times and one refused forty
+                            // times are not the same row in a triage list; see
+                            // `severity_from_magnitude`.
+                            severity_from_magnitude(
+                                tokenfuse_core::Severity::High,
+                                n,
+                                cfg.budget_blocks,
+                            ),
                             &r.run_id,
                             Some(r.run_id.clone()),
                             agent.clone(),
@@ -1406,7 +1413,11 @@ impl Store {
                             &mut inner.incidents,
                             org,
                             "sustained_loop",
-                            tokenfuse_core::Severity::Medium,
+                            severity_from_magnitude(
+                                tokenfuse_core::Severity::Medium,
+                                n,
+                                cfg.loop_repeats,
+                            ),
                             &r.run_id,
                             Some(r.run_id.clone()),
                             agent.clone(),
@@ -1451,6 +1462,14 @@ impl Store {
                         cfg.fanout_window_ms,
                         n,
                     );
+                    // The point this agent had to pass to be here at all: the
+                    // floor, or its own habit times the multiple, whichever is
+                    // higher. Escalating against that rather than against the
+                    // floor alone keeps the ladder measuring the same thing the
+                    // trigger measures.
+                    let trigger = cfg
+                        .fanout_runs
+                        .max(baseline.saturating_mul(cfg.fanout_multiple));
                     let exploding = completed >= 2
                         && n >= cfg.fanout_runs
                         && n >= baseline.saturating_mul(cfg.fanout_multiple);
@@ -1462,7 +1481,7 @@ impl Store {
                             &mut inner.incidents,
                             org,
                             "fanout_explosion",
-                            tokenfuse_core::Severity::High,
+                            severity_from_magnitude(tokenfuse_core::Severity::High, n, trigger),
                             a,
                             None,
                             Some(a.clone()),
@@ -1603,11 +1622,22 @@ impl Store {
             // would take it off the console before anyone had seen it.
             let was_spiking = inner.spike_active.get(org).copied().unwrap_or(false);
             if spiking && !was_spiking {
+                // Same rule as the fan-out above: escalate against the line
+                // this org actually had to cross, which is the floor or its own
+                // normal times the multiple.
+                let spike_trigger = cfg
+                    .spend_per_min_micros
+                    .max(baseline_per_min.saturating_mul(cfg.spike_multiple))
+                    .max(0) as u64;
                 let inc = upsert_incident(
                     &mut inner.incidents,
                     org,
                     "spend_spike",
-                    tokenfuse_core::Severity::High,
+                    severity_from_magnitude(
+                        tokenfuse_core::Severity::High,
+                        burn.max(0) as u64,
+                        spike_trigger,
+                    ),
                     "",
                     None,
                     None,
@@ -2830,8 +2860,71 @@ fn fanout_baseline(
     (sum / completed.len() as u64, completed.len())
 }
 
+/// How many times over its own threshold a detector's magnitude has to be
+/// before the incident moves up one step on the severity scale, and again for
+/// the step after that.
+///
+/// Four, and the number matters less than the fact that it is a MULTIPLE. A
+/// fixed second threshold ("critical at 20 blocks") measures a size again, one
+/// level up, and inherits the fault this exists to fix: an agent whose ordinary
+/// work is twenty concurrent runs would sit at critical permanently. A multiple
+/// of the line the operator already configured moves with that line.
+const SEVERITY_ESCALATE_AT: u64 = 4;
+
+/// The most steps a magnitude can add. Two is the whole usable range of the
+/// scale from `Medium`, and it keeps the ladder from turning a large number
+/// into `Critical` on the strength of arithmetic alone.
+const SEVERITY_MAX_STEPS: usize = 2;
+
+/// Severity from the magnitude a detector measured, rather than from the name
+/// of the detector.
+///
+/// WHY THIS EXISTS
+///
+/// Measured on a live fleet 2026-08-04: 999 agents raised 3000 alerts, and
+/// inside the largest detector the trip counts ran from 1 to 73, median 2. The
+/// planted runaway was at 45. Every one of those thousand alerts carried the
+/// same severity, so the column an operator sorts by said nothing, and the
+/// worst agent in the fleet sat next to one that went over budget once. The
+/// magnitude was already computed and already printed in the summary line;
+/// only the severity ignored it.
+///
+/// The general form is worth keeping: a detector that scales as COMPUTATION
+/// does not automatically scale as an ALERT. Ten times the fleet does not break
+/// detection, it breaks the ability to act on the output, and the two failures
+/// look nothing alike from inside the code.
+///
+/// `base` stays the floor: crossing a threshold is what the threshold is for,
+/// and an incident at the line reads exactly as it did before this change.
+fn severity_from_magnitude(
+    base: tokenfuse_core::Severity,
+    magnitude: u64,
+    threshold: u64,
+) -> tokenfuse_core::Severity {
+    use tokenfuse_core::Severity::*;
+    const LADDER: [tokenfuse_core::Severity; 5] = [Info, Low, Medium, High, Critical];
+
+    let threshold = threshold.max(1);
+    let mut steps = 0usize;
+    let mut bar = threshold.saturating_mul(SEVERITY_ESCALATE_AT);
+    while steps < SEVERITY_MAX_STEPS && magnitude >= bar {
+        steps += 1;
+        bar = bar.saturating_mul(SEVERITY_ESCALATE_AT);
+    }
+
+    let at = LADDER.iter().position(|s| *s == base).unwrap_or(0);
+    LADDER[(at + steps).min(LADDER.len() - 1)]
+}
+
 /// Upsert the incident for `(org, kind, scope)`: create it on first trip, else
 /// bump `occurrences`/`last_seen_millis` in place. Returns the current state.
+///
+/// Severity RISES with a later trip and never falls. Two of these detectors
+/// count inside a window, so their magnitude drops as old evidence ages out,
+/// and an open incident that quietly downgraded itself would move down a triage
+/// list while the run that earned the row is still running. The incident
+/// records the worst it was ever raised at; the window governs whether it fires
+/// again, not what it says about what happened.
 #[allow(clippy::too_many_arguments)]
 fn upsert_incident(
     incidents: &mut HashMap<String, HashMap<String, Incident>>,
@@ -2883,6 +2976,9 @@ fn upsert_incident(
         summary: None,
     });
     inc.occurrences += 1;
+    if severity > inc.severity {
+        inc.severity = severity;
+    }
     if ts > inc.last_seen_millis {
         inc.last_seen_millis = ts;
     }
@@ -4255,6 +4351,148 @@ mod tests {
         assert_eq!(incs.len(), 1, "same incident, not a duplicate");
         assert_eq!(incs[0].occurrences, 2);
         assert_eq!(incs[0].last_seen_millis, now + 5);
+    }
+
+    // ---- severity comes from the magnitude, not from the detector's name ----
+    //
+    // Measured on 2026-08-04 against a live fleet: 999 agents produced 3000
+    // alerts, every agent tripping all three detectors that had anything to say
+    // about it. Inside the largest, breaker trips ran from 1 to 73, median 2,
+    // and the planted runaway sat at 45. The signal was there and printed in
+    // the summary line. The field an operator SORTS by was identical on all
+    // thousand rows.
+    //
+    // A detector scales as computation and does not scale as an alert. Those
+    // are different things, and on six identities in a demo the difference is
+    // invisible.
+
+    #[test]
+    fn the_ladder_is_a_multiple_of_the_threshold_not_a_second_threshold() {
+        use tokenfuse_core::Severity::*;
+        // At the line, and anywhere under four times it, the incident reads
+        // exactly as it did before this change.
+        assert_eq!(severity_from_magnitude(Medium, 3, 3), Medium);
+        assert_eq!(severity_from_magnitude(Medium, 11, 3), Medium);
+        assert_eq!(severity_from_magnitude(Medium, 12, 3), High);
+        assert_eq!(severity_from_magnitude(Medium, 48, 3), Critical);
+        assert_eq!(
+            severity_from_magnitude(Medium, 100_000, 3),
+            Critical,
+            "the scale ends at critical; a bigger number is not a bigger word"
+        );
+        // The multiple is what makes this move with an operator's own
+        // configuration: forty blocks against a threshold of twenty is the
+        // same alert as three against three.
+        assert_eq!(severity_from_magnitude(High, 40, 20), High);
+        // A threshold of zero is a misconfiguration, not a division by zero.
+        assert_eq!(severity_from_magnitude(High, 4, 0), Critical);
+    }
+
+    #[test]
+    fn a_run_blocked_far_past_the_threshold_outranks_one_that_just_crossed() {
+        let s = Store::new(); // default budget_blocks = 3
+        let now = 1_000_000;
+
+        // r1: exactly at the line, which is what the threshold is for.
+        let just: Vec<CallRecord> = (0..3)
+            .map(|i| block_at("r1", "budget_exceeded", 1000, now + i))
+            .collect();
+        s.ingest_at("acme", &just, now);
+
+        // r2: the shape a007 had. Same detector, same kind, an order of
+        // magnitude more of it.
+        let far: Vec<CallRecord> = (0..40)
+            .map(|i| block_at("r2", "budget_exceeded", 1000, now + i))
+            .collect();
+        s.ingest_at("acme", &far, now);
+
+        let incs = s.incidents("acme");
+        let at_line = incs.iter().find(|i| i.run_id.as_deref() == Some("r1"));
+        let far_past = incs.iter().find(|i| i.run_id.as_deref() == Some("r2"));
+        let at_line = at_line.expect("the run at the line raised an incident");
+        let far_past = far_past.expect("the run far past it raised one too");
+
+        assert_eq!(at_line.severity, tokenfuse_core::Severity::High);
+        assert!(
+            far_past.severity > at_line.severity,
+            "forty blocks and three blocks cannot be the same row in a triage list: \
+             got {:?} and {:?}",
+            far_past.severity,
+            at_line.severity
+        );
+    }
+
+    #[test]
+    fn a_loop_that_only_just_crossed_keeps_its_base_severity() {
+        // The other direction, and the reason this is a ladder rather than a
+        // flag: a detector that escalated on its own threshold would make every
+        // incident critical, which is the same list with a louder word on it.
+        let s = Store::new(); // default loop_repeats = 3
+        let now = 2_000_000;
+        let loops: Vec<CallRecord> = (0..3)
+            .map(|i| block_at("r-loop", "loop_detected", 0, now + i))
+            .collect();
+        s.ingest_at("acme", &loops, now);
+
+        let incs = s.incidents("acme");
+        let inc = incs
+            .iter()
+            .find(|i| i.kind == "sustained_loop")
+            .expect("the loop incident");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Medium);
+    }
+
+    #[test]
+    fn a_loop_that_keeps_going_climbs_the_scale() {
+        // Medium at the line, and the full distance to Critical available above
+        // it. `sustained_loop` is the detector with the most room, which is why
+        // it is the one that shows the ladder working end to end.
+        let s = Store::new();
+        let now = 2_000_000;
+        let loops: Vec<CallRecord> = (0..60)
+            .map(|i| block_at("r-loop", "loop_detected", 0, now + i))
+            .collect();
+        s.ingest_at("acme", &loops, now);
+
+        let incs = s.incidents("acme");
+        let inc = incs
+            .iter()
+            .find(|i| i.kind == "sustained_loop")
+            .expect("the loop incident");
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Critical);
+    }
+
+    #[test]
+    fn severity_records_the_worst_it_reached_and_never_walks_back() {
+        // `sustained_loop` counts inside a window, so its magnitude FALLS as
+        // old repeats age out. An incident that quietly downgraded itself under
+        // a triager's cursor would be worse than one that never escalated: the
+        // row would move down the list while the run that earned it is still
+        // open.
+        let s = Store::new();
+        let now = 3_000_000;
+        let burst: Vec<CallRecord> = (0..60)
+            .map(|i| block_at("r-burst", "loop_detected", 0, now + i))
+            .collect();
+        s.ingest_at("acme", &burst, now);
+        assert_eq!(
+            s.incidents("acme")[0].severity,
+            tokenfuse_core::Severity::Critical
+        );
+
+        // Long enough later that the burst has aged out of the ten-minute
+        // window entirely, then three fresh repeats: the detector trips again,
+        // at a magnitude of three, which on its own would read Medium.
+        let later = now + 700_000;
+        let fresh: Vec<CallRecord> = (0..3)
+            .map(|i| block_at("r-burst", "loop_detected", 0, later + i))
+            .collect();
+        s.ingest_at("acme", &fresh, later + 2);
+        assert_eq!(
+            s.incidents("acme")[0].severity,
+            tokenfuse_core::Severity::Critical,
+            "an open incident keeps the worst magnitude it was raised at"
+        );
     }
 
     // The narrowing, and the whole reason for it: an incident that says a
