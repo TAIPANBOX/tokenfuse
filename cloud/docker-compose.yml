@@ -4,7 +4,17 @@
 #
 # Then open the dashboard on http://localhost:3000 (control-plane URL
 # http://localhost:8080, org key `devkey`) and send traffic through the gateway
-# on :4100 — runs and spend show up live. Runs anywhere Docker runs.
+# on :4100 - runs and spend show up live. Runs anywhere Docker runs.
+#
+#   curl http://localhost:4100/v1/messages \
+#     -H 'content-type: application/json' \
+#     -H 'x-fuse-run-id: demo-1' -H 'x-fuse-budget-usd: 0.50' \
+#     -d '{"model":"claude-sonnet","max_tokens":100,
+#          "messages":[{"role":"user","content":"hi"}]}'
+#
+# The run id is required, not decorative: a call without one is refused with
+# 400 metering_required rather than reaching a provider unaccounted for, and it
+# is also the id every row on the dashboard is keyed by.
 services:
   control-plane:
     image: ghcr.io/taipanbox/tokenfuse-control-plane:latest
@@ -34,7 +44,14 @@ services:
     image: ghcr.io/taipanbox/tokenfuse:latest
     environment:
       TOKENFUSE_ADDR: "0.0.0.0:4100"
-      # Point at a real provider to use it for real; omit for the offline stub.
+      # This stack is a demo, so it runs offline against the built-in stub.
+      # The stub answers every call itself and meters a fixed 1000 input / 500
+      # output tokens, so THE SPEND ON THE DASHBOARD IS INVENTED: it shows the
+      # shape of the product, not any real money. The gateway refuses to start
+      # with neither variable set, precisely so that nobody gets these numbers
+      # by accident. Comment this out and set TOKENFUSE_UPSTREAM to make the
+      # figures real; your provider key is passed through per request.
+      TOKENFUSE_ALLOW_STUB: "1"
       # TOKENFUSE_UPSTREAM: "https://api.anthropic.com/v1/messages"
       TOKENFUSE_MODE: "enforce"
       TOKENFUSE_CLOUD_URL: "http://control-plane:8080"

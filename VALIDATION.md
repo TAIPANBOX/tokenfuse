@@ -195,8 +195,10 @@ should be worded as though it did.
 
 **Two faults this run found, both since fixed.** A call with no `x-fuse-run-id` reached the
 provider and was recorded in no ledger, trace or event stream (all three NDJSON files at 0 bytes
-after a successful call) - now refusable with `TOKENFUSE_REQUIRE_RUN_ID=1`, and the startup line
-says in words what happens when it is not set. And a missing `x-fuse-agent-id` was passed to the
+after a successful call) - refused by default since 2026-08-06 with `400 metering_required`, and
+`TOKENFUSE_REQUIRE_RUN_ID=0` restores the pass-through for a deployment that wants it. Secret
+scanning moved the same way in the same change: this run had to enable `TOKENFUSE_DLP` by hand
+because unset meant `off`, and unset now means `block`. And a missing `x-fuse-agent-id` was passed to the
 PDP as an empty identity, whose rejection the gateway reported as `wardryx unreachable`, sending
 an operator to debug a healthy machine - now a local `identity_required` naming the header.
 

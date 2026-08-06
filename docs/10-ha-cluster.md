@@ -201,6 +201,7 @@ lean). Run one gateway per host; bootstrap on exactly one:
 ```bash
 docker run -p 4100:4100 -p 5001:5001 -v tf1:/data \
   -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   -e TOKENFUSE_CLUSTER_ID=1 \
   -e TOKENFUSE_CLUSTER_ADDR=0.0.0.0:5001 \
   -e TOKENFUSE_CLUSTER_PEERS=1=http://host1:5001,2=http://host2:5001,3=http://host3:5001 \

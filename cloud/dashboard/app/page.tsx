@@ -138,8 +138,13 @@ export default function Page() {
         api("/v1/budgets"),
         api("/v1/series?window=15m&step=60s"),
         api("/v1/alerts"),
-        // Savings is a paid-plan feature: 402/absent on free plans. Swallow the
-        // error so the rest of the dashboard still refreshes; the tile hides.
+        // Savings can be absent on an older plane, exactly like /v1/units
+        // below. Swallow the error so the rest of the dashboard still
+        // refreshes; the tile hides. This used to say "a paid-plan feature:
+        // 402 on free plans", which stopped being true when plan entitlements
+        // were removed from the product (#123, #125): there are no plans, so
+        // there is no 402 to catch, and the only reason left to be defensive
+        // here is a plane that predates the endpoint.
         api("/v1/savings")
           .then((r) => r.json() as Promise<Savings>)
           .catch(() => null),

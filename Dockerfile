@@ -4,9 +4,15 @@
 # particular server. Published to GitHub Container Registry by
 # .github/workflows/release.yml:
 #
-#   docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse
 #   docker run -p 4100:4100 -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
 #     ghcr.io/taipanbox/tokenfuse
+#
+# Offline, with no provider behind it, the gateway answers from a stub and
+# meters a fixed 1000/500 tokens as spend, so every figure it reports is
+# invented. That is a fine dev loop and indefensible anywhere else, so it is
+# opt-in and the process refuses to start without either variable:
+#
+#   docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse
 #
 # Builds the default gateway (drop-in proxy). Pass FEATURES=cluster to bake in
 # the raft HA stack (the `:cluster` image tag); onnx/wasm are also opt-in.

@@ -172,6 +172,35 @@ run_case "honest-claims: the catalog parse broke, so it measured nothing" fail \
 	"$(py 'edit_all("crates/core/src/compliance.rs", "control_id:", "control_ident:")')" \
 	"measured nothing"
 
+# --- invariant 16: a documented command can start a gateway ----------------
+
+run_case "runnable-quickstart: the headline command loses its flag" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse")')" \
+	"cannot start a gateway"
+
+# The compose stack is the case that would have failed on somebody else's
+# machine rather than in a document, so it gets its own case.
+run_case "runnable-quickstart: the compose gateway loses its flag" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "      TOKENFUSE_ALLOW_STUB: \"1\"", "")')" \
+	"crash-loops"
+
+# The one that must NOT fire, carrying both exclusions. `tokenfuse mcp-scan`,
+# `tokenfuse top` and `tokenfuse constants` share the binary with the gateway
+# and need no provider; and a line with an ellipsis is prose ABOUT a command,
+# which this repository writes a great deal of, since the fault the gate exists
+# for has to be explained somewhere. A gate that flags either is deleted by
+# whoever is unblocking CI.
+run_case "runnable-quickstart: a subcommand and a prose ellipsis" pass \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("README.md", "## 📜 License", "```bash\ndocker run ghcr.io/taipanbox/tokenfuse mcp-scan --url https://mcp.example.com/rpc\n```\n\nRunning `docker run ... ghcr.io/taipanbox/tokenfuse` with no provider exits 2.\n\n## 📜 License")')"
+
+run_case "runnable-quickstart: the compose image renamed, so it measured nothing" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "image: ghcr.io/taipanbox/tokenfuse:latest", "image: ghcr.io/taipanbox/tokenfuse-gw:latest")')" \
+	"measured nothing"
+
 # --- the published stack constants match the Rust --------------------------
 #
 # The odd one out among the gates: it BUILDS instead of parsing text, so this
