@@ -3,7 +3,49 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-08-05, covering #134-#170. Four tracks, and none of them
+**Last updated:** 2026-08-06, covering #171-#177. One theme, and it is the same
+one #134-#170 ended on: statements that were true when written and had quietly
+stopped being, plus the mechanisms that now hold them instead of attention.
+
+**This file, made current and then gated** (#171-#173). The header and the
+Status-by-component table were brought up to #170; the remaining-work list was
+re-verified against #111-#170, with the one-command check for each item recorded
+beside it, because the old line said "re-checked against #91-#110" and had no
+clock. The test count then moved from a badge-only gate to one covering every
+file that states it (`scripts/stated-numbers.sh`), after this file was found
+saying **100 passing** where the workspace ran 747, a sevenfold error sitting
+next to an already-gated badge. A number is not gated because it is prominent,
+it is gated because it is stated.
+
+**The Cloud DTO boundary, gated and then made largely unnecessary** (#174-#176).
+Invariant 3 got `scripts/dto-boundary.sh`, and writing the mutants first showed
+the debt note's plan was wrong twice over: the compiler already refuses every
+shape that note described (invariant 1 keeps `utoipa` out of core, so no core
+type can implement `ToSchema`), while the one shape it does not refuse,
+`#[schema(value_type = ..)]`, was already in use and unmentioned. Three
+documentation mirrors were then retired: `/v1/audit`, `ReplayResponse.audit` and
+`/v1/compliance` had published hand-written `*Schema` types while serialising
+the core types those merely described, so each pair agreed only while somebody
+kept it agreeing by hand. Proven twice with a field added to core, which made
+each endpoint answer a key its published schema never declared. All three now
+serialise the DTO, so the compiler holds both directions and the script's
+mirror table is empty.
+
+**The replicated ledger's shape, pinned** (#177). Invariant 5's note said the
+rule could not be scripted and asked for a comment. The replicated schema is
+four types in one file, so it pins as mechanically as invariant 1's dependency
+list. What the comment could not have carried is the consequence: adding a field
+to `RunState` compiles and every test passes, because every test builds a fresh
+state machine, while a node with a durable store cannot read back what it wrote
+under the old shape and restarts having lost every budget, silently.
+`scripts/replicated-shape.sh` makes that a decision rather than an accident; the
+comment went in beside it, at the top of `ledger_backend.rs`.
+
+Worth recording once rather than twice: **two debt notes in a row underestimated
+what was checkable**, and both times the cost of finding out was half an hour
+reading the code the note described. That lesson is in CLAUDE.md, next to the
+entries it came from;
+earlier 2026-08-05, covering #134-#170. Four tracks, and none of them
 a new capability: this stretch was spent making the capabilities already listed
 below actually true.
 
@@ -115,7 +157,7 @@ comparison in #132.
 
 | Component | State | Notes |
 |---|---|---|
-| Workspace + tooling | ✅ done | Cargo workspace, `rust-toolchain.toml`, rustfmt, GitHub Actions CI (fmt + clippy + test) |
+| Workspace + tooling | ✅ done | Cargo workspace, `rust-toolchain.toml`, rustfmt, GitHub Actions CI. Nine jobs, not the three this row used to name: `fmt · clippy · test`, `python sdk`, `js sdk`, `openapi spec`, `dashboard (Next.js)`, `cluster (raft HA)`, `security (cargo audit)`, `radar (eBPF build)`, `cloud apns (feature build)`. The first of those also runs the four script gates listed in the row below. |
 | `crates/core` — money | ✅ done | Integer microdollar type, tested |
 | `crates/core` — pricing | ✅ done | Per-Mtok prices, cache priced separately, overflow-safe, fallback for unknown models |
 | `crates/core` — ledger | ✅ done | Reserve → settle, atomic under concurrency (test proves no oversubscription) |
@@ -188,7 +230,7 @@ comparison in #132.
 | A refused call settles as zero | ✅ done | When a response reports no usage it can price, settlement charges `reservation.amount`, the pre-flight estimate. On a 2xx that is the conservative fallback it was written to be. On a 4xx or 5xx there is no completion at all, so the estimate was a number this gateway invented and then wrote into the run's budget, the unit's monthly cap, the Parquet trace, the FOCUS export and the Cloud aggregates as money somebody was billed; a provider that 429s a run repeatedly would exhaust that run's budget on calls that cost nothing. Fixed on the buffered path (#167) and then on the streaming one (#168). Not a blanket zero: usage a provider **does** report on a refusal is still settled as itself, because a provider that generated part of a response and then failed over it bills for what it generated. |
 | Ingest requires an admin credential | ✅ done | `POST /v1/ingest` accepted any valid org principal, including a read-only key, so a viewer credential could write the evidence that pages a human. Narrowed to an admin credential (#168). All three deployment repos already hand the gateway an admin key (stack-k8s `cloud_admin`, stack-single `CLOUD_ADMIN`, stack-up dev-mode `devkey`), so nothing known broke; a deployment outside those three that used a viewer key now gets a 403, which is why #170 exists. |
 | `CloudSink` reports a refused push | ✅ done | `ship` matched only the transport error `reqwest` returns when a request never gets an answer, and `reqwest` returns `Ok(Response)` for every status it does get, so a 401, 403 or 500 from `/v1/ingest` left no log line, no counter and no metric. A gateway whose cloud key was wrong, rotated or short of the role the endpoint requires was byte for byte a healthy one from both ends while the org's spend never reached the control plane. A refusal now warns **once per distinct status per sink**, repeats drop to debug, and an unreachable control plane deliberately stays at debug because that fault clears itself. Five tests, each checked against a mutant (#170, CLAUDE.md invariant 13). |
-| The repo's own gates | ✅ done | The checks this project claims to run now run. CI executes the gate set it advertised (#149); `scripts/core-deps.sh` had been committed **non-executable**, so it failed with permission denied for everyone who cloned (#148, and the `git update-index --chmod=+x` pitfall is now in CLAUDE.md); the agent-event exporter's two promises (zero-cost when unset, fail-open when set) got tests, and the latent env-var race between them got a mutex rather than a new dev-dependency (#150); first-party actions moved off the Node 20 runtime (#151); the README's test count is computed from `cargo test --all` and gated, after the it-rat.com page said 513 where the workspace ran 709 (#164, invariant 12); CLAUDE.md dropped its status section in favour of enforcement markers and a gate (#146); and wasmtime 43 -> 47.0.3 closed RUSTSEC-2026-0222 in the off-by-default wasm sandbox (#147). |
+| The repo's own gates | ✅ done | Four scripts, each run by CI's `fmt · clippy · test` job and each verified against mutants rather than written green. **`core-deps.sh`** (invariant 1) holds core's dependency list; it had been committed **non-executable**, so it failed with permission denied for everyone who cloned (#148). **`stated-numbers.sh`** (invariant 12) checks every number this repo states about itself, in every file that states it: the README badge and PROGRESS.md's Test status. It began as a badge-only check (#164) and was widened (#173) after the same figure in prose one file over said 100 where the workspace ran 747. **`dto-boundary.sh`** (invariant 3) keeps `tokenfuse-core` types off the Cloud OpenAPI surface, covering the one road the compiler leaves open, `#[schema(value_type = ..)]`, since invariant 1 closes the rest by construction (#174). **`replicated-shape.sh`** (invariant 5) pins the replicated ledger's schema, because a field added there compiles and passes every test while a node with a durable store silently loses its ledger (#177). CI also runs the gates it had only claimed to (#149), first-party actions moved off the Node 20 runtime (#151), and `cargo audit` runs through `audit.sh` so its one ignore re-establishes its own reason every run (invariant 11). |
 
 ## Test status
 

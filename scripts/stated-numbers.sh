@@ -88,7 +88,14 @@ fi
 # Normalise the whitespace before matching, rather than writing a pattern that
 # depends on where a paragraph happens to wrap today.
 
-progress_text=$(tr '\n' ' ' <"$progress")
+# Scoped to the Test status section, not the whole file. The figure lives there,
+# and the rest of PROGRESS.md is prose that may legitimately quote an older
+# count while explaining how it drifted. Reading the whole file made exactly
+# that happen: a paragraph recording that this file once said "100 passing"
+# where the workspace ran 747 was picked up as the current claim, and the gate
+# failed on its own history lesson. A check that a true sentence can break is a
+# check somebody eventually deletes.
+progress_text=$(awk '/^## Test status/{f=1; next} /^## /{f=0} f' "$progress" | tr '\n' ' ')
 
 stated_progress=$(printf '%s' "$progress_text" |
 	grep -oE '\*\*[0-9]+ passing\*\*' | grep -oE '[0-9]+' | head -1)
