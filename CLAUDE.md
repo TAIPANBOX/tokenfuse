@@ -74,6 +74,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/stated-numbers.sh
 ./scripts/dto-boundary.sh
 ./scripts/replicated-shape.sh
+./scripts/honest-claims.sh
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -186,7 +187,32 @@ build)`, `cloud apns (feature build)`.
    hard-guarantee semantics. Budgets are estimate-then-settle, and the system
    fails open by default - docs and READMEs must state these limitations
    plainly, not bury them.
-   *(not enforced)*
+
+   **Two thirds of this has a mechanical form, found by testing the premise
+   rather than repeating that it is judgment.** First, every control in
+   `CATALOG` carries a grade, and that grade is a claim made to whoever reads
+   `/v1/compliance` or runs `tokenfuse compliance`. Moving one up is
+   over-claiming coverage in the most literal sense this invariant has, it is a
+   one-word edit, and nothing else here would notice. The grades are recorded in
+   the script; an upgrade, a downgrade and a new control each fail differently,
+   because they need different answers. Second, a limitation the docs must state
+   plainly can be checked for presence: a sentence that stops being said is how
+   "not buried" fails, and a missing sentence is exactly as checkable as a
+   present one.
+
+   **The remaining third stays judgment, and this was established rather than
+   assumed.** Whether a NEW sentence over-claims cannot be checked by a word
+   list, and the obvious list was tried against this repository on 2026-08-06:
+   `guarantee` appears five times in README.md, and the uses it would flag
+   hardest are the honest ones, "not a hard real-time guarantee" and "not a
+   guarantee that not one extra cent can ever be spent". The honest sentence and
+   the dishonest one share a vocabulary and differ in polarity, which is the part
+   a regex cannot read. A gate that fires on the sentences an invariant exists to
+   protect gets deleted, correctly.
+   *(gate: `scripts/honest-claims.sh`; verified against six mutants: a control
+   upgraded, a control downgraded, a control added, each of the two required
+   disclosures removed from the README, and a catalog whose shape this script can
+   no longer parse, which fails as unverified rather than passing)*
 5. **Don't thread new dimensions through `LedgerBackend`/raft casually.** The
    ledger's replicated state (`crates/gateway/src/ledger_backend.rs`,
    `crates/cluster`) is the thing that has to stay linearizable across nodes;

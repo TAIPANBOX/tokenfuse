@@ -59,6 +59,14 @@ jobs:
       - name: the replicated ledger keeps its recorded shape
         run: ./scripts/replicated-shape.sh
 
+      # Invariant 4's two halves that have a mechanical form: a control's grade
+      # in the compliance catalog is a claim made to a regulator, and moving one
+      # up is a one-word edit nothing else would notice; and the limitations the
+      # docs must state plainly can be checked for presence, since a missing
+      # sentence is as checkable as a present one.
+      - name: claims about coverage stay recorded
+        run: ./scripts/honest-claims.sh
+
       # The gates above parse text with regular expressions, which does not
       # break loudly: it stops matching and reports success. This breaks each
       # of them on purpose and requires the failure, so a gate that has quietly
