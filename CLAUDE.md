@@ -74,7 +74,23 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/stated-numbers.sh
 ./scripts/dto-boundary.sh
 ./scripts/replicated-shape.sh
+./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
+
+`gates-have-teeth.sh` is the odd one out and is listed last on purpose. The
+four gates above it all parse text with regular expressions, and that kind of
+parser does not break loudly: it stops matching and reports success. Three of
+the four broke exactly that way while being written, each time caught only
+because a mutant was supposed to fail and did not. So the mutants stopped being
+prose in commit messages and became a harness: it breaks each gate on purpose,
+requires the failure, and for the diagnosis cases requires the failure to SAY
+the right thing, since "it failed" and "it failed for this reason" are different
+claims. It also asserts one gate must NOT fire, because an overeager check gets
+deleted as fast as a toothless one.
+
+It mutates tracked files and restores them with `git checkout`, so it refuses to
+start on a dirty tree and cannot tell your edits from its own. That makes it the
+gate you run after committing rather than before, and CI is its real home.
 
 The `--features cluster` line is the raft-backed ledger test; copy that exact
 invocation, it is what `.github/workflows/ci.yml` runs. It is named here rather
