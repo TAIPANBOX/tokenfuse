@@ -521,6 +521,54 @@ build)`, `cloud apns (feature build)`.
    independently. A test whose expectation comes from the thing under test
    cannot fail, and it looks exactly like a test that has nothing to catch)*
 
+15. **Under strict, identity comes from the credential and never from a
+   header.** `crates/gateway/src/clientkeys.rs` exists because anything a
+   caller can choose, a caller can change: a cap keyed on `x-fuse-agent-id` is
+   bypassed by sending a different one, and somebody else's can be burned on
+   purpose. `IdentityMap::resolve` then ran the binding check only for a
+   `key_id` with an explicit `keys[]` entry, and every OTHER authenticated
+   caller fell through to prefix matching on exactly that header.
+
+   So a real credential the map did not bind had two ways past a unit's
+   monthly cap, and `TOKENFUSE_IDENTITY_STRICT` closed neither, because it
+   governs the binding check and this path never reached one. An agent id
+   matching no prefix resolved to no unit, which makes `unit_reservation`
+   `None` in the proxy and skips the cap entirely. One matching a different
+   unit's prefix charged that unit. Both were silent: startup warned about the
+   opposite mismatch (a map `key_id` with no client key) and not this one, and
+   the docs described the prefixes as the fallback "for unkeyed traffic",
+   which was true of the case they had in mind and not of this one.
+
+   Strict now refuses both, and refusing the SECOND is the decision worth
+   recording. Attributing it would have been defensible (a unit did resolve),
+   and it is wrong for this invariant's reason: the only thing connecting that
+   caller to that unit is a string it wrote. A credential the map DOES bind is
+   unaffected in both directions, because the prefixes are never consulted for
+   it.
+
+   Two boundaries keep this from breaking deployments, and both are
+   load-bearing. `off`, the default, is byte-identical: the resolved unit is
+   unchanged in every case and `off` never consults the mismatch, so the only
+   mode that behaves differently is one an operator asked for. And a map that
+   is not configured reports nothing, because `main.rs` parses
+   `TOKENFUSE_IDENTITY_STRICT` and `TOKENFUSE_IDENTITY_MAP` independently:
+   strict without a map is a live configuration, it has always been a no-op,
+   and without that guard enforce would answer 403 to every authenticated
+   call on upgrade.
+   *(test: `the_monthly_cap_cannot_be_skipped_by_choosing_an_agent_id`,
+   `strict_refuses_an_authenticated_key_the_map_does_not_bind`,
+   `strict_refuses_an_unbound_key_that_points_at_another_units_prefix`,
+   `strict_still_allows_a_bound_key_and_bills_its_own_unit`,
+   `an_unmapped_key_is_unchanged_when_strict_is_off` and
+   `warn_reports_an_unbound_key_without_refusing_it` in `gateway::proxy`, plus
+   four in `gateway::identitymap` including
+   `a_bound_key_is_never_diverted_by_a_prefix_for_another_unit` and the
+   disabled-map guard inside
+   `the_default_map_is_disabled_and_resolves_nothing`. Each of the six failing
+   ones was run against the unfixed code first. Two OLD tests asserted the
+   defect as expected behaviour and were changed, which is recorded in their
+   bodies rather than left to be noticed in a diff)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
