@@ -24,6 +24,7 @@ pub mod mcpexposure_probe;
 pub mod obs;
 pub mod otel;
 pub mod outcomescli;
+pub mod policyplane;
 pub mod pricebook;
 pub mod provider;
 pub mod proxy;
@@ -62,6 +63,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runs", get(obs::list_runs))
         .route("/v1/runs/{id}/kill", post(obs::kill_run))
         .route("/v1/keys", get(keysreport::list_keys))
+        .route("/v1/policy-plane", get(policyplane::policy_plane))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }

@@ -85,6 +85,26 @@ fn state(wardryx: Wardryx) -> AppState {
     .with_wardryx(Arc::new(wardryx))
 }
 
+/// The same state, but keeping the caller's own handle on the hook so a test
+/// can read what the PDP answered afterwards (`Wardryx::verdicts`).
+fn state_sharing(wardryx: Arc<Wardryx>) -> AppState {
+    let prices = PriceBook::new().with(
+        "test-model",
+        ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
+    );
+    AppState::new(
+        Arc::new(Ledger::new()),
+        Arc::new(prices),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(StubProvider::default()),
+        "wardryx-test-policy",
+    )
+    .with_wardryx(wardryx)
+}
+
 fn body() -> String {
     r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#
         .to_string()
@@ -612,4 +632,75 @@ async fn shadow_without_an_agent_id_still_observes_and_never_blocks() {
         1,
         "shadow mode observes; refusing here would make it act, which is the one thing it must not do"
     );
+}
+
+// -- what the PDP actually answered (GET /v1/policy-plane) -------------------
+//
+// `src/policyplane.rs` decides what a set of verdicts MEANS, and its unit tests
+// cover that. These two cover the wiring underneath it, which no unit test can
+// see: that a decision off the wire is recorded, and that a failmode fallback
+// is not. Without them `decide` could stop counting altogether and every other
+// test in this repository would still pass, which is precisely the shape of
+// fault the endpoint exists to catch.
+
+/// A real deny from a real PDP is the evidence a deployment check needs, and
+/// it has to arrive by itself: an allow this gateway never received must not
+/// appear beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verdict_off_the_wire_is_recorded_as_one() {
+    let stub = WardryxStub::new(json!({ "decision": "deny", "reason": "policy says no" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let hook = Arc::new(Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        // No cache: a second call must reach the PDP, not a stored copy.
+        Duration::from_millis(0),
+    ));
+    let app = tokenfuse_gateway::app(state_sharing(hook.clone()));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let v = hook.verdicts();
+    assert_eq!(v.deny, 1, "the deny the PDP returned");
+    assert_eq!(v.allow, 0, "and nothing else");
+    assert_eq!(v.unreachable_fallbacks, 0);
+    assert!(
+        v.last_deny_millis > 0,
+        "a verdict with no timestamp cannot answer a question about a window"
+    );
+}
+
+/// The fault this endpoint exists for, end to end: `failmode=open` turns an
+/// unreachable PDP into an allow, the call proceeds, and the deployment looks
+/// exactly like a governed one. It must not COUNT as a verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_pdp_never_counts_as_an_allow() {
+    let hook = Arc::new(Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        // Port 1: nothing is listening, so every decide call fails transport.
+        "http://127.0.0.1:1",
+        None,
+        Duration::from_millis(50),
+        Duration::from_millis(0),
+    ));
+    let app = tokenfuse_gateway::app(state_sharing(hook.clone()));
+
+    let resp = app.oneshot(request(&body())).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "fail-open is the configured behaviour and is unchanged by this test"
+    );
+
+    let v = hook.verdicts();
+    assert_eq!(v.allow, 0, "the gateway allowed it; the PDP did not");
+    assert_eq!(v.deny, 0);
+    assert_eq!(v.unreachable_fallbacks, 1);
 }
