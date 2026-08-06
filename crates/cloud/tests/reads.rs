@@ -506,6 +506,78 @@ async fn compliance_reports_decision_and_incident_evidence() {
     assert_eq!(poison["evidence_seen"], false);
 }
 
+/// `/v1/compliance` publishes exactly the fields its OpenAPI schema declares,
+/// at both levels of the document, and nothing else.
+///
+/// The two `*Schema` types here were documentation-only mirrors: the handler
+/// serialised `tokenfuse_core::compliance::ComplianceReport` while the schema
+/// named cloud-local structs that nothing ever built. They agreed for exactly
+/// as long as somebody kept them agreeing by hand, and a field added to either
+/// core struct appeared in this response and in no schema.
+///
+/// Verified the way that claim deserves: with a field added to core's
+/// `ControlEvidence`, this test fails against the old handler and passes
+/// against the converted one, because a DTO cannot carry a field it does not
+/// declare.
+#[tokio::test]
+async fn the_compliance_response_carries_exactly_the_fields_the_schema_declares() {
+    let (state, _) = test_state();
+
+    let (status, v) = get(&state, "/v1/compliance", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut top: Vec<&str> = v
+        .as_object()
+        .expect("the report is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort_unstable();
+    assert_eq!(
+        top,
+        [
+            "controls",
+            "decisions_total",
+            "findings_total",
+            "framework_versions",
+            "generated_note",
+        ],
+        "the report body and ComplianceReportSchema have to name the same fields"
+    );
+
+    let controls = v["controls"].as_array().expect("controls array");
+    assert!(!controls.is_empty(), "the catalog is never empty");
+    let mut control: Vec<&str> = controls[0]
+        .as_object()
+        .expect("a control is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    control.sort_unstable();
+    assert_eq!(
+        control,
+        [
+            "control_id",
+            "covered",
+            "decision_counts",
+            "enforcement",
+            "evidence_seen",
+            "finding_counts",
+            "incident_count",
+            "title",
+        ],
+        "a control body and ControlEvidenceSchema have to name the same fields"
+    );
+
+    // The classification is the lowercase wire form core produced, not the
+    // Rust variant name: the conversion must not quietly restyle it.
+    let enforcement = controls[0]["enforcement"].as_str().unwrap();
+    assert!(
+        matches!(enforcement, "enforced" | "partial" | "documented"),
+        "enforcement was {enforcement}"
+    );
+}
+
 #[tokio::test]
 async fn compliance_requires_a_valid_key() {
     let (state, _) = test_state();

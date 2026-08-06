@@ -5,7 +5,7 @@
 //! (A6), which is the single source of truth any generated client is built
 //! from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenfuse_core::audit::AuditEntry;
 use tokenfuse_core::compliance::{
-    compute_compliance_from_counts, ControlEvidence, Enforcement, CATALOG, DISCLAIMER,
+    compute_compliance_from_counts, ComplianceReport, ControlEvidence, Enforcement, CATALOG,
+    DISCLAIMER,
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -541,19 +542,20 @@ impl From<&AuditEntry> for AuditEntrySchema {
 /// control's realized evidence. The `/v1/compliance` handler returns the core
 /// type, which serializes identically; the schema lives here (not deriving
 /// `ToSchema` in core) to keep `tokenfuse-core` free of the `utoipa` dependency.
-#[derive(ToSchema)]
-#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
 struct ControlEvidenceSchema {
     control_id: String,
     title: String,
     /// Honesty classification, serialized lowercase (`enforced`/`partial`/
     /// `documented`).
-    #[schema(value_type = String, example = "enforced")]
+    #[schema(example = "enforced")]
     enforcement: String,
-    /// Watched wire `decision` -> times it fired.
-    decision_counts: HashMap<String, u64>,
-    /// Watched finding `kind` -> times it appeared.
-    finding_counts: HashMap<String, u64>,
+    /// Watched wire `decision` -> times it fired. `BTreeMap`, not `HashMap`:
+    /// core produces one, so this keeps the key order the body has always had.
+    decision_counts: BTreeMap<String, u64>,
+    /// Watched finding `kind` -> times it appeared. `BTreeMap` for the same
+    /// reason.
+    finding_counts: BTreeMap<String, u64>,
     /// Cloud incidents aggregating into this control.
     incident_count: u64,
     covered: bool,
@@ -564,8 +566,7 @@ struct ControlEvidenceSchema {
 /// evidence pack returned by `/v1/compliance`. Mirrors the core shape exactly
 /// (the handler returns the core type). `framework_versions` is a list of
 /// `[framework_id, human_name, version_or_retrieval_date]` triples.
-#[derive(ToSchema)]
-#[allow(dead_code)]
+#[derive(Serialize, ToSchema)]
 struct ComplianceReportSchema {
     /// Standing disclaimer — this is evidence, not a certification.
     generated_note: String,
@@ -576,6 +577,49 @@ struct ComplianceReportSchema {
     controls: Vec<ControlEvidenceSchema>,
     decisions_total: u64,
     findings_total: u64,
+}
+
+impl From<&ControlEvidence> for ControlEvidenceSchema {
+    fn from(c: &ControlEvidence) -> Self {
+        Self {
+            control_id: c.control_id.to_string(),
+            title: c.title.to_string(),
+            // Matched rather than formatted, so a variant added to core's
+            // `Enforcement` fails to compile here and somebody decides what
+            // this API should call it. The strings are core's own wire form
+            // (`#[serde(rename_all = "lowercase")]`), unchanged.
+            enforcement: match c.enforcement {
+                Enforcement::Enforced => "enforced",
+                Enforcement::Partial => "partial",
+                Enforcement::Documented => "documented",
+            }
+            .to_string(),
+            decision_counts: c.decision_counts.clone(),
+            finding_counts: c.finding_counts.clone(),
+            incident_count: c.incident_count,
+            covered: c.covered,
+            evidence_seen: c.evidence_seen,
+        }
+    }
+}
+
+impl From<&ComplianceReport> for ComplianceReportSchema {
+    fn from(r: &ComplianceReport) -> Self {
+        Self {
+            generated_note: r.generated_note.to_string(),
+            // A 3-tuple and a 3-element Vec serialize to the same JSON array.
+            framework_versions: r
+                .framework_versions
+                .iter()
+                .map(|(id, name, version)| {
+                    vec![id.to_string(), name.to_string(), version.to_string()]
+                })
+                .collect(),
+            controls: r.controls.iter().map(Into::into).collect(),
+            decisions_total: r.decisions_total,
+            findings_total: r.findings_total,
+        }
+    }
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -1225,7 +1269,7 @@ async fn compliance(State(st): State<AppState>, headers: HeaderMap) -> Response 
         &std::collections::BTreeMap::new(),
         &st.store.incident_kind_counts(&org),
     );
-    (StatusCode::OK, Json(report)).into_response()
+    (StatusCode::OK, Json(ComplianceReportSchema::from(&report))).into_response()
 }
 
 /// Honesty classification for one control in the regulator evidence pack
