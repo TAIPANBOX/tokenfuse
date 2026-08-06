@@ -100,7 +100,13 @@ build)`, `cloud apns (feature build)`.
    belong in `crates/gateway` or `crates/cloud`, which sit on the I/O
    boundary. Core is money, pricing, ledger, policy - it has to stay provable
    and portable.
-   *(gate: `scripts/core-deps.sh`)*
+   *(gate: `scripts/core-deps.sh`; verified against four mutants: a dependency
+   added, a dependency removed, and two that establish nothing rather than
+   finding something, `cargo` absent from PATH and a metadata format this script
+   can no longer read. The last pair has its own exit path because an empty read
+   used to fail as five lines claiming serde and sha2 had vanished from a
+   manifest that still lists them, which sends the reader to the wrong file and
+   gets a check relaxed by whoever is unblocking CI)*
 2. **Enforcement hot path: byte-identical output across refactors.** The
    golden regression test is
    `breaker_error_response_matches_budget_error_byte_for_byte` in
