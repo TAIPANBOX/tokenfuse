@@ -3,7 +3,35 @@
 A living log of *where the code is*, so anyone (or a future session) can pick up
 mid-stream. Planning docs live in [`docs/`](docs/); this file tracks implementation.
 
-**Last updated:** 2026-08-06, covering #171-#177. One theme, and it is the same
+**Last updated:** 2026-08-06, covering #178-#180. Three commits about the
+checks themselves, and the shape they share is that a check can fail without
+having established anything.
+
+**Two gates were wrong in ways that read as findings** (#178, #179).
+`stated-numbers.sh` matched its pattern across the whole of this file and took
+the first hit, so a new paragraph recording that PROGRESS.md once said "100
+passing" was read as the current claim, and the gate failed on its own history
+lesson. Scoped to the Test status section, where the claim lives, because a
+check a true sentence can break is a check somebody eventually deletes.
+`core-deps.sh` could not pass an empty read, which sounded safe and was not: it
+failed with five lines saying serde, sha2 and the rest had been removed from a
+manifest that still lists all five, plus advice about putting new dependencies
+in the gateway. Every word pointed at `Cargo.toml`, where nothing was wrong. An
+unreadable manifest now has its own exit path, distinct from a finding, and the
+distinction it draws is where it sends the reader.
+
+**The mutants stopped being prose** (#180). Four gates hold four invariants and
+every one parses text with regular expressions, which does not break loudly: it
+stops matching and reports success. Three of the four broke exactly that way
+while being written, each caught only because a mutant was supposed to fail and
+did not. Those mutants lived in commit messages and in CLAUDE.md's
+`*(gate: ...)*` markers, a record of what was true once, and nothing ran them
+again. `scripts/gates-have-teeth.sh` now runs nine of them in CI: eight require
+a gate to fail on the fault it exists to catch, one requires a gate NOT to fail
+on what it must not catch, and three require the failure to say the right thing,
+since "it failed" and "it failed for this reason" are different claims. It was
+checked against itself, because a checker of checkers can also be toothless;
+earlier 2026-08-06, covering #171-#177. One theme, and it is the same
 one #134-#170 ended on: statements that were true when written and had quietly
 stopped being, plus the mechanisms that now hold them instead of attention.
 
@@ -157,7 +185,7 @@ comparison in #132.
 
 | Component | State | Notes |
 |---|---|---|
-| Workspace + tooling | ✅ done | Cargo workspace, `rust-toolchain.toml`, rustfmt, GitHub Actions CI. Nine jobs, not the three this row used to name: `fmt · clippy · test`, `python sdk`, `js sdk`, `openapi spec`, `dashboard (Next.js)`, `cluster (raft HA)`, `security (cargo audit)`, `radar (eBPF build)`, `cloud apns (feature build)`. The first of those also runs the four script gates listed in the row below. |
+| Workspace + tooling | ✅ done | Cargo workspace, `rust-toolchain.toml`, rustfmt, GitHub Actions CI. Nine jobs, not the three this row used to name: `fmt · clippy · test`, `python sdk`, `js sdk`, `openapi spec`, `dashboard (Next.js)`, `cluster (raft HA)`, `security (cargo audit)`, `radar (eBPF build)`, `cloud apns (feature build)`. The first of those also runs the five script gates listed in the row below. |
 | `crates/core` — money | ✅ done | Integer microdollar type, tested |
 | `crates/core` — pricing | ✅ done | Per-Mtok prices, cache priced separately, overflow-safe, fallback for unknown models |
 | `crates/core` — ledger | ✅ done | Reserve → settle, atomic under concurrency (test proves no oversubscription) |
@@ -230,7 +258,7 @@ comparison in #132.
 | A refused call settles as zero | ✅ done | When a response reports no usage it can price, settlement charges `reservation.amount`, the pre-flight estimate. On a 2xx that is the conservative fallback it was written to be. On a 4xx or 5xx there is no completion at all, so the estimate was a number this gateway invented and then wrote into the run's budget, the unit's monthly cap, the Parquet trace, the FOCUS export and the Cloud aggregates as money somebody was billed; a provider that 429s a run repeatedly would exhaust that run's budget on calls that cost nothing. Fixed on the buffered path (#167) and then on the streaming one (#168). Not a blanket zero: usage a provider **does** report on a refusal is still settled as itself, because a provider that generated part of a response and then failed over it bills for what it generated. |
 | Ingest requires an admin credential | ✅ done | `POST /v1/ingest` accepted any valid org principal, including a read-only key, so a viewer credential could write the evidence that pages a human. Narrowed to an admin credential (#168). All three deployment repos already hand the gateway an admin key (stack-k8s `cloud_admin`, stack-single `CLOUD_ADMIN`, stack-up dev-mode `devkey`), so nothing known broke; a deployment outside those three that used a viewer key now gets a 403, which is why #170 exists. |
 | `CloudSink` reports a refused push | ✅ done | `ship` matched only the transport error `reqwest` returns when a request never gets an answer, and `reqwest` returns `Ok(Response)` for every status it does get, so a 401, 403 or 500 from `/v1/ingest` left no log line, no counter and no metric. A gateway whose cloud key was wrong, rotated or short of the role the endpoint requires was byte for byte a healthy one from both ends while the org's spend never reached the control plane. A refusal now warns **once per distinct status per sink**, repeats drop to debug, and an unreachable control plane deliberately stays at debug because that fault clears itself. Five tests, each checked against a mutant (#170, CLAUDE.md invariant 13). |
-| The repo's own gates | ✅ done | Four scripts, each run by CI's `fmt · clippy · test` job and each verified against mutants rather than written green. **`core-deps.sh`** (invariant 1) holds core's dependency list; it had been committed **non-executable**, so it failed with permission denied for everyone who cloned (#148). **`stated-numbers.sh`** (invariant 12) checks every number this repo states about itself, in every file that states it: the README badge and PROGRESS.md's Test status. It began as a badge-only check (#164) and was widened (#173) after the same figure in prose one file over said 100 where the workspace ran 747. **`dto-boundary.sh`** (invariant 3) keeps `tokenfuse-core` types off the Cloud OpenAPI surface, covering the one road the compiler leaves open, `#[schema(value_type = ..)]`, since invariant 1 closes the rest by construction (#174). **`replicated-shape.sh`** (invariant 5) pins the replicated ledger's schema, because a field added there compiles and passes every test while a node with a durable store silently loses its ledger (#177). CI also runs the gates it had only claimed to (#149), first-party actions moved off the Node 20 runtime (#151), and `cargo audit` runs through `audit.sh` so its one ignore re-establishes its own reason every run (invariant 11). |
+| The repo's own gates | ✅ done | Five scripts, each run by CI's `fmt · clippy · test` job and each verified against mutants rather than written green. **`core-deps.sh`** (invariant 1) holds core's dependency list; it had been committed **non-executable**, so it failed with permission denied for everyone who cloned (#148), and an unreadable manifest used to fail as five lines claiming serde and sha2 had vanished from a file that still lists them, so an empty read now has its own exit path (#179). **`stated-numbers.sh`** (invariant 12) checks every number this repo states about itself, in every file that states it: it began as a badge-only check (#164), widened after the same figure in prose one file over said 100 where the workspace ran 747 (#173), and was scoped to the Test status section after it failed on a paragraph recording that very drift (#178). **`dto-boundary.sh`** (invariant 3) keeps `tokenfuse-core` types off the Cloud OpenAPI surface, covering the one road the compiler leaves open, `#[schema(value_type = ..)]`, since invariant 1 closes the rest by construction (#174). **`replicated-shape.sh`** (invariant 5) pins the replicated ledger's schema, because a field added there compiles and passes every test while a node with a durable store silently loses its ledger (#177). **`gates-have-teeth.sh`** breaks the other four on purpose and requires the failure, since a regex parser stops matching and reports success rather than breaking loudly, and three of the four did exactly that while being written (#180). It mutates tracked files, so it refuses a dirty tree, restores from a trap, and asserts the tree is clean before reporting success. CI also runs the gates it had only claimed to (#149), first-party actions moved off the Node 20 runtime (#151), and `cargo audit` runs through `audit.sh` so its one ignore re-establishes its own reason every run (invariant 11). |
 
 ## Test status
 
