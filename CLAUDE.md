@@ -375,10 +375,19 @@ build)`, `cloud apns (feature build)`.
    that is deliberately weaker: the parts must SUM to the measured total, which
    catches a breakdown drifting out of step and not two compensating errors. The
    limit is written in the script rather than left to be discovered.
+
+   The PROGRESS.md half reads only the **Test status** section, not the whole
+   file, and that is not tidiness. The rest of that file is prose which
+   legitimately quotes older counts while explaining how they drifted, and
+   reading everything made this gate fail on a paragraph recording its own
+   history lesson. A check that a true sentence can break is a check somebody
+   eventually deletes.
    *(gate: `scripts/stated-numbers.sh`, which covers README.md and PROGRESS.md;
-   verified against four mutants, each of which fails it and names both figures:
-   the badge off by one, the PROGRESS total off by one, a breakdown that no
-   longer sums, and either figure reworded out of the file entirely)*
+   verified against five mutants: the badge off by one, the PROGRESS total off
+   by one, a breakdown that no longer sums, and either figure reworded out of
+   the file, each of which fails it and names both figures. The fifth pins the
+   scoping in the other direction: an old count quoted in prose outside the Test
+   status section must NOT fail it)*
 
 13. **A failure nobody else reports is made visible, once per distinct kind.**
    `CloudSink::ship` matched only the transport error `reqwest` returns when a
