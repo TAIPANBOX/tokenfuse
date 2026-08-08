@@ -39,6 +39,19 @@ fn resolve_llm_ips() -> HashSet<Ipv4Addr> {
     set
 }
 
+/// Ports a local model server is expected on: Ollama's own, and the two vLLM
+/// defaults.
+///
+/// One list, read by both the loopback filter and `is_llm`, because they had
+/// two and disagreed: the filter admitted 11434 and 8000, `is_llm` also
+/// claimed 8001, and the filter runs first. A local vLLM on 8001 was
+/// therefore dropped before anything could recognise it, and the classifier
+/// branch that named it could never run. Two lists that must agree are one
+/// list.
+fn is_local_model_port(port: u16) -> bool {
+    matches!(port, 11434 | 8000 | 8001)
+}
+
 fn is_llm(ip: Ipv4Addr, port: u16, llm: &HashSet<Ipv4Addr>) -> Option<&'static str> {
     if llm.contains(&ip) {
         Some("LLM provider")
@@ -48,6 +61,37 @@ fn is_llm(ip: Ipv4Addr, port: u16, llm: &HashSet<Ipv4Addr>) -> Option<&'static s
         Some("local vLLM?")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression that motivated `is_local_model_port`: before it, the
+    /// loopback filter and `is_llm` carried separate lists and disagreed on
+    /// 8001. This asserts the property that fixes it rather than the two
+    /// lists' contents: every port `is_llm` calls a local model server must
+    /// survive the loopback filter.
+    #[test]
+    fn every_port_is_llm_calls_local_survives_the_loopback_filter() {
+        let none = HashSet::new();
+        for port in 0..=u16::MAX {
+            if let Some(flag) = is_llm(Ipv4Addr::LOCALHOST, port, &none) {
+                assert!(
+                    is_local_model_port(port),
+                    "is_llm calls port {port} \"{flag}\" but the loopback filter drops it, \
+                     so that branch is unreachable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_loopback_chatter_is_still_dropped() {
+        assert!(!is_local_model_port(22));
+        assert!(!is_local_model_port(5432));
+        assert!(!is_local_model_port(0));
     }
 }
 
@@ -79,7 +123,12 @@ async fn main() -> anyhow::Result<()> {
             if ev.dport == 0 {
                 continue; // ignore name-resolution / non-TCP noise
             }
-            if ip.is_loopback() && ev.dport != 11434 && ev.dport != 8000 {
+            // Every port `is_llm` treats as a local model server has to be
+            // listed here too, or the filter drops the packet before the
+            // classifier ever sees it. 8001 was missing: `is_llm` called it
+            // vLLM and this line threw it away first, so that branch was
+            // unreachable and a local vLLM on 8001 was never reported.
+            if ip.is_loopback() && !is_local_model_port(ev.dport) {
                 continue; // skip local chatter unless a model port
             }
             let comm = String::from_utf8_lossy(&ev.comm)

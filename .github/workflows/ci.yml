@@ -226,6 +226,13 @@ jobs:
       - name: Build radar
         working-directory: crates/radar
         run: cargo build
+      # The userspace crate only: radar-ebpf is `no_std`/`no_main` and has
+      # nothing to run. Added with the first tests this crate ever had; until
+      # 2026-08-08 the job built and stopped, so a test placed here would have
+      # been compiled by nobody and run by nobody while reading as coverage.
+      - name: Test radar (userspace)
+        working-directory: crates/radar
+        run: cargo test -p radar
 
   apns:
     name: cloud apns (feature build)
