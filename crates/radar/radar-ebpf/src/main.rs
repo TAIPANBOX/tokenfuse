@@ -28,20 +28,31 @@ struct SockAddrIn {
 
 const AF_INET: u16 = 2;
 
-/// `try_radar` reads the syscall argument at a fixed byte offset into the
-/// tracepoint context, which is an x86_64 fact and not a portable one: the
-/// layout of `trace_event_raw_sys_enter` is per-architecture, so the same
-/// offset on aarch64 reads a different field and hands the userspace side a
-/// plausible, wrong pointer. Nothing about that failure is loud. The program
-/// loads, the ring buffer fills, and the addresses are rubbish.
-///
-/// So the build refuses rather than the sensor lying. The real fix is CO-RE,
-/// reading the argument through BTF instead of counting bytes, and it exists:
-/// idryx's `connect.c` does exactly that through `trace_event_raw_sys_enter`
-/// out of `vmlinux.h`. Per invariant 21 in CLAUDE.md that is where the sensor
-/// grows, so this crate gets the honest refusal and idryx gets the portable
-/// read.
-#[cfg(not(target_arch = "x86_64"))]
+// `try_radar` reads the syscall argument at a fixed byte offset into the
+// tracepoint context, which is an x86_64 fact and not a portable one: the
+// layout of `trace_event_raw_sys_enter` is per-architecture, so the same offset
+// on aarch64 reads a different field and hands the userspace side a plausible,
+// wrong pointer. Nothing about that failure is loud. The program loads, the ring
+// buffer fills, and the addresses are rubbish.
+//
+// So the build refuses rather than the sensor lying. The real fix is CO-RE,
+// reading the argument through BTF instead of counting bytes, and it exists:
+// idryx's `connect.c` does exactly that through `trace_event_raw_sys_enter` out
+// of `vmlinux.h`. Per invariant 21 in CLAUDE.md that is where the sensor grows,
+// so this crate gets the honest refusal and idryx gets the portable read.
+//
+// THE CONDITION IS `bpf_target_arch`, NOT `target_arch`, and the difference is
+// the whole thing. This crate compiles for `bpfel-unknown-none`, where
+// `target_arch` is "bpf" on every host, so `not(target_arch = "x86_64")` is
+// always true and the first version of this refused to build everywhere,
+// including the machine it was meant to allow. `bpf_target_arch` is what aya
+// passes for the HOST architecture the object will run against:
+// `--cfg=bpf_target_arch="x86_64"` appears verbatim in the build command.
+//
+// A plain comment rather than a doc comment, because a doc comment on a macro
+// invocation documents nothing and warns about it (`unused_doc_comments`),
+// which in this crate's `#![warn(unused)]` is noise on every build.
+#[cfg(not(bpf_target_arch = "x86_64"))]
 compile_error!(
     "radar's tracepoint argument offset is x86_64-specific and would silently \
      read the wrong field here. Use idryx's CO-RE sensor (internal/ebpfcapture) \
