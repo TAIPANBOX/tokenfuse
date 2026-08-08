@@ -718,12 +718,53 @@ build)`, `cloud apns (feature build)`.
    `gateway::mcpbroker`. The first five were run against the unfixed code
    first: `refuse_open_bind` did not exist, so the suite failed to compile)*
 
+21. **Radar reports what it sees; it is not where the sensor grows.** The
+   estate has two implementations of one eBPF sensor: `crates/radar` here, and
+   idryx's `internal/ebpfcapture`, a Go port of this one. Every capability the
+   sensor gains from now on is built in idryx, and radar's job narrows to
+   emitting what it observes into the shared agent-event stream instead of
+   printing a table to a terminal.
+   *(@yurii 2026-08-08, "Idryx основний, radar зводимо до відправника подій")*
+
+   **Three defects found on 2026-08-08 are why the direction is that way and
+   not the other** (@claude, read off both trees). `radar-ebpf` reads the
+   syscall argument at a hard-coded `ctx.read_at::<u64>(24)`, commented "offset
+   24 on x86_64", so it is not CO-RE and reads the wrong bytes anywhere else;
+   the port uses the BTF-typed `trace_event_raw_sys_enter` and is portable.
+   `main.rs`'s loopback filter admits ports 11434 and 8000 but not 8001, while
+   its own `is_llm` lists 8001 as a vLLM port, so that branch is unreachable
+   and a local vLLM on 8001 is never reported. And it drops its own traffic by
+   comparing `comm`, which any process can rename with `prctl`; the port
+   compares PID.
+
+   The structural half matters as much: this file holds twenty invariants and
+   none of them is about radar, the crate has no tests at all, and its CI job
+   runs `cargo build` and stops. The most fragile code in the repository had
+   the least holding it.
+
+   **This does not deprecate radar and does not forbid fixing it.** The three
+   defects above are worth repairing precisely because it ships and runs. The
+   line is between correcting what exists and adding observation that does not.
+   *(not enforced yet, deliberately. It becomes checkable the moment radar
+   emits agent-event NDJSON, when a gate can require the shared envelope and
+   refuse a return to the terminal table. Until then this is prose, which is
+   the weakest form, and the failure mode is quiet: a capability added here
+   compiles, passes CI, and reads as progress)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
 
-**Held by this file alone: invariants 4 and 5.** Invariant 6 is only partly
+**Held by this file alone: invariants 4 and 21.** Invariant 6 is only partly
 held, and invariant 2 is held by one golden test that must never be deleted.
+
+- **Invariant 21** has a known end date as prose: it stops being judgement the
+  moment radar emits the shared envelope, because a shape is checkable and a
+  terminal table is distinguishable from NDJSON by any script. It is recorded
+  here rather than left implicit, because a rule about WHERE work happens
+  breaks silently. Nothing goes red when the next sensor capability lands in
+  this crate instead of idryx: it compiles, its job stays green, and the
+  duplicate work is only visible to somebody who reads both repositories.
 
 - **Invariant 3 came off this list on 2026-08-06**, and how it came off is worth
   keeping. The note here said it was "mechanically checkable: fail if any
