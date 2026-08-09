@@ -76,13 +76,6 @@ jobs:
       - name: the published stack constants match the Rust
         run: ./scripts/constants.sh
 
-      # The gates above parse text with regular expressions, which does not
-      # break loudly: it stops matching and reports success. This breaks each
-      # of them on purpose and requires the failure, so a gate that has quietly
-      # stopped catching anything cannot keep looking like a gate with nothing
-      # to catch. It mutates tracked files and restores them, so it runs last.
-      - name: the gates still fail on the faults they exist to catch
-        run: ./scripts/gates-have-teeth.sh
 
       # A number in a document is a claim with no owner. The it-rat.com page for
       # this service said 513 tests while the workspace ran 709, and nobody
@@ -204,6 +197,22 @@ jobs:
       # directory and does not walk up.
       - name: Audit both lockfiles
         run: ./scripts/audit.sh
+
+      # The gates parse text with regular expressions, which does not break
+      # loudly: a parser stops matching and reports success. This breaks each
+      # of them on purpose and requires the failure.
+      #
+      # It lives in THIS job rather than beside the other gates, and the reason
+      # is cargo-audit: it exercises every gate in scripts/, audit.sh among
+      # them, and that one needs a tool only this job installs. Run anywhere
+      # else it reports three cases UNJUDGEABLE, correctly, because a gate that
+      # cannot run is not a gate that passed. That is how this was found.
+      #
+      # It mutates tracked files and restores them, so it goes last, and it
+      # needs a clean tree and says so plainly, which also reports any earlier
+      # step that starts writing into the checkout.
+      - name: the gates still fail on the faults they exist to catch
+        run: ./scripts/gates-have-teeth.sh
 
   radar:
     name: radar (eBPF build)
