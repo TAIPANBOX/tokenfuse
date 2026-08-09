@@ -76,20 +76,32 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/replicated-shape.sh
 ./scripts/honest-claims.sh
 ./scripts/runnable-quickstart.sh
-./scripts/constants.sh          # builds, unlike the five above; see invariant 14
+./scripts/audit.sh              # invariant 11; needs cargo-audit
+./scripts/constants.sh          # builds, unlike the text gates; see invariant 14
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
+`audit.sh` was missing from this list until 2026-08-09 while CI ran it, which
+is this repository's own recurring fault: a list that covers part of something
+inherits trust for the whole. Somebody following these instructions ran seven
+gates and believed they had run all of them.
+
 `gates-have-teeth.sh` is the odd one out and is listed last on purpose. The
-five gates above it all parse text with regular expressions, and that kind of
-parser does not break loudly: it stops matching and reports success. Three of
-them broke exactly that way while being written, each time caught only
-because a mutant was supposed to fail and did not. So the mutants stopped being
-prose in commit messages and became a harness: it breaks each gate on purpose,
-requires the failure, and for the diagnosis cases requires the failure to SAY
-the right thing, since "it failed" and "it failed for this reason" are different
-claims. It also asserts one gate must NOT fire, because an overeager check gets
-deleted as fast as a toothless one.
+text gates above it all parse with regular expressions, and that kind of parser
+does not break loudly: it stops matching and reports success. Three of them
+broke exactly that way while being written, each time caught only because a
+mutant was supposed to fail and did not. So the mutants stopped being prose in
+commit messages and became a harness: it breaks each gate on purpose, requires
+the failure, and for the diagnosis cases requires the failure to SAY the right
+thing, since "it failed" and "it failed for this reason" are different claims.
+It also asserts two gates must NOT fire, because an overeager check gets deleted
+as fast as a toothless one.
+
+**It asserts a third property, on seven of its 22 cases: a gate whose subject
+has been taken away must say it measured nothing rather than report OK.** A
+check that cannot tell "did not fail" from "did not run" is the most expensive
+mistake this estate makes in its tooling, and it is made in tooling rather than
+in product code because tooling is where a silent pass looks like a result.
 
 It mutates tracked files and restores them with `git checkout`, so it refuses to
 start on a dirty tree and cannot tell your edits from its own. That makes it the
@@ -399,7 +411,12 @@ build)`, `cloud apns (feature build)`.
    copies.
    *(gate: `scripts/audit.sh`; verified by pointing the recorded crate at one
    that IS built, which fails it, and by adding an ignore with no recorded
-   reason, which also fails it)*
+   reason, which also fails it. Both of those were done by hand once, in the
+   session that wrote the script, and nothing re-ran them for three days; they
+   are now cases in `gates-have-teeth.sh`, together with a third the sentence
+   above never claimed, the ignore list deleted entirely, which must fail as a
+   missing single source rather than pass with nothing to check. None of the
+   three reaches `cargo audit`, so they cost no advisory-db fetch.)*
 
 12. **A number this repository states about itself is checked against itself,
    in every file that states it.** A figure on a page has no owner and no clock:
