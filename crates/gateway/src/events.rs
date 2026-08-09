@@ -75,6 +75,20 @@ pub fn log_outcome(event_type: EventType, outcome: EmitOutcome) {
                 "agent-event skipped: no agent_id on the request"
             );
         }
+        EmitOutcome::WrittenNonconformingAgentId {
+            nonconforming_total,
+        } => {
+            // Written, not dropped: the line is on the bus and a consumer
+            // validating the envelope will reject it. Warned so the operator
+            // learns that from us rather than from the consumer's silence.
+            tracing::warn!(
+                event = event_type.as_wire_str(),
+                nonconforming_total,
+                "agent-event written with an agent_id outside the Agent Passport \
+                 grammar (agent://<trust-domain>/<name>); a consumer validating \
+                 the envelope will reject it"
+            );
+        }
         EmitOutcome::WriteError {
             errors_total,
             message,
@@ -239,6 +253,70 @@ mod tests {
     /// skipped and counted, not invented and not fatal. The enabled path is
     /// exercised in the same test so a skip cannot be the exporter simply
     /// being broken.
+    /// An id the envelope rejects is written, counted and reported.
+    ///
+    /// Written on purpose: refusing would empty the log for exactly the
+    /// operator who needs to see the fault, and the line being there is what
+    /// lets a consumer reject it loudly instead of the fault being invisible
+    /// on both sides. This is engram's and verdryx's decision for the same
+    /// problem.
+    #[test]
+    fn a_nonconforming_agent_id_is_written_counted_and_reported() {
+        let _g = env_lock();
+        let dir = temp_dir("nonconforming");
+        let path = dir.join("events.ndjson");
+        std::env::set_var(
+            tokenfuse_core::agent_event::EVENTS_PATH_ENV,
+            path.to_str().unwrap(),
+        );
+        let exp = from_env();
+        std::env::remove_var(tokenfuse_core::agent_event::EVENTS_PATH_ENV);
+
+        match emit_once(&exp, Some("planner")) {
+            EmitOutcome::WrittenNonconformingAgentId {
+                nonconforming_total,
+            } => assert_eq!(nonconforming_total, 1),
+            other => panic!("expected a nonconforming report, got {other:?}"),
+        }
+
+        let written = std::fs::read_to_string(&path).expect("the line is on disk");
+        assert!(
+            written.contains(r#""agent_id":"planner""#),
+            "written unchanged rather than repaired: {written}"
+        );
+        assert_eq!(exp.nonconforming_agent_id_count(), 1);
+        assert_eq!(
+            exp.skipped_count(),
+            0,
+            "a malformed id is not an absent one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The overeager guard. A check that fires on correct input gets deleted by
+    /// whoever is unblocking CI, so the canonical case is pinned beside it.
+    #[test]
+    fn a_canonical_agent_id_is_written_without_a_report() {
+        let _g = env_lock();
+        let dir = temp_dir("conforming");
+        let path = dir.join("events.ndjson");
+        std::env::set_var(
+            tokenfuse_core::agent_event::EVENTS_PATH_ENV,
+            path.to_str().unwrap(),
+        );
+        let exp = from_env();
+        std::env::remove_var(tokenfuse_core::agent_event::EVENTS_PATH_ENV);
+
+        match emit_once(&exp, Some("agent://acme.example/support/tier1-bot")) {
+            EmitOutcome::Written => {}
+            other => panic!("a canonical id must report nothing, got {other:?}"),
+        }
+        assert_eq!(exp.nonconforming_agent_id_count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_missing_agent_id_is_skipped_and_counted_never_invented() {
         let _g = env_lock();

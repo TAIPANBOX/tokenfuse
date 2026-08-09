@@ -966,6 +966,20 @@ fn log_event_outcome(event_type: EventType, outcome: tokenfuse_core::agent_event
                 "agent-event skipped: incident has no attributed agent_id"
             );
         }
+        EmitOutcome::WrittenNonconformingAgentId {
+            nonconforming_total,
+        } => {
+            // Written, not dropped: the line is on the bus and a consumer
+            // validating the envelope will reject it. Warned so the operator
+            // learns that from us rather than from the consumer's silence.
+            tracing::warn!(
+                event = event_type.as_wire_str(),
+                nonconforming_total,
+                "agent-event written with an agent_id outside the Agent Passport \
+                 grammar (agent://<trust-domain>/<name>); a consumer validating \
+                 the envelope will reject it"
+            );
+        }
         EmitOutcome::WriteError {
             errors_total,
             message,

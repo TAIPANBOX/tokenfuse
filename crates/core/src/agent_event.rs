@@ -245,6 +245,37 @@ pub struct AgentEvent {
 /// [`Exporter`], the stream's single serialization point, which stamps it
 /// under the same lock that orders the writes (SPEC.md §6.5). A built event
 /// starts unchained; `Exporter::emit` links it.
+/// SPEC.md §3.1's `agent://<trust-domain>/<name>` grammar and the cap the
+/// envelope puts on it, as the shared schema states them.
+///
+/// A local copy of two values agent-passport owns, which is the shape this
+/// estate is repeatedly bitten by, and **nothing in this repository checks it**.
+///
+/// A test comparing it against the canonical schema was written and removed:
+/// this repository's CI does not check out the sibling, so it would have taken
+/// its own skip path and passed having measured nothing, which is the exact
+/// failure the gates here exist to refuse. Saying that plainly is worth more
+/// than a check that reports green in the only place it runs unattended.
+///
+/// The cross-repo comparison belongs in `estate-gates`, beside C2, which
+/// already holds vendored schema FILES byte-identical and does not yet look at
+/// a rule copied into code. Recorded as G4.2 in its `GAPS.md`.
+pub const AGENT_ID_MAX_LENGTH: usize = 255;
+
+/// Whether `agent_id` is one a consumer validating the envelope accepts.
+///
+/// The same question the shared schema asks, in the same two parts: the grammar
+/// and the length cap. A regex is compiled once, the way `crate::dlp` does it,
+/// because this runs per emitted event.
+pub fn is_canonical_agent_id(agent_id: &str) -> bool {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PATTERN.get_or_init(|| {
+        regex::Regex::new(r"^agent://[a-z0-9.-]+/[a-z0-9._/-]+$")
+            .expect("the agent_id pattern is a literal and compiles")
+    });
+    agent_id.len() <= AGENT_ID_MAX_LENGTH && re.is_match(agent_id)
+}
+
 pub fn build(
     event_type: EventType,
     ts_millis: i64,
@@ -323,6 +354,7 @@ pub struct Exporter {
     sink: Option<std::sync::Mutex<ChainSink>>,
     skipped: std::sync::atomic::AtomicU64,
     write_errors: std::sync::atomic::AtomicU64,
+    nonconforming: std::sync::atomic::AtomicU64,
 }
 
 /// The open file plus the chain state that must advance in lockstep with it
@@ -346,6 +378,16 @@ pub enum EmitOutcome {
     Written,
     /// Skipped: no `agent_id` was available. Carries the running total.
     SkippedNoAgentId { skipped_total: u64 },
+    /// Wrote one NDJSON line whose `agent_id` does not match SPEC.md §3.1's
+    /// grammar, so a consumer validating the envelope will reject it. Carries
+    /// the running total.
+    ///
+    /// A separate variant rather than a field on [`Self::Written`], for the
+    /// reason this crate applies to refusals: a fact somebody may need to act
+    /// on gets a type of its own, and adding a variant makes every existing
+    /// `match` state what it does about this case instead of inheriting the
+    /// healthy branch by accident.
+    WrittenNonconformingAgentId { nonconforming_total: u64 },
     /// The file write failed (fail-open: the request is unaffected). Carries
     /// the running total and a message for the caller to log.
     WriteError { errors_total: u64, message: String },
@@ -359,6 +401,7 @@ impl Exporter {
             sink: None,
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
+            nonconforming: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -389,6 +432,7 @@ impl Exporter {
             })),
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
+            nonconforming: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -449,6 +493,13 @@ impl Exporter {
             return EmitOutcome::SkippedNoAgentId { skipped_total: n };
         };
 
+        // Checked here rather than in `build`: an id the envelope rejects is
+        // still a real event about a real agent, and refusing to build it would
+        // empty the log for exactly the operator who needs to see the fault.
+        // Written, counted, and reported, which is engram's and verdryx's
+        // decision for the same problem.
+        let nonconforming = !is_canonical_agent_id(&event.agent_id);
+
         let mut sink = sink.lock().unwrap();
         event.prev_hash = sink.next.clone();
         let Some(mut line) = to_ndjson_line(&event) else {
@@ -470,6 +521,18 @@ impl Exporter {
                 // chain_hash is prev-hash-independent, so this is the same
                 // value a verifier recomputes from the line on disk.
                 sink.next = chain_hash(&event);
+                if nonconforming {
+                    // Counted only once the line is actually on the bus. A write
+                    // that failed is reported as a WriteError, which is louder,
+                    // and counting it here too would report one fault twice.
+                    let n = self
+                        .nonconforming
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    return EmitOutcome::WrittenNonconformingAgentId {
+                        nonconforming_total: n,
+                    };
+                }
                 EmitOutcome::Written
             }
             Err(e) => {
@@ -487,6 +550,12 @@ impl Exporter {
 
     pub fn skipped_count(&self) -> u64 {
         self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many emitted events carried an `agent_id` the envelope rejects.
+    pub fn nonconforming_agent_id_count(&self) -> u64 {
+        self.nonconforming
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn write_error_count(&self) -> u64 {
@@ -603,6 +672,25 @@ mod tests {
     }
 
     // -- build() / envelope shape -------------------------------------------
+
+    #[test]
+    fn an_id_outside_the_grammar_is_not_canonical() {
+        assert!(is_canonical_agent_id(
+            "agent://acme.example/support/tier1-bot"
+        ));
+        assert!(!is_canonical_agent_id("planner"));
+        assert!(!is_canonical_agent_id("agent://Acme.Example/Support"));
+        assert!(!is_canonical_agent_id("user://acme.example/j.doe"));
+    }
+
+    /// Both halves of the rule, not only the grammar. The cap is the half a
+    /// regex alone would miss.
+    #[test]
+    fn an_over_long_id_matches_the_grammar_and_is_still_not_canonical() {
+        let long = format!("agent://acme.example/{}", "a".repeat(300));
+        assert!(long.len() > AGENT_ID_MAX_LENGTH);
+        assert!(!is_canonical_agent_id(&long));
+    }
 
     #[test]
     fn build_returns_none_without_agent_id() {
