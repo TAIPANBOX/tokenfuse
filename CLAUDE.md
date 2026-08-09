@@ -404,6 +404,22 @@ build)`, `cloud apns (feature build)`.
    under `--all-features --target all`, and an ignore with no recorded crate is
    refused outright rather than trusted.
 
+   **The same script refuses to audit against a dirty advisory database, and
+   that is a different failure worth naming.** `cargo audit` fetches by pulling
+   into `~/.cargo/advisory-db`, and `git pull` never removes an untracked file.
+   It then reads the DIRECTORY rather than git `HEAD`, so a stale file that once
+   landed there is loaded as an advisory forever while every fetch reports
+   success. On 2026-08-09 an upstream rename left the old path behind locally,
+   cargo-audit saw one id twice and refused to load the whole database, and the
+   condition was written up as an upstream outage for hours. It was not:
+   `git grep -l <id> HEAD` returned one path throughout, and `git clean -fd`
+   fixed it in one command. `--ignore` does not help, because the failure is at
+   database LOAD, before any ignore is evaluated.
+   *(gate: `scripts/audit.sh` refuses and NAMES the untracked files before
+   cargo-audit runs, because cargo-audit's own error names an advisory id and
+   sends a reader to the wrong repository. Verified by planting the exact file
+   that caused it.)*
+
    The same script is also the one caller of both audits, because the ignore
    list would otherwise need a second copy inside `crates/cluster`:
    cargo-audit reads `.cargo/audit.toml` from the current directory and does

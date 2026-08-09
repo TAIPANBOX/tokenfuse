@@ -44,6 +44,46 @@ for tool in cargo cargo-audit; do
   }
 done
 
+# THE ADVISORY DATABASE MUST BE CLEAN, AND THIS IS NOT PEDANTRY.
+#
+# `cargo audit` fetches by pulling into ~/.cargo/advisory-db, and `git pull`
+# never removes an UNTRACKED file. It then reads the DIRECTORY rather than git
+# HEAD, so any stale file that ever landed there is loaded as an advisory
+# forever while every subsequent fetch reports success.
+#
+# On 2026-08-09 that cost hours. Upstream renamed an advisory between two
+# crate directories; the old path survived locally as untracked, cargo-audit
+# saw the id twice, and refused to load the ENTIRE database with
+#
+#   error loading advisory database: parse error: duplicate advisory ID
+#
+# Every audit in the estate was red, `--ignore` did not help (the failure is at
+# database LOAD, before any ignore is evaluated), and the finding was written up
+# as an upstream outage. It was not: `git grep -l <id> HEAD -- crates/` returned
+# exactly one path throughout. `git clean -fd` fixed it in one command.
+#
+# The diagnosis is one line and nobody runs it, so it runs here. Naming the
+# files is the whole value: the cargo-audit error names an advisory id, which
+# sends a reader to the wrong repository.
+db="${CARGO_HOME:-$HOME/.cargo}/advisory-db"
+if [ -d "$db/.git" ]; then
+  dirty="$(git -C "$db" status --porcelain 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    echo "FAIL: the advisory database at $db has files git does not track."
+    echo
+    printf '%s\n' "$dirty" | sed 's/^/      /'
+    echo
+    echo "      cargo-audit reads that DIRECTORY, not git HEAD, and \`git pull\`"
+    echo "      never removes an untracked file, so these are loaded as advisories"
+    echo "      on every run and no upstream fix will ever clear them. A duplicate"
+    echo "      id among them makes cargo-audit refuse the whole database, which"
+    echo "      looks exactly like an upstream outage and is not one."
+    echo
+    echo "      Fix it with:  git -C $db clean -fd"
+    exit 1
+  fi
+fi
+
 config=".cargo/audit.toml"
 [ -f "$config" ] || {
   echo "FAIL: $config is missing, so the ignore list has no single source"
