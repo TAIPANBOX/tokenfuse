@@ -674,7 +674,6 @@ mod tests {
     // -- build() / envelope shape -------------------------------------------
 
     #[test]
-    #[test]
     fn an_id_outside_the_grammar_is_not_canonical() {
         assert!(is_canonical_agent_id(
             "agent://acme.example/support/tier1-bot"
@@ -693,6 +692,7 @@ mod tests {
         assert!(!is_canonical_agent_id(&long));
     }
 
+    #[test]
     fn build_returns_none_without_agent_id() {
         assert!(build(
             EventType::BreakerTripped,
