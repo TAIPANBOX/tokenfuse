@@ -30,6 +30,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The tools first, by name, because without them this script does not measure
+# a weaker version of the same thing: it dies inside a python subprocess call
+# with a FileNotFoundError, several screens from the cause. An advisory check
+# that cannot run has to say so.
+for tool in cargo cargo-audit; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "FAIL: $tool is not on PATH, so this check measured nothing."
+    echo "      An ignore is a claim that an advisory cannot reach us, and that"
+    echo "      claim is worth nothing unless something re-establishes it."
+    echo "      Install it with: cargo install cargo-audit --locked"
+    exit 1
+  }
+done
+
 config=".cargo/audit.toml"
 [ -f "$config" ] || {
   echo "FAIL: $config is missing, so the ignore list has no single source"

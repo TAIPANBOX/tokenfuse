@@ -28,6 +28,15 @@
 # reporting success. If this script ever leaves residue, its own last check
 # fails and says so.
 #
+#
+# A GATE THAT IS ALREADY FAILING CANNOT BE JUDGED
+#
+# A case expecting a gate to FAIL proves nothing if the gate was failing before
+# the mutation. So every fail-case runs the gate on the UNMUTATED tree first
+# and reports UNJUDGEABLE rather than a pass. Found on 2026-08-09 in it-rat,
+# where one gate was legitimately red and a case against it would have been
+# indistinguishable from a working one.
+#
 # A MUTATION THAT DID NOT APPLY PROVES NOTHING
 #
 # Every edit below asserts it changed the file, and a case whose edit applied
@@ -64,7 +73,17 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 restore() { git checkout -- . 2>/dev/null; }
-trap restore EXIT INT TERM
+baseline_dir="$(mktemp -d)"
+
+# One trap for both, because a second `trap ... EXIT` REPLACES the first
+# rather than adding to it. Writing them separately disarmed `restore` on
+# every interrupt path, which would leave a mutated tree behind on Ctrl-C.
+cleanup() {
+	restore
+	rm -rf "$baseline_dir"
+}
+trap cleanup EXIT INT TERM
+
 
 failures=0
 cases=0
@@ -77,6 +96,36 @@ cases=0
 run_case() {
 	local name="$1" expect="$2" gate="$3" edit="$4" needle="${5:-}"
 	cases=$((cases + 1))
+
+	# A gate that is ALREADY failing cannot be judged: a fail-case against it
+	# passes while proving nothing, which is this harness committing the very
+	# fault it exists to catch. Added estate-wide on 2026-08-09 after it-rat,
+	# where `demo-bundle-current.sh` was red on a clean tree because the
+	# published demo had fallen behind genaryx. Any case written against it
+	# would have gone green having measured nothing.
+	#
+	# The result is cached per GATE rather than per case: the tree is restored
+	# between cases, so a gate's verdict on the clean tree cannot change within
+	# one run, and some of these gates compile or run a whole suite.
+	# `fail_env` is `fail` with the baseline check skipped, for the cases whose
+	# fault IS the command rather than a mutation: running the gate with cargo
+	# off PATH is meant to be red before and after, so a baseline would report
+	# it UNJUDGEABLE and hide a case that works.
+	if [ "$expect" = fail_env ]; then
+		expect=fail
+	elif [ "$expect" = fail ]; then
+		local key base_out
+		key="$baseline_dir/$(printf '%s' "$gate" | cksum | tr -d ' ')"
+		if [ ! -f "$key" ]; then
+			if eval "$gate" >/dev/null 2>&1; then printf 'green' >"$key"; else printf 'red' >"$key"; fi
+		fi
+		base_out="$(cat "$key")"
+		if [ "$base_out" = red ]; then
+			printf 'UNJUDGEABLE  %s\n             the gate is already failing on a clean tree, so a\n             failure after the mutation would prove nothing\n' "$name"
+			failures=$((failures + 1))
+			return
+		fi
+	fi
 
 	if ! python3 -c "$edit"; then
 		printf 'BROKEN  %s\n        its mutation did not apply, so this case proved nothing\n' "$name"
@@ -128,7 +177,7 @@ run_case "core-deps: an allowed dependency removed" fail \
 
 # No mutation: the fault is the environment, so the edit is a no-op that still
 # has to be a real statement for the harness to accept it.
-run_case "core-deps: cargo missing, so it measured nothing" fail \
+run_case "core-deps: cargo missing, so it measured nothing" fail_env \
 	"env PATH=/usr/bin:/bin ./scripts/core-deps.sh" \
 	"pass" \
 	"measured nothing"
