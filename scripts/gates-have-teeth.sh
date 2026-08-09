@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Checks that the gates in `scripts/` still FAIL on the faults they exist to
-# catch, and still PASS on the things they must not catch.
+# catch, still PASS on the things they must not catch, and REFUSE to report
+# success when they measured nothing at all.
 #
 # WHY
 #
-# Four gates hold four invariants, and every one of them parses text with
-# regular expressions. That kind of parser does not break loudly: it stops
-# matching and reports success. Three of the four broke exactly that way while
-# being written, and each time the only reason anybody noticed was that a mutant
-# was supposed to fail and did not.
+# Most of these gates parse text with regular expressions. That kind of parser
+# does not break loudly: it stops matching and reports success. Three of the
+# first four broke exactly that way while being written, and each time the only
+# reason anybody noticed was that a mutant was supposed to fail and did not.
+#
+# (This header said "Four gates hold four invariants" until 2026-08-09, when
+# eight gates held rather more. A count written into prose beside the thing it
+# counts is the same defect invariant 12 exists for, one file in.)
 #
 # So the mutants existed as prose in commit messages and in the `*(gate: ...)*`
 # markers in CLAUDE.md, which is a record of what was true once. Nothing ran
@@ -30,6 +34,23 @@
 # nothing is a failure rather than a pass. That is not hypothetical either: an
 # early mutant here edited zero bytes because the string it looked for was not
 # in the manifest in the form assumed, and reported a clean run.
+#
+# It caught three more on 2026-08-09, all in the cases added that day, and all
+# the same fault: a mutation written with one level of escaping too many, which
+# is invisible until something asserts the file changed. Each of the three had
+# been verified BY HAND against the same gate minutes earlier and worked. The
+# hand version and the harness version differ only in how many layers of quoting
+# sit between the text and python, which is exactly the difference nobody sees.
+#
+# WHAT THE THIRD PROPERTY IS FOR
+#
+# A gate whose subject has been renamed, emptied or deleted must say so. Seven
+# cases below take a subject away: cargo off PATH, a renamed type, a catalog
+# whose shape stopped parsing, a renamed image, the ignore list deleted, the
+# badge deleted, the published artifact deleted. Each must fail as "measured
+# nothing" rather than pass on an empty read. This is the estate's most
+# expensive recurring mistake and it lives in tooling rather than product code,
+# because tooling is where a silent pass looks like a result.
 
 set -uo pipefail
 
@@ -217,6 +238,57 @@ run_case "constants: a wire string changed without regenerating" fail \
 	"./scripts/constants.sh" \
 	"$(py 'edit("crates/core/src/breaker.rs", "BreakerReason::LoopDetected => \"loop_detected\",", "BreakerReason::LoopDetected => \"loop_detected_v2\",")')" \
 	"disagrees with the Rust"
+
+# --- invariant 11: a silenced advisory carries a reason that still holds ----
+#
+# This gate had no case here at all until 2026-08-09, while CLAUDE.md said it
+# was "verified by pointing the recorded crate at one that IS built, which fails
+# it, and by adding an ignore with no recorded reason, which also fails it".
+# Both were true. Both were done by hand once, in the session that wrote it, and
+# nothing had run them since. That is the state this whole harness exists to end,
+# and the gate holding the ignore list is a poor one to leave in it: an ignore
+# that has stopped being justified reports zero for a vulnerability that now
+# reaches production code.
+#
+# None of the three reaches `cargo audit` itself, so they cost no advisory-db
+# fetch. They fail in the reachability check that runs before it.
+
+run_case "audit: an ignore with no reason recorded" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit(".cargo/audit.toml", "RUSTSEC-2026-0235", "RUSTSEC-2026-0235\", \"RUSTSEC-2020-0001")')" \
+	"no reason recorded for it"
+
+# The recorded reason lives in the gate, so this case mutates the gate rather
+# than the tree it reads. Pointing it at a crate that IS compiled is the exact
+# shape of an ignore whose justification has stopped holding.
+run_case "audit: a recorded crate that is actually built" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("scripts/audit.sh", "\"RUSTSEC-2026-0235\": \"rkyv\",", "\"RUSTSEC-2026-0235\": \"serde\",")')" \
+	"IS in the build graph"
+
+run_case "audit: no ignore list left to check" fail \
+	"./scripts/audit.sh" \
+	"$(py 'import os; os.remove(".cargo/audit.toml")')" \
+	"no single source"
+
+# --- two subjects taken away, on gates that had no such case ----------------
+#
+# Both refuse correctly today. Neither had anything asserting it, which is the
+# difference between a property and a property somebody has watched hold.
+
+run_case "stated-numbers: no badge left to compare against" fail \
+	"./scripts/stated-numbers.sh" \
+	"$(py 'import re
+s = open("README.md").read()
+m = re.search(r"!\[[^]]*\]\(https://img.shields.io/badge/tests-\d+-[a-z]+[^)]*\)", s)
+assert m, "no test badge in README.md"
+open("README.md","w").write(s.replace(m.group(0), "", 1))')" \
+	"nothing to compare against"
+
+run_case "constants: the published artifact deleted" fail \
+	"./scripts/constants.sh" \
+	"$(py 'import os; os.remove("contracts/tokenfuse-constants.json")')" \
+	"does not exist"
 
 # --- the harness cleans up after itself ------------------------------------
 
