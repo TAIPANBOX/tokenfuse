@@ -1152,6 +1152,7 @@ impl Store {
         // `budget_threshold`'s budget/spend pair, which the generic
         // `{org, occurrences}` payload has no place for.
         let mut threshold_extra: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut exhausted_extra: HashMap<String, serde_json::Value> = HashMap::new();
         let mut spike_extra: HashMap<String, serde_json::Value> = HashMap::new();
         let mut fanout_extra: HashMap<String, serde_json::Value> = HashMap::new();
         {
@@ -1479,6 +1480,42 @@ impl Store {
                             agent.clone(),
                             ts,
                         );
+                        // The amounts, for the same reason `budget_threshold`
+                        // carries them: a consumer's whole question is "over by
+                        // how much", and until now this event answered it with
+                        // `{org, occurrences}` and nothing else. Every reader
+                        // either called back for the run or, more often, showed
+                        // a blank. Genaryx's Statistics tab had to read the
+                        // GATEWAY's `breaker_tripped` to fill that column,
+                        // because the Cloud's own exhaustion event did not say.
+                        //
+                        // `budget` is 0 when no central budget was ever set on
+                        // the run: the block came from a gateway-side ceiling
+                        // this plane never saw. The keys are then omitted
+                        // rather than sent as zeros, because "no budget
+                        // recorded here" and "a budget of nothing" are
+                        // different facts and a 0 reads as the second.
+                        let budget = inner
+                            .budgets
+                            .get(org)
+                            .and_then(|b| b.get(&r.run_id))
+                            .copied()
+                            .unwrap_or(0);
+                        if budget > 0 {
+                            let spent = inner
+                                .orgs
+                                .get(org)
+                                .and_then(|runs| runs.get(&r.run_id))
+                                .map(|a| a.spent_microusd)
+                                .unwrap_or(0);
+                            exhausted_extra.insert(
+                                inc.id.clone(),
+                                serde_json::json!({
+                                    "budget_micros": budget,
+                                    "spent_micros": spent,
+                                }),
+                            );
+                        }
                         fired.insert(inc.id.clone(), inc);
                     }
                 }
@@ -1772,6 +1809,7 @@ impl Store {
                 });
                 for extra in [
                     threshold_extra.get(&inc.id),
+                    exhausted_extra.get(&inc.id),
                     spike_extra.get(&inc.id),
                     fanout_extra.get(&inc.id),
                 ]
@@ -5320,6 +5358,96 @@ mod tests {
     /// A tripped `fanout_explosion` incident (which always carries an
     /// `agent_id` — see the detector above) is exported as an agent-event
     /// NDJSON line when an exporter is attached (agent-passport SPEC.md §6).
+    #[test]
+    fn budget_exhausted_carries_the_amounts_when_a_budget_is_known() {
+        let dir =
+            std::env::temp_dir().join(format!("tf-cloud-exhausted-amounts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+        let s = Store::new().with_event_exporter(exporter);
+        let now = 1_000_000;
+
+        // A central budget this plane knows about, then three refusals: the
+        // third raises the incident and exports the event.
+        // WITH an agent: the exporter refuses to fabricate an `agent_id`
+        // (SPEC 6.1) and counts the skip, so a record without one raises the
+        // incident and exports nothing. `block_at` omits it, which is right
+        // for the incident tests above and wrong for an export test.
+        let blk = |ts: i64| CallRecord {
+            run_id: "r1".into(),
+            agent_id: "agent://acme.example/support/bot".into(),
+            decision: "budget_exceeded".into(),
+            cost_microusd: 900_000,
+            ts_millis: ts,
+            ..Default::default()
+        };
+
+        s.set_budget("acme", "r1", 2_000_000);
+        for i in 0..3 {
+            s.ingest_at("acme", &[blk(now + i)], now + i);
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["type"] == "budget_exhausted")
+            .expect("the exhaustion event must be exported");
+
+        assert_eq!(
+            line["data"]["budget_micros"], 2_000_000,
+            "the ceiling it broke, which this event never used to carry"
+        );
+        assert!(
+            line["data"]["spent_micros"].is_i64(),
+            "and what it had spent against it, so a reader can say by how much"
+        );
+        assert_eq!(line["data"]["org"], "acme", "the old fields stay");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run blocked by a ceiling this plane never saw carries NO amounts, not
+    /// zeros. "No budget recorded here" and "a budget of nothing" are different
+    /// facts, and a `0` reads as the second: a reader would compute an
+    /// overspend of the entire spend against a limit that was never set.
+    #[test]
+    fn budget_exhausted_omits_the_amounts_when_no_budget_is_known() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-cloud-exhausted-nobudget-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+        let s = Store::new().with_event_exporter(exporter);
+        let now = 1_000_000;
+
+        let blk = |ts: i64| CallRecord {
+            run_id: "r1".into(),
+            agent_id: "agent://acme.example/support/bot".into(),
+            decision: "budget_exceeded".into(),
+            cost_microusd: 900_000,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            s.ingest_at("acme", &[blk(now + i)], now + i);
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["type"] == "budget_exhausted")
+            .expect("the event still fires");
+        assert!(line["data"]["budget_micros"].is_null());
+        assert!(line["data"]["spent_micros"].is_null());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn fanout_explosion_is_exported_as_an_agent_event() {
         let dir = std::env::temp_dir().join(format!("tf-cloud-events-{}", std::process::id()));
