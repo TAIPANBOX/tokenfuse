@@ -39,8 +39,8 @@ use crate::keys::Principal;
 use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
-    AgentAgg, Alert, CallRecord, Incident, RunAgg, SavingsSummary, SeriesBucket, Store, Summary,
-    UnitAgg,
+    AgentAgg, Alert, CallRecord, Incident, OwnerAgg, RunAgg, SavingsSummary, SeriesBucket, Store,
+    Summary, UnitAgg,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -53,7 +53,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, agents, units, savings, summary, alerts, series, kill, kills, set_budget,
+        ingest, runs, agents, units, owners, savings, summary, alerts, series, kill, kills, set_budget,
         budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
         compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
         register_apns, register_activity,
@@ -63,6 +63,7 @@ use crate::store::{
         RunAgg,
         AgentAgg,
         UnitAgg,
+        OwnerAgg,
         SavingsSummary,
         Summary,
         Alert,
@@ -348,6 +349,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runs", get(runs))
         .route("/v1/agents", get(agents))
         .route("/v1/units", get(units))
+        .route("/v1/owners", get(owners))
         .route("/v1/savings", get(savings))
         .route("/v1/summary", get(summary))
         .route("/v1/alerts", get(alerts))
@@ -731,6 +733,30 @@ async fn units(State(st): State<AppState>, headers: HeaderMap) -> Response {
         return unauthorized();
     };
     (StatusCode::OK, Json(st.store.units(&org))).into_response()
+}
+
+/// The caller org's spend rolled up by the human each run answers to, highest
+/// spend first.
+///
+/// The owner is the root `user://` principal of the delegation chain the
+/// gateway forwards; a run whose chain named nobody rolls up under the literal
+/// `"unassigned"` rather than being dropped. Unlike `/v1/units` there are no
+/// `month_*` columns, and that absence is deliberate: nothing budgets a person,
+/// so a monthly figure here would mirror no enforcement (see `OwnerAgg`).
+#[utoipa::path(
+    get, path = "/v1/owners",
+    responses(
+        (status = 200, description = "aggregated owners, highest spend first; runs whose delegation chain named no human roll up under \"unassigned\"", body = Vec<OwnerAgg>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer" = [])),
+    tag = "reads",
+)]
+async fn owners(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.owners(&org))).into_response()
 }
 
 /// The caller org's FinOps savings: budget-protection blocked (avoided) spend,
