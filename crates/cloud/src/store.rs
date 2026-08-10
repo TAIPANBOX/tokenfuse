@@ -180,6 +180,21 @@ pub struct RunAgg {
     /// pre-identity-map snapshots still load.
     #[serde(default)]
     pub unit: String,
+    /// The human this run is answerable to: the root `user://` principal of
+    /// the delegation chain the gateway forwarded (P3, agent-passport SPEC
+    /// §5). `""` when the chain named no human, which is the ordinary case
+    /// for a run nobody delegated - folded into the literal `"unassigned"`
+    /// bucket by [`Store::owners`], never dropped, for the same reason
+    /// `unit` is (docs/20 section 3: unattributed spend stays VISIBLE).
+    ///
+    /// Derived at ingest rather than stored raw, because the raw
+    /// `on_behalf_of` is a whole chain and an aggregation keyed on it would
+    /// bucket `alice -> planner` apart from `alice -> researcher`, which are
+    /// the same person's spend.
+    ///
+    /// `serde(default)` so pre-owner-fold snapshots still load.
+    #[serde(default)]
+    pub owner: String,
     pub spent_microusd: i64,
     pub calls: u64,
     pub cache_hits: u64,
@@ -272,6 +287,58 @@ pub struct UnitAgg {
     /// Month-to-date call count (every record, blocked included - a block
     /// is a guard firing; only its avoided SPEND is excluded above).
     pub month_calls: u64,
+}
+
+/// The human at the root of a delegation chain, or `None` when it names none.
+///
+/// The wire form is `X-Fuse-On-Behalf-Of`: a comma-separated chain, ROOT FIRST
+/// (agent-passport SPEC §5), e.g. `user://acme/alice,agent://acme/planner`.
+/// The person is the first `user://` element. Scanning for it rather than
+/// taking element zero is deliberate: a chain that begins with an agent is
+/// well-formed (an agent acting on its own), and index-zero logic would then
+/// attribute that run to an agent id in a column of people.
+///
+/// Only the FIRST `user://` counts. A chain naming two humans is a delegation
+/// from one person to another, and the spend answers to the one who started
+/// it, which is the root.
+fn owner_of_chain(on_behalf_of: &str) -> Option<String> {
+    on_behalf_of
+        .split(',')
+        .map(str::trim)
+        .find(|part| part.starts_with("user://"))
+        .filter(|part| part.len() > "user://".len())
+        .map(String::from)
+}
+
+/// Per-owner spend rollup: the same fold as [`AgentAgg`], keyed on the human
+/// the run was answerable to.
+///
+/// Deliberately shaped on [`AgentAgg`] and not on [`UnitAgg`], and the missing
+/// half is the point. `UnitAgg` carries month-to-date columns because unit
+/// budgets are enforced over the UTC calendar month by the gateway's
+/// `unitledger`, so a month figure there mirrors something that actually gates
+/// traffic. Nothing anywhere budgets a PERSON. A `month_spent_microusd` here
+/// would be a number with no enforcement behind it, and this repository's
+/// invariant 4 is precisely about not shipping those.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct OwnerAgg {
+    /// The human, as a `user://` principal; the literal `"unassigned"` for
+    /// runs whose chain named none (see the struct doc - never `""`).
+    pub owner: String,
+    /// Real spend (blocked/avoided-spend rows already excluded upstream).
+    pub spent_microusd: i64,
+    pub calls: u64,
+    /// Distinct runs attributed to this person.
+    pub runs: u64,
+    /// Distinct agents that ran on this person's behalf, which is the number
+    /// an operator actually asks for first: "how much of the fleet is this
+    /// one human running".
+    pub agents: u64,
+    #[serde(rename = "last_seen_millis")]
+    pub last_seen: i64,
+    /// Sum of `tool_calls` across this person's runs (I1,
+    /// docs/21-tool-runs.md), folded the same way as `spent_microusd`.
+    pub tool_calls: u64,
 }
 
 /// Milliseconds per UTC day (for [`month_key`]).
@@ -1208,6 +1275,13 @@ impl Store {
                     if !r.unit.is_empty() {
                         agg.unit = r.unit.clone();
                     }
+                    // Same treatment for the owner, and the same "last
+                    // non-empty wins" rule: a later call on the same run that
+                    // forwarded no chain must not erase the person an earlier
+                    // one named.
+                    if let Some(owner) = owner_of_chain(&r.on_behalf_of) {
+                        agg.owner = owner;
+                    }
                     if r.step > agg.steps {
                         agg.steps = r.step;
                     }
@@ -1937,6 +2011,69 @@ impl Store {
         }
         let mut out: Vec<UnitAgg> = by_unit.into_values().collect();
         out.sort_by_key(|u| std::cmp::Reverse((u.month_spent_microusd, u.spent_microusd)));
+        out
+    }
+
+    /// An org's per-owner spend rollup, highest spend first.
+    ///
+    /// Folds the org's retained [`RunAgg`]s by `owner`, exactly as
+    /// [`Store::agents`] folds by `agent_id`. Same eviction caveat as that
+    /// one: it reads the run map, which `MAX_RUNS_PER_ORG` bounds, so on an
+    /// org past the cap this is "across the retained runs" rather than
+    /// all-time. `OrgTotals` is the exact figure and is org-wide only; there
+    /// is no per-owner exact counter and this fold does not pretend otherwise.
+    ///
+    /// `agents` counts DISTINCT agent ids rather than runs, because "this
+    /// person is running nine agents" and "this person has had nine runs" are
+    /// different facts and the first is the one asked for.
+    pub fn owners(&self, org: &str) -> Vec<OwnerAgg> {
+        let inner = self.inner.read().unwrap();
+        let mut by_owner: HashMap<String, (OwnerAgg, HashSet<String>)> = HashMap::new();
+        if let Some(runs) = inner.orgs.get(org) {
+            for agg in runs.values() {
+                // Unattributed spend keeps a visible bucket under a literal
+                // id, never a blank key: docs/20 section 3's rule for units,
+                // and it applies here for the same reason. A blank row in a
+                // list of people reads as a rendering fault; "unassigned"
+                // reads as the answer it is.
+                let key: &str = if agg.owner.is_empty() {
+                    "unassigned"
+                } else {
+                    &agg.owner
+                };
+                let (o, seen) = by_owner.entry(key.to_string()).or_insert_with(|| {
+                    (
+                        OwnerAgg {
+                            owner: key.to_string(),
+                            ..Default::default()
+                        },
+                        HashSet::new(),
+                    )
+                });
+                // C4 defense-in-depth: the same overflow guard `agents()` and
+                // `units()` use.
+                o.spent_microusd = o.spent_microusd.saturating_add(agg.spent_microusd);
+                o.calls += agg.calls;
+                o.runs += 1;
+                if agg.last_seen > o.last_seen {
+                    o.last_seen = agg.last_seen;
+                }
+                o.tool_calls = o.tool_calls.saturating_add(agg.tool_calls);
+                // An untagged run contributes no agent, rather than an empty
+                // string that would count as one.
+                if !agg.agent_id.is_empty() {
+                    seen.insert(agg.agent_id.clone());
+                }
+            }
+        }
+        let mut out: Vec<OwnerAgg> = by_owner
+            .into_values()
+            .map(|(mut o, seen)| {
+                o.agents = seen.len() as u64;
+                o
+            })
+            .collect();
+        out.sort_by_key(|o| std::cmp::Reverse(o.spent_microusd));
         out
     }
 
@@ -3287,6 +3424,156 @@ mod tests {
     /// (docs/20-identity-map.md section 4) - with the one deliberate
     /// difference the doc calls out: an empty unit rolls up under the
     /// literal `"unassigned"` bucket, not its own blank one.
+    #[test]
+    fn owner_of_chain_takes_the_root_human_and_nothing_else() {
+        // Root-first, the ordinary shape.
+        assert_eq!(
+            owner_of_chain("user://acme/alice,agent://acme/planner").as_deref(),
+            Some("user://acme/alice")
+        );
+        // An agent acting on its own is well-formed and names no person. Index
+        // -zero logic would have put an agent id in a column of humans.
+        assert_eq!(owner_of_chain("agent://acme/planner"), None);
+        // A chain that reaches a human through an agent still answers to the
+        // human.
+        assert_eq!(
+            owner_of_chain("agent://acme/planner,user://acme/alice").as_deref(),
+            Some("user://acme/alice")
+        );
+        // Two humans: the spend answers to the one who started it.
+        assert_eq!(
+            owner_of_chain("user://acme/alice,user://acme/bob").as_deref(),
+            Some("user://acme/alice")
+        );
+        // Whitespace around the separator is the sender's, not a new principal.
+        assert_eq!(
+            owner_of_chain("agent://acme/p, user://acme/alice").as_deref(),
+            Some("user://acme/alice")
+        );
+        // Nothing to attribute.
+        assert_eq!(owner_of_chain(""), None);
+        // A scheme with no principal after it names nobody, and must not
+        // become an owner called "user://".
+        assert_eq!(owner_of_chain("user://"), None);
+    }
+
+    #[test]
+    fn owners_roll_up_by_the_root_human_and_keep_an_unassigned_bucket() {
+        let s = Store::new();
+        let r =
+            |run: &str, agent: &str, chain: &str, decision: &str, cost: i64, ts: i64| CallRecord {
+                run_id: run.into(),
+                agent_id: agent.into(),
+                on_behalf_of: chain.into(),
+                decision: decision.into(),
+                cost_microusd: cost,
+                ts_millis: ts,
+                ..Default::default()
+            };
+        s.ingest(
+            "acme",
+            &[
+                // One person, two agents: the fold is by human, not by agent.
+                r(
+                    "r1",
+                    "planner",
+                    "user://acme/alice,agent://acme/planner",
+                    "allow",
+                    1000,
+                    10,
+                ),
+                r(
+                    "r2",
+                    "coder",
+                    "user://acme/alice,agent://acme/coder",
+                    "allow",
+                    2000,
+                    20,
+                ),
+                // A budget-protection block: its avoided cost is not real
+                // spend and must not reach the person's total.
+                r(
+                    "r3",
+                    "coder",
+                    "user://acme/bob,agent://acme/coder",
+                    "allow",
+                    500,
+                    30,
+                ),
+                r(
+                    "r3",
+                    "coder",
+                    "user://acme/bob,agent://acme/coder",
+                    "budget_exceeded",
+                    999_999,
+                    40,
+                ),
+                // A run nobody delegated: visible bucket, never dropped.
+                r("r4", "cron", "", "allow", 250, 50),
+            ],
+        );
+
+        let owners = s.owners("acme");
+        assert_eq!(owners.len(), 3, "alice, bob, and unassigned");
+
+        assert_eq!(owners[0].owner, "user://acme/alice");
+        assert_eq!(owners[0].spent_microusd, 3000);
+        assert_eq!(owners[0].runs, 2);
+        assert_eq!(
+            owners[0].agents, 2,
+            "distinct agents she is running, not her run count"
+        );
+
+        assert_eq!(owners[1].owner, "user://acme/bob");
+        assert_eq!(
+            owners[1].spent_microusd, 500,
+            "the blocked call's avoided cost is not his spend"
+        );
+        assert_eq!(owners[1].runs, 1);
+
+        let unassigned = owners
+            .iter()
+            .find(|o| o.owner == "unassigned")
+            .expect("a run with no chain keeps a visible bucket");
+        assert_eq!(unassigned.spent_microusd, 250);
+
+        // And the totals reconcile with the by-agent fold, which is the
+        // property that stops two screens of the same estate disagreeing.
+        let by_agent: i64 = s.agents("acme").iter().map(|a| a.spent_microusd).sum();
+        let by_owner: i64 = owners.iter().map(|o| o.spent_microusd).sum();
+        assert_eq!(by_agent, by_owner);
+    }
+
+    /// A later call on the same run that forwards no chain must not erase the
+    /// person an earlier one named. Same "last non-empty wins" rule `agent_id`
+    /// and `unit` follow, and getting it wrong would silently move spend into
+    /// "unassigned" whenever one call in a run lost its header.
+    #[test]
+    fn an_empty_chain_never_clears_an_owner_already_named() {
+        let s = Store::new();
+        let r = |chain: &str, cost: i64, ts: i64| CallRecord {
+            run_id: "r1".into(),
+            agent_id: "planner".into(),
+            on_behalf_of: chain.into(),
+            decision: "allow".into(),
+            cost_microusd: cost,
+            ts_millis: ts,
+            ..Default::default()
+        };
+        s.ingest(
+            "acme",
+            &[
+                r("user://acme/alice,agent://acme/planner", 1000, 10),
+                r("", 500, 20),
+            ],
+        );
+
+        let owners = s.owners("acme");
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].owner, "user://acme/alice");
+        assert_eq!(owners[0].spent_microusd, 1500);
+    }
+
     #[test]
     fn units_roll_up_by_unit_and_unassigned_bucket() {
         let s = Store::new();
