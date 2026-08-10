@@ -92,7 +92,7 @@ flowchart TB
 - **Produces**: priced and enforced upstream calls, agent-event NDJSON, CallRecords to its Cloud control plane, and outcome-tagged Parquet traces.
 - **Talks to**: **Wardryx** (per-request policy), its own **Cloud** control plane, and every downstream consumer (**Idryx**, **Qryx**, **Verdryx**) via the event bus. Configured by **terraform-provider-taipan**; rehearsed against by **Mockryx**.
 
-The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod) and heraldyx (the mail out), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan and driven from Genaryx, the console over all of it. Trailryx, the record plane, is built and not wired into this yet.
+The full stack is TokenFuse (spend), Wardryx (policy), Engram (memory), Idryx (access), Qryx (crypto), Verdryx (quality), Mockryx (pre-prod), heraldyx (the mail out) and scopyx (governed web egress), on the shared Agent Passport + agent-event contract (agent-stack-go / agent-passport), configured via terraform-provider-taipan and driven from Genaryx, the console over all of it. Trailryx, the record plane, is built and not wired into this yet.
 
 Run the whole open stack locally with one command via [**stack-up**](https://github.com/TAIPANBOX/stack-up); the stack's home on the web is [**it-rat.com**](https://it-rat.com).
 
