@@ -775,3 +775,127 @@ async fn runs_names_the_window_it_applied() {
          Cloud that cannot window at all omits this header"
     );
 }
+
+/// `/v1/spend?days=` sums per-DAY buckets, so a week is a week.
+///
+/// # THE FOLD THIS EXISTS BECAUSE OF
+///
+/// Every other spend read in this store is per run over that run's whole life,
+/// so no filter on one can answer a period. `/v1/runs?since_millis=` came
+/// closest and was still wrong: it selects runs by last activity and each
+/// brings its lifetime total, which put a day at $8,151 beside a week at
+/// $15,024 on the console. Yurii read that and said it could not be right.
+///
+/// So the assertion that matters is PROPORTIONALITY: two days of equal spend
+/// must read as twice one of them, and the totals must add up rather than
+/// merely differ.
+#[tokio::test]
+async fn spend_sums_whole_days_and_says_how_many_it_had() {
+    let (state, store) = test_state();
+    let day = 86_400_000i64;
+    // Days relative to the real clock: `Store::ingest` prunes against it, so
+    // synthetic 1970 timestamps would be dropped as past retention before
+    // anything could read them. (That is the retention working, and it cost a
+    // red test to notice.)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let today = now.div_euclid(day);
+    // Three consecutive days, 1000 microusd each, one agent.
+    for d in [today - 2, today - 1, today] {
+        store.ingest(
+            "acme",
+            &[CallRecord {
+                ts_millis: d * day + 3_600_000,
+                run_id: format!("r{d}"),
+                model: "m".into(),
+                decision: "allow".into(),
+                cost_microusd: 1_000,
+                step: 1,
+                agent_id: "agent://acme.local/a/one".into(),
+                ..Default::default()
+            }],
+        );
+    }
+
+    let one = store.spend_window("acme", 1, now);
+    let three = store.spend_window("acme", 3, now);
+
+    assert_eq!(one.spent_microusd, 1_000, "today alone");
+    assert_eq!(
+        three.spent_microusd, 3_000,
+        "three equal days are three times one, which is the whole point of a \
+         per-period fold and is exactly what a per-run fold could not do"
+    );
+    assert_eq!(one.days_covered, 1);
+    assert_eq!(three.days_covered, 3);
+
+    // A period longer than the data must say how much it actually had, not
+    // return a small number that reads as a quiet month.
+    let month = store.spend_window("acme", 30, now);
+    assert_eq!(month.spent_microusd, 3_000);
+    assert_eq!(
+        month.days_covered, 3,
+        "asked for thirty days, held three, and says so"
+    );
+    assert_eq!(month.days_requested, 30);
+
+    // And the same answer over HTTP, per agent.
+    let (status, v) = get(&state, "/v1/spend?days=30", Some("devkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["spent_microusd"], 3_000);
+    assert_eq!(v["days_covered"], 3);
+    assert_eq!(v["agents"][0]["agent_id"], "agent://acme.local/a/one");
+    assert_eq!(v["agents"][0]["spent_microusd"], 3_000);
+}
+
+/// A blocked call is counted and never spent.
+///
+/// The same gate every other fold here applies, asserted separately because a
+/// day bucket that quietly added avoided spend to real spend would inflate
+/// exactly the number an operator reports upward.
+#[tokio::test]
+async fn spend_counts_blocked_calls_without_spending_them() {
+    let (_state, store) = test_state();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    store.ingest(
+        "acme",
+        &[
+            CallRecord {
+                ts_millis: now,
+                run_id: "r1".into(),
+                model: "m".into(),
+                decision: "allow".into(),
+                cost_microusd: 700,
+                step: 1,
+                agent_id: "agent://acme.local/a/one".into(),
+                ..Default::default()
+            },
+            CallRecord {
+                ts_millis: now,
+                run_id: "r2".into(),
+                model: "m".into(),
+                decision: "budget_exceeded".into(),
+                cost_microusd: 9_999,
+                step: 1,
+                agent_id: "agent://acme.local/a/one".into(),
+                ..Default::default()
+            },
+        ],
+    );
+
+    let w = store.spend_window("acme", 1, now);
+    assert_eq!(
+        w.spent_microusd, 700,
+        "the blocked row's estimate is not spend"
+    );
+    assert_eq!(
+        w.calls, 2,
+        "but it IS a call: a guard firing is not idleness"
+    );
+    assert_eq!(w.blocked, 1);
+}

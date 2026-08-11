@@ -391,6 +391,75 @@ struct UnitMonthAcc {
     calls: u64,
 }
 
+/// One UTC day of one agent's spend, the bucket a per-period question is
+/// actually answerable from.
+///
+/// # WHY THIS EXISTS WHEN `RunAgg` ALREADY HOLDS SPEND
+///
+/// `RunAgg` folds per RUN over that run's whole life, so no filter on it can
+/// answer "what did this cost last week". The console tried: it narrowed runs
+/// by last activity and summed their lifetime totals, and the demo showed a day
+/// at $8,151 next to a week at $15,024. Yurii read that in seconds and said it
+/// could not be right, and it could not: a day at $8,151 is $57,000 a week.
+///
+/// A per-period number needs a per-period fold. This is it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct DaySpend {
+    /// Real spend (blocked rows excluded, the same gate every other spend fold
+    /// applies).
+    spent_microusd: i64,
+    /// Calls, blocked included: a block is a guard firing, and hiding it would
+    /// make a well-defended day look idle.
+    calls: u64,
+    blocked: u64,
+}
+
+/// How many UTC days of per-agent spend to keep.
+///
+/// A year plus five weeks, so the console's widest window (1y) is answerable
+/// with slack rather than exactly. Beyond it days are dropped on ingest.
+const SPEND_DAYS_RETAINED: i64 = 400;
+
+/// Hard cap on distinct agents recorded per day, per org.
+///
+/// Overflow folds into the empty-string bucket rather than evicting, the same
+/// rule [`MAX_UNIT_MONTH_KEYS`] applies: an estate that suddenly emits ten
+/// thousand agent ids loses the per-agent split for that day and never loses
+/// the total.
+const MAX_SPEND_AGENTS_PER_DAY: usize = 4_096;
+
+/// One agent's spend over a requested period.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct AgentWindowSpend {
+    /// The empty string is the overflow bucket, never a real agent.
+    pub agent_id: String,
+    pub spent_microusd: i64,
+    pub calls: u64,
+    pub blocked: u64,
+}
+
+/// What `/v1/spend` answers, and what it can honestly claim to cover.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct WindowSpend {
+    /// Days the caller asked for.
+    pub days_requested: i64,
+    /// Days this store actually holds inside that request.
+    ///
+    /// The load-bearing field. A box up for three days cannot answer thirty,
+    /// and returning a smaller number without saying so is how "we spent very
+    /// little last month" gets read off a box that was only switched on last
+    /// week.
+    pub days_covered: i64,
+    /// UTC day index (epoch millis / 86_400_000) of the oldest day counted, or
+    /// `None` when nothing was counted at all.
+    pub from_day: Option<i64>,
+    pub spent_microusd: i64,
+    pub calls: u64,
+    pub blocked: u64,
+    /// Highest spend first.
+    pub agents: Vec<AgentWindowSpend>,
+}
+
 /// Per-org FinOps savings summary (P2). `total_saved_microusd` is the marketing
 /// headline: budget-protection blocked spend plus semantic-cache savings plus
 /// model-router savings.
@@ -854,6 +923,11 @@ struct Inner {
     series: HashMap<String, VecDeque<Sample>>,
     /// org → live FinOps savings accumulator (persisted)
     savings: HashMap<String, SavingsAcc>,
+    /// org → UTC day → agent → that day's spend (persisted). The only fold in
+    /// this store that can answer "what did the last N days cost"; everything
+    /// else is per run and per lifetime. Bounded by [`SPEND_DAYS_RETAINED`]
+    /// days and [`MAX_SPEND_AGENTS_PER_DAY`] agents within each.
+    spend_days: HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     /// org → unit bucket → month-to-date accumulator (persisted). Keyed by
     /// the RESOLVED bucket - the literal "unassigned" for an empty unit,
     /// the same key [`Store::units`] folds unmapped runs under - so the
@@ -923,6 +997,7 @@ struct SnapshotRef<'a> {
     unit_budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
     savings: &'a HashMap<String, SavingsAcc>,
+    spend_days: &'a HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     unit_months: &'a HashMap<String, HashMap<String, UnitMonthAcc>>,
     decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
@@ -954,6 +1029,14 @@ struct SnapshotOwned {
     /// telemetry accumulates. Deliberately NOT backfilled from `orgs`: a
     /// [`RunAgg`] carries no per-month split, and passing lifetime spend
     /// off as a month is exactly the dishonesty this fold exists to fix.
+    /// Missing on snapshots that predate the per-day spend fold - `default`
+    /// loads empty, so `spend_window()` reports `days_covered: 0` until fresh
+    /// telemetry accumulates. Deliberately NOT backfilled from `orgs`, for the
+    /// same reason `unit_months` is not: a [`RunAgg`] carries no per-day split,
+    /// and passing lifetime spend off as a period is exactly the dishonesty
+    /// this fold exists to fix.
+    #[serde(default)]
+    spend_days: HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     #[serde(default)]
     unit_months: HashMap<String, HashMap<String, UnitMonthAcc>>,
     /// Missing on pre-compliance snapshots — `default` loads empty, so
@@ -1169,6 +1252,12 @@ impl Store {
                 let recency = inner.run_recency.entry(org.to_string()).or_default();
                 let break_recency = inner.break_recency.entry(org.to_string()).or_default();
                 let unit_months = inner.unit_months.entry(org.to_string()).or_default();
+                let spend_days = inner.spend_days.entry(org.to_string()).or_default();
+                // Drop days past retention here rather than on read: a read
+                // must not mutate, and an org that stops ingesting should stop
+                // growing rather than keep being trimmed.
+                let oldest_kept = now_ms.div_euclid(DAY_MILLIS) - SPEND_DAYS_RETAINED;
+                spend_days.retain(|day, _| *day >= oldest_kept);
                 let budgets = inner.budgets.get(org);
                 let alert_pct = self.alert_pct;
                 // The month window every record in this batch folds into -
@@ -1327,6 +1416,30 @@ impl Store {
                             // C4: same clamped `cost` and saturating fold as
                             // the run/org totals above.
                             acc.spent_microusd = acc.spent_microusd.saturating_add(cost);
+                        }
+                    }
+
+                    // The per-DAY fold, the only one that can answer a
+                    // per-period question. Same clamped `cost` and the same
+                    // blocked gate as every other spend fold here.
+                    {
+                        let day = r.ts_millis.div_euclid(DAY_MILLIS);
+                        let days = spend_days.entry(day).or_default();
+                        let akey: &str = if days.contains_key(&r.agent_id)
+                            || days.len() < MAX_SPEND_AGENTS_PER_DAY
+                        {
+                            &r.agent_id
+                        } else {
+                            // Overflow keeps the day's TOTAL correct and loses
+                            // only the split, which is the right way round.
+                            ""
+                        };
+                        let d = days.entry(akey.to_string()).or_default();
+                        d.calls += 1;
+                        if is_blocked(&r.decision) {
+                            d.blocked += 1;
+                        } else {
+                            d.spent_microusd = d.spent_microusd.saturating_add(cost);
                         }
                     }
                     // FinOps savings, folded in the same pass. Only the
@@ -1889,6 +2002,70 @@ impl Store {
 
     /// An org's run aggregates (order unspecified; the client sorts). The
     /// `killed` flag is resolved at read time from the kill set.
+    /// Per-agent spend over the last `days` UTC days, ending today.
+    ///
+    /// # THE FOLD THAT ACTUALLY ANSWERS "WHAT DID LAST WEEK COST"
+    ///
+    /// Every other spend read here is per RUN and per lifetime, so no filter on
+    /// it can answer a period. `/v1/runs?since_millis=` came closest and was
+    /// still wrong: it selects runs by last activity and each brings its whole
+    /// life's spend, which put a day at $8,151 beside a week at $15,024 on a
+    /// console screen. This sums day buckets instead, so a week is a week.
+    ///
+    /// # DAYS, NOT ROLLING HOURS, AND THE CALLER MUST SAY SO
+    ///
+    /// The buckets are whole UTC days. `days = 1` is TODAY so far, not the last
+    /// twenty-four hours, and a caller that labels it "24h" is overstating by
+    /// up to a day. Hour buckets over a year would be 8,760 per agent, which is
+    /// the memory this store is not going to spend on a rollup.
+    ///
+    /// `days_covered` is what stops the other half of the misreading: a box up
+    /// for three days cannot answer thirty, and a smaller number returned
+    /// silently reads as a quiet month.
+    pub fn spend_window(&self, org: &str, days: i64, now_millis: i64) -> WindowSpend {
+        let days = days.max(1);
+        let today = now_millis.div_euclid(DAY_MILLIS);
+        let first = today - days + 1;
+        let inner = self.inner.read().unwrap();
+        let mut out = WindowSpend {
+            days_requested: days,
+            ..Default::default()
+        };
+        let mut per_agent: HashMap<&str, AgentWindowSpend> = HashMap::new();
+        let mut counted_days = 0i64;
+        if let Some(by_day) = inner.spend_days.get(org) {
+            for (day, agents) in by_day {
+                if *day < first || *day > today {
+                    continue;
+                }
+                counted_days += 1;
+                out.from_day = Some(match out.from_day {
+                    Some(f) => f.min(*day),
+                    None => *day,
+                });
+                for (agent, d) in agents {
+                    out.spent_microusd = out.spent_microusd.saturating_add(d.spent_microusd);
+                    out.calls += d.calls;
+                    out.blocked += d.blocked;
+                    let e = per_agent.entry(agent.as_str()).or_default();
+                    e.agent_id.clone_from(agent);
+                    e.spent_microusd = e.spent_microusd.saturating_add(d.spent_microusd);
+                    e.calls += d.calls;
+                    e.blocked += d.blocked;
+                }
+            }
+        }
+        out.days_covered = counted_days;
+        let mut agents: Vec<AgentWindowSpend> = per_agent.into_values().collect();
+        agents.sort_by(|a, b| {
+            b.spent_microusd
+                .cmp(&a.spent_microusd)
+                .then_with(|| a.agent_id.cmp(&b.agent_id))
+        });
+        out.agents = agents;
+        out
+    }
+
     pub fn runs(&self, org: &str) -> Vec<RunAgg> {
         self.runs_since(org, None)
     }
@@ -2603,6 +2780,7 @@ impl Store {
                 unit_budgets: &inner.unit_budgets,
                 devices: &inner.devices,
                 savings: &inner.savings,
+                spend_days: &inner.spend_days,
                 unit_months: &inner.unit_months,
                 decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
@@ -2634,6 +2812,7 @@ impl Store {
         inner.unit_budgets = snap.unit_budgets;
         inner.devices = snap.devices;
         inner.savings = snap.savings;
+        inner.spend_days = snap.spend_days;
         inner.unit_months = snap.unit_months;
         inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;

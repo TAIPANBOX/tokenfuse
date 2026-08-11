@@ -39,8 +39,8 @@ use crate::keys::Principal;
 use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
-    AgentAgg, Alert, CallRecord, Incident, OwnerAgg, RunAgg, SavingsSummary, SeriesBucket, Store,
-    Summary, UnitAgg,
+    AgentAgg, AgentWindowSpend, Alert, CallRecord, Incident, OwnerAgg, RunAgg, SavingsSummary,
+    SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -53,7 +53,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, agents, units, owners, savings, summary, alerts, series, kill, kills, set_budget,
+        ingest, runs, spend, agents, units, owners, savings, summary, alerts, series, kill, kills, set_budget,
         budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
         compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
         register_apns, register_activity,
@@ -61,6 +61,8 @@ use crate::store::{
     components(schemas(
         CallRecord,
         RunAgg,
+        WindowSpend,
+        AgentWindowSpend,
         AgentAgg,
         UnitAgg,
         OwnerAgg,
@@ -347,6 +349,7 @@ pub fn app(state: AppState) -> Router {
         .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
+        .route("/v1/spend", get(spend))
         .route("/v1/agents", get(agents))
         .route("/v1/units", get(units))
         .route("/v1/owners", get(owners))
@@ -745,6 +748,57 @@ pub const RUNS_WINDOW_HEADER: &str = "x-fuse-runs-window";
 struct RunsQuery {
     since_millis: Option<i64>,
 }
+
+/// The caller org's spend over the last N UTC days, per agent.
+///
+/// The only read here that answers a PERIOD. `/v1/runs` and `/v1/agents` fold
+/// per run over each run's whole life, so no filter on them can say what a week
+/// cost; this sums day buckets.
+///
+/// `days_covered` is not decoration: a store up for three days cannot answer
+/// thirty, and a smaller total returned silently reads as a quiet month.
+#[utoipa::path(
+    get, path = "/v1/spend",
+    params(SpendQuery),
+    responses(
+        (status = 200, description = "spend over the requested period", body = WindowSpend),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn spend(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SpendQuery>,
+) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    let days = q
+        .days
+        .unwrap_or(DEFAULT_SPEND_DAYS)
+        .clamp(1, MAX_SPEND_DAYS);
+    (
+        StatusCode::OK,
+        Json(st.store.spend_window(&org, days, now_millis())),
+    )
+        .into_response()
+}
+
+/// How many UTC days `/v1/spend` sums. Whole days ending today, so `days=1` is
+/// TODAY so far rather than the last twenty-four hours; a caller that renders
+/// it as "24h" is overstating by up to a day.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+struct SpendQuery {
+    days: Option<i64>,
+}
+
+/// A month, matching the period an operator most often asks for first.
+const DEFAULT_SPEND_DAYS: i64 = 30;
+
+/// Clamped rather than refused, and clamped to the store's own retention so the
+/// endpoint cannot promise a period the fold does not keep.
+const MAX_SPEND_DAYS: i64 = 400;
 
 /// The caller org's per-agent spend rollup, highest spend first. The
 /// empty-string agent is the unattributed bucket.
