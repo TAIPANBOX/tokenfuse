@@ -52,8 +52,20 @@ than the safest.
 3. Run the gates (below) - all must pass.
 4. If working as a subagent for the architect: leave changes **uncommitted**
    for review before committing.
-5. Commit with Conventional Commits, message ending in:
-   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
+5. Commit with Conventional Commits, message ending in a `Co-Authored-By:`
+   trailer naming **the model that actually did the work**:
+   `Co-Authored-By: Claude <model> <noreply@anthropic.com>`, for example
+   `Claude Opus 5` or `Claude Fable 5`.
+
+   This line named `Claude Fable 5` outright until 2026-08-11, and by then it
+   was wrong twice over. Measured on that date, the last forty commits on
+   `main` carry 14 `Opus 5` trailers and 11 `Fable 5`: the repository had
+   already stopped following it, correctly, because a trailer exists to record
+   authorship and a fixed string records whatever was true when somebody typed
+   it. A session that obeyed the line signed Fable 5 for work Opus 5 did, which
+   is the one thing this trailer must not do.
+
+   Do not rewrite published history to correct a trailer. Fix the next one.
 6. Push the branch, open a PR with `gh`.
 7. Wait for **all** CI checks to go green. Fix forward if red.
 8. **Ask the user** before merging.
