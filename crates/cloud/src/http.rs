@@ -683,17 +683,41 @@ async fn ingest(State(st): State<AppState>, headers: HeaderMap, uri: Uri, body: 
 /// The caller org's aggregated runs.
 #[utoipa::path(
     get, path = "/v1/runs",
+    params(RunsQuery),
     responses(
         (status = 200, description = "aggregated runs", body = Vec<RunAgg>),
         (status = 401, description = "unauthorized", body = ErrorResponse),
     ),
     tag = "reads"
 )]
-async fn runs(State(st): State<AppState>, headers: HeaderMap) -> Response {
+async fn runs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RunsQuery>,
+) -> Response {
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
-    (StatusCode::OK, Json(st.store.runs(&org))).into_response()
+    (
+        StatusCode::OK,
+        Json(st.store.runs_since(&org, q.since_millis)),
+    )
+        .into_response()
+}
+
+/// Optional window for `/v1/runs`.
+///
+/// Absent means every run this org has, which is what the endpoint did before
+/// and what an older caller still gets. Present narrows to runs last seen at or
+/// after the timestamp.
+///
+/// **It selects runs, not spend.** Each run's totals stay its lifetime totals,
+/// so a long-running run that predates the window brings all of its spend with
+/// it. `Store::runs_since` explains why, and any caller that renders this must
+/// label it "runs active in the window" rather than "spend in the window".
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+struct RunsQuery {
+    since_millis: Option<i64>,
 }
 
 /// The caller org's per-agent spend rollup, highest spend first. The
