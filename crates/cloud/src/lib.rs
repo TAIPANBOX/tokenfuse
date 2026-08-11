@@ -14,7 +14,7 @@ pub mod replay;
 pub mod store;
 
 pub use audit_sign::{signing_key_from_env as audit_signing_key_from_env, AuditManifest};
-pub use http::{app, openapi_spec, AppState};
+pub use http::{app, openapi_spec, AppState, RUNS_WINDOW_HEADER};
 pub use keys::{parse_keys, Principal};
 pub use oidc::{verify_id_token, OidcConfig};
 pub use push::{NullSender, PushPipeline, PushSender};

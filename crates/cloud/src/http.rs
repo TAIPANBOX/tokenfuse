@@ -698,12 +698,38 @@ async fn runs(
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    // Say which window was actually applied, and say it in a way an OLDER
+    // Cloud cannot fake.
+    //
+    // `since_millis` arrived in #197. A Cloud without it ignores the query
+    // string entirely and returns every run, silently, so a caller asking for
+    // seven days gets all of history and has no way to know. It would then
+    // label that answer "7 days", which is the exact shape of wrong this estate
+    // keeps paying for: a number honest about itself and false about the
+    // question.
+    //
+    // A response header fixes it without breaking the body's shape, and the
+    // signal is its ABSENCE: no header means the Cloud does not window, so the
+    // caller must not claim one. `none` means the caller asked for everything
+    // and got everything, which is different again.
+    let applied = match q.since_millis {
+        Some(ms) => ms.to_string(),
+        None => "none".to_string(),
+    };
     (
         StatusCode::OK,
+        [(RUNS_WINDOW_HEADER, applied)],
         Json(st.store.runs_since(&org, q.since_millis)),
     )
         .into_response()
 }
+
+/// Names the window `/v1/runs` applied: the epoch-millisecond cutoff, or
+/// `none` when the caller asked for every run.
+///
+/// Absent from a Cloud older than this, which is the point: a caller reads the
+/// absence as "this Cloud cannot window" rather than as "no window was needed".
+pub const RUNS_WINDOW_HEADER: &str = "x-fuse-runs-window";
 
 /// Optional window for `/v1/runs`.
 ///
