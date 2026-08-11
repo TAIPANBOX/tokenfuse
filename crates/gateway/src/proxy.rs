@@ -510,7 +510,15 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         Some(&agent_id),
                         Some(&run_id),
                         (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
-                        serde_json::json!({ "summary": summary }),
+                        serde_json::json!({
+                            "summary": summary,
+                            // The resolved business unit (docs/20); null when
+                            // the identity map is off or nothing matched. The
+                            // ledger row directly above carries it, and until
+                            // 2026-08-11 this envelope did not, alone with
+                            // `taint_block` among the enforcement events.
+                            "unit": (!unit.is_empty()).then_some(&unit),
+                        }),
                     );
                     crate::events::log_outcome(EventType::DlpBlock, outcome);
                     return dlp_block(&run_id, &summary);
@@ -1480,7 +1488,14 @@ async fn buffered_managed(
                     Some(agent_id),
                     Some(&reservation.run_id),
                     (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
-                    serde_json::json!({ "reason": reason }),
+                    serde_json::json!({
+                        "reason": reason,
+                        // As on `dlp_block` above, and for the same reason:
+                        // every other enforcement event carries the resolved
+                        // unit, and a consumer cannot tell one that omits the
+                        // field from one whose map resolved nothing.
+                        "unit": (!unit.is_empty()).then_some(unit),
+                    }),
                 );
                 crate::events::log_outcome(EventType::TaintBlock, outcome);
                 return firewall_block(&reservation.run_id, &reason);
@@ -4062,6 +4077,133 @@ mod tests {
             assert_eq!(records[0].unit, want_unit, "agent id {agent_id}");
         }
     }
+
+    /// Every enforcement event this gateway emits must carry the business unit
+    /// the identity map resolved.
+    ///
+    /// # WHY THIS IS ONE TEST OVER THE WHOLE STREAM AND NOT ONE PER EVENT
+    ///
+    /// `breaker_tripped` and `identity_mismatch` have carried `unit` since
+    /// docs/20. `dlp_block` and `taint_block` did not, and nothing noticed for
+    /// months, because the tests around them assert on the LEDGER row (which
+    /// does carry it, right above the emission) and never on the emitted
+    /// envelope. Two different objects, one of them checked.
+    ///
+    /// **Nothing was visibly broken by it, and that is worth stating plainly
+    /// rather than dressing the fix up.** Checked on 2026-08-11: no consumer in
+    /// this estate reads `data.unit` off an event. The genaryx console derives
+    /// the unit from the `agent_id` string, and the Cloud aggregates the ledger
+    /// row. What the gap actually was is an envelope that promised a field on
+    /// four enforcement events and omitted it on two, so the first consumer to
+    /// read it would have got a partial answer with nothing to distinguish
+    /// "this event type never carries unit" from "the map resolved nothing
+    /// here". Absent and null are the same bytes to a reader.
+    ///
+    /// So the assertion is a property of the STREAM, not a list of types. Every
+    /// event these blocked calls emit must carry the unit, whatever the event
+    /// is. A new enforcement event added without the field fails here as soon
+    /// as any path exercises it, instead of waiting for somebody to write its
+    /// own test and remember the field.
+    #[tokio::test]
+    async fn every_enforcement_event_carries_the_resolved_unit() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenfuse-unit-events-{}-{}.ndjson",
+            std::process::id(),
+            NEXT_UNIT_EVENTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // Both blocked calls write to the SAME file, so the assertion below
+        // runs over everything the gateway had to say about them.
+        let events = Arc::new(
+            tokenfuse_core::agent_event::Exporter::open(path.to_str().expect("temp path is utf-8"))
+                .expect("exporter opens"),
+        );
+
+        // 1. DLP: a whole AWS key in the prompt, refused before the provider.
+        let mut st =
+            identity_state(Mode::Enforce, StrictMode::Enforce).with_events(Arc::clone(&events));
+        st.dlp = DlpMode::Block;
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"my key is AKIA1234567890ABCDEF"}]}"#;
+        let resp = call(
+            st,
+            Request::post("/v1/messages")
+                .header("x-fuse-key", "sk-t")
+                .header("x-fuse-run-id", "unit-dlp")
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "agent://bank.example/treasury/bot1")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "the DLP block fires");
+
+        // 2. Taint: web-tainted context asking for an exec tool.
+        let mut st =
+            identity_state(Mode::Enforce, StrictMode::Enforce).with_events(Arc::clone(&events));
+        st.provider = Arc::new(StubProvider {
+            body_override: Some(
+                r#"{"content":[{"type":"tool_use","name":"run_shell","input":{}}]}"#.into(),
+            ),
+            ..StubProvider::default()
+        });
+        st.firewall = Arc::new(crate::firewall::FirewallConfig::defaults(
+            FirewallMode::Enforce,
+        ));
+        let resp = call(
+            st,
+            Request::post("/v1/messages")
+                .header("x-fuse-key", "sk-t")
+                .header("x-fuse-run-id", "unit-taint")
+                .header("x-fuse-taint", "web")
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "agent://bank.example/treasury/bot1")
+                .body(Body::from(body(100)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the taint block fires"
+        );
+
+        let body = std::fs::read_to_string(&path).expect("the exporter wrote its file");
+        let seen: Vec<serde_json::Value> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON envelope"))
+            .collect();
+
+        // Proof the test exercised what it claims to. Without this, a run that
+        // emitted nothing at all would pass the loop below trivially, which is
+        // the shape of green that measures nothing.
+        let types: Vec<&str> = seen.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert!(
+            types.contains(&"dlp_block"),
+            "expected a dlp_block among {types:?}"
+        );
+        assert!(
+            types.contains(&"taint_block"),
+            "expected a taint_block among {types:?}"
+        );
+
+        for e in &seen {
+            assert_eq!(
+                e["data"]["unit"].as_str(),
+                Some("treasury"),
+                "{} must carry the unit the identity map resolved, as every other \
+                 enforcement event does; the ledger row beside it already carries it, \
+                 and a consumer cannot tell an omitted field from an unresolved map. \
+                 Full event: {e}",
+                e["type"].as_str().unwrap_or("?")
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    static NEXT_UNIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
     async fn warn_reports_an_unbound_key_without_refusing_it() {
