@@ -80,6 +80,9 @@ pub struct AppState {
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
     pub events: Arc<EventExporter>,
+    /// What to do about an `agent_id` the envelope would reject. `Off` by
+    /// default, which is the historical behaviour; see `crate::agentids`.
+    pub agent_id_mode: crate::agentids::AgentIdMode,
     /// Who may send calls through this gateway, and the stable `key_id` their
     /// spend is attributed to. Empty (authentication off, `key_id` empty)
     /// unless `TOKENFUSE_CLIENT_KEYS` is set at startup — see
@@ -143,6 +146,7 @@ impl AppState {
             taint: Arc::new(Mutex::new(HashMap::new())),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventExporter::disabled()),
+            agent_id_mode: crate::agentids::AgentIdMode::default(),
             client_keys: Arc::new(ClientKeys::default()),
             identity: Arc::new(IdentityMap::default()),
             identity_strict: StrictMode::Off,
@@ -259,6 +263,12 @@ impl AppState {
     /// Attach the agent-event NDJSON exporter. Chainable.
     pub fn with_events(mut self, events: Arc<EventExporter>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Chainable. See `crate::agentids` for why the default is permissive.
+    pub fn with_agent_id_mode(mut self, mode: crate::agentids::AgentIdMode) -> Self {
+        self.agent_id_mode = mode;
         self
     }
 

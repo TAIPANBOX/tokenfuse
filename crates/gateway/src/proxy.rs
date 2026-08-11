@@ -276,6 +276,32 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // ledger/budget. Defaults to "" when the header is absent.
     let agent_id = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
 
+    // An id the envelope would reject, handled per the configured mode. See
+    // `crate::agentids` for why the default records rather than refuses: the
+    // emission path is fail-open on purpose, and refusing by default would
+    // break live traffic for a header nobody had looked at yet.
+    //
+    // An EMPTY id is not this check's business. It means the caller sent no
+    // header at all, which `build()` already handles by skipping the event
+    // rather than emitting a broken one, and refusing it here would turn an
+    // optional header into a required one.
+    if !agent_id.is_empty() && !tokenfuse_core::agent_event::is_canonical_agent_id(&agent_id) {
+        match st.agent_id_mode {
+            crate::agentids::AgentIdMode::Off => {}
+            crate::agentids::AgentIdMode::Warn => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    expected = crate::agentids::EXPECTED_GRAMMAR,
+                    "x-fuse-agent-id does not match the envelope grammar; a consumer that \
+                     validates it will quarantine this agent's events"
+                );
+            }
+            crate::agentids::AgentIdMode::Enforce => {
+                return agent_id_refused(&agent_id);
+            }
+        }
+    }
+
     // Delegation chain (agent-passport SPEC.md §5): captured raw for the
     // trace, and split into an ordered list for agent-event envelopes. No
     // enforcement semantics this phase — capture only.
@@ -1696,6 +1722,30 @@ fn dlp_block(run_id: &str, summary: &str) -> Response {
 }
 
 /// Firewall block: the model asked for a capability denied under the run's taint.
+/// 400 for an `agent_id` the envelope rejects, under
+/// [`crate::agentids::AgentIdMode::Enforce`].
+///
+/// Names the grammar in the body, because a refusal an operator cannot act on
+/// is a refusal they will switch off. 400 rather than 403: the caller sent a
+/// malformed header, which is a bad request, not a denied one.
+fn agent_id_refused(agent_id: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "agent_id_malformed",
+            "agent_id": agent_id,
+            "expected": crate::agentids::EXPECTED_GRAMMAR,
+            "detail": "x-fuse-agent-id must match the envelope grammar or a consumer validating it will quarantine every event about this agent. Set TOKENFUSE_AGENT_ID_MODE=warn to log instead of refusing.",
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
 fn firewall_block(run_id: &str, reason: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -4204,6 +4254,102 @@ mod tests {
     }
 
     static NEXT_UNIT_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+    /// The producer-side half of the `aws-comparable-176` finding.
+    ///
+    /// That campaign emitted all twelve of its events with
+    /// `agent_id: "aws-comparable-agent"`, no `agent://` prefix, and a console
+    /// ingesting them quarantines every one: the agent looks idle rather than
+    /// broken, and every count about it is correct and describes nothing. Found
+    /// 2026-07-16 and still true here on 2026-08-11, because the gateway
+    /// counted the fault and nothing refused or reported it.
+    ///
+    /// Both directions are asserted on purpose. A mode that refuses a bare name
+    /// and ALSO refuses a valid `agent://` id is a different bug wearing the
+    /// same green tick.
+    #[tokio::test]
+    async fn enforce_refuses_a_bare_agent_id_and_admits_a_conforming_one() {
+        use crate::agentids::AgentIdMode;
+
+        let bad =
+            state(Mode::Shadow, StubProvider::default()).with_agent_id_mode(AgentIdMode::Enforce);
+        let resp = call(
+            bad,
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "aid-bad")
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "aws-comparable-agent")
+                .body(Body::from(body(100)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a bare name is a malformed header, not a denied one"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "agent_id_malformed");
+        assert!(
+            json["error"]["expected"]
+                .as_str()
+                .is_some_and(|e| e.contains("agent://")),
+            "the refusal must name the grammar, or it is one an operator switches off"
+        );
+
+        let good =
+            state(Mode::Shadow, StubProvider::default()).with_agent_id_mode(AgentIdMode::Enforce);
+        let resp = call(
+            good,
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "aid-good")
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "agent://bank.example/treasury/bot1")
+                .body(Body::from(body(100)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "a conforming id must pass");
+    }
+
+    /// Off is the default and it must stay permissive: the emission path is
+    /// fail-open on purpose, and a gateway that started refusing on upgrade
+    /// would break live traffic for a header nobody had looked at yet.
+    #[tokio::test]
+    async fn the_default_mode_records_a_bare_agent_id_rather_than_refusing_it() {
+        let st = state(Mode::Shadow, StubProvider::default());
+        let resp = call(
+            st,
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "aid-off")
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "aws-comparable-agent")
+                .body(Body::from(body(100)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// An ABSENT header is not a malformed one. Refusing it would turn an
+    /// optional header into a required one, and `build()` already handles the
+    /// empty case by skipping the event rather than emitting a broken one.
+    #[tokio::test]
+    async fn enforce_does_not_require_the_header_to_be_present() {
+        let st = state(Mode::Shadow, StubProvider::default())
+            .with_agent_id_mode(crate::agentids::AgentIdMode::Enforce);
+        let resp = call(
+            st,
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "aid-absent")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(body(100)))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn warn_reports_an_unbound_key_without_refusing_it() {

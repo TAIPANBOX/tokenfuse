@@ -262,6 +262,14 @@ pub struct AgentEvent {
 /// a rule copied into code. Recorded as G4.2 in its `GAPS.md`.
 pub const AGENT_ID_MAX_LENGTH: usize = 255;
 
+/// How many DISTINCT non-conforming agent ids to remember for the operator.
+///
+/// Bounded because the id comes from a caller-controlled header: an unbounded
+/// set here is a memory leak anybody with a key can drive. Thirty-two describes
+/// a misconfigured fleet as well as three thousand would, and the COUNT stays
+/// exact whatever the set drops.
+pub const NONCONFORMING_SAMPLE_CAP: usize = 32;
+
 /// Whether `agent_id` is one a consumer validating the envelope accepts.
 ///
 /// The same question the shared schema asks, in the same two parts: the grammar
@@ -355,6 +363,10 @@ pub struct Exporter {
     skipped: std::sync::atomic::AtomicU64,
     write_errors: std::sync::atomic::AtomicU64,
     nonconforming: std::sync::atomic::AtomicU64,
+    /// The distinct offending ids, bounded by [`NONCONFORMING_SAMPLE_CAP`].
+    /// A `Mutex<BTreeSet>` rather than anything cleverer: this is touched only
+    /// on the failure path, which on a healthy gateway is never.
+    nonconforming_ids: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// The open file plus the chain state that must advance in lockstep with it
@@ -402,6 +414,7 @@ impl Exporter {
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
             nonconforming: std::sync::atomic::AtomicU64::new(0),
+            nonconforming_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -433,6 +446,7 @@ impl Exporter {
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
             nonconforming: std::sync::atomic::AtomicU64::new(0),
+            nonconforming_ids: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -499,6 +513,12 @@ impl Exporter {
         // Written, counted, and reported, which is engram's and verdryx's
         // decision for the same problem.
         let nonconforming = !is_canonical_agent_id(&event.agent_id);
+        if nonconforming {
+            let mut seen = self.nonconforming_ids.lock().unwrap();
+            if seen.len() < NONCONFORMING_SAMPLE_CAP {
+                seen.insert(event.agent_id.clone());
+            }
+        }
 
         let mut sink = sink.lock().unwrap();
         event.prev_hash = sink.next.clone();
@@ -556,6 +576,31 @@ impl Exporter {
     pub fn nonconforming_agent_id_count(&self) -> u64 {
         self.nonconforming
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// WHICH ids those were, sorted, capped at
+    /// [`NONCONFORMING_SAMPLE_CAP`].
+    ///
+    /// # WHY A COUNT WAS NOT ENOUGH
+    ///
+    /// The count has existed since this exporter did, and nothing outside a
+    /// test has ever read it. Even read, it does not help: "418 events had a
+    /// bad agent_id" tells an operator a problem exists and nothing about
+    /// where. The ids are what makes it fixable, because an id names the
+    /// producer that sent it.
+    ///
+    /// This is the same fault the console's quarantine had until 2026-08-11,
+    /// one layer up: kept, counted, and unreadable.
+    ///
+    /// Capped and never evicting: a caller with ten thousand distinct broken
+    /// ids has a configuration problem the first thirty-two describe just as
+    /// well, and an unbounded set here would be a memory leak an untrusted
+    /// header controls.
+    pub fn nonconforming_agent_ids(&self) -> Vec<String> {
+        let seen = self.nonconforming_ids.lock().unwrap();
+        let mut out: Vec<String> = seen.iter().cloned().collect();
+        out.sort();
+        out
     }
 
     pub fn write_error_count(&self) -> u64 {

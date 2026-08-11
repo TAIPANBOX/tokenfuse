@@ -582,6 +582,30 @@ async fn serve() {
             }
         }
     };
+    // The same three-step rollout as the identity map above, and an unknown
+    // value exits for the same reason: a mistyped mode must not silently pick
+    // the permissive one. Default off, because the emission path is fail-open
+    // on purpose and a gateway that started refusing on upgrade would break
+    // live traffic for a header nobody had looked at yet. `GET /v1/agent-ids`
+    // is what an operator reads before turning this on.
+    let agent_id_mode = {
+        let raw = std::env::var("TOKENFUSE_AGENT_ID_MODE").unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            tokenfuse_gateway::agentids::AgentIdMode::Off
+        } else {
+            match trimmed.parse::<tokenfuse_gateway::agentids::AgentIdMode>() {
+                Ok(mode) => mode,
+                Err(_) => {
+                    eprintln!(
+                        "tokenfuse: TOKENFUSE_AGENT_ID_MODE must be off|warn|enforce, got `{trimmed}`"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+
     let units = Arc::new(tokenfuse_gateway::unitledger::UnitLedger::new(
         identity_map.unit_budgets(),
     ));
@@ -642,7 +666,8 @@ async fn serve() {
         "default",
     )
     .with_client_keys(Arc::new(client_keys))
-    .with_identity(Arc::new(identity_map), identity_strict, units.clone());
+    .with_identity(Arc::new(identity_map), identity_strict, units.clone())
+    .with_agent_id_mode(agent_id_mode);
 
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
     // records would-hits without serving them — safe to drop in).

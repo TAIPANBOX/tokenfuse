@@ -2,6 +2,7 @@
 //! `Router`. The binary (`main.rs`) wires real config around `app()`; tests
 //! drive `app()` directly.
 
+pub mod agentids;
 pub mod backtestcli;
 pub mod clientkeys;
 pub mod cloudsink;
@@ -64,6 +65,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/runs/{id}/kill", post(obs::kill_run))
         .route("/v1/keys", get(keysreport::list_keys))
         .route("/v1/policy-plane", get(policyplane::policy_plane))
+        .route("/v1/agent-ids", get(agentids::agent_ids))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
