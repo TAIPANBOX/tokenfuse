@@ -1890,11 +1890,37 @@ impl Store {
     /// An org's run aggregates (order unspecified; the client sorts). The
     /// `killed` flag is resolved at read time from the kill set.
     pub fn runs(&self, org: &str) -> Vec<RunAgg> {
+        self.runs_since(org, None)
+    }
+
+    /// The caller org's runs, optionally narrowed to those still ACTIVE at or
+    /// after `since_millis`.
+    ///
+    /// # WHAT THE WINDOW SELECTS, AND WHAT IT DOES NOT
+    ///
+    /// It selects runs by `last_seen_millis`, so "the last 7 days" means "runs
+    /// this org touched in the last 7 days". Each run's totals are still its
+    /// LIFETIME totals, because that is what this store holds: the fold is per
+    /// run, not per time bucket.
+    ///
+    /// So a run that started three weeks ago and is still going contributes all
+    /// three weeks of its spend to a 7-day window. That is a real limit and it
+    /// is stated here rather than papered over, because the alternative reading
+    /// ("spend incurred during the window") is the one a caller will assume if
+    /// nobody says otherwise, and it would be wrong.
+    ///
+    /// Per-bucket spend needs a time-series fold this store does not keep. When
+    /// something needs that number, it is a new shape, not a stricter filter on
+    /// this one.
+    pub fn runs_since(&self, org: &str, since_millis: Option<i64>) -> Vec<RunAgg> {
         let inner = self.inner.read().unwrap();
         let killed = inner.killed.get(org);
         let mut out = Vec::new();
         if let Some(runs) = inner.orgs.get(org) {
             for agg in runs.values() {
+                if since_millis.is_some_and(|cutoff| agg.last_seen < cutoff) {
+                    continue;
+                }
                 let mut a = agg.clone();
                 a.killed = killed
                     .and_then(|k| k.get(&a.run_id))

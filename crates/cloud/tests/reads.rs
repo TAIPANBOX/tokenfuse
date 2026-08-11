@@ -639,3 +639,68 @@ async fn cors_preflight_is_answered() {
         "*"
     );
 }
+
+/// `/v1/runs?since_millis=` narrows to runs still ACTIVE in the window.
+///
+/// # WHY THIS ENDPOINT GREW A WINDOW
+///
+/// The console's Statistics view has one window selector above a table whose
+/// money columns could not follow it, because this endpoint took no time filter
+/// at all. Yurii switched to 7 days, watched Spend not move, and asked whether
+/// that was intended. Half of it was: the two windows are deliberately separate
+/// stores. The other half was a control that appeared to govern a column it
+/// could not reach.
+///
+/// # WHAT THE TEST PINS, AND IT IS THE LIMIT AS MUCH AS THE FEATURE
+///
+/// The filter selects runs by `last_seen_millis`. Each run's totals remain its
+/// LIFETIME totals, so a run that started before the window and is still active
+/// brings all of its spend in. That is asserted below on purpose: it is the
+/// reading a caller will otherwise assume away, and a test that only checked
+/// the happy narrowing would let somebody relabel this "spend in the window".
+#[tokio::test]
+async fn runs_can_be_narrowed_to_a_window_and_still_report_lifetime_totals() {
+    let (state, _store) = test_state();
+
+    let ingest = |body: String| {
+        let st = state.clone();
+        async move {
+            let resp = app(st)
+                .oneshot(
+                    Request::post("/v1/ingest")
+                        .header("authorization", "Bearer devkey")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+
+    // An old run, last seen well before the cutoff.
+    ingest(r#"{"records":[{"ts_millis":10000,"run_id":"old-run","model":"m","decision":"allow","cost_microusd":1000,"step":1}]}"#.to_string()).await;
+    // A run that started long ago and is STILL active: its last_seen is inside
+    // the window, its spend is not confined to it.
+    ingest(r#"{"records":[{"ts_millis":10000,"run_id":"long-run","model":"m","decision":"allow","cost_microusd":5000,"step":1}]}"#.to_string()).await;
+    ingest(r#"{"records":[{"ts_millis":90000,"run_id":"long-run","model":"m","decision":"allow","cost_microusd":5000,"step":2}]}"#.to_string()).await;
+
+    let (_, all) = get(&state, "/v1/runs", Some("devkey")).await;
+    assert_eq!(
+        all.as_array().unwrap().len(),
+        2,
+        "no window returns every run, exactly as before"
+    );
+
+    let (status, windowed) = get(&state, "/v1/runs?since_millis=50000", Some("devkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = windowed.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the run active in the window");
+    assert_eq!(rows[0]["run_id"], "long-run");
+    assert_eq!(
+        rows[0]["spent_microusd"].as_i64().unwrap(),
+        10_000,
+        "and it carries BOTH of its calls: the window selects runs, not spend, \
+         and a caller that reads this as in-window spend is reading it wrong"
+    );
+}
