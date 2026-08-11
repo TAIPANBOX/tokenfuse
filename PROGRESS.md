@@ -302,7 +302,7 @@ comparison in #132.
 
 **Counts re-measured 2026-08-06**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **808 passing** (core 220, gateway 391, cloud 196,
+`cargo test --all` runs **809 passing** (core 220, gateway 391, cloud 197,
 umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.

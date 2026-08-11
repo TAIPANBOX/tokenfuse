@@ -57,6 +57,29 @@ async fn get(state: &AppState, path: &str, key: Option<&str>) -> (StatusCode, se
     (status, v)
 }
 
+/// GET a path and return the response headers too. Only the runs-window tests
+/// need this; everything else reads the body alone.
+async fn get_with_headers(
+    state: &AppState,
+    path: &str,
+    key: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    let resp = app(state.clone())
+        .oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, headers, v)
+}
+
 #[tokio::test]
 async fn ingest_then_query_runs_and_summary() {
     let (state, _store) = test_state();
@@ -702,5 +725,53 @@ async fn runs_can_be_narrowed_to_a_window_and_still_report_lifetime_totals() {
         10_000,
         "and it carries BOTH of its calls: the window selects runs, not spend, \
          and a caller that reads this as in-window spend is reading it wrong"
+    );
+}
+
+/// `/v1/runs` names the window it applied, so a caller can tell an answer that
+/// was narrowed from one that only looks narrow.
+///
+/// # WHY A HEADER AND NOT JUST THE ROWS
+///
+/// A Cloud older than #197 ignores `since_millis` and returns every run, with
+/// a 200 and a perfectly well-formed body. A console asking for seven days
+/// would get all of history and label it "7 days". That is the failure this
+/// estate keeps paying for: an answer honest about itself and false about the
+/// question.
+///
+/// The signal is the header's ABSENCE, which an old Cloud produces for free by
+/// not knowing about it. `none` is a third, distinct state: the caller asked
+/// for everything and got everything.
+#[tokio::test]
+async fn runs_names_the_window_it_applied() {
+    let (state, _store) = test_state();
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer devkey")
+                .body(Body::from(
+                    r#"{"records":[{"ts_millis":90000,"run_id":"r","model":"m","decision":"allow","cost_microusd":1,"step":1}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (_, h, _) = get_with_headers(&state, "/v1/runs?since_millis=50000", "devkey").await;
+    assert_eq!(
+        h.get(tokenfuse_cloud::RUNS_WINDOW_HEADER)
+            .map(|v| v.to_str().unwrap()),
+        Some("50000"),
+        "a windowed answer names its cutoff"
+    );
+
+    let (_, h, _) = get_with_headers(&state, "/v1/runs", "devkey").await;
+    assert_eq!(
+        h.get(tokenfuse_cloud::RUNS_WINDOW_HEADER)
+            .map(|v| v.to_str().unwrap()),
+        Some("none"),
+        "and asking for everything is a stated answer, not a missing one: only a \
+         Cloud that cannot window at all omits this header"
     );
 }
