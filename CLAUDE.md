@@ -917,6 +917,17 @@ it, because later is where the drift lives.
   2026-08-20, when the h2 fix for RUSTSEC-2026-0258 landed in the root
   lockfile and left `crates/cluster` on the vulnerable version.
 
+- **An unpinned `cargo install` in CI is a dependency with no lockfile.** The
+  radar job ran `cargo install bpf-linker` with no version and no `--locked`,
+  so it resolved to whatever was newest when the job started. bpf-linker 0.11.0
+  landed on 2026-08-12, the day after this job last went green, and it links
+  system LLVM dynamically, which the `System deps` step does not install. Main
+  went red on 2026-08-20 with nothing in this repository having changed, and
+  the first PR to notice looked like the cause. Pinned to 0.10.4 `--locked`.
+  Two `pip install` steps (pytest, openapi-spec-validator) are still unpinned
+  and can fail the same way; `cargo install cargo-audit --locked` carries no
+  version either, so it floats a major.
+
 ## Model escalation - tell the user, don't just push through
 
 No model can switch itself. When a task hits the criteria below, stop and

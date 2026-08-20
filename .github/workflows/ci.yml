@@ -41,7 +41,7 @@ jobs:
         run: cargo clippy --all-targets --all-features
       - name: Test
         run: cargo test --all
-      - name: Test (cluster feature — raft-backed ledger)
+      - name: Test (cluster feature, raft-backed ledger)
         run: cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
       - name: tokenfuse-core stays dependency-minimal
         run: ./scripts/core-deps.sh
@@ -230,8 +230,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/radar
+      # Pinned, and the pin is the point. This step read `cargo install
+      # bpf-linker` until 2026-08-20, which resolves to whatever is newest at
+      # the moment the job runs. bpf-linker 0.11.0 was published on 2026-08-12,
+      # the day after the last green run of this job, and it links against
+      # system LLVM dynamically: the step then died with `rust-lld: error:
+      # unable to find library -lLLVM`, because `System deps` above installs
+      # `llvm` and not `llvm-dev`. Nothing in this repository had changed, and
+      # main went red on its own.
+      #
+      # 0.10.4 is the last 0.10.x and ships its own Cargo.lock, so `--locked`
+      # holds bpf-linker's transitive dependencies too and not only its
+      # version. Moving to 0.11.0 is a separate decision and needs the LLVM
+      # dev package chosen deliberately rather than inherited from whatever
+      # the runner image happens to carry, which is the coupling that broke
+      # this in the first place.
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: cargo install bpf-linker --version 0.10.4 --locked
       - name: Build radar
         working-directory: crates/radar
         run: cargo build
