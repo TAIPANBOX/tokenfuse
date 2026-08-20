@@ -379,8 +379,21 @@ run_case "pinned-installs: an unpinned command quoted in a comment" pass \
 # is the most expensive mistake this estate makes in its tooling.
 run_case "pinned-installs: no install commands left, so it measured nothing" fail \
 	"./scripts/pinned-installs.sh" \
-	"$(py 'edit_all(".github/workflows/ci.yml", " install ", " nstall ")')" \
+	"$(py 'edit_all(".github/workflows/ci.yml", " install ", " nstall ")
+edit_all(".github/workflows/bench.yml", " install ", " nstall ")')" \
 	"measured nothing"
+
+run_case "pinned-installs: an apt install loses its snapshot" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "sudo apt-get install -y --snapshot \"$APT_SNAPSHOT\" clang", "sudo apt-get install -y clang")')" \
+	"--snapshot YYYYMMDDTHHMMSSZ"
+
+# The runner image is the layer the snapshot pin above stands on. A snapshot
+# pinned onto a rolling label is half a pin, so the same gate holds both.
+run_case "pinned-installs: a runner label goes back to -latest" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")')" \
+	"rolls to the next OS release"
 
 # --- the harness cleans up after itself ------------------------------------
 

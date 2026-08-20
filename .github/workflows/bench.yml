@@ -1,21 +1,37 @@
 name: bench
 
-# Reproduce the networked latency benchmark in GitHub Actions (manual trigger) —
+# Reproduce the networked latency benchmark in GitHub Actions (manual trigger),
 # so the numbers can be regenerated in the cloud, without any personal server.
 # Runner numbers are noisier than a dedicated box; the delta is what matters.
 on:
   workflow_dispatch:
 
+env:
+  APT_SNAPSHOT: "20260820T000000Z"
+
 jobs:
   networked:
     name: networked latency (wrk)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install wrk
-        run: sudo apt-get update && sudo apt-get install -y wrk
+        run: |
+          # The snapshot service is served from archive.ubuntu.com. The runner
+          # ships pointing at the azure mirror, which does not serve snapshots
+          # and has its own long record of missing content.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+                   /etc/apt/sources.list.d/*.list; do
+            # `if`, not `[ -f ] &&`: GitHub runs these blocks under `bash -e`, and a
+            # glob that matches nothing makes the && list exit 1 and kill the step.
+            if [ -f "$f" ]; then
+              sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"
+            fi
+          done
+          sudo apt-get update --snapshot "$APT_SNAPSHOT"
+          sudo apt-get install -y --snapshot "$APT_SNAPSHOT" wrk
       - name: Run benchmark
         run: bash bench/run.sh | tee bench-result.txt
       - name: Upload result

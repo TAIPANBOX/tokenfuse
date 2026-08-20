@@ -7,12 +7,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # One archive snapshot for every apt step in this file. Bump it deliberately,
+  # in a commit that says what moved and why, the way a lockfile is bumped.
+  APT_SNAPSHOT: "20260820T000000Z"
   RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
     name: fmt · clippy · test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Free runner disk
@@ -99,7 +102,7 @@ jobs:
 
   python-sdk:
     name: python sdk
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -113,7 +116,7 @@ jobs:
 
   js-sdk:
     name: js sdk
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -125,7 +128,7 @@ jobs:
 
   openapi:
     name: openapi spec
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -151,7 +154,7 @@ jobs:
 
   dashboard:
     name: dashboard (Next.js)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -168,7 +171,7 @@ jobs:
 
   cluster:
     name: cluster (raft HA)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -191,7 +194,7 @@ jobs:
 
   security:
     name: security (cargo audit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -225,11 +228,24 @@ jobs:
 
   radar:
     name: radar (eBPF build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: System deps
-        run: sudo apt-get update && sudo apt-get install -y clang llvm libelf-dev
+        run: |
+          # The snapshot service is served from archive.ubuntu.com. The runner
+          # ships pointing at the azure mirror, which does not serve snapshots
+          # and has its own long record of missing content.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+                   /etc/apt/sources.list.d/*.list; do
+            # `if`, not `[ -f ] &&`: GitHub runs these blocks under `bash -e`, and a
+            # glob that matches nothing makes the && list exit 1 and kill the step.
+            if [ -f "$f" ]; then
+              sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"
+            fi
+          done
+          sudo apt-get update --snapshot "$APT_SNAPSHOT"
+          sudo apt-get install -y --snapshot "$APT_SNAPSHOT" clang llvm libelf-dev
       - name: Install Rust (stable + nightly + rust-src)
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -269,7 +285,7 @@ jobs:
 
   apns:
     name: cloud apns (feature build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
