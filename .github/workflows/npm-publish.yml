@@ -8,7 +8,7 @@ name: publish npm
 #   (npmjs.com → Access Tokens → Generate → Automation).
 #
 # Then run: Actions tab → "publish npm" → Run workflow. actions/setup-node wires
-# the token into a temporary .npmrc via NODE_AUTH_TOKEN — nothing is committed to
+# the token into a temporary .npmrc via NODE_AUTH_TOKEN. Nothing is committed to
 # the repo, so it never shadows a local `npm login`.
 on:
   workflow_dispatch:

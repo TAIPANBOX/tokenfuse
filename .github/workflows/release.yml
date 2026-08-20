@@ -1,13 +1,13 @@
 name: release
 
 # Build and publish the container images to GitHub Container Registry (ghcr.io)
-# — so TokenFuse runs on any host or cloud with `docker run` / `docker compose`,
+# so TokenFuse runs on any host or cloud with `docker run` / `docker compose`,
 # with no dependence on a personal server. Uses the built-in GITHUB_TOKEN.
 #
 # Images / tags:
-#   ghcr.io/<owner>/tokenfuse                — the gateway (drop-in proxy)
-#   ghcr.io/<owner>/tokenfuse:cluster        — the gateway + raft HA (--features cluster)
-#   ghcr.io/<owner>/tokenfuse-control-plane  — the Cloud control plane
+#   ghcr.io/<owner>/tokenfuse                - the gateway (drop-in proxy)
+#   ghcr.io/<owner>/tokenfuse:cluster        - the gateway + raft HA (--features cluster)
+#   ghcr.io/<owner>/tokenfuse-control-plane  - the Cloud control plane
 on:
   push:
     tags: ["v*"]
