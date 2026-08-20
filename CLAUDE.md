@@ -819,19 +819,40 @@ build)`, `cloud apns (feature build)`.
    version alone still lets the crate's own dependencies float, which is this
    same failure one level down.
 
-   **`apt-get install` is deliberately out of scope, and the residual risk keeps
-   its name.** apt is half of the failure above: `System deps` installs `llvm`
-   and not `llvm-dev`. Pinning apt on a hosted runner pins to versions that
-   exist only in the image the runner happens to boot, so the pin breaks on the
-   next image roll and the gate demanding it gets deleted by whoever is
-   unblocking CI. A system package can still change under this project without
-   warning. This removes the half a version number fixes.
-   *(gate: `scripts/pinned-installs.sh`; verified against five mutants: a
+   **apt is in scope, and this reverses what stood here for one afternoon.**
+   `@yurii 2026-08-20`: «запінь apt теж». The argument recorded here against it
+   was that pinning apt on a hosted runner pins to versions that exist only in
+   the image the runner happens to boot, so the pin breaks on the next image
+   roll and the gate demanding it gets deleted by whoever is unblocking CI.
+
+   That argument was right about `pkg=version` and wrong about apt, because it
+   assumed a version number is the only way to pin. `@claude`: the Ubuntu
+   snapshot service serves the archive as it stood at a timestamp, for any date
+   after 1 March 2023, and apt in 24.04 speaks it natively. **A snapshot does
+   not break when the image rolls, because it does not describe the image, it
+   describes the archive.** One `APT_SNAPSHOT` per workflow file, bumped
+   deliberately in a commit that says what moved, the way a lockfile is bumped.
+
+   Two things had to move with it. The runner's own sources point at the azure
+   mirror, which does not serve snapshots and has a long public record of
+   missing content, so each apt step repoints them at `archive.ubuntu.com`
+   first. And **the runner image is pinned**, `ubuntu-24.04` rather than
+   `ubuntu-latest`, because a snapshot pin on a rolling image is half a pin:
+   the label is 24.04 today, 26.04 is in public preview, and GitHub migrates it
+   over one to two months during which a workflow may see the OS change
+   underneath. `runs-on` is therefore checked by the same gate.
+
+   `@claude`, the honest residual: whether `apt-get` accepts `--snapshot` on
+   the runner is proven by CI and by nothing available on a developer's macOS.
+   If it turns out apt-get does not take the flag where `apt` does, the fix is
+   the verb, not the approach.
+   *(gate: `scripts/pinned-installs.sh`; verified against eight mutants: a
    `cargo install` losing its version, one losing `--locked`, a `pip install`
-   losing its `==`, and two that must NOT fire, `rustup toolchain install` and
-   the comment above the radar step which quotes the old unpinned command
-   verbatim. A sixth takes the subject away: with the workflow glob matching
-   nothing it must say it measured nothing rather than report OK)*
+   losing its `==`, an `apt-get install` losing its snapshot, a `runs-on` back
+   to a `-latest` label, and two that must NOT fire, `rustup toolchain install`
+   and the comment above the radar step which quotes the old unpinned command
+   verbatim. The eighth takes the subject away: with no install command left it
+   must say it measured nothing rather than report OK)*
 
 ## Decisions that have no gate yet
 

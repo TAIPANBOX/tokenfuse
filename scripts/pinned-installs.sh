@@ -25,17 +25,36 @@
 #   npm install -g   `name@version`.
 #   go install       `path@version`, and `@latest` is not a version.
 #
-# WHAT IS DELIBERATELY NOT CHECKED, established before writing this rather
-# than assumed
+#   apt-get install  a snapshot (--snapshot YYYYMMDDTHHMMSSZ), or an explicit
+#                    pkg=version. Added 2026-08-20 on Yurii's instruction,
+#                    after this header argued for leaving apt alone.
+#   runs-on          a released image label, never a `-latest` one.
 #
-# `apt-get install` is out of scope, and saying so plainly matters because apt
-# is half of the failure described above: `System deps` installs `llvm` and not
-# `llvm-dev`. Pinning apt on a hosted runner means pinning to package versions
+# WHY APT IS IN SCOPE AFTER ALL, since this header used to argue the opposite
+#
+# The argument against was that pinning apt on a hosted runner pins to versions
 # that exist only in the image the runner happens to boot, so the pin breaks on
-# the next image roll, and the gate that demanded it gets deleted by whoever is
-# unblocking CI. The residual risk is real and is left with its name on it: a
-# system package can still change under this project without warning. What this
-# gate removes is the half that a version number does fix.
+# the next image roll and the gate demanding it gets deleted by whoever is
+# unblocking CI. That argument was right about `pkg=version` and wrong about
+# apt, because it assumed a version number is the only way to pin.
+#
+# The Ubuntu snapshot service serves the archive as it stood at a timestamp,
+# for any date after 1 March 2023, and apt in 24.04 speaks it natively. A
+# snapshot does not break when the image rolls, because it does not describe
+# the image; it describes the archive. That is the pin the earlier argument
+# said did not exist.
+#
+# It only holds with the runner image pinned too, which is why `runs-on` is
+# checked here rather than somewhere else. `ubuntu-latest` is a rolling label:
+# it is 24.04 today, 26.04 is already in public preview, and GitHub migrates
+# the label over one to two months during which any workflow using it may see
+# the OS change underneath. A snapshot pin on a rolling image is half a pin.
+#
+# WHAT IS STILL NOT CHECKED
+#
+# That the snapshot timestamp is recent, or that it is the same one everywhere.
+# Both are judgement: an old snapshot is a deliberate choice as often as it is
+# neglect, and a job may legitimately need a different one.
 #
 # `rustup toolchain install` is not a tool install, it is a channel, and
 # `npm ci` is driven by a lockfile that is committed. Both must NOT fail this,
@@ -111,6 +130,16 @@ def npm_pinned(rest):
     return ["a version (pkg@X.Y.Z)"]
 
 
+def apt_pinned(rest):
+    if re.search(r"--snapshot[= ]\S+", rest):
+        return []
+    # An explicit pkg=version is accepted, but it is the weaker form: it holds
+    # only until the archive publishes a new build inside the same release.
+    if re.search(r"[\w.+-]+=[\w.:+~-]+", rest):
+        return []
+    return ["a snapshot (--snapshot YYYYMMDDTHHMMSSZ), or an explicit pkg=version"]
+
+
 def go_pinned(rest):
     m = re.search(r"\S+@(\S+)", rest)
     if m and m.group(1) != "latest":
@@ -125,6 +154,7 @@ VERBS = [
     (re.compile(r"\buv\s+tool\s+install\b(?P<rest>.*)"), "uv tool install", pip_pinned),
     (re.compile(r"\bnpm\s+(?:install|i)\s+(?:-g|--global)\b(?P<rest>.*)"), "npm install -g", npm_pinned),
     (re.compile(r"\bgo\s+install\b(?P<rest>.*)"), "go install", go_pinned),
+    (re.compile(r"\bapt(?:-get)?\s+install\b(?P<rest>.*)"), "apt-get install", apt_pinned),
 ]
 
 # `rustup toolchain install stable` contains the word install and is a channel,
@@ -151,11 +181,40 @@ for path in WORKFLOWS:
             if missing:
                 note(
                     f"{path}:{lineno} floats: {line.strip()}",
-                    f"    a {verb} here needs {' and '.join(missing)}.",
+                    f"    this {verb} needs {' and '.join(missing)}.",
                     "    Unpinned, this resolves to whatever is newest when the job runs, so",
                     "    the commit that passes today is the commit that fails tomorrow.",
                 )
             break
+
+# --- the runner image ------------------------------------------------------
+#
+# A rolling image label is the same fault one layer out, and it is the layer a
+# snapshot pin above depends on. `ubuntu-latest` is 24.04 today, 26.04 is in
+# public preview, and the migration takes one to two months during which a
+# workflow using the label may see the OS change underneath it.
+runners = 0
+for path in WORKFLOWS:
+    for lineno, raw in enumerate(open(path).read().split("\n"), 1):
+        line = strip_comment(raw)
+        m = re.search(r"runs-on:\s*(?P<label>[\w.-]+)", line)
+        if not m:
+            continue
+        runners += 1
+        label = m.group("label")
+        if label.endswith("-latest"):
+            note(
+                f"{path}:{lineno} floats: runs-on: {label}",
+                "    a -latest label rolls to the next OS release on GitHub's schedule,",
+                "    over one to two months, and a workflow using it sees the change",
+                "    underneath. Name the release the job is tested against.",
+            )
+
+if runners == 0:
+    measured_nothing(
+        f"{len(WORKFLOWS)} workflow file(s) were read and not one `runs-on:` was found. "
+        "Either these are not workflow files or this pattern no longer matches."
+    )
 
 if checked == 0:
     measured_nothing(
@@ -168,5 +227,8 @@ if problems:
     print(f"\n{len(problems)} unpinned install(s) across {len(WORKFLOWS)} workflow file(s).")
     sys.exit(1)
 
-print(f"{checked} tool install(s) across {len(WORKFLOWS)} workflow file(s), every one pinned.")
+print(
+    f"{checked} tool install(s) and {runners} runner label(s) across "
+    f"{len(WORKFLOWS)} workflow file(s), every one pinned."
+)
 PY
