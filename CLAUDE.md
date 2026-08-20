@@ -88,6 +88,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/replicated-shape.sh
 ./scripts/honest-claims.sh
 ./scripts/runnable-quickstart.sh
+./scripts/pinned-installs.sh
 ./scripts/audit.sh              # invariant 11; needs cargo-audit
 ./scripts/constants.sh          # builds, unlike the text gates; see invariant 14
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
@@ -795,6 +796,42 @@ build)`, `cloud apns (feature build)`.
    refuse a return to the terminal table. Until then this is prose, which is
    the weakest form, and the failure mode is quiet: a capability added here
    compiles, passes CI, and reads as progress)*
+
+22. **A tool CI installs by name is installed at a named version.** An unpinned
+   install is a dependency with no lockfile: it resolves to whatever is newest
+   at the moment the job runs, so the commit that passes today and the commit
+   that fails tomorrow are the same commit.
+
+   Measured rather than feared. The radar job ran `cargo install bpf-linker`
+   with no version and no `--locked`. bpf-linker 0.11.0 was published on
+   2026-08-12, the day after that job last went green, and it links system LLVM
+   dynamically, which `System deps` does not install. main went red on
+   2026-08-20 with nothing in this repository having changed, and #203, a
+   two-file markdown change opened afterwards, arrived wearing the red check.
+
+   That last part is the reason this is an invariant and not a fix. The cost of
+   an unpinned install is not the build minutes, it is a failure attributed to
+   the wrong change, which is the same class as invariant 12's stated numbers
+   and invariant 16's quickstart: the repository was correct, and something
+   outside a commit made it look otherwise.
+
+   `--locked` is required alongside the version for `cargo install`, because a
+   version alone still lets the crate's own dependencies float, which is this
+   same failure one level down.
+
+   **`apt-get install` is deliberately out of scope, and the residual risk keeps
+   its name.** apt is half of the failure above: `System deps` installs `llvm`
+   and not `llvm-dev`. Pinning apt on a hosted runner pins to versions that
+   exist only in the image the runner happens to boot, so the pin breaks on the
+   next image roll and the gate demanding it gets deleted by whoever is
+   unblocking CI. A system package can still change under this project without
+   warning. This removes the half a version number fixes.
+   *(gate: `scripts/pinned-installs.sh`; verified against five mutants: a
+   `cargo install` losing its version, one losing `--locked`, a `pip install`
+   losing its `==`, and two that must NOT fire, `rustup toolchain install` and
+   the comment above the radar step which quotes the old unpinned command
+   verbatim. A sixth takes the subject away: with the workflow glob matching
+   nothing it must say it measured nothing rather than report OK)*
 
 ## Decisions that have no gate yet
 
