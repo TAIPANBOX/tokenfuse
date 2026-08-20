@@ -1,4 +1,4 @@
-# EXAMPLE / TEMPLATE — not part of this repo's CI.
+# EXAMPLE / TEMPLATE, not part of this repo's CI.
 #
 # TokenFuse itself has no MCP server for this workflow to scan, so this file
 # is `workflow_dispatch`-only: it never fires on push/PR and cannot break
@@ -13,7 +13,7 @@
 #   4. Replace `uses: ./` with `uses: TAIPANBOX/tokenfuse@main` (pin to a
 #      tag/SHA in production).
 #
-# `permissions` below grants `pull-requests: write` — required for the
+# `permissions` below grants `pull-requests: write`, required for the
 # action's PR-comment step (posts/updates a scan-summary comment on the pull
 # request). Drop it (or leave it at the default `read`) if you don't want
 # that comment; the scan and its pass/fail gate work fine without it, the
@@ -40,5 +40,5 @@ jobs:
         with:
           url: "https://mcp.example.com/rpc"
           fail-on: high
-          # attempt-call: "true"   # only for a server you own — see docs
+          # attempt-call: "true"   # only for a server you own, see docs
           # lock-path: ".mcp-scan.lock.json"

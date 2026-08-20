@@ -842,10 +842,13 @@ build)`, `cloud apns (feature build)`.
    over one to two months during which a workflow may see the OS change
    underneath. `runs-on` is therefore checked by the same gate.
 
-   `@claude`, the honest residual: whether `apt-get` accepts `--snapshot` on
-   the runner is proven by CI and by nothing available on a developer's macOS.
-   If it turns out apt-get does not take the flag where `apt` does, the fix is
-   the verb, not the approach.
+   `@measured` radar job on PR #206, 2026-08-20: `apt-get` does accept
+   `--snapshot`, and the snapshot service answers once the runner's sources are
+   repointed off the azure mirror. That was the one thing holding the approach
+   up and it is not checkable on a developer's macOS, so it was written here as
+   an open residual until the run existed. The measurement is of that run and
+   that image: an apt-get that stopped taking the flag would be a fix to the
+   verb, not to the approach.
    *(gate: `scripts/pinned-installs.sh`; verified against eight mutants: a
    `cargo install` losing its version, one losing `--locked`, a `pip install`
    losing its `==`, an `apt-get install` losing its snapshot, a `runs-on` back
