@@ -906,6 +906,16 @@ it, because later is where the drift lives.
 - **Docs are numbered 01-20** (`docs/`); new design docs continue the
   sequence (next is 21). `docs/09-product-strategy.md` is the one to read
   before touching product framing or positioning.
+- **`cargo audit` at the repo root is a false green.** There are TWO
+  lockfiles, the workspace root and `crates/cluster`, and CI names it in the
+  step it fails on: "Audit both lockfiles". A bare `cargo audit` scans one and
+  says nothing about the other, so it PASSES while CI goes red, which is the
+  dangerous direction for a check to be wrong in. It also does not know about
+  the allowances `scripts/audit.sh` carries (currently RUSTSEC-2026-0235,
+  rkyv, "is in no build graph, only in the lockfile"), so it reports a failure
+  the gate has already judged. Run `./scripts/audit.sh`. This cost a red CI on
+  2026-08-20, when the h2 fix for RUSTSEC-2026-0258 landed in the root
+  lockfile and left `crates/cluster` on the vulnerable version.
 
 ## Model escalation - tell the user, don't just push through
 
