@@ -88,6 +88,15 @@ jobs:
       - name: the numbers this repo states about itself are true
         run: ./scripts/stated-numbers.sh
 
+      # An unpinned install is a dependency with no lockfile. `cargo install
+      # bpf-linker` took main red on 2026-08-20 without a commit: 0.11.0 was
+      # published the day after that job last passed, and the first pull
+      # request opened afterwards wore the red check. Every job here installs
+      # tools by name, so the check that they are pinned runs once, over all
+      # the workflow files, rather than once per job.
+      - name: every tool CI installs is pinned
+        run: ./scripts/pinned-installs.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-latest
@@ -97,7 +106,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install pytest
+        run: pip install pytest==9.1.1
       - name: Test
         working-directory: sdk/python
         run: python -m pytest -q
@@ -128,7 +137,7 @@ jobs:
         run: cargo run -q -p tokenfuse-cloud -- --openapi > openapi.json
       - name: Validate spec
         run: |
-          pip install openapi-spec-validator
+          pip install openapi-spec-validator==0.9.0
           openapi-spec-validator openapi.json
       - name: Upload spec artifact
         uses: actions/upload-artifact@v7
@@ -190,7 +199,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       # Both lockfiles, one ignore list, and a check that each ignore's reason
       # still holds. Two bare `cargo audit` calls needed the list in two
       # places, because cargo-audit reads `.cargo/audit.toml` from the current

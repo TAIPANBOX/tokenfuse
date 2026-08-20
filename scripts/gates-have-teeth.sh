@@ -342,6 +342,46 @@ run_case "constants: the published artifact deleted" fail \
 	"$(py 'import os; os.remove("contracts/tokenfuse-constants.json")')" \
 	"does not exist"
 
+# --- invariant 22: every tool CI installs is pinned ------------------------
+#
+# The two `pass` cases here matter as much as the failures. This gate reads
+# workflow files as text, and the comment above the radar step quotes the old
+# unpinned command verbatim to explain what went wrong; a scanner that fails on
+# that sentence teaches people to stop writing down why. `rustup toolchain
+# install` is a channel rather than a crate and must never be a finding either.
+
+run_case "pinned-installs: a cargo install loses its version" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "cargo install cargo-audit --version 0.22.2 --locked", "cargo install cargo-audit --locked")')" \
+	"needs a version"
+
+run_case "pinned-installs: a cargo install loses --locked" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "cargo install bpf-linker --version 0.10.4 --locked", "cargo install bpf-linker --version 0.10.4")')" \
+	"--locked"
+
+run_case "pinned-installs: a pip install loses its ==" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "pip install pytest==9.1.1", "pip install pytest")')" \
+	"pkg==X.Y.Z"
+
+run_case "pinned-installs: a toolchain channel is not a tool install" pass \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "      - run: rustup toolchain install stable", "      - run: rustup toolchain install stable\\n      - run: rustup toolchain install nightly")')"
+
+run_case "pinned-installs: an unpinned command quoted in a comment" pass \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "      # Pinned, and the pin is the point.", "      # Historic note: this step read `cargo install bpf-linker` and `pip install foo`.\\n      # Pinned, and the pin is the point.")')"
+
+# Take the subject away. Every install command in this repository lives in
+# ci.yml, so neutralising the verb there leaves the gate with nothing to read,
+# and a check that cannot tell "found no faults" from "found nothing to check"
+# is the most expensive mistake this estate makes in its tooling.
+run_case "pinned-installs: no install commands left, so it measured nothing" fail \
+	"./scripts/pinned-installs.sh" \
+	"$(py 'edit_all(".github/workflows/ci.yml", " install ", " nstall ")')" \
+	"measured nothing"
+
 # --- the harness cleans up after itself ------------------------------------
 
 restore
