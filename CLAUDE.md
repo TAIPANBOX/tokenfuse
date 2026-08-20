@@ -950,9 +950,17 @@ Routine increments are fine on a cheaper model: a new report CLI (like
 
 ## Memory
 
-Session learnings live under
-`~/.claude/projects/-Users-factory-Development-tokenfuse/memory/` if present.
-Check it for prior lessons before repeating a class of mistake.
+Session learnings live under this checkout's own Claude Code project directory,
+`~/.claude/projects/<this checkout's absolute path, slashes as hyphens>/memory/`,
+if present. Check it for prior lessons before repeating a class of mistake.
+
+The literal path was written out here until 2026-08-20 and named a home
+directory that does not exist on the machine this repository is developed on, so
+for months the one line telling a reader where the prior lessons are sent them
+to nothing, silently, which is the failure mode this whole file is about. It is
+written as a derivation now for two reasons: the directory is per-machine by
+construction, so any literal is right on exactly one clone; and this repository
+is public, so a literal publishes somebody's username to everyone who reads it.
 
 ## Conventions
 

@@ -253,27 +253,45 @@ There are excellent tools *around* this problem. None of the categories below si
 | **AI gateways / proxies** | Routing, caching, fallbacks, **per-key / per-user** rate + spend limits | Key-scoped, not **run**-scoped; no loop detection; can't stop a task mid-flight |
 | **FinOps / cost tools** | Attribute cloud spend after the fact | Not in the request path; can't prevent anything |
 | **Agent guardrails / content scanners** | Content safety, prompt-injection filtering | Focused on *content*, usually SDK-level; no cost / loop / runtime enforcement |
+| **MCP scanners** | Scan an MCP server's advertised tools for poisoning, drift and unsafe flows | Scan-time, not request-time: they read `tools/list`, they do not sit between the agent and the provider, so no spend, loop or credential enforcement |
 
 ### Capability matrix
 
-| Capability | <img src="docs/assets/logo.png" height="15" align="top"> TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails |
-|---|:---:|:---:|:---:|:---:|
-| Show how much you spent | ✅ | ✅ | ✅ | - |
-| Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ |
-| **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial | ❌ |
-| **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ |
-| **Enforce: stop before the damage** | ✅ | ❌ | ⚠️ key caps only | ⚠️ content only |
-| Live kill-switch (API, TUI, dashboard) | ✅ | ❌ | ❌ | ❌ |
-| **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ |
-| Free MCP poisoning / rug-pull scan, CI-gated | ✅ | ❌ | ❌ | ⚠️ partial |
-| Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial |
-| Shadow-agent discovery (eBPF) | ✅ | ❌ | ❌ | ❌ |
+| Capability | <img src="docs/assets/logo.png" height="15" align="top"> TokenFuse | 🪞 Observability | 🚦 Gateways | 🛡️ Guardrails | 🔎 MCP scanners |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Show how much you spent | ✅ | ✅ | ✅ | - | ❌ |
+| Per-key / per-user spend limits | ✅ | ❌ | ✅ | ❌ | ❌ |
+| **Per-run budgets** (a whole agent task) | ✅ | ❌ | ⚠️ partial | ❌ | ❌ |
+| **Loop / runaway detection** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Enforce: stop before the damage** | ✅ | ❌ | ⚠️ dollar caps per model / user / team | ⚠️ content only | ⚠️ at scan time, not in the request path |
+| Live kill-switch (API, TUI, dashboard) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Budgets survive a crash** (HA, no double-spend) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Free MCP poisoning / rug-pull scan, CI-gated | ✅ | ❌ | ❌ | ⚠️ partial | ✅ |
+| Tool shadowing / toxic-flow detection | ❌ | ❌ | ❌ | ⚠️ partial | ✅ |
+| Secrets kept out of the model (MCP broker) | ✅ | ❌ | ❌ | ⚠️ partial | ❌ |
+| Shadow-agent discovery (eBPF) | ✅ | ❌ | ❌ | ❌ | ❌ |
+
+**Checked against the field on 2026-08-20**, and this table dates faster than the rest of this
+document, so treat an undated copy of it as stale. Two rows moved since the table was first written:
+
+- **Gateways can now stop a call on spend.** Cloudflare AI Gateway opened a public beta of
+  dollar-denominated [spend limits](https://developers.cloudflare.com/ai-gateway/features/spend-limits/)
+  on 2026-06-05: up to 20 rules per gateway scoped by model, provider or a custom metadata dimension
+  such as user, team or app, returning `429` or falling back to a cheaper model when a budget is hit.
+  That is real enforcement, and the cell above was upgraded from "key caps only" to say so. What it is
+  not is a budget for *one agent run*: the rules are configured on the gateway, not opened and closed
+  by the task, and nothing there survives a crash without double-spending.
+- **A dedicated MCP scanner category now exists**, so it gets its own column rather than being left
+  out of a table it would score well in. [`mcp-scan`](https://github.com/invariantlabs-ai/mcp-scan)
+  from Invariant Labs, who named tool poisoning in April 2025, is Apache-2.0, free, pins tool hashes
+  against rug pulls, and covers 15+ risk classes; Cisco ships `mcp-scanner`. On scan *breadth* they are
+  ahead of us, which is why the tool-shadowing row above is a ❌ in our column.
 
 ### What has no equivalent we're aware of
 
-TokenFuse's core bet is **enforcement, not observation**, and a few of its capabilities have, to our knowledge, no direct equivalent in another tool:
+TokenFuse's core bet is **enforcement, not observation**. Enforcement itself is no longer ours alone, as the note above records, but a few capabilities still have, to our knowledge and as checked on 2026-08-20, no direct equivalent in another tool:
 
-- **Loop-aware enforcement at the proxy.** Gateways cap a key; none *detect a runaway loop* and cut it off mid-task.
+- **Loop-aware enforcement at the proxy.** Gateways cap a key or a spend rule; none *detect a runaway loop* and cut it off mid-task. A loop that stays under budget is invisible to a dollar cap and expensive to the person paying it.
 - **Per-run budgets linearized across an HA cluster.** Reserve/settle runs through a raft state machine, so several gateways serving the same run can't *both* slip past one ceiling, a distributed no-double-spend guarantee for budgets.
 - **MCP credential brokering.** The agent holds only a *handle* (`{{secret:token}}`); the real secret is injected at the boundary, so it never enters the prompt, trace, or the model's memory.
 - **eBPF shadow-agent discovery.** Find agents by the LLM traffic they emit, with zero application changes.
