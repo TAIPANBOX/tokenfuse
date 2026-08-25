@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
-use tokenfuse_core::SecretVault;
+use tokenfuse_core::{ScopeRule, SecretVault};
 use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
 use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
@@ -911,5 +911,293 @@ async fn pii_masks_in_tool_args() {
     assert!(
         forwarded_email.contains("[REDACTED:pii_email]"),
         "masked args should carry the redaction marker: {resp}"
+    );
+}
+
+// --- Secret scoping (TOKENFUSE_MCP_SECRET_SCOPES, CLAUDE.md invariant 23) -
+//
+// Before this, `SecretVault::get` took only a name: any authenticated
+// caller, as any agent, calling any tool, could resolve any secret in the
+// vault by using its handle. These tests cover the fix: resolution is now
+// identity-aware, a rule is optional and configured separately from
+// TOKENFUSE_MCP_SECRETS, and an unscoped secret behaves exactly as before.
+
+/// Like `broker_state`, but the caller supplies the vault directly (with
+/// whatever `ScopeRule`s it wants set) instead of the hardcoded unscoped
+/// "gh" secret. Everything else is the same un-gated default: no scan, no
+/// dlp, no lock, Wardryx disabled, no broker keys - the point of these tests
+/// is who may resolve which secret, not any of the broker's other planes.
+fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerState> {
+    Arc::new(BrokerState {
+        upstream,
+        named_upstreams: Default::default(),
+        vault,
+        scan: ScanMode::Off,
+        dlp: tokenfuse_core::DlpMode::Off,
+        dlp_pii: tokenfuse_core::DlpMode::Off,
+        lock: None,
+        wardryx: Arc::new(Wardryx::disabled()),
+        keys: ClientKeys::default(),
+        client: reqwest::Client::new(),
+        events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+    })
+}
+
+fn broker_with_vault(upstream: String, vault: SecretVault) -> Router {
+    app(broker_state_with_vault(upstream, vault))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_secret_resolves_for_its_allowed_agent_and_reaches_the_upstream() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::agents(["agent-a"]));
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent-a")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let auth = resp["result"]["echo"]["arguments"]["auth"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        auth, "Bearer ghp_REALSECRET",
+        "the allowed agent must get the real secret: {resp}"
+    );
+}
+
+/// The upstream must see NO REQUEST at all, matching how
+/// `a_tool_call_with_no_agent_id_is_refused_and_no_secret_is_resolved`
+/// proves its own refusal above: a scope-denied handle is caught before
+/// forwarding, not merely left blank on the way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_secret_is_refused_for_a_different_agent_and_nothing_is_forwarded() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::agents(["agent-a"]));
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent-mallory")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let forwarded = seen.lock().expect("upstream log");
+    assert!(
+        forwarded.is_empty(),
+        "a scope-denied secret must never reach the upstream: {} request(s) were forwarded",
+        forwarded.len()
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32008),
+        "a scope-denied secret is a distinct JSON-RPC error: {resp}"
+    );
+    assert!(
+        resp.get("result").is_none(),
+        "a refused call must not carry a result: {resp}"
+    );
+    assert!(
+        !resp.to_string().contains("ghp_REALSECRET"),
+        "the vault value must never leave the broker, not even inside the error body: {resp}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_scoped_secret_resolves_for_its_allowed_tool() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::tools(["create_issue"]));
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // No agent id header at all: a tools-only rule must not require one.
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "create_issue", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let auth = resp["result"]["echo"]["arguments"]["auth"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        auth, "Bearer ghp_REALSECRET",
+        "the allowed tool must get the real secret, with no agent id required: {resp}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_scoped_secret_is_refused_for_a_different_tool() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::tools(["create_issue"]));
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "delete_repo", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        seen.lock().expect("upstream log").is_empty(),
+        "a tool outside the rule's tools clause must never reach the upstream"
+    );
+    assert_eq!(resp["error"]["code"], json!(-32008), "{resp}");
+}
+
+/// Back-compat pin: a vault built with no `set_scope` call at all (the shape
+/// every existing `TOKENFUSE_MCP_SECRETS`-only deployment has) resolves for a
+/// call with no agent id header and no Wardryx configured, exactly as
+/// `injects_secret_before_forwarding` already pins above for the
+/// pre-scoping vault builder. This is the guarantee CLAUDE.md invariant 23
+/// states: scoping is additive, and a deployment that never sets
+/// `TOKENFUSE_MCP_SECRET_SCOPES` sees no behaviour change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unscoped_secret_still_resolves_for_any_agent_unchanged() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let auth = resp["result"]["echo"]["arguments"]["auth"]
+        .as_str()
+        .unwrap();
+    assert_eq!(auth, "Bearer ghp_REALSECRET");
+}
+
+/// A negative control: the SAME rule, the SAME secret, the SAME tool, only
+/// the agent id differs. If the refusal proven above were vacuous (say,
+/// `inj.refused` were never populated, or the check at the injection site
+/// never actually ran), this test could not tell a passing case from a
+/// refused one, because a broker that refuses every `tools/call` for
+/// unrelated reasons would also make the first half pass. Running both
+/// halves against the identical setup is what proves the gate is live,
+/// specifically for scoping, and not a coincidence of some other refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_allowed_pairing_proves_the_scope_refusal_above_is_not_vacuous() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::agents(["agent-a"]));
+    let broker_url = spawn_server(broker_with_vault(upstream, vault)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let http = reqwest::Client::new();
+    let call = |id: i64| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        })
+    };
+
+    // Disallowed first: refused, nothing forwarded.
+    let denied: Value = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent-mallory")
+        .json(&call(1))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(denied["error"]["code"], json!(-32008), "{denied}");
+    assert!(
+        seen.lock().expect("upstream log").is_empty(),
+        "the denied call must not have reached the upstream"
+    );
+
+    // Same rule, same secret, same tool, allowed agent this time: must
+    // succeed and must actually forward the real value. If this half failed
+    // too, the refusal above would prove nothing about scoping in
+    // particular: it could just as well be a broker that refuses every
+    // tools/call regardless of the rule.
+    let allowed: Value = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent-a")
+        .json(&call(2))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        allowed.get("error").is_none(),
+        "the allowed pairing must not be refused: {allowed}"
+    );
+    // recording_upstream's stub always answers `{"ok": true}`, not an echo,
+    // so the proof the real secret was forwarded is in what the upstream
+    // actually RECEIVED (`seen`), the same wire-level check the denied half
+    // above uses, not in the response body.
+    let forwarded = seen.lock().expect("upstream log");
+    assert_eq!(
+        forwarded.len(),
+        1,
+        "exactly the allowed call must have reached the upstream"
+    );
+    assert_eq!(
+        forwarded[0]["params"]["arguments"]["auth"], "Bearer ghp_REALSECRET",
+        "the upstream must receive the real secret, not the handle: {:?}",
+        forwarded[0]
     );
 }

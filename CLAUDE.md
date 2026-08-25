@@ -857,6 +857,73 @@ build)`, `cloud apns (feature build)`.
    verbatim. The eighth takes the subject away: with no install command left it
    must say it measured nothing rather than report OK)*
 
+23. **A door with something behind it still has to check who is knocking.**
+   Invariant 20 closed who may reach the broker's port; this closes a
+   different question the door does not answer: once inside, which secret a
+   caller may pull. `SecretVault::get` took only a name, so `{{secret:NAME}}`
+   resolved against the whole vault for any authenticated caller, as any
+   agent, calling any tool. `mcpbroker::process` had both `agent_id` (already
+   read two lines earlier for the Wardryx gate) and the tool name in hand at
+   the injection call site and used neither. Verified 2026-08-25.
+
+   Resolution is now identity-aware: `SecretVault::resolve(name, agent_id,
+   tool)` is the read path `inject_secrets` goes through, and a secret may
+   carry an optional `ScopeRule` naming allowed agent ids and/or allowed tool
+   names, `TOKENFUSE_MCP_SECRET_SCOPES`, configured SEPARATELY from
+   `TOKENFUSE_MCP_SECRETS` so an existing deployment that never sets it is
+   byte-for-byte unchanged: a secret named in no rule is unscoped, resolvable
+   by any agent, any tool, exactly as before this existed. The handle syntax,
+   `{{secret:NAME}}`, did not change.
+
+   Unlike `ClientKeys::from_spec`, which skips one malformed entry and keeps
+   the rest of a spec usable, ONE malformed `TOKENFUSE_MCP_SECRET_SCOPES`
+   entry refuses the whole spec and the process does not start. The two
+   failures are not the same shape: a dropped key entry only makes one fewer
+   credential valid; a dropped scope entry would silently unscope the secret
+   it was meant to protect, which is the exact failure this invariant closes.
+
+   A refused resolution refuses the WHOLE `tools/call` (JSON-RPC `-32008`),
+   the same posture as the Wardryx deny beside it in `process`, rather than
+   forwarding the call with the handle left as an unsubstituted placeholder.
+   Leaving the placeholder and forwarding anyway would still reach the
+   upstream MCP server and could still trigger whatever side effect that tool
+   has, with a syntactically broken credential standing in for a real one; an
+   agent with no authorization for a secret has no business causing that tool
+   to run at all. Never logs the secret value, only its name, the agent, and
+   the tool.
+
+   Because unscoped means anyone, and that must never be silent: the broker
+   logs at startup how many configured secrets carry no rule
+   (`mcpbroker::unscoped_secrets_warning`), and an opt-in
+   `TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES=1` (parsed like
+   `TOKENFUSE_MCP_ALLOW_OPEN_BIND`) turns that into a refusal to start
+   (`mcpbroker::refuse_unscoped_secrets`), naming the unscoped secrets and how
+   to fix it. Off by default, so nothing changes until an operator asks.
+   *(test: sixteen in `core::secretbroker` covering `ScopeRule::allows`,
+   `SecretVault::resolve` and `parse_scope_spec`, including
+   `an_unscoped_secret_resolves_for_any_agent_any_tool` (the back-compat
+   guarantee), `an_agent_scoped_secret_refuses_an_absent_identity` (a call
+   with no agent id is never a wildcard) and
+   `a_malformed_entry_fails_the_whole_spec`; seven in `gateway::mcpbroker`
+   covering `unscoped_secrets_warning` and `refuse_unscoped_secrets`,
+   including `require_scopes_refuses_to_start_when_a_secret_is_unscoped` and
+   `require_scopes_off_never_refuses_even_with_unscoped_secrets`; and six in
+   `tests/mcp_broker.rs` over the live HTTP path, asserting on what actually
+   reached the upstream the way
+   `a_tool_call_with_no_agent_id_is_refused_and_no_secret_is_resolved` already
+   does:
+   `a_scoped_secret_resolves_for_its_allowed_agent_and_reaches_the_upstream`,
+   `a_scoped_secret_is_refused_for_a_different_agent_and_nothing_is_forwarded`,
+   `a_tool_scoped_secret_resolves_for_its_allowed_tool`,
+   `a_tool_scoped_secret_is_refused_for_a_different_tool`,
+   `an_unscoped_secret_still_resolves_for_any_agent_unchanged` and
+   `the_allowed_pairing_proves_the_scope_refusal_above_is_not_vacuous`, the
+   negative control: the SAME rule, both halves, so the refusal cannot be
+   mistaken for a broker that refuses every call. All twenty-nine were run
+   against the unfixed code first: `ScopeRule`, `resolve` and
+   `parse_scope_spec` did not exist, and `inject_secrets` took two arguments,
+   not four, so the suite failed to compile)*
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

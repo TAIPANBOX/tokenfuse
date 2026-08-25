@@ -28,7 +28,11 @@
 //! mask|block`, a separate opt-in PII extension of `_DLP`, see
 //! `tokenfuse_core::dlp`'s module doc), `_LOCK` (rug-pull baseline), `_ADDR`,
 //! `_KEYS` (the broker's own client credentials, off unless set), `_STDIO`,
-//! `_ALLOW_OPEN_BIND` (opt out of the refusal below, off unless set), plus
+//! `_ALLOW_OPEN_BIND` (opt out of the refusal below, off unless set),
+//! `_SECRET_SCOPES` (which agent ids and/or tool names may resolve which
+//! secret, off unless set, see [`BrokerState::vault`] and
+//! `docs/23-mcp-broker-v2.md` section 4), `_REQUIRE_SECRET_SCOPES` (refuse to
+//! start if any configured secret has no scope rule, off unless set), plus
 //! the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
 //! Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
 //!
@@ -76,6 +80,13 @@ pub struct BrokerState {
     /// request (and its injected secrets) to the wrong server is exactly the
     /// mistake this refusal prevents.
     pub named_upstreams: BTreeMap<String, String>,
+    /// Named secrets the broker can inject, and the optional per-secret
+    /// [`tokenfuse_core::ScopeRule`]s (`TOKENFUSE_MCP_SECRET_SCOPES`) that
+    /// narrow WHICH agent id and/or tool may resolve which. A secret with no
+    /// rule resolves for any agent, any tool: the only behaviour before
+    /// scoping existed, and still the default for a secret named in no
+    /// `TOKENFUSE_MCP_SECRET_SCOPES` entry. See `docs/23-mcp-broker-v2.md`
+    /// section 4 and [`process`]'s injection step.
     pub vault: SecretVault,
     pub scan: ScanMode,
     /// Scan outgoing tool-call args for raw secrets the agent pasted directly
@@ -274,6 +285,62 @@ pub fn refuse_open_bind(
     ))
 }
 
+/// The startup message for how many configured secrets carry no
+/// `TOKENFUSE_MCP_SECRET_SCOPES` rule, or `None` when the vault is empty or
+/// every configured secret is scoped.
+///
+/// An unscoped secret is resolvable by ANY agent, ANY tool: the only
+/// behaviour before scoping existed, and still the default (invariant 23,
+/// CLAUDE.md). That default must never be silent, so this fires whenever it
+/// applies rather than only above some threshold. [`refuse_unscoped_secrets`]
+/// is the opt-in stricter posture beside this warning; a warning alone is a
+/// message, not a control.
+pub fn unscoped_secrets_warning(vault: &SecretVault) -> Option<String> {
+    let unscoped = vault.unscoped_names();
+    if unscoped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "mcp broker: {} of {} configured secret(s) carry no TOKENFUSE_MCP_SECRET_SCOPES rule \
+         and are resolvable by any agent, any tool: {}. Set TOKENFUSE_MCP_SECRET_SCOPES to \
+         narrow them, or set TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES=1 to refuse to start until \
+         every secret is scoped.",
+        unscoped.len(),
+        vault.len(),
+        unscoped.join(", ")
+    ))
+}
+
+/// Whether the broker must refuse to start because
+/// `TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES` is on and at least one configured
+/// secret carries no `TOKENFUSE_MCP_SECRET_SCOPES` rule, or `None` to
+/// proceed exactly as before (which may still print
+/// [`unscoped_secrets_warning`]).
+///
+/// `require_scopes: false` (the default) never refuses, so an existing
+/// `TOKENFUSE_MCP_SECRETS`-only deployment starts exactly as it always has,
+/// the same back-compat guarantee [`refuse_open_bind`] gives a deployment
+/// with no `TOKENFUSE_MCP_KEYS`. An operator who wants every secret scoped
+/// as a hard precondition, not merely a warning read after the fact, opts in.
+pub fn refuse_unscoped_secrets(vault: &SecretVault, require_scopes: bool) -> Option<String> {
+    if !require_scopes {
+        return None;
+    }
+    let unscoped = vault.unscoped_names();
+    if unscoped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to start: TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES=1 and {} of {} configured \
+         secret(s) carry no TOKENFUSE_MCP_SECRET_SCOPES rule: {}. Add a rule for each (or \
+         drop it from TOKENFUSE_MCP_SECRETS), or unset TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES to \
+         run with unscoped secrets allowed.",
+        unscoped.len(),
+        vault.len(),
+        unscoped.join(", ")
+    ))
+}
+
 /// JSON-RPC error response with the same id as the request.
 fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
     json!({
@@ -367,6 +434,14 @@ const IDENTITY_RPC_CODE: i64 = -32007;
 const IDENTITY_RPC_MESSAGE: &str =
     "blocked: policy enforcement is on and this call carries no agent identity; \
      send one in `x-fuse-agent-id`";
+
+/// JSON-RPC code for "a `{{secret:NAME}}` handle names a secret that HAS a
+/// `TOKENFUSE_MCP_SECRET_SCOPES` rule, and this call's (agent, tool) does not
+/// satisfy it". Distinct from `-32004` (Wardryx denied the TOOL): this is the
+/// secret vault's own decision and fires whether or not Wardryx is
+/// configured at all. Distinct from `-32007` (no agent id at all): this call
+/// DID present an identity, just not one (or a tool) the rule admits.
+const SECRET_SCOPE_RPC_CODE: i64 = -32008;
 
 /// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
@@ -485,6 +560,17 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .unwrap_or("")
         .to_string();
     let agent_id = attributed_agent(ctx);
+    // The tool this call names, read once here so both the Wardryx gate
+    // below and secret-scope resolution at the injection step (which runs
+    // whether or not Wardryx is configured) see the same value. Empty when
+    // `params.name` is absent or not a string: a [`tokenfuse_core::ScopeRule`]
+    // reads an empty tool as "names no tool", never as "any tool".
+    let tool = req
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Which real MCP server this request forwards to. Resolved up front so an
     // unknown named upstream is refused before any secret is injected.
@@ -579,12 +665,6 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         if st.wardryx.mode != WardryxMode::Off {
             match agent_id {
                 Some(aid) => {
-                    let tool = req
-                        .get("params")
-                        .and_then(|p| p.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     let dctx = DecideContext {
                         agent_id: aid.to_string(),
                         // The broker has no run/budget/step state; a stable
@@ -688,12 +768,42 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         }
 
         if let Some(params) = req.get_mut("params") {
-            let inj = inject_secrets(params, &st.vault);
+            let inj = inject_secrets(params, &st.vault, agent_id, &tool);
             if inj.replaced > 0 {
                 tracing::info!(count = inj.replaced, "mcp broker: injected secrets");
             }
             if !inj.missing.is_empty() {
                 tracing::warn!(missing = ?inj.missing, "mcp broker: unknown secret handles");
+            }
+            if !inj.refused.is_empty() {
+                // A secret exists but its TOKENFUSE_MCP_SECRET_SCOPES rule
+                // does not admit this (agent, tool). Refuse the WHOLE call,
+                // the same posture as the Wardryx deny above, rather than
+                // forwarding it with the handle left as a placeholder: a
+                // "leave it unsubstituted but still forward" call still
+                // reaches the upstream MCP server and may still trigger
+                // whatever side effect that tool has, with a syntactically
+                // broken credential standing in for a real one. An agent
+                // with no authorization for this secret has no business
+                // causing that tool to run at all, so the call never
+                // leaves the broker. Never log the secret VALUE: `inj.refused`
+                // only ever carries names, never values, same as `missing`.
+                tracing::warn!(
+                    secrets = ?inj.refused,
+                    agent_id = agent_id.unwrap_or(""),
+                    tool = %tool,
+                    "mcp broker: secret handle scope-denied for this agent/tool"
+                );
+                return rpc_error(
+                    &id,
+                    SECRET_SCOPE_RPC_CODE,
+                    &format!(
+                        "blocked: secret(s) {:?} are not scoped to agent {:?} and tool {:?}",
+                        inj.refused,
+                        agent_id.unwrap_or("<none>"),
+                        tool
+                    ),
+                );
             }
         }
     }
@@ -1072,5 +1182,96 @@ mod tests {
         let warning = bind_exposure_warning("0.0.0.0:4200", false)
             .expect("the warning still fires once the refusal is opted out of");
         assert!(warning.contains("TOKENFUSE_MCP_KEYS"));
+    }
+
+    // --- unscoped_secrets_warning / refuse_unscoped_secrets ---------------
+    //
+    // Invariant 23 (CLAUDE.md): an unscoped secret is resolvable by any
+    // agent, any tool, which is a real risk that must never be silent.
+    // `unscoped_secrets_warning` is the always-on visibility;
+    // `refuse_unscoped_secrets` is the opt-in stricter posture beside it,
+    // gated on `TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES`.
+
+    fn a_vault_with(secrets: &[(&str, &str)]) -> tokenfuse_core::SecretVault {
+        let mut vault = tokenfuse_core::SecretVault::new();
+        for (name, value) in secrets {
+            vault.insert(*name, *value);
+        }
+        vault
+    }
+
+    #[test]
+    fn an_empty_vault_warns_about_nothing() {
+        assert_eq!(unscoped_secrets_warning(&a_vault_with(&[])), None);
+    }
+
+    #[test]
+    fn a_fully_scoped_vault_warns_about_nothing() {
+        let mut vault = a_vault_with(&[("gh", "ghp_REAL")]);
+        vault.set_scope("gh", tokenfuse_core::ScopeRule::agents(["agent-a"]));
+        assert_eq!(unscoped_secrets_warning(&vault), None);
+    }
+
+    #[test]
+    fn an_unscoped_secret_is_named_in_the_warning() {
+        let vault = a_vault_with(&[("gh", "ghp_REAL"), ("stripe", "sk_REAL")]);
+        let warning = unscoped_secrets_warning(&vault).expect("an unscoped secret must warn");
+        assert!(warning.contains("gh"), "{warning:?}");
+        assert!(warning.contains("stripe"), "{warning:?}");
+        assert!(
+            warning.contains("TOKENFUSE_MCP_SECRET_SCOPES"),
+            "the warning must name the variable that fixes it: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn require_scopes_off_never_refuses_even_with_unscoped_secrets() {
+        let vault = a_vault_with(&[("gh", "ghp_REAL")]);
+        assert_eq!(
+            refuse_unscoped_secrets(&vault, false),
+            None,
+            "the default (off) must behave exactly as before this existed"
+        );
+    }
+
+    #[test]
+    fn require_scopes_with_an_empty_vault_never_refuses() {
+        assert_eq!(
+            refuse_unscoped_secrets(&a_vault_with(&[]), true),
+            None,
+            "nothing configured means nothing to refuse"
+        );
+    }
+
+    /// The decided behaviour: strict mode with an unscoped secret refuses to
+    /// start, naming the secret, the switch that caused it, and how to fix
+    /// it, so an operator can act without reading source.
+    #[test]
+    fn require_scopes_refuses_to_start_when_a_secret_is_unscoped() {
+        let vault = a_vault_with(&[("gh", "ghp_REAL")]);
+        let refusal = refuse_unscoped_secrets(&vault, true)
+            .expect("strict mode with an unscoped secret must refuse to start");
+        assert!(refusal.contains("gh"), "{refusal:?}");
+        assert!(
+            refusal.contains("TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES"),
+            "the refusal must name the switch that caused it: {refusal:?}"
+        );
+        assert!(
+            refusal.contains("TOKENFUSE_MCP_SECRET_SCOPES"),
+            "the refusal must name how to fix it: {refusal:?}"
+        );
+    }
+
+    /// The mirror image: every secret scoped means strict mode starts
+    /// cleanly, same as if it were never turned on.
+    #[test]
+    fn require_scopes_starts_cleanly_when_every_secret_is_scoped() {
+        let mut vault = a_vault_with(&[("gh", "ghp_REAL")]);
+        vault.set_scope("gh", tokenfuse_core::ScopeRule::agents(["agent-a"]));
+        assert_eq!(
+            refuse_unscoped_secrets(&vault, true),
+            None,
+            "every secret scoped must start cleanly even under strict mode"
+        );
     }
 }
