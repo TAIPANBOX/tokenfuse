@@ -111,11 +111,25 @@ thing, since "it failed" and "it failed for this reason" are different claims.
 It also asserts two gates must NOT fire, because an overeager check gets deleted
 as fast as a toothless one.
 
-**It asserts a third property, on seven of its 22 cases: a gate whose subject
+**It asserts a third property, on nine of its 34 cases: a gate whose subject
 has been taken away must say it measured nothing rather than report OK.** A
 check that cannot tell "did not fail" from "did not run" is the most expensive
 mistake this estate makes in its tooling, and it is made in tooling rather than
 in product code because tooling is where a silent pass looks like a result.
+
+Both numbers in that sentence were stale before they were corrected on
+2026-08-25: it said seven of 22 while the harness ran 30, because the count was
+written once and the cases kept arriving. @measured on that date, the run
+itself for the new figure and `git show origin/main:scripts/gates-have-teeth.sh
+| grep -c '^run_case'` for the old one, minus one for the function's own
+definition, which that pattern also matches. That is invariant 12's own failure
+inside the file that records invariant 12, and it is left written down rather
+than quietly fixed, because the fix that would actually hold is a gate and
+there is not one. Nothing checks this sentence. Counting cases is easy
+(`./scripts/gates-have-teeth.sh | grep -c '^ok '`); deciding which of them
+assert the taken-away property is a reading of each case's intent, and a
+regular expression over the labels would be a fourth thing to keep true.
+`@claude` 2026-08-25.
 
 It mutates tracked files and restores them with `git checkout`, so it refuses to
 start on a dirty tree and cannot tell your edits from its own. That makes it the
