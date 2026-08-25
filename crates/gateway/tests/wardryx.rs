@@ -704,3 +704,178 @@ async fn an_unreachable_pdp_never_counts_as_an_allow() {
     assert_eq!(v.deny, 0);
     assert_eq!(v.unreachable_fallbacks, 1);
 }
+
+// ---------------------------------------------------------------------------
+// The policy plane as a DEPENDENCY of this box, rather than as its judge.
+//
+// Everything above this line asks what the PDP decided. These four ask what
+// happens when it decides nothing because nobody could reach it, which until
+// now was the quietest failure in the gateway: `Verdicts` counted it, a
+// `tracing::warn!` mentioned it, and the shared event bus said nothing at all,
+// so a call that no policy had governed was indistinguishable on the trail
+// from one that a policy had allowed.
+// ---------------------------------------------------------------------------
+
+/// An exporter on a private file, plus the path to read back.
+fn recording_exporter(
+    tag: &str,
+) -> (
+    Arc<tokenfuse_core::agent_event::Exporter>,
+    std::path::PathBuf,
+) {
+    let dir = std::env::temp_dir().join(format!("tf-pdp-depfail-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let path = dir.join("events.ndjson");
+    let exp =
+        tokenfuse_core::agent_event::Exporter::open(path.to_str().expect("a utf-8 temp path"))
+            .expect("an exporter on a fresh file");
+    (Arc::new(exp), path)
+}
+
+fn dependency_failures_at(path: &std::path::Path) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("one JSON object per line"))
+        .filter(|e| e["type"] == "dependency_failed")
+        .collect()
+}
+
+/// A port nothing is listening on, so `decide` fails at connect rather than
+/// hanging until the timeout. The same precondition mockryx's game-day drill
+/// creates for the provider, one plane over.
+const DEAD_PDP: &str = "http://127.0.0.1:1";
+
+#[tokio::test]
+async fn an_unreachable_policy_plane_is_recorded_when_it_fails_open() {
+    let (events, path) = recording_exporter("open");
+    let hook = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        DEAD_PDP,
+        None,
+        Duration::from_millis(200),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "fail-open means the call proceeds, and this test does not change that"
+    );
+
+    let found = dependency_failures_at(&path);
+    assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+    let e = &found[0];
+    assert_eq!(e["severity"], "high");
+    assert_eq!(e["data"]["dependency"], "policy_plane");
+    assert_eq!(e["data"]["stage"], "decide");
+    assert_eq!(
+        e["data"]["effect"], "allowed_ungoverned",
+        "the member that stops a reader filing this as an ordinary outage: \
+         nothing governed this call"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_policy_plane_is_recorded_when_it_fails_closed() {
+    let (events, path) = recording_exporter("closed");
+    let hook = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Closed,
+        DEAD_PDP,
+        None,
+        Duration::from_millis(200),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "fail-closed refuses the call"
+    );
+
+    let found = dependency_failures_at(&path);
+    assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+    assert_eq!(found[0]["data"]["dependency"], "policy_plane");
+    assert_eq!(
+        found[0]["data"]["effect"], "denied_unasked",
+        "\"a policy denied this\" and \"nobody could be asked\" are different \
+         facts, and only one of them is true here"
+    );
+}
+
+// Shadow mode reaches the same code and blocks nothing whatever the failmode
+// says, so the effect is read from the decision that was applied and not from
+// the configuration. Without this case a reader of the trail would be told a
+// shadow deployment had refused a call it forwarded.
+#[tokio::test]
+async fn an_unreachable_policy_plane_in_shadow_mode_reports_what_actually_happened() {
+    let (events, path) = recording_exporter("shadow");
+    let hook = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Closed,
+        DEAD_PDP,
+        None,
+        Duration::from_millis(200),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "shadow never blocks");
+
+    let found = dependency_failures_at(&path);
+    assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+    assert_eq!(
+        found[0]["data"]["effect"], "allowed_ungoverned",
+        "the failmode says closed and the call went through; the event reports \
+         the call, not the setting"
+    );
+}
+
+// The non-fault case, and the one that decides whether the flag means
+// anything: a PDP that answered must never be reported as a PDP that died,
+// including when what it answered was no.
+#[tokio::test]
+async fn a_policy_plane_that_answered_is_not_reported_as_unreachable() {
+    let (events, path) = recording_exporter("answered");
+    let stub = WardryxStub::new(json!({"decision": "deny", "reason": "tool not allowed"}));
+    let url = spawn_server(wardryx_router(stub)).await;
+    let hook = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_secs(2),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::OK, "the PDP said no");
+
+    assert!(
+        dependency_failures_at(&path).is_empty(),
+        "a plane that answered was reported as a plane that failed: {:?}",
+        dependency_failures_at(&path)
+    );
+}
