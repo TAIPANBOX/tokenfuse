@@ -191,6 +191,21 @@ pub struct WardryxOutcome {
     /// Set only on `hold`: the id the caller references, via
     /// `x-fuse-approval-token` once approved, to resubmit the request.
     pub approval_id: Option<String>,
+    /// This outcome was SYNTHESIZED because the PDP could not be reached, and
+    /// no policy engine produced it.
+    ///
+    /// A field rather than a caller parsing `reason` for the word
+    /// "unreachable": the reason is an operator-facing string that exists to
+    /// be read, and a control-flow decision keyed on its wording breaks
+    /// silently the first time somebody improves the sentence.
+    ///
+    /// It is here because the fallback is invisible from every other angle.
+    /// `Verdicts` already counts it (`unreachable_fallbacks`), and that
+    /// counter is what `/v1/policy-plane` reports, but a count is a number in
+    /// a process that restarts; nothing on the shared bus said the plane had
+    /// been down at all, so a call that nobody governed was recorded as a
+    /// call that policy allowed.
+    pub unreachable: bool,
     /// Whether resubmission requires `x-fuse-approval-token`. Defaults to
     /// `true` (the safer assumption) when the PDP response omits it.
     pub approval_token_required: bool,
@@ -325,6 +340,10 @@ impl WardryxClient {
             reason: wire.reason,
             approval_id: wire.approval_id,
             approval_token_required: wire.approval_token_required.unwrap_or(true),
+            // A plane that answered. This is the value that makes the flag
+            // worth having: without a decode path that sets it false, an
+            // "unreachable" flag is a constant.
+            unreachable: false,
         };
         Ok((outcome, wire.cacheable))
     }
@@ -391,6 +410,11 @@ impl Cache {
             // Only `allow`/`deny` are ever stored (see `put`), and neither
             // carries an approval id, so this is always correct for a hit.
             approval_id: None,
+            // A cache hit is a real verdict the PDP gave, replayed. `fallback`
+            // is never cached (its own doc says why: a transient outage must
+            // not outlive itself by a TTL), so nothing unreachable can arrive
+            // here to be reported twice.
+            unreachable: false,
             approval_token_required: true,
         })
     }
@@ -637,6 +661,7 @@ impl Wardryx {
             )),
             approval_id: None,
             approval_token_required: true,
+            unreachable: true,
         }
     }
 }
@@ -693,6 +718,7 @@ mod tests {
             reason: Some("no".to_string()),
             approval_id: None,
             approval_token_required: true,
+            unreachable: false,
         };
         cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
         let hit = cache.get("agent-1", &["grep".to_string()], None).unwrap();
@@ -709,6 +735,7 @@ mod tests {
             reason: None,
             approval_id: Some("appr-1".to_string()),
             approval_token_required: true,
+            unreachable: false,
         };
         // cacheable: true here on purpose -- proves the hold guard fires on
         // its own, independent of the cacheable guard below it.
@@ -729,6 +756,7 @@ mod tests {
             reason: Some("allowed for now".to_string()),
             approval_id: None,
             approval_token_required: true,
+            unreachable: false,
         };
         cache.put("agent-1", &["grep".to_string()], None, &outcome, false);
         assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
@@ -743,6 +771,7 @@ mod tests {
             reason: None,
             approval_id: None,
             approval_token_required: true,
+            unreachable: false,
         };
         cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
         std::thread::sleep(Duration::from_millis(20));

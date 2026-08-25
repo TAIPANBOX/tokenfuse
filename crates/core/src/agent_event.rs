@@ -127,6 +127,171 @@ pub enum EventType {
     /// gate is active and the request carried an `agent_id` (never fabricated,
     /// see [`build`]).
     ToolCall,
+    /// One of THIS BOX'S OWN dependencies failed: the model provider could not
+    /// be reached or died mid-answer, or the policy plane could not be asked.
+    ///
+    /// The first type in this taxonomy that is not about an agent. Every
+    /// variant above it is either the agent misbehaving or this gateway
+    /// refusing it, which is what made the gap worth a type rather than a log
+    /// line: measured 2026-08-25 against a gateway whose upstream was pointed
+    /// at a dead port, the refusal degraded correctly (502, no hang, no
+    /// invented answer, reservation released at zero) and **nothing anywhere
+    /// in the estate recorded that it had happened**. `mockryx`'s
+    /// `provider-outage-game-day` drill fails on exactly that and keeps
+    /// failing until this is emitted.
+    ///
+    /// **One type, with `data.dependency` saying which one**, rather than
+    /// `upstream_failure` beside a later `policy_plane_unreachable`. The same
+    /// decision SPEC.md §6.2 records for idryx's `identity_finding`: one name a
+    /// consumer routes on, the detail in `data`, instead of a row in the
+    /// registry and an entry in every consumer's render catalogue per
+    /// dependency. This box has more than two dependencies and will grow more.
+    ///
+    /// `data` carries `{dependency, stage, effect, detail}`:
+    /// `dependency` is `provider` | `policy_plane`; `stage` is where in the
+    /// call it happened (`send` | `stream` | `response_body` | `decide`);
+    /// `detail` is the transport error, capped at
+    /// [`DEPENDENCY_DETAIL_MAX_CHARS`]; and `effect` is what this gateway then
+    /// DID, which is the member a consumer must not skip:
+    ///
+    /// - `call_failed` — the call did not complete. The agent got an error.
+    /// - `allowed_ungoverned` — the policy plane could not be reached and
+    ///   `failmode=open` (the default) let the call proceed. **Nothing
+    ///   governed this call**, and a consumer that files this beside an
+    ///   ordinary outage is filing a governance gap as a provider problem.
+    /// - `denied_unasked` — the policy plane could not be reached and
+    ///   `failmode=closed` refused the call. Not the same fact as a policy
+    ///   denying it, and `policy_deny` would say the wrong one.
+    ///
+    /// Severity `high`, and `high` rather than `critical` for the reason
+    /// `breaker_tripped` was lowered on 2026-08-03: `critical` is where
+    /// `budget_exhausted` and `mcp_drift` live, and a provider having a bad
+    /// afternoon does not belong in the band an operator has reserved for
+    /// money gone and a rug-pull. `high` clears heraldyx's default floor and
+    /// stack-up's `medium` one, so a person is told either way.
+    ///
+    /// The severity is one value for a type that covers a provider outage and
+    /// a silently ungoverned call, and that is deliberate rather than
+    /// unfinished: severity is fixed per type in this crate precisely so no
+    /// emission site can pick one, and splitting the band would mean splitting
+    /// the type. Which case it was is in `effect`, where a consumer can read
+    /// it, rather than in a number two cases have to share.
+    DependencyFailed,
+}
+
+/// How much of a transport error's text travels in `data.detail`.
+///
+/// Capped because the string comes from whatever the HTTP client had to say
+/// about a failure, and an unbounded field on a per-call event is a line of
+/// NDJSON whose length an operator's upstream chose. What it holds is the
+/// error text and the configured upstream host, never a request body: nothing
+/// on the failure paths that emit this has parsed the body into the error.
+pub const DEPENDENCY_DETAIL_MAX_CHARS: usize = 200;
+
+/// Which of the box's own dependencies failed (`data.dependency`).
+///
+/// An enum rather than a `&str` at the call site for the reason the severity
+/// mapping is not caller-supplied: two emission sites spelling the same
+/// dependency differently would put two names for one thing on a shared bus,
+/// and every downstream count of them would be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dependency {
+    /// The model provider this gateway forwards to.
+    Provider,
+    /// The policy decision point (wardryx).
+    PolicyPlane,
+}
+
+impl Dependency {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Dependency::Provider => "provider",
+            Dependency::PolicyPlane => "policy_plane",
+        }
+    }
+}
+
+/// Where in the call the dependency failed (`data.stage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyStage {
+    /// The request could not be sent, or the send returned an error.
+    Send,
+    /// The answer had started and the stream broke partway through.
+    Stream,
+    /// The answer arrived and its body could not be collected.
+    ResponseBody,
+    /// The policy plane could not be asked for a decision.
+    Decide,
+}
+
+impl DependencyStage {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            DependencyStage::Send => "send",
+            DependencyStage::Stream => "stream",
+            DependencyStage::ResponseBody => "response_body",
+            DependencyStage::Decide => "decide",
+        }
+    }
+}
+
+/// What this gateway did about it (`data.effect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyEffect {
+    /// The call did not complete and the caller got an error.
+    CallFailed,
+    /// The policy plane was unreachable and `failmode=open` let the call
+    /// through. Nothing governed it.
+    AllowedUngoverned,
+    /// The policy plane was unreachable and `failmode=closed` refused the
+    /// call. Nobody was asked; no policy denied it.
+    DeniedUnasked,
+}
+
+impl DependencyEffect {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            DependencyEffect::CallFailed => "call_failed",
+            DependencyEffect::AllowedUngoverned => "allowed_ungoverned",
+            DependencyEffect::DeniedUnasked => "denied_unasked",
+        }
+    }
+}
+
+/// The `data` object for [`EventType::DependencyFailed`], built in one place.
+///
+/// A constructor rather than a `json!` at each of the five emission sites: the
+/// member names are the published contract (SPEC.md §6.2), four call sites
+/// spelling them by hand is four chances to write `dep` or `reason` on a bus
+/// three other repositories parse, and this is the shape invariant 14 is about
+/// one scale down.
+pub fn dependency_failed_data(
+    dependency: Dependency,
+    stage: DependencyStage,
+    effect: DependencyEffect,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dependency": dependency.as_wire_str(),
+        "stage": stage.as_wire_str(),
+        "effect": effect.as_wire_str(),
+        "detail": truncate_detail(detail),
+    })
+}
+
+/// Cut `detail` to [`DEPENDENCY_DETAIL_MAX_CHARS`] on a CHARACTER boundary.
+///
+/// By characters and not by bytes: `&s[..200]` panics in the middle of a
+/// multi-byte sequence, and an error message is somebody else's text, which
+/// means it can carry any UTF-8 at all. A truncated value ends with `…` so a
+/// reader can tell a cut string from a short one.
+fn truncate_detail(detail: &str) -> String {
+    if detail.chars().count() <= DEPENDENCY_DETAIL_MAX_CHARS {
+        return detail.to_string();
+    }
+    let mut out: String = detail.chars().take(DEPENDENCY_DETAIL_MAX_CHARS).collect();
+    out.push('…');
+    out
 }
 
 impl EventType {
@@ -149,6 +314,7 @@ impl EventType {
             EventType::UnitCapExceeded => "unit_cap_exceeded",
             EventType::PolicyDeny => "policy_deny",
             EventType::ToolCall => "tool_call",
+            EventType::DependencyFailed => "dependency_failed",
         }
     }
 
@@ -157,7 +323,7 @@ impl EventType {
     /// `budget_exhausted` / `mcp_drift` = `critical`;
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
-    /// `unit_cap_exceeded` / `policy_deny` = `high`;
+    /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
     /// `budget_threshold` / `breaker_tripped` = `medium`;
     /// `tool_call` = `low`.
     ///
@@ -194,7 +360,8 @@ impl EventType {
             | EventType::IdentityMismatch
             | EventType::RunKilled
             | EventType::UnitCapExceeded
-            | EventType::PolicyDeny => Severity::High,
+            | EventType::PolicyDeny
+            | EventType::DependencyFailed => Severity::High,
             // An early warning, on purpose one band below the incident it
             // warns about: the run is still inside its budget. Beside it, the
             // per-call record of a refusal that already happened, which is the

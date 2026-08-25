@@ -87,6 +87,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/dto-boundary.sh
 ./scripts/replicated-shape.sh
 ./scripts/honest-claims.sh
+./scripts/features-are-bound.sh
 ./scripts/runnable-quickstart.sh
 ./scripts/pinned-installs.sh
 ./scripts/audit.sh              # invariant 11; needs cargo-audit
@@ -110,11 +111,25 @@ thing, since "it failed" and "it failed for this reason" are different claims.
 It also asserts two gates must NOT fire, because an overeager check gets deleted
 as fast as a toothless one.
 
-**It asserts a third property, on seven of its 22 cases: a gate whose subject
+**It asserts a third property, on nine of its 34 cases: a gate whose subject
 has been taken away must say it measured nothing rather than report OK.** A
 check that cannot tell "did not fail" from "did not run" is the most expensive
 mistake this estate makes in its tooling, and it is made in tooling rather than
 in product code because tooling is where a silent pass looks like a result.
+
+Both numbers in that sentence were stale before they were corrected on
+2026-08-25: it said seven of 22 while the harness ran 30, because the count was
+written once and the cases kept arriving. @measured on that date, the run
+itself for the new figure and `git show origin/main:scripts/gates-have-teeth.sh
+| grep -c '^run_case'` for the old one, minus one for the function's own
+definition, which that pattern also matches. That is invariant 12's own failure
+inside the file that records invariant 12, and it is left written down rather
+than quietly fixed, because the fix that would actually hold is a gate and
+there is not one. Nothing checks this sentence. Counting cases is easy
+(`./scripts/gates-have-teeth.sh | grep -c '^ok '`); deciding which of them
+assert the taken-away property is a reading of each case's intent, and a
+regular expression over the labels would be a fourth thing to keep true.
+`@claude` 2026-08-25.
 
 It mutates tracked files and restores them with `git checkout`, so it refuses to
 start on a dirty tree and cannot tell your edits from its own. That makes it the
@@ -923,6 +938,60 @@ build)`, `cloud apns (feature build)`.
    against the unfixed code first: `ScopeRule`, `resolve` and
    `parse_scope_spec` did not exist, and `inject_secrets` took two arguments,
    not four, so the suite failed to compile)*
+
+24. **A dependency THIS BOX needs, failing, is an event on the shared bus and
+   not only a line in this process's log.** Every one of the fourteen event
+   types that preceded this one was about the agent: it misbehaved, or this
+   gateway refused it. Nothing was about the gateway's own supply failing, so
+   the loudest thing that can happen to a fleet, its model provider going away,
+   left the ledger, the trace, the Parquet export and the event bus all exactly
+   as they were on a quiet afternoon. Measured 2026-08-25 against a gateway
+   with `TOKENFUSE_UPSTREAM` pointed at a dead port: 502, no hang, no invented
+   answer, reservation released at zero, and no record anywhere that it had
+   happened.
+
+   The policy plane is the same fault one plane over and the worse half of it.
+   An unreachable PDP under the DEFAULT `failmode=open` synthesizes an `allow`,
+   `Verdicts::unreachable_fallbacks` counts it, a `tracing::warn!` mentions it,
+   and wardryx writes no `policy_allow` of its own because wardryx is the thing
+   that is down. So the response carries `x-fuse-wardryx: allow`, which is true
+   about what this gateway did and false about what any policy decided, and the
+   trail cannot tell a governed call from an ungoverned one.
+
+   **Why it is one type and not one per dependency.** `data.dependency` names
+   which; `data.effect` names what this gateway then did, and that member is
+   the one a consumer must not skip, because `allowed_ungoverned` is a
+   governance gap wearing an outage's clothes. Splitting the type would split
+   the fixed severity with it, and severity is fixed per type in this crate
+   precisely so no call site can choose one. It is the shape agent-passport
+   SPEC.md §6.2 already argues for on idryx's `identity_finding`: one name a
+   consumer routes on, the detail in `data`, rather than a registry row and a
+   render-catalogue entry per case.
+
+   **Where it deliberately says nothing.** The unmanaged pass-through reaches
+   the provider before `run_id` or `agent_id` has been resolved, so a failure
+   there has no subject; SPEC.md §6.1 forbids inventing one and
+   `Exporter::emit` counts the skip. That path has also been off by default
+   since 2026-08-06 (`require_run_id`), so it is reachable only where an
+   operator asked for it back. And a provider that ANSWERS 5xx or 529 is not
+   this event at all: it is `Ok(ProviderResponse)` with a status, forwarded
+   with its settlement, which mockryx's game-day drill spends a paragraph
+   distinguishing and which this invariant does not claim to cover.
+   *(test: `a_provider_that_cannot_be_reached_is_recorded`,
+   `a_stream_that_dies_mid_answer_is_recorded` and
+   `a_response_body_that_cannot_be_read_is_recorded` in `gateway::proxy`, each
+   verified red against the unfixed code, verbatim `exactly one event, got []`;
+   `an_unreachable_policy_plane_is_recorded_when_it_fails_open`,
+   `..._when_it_fails_closed` and
+   `an_unreachable_policy_plane_in_shadow_mode_reports_what_actually_happened`
+   in `tests/wardryx.rs`, verified red by removing the emit block, same
+   verbatim failure. The two that must NOT fire carry the rule's other half and
+   were verified against their own mutants: `a_healthy_call_reports_no_...` and
+   `a_call_with_no_identity_reports_no_...` in `gateway::proxy`, and
+   `a_policy_plane_that_answered_is_not_reported_as_unreachable`, which goes
+   red when the decode path claims `unreachable: true`. The fixed band is
+   pinned by `the_dependency_failed_event_carries_the_high_band`, and the
+   published artifact by `scripts/constants.sh`, which builds.)*
 
 ## Decisions that have no gate yet
 

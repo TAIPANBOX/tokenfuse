@@ -58,6 +58,10 @@
       {
         "severity": "low",
         "type": "tool_call"
+      },
+      {
+        "severity": "high",
+        "type": "dependency_failed"
       }
     ]
   },

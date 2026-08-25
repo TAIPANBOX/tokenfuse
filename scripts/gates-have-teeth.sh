@@ -342,6 +342,38 @@ run_case "constants: the published artifact deleted" fail \
 	"$(py 'import os; os.remove("contracts/tokenfuse-constants.json")')" \
 	"does not exist"
 
+# --- the scenarios stay bound to tests --------------------------------------
+#
+# Three cases, because this gate's three ways of being useless are different
+# faults. A binding pointing at a test that was renamed is the one that happens
+# on its own; a scenario nobody bound is the one that happens while somebody is
+# writing prose in a hurry; and a features/ directory that has gone missing is
+# the shape this repository has been bitten by twice, where a check reads
+# nothing and reports success.
+
+run_case "features-are-bound: a binding names a test that is gone" fail \
+	"./scripts/features-are-bound.sh" \
+	"$(py 'edit("features/dependency-failed.feature", "@test:a_provider_that_cannot_be_reached_is_recorded", "@test:a_provider_that_cannot_be_reached")')" \
+	"names no test"
+
+run_case "features-are-bound: a scenario with nothing behind it" fail \
+	"./scripts/features-are-bound.sh" \
+	"$(py 'edit("features/dependency-failed.feature", "  # @test:a_healthy_call_reports_no_dependency_failure\n", "")')" \
+	"proves nothing"
+
+run_case "features-are-bound: the subject taken away entirely" fail \
+	"./scripts/features-are-bound.sh" \
+	"$(py 'import shutil; shutil.rmtree("features")')" \
+	"not a pass"
+
+# And the one it must NOT fire on. A scenario may be bound to a test in
+# crates/*/tests/ as well as to one inside a module, and the two are written
+# differently (`async fn name(` against `fn name(`); a gate that only found one
+# of them would send somebody deleting perfectly good scenarios.
+run_case "features-are-bound: an integration-test binding is still a binding" pass \
+	"./scripts/features-are-bound.sh" \
+	"$(py 'edit("features/dependency-failed.feature", "Scenario: Governance is silently off", "Scenario: governance is silently off")')"
+
 # --- invariant 22: every tool CI installs is pinned ------------------------
 #
 # The two `pass` cases here matter as much as the failures. This gate reads

@@ -25,6 +25,9 @@ use axum::response::Response;
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenfuse_core::agent_event::EventType;
+use tokenfuse_core::agent_event::{
+    dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
+};
 use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
@@ -166,6 +169,75 @@ fn specific_event_for(reason: Option<BreakerReason>) -> Option<EventType> {
         | BreakerReason::DlpBlocked
         | BreakerReason::IdentityMismatch => None,
     }
+}
+
+/// One `dependency_failed` event: THIS BOX'S own dependency died, as opposed
+/// to every other event this gateway raises, which is about the agent.
+///
+/// A single function for all four failure paths rather than a `json!` at each,
+/// for the reason `tokenfuse_core::agent_event::dependency_failed_data` gives
+/// about the member names: four hand-written copies of a published contract is
+/// four chances for one of them to be spelled differently on a bus three other
+/// repositories parse.
+///
+/// Emits nothing when there is no `agent_id`, which is `build`'s rule and not
+/// a decision taken here: the envelope requires a subject, SPEC.md §6.1
+/// forbids inventing one, and `Exporter::emit` counts the skip. The unmanaged
+/// pass-through is the path where that bites, and it bites correctly: it
+/// reaches the provider before either identifier is resolved, so the honest
+/// answer about whose call the outage broke is that this gateway does not
+/// know.
+#[allow(clippy::too_many_arguments)]
+fn emit_dependency_failed(
+    st: &AppState,
+    run_id: Option<&str>,
+    agent_id: &str,
+    on_behalf_of: &[String],
+    dependency: Dependency,
+    stage: DependencyStage,
+    effect: DependencyEffect,
+    detail: &str,
+) {
+    emit_dependency_failed_via(
+        &st.events,
+        run_id,
+        agent_id,
+        on_behalf_of,
+        dependency,
+        stage,
+        effect,
+        detail,
+    );
+}
+
+/// The same, taking the exporter instead of the whole state.
+///
+/// It exists for exactly one caller and the caller is the reason: the
+/// streaming passthrough emits from inside a stream that outlives
+/// `stream_managed`, so it holds an `Arc<EventExporter>` and cannot hold an
+/// `&AppState`. Writing the emit a second time by hand there would put a
+/// second copy of this call in the file, which is the shape this repository
+/// keeps getting bitten by one scale up (invariant 14).
+#[allow(clippy::too_many_arguments)]
+fn emit_dependency_failed_via(
+    events: &crate::events::EventExporter,
+    run_id: Option<&str>,
+    agent_id: &str,
+    on_behalf_of: &[String],
+    dependency: Dependency,
+    stage: DependencyStage,
+    effect: DependencyEffect,
+    detail: &str,
+) {
+    let outcome = events.emit(
+        EventType::DependencyFailed,
+        now_millis(),
+        (!agent_id.is_empty()).then_some(agent_id),
+        run_id,
+        (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+        dependency_failed_data(dependency, stage, effect, detail),
+    );
+    crate::events::log_outcome(EventType::DependencyFailed, outcome);
 }
 
 fn emit_breaker_event(
@@ -894,6 +966,40 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             })
             .await;
 
+        // The policy plane is a dependency of this box exactly the way the
+        // provider is, and until now its dying was the quieter of the two
+        // failures and the worse one. `Verdicts::unreachable_fallbacks`
+        // counted it and `/v1/policy-plane` reported the count, but nothing
+        // reached the shared bus, so a call nobody governed was recorded by
+        // wardryx's own trail as... nothing at all, because wardryx was down
+        // and wrote no `policy_allow` either. The `x-fuse-wardryx` header on
+        // the response says `allow`, which is true of what this gateway did
+        // and false about what a policy decided.
+        if wardryx_outcome.unreachable {
+            // What the box DID, read from the decision that was actually
+            // applied rather than from the failmode, because shadow mode
+            // reaches here too and blocks nothing whatever the failmode says.
+            // `fallback` only ever synthesizes allow or deny, never hold, so
+            // there is no third case to leave unstated.
+            let effect = if st.wardryx.mode != WardryxMode::Shadow
+                && wardryx_outcome.decision == WardryxDecision::Deny
+            {
+                DependencyEffect::DeniedUnasked
+            } else {
+                DependencyEffect::AllowedUngoverned
+            };
+            emit_dependency_failed(
+                &st,
+                Some(&run_id),
+                &agent_id,
+                &on_behalf_of_chain,
+                Dependency::PolicyPlane,
+                DependencyStage::Decide,
+                effect,
+                wardryx_outcome.reason.as_deref().unwrap_or_default(),
+            );
+        }
+
         if st.wardryx.mode == WardryxMode::Shadow {
             // Shadow never blocks: just report what WOULD have happened.
             wardryx_header = Some(format!("would-{}", wardryx_outcome.decision.as_wire_str()));
@@ -1155,6 +1261,21 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             if let Some(ur) = &unit_reservation {
                 st.units.settle(ur, Microusd::ZERO, now_millis());
             }
+            // No CallRecord is written on this path, deliberately (there was
+            // no call to price), which is why the event is the only thing
+            // that will ever say this happened: without it a provider outage
+            // leaves the ledger, the trace, the Parquet export and the event
+            // bus all exactly as they were on a quiet afternoon.
+            emit_dependency_failed(
+                &st,
+                Some(&run_id),
+                &agent_id,
+                &on_behalf_of_chain,
+                Dependency::Provider,
+                DependencyStage::Send,
+                DependencyEffect::CallFailed,
+                &e.to_string(),
+            );
             return upstream_error(e);
         }
     };
@@ -1170,6 +1291,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             agent_id,
             parent_run_id,
             on_behalf_of,
+            on_behalf_of_chain,
             outcome_tag,
             key_id,
             unit,
@@ -1250,6 +1372,10 @@ fn stream_managed(
     agent_id: String,
     parent_run_id: String,
     on_behalf_of: String,
+    // The chain as a list, beside the joined `on_behalf_of` above. The joined
+    // form is a trace column and the list is what the event envelope takes
+    // (SPEC.md §5), and this function now emits, so it needs both.
+    on_behalf_of_chain: Vec<String>,
     outcome: String,
     key_id: String,
     unit: String,
@@ -1263,6 +1389,12 @@ fn stream_managed(
     // Capture the header values before `reservation` is moved into the guard.
     let run_id = reservation.run_id.clone();
     let step = reservation.step;
+    // And what an event needs, for the same reason and one line further: the
+    // guard takes `agent_id` by value, and the stream that may fail outlives
+    // this function entirely.
+    let ev_events = std::sync::Arc::clone(&st.events);
+    let ev_agent_id = agent_id.clone();
+    let ev_run_id = run_id.clone();
     // Whether the estimate may be charged when the stream reports no usage,
     // the same rule PR #167 established for `buffered_managed` one screen
     // down. A refusal is a refusal whether the client asked to stream it or
@@ -1297,7 +1429,29 @@ fn stream_managed(
         let guard = guard;
         futures::pin_mut!(inner);
         while let Some(chunk) = inner.next().await {
-            let chunk = chunk?;
+            // Reported before it is propagated, and this is the one failure
+            // path in the gateway that CANNOT be reported any other way: the
+            // status line and every header went out when the stream opened,
+            // so by the time this happens the caller has a 200 and the only
+            // thing left to say it with is the record. The guard's Drop still
+            // settles the reservation as it always did; this adds a witness,
+            // it does not change the money.
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    emit_dependency_failed_via(
+                        &ev_events,
+                        Some(ev_run_id.as_str()),
+                        &ev_agent_id,
+                        &on_behalf_of_chain,
+                        Dependency::Provider,
+                        DependencyStage::Stream,
+                        DependencyEffect::CallFailed,
+                        &e.to_string(),
+                    );
+                    Err(e)?
+                }
+            };
             yield chunk;
         }
         guard.complete();
@@ -1377,6 +1531,21 @@ async fn buffered_managed(
             if let Some(ur) = &unit_reservation {
                 st.units.settle(ur, Microusd::ZERO, now_millis());
             }
+            // A different stage from the send failure above and worth telling
+            // apart: the provider answered, so whatever is wrong is between
+            // the status line and the last byte rather than in reaching the
+            // provider at all, and an operator debugging one should not be
+            // shown the other.
+            emit_dependency_failed(
+                st,
+                Some(&reservation.run_id),
+                agent_id,
+                on_behalf_of_chain,
+                Dependency::Provider,
+                DependencyStage::ResponseBody,
+                DependencyEffect::CallFailed,
+                &e.to_string(),
+            );
             return upstream_error(e);
         }
     };
@@ -3410,6 +3579,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
+            Vec::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -4840,5 +5010,284 @@ mod tests {
         assert_eq!(snap.reserved, Microusd::ZERO, "the reservation is released");
         let records = sink.snapshot();
         assert_eq!(records[0].cost_microusd, billed.0);
+    }
+
+    // -- the box's own dependency failing ----------------------------------
+    //
+    // Every test below asserts on the NDJSON the exporter actually wrote,
+    // not on a counter or a log line: the whole finding these close is that
+    // a fault which changed no observable state was invisible, and a test
+    // that read an in-process counter would have passed against the code
+    // that had the fault.
+
+    /// An upstream that cannot be reached at all: `send` returns `Err`, the
+    /// shape a refused connection, a DNS failure, a TLS failure or a connect
+    /// timeout takes by the time it reaches this crate (see
+    /// `provider::HttpProvider::send`, which maps every one of them to
+    /// `ProviderError::Upstream`).
+    ///
+    /// Distinct from `RefusingProvider` above, and the distinction is the one
+    /// mockryx's game-day drill spends a paragraph on: a provider that answers
+    /// 529 is `Ok(ProviderResponse)` with a status, while a provider that is
+    /// not there at all never produces a response to have a status.
+    struct UnreachableProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for UnreachableProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::Upstream(
+                "error sending request for url (http://127.0.0.1:1/v1/messages): \
+                 tcp connect error: Connection refused (os error 61)"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// An upstream that accepts the call, starts answering, and then breaks.
+    /// The status line is already 200 and already sent by the time this
+    /// happens, which is why the failure cannot be reported by a status code
+    /// and has to be reported by an event.
+    struct TornStreamProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TornStreamProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let first = Ok(Bytes::from_static(b"event: message_start\ndata: {}\n\n"));
+            let then = Err(ProviderError::Upstream(
+                "error reading a body from connection: connection reset by peer".to_string(),
+            ));
+            Ok(ProviderResponse {
+                status: 200,
+                content_type: Some("text/event-stream".to_string()),
+                body: Box::pin(futures::stream::iter(vec![first, then])),
+                usage: Arc::new(Mutex::new(None)),
+            })
+        }
+    }
+
+    /// `state` with an arbitrary upstream. The shared `state` helper takes a
+    /// `StubProvider` by value and `AppState`'s fields are private, so a test
+    /// that needs a broken upstream builds its own rather than reaching into
+    /// the struct.
+    fn state_with_provider(provider: Arc<dyn Provider>) -> AppState {
+        let prices = PriceBook::new().with(
+            "test-model",
+            ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
+        );
+        AppState::new(
+            Arc::new(Ledger::new()),
+            Arc::new(prices),
+            Arc::new(Policy {
+                mode: Mode::Enforce,
+                ..Default::default()
+            }),
+            provider,
+            "test-policy",
+        )
+    }
+
+    /// An exporter writing to a private file, plus the path to read it back.
+    ///
+    /// A real `Exporter` on a real file rather than a double: it is the
+    /// serialization point that stamps `prev_hash` and the place `agent_id`
+    /// is enforced, so a double here would prove the call site compiles and
+    /// nothing about what lands on the bus.
+    fn recording_exporter(tag: &str) -> (Arc<crate::events::EventExporter>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tf-depfail-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("events.ndjson");
+        let exp = crate::events::EventExporter::open(path.to_str().expect("a utf-8 temp path"))
+            .expect("an exporter on a fresh file");
+        (Arc::new(exp), path)
+    }
+
+    /// Every event written to `path`, parsed. An absent file means the
+    /// exporter never wrote, which is a legitimate outcome several of these
+    /// tests assert, so it reads as zero events rather than panicking.
+    fn events_at(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+            .collect()
+    }
+
+    fn only_dependency_failures(path: &std::path::Path) -> Vec<serde_json::Value> {
+        events_at(path)
+            .into_iter()
+            .filter(|e| e["type"] == "dependency_failed")
+            .collect()
+    }
+
+    // The fixed band, asserted on the type rather than on an emitted event:
+    // a call site cannot choose it, so this is the only place it can be
+    // wrong. `high` and not `critical` is a judgement (see the variant's own
+    // doc); what the test holds is that it is not silently below heraldyx's
+    // floors, which is what would make the whole feature deliver nothing.
+    #[test]
+    fn the_dependency_failed_event_carries_the_high_band() {
+        use tokenfuse_core::agent_event::EventType;
+        use tokenfuse_core::Severity;
+        assert_eq!(EventType::DependencyFailed.severity(), Severity::High);
+        assert_eq!(
+            EventType::DependencyFailed.as_wire_str(),
+            "dependency_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_cannot_be_reached_is_recorded() {
+        let (events, path) = recording_exporter("unreachable");
+        let st = state_with_provider(Arc::new(UnreachableProvider)).with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-outage")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "the caller still gets a clean 502; this feature adds a record, it does \
+             not change what the agent sees"
+        );
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+        let e = &found[0];
+        assert_eq!(e["source"], "tokenfuse");
+        assert_eq!(e["severity"], "high");
+        assert_eq!(e["agent_id"], "agent://test.local/rehearsal");
+        assert_eq!(e["run_id"], "run-outage");
+        assert_eq!(e["data"]["dependency"], "provider");
+        assert_eq!(e["data"]["stage"], "send");
+        assert_eq!(e["data"]["effect"], "call_failed");
+        assert!(
+            e["data"]["detail"]
+                .as_str()
+                .expect("a detail string")
+                .contains("Connection refused"),
+            "the operator is told what actually failed, got {:?}",
+            e["data"]["detail"]
+        );
+    }
+
+    // The other half of the same rule, and the one that decides whether this
+    // event is worth having: a type that also fires on a working day is a
+    // type an operator filters out within a week.
+    #[tokio::test]
+    async fn a_healthy_call_reports_no_dependency_failure() {
+        let (events, path) = recording_exporter("healthy");
+        let st = state(Mode::Enforce, StubProvider::default()).with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-fine")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            only_dependency_failures(&path).is_empty(),
+            "a call that worked wrote a dependency failure: {:?}",
+            only_dependency_failures(&path)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_answer_is_recorded() {
+        let (events, path) = recording_exporter("torn-stream");
+        let st = state_with_provider(Arc::new(TornStreamProvider)).with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-torn")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the status line went out before the break, which is exactly why the \
+             status cannot carry this fact"
+        );
+        // Drain the body so the stream actually runs to its error.
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+        assert_eq!(found[0]["data"]["dependency"], "provider");
+        assert_eq!(found[0]["data"]["stage"], "stream");
+        assert_eq!(found[0]["data"]["effect"], "call_failed");
+    }
+
+    #[tokio::test]
+    async fn a_response_body_that_cannot_be_read_is_recorded() {
+        let (events, path) = recording_exporter("torn-body");
+        let st = state_with_provider(Arc::new(TornStreamProvider)).with_events(events);
+        // Same broken upstream, non-streaming request: the break lands in
+        // `collect` inside `buffered_managed` instead of in the passthrough
+        // stream, which is a different call site and a different stage.
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-torn-body")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+        assert_eq!(found[0]["data"]["stage"], "response_body");
+        assert_eq!(found[0]["data"]["effect"], "call_failed");
+    }
+
+    // SPEC.md §6.1 requires `agent_id` and §6.2 says a missing one is skipped
+    // and counted, never fabricated. The unmanaged pass-through reaches the
+    // provider before either identifier has been resolved, so there is
+    // nothing to attribute this to and the honest answer is silence. Asserted
+    // rather than assumed, because "we skip it" and "we forgot the call site"
+    // look the same from outside.
+    //
+    // `with_require_run_id(false)` is not decoration: the pass-through has
+    // been OFF by default since 2026-08-06, so an unmetered call is a 400
+    // that never reaches a provider, and a test that left the default on
+    // would have asserted this about a branch it never entered. The path
+    // exists only for an operator who deliberately restored the drop-in
+    // behaviour, and it is exactly that operator whose outage would
+    // otherwise be attributed to whichever agent the gateway guessed.
+    #[tokio::test]
+    async fn a_call_with_no_identity_reports_no_dependency_failure() {
+        let (events, path) = recording_exporter("no-identity");
+        let st = state_with_provider(Arc::new(UnreachableProvider))
+            .with_require_run_id(false)
+            .with_events(events);
+        let req = Request::post("/v1/messages")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            events_at(&path).is_empty(),
+            "an event was written for a call with no identity to put on it: {:?}",
+            events_at(&path)
+        );
     }
 }

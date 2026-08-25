@@ -96,7 +96,7 @@ const ALL_BREAKER_REASONS: [BreakerReason; 9] = [
 /// Every [`EventType`] this repository can emit, same discipline as
 /// [`ALL_BREAKER_REASONS`]: [`exhaustiveness_guard`] fails to compile when a
 /// variant is added.
-const ALL_EVENT_TYPES: [EventType; 14] = [
+const ALL_EVENT_TYPES: [EventType; 15] = [
     EventType::BudgetExhausted,
     EventType::SustainedLoop,
     EventType::SpendSpike,
@@ -111,6 +111,7 @@ const ALL_EVENT_TYPES: [EventType; 14] = [
     EventType::UnitCapExceeded,
     EventType::PolicyDeny,
     EventType::ToolCall,
+    EventType::DependencyFailed,
 ];
 
 /// The half of the two lists above that the compiler holds.
@@ -151,6 +152,7 @@ fn exhaustiveness_guard(reason: BreakerReason, event: EventType) -> (usize, usiz
         EventType::UnitCapExceeded => 11,
         EventType::PolicyDeny => 12,
         EventType::ToolCall => 13,
+        EventType::DependencyFailed => 14,
     };
     (r, e)
 }
@@ -414,6 +416,7 @@ mod tests {
                 ("unit_cap_exceeded", "high"),
                 ("policy_deny", "high"),
                 ("tool_call", "low"),
+                ("dependency_failed", "high"),
             ],
             "the artifact does not publish the agent-event vocabulary this \
              repository emits. If a type was added or a severity moved, update \
