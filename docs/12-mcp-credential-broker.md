@@ -48,6 +48,14 @@ default `127.0.0.1:4200`), forwarding to `TOKENFUSE_MCP_UPSTREAM`:
 are unit-tested (nested objects/arrays, missing handles, plain values untouched);
 a richer vault (files, a secrets manager) plugs in behind the same type.
 
+**Resolution is identity-aware.** A secret can optionally carry a rule naming
+which agent ids and/or which tool names may resolve it
+(`TOKENFUSE_MCP_SECRET_SCOPES`, configured SEPARATELY from the values above);
+a secret named in no rule is unscoped, resolvable by any agent, any tool,
+exactly as before this existed. Full writeup, the wire grammar, the refusal
+shape, and the `TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES` strict switch:
+[docs/23 section 4](23-mcp-broker-v2.md#4-secret-scoping-who-may-resolve-which-secret).
+
 ## Run it
 
 ```bash
@@ -148,9 +156,11 @@ against such a lock, since those compare names, which every format agreed on.
 
 ## The broker's own door
 
-The broker resolves handles against the **whole** vault and forwards to any
-configured upstream, so whatever can reach the port can spend the credentials.
-Two things guard that, and until 2026-08-05 only the first existed:
+The broker resolves handles against the vault (the whole vault, for any
+secret carrying no scope rule; see above) and forwards to any configured
+upstream, so whatever can reach the port can spend the credentials it is
+scoped to reach. Two things guard THAT question, whether a caller can reach
+the broker at all, and until 2026-08-05 only the first existed:
 
 1. **The loopback default.** `TOKENFUSE_MCP_ADDR` defaults to
    `127.0.0.1:4200`. Widening it with credentials configured logs a startup

@@ -304,9 +304,44 @@ async fn mcp_broker() {
     // reads (TOKENFUSE_WARDRYX_*), so configuring Wardryx once gates both the
     // LLM path and MCP tool calls. Off unless TOKENFUSE_WARDRYX_MODE+URL are set.
     let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env());
-    let vault = tokenfuse_core::SecretVault::from_pairs(
+    let mut vault = tokenfuse_core::SecretVault::from_pairs(
         &std::env::var("TOKENFUSE_MCP_SECRETS").unwrap_or_default(),
     );
+    // Optional per-secret scoping (docs/23-mcp-broker-v2.md section 4, CLAUDE.md
+    // invariant 23): which agent ids and/or tool names may resolve which
+    // secret. Configured SEPARATELY from TOKENFUSE_MCP_SECRETS above, so an
+    // existing deployment that never sets this keeps every secret resolvable
+    // by any agent, any tool, byte-for-byte unchanged. Set-but-unusable (a
+    // typo, an unknown clause label) refuses to start rather than silently
+    // leaving the named secret unscoped: same fail-closed posture
+    // TOKENFUSE_MCP_KEYS and TOKENFUSE_IDENTITY_MAP already take for their own
+    // set-but-unusable case.
+    if let Err(e) =
+        vault.apply_scope_spec(&std::env::var("TOKENFUSE_MCP_SECRET_SCOPES").unwrap_or_default())
+    {
+        eprintln!("tokenfuse: {e}");
+        std::process::exit(2);
+    }
+    // An unscoped secret is resolvable by any agent, any tool: a real risk
+    // that must never be silent, so this fires whenever it applies, not only
+    // above some threshold.
+    if let Some(warning) = tokenfuse_gateway::mcpbroker::unscoped_secrets_warning(&vault) {
+        tracing::warn!("{warning}");
+    }
+    // The opt-in stricter posture beside the warning above: refuse to start
+    // rather than merely warn. Same parsing this file already uses for
+    // TOKENFUSE_MCP_ALLOW_OPEN_BIND and TOKENFUSE_ALLOW_STUB: only "1" or
+    // "true" (case-insensitive) count, not any other non-empty string, so a
+    // typo reads as "not opted in", never as "opted in".
+    let require_secret_scopes = std::env::var("TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if let Some(refusal) =
+        tokenfuse_gateway::mcpbroker::refuse_unscoped_secrets(&vault, require_secret_scopes)
+    {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
     let scan = match std::env::var("TOKENFUSE_MCP_SCAN").as_deref() {
         Ok("off") => ScanMode::Off,
         Ok("block") => ScanMode::Block,
