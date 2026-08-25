@@ -123,6 +123,15 @@ pub struct HttpConn {
 impl HttpConn {
     /// POST `req` as JSON to `{base}{path}` and decode the JSON body as `Resp`.
     /// Transport-level failures map to `Unreachable`/`NetworkError`.
+    ///
+    /// The large `Err` variant is openraft's `RPCError` and it is not ours to
+    /// shrink. Boxing it here would only move the unboxing one line out: every
+    /// caller is a method of `impl RaftNetwork` (`append_entries`, `vote`,
+    /// `install_snapshot`), and those signatures are fixed by the trait, which
+    /// returns the error unboxed. So the allow sits where the size is, with the
+    /// reason, rather than raising `large-error-threshold` for the whole crate
+    /// and hiding a future oversized error of our own along with it.
+    #[allow(clippy::result_large_err)]
     async fn post<Req, Resp, E>(
         &self,
         path: &str,

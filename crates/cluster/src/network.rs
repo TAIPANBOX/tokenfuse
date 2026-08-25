@@ -53,6 +53,10 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// The large `Err` variant is openraft's `RPCError`, same reasoning as
+    /// `net_http::HttpConn::post`: both callers are `impl RaftNetwork` methods
+    /// whose signatures the trait fixes, so boxing here buys nothing.
+    #[allow(clippy::result_large_err)]
     async fn peer(
         &self,
     ) -> Result<Raft<TypeConfig>, RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>>
