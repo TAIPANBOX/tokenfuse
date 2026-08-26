@@ -140,11 +140,13 @@ header.
 Two limits, stated because an auditor reading the JSON above would otherwise
 assume otherwise.
 
-**The proof vouches for the CHAIN, not for the subject.** When a caller sends
-`x-fuse-agent-id` AND presents a token whose chain names a different agent, the
-header still wins for `agent_id` and the proof sits beside it vouching only for
-`on_behalf_of`. Nothing compares the two. A caller can therefore present one
-agent's token and name itself another.
+**The proof vouches for the CHAIN, and the subject is now checked against it.**
+A caller sending `x-fuse-agent-id` that names a different agent than its token
+proves is an `agent_id_contradicts_proven_chain` mismatch, on the same
+`TOKENFUSE_IDENTITY_STRICT` dial as the key-binding check: recorded under
+`warn`, refused under `enforce`, ignored when the dial is off, which is the
+default and what every existing deployment sees. The key-binding check could not
+catch this, because one key may legitimately speak for several agents.
 
 **A store may erase the proof.** trailryx partitions a record into typed
 metadata it keeps and a payload plane a per-event key destroys, and until it

@@ -102,3 +102,19 @@ Feature: One binary, two processes, and the same door in both
     Given a proven chain whose last name is the bare `agent://`
     When a record looks for whom to file under
     Then it finds nobody, because a scheme is not an identity
+
+  # @test:a_token_for_one_agent_and_a_header_for_another_is_a_mismatch
+  Scenario: A token for one agent and a header for another
+    Given a caller presenting the triage agent's delegation token
+    And a header naming itself a different agent
+    When strict identity is enforced
+    Then the call is refused and recorded as an identity mismatch, because a
+      credential that vouches for one agent does not let a caller act as
+      another, and the key binding check cannot see it since one key may
+      legitimately speak for several agents
+
+  # @test:a_header_that_agrees_with_the_proven_chain_is_not_a_mismatch
+  Scenario: Agreement is not a contradiction
+    Given a caller whose header names the same agent its token proves
+    When strict identity is enforced
+    Then the call proceeds and nothing is recorded as a mismatch
