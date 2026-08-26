@@ -36,7 +36,51 @@
 //! `AML.T0110` AI Agent Tool Poisoning) exist but are intentionally left as
 //! tactic-level references here pending independent confirmation.
 //!
+//! # DORA and NIS2, and how precisely they are cited
+//!
+//! Added 2026-08. Both were named in market research beside FCA/PRA, BaFin,
+//! ACPR and FINMA, and for an EU financial entity DORA binds NOW while the AI
+//! Act's agent-relevant articles do not, which is why they rank ahead of newer
+//! AI-specific frameworks here.
+//!
+//! They are cited at the level each identifier can be defended at, which is the
+//! rule this module already applies to MITRE ATLAS. DORA articles are named
+//! where the article number and its subject are both certain (Art. 9
+//! protection and prevention, Art. 10 detection, Art. 11 response and
+//! recovery, Art. 17 the ICT-related incident management process, Art. 28
+//! third-party risk). NIS2 is cited at Art. 21, the operative
+//! cybersecurity risk-management article, and at Art. 23 for reporting; its
+//! sub-points 21(2)(a) to (j) are NOT cited letter by letter, because a wrong
+//! letter is a mis-citation and a right article is not.
+//!
+//! **Neither is a claim about compliance.** A framework row here says which
+//! obligation a runtime control is EVIDENCE FOR, never that the obligation is
+//! met: DORA and NIS2 are both mostly about governance, testing regimes and
+//! reporting timelines that a proxy cannot enforce and this catalog does not
+//! pretend to.
+//!
+//! **ISO/IEC 23894 was asked for and is deliberately NOT here.** `@claude`
+//! 2026-08-26, and it is a deviation from the plan's literal wording. 23894 is
+//! GUIDANCE on an AI risk-management PROCESS, built on ISO 31000: its clauses
+//! describe how an organisation should identify, analyse and treat AI risk,
+//! not controls a product enforces. A runtime control point can be one input
+//! to that process and cannot satisfy a clause of it, and a row claiming
+//! otherwise would be exactly the over-claim [`Enforcement`] exists to
+//! prevent. It belongs in a customer's own risk file, citing this catalog as
+//! evidence, rather than in this catalog citing it.
+//!
 //! # Gaps we do NOT claim (honesty, stated explicitly)
+//!
+//! - **ASI07 (Insecure Inter-Agent Communication).** Named in the plan for this
+//!   pass and deliberately not mapped. The agents this proxy governs do not
+//!   talk to each other across a trust boundary: they talk to a model and to
+//!   tools, both through this gateway. What the estate does have is a
+//!   DELEGATION chain and, since 2026-08-26, taint that a sub-run inherits from
+//!   its parent, so a compromised agent cannot launder its context by spawning
+//!   a child. That is a control about the CHAIN, not about the CHANNEL, and
+//!   ASI07 is about the channel. Claiming it would describe a control this
+//!   product does not have and would leave a reader believing an agent-to-agent
+//!   transport is being inspected. When one exists, this is the row to write.
 //!
 //! - **Data residency / geo-fencing.** TokenFuse does not pin where provider
 //!   traffic or telemetry is stored/processed. Not claimed against any control.
@@ -136,6 +180,16 @@ pub const FRAMEWORK_VERSIONS: &[(&str, &str, &str)] = &[
         "EU AI Act (Regulation (EU) 2024/1689)",
         "retrieved 2026-07",
     ),
+    (
+        "DORA",
+        "Digital Operational Resilience Act (Regulation (EU) 2022/2554)",
+        "retrieved 2026-08",
+    ),
+    (
+        "NIS2",
+        "NIS 2 Directive (Directive (EU) 2022/2555)",
+        "retrieved 2026-08",
+    ),
 ];
 
 /// The control catalog: eight ENFORCED runtime controls plus the honest
@@ -156,6 +210,8 @@ pub const CATALOG: &[ControlMapping] = &[
         frameworks: &[
             ("OWASP-ASI-2026", "ASI08 (Cascading Failures)"),
             ("NIST-800-53r5", "SC-6 (Resource Availability)"),
+            ("DORA", "Art. 9 (Protection and prevention)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("SOC2", "CC7.2 (System Monitoring)"),
             (
                 "EU-AI-ACT",
@@ -176,6 +232,8 @@ pub const CATALOG: &[ControlMapping] = &[
         frameworks: &[
             ("OWASP-ASI-2026", "ASI08 (Cascading Failures)"),
             ("NIST-800-53r5", "SC-6 (Resource Availability)"),
+            ("DORA", "Art. 10 (Detection)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("NIST-800-53r5", "SI-4 (System Monitoring)"),
             (
                 "EU-AI-ACT",
@@ -194,6 +252,8 @@ pub const CATALOG: &[ControlMapping] = &[
         evidence_finding_kinds: &[],
         evidence_incident_kinds: &[],
         frameworks: &[
+            ("DORA", "Art. 11 (Response and recovery)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("OWASP-ASI-2026", "ASI10 (Rogue Agents)"),
             ("EU-AI-ACT", "Art. 14 (Human oversight)"),
             ("NIST-800-53r5", "AC-3 (Access Enforcement)"),
@@ -239,8 +299,12 @@ pub const CATALOG: &[ControlMapping] = &[
         evidence_finding_kinds: &[],
         evidence_incident_kinds: &[],
         frameworks: &[
+            ("OWASP-ASI-2026", "ASI05 (Unexpected Code Execution)"),
+            ("OWASP-ASI-2026", "ASI09 (Human-Agent Trust Exploitation)"),
             ("OWASP-ASI-2026", "ASI01 (Agent Goal Hijack)"),
             ("MITRE-ATLAS", "AML.T0051 (LLM Prompt Injection)"),
+            ("DORA", "Art. 9 (Protection and prevention)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("NIST-800-53r5", "SI-4 (System Monitoring)"),
             (
                 "EU-AI-ACT",
@@ -259,6 +323,8 @@ pub const CATALOG: &[ControlMapping] = &[
         evidence_finding_kinds: &["poisoning"],
         evidence_incident_kinds: &[],
         frameworks: &[
+            ("DORA", "Art. 28 (General principles, ICT third-party risk)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("OWASP-ASI-2026", "ASI06 (Memory & Context Poisoning)"),
             ("MITRE-ATLAS", "AML.T0051 (LLM Prompt Injection)"),
             (
@@ -353,6 +419,8 @@ pub const CATALOG: &[ControlMapping] = &[
             ("NIST-800-53r5", "AU-9 (Protection of Audit Information)"),
             ("EU-AI-ACT", "Art. 12 (Record-keeping)"),
             ("SOC2", "CC7.2 (System Monitoring)"),
+            ("DORA", "Art. 17 (ICT-related incident management process)"),
+            ("NIS2", "Art. 23 (Reporting obligations)"),
         ],
     },
     ControlMapping {
@@ -370,6 +438,7 @@ pub const CATALOG: &[ControlMapping] = &[
             ("NIST-800-53r5", "AC-3 (Access Enforcement)"),
             ("NIST-800-53r5", "AC-6 (Least Privilege)"),
             ("SOC2", "CC6.1 (Logical access security)"),
+            ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
         ],
     },
 ];
@@ -704,6 +773,89 @@ mod tests {
                     "catalog control {} references incident kind {:?} not in store.rs",
                     c.control_id,
                     k
+                );
+            }
+        }
+    }
+
+    /// The other direction, and the one that was missing.
+    ///
+    /// `every_framework_id_is_declared_in_framework_versions` catches a row
+    /// citing a framework nobody declared. This catches a framework declared
+    /// and cited by nothing, which is the failure that looks like progress: a
+    /// customer reads the report's framework list, asks which controls cover
+    /// DORA, and the answer is none. A registry entry is a promise that
+    /// something in the catalog is evidence for it.
+    #[test]
+    fn every_declared_framework_is_actually_cited_by_a_control() {
+        let cited: HashSet<&str> = CATALOG
+            .iter()
+            .flat_map(|c| c.frameworks.iter().map(|(id, _)| *id))
+            .collect();
+        for (id, name, _) in FRAMEWORK_VERSIONS {
+            assert!(
+                cited.contains(id),
+                "{id} ({name}) is declared and no control cites it: a customer \
+                 reading the framework list would ask which controls cover it \
+                 and get none"
+            );
+        }
+    }
+
+    /// The three OWASP categories this pass added, held by name.
+    ///
+    /// Named rather than counted, because a count goes green when one category
+    /// is swapped for another. ASI07 is deliberately absent and is asserted
+    /// absent for the same reason its gap note exists: the agents here do not
+    /// talk to each other across a trust boundary, and a row claiming
+    /// otherwise would describe a control this product does not have.
+    #[test]
+    fn the_owasp_rows_added_in_this_pass_are_the_ones_that_were_asked_for() {
+        let cited: HashSet<&str> = CATALOG
+            .iter()
+            .flat_map(|c| c.frameworks.iter())
+            .filter(|(id, _)| *id == "OWASP-ASI-2026")
+            .map(|(_, control)| *control)
+            .collect();
+        for want in [
+            "ASI05 (Unexpected Code Execution)",
+            "ASI09 (Human-Agent Trust Exploitation)",
+        ] {
+            assert!(cited.contains(want), "missing {want}: {cited:?}");
+        }
+        assert!(
+            !cited.iter().any(|c| c.starts_with("ASI07")),
+            "ASI07 is a channel this product does not inspect; see the gap note"
+        );
+    }
+
+    /// DORA and NIS2 are cited at a level each identifier can be defended at.
+    ///
+    /// The rule this module already applies to MITRE ATLAS, held here as a
+    /// shape: an article number and its subject, never a sub-point letter,
+    /// because a wrong letter is a mis-citation and mis-citing a standard is
+    /// itself the over-claim `Enforcement` exists to prevent.
+    #[test]
+    fn dora_and_nis2_are_cited_by_article_and_never_by_sub_point() {
+        for c in CATALOG {
+            for (id, control) in c.frameworks {
+                if *id != "DORA" && *id != "NIS2" {
+                    continue;
+                }
+                assert!(
+                    control.starts_with("Art. "),
+                    "{id} row {control:?} on {} is not an article citation",
+                    c.control_id
+                );
+                assert!(
+                    !control.contains(")("),
+                    "{id} row {control:?} cites a sub-point; a wrong letter is a \
+                     mis-citation and a right article is not"
+                );
+                assert!(
+                    control.contains('(') && control.ends_with(')'),
+                    "{id} row {control:?} names no subject, so a reader cannot \
+                     tell whether the number is right"
                 );
             }
         }
