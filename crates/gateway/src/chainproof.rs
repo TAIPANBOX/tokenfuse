@@ -167,6 +167,46 @@ pub fn resolve(
     }
 }
 
+/// The agent a PROVEN chain names as its current actor, if it names one.
+///
+/// # Why a proven chain may stand in for a header, and a claimed one may not
+///
+/// The record's `agent_id` came from `x-fuse-agent-id`, a header the caller
+/// writes. Measured 2026-08-26 on a running gateway: a request carrying a
+/// DPoP-bound, issuer-signed chain raised two `taint_raised` events in enforce
+/// mode and BOTH were dropped, because that header was absent. An attack was
+/// detected on the request with the strongest identity this gateway ever sees,
+/// and the security record was empty.
+///
+/// A claimed chain must never do this. It is the same free-form weakness with
+/// extra steps: a caller who can write the header can write the chain.
+///
+/// # The last element, and only when it is an agent
+///
+/// `chain_of` builds `[sub] + reverse(act)`, and RFC 8693 nests `act`
+/// current-first, so after the reverse the current actor is LAST. The first
+/// element is the root, usually a human.
+///
+/// A token with no `act` at all is the trap: the chain is then `[sub]` alone,
+/// and `sub` may be `user://...`, a person calling directly with no agent
+/// anywhere. Taking the last element unconditionally would put a natural person
+/// into `agent_id`, which this estate refuses by name.
+///
+/// The check is the SCHEME and deliberately not the full grammar. An
+/// off-grammar leaf like `agent://Acme/Bot` is still the proven actor, and this
+/// repository's rule is to write, count and report a nonconforming id rather
+/// than empty the log. A `user://` or `claimed:` leaf is different in kind, and
+/// is never a fallback.
+pub fn proven_actor(chain: &Chain) -> Option<&str> {
+    let Chain::Proven { chain, .. } = chain else {
+        return None;
+    };
+    chain
+        .last()
+        .map(String::as_str)
+        .filter(|leaf| leaf.starts_with("agent://"))
+}
+
 /// Order AND membership. Compared both ways on purpose: an equal-length
 /// reordering has the same set, and an extra name has the same prefix, so
 /// either comparison alone lets one of the two through.
@@ -396,5 +436,72 @@ mod tests {
             |_, _, _| false,
         );
         assert_eq!(resolved, Chain::Claimed(declared));
+    }
+
+    /// The measured defect, as a unit: a proven chain names its actor, so a
+    /// record has something to be filed under even with no header.
+    #[test]
+    fn a_proven_chain_names_the_agent_that_acted() {
+        let proven = Chain::Proven {
+            chain: vec![
+                "user://acme/alice".to_string(),
+                "agent://acme/triage".to_string(),
+            ],
+            proof: tokenfuse_core::agent_event::DelegationProof {
+                jti: "t".into(),
+                jkt: "k".into(),
+                iss: "https://vouchryx.acme.example".into(),
+                exp: 0,
+            },
+        };
+        assert_eq!(proven_actor(&proven), Some("agent://acme/triage"));
+    }
+
+    /// The test that pins the whole design. If anybody ever widens the fallback
+    /// to claimed chains, this goes red, and it should: a caller who can write
+    /// the header can write the chain.
+    #[test]
+    fn a_claimed_chain_names_nobody() {
+        let claimed = Chain::Claimed(vec![
+            "user://acme/alice".to_string(),
+            "agent://acme/triage".to_string(),
+        ]);
+        assert_eq!(proven_actor(&claimed), None);
+        assert_eq!(proven_actor(&Chain::Refused(ChainRefusal::BadToken)), None);
+    }
+
+    /// A token with no `act` is a person calling directly. The last element is
+    /// then the human, and a human is not an agent id.
+    #[test]
+    fn a_chain_with_no_agent_in_it_names_nobody() {
+        for leaf in ["user://acme/alice", "claimed:agent://acme/triage"] {
+            let proven = Chain::Proven {
+                chain: vec![leaf.to_string()],
+                proof: tokenfuse_core::agent_event::DelegationProof {
+                    jti: "t".into(),
+                    jkt: "k".into(),
+                    iss: "i".into(),
+                    exp: 0,
+                },
+            };
+            assert_eq!(proven_actor(&proven), None, "{leaf} was taken as an agent");
+        }
+    }
+
+    /// An off-grammar leaf is still the actor the issuer named. Written and
+    /// counted rather than dropped, which is this repository's rule for a
+    /// nonconforming id and is why the check is the scheme and not the grammar.
+    #[test]
+    fn an_off_grammar_agent_is_still_the_actor() {
+        let proven = Chain::Proven {
+            chain: vec!["agent://Acme/Bot".to_string()],
+            proof: tokenfuse_core::agent_event::DelegationProof {
+                jti: "t".into(),
+                jkt: "k".into(),
+                iss: "i".into(),
+                exp: 0,
+            },
+        };
+        assert_eq!(proven_actor(&proven), Some("agent://Acme/Bot"));
     }
 }

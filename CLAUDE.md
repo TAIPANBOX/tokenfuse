@@ -307,6 +307,32 @@ build)`, `cloud apns (feature build)`.
    warning, don't crash the gateway) - and it must never fabricate an
    `agent_id`; skip the event if the request doesn't carry one.
 
+   **Carrying one is not the same as sending the header, and the difference was
+   costing records.** Measured 2026-08-26 on a running gateway: a request whose
+   DPoP-bound, issuer-signed chain named `agent://acme/triage` raised two
+   `taint_raised` events in enforce mode and both were dropped, because
+   `x-fuse-agent-id` was absent. An injection was detected on the request with
+   the strongest identity this gateway ever sees, and the record was empty.
+
+   So a PROVEN chain's agent leaf now fills the record's subject when the header
+   is absent. That is not fabrication: the identity was in the request, inside a
+   credential this gateway verified. A CLAIMED chain never does, because a
+   caller who can write the header can write the chain, and reading one because
+   the other is missing is the same free-form weakness with extra steps. Nor
+   does a leaf that is not an `agent://` URI: a token with no `act` names a
+   person, and a person is not an agent id.
+
+   **Records only.** `agent_id` still governs the identity map, the unit a call
+   is billed to, the strict-mode binding check, and what the PDP is told. None
+   of those read the derived value, and moving them is a separate decision with
+   money and enforcement attached.
+   *(rule: `chainproof::proven_actor`, four unit tests including
+   `a_claimed_chain_names_nobody`, which is the one that goes red if the
+   fallback is ever widened. Handler tests
+   `a_proven_chain_files_the_record_when_no_header_names_an_agent`, verified red
+   against the header-only rule with verbatim "the injection was detected and
+   nothing reached the record", and `a_claimed_chain_does_not_file_the_record`)*
+
    *(partly gated: the mixed-schema test in `crates/gateway/src/sqlq.rs` covers
    the Parquet read path; the exporter's two promises are now held by
    `a_disabled_exporter_does_no_work_at_all`,

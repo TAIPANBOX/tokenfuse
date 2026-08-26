@@ -101,7 +101,41 @@ A misread setting is refused rather than guessed, `closed` misspelt `close`
 included. An operator who asks for the safe mode and silently gets it anyway is
 indistinguishable from one who asks and is ignored.
 
-## 5. Not proven
+## 5. What the record says
+
+Since 2026-08-26 the events this door writes are on schema
+`taipanbox.dev/agent-event/v0.2`, and a proven chain carries SPEC 5.2's
+`delegation_proof` beside it:
+
+```json
+{"schema":"taipanbox.dev/agent-event/v0.2","type":"taint_raised",
+ "agent_id":"agent://acme/triage",
+ "on_behalf_of":["user://acme/alice","agent://acme/triage"],
+ "delegation_proof":{"jti":"tok-live-1","jkt":"UHQRs9p3...","iss":"https://vouchryx.acme.example","exp":1787779200},
+ "data":{"stage":"tool_result","signals":["instruction_override"]}}
+```
+
+Which token, bound to which key, from which issuer, valid until when. The token
+itself never travels: it is a live credential and this is a replicated,
+hash-chained record that outlives it. **Absent means NOT proven**, never proven
+somewhere else, so an old consumer that ignores the member under-trusts.
+
+`iss` is the issuer this deployment VERIFIED against, read from the config
+rather than off the token, because the two were matched exactly and recording
+the token's own claim would record what it said about itself.
+
+**The subject is the header, or the agent a proven chain named.** Before this,
+`agent_id` came only from `x-fuse-agent-id`, so a request carrying a verified
+chain and no header had its security events dropped entirely. A claimed chain
+is never read this way: a caller who can write the header can write the chain.
+Neither is a leaf that is not an `agent://` URI, since a token with no `act`
+names a person.
+
+This governs the RECORD only. The identity map, the unit a call is billed to,
+the strict-mode binding check and what the PDP is told all still read the
+header.
+
+## 6. Not proven
 
 - **Nothing has run a live poll against vouchryx.** The poller, the startup
   fetch and the refusal paths have tests; the round trip against the real
