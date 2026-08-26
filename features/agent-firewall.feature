@@ -320,6 +320,146 @@ Feature: The agent firewall says what it did, and can be told what to do
     Then it reports one kind, so a count measures kinds and not persistence
 
   # ---------------------------------------------------------------------
+  # 2026-08-26. What the document SAID. The record could name the shape
+  # that matched, the tool whose output carried it, and the run's whole
+  # label set, and it could not say one thing: what the stranger's document
+  # actually said. That sentence is the reason somebody opens the event.
+  # ---------------------------------------------------------------------
+
+  # @test:the_excerpt_carries_the_sentence_and_not_only_the_match
+  Scenario: The record says what the document said
+    Given a ticket from a source the operator marked trusted
+    And the ticket carries an instruction to ignore previous instructions
+    When the excerpt is taken
+    Then it carries the sentence around the match and not only the match,
+      because twenty characters of an override explains nothing an operator
+      can act on
+
+  # @test:a_quote_that_is_whole_is_not_marked_clipped
+  Scenario: A whole quote is not marked as cut
+    Given a short document whose every word fits
+    When the excerpt is taken
+    Then nothing says it was cut, because a reader who cannot tell a whole
+      quote from a cut one draws a conclusion from a sentence that ended
+      mid-clause
+
+  # @test:a_quote_that_was_cut_says_so_at_the_edge_that_was_cut
+  Scenario: A cut quote says so, at the edge that was cut
+    Given a long document with the override buried in the middle of it
+    When the excerpt is taken
+    Then it is marked as cut and shows an ellipsis at each end that was cut
+
+  # @test:a_secret_in_the_document_is_redacted_by_the_redactor_this_crate_already_has
+  Scenario: A credential in the attacker's document does not reach the record
+    Given an injected document that quotes an AWS access key
+    When the excerpt is taken
+    Then the key is replaced by the DLP scanner this crate already has, and
+      no second redactor is written
+
+  # @test:a_secret_lying_across_the_edge_of_the_window_is_never_recorded_in_halves
+  Scenario: A credential lying across the edge is not recorded in halves
+    Given a key positioned so the excerpt's own edge falls inside it
+    When the excerpt is taken, at every offset in a swept range
+    Then no fragment of the key survives, because half a key no longer
+      matches the pattern that would have removed it and nothing would report
+      that it got out
+
+  # @test:the_address_the_attacker_wants_the_data_sent_to_survives_the_default_pass
+  Scenario: The destination survives the pass that runs by default
+    Given an injected document telling the agent to email a customer list to
+      an outside address
+    When the excerpt is taken with the default redaction
+    Then the address is still readable, because it is what an operator blocks
+      and greps their egress logs for
+    But when the PII pass is chosen instead, the address is removed and that
+      cost is the operator's to accept
+
+  # @test:the_default_pass_is_the_one_that_keeps_a_credential_out_of_the_record
+  Scenario: The default is the pass that keeps a credential out of a log
+    When a caller does not choose a redaction
+    Then secrets are removed and people are not
+
+  # @test:two_kinds_in_one_sentence_are_one_excerpt_naming_both
+  Scenario: One sentence that does two things is quoted once
+    Given a sentence that both overrides instructions and asks for the
+      context to be posted somewhere
+    When the excerpts are taken
+    Then there is one of them and it names both kinds, rather than the same
+      two hundred characters appearing in the record twice
+
+  # @test:two_kinds_in_different_places_are_two_excerpts
+  Scenario: Two places in one document are two quotes
+    Given a document that tries something at the top and something else six
+      hundred characters later
+    When the excerpts are taken
+    Then there are two, so folding everything into one entry would lose the
+      second place it tried
+
+  # @test:forty_attempts_of_one_kind_do_not_become_forty_excerpts
+  Scenario: Forty attempts of one kind are still one quote
+    Given a document that repeats one override forty times
+    When the excerpts are taken
+    Then there is one, matching how the signals themselves count kinds rather
+      than persistence
+
+  # @test:the_length_of_the_record_is_not_the_attackers_to_choose
+  Scenario: The attacker does not choose how long the record is
+    Given a four hundred kilobyte document full of every shape at once
+    When the excerpts are taken
+    Then at most six of them are kept and each is capped, because a line whose
+      length an attacker picks is a way to fill an operator's disk with their
+      prose
+
+  # @test:control_characters_never_reach_the_record
+  Scenario: Nothing in the quote is obeyed rather than printed
+    Given a document carrying an escape sequence, a newline and a
+      right-to-left override
+    When the excerpt is taken
+    Then no control character survives, because a consumer that parses the
+      line and prints the value hands whatever is in it straight to a terminal
+
+  # @test:the_invisible_character_that_caused_the_signal_is_made_visible
+  Scenario: The character nobody can see is shown
+    Given a document whose only fault is a zero-width space
+    When the excerpt is taken
+    Then the character is written out as its code point, because an excerpt
+      that looks like an ordinary sentence reads as a false positive
+
+  # @test:the_detector_and_the_sanitiser_read_one_list_of_invisible_characters
+  Scenario: One list of invisible characters, not two that agree today
+    Given every boundary of the hidden-text ranges
+    When each is scanned and then excerpted
+    Then the detector fires and the character is made visible, because the
+      pattern and the sanitiser are built from the same array
+
+  # @test:the_excerpts_and_the_scan_never_disagree_about_which_kinds_fired
+  Scenario: The quotes and the signals never disagree
+    Given a document that fires all six kinds
+    When it is both scanned and excerpted
+    Then the two answers name the same kinds, so an operator reading either
+      member comes away with the same list
+
+  # @test:an_excerpt_is_a_member_of_its_own_and_signals_stay_names
+  Scenario: Signals stay names and the words go somewhere else
+    Given an excerpt attached to a taint-raised record
+    When the record is read
+    Then the signals member still carries names alone and the words arrive in
+      a member of their own, so a consumer that wants no content drops one key
+
+  # @test:a_record_with_nothing_to_quote_is_the_record_it_was_before
+  Scenario: A deployment that stores nothing looks exactly as it did
+    Given a deployment that has not turned excerpt storage on
+    When a taint-raised record is built
+    Then it is byte for byte the record it was before this existed, with no
+      empty array announcing a feature nobody asked for
+
+  # @test:whatever_the_document_did_the_event_is_still_one_line
+  Scenario: One event is still one line of NDJSON
+    Given a document containing newlines, quotes and backslashes
+    When the event is written through the real exporter
+    Then the file holds exactly one line and it parses
+
+  # ---------------------------------------------------------------------
   # 2026-08-26, B.4. The release valve, and the honest answer about the
   # other two gates.
   # ---------------------------------------------------------------------
