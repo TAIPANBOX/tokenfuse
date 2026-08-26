@@ -500,6 +500,57 @@ run_case "pinned-installs: a runner label goes back to -latest" fail \
 	"$(py 'edit(".github/workflows/ci.yml", "runs-on: ubuntu-24.04", "runs-on: ubuntu-latest")')" \
 	"rolls to the next OS release"
 
+# --- both processes configure the same doors --------------------------------
+
+# The fault this gate was written for, planted as it actually happened: a door
+# wired into one process and not the other. Measured on 2026-08-26 with
+# `chainproof`, which the broker configured and the proxy did not. The gate is
+# symmetric, so killing either side is the same fault; this kills the first,
+# which is the broker's.
+run_case "same-doors: a door configured in one process only" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "let chain_proof = tokenfuse_gateway::chainproof::from_env();", "let chain_proof = None;")')" \
+	"and not in"
+
+# An exception has to be written in the form the gate reads. A near-miss is how
+# an exemption quietly stops being one while still looking like an explanation.
+run_case "same-doors: an exception written in a form nothing reads" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit_all("crates/gateway/src/main.rs", "process-local:", "process local:")')" \
+	"and not in"
+
+# The subject list is DISCOVERED, so a gate that can no longer find any door
+# must say it measured nothing rather than report success over an empty set.
+run_case "same-doors: the startup wiring it reads is gone" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit_all("crates/gateway/src/main.rs", "::from_env(", "::built(")')" \
+	"measured nothing"
+
+# And it must not fire on a legitimate one-sided door that still says why.
+run_case "same-doors: an explained one-sided door, reworded" pass \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "process-local: the broker forwards MCP messages and picks no model", "process-local: the broker picks no model at all")')"
+
+# --- every gate in scripts/ has a case here ---------------------------------
+#
+# This harness is a hand-written list of cases, which is the shape that goes
+# stale silently: a gate added without a case looks exactly like a gate with
+# nothing to catch, and that is the whole thing this file exists to deny. So
+# the list is checked against what is actually on disk.
+uncovered=""
+for gate in scripts/*.sh; do
+	base="$(basename "$gate")"
+	case "$base" in
+	gates-have-teeth.sh) continue ;;
+	esac
+	grep -qF -- "./scripts/$base" "$0" || uncovered="$uncovered $base"
+done
+if [ -n "$uncovered" ]; then
+	printf '\nno case in this file exercises:%s\n' "$uncovered"
+	printf 'A gate with no case here is a gate nothing proves can go red.\n'
+	failures=$((failures + 1))
+fi
+
 # --- the harness cleans up after itself ------------------------------------
 
 restore
