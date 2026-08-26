@@ -131,6 +131,10 @@ fn broker_state(
         keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+        // The taint gate is level 3 and needs a gateway to ask; these fixtures
+        // have none, so it is off and every existing case is unchanged.
+        taint_gateway: None,
+        taint_failclosed: false,
     })
 }
 
@@ -151,6 +155,10 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+        // The taint gate is level 3 and needs a gateway to ask; these fixtures
+        // have none, so it is off and every existing case is unchanged.
+        taint_gateway: None,
+        taint_failclosed: false,
     }))
 }
 
@@ -940,6 +948,10 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         keys: ClientKeys::default(),
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+        // The taint gate is level 3 and needs a gateway to ask; these fixtures
+        // have none, so it is off and every existing case is unchanged.
+        taint_gateway: None,
+        taint_failclosed: false,
     })
 }
 
@@ -1199,5 +1211,186 @@ async fn the_allowed_pairing_proves_the_scope_refusal_above_is_not_vacuous() {
         forwarded[0]["params"]["arguments"]["auth"], "Bearer ghp_REALSECRET",
         "the upstream must receive the real secret, not the handle: {:?}",
         forwarded[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// docs/07 B.7 level 3: the agent firewall at the MCP door
+// ---------------------------------------------------------------------------
+
+/// A stand-in for the gateway's `/v1/fuse/check-tool-call`, answering whatever
+/// this test needs and recording what it was asked.
+fn judge(decision: &'static str) -> (Router, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let r = Router::new().route(
+        "/v1/fuse/check-tool-call",
+        post(move |Json(req): Json<Value>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(req);
+                Json(json!({
+                    "decision": decision,
+                    "governed": true,
+                    "reason": "tainted context [web] denies capability [exec]",
+                    "rule": "no-exec-after-untrusted",
+                }))
+            }
+        }),
+    );
+    (r, seen)
+}
+
+fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool) -> Router {
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    app(Arc::new(BrokerState {
+        upstream,
+        named_upstreams: Default::default(),
+        vault,
+        scan: ScanMode::Off,
+        dlp: tokenfuse_core::DlpMode::Off,
+        dlp_pii: tokenfuse_core::DlpMode::Off,
+        lock: None,
+        wardryx: Arc::new(Wardryx::disabled()),
+        keys: ClientKeys::default(),
+        client: reqwest::Client::new(),
+        events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
+        taint_gateway: gateway,
+        taint_failclosed: failclosed,
+    }))
+}
+
+async fn mcp_call(broker_url: &str, run: Option<&str>) -> Value {
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "run_shell" } });
+    let mut req = reqwest::Client::new()
+        .post(format!("{broker_url}/"))
+        .header("x-fuse-agent-id", "agent://acme.example/sre/rca")
+        .json(&call);
+    if let Some(r) = run {
+        req = req.header("x-fuse-run-id", r);
+    }
+    req.send().await.unwrap().json().await.unwrap()
+}
+
+/// The MCP door is the one docs/07 B.7 calls a FULL guarantee, and until now it
+/// was the only door the firewall did not stand at: level 1 tells a client
+/// after the fact and the client may ignore it, so a tool run through the
+/// broker was reachable from a tainted context with nothing in the way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mcp_door_refuses_a_tool_a_tainted_run_may_not_use() {
+    let up = spawn_server(marker_router("upstream")).await;
+    let (judge_router, asked) = judge("deny");
+    let gw = spawn_server(judge_router).await;
+    let broker_url = spawn_server(broker_with_taint(up, Some(gw), false)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = mcp_call(&broker_url, Some("run-web")).await;
+    let msg = out["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("denies capability"), "{out}");
+
+    // One judge, and the broker told it which door was asking so the record can
+    // say so. A gate that judged locally would be a second answer about one run.
+    let seen = asked.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["run_id"], "run-web");
+    assert_eq!(seen[0]["tool"], "run_shell");
+    assert_eq!(seen[0]["via"], "mcp");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_allowed_tool_still_reaches_the_upstream() {
+    // The other half. A gate that refused everything would pass the test above
+    // and be useless, and this is the case an operator meets all day.
+    let up = spawn_server(marker_router("upstream")).await;
+    let (judge_router, _) = judge("allow");
+    let gw = spawn_server(judge_router).await;
+    let broker_url = spawn_server(broker_with_taint(up, Some(gw), false)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = mcp_call(&broker_url, Some("run-clean")).await;
+    assert_eq!(out["result"]["upstream"], "upstream", "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_gateway_configured_the_gate_is_plainly_off() {
+    // The broker is a separate process with no taint state of its own, so with
+    // nothing to ask it can only let calls through. Being plainly off is the
+    // honest state; pretending to judge would be worse.
+    let up = spawn_server(marker_router("upstream")).await;
+    let broker_url = spawn_server(broker_with_taint(up, None, false)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = mcp_call(&broker_url, Some("run-any")).await;
+    assert_eq!(out["result"]["upstream"], "upstream", "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_with_no_run_id_is_refused_only_when_the_gate_is_fail_closed() {
+    // Taint is per run and MCP carries no run identity of its own, so a call
+    // without `x-fuse-run-id` is one the gate cannot judge. Which way that
+    // falls is the operator's decision and not a default anybody should have
+    // to discover: fail-open matches the LLM path, fail-closed is available.
+    let up = spawn_server(marker_router("upstream")).await;
+    let (judge_router, asked) = judge("deny");
+    let gw = spawn_server(judge_router).await;
+
+    let open = spawn_server(broker_with_taint(up.clone(), Some(gw.clone()), false)).await;
+    let closed = spawn_server(broker_with_taint(up, Some(gw), true)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let permitted = mcp_call(&open, None).await;
+    assert_eq!(permitted["result"]["upstream"], "upstream", "{permitted}");
+
+    let refused = mcp_call(&closed, None).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("x-fuse-run-id"),
+        "the refusal names the header that would fix it: {refused}"
+    );
+
+    // Neither reached the judge: there was nothing to ask about.
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_that_cannot_be_reached_does_not_silently_become_permission() {
+    // The `allowed_ungoverned` shape, one door over. Fail-open is the default
+    // because it matches the LLM path, and it is only defensible because the
+    // call is RECORDED as ungoverned rather than as permitted.
+    let up = spawn_server(marker_router("upstream")).await;
+    // A port nothing listens on.
+    let broker_url = spawn_server(broker_with_taint(
+        up,
+        Some("http://127.0.0.1:1".to_string()),
+        false,
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = mcp_call(&broker_url, Some("run-outage")).await;
+    assert_eq!(
+        out["result"]["upstream"], "upstream",
+        "fail-open lets it through: {out}"
+    );
+
+    // And the same thing fails closed when the operator asked for that.
+    let up2 = spawn_server(marker_router("upstream")).await;
+    let strict = spawn_server(broker_with_taint(
+        up2,
+        Some("http://127.0.0.1:1".to_string()),
+        true,
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let refused = mcp_call(&strict, Some("run-outage")).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be reached"),
+        "{refused}"
     );
 }

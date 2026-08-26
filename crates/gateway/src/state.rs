@@ -71,8 +71,8 @@ pub struct AppState {
     pub wardryx: Arc<Wardryx>,
     history: History,
     killed: Killed,
-    /// Per-run accumulated taint labels.
-    taint: Arc<Mutex<HashMap<String, Labels>>>,
+    /// Run taint, shared so the MCP broker judges against the same state.
+    pub taint: Arc<TaintStore>,
     /// Per-run budgets pushed from the Cloud control plane (override the
     /// client-supplied budget). Empty unless cloud mode is on.
     cloud_budgets: Arc<Mutex<HashMap<String, Microusd>>>,
@@ -109,7 +109,103 @@ pub struct AppState {
     pub keystats: Arc<KeyStats>,
 }
 
-/// What one [`AppState::accumulate_taint`] call did: the labels this run did
+/// The run-taint store, held apart from [`AppState`] so more than one door can
+/// judge against one state.
+///
+/// It exists because the MCP broker is a second enforcement point (docs/07 B.7
+/// level 3) with its own state and no `AppState`, and two doors keeping two
+/// taint maps would be two answers about one run: an operator reading a refusal
+/// at one and a permission at the other has no way to tell which was right.
+#[derive(Debug, Default)]
+pub struct TaintStore {
+    labels: Mutex<HashMap<String, Labels>>,
+    /// Child run -> the parent it declared, for docs/07 B.3 P3. Separate from
+    /// the ledger's budget hierarchy: that one is about money and is opened
+    /// once per run, this is consulted on every request and must survive a
+    /// caller declaring a parent it never opened.
+    parents: Mutex<HashMap<String, String>>,
+}
+
+impl TaintStore {
+    /// Record which run a child declared as its parent.
+    ///
+    /// Last write wins, deliberately: the value comes off a request header, so
+    /// a caller that changes its mind mid-run has told us something different,
+    /// and refusing the second value would mean holding a claim against a
+    /// caller that can already say anything. It cannot LOSE taint either way,
+    /// because [`inherited`](Self::inherited) only ever adds and a run's own
+    /// set is monotonic.
+    pub fn note_parent(&self, run_id: &str, parent: &str) {
+        if run_id.is_empty() || parent.is_empty() || run_id == parent {
+            return;
+        }
+        self.parents
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), parent.to_string());
+    }
+
+    /// Every label this run's ancestors carry (docs/07 B.3 P3).
+    ///
+    /// Walked on each request rather than seeded once when the child opens, so
+    /// a parent that becomes untrusted AFTER its child started is picked up on
+    /// the child's next call. Seeding once would have made "spawn the child
+    /// first" the same bypass in a different order.
+    ///
+    /// The chain comes off a request header, so its shape is the caller's to
+    /// choose and a cycle is one line of curl. The visited set and the depth
+    /// cap are not defensive programming: without them this spins inside a
+    /// lock held on the request path, which takes down the gateway rather than
+    /// the run.
+    pub fn inherited(&self, run_id: &str) -> Labels {
+        const MAX_DEPTH: usize = 32;
+        let parents = self.parents.lock().unwrap();
+        let labels = self.labels.lock().unwrap();
+        let mut out = Labels::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from([run_id.to_string()]);
+        let mut cursor = parents.get(run_id).cloned();
+        let mut depth = 0;
+        while let Some(id) = cursor {
+            if depth >= MAX_DEPTH || !seen.insert(id.clone()) {
+                break;
+            }
+            depth += 1;
+            if let Some(l) = labels.get(&id) {
+                out.extend(l.iter().cloned());
+            }
+            cursor = parents.get(&id).cloned();
+        }
+        out
+    }
+
+    /// Merge `new_labels` into a run's set and report what changed.
+    ///
+    /// Returns the delta as well as the total because a caller has to be able
+    /// to tell a run that just became untrusted from one that has been
+    /// untrusted for thirty turns. Before 2026-08-26 this returned only the
+    /// total, which is why the acquisition could not be recorded: by the time
+    /// the set was in hand there was no way left to know which of it was new.
+    pub fn accumulate(&self, run_id: &str, new_labels: Labels) -> TaintDelta {
+        let mut map = self.labels.lock().unwrap();
+        let entry = map.entry(run_id.to_string()).or_default();
+        let added: Labels = new_labels.difference(entry).cloned().collect();
+        entry.extend(new_labels);
+        TaintDelta {
+            added,
+            carrying: entry.clone(),
+        }
+    }
+
+    /// Everything a run is judged against: its own labels plus its ancestors'.
+    pub fn effective(&self, run_id: &str) -> Labels {
+        let mut out = self.accumulate(run_id, Labels::new()).carrying;
+        out.extend(self.inherited(run_id));
+        out
+    }
+}
+
+/// What one [`TaintStore::accumulate`] call did: the labels this run did
 /// not already carry, and everything it carries now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintDelta {
@@ -154,7 +250,7 @@ impl AppState {
             wardryx: Arc::new(Wardryx::disabled()),
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
-            taint: Arc::new(Mutex::new(HashMap::new())),
+            taint: Arc::new(TaintStore::default()),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventExporter::disabled()),
             agent_id_mode: crate::agentids::AgentIdMode::default(),
@@ -265,14 +361,17 @@ impl AppState {
     /// total, which is why the acquisition could not be recorded: by the time
     /// the set was in hand there was no way left to know which of it was new.
     pub fn accumulate_taint(&self, run_id: &str, new_labels: Labels) -> TaintDelta {
-        let mut map = self.taint.lock().unwrap();
-        let entry = map.entry(run_id.to_string()).or_default();
-        let added: Labels = new_labels.difference(entry).cloned().collect();
-        entry.extend(new_labels);
-        TaintDelta {
-            added,
-            carrying: entry.clone(),
-        }
+        self.taint.accumulate(run_id, new_labels)
+    }
+
+    /// See [`TaintStore::note_parent`].
+    pub fn note_taint_parent(&self, run_id: &str, parent: &str) {
+        self.taint.note_parent(run_id, parent);
+    }
+
+    /// See [`TaintStore::inherited`].
+    pub fn inherited_taint(&self, run_id: &str) -> Labels {
+        self.taint.inherited(run_id)
     }
 
     /// Attach an event sink (e.g. the Parquet trace). Chainable.

@@ -428,6 +428,15 @@ async fn mcp_broker() {
         keys,
         client: reqwest::Client::new(),
         events,
+        // docs/07 B.7 level 3. Off unless an operator names the gateway whose
+        // firewall should judge: the broker is a separate process invocation
+        // with no taint state of its own, so with nothing to ask it can only
+        // let calls through, and pretending otherwise would be worse than
+        // being plainly off.
+        taint_gateway: std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        taint_failclosed: std::env::var("TOKENFUSE_MCP_TAINT_FAILMODE").as_deref() == Ok("closed"),
     });
     if stdio {
         tracing::info!(%upstream, "mcp credential-broker on stdio");

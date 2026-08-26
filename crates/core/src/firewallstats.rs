@@ -106,6 +106,14 @@ pub struct LabelRow {
     pub from_tools: Vec<(String, usize)>,
     /// Times the caller declared it on the request header instead.
     pub declared: usize,
+    /// Runs that got it from an ANCESTOR rather than from anything they did.
+    ///
+    /// Counted apart from `from_tools` because the producer puts the ancestor's
+    /// RUN ID in the same member a tool name would occupy, so a report that
+    /// merged them printed "from p1, web_search" and invited a reader to go
+    /// looking for a tool called `p1`. Found by reading the report against a
+    /// live run, not by a test.
+    pub inherited: usize,
 }
 
 /// One rule and what it did.
@@ -164,6 +172,7 @@ pub fn compute(events: &[FirewallEvent]) -> FirewallStats {
     let mut label_runs: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
     let mut label_tools: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut label_declared: BTreeMap<String, usize> = BTreeMap::new();
+    let mut label_inherited: BTreeMap<String, usize> = BTreeMap::new();
 
     // verdicts
     let mut rule_refused: BTreeMap<String, usize> = BTreeMap::new();
@@ -204,12 +213,17 @@ pub fn compute(events: &[FirewallEvent]) -> FirewallStats {
 
         match e.kind {
             Kind::Raised => {
+                let from_ancestor = e.stage == "parent_run";
                 for label in &e.added {
                     if !e.run_id.is_empty() {
                         label_runs
                             .entry(label.clone())
                             .or_default()
                             .insert(&e.run_id);
+                    }
+                    if from_ancestor {
+                        *label_inherited.entry(label.clone()).or_default() += 1;
+                        continue;
                     }
                     if e.from_tools.is_empty() {
                         *label_declared.entry(label.clone()).or_default() += 1;
@@ -265,6 +279,7 @@ pub fn compute(events: &[FirewallEvent]) -> FirewallStats {
     let mut acquisitions: Vec<LabelRow> = label_runs
         .keys()
         .chain(label_declared.keys())
+        .chain(label_inherited.keys())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|label| {
@@ -278,6 +293,7 @@ pub fn compute(events: &[FirewallEvent]) -> FirewallStats {
                 runs: label_runs.get(label).map(BTreeSet::len).unwrap_or(0),
                 from_tools,
                 declared: label_declared.get(label).copied().unwrap_or(0),
+                inherited: label_inherited.get(label).copied().unwrap_or(0),
             }
         })
         .collect();
@@ -423,6 +439,28 @@ mod tests {
         let s = compute(&[e]);
         assert_eq!(s.acquisitions[0].declared, 1);
         assert!(s.acquisitions[0].from_tools.is_empty());
+    }
+
+    #[test]
+    fn an_inherited_label_is_not_reported_as_a_tool_this_run_called() {
+        // Found by reading the report against a live run, not by a test. The
+        // producer puts the ancestor's RUN ID in the same member a tool name
+        // would occupy, so the report printed "from p1, web_search" and
+        // invited a reader to go looking for a tool called `p1`.
+        let mut inherited = raised("child", &["web"], &["parent-run"]);
+        inherited.stage = "parent_run".into();
+        let evs = vec![raised("parent", &["web"], &["web_search"]), inherited];
+        let s = compute(&evs);
+        assert_eq!(s.acquisitions.len(), 1);
+        let web = &s.acquisitions[0];
+        assert_eq!(web.runs, 2, "both runs carry it");
+        assert_eq!(
+            web.from_tools,
+            vec![("web_search".into(), 1)],
+            "one tool actually carried it in; the other run inherited it"
+        );
+        assert_eq!(web.inherited, 1);
+        assert_eq!(web.declared, 0, "and it is not a header declaration either");
     }
 
     #[test]

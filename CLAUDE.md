@@ -1052,12 +1052,110 @@ build)`, `cloud apns (feature build)`.
    `scripts/constants.sh`, which builds the published artifact from the Rust
    source.)*
 
-   **Where it says nothing.** This is docs/07 B.7 level 1, advisory: the
-   gateway sees `tool_use` in the model's answer and the CLIENT executes the
-   tool, so a caller that ignores a 403 is not stopped by any of this. Levels 2
-   and 3 (`POST /v1/fuse/check-tool-call`, the MCP gateway) remain unbuilt, and
-   nothing here changes that. Nor does anything here look at the TEXT of a
-   prompt: the model is label-based by design, and B.10 is unamended.
+   **Where it says nothing.** Nothing here looks at the TEXT of a prompt: the
+   model is label-based by design, and B.10 is unamended. Levels 2 and 3 and
+   the sub-run bypass were open when this invariant was first written and are
+   closed by invariant 26.
+
+26. **A firewall you can walk around is a firewall you do not have, and it must
+   be on to be walked around at all.** Invariant 25 gave the taint filter a
+   voice. This gives it reach, and the first of the four was not a missing
+   feature but a bypass.
+
+   **A sub-run laundered its parent's taint.** docs/07 B.3 P3 has said since
+   2026-07-02 that a subagent inherits its parent by default, and the taint map
+   was keyed on `run_id` alone, so the entire firewall was one
+   `x-fuse-parent-run-id` header away from off: taint the parent, spawn a
+   child, do the dangerous thing in the child. Measured against the unfixed
+   tree, the child got HTTP 200 and the shell went through. The chain is now
+   resolved on EVERY request rather than seeded when a child opens, because
+   seeding once would have made "spawn the child first" the same bypass in a
+   different order. The chain comes off a request header, so a cycle is one
+   line of curl: the visited set and the depth cap are not defensive
+   programming, they are what keeps a caller from spinning the gateway inside a
+   lock on the request path.
+
+   **Every enforcement claim this product made was advisory.** B.7 level 1 is
+   the gateway seeing `tool_use` in the model's answer; the CLIENT executes the
+   tool, so a caller that ignores the 403 runs it anyway, and B.10 listed that
+   as a limitation for seven weeks. `POST /v1/fuse/check-tool-call` is the
+   other order of operations: an executor asks BEFORE it runs, and acts on the
+   answer because acting on it is why it asked. It judges and does not
+   accumulate, since a tool's OUTPUT is what carries taint and the tool has not
+   run. It answers HTTP 200 always, with the decision in the body: a 403 here
+   is indistinguishable from an auth failure or a proxy in the way, and a
+   client that cannot tell those apart must choose between failing closed on a
+   network blip and failing open on a refusal.
+
+   **Its answer distinguishes three things, not two**, and this is the member a
+   consumer must not skip: `allow` because nothing objected, `allow` because
+   the firewall is OFF (`governed: false`), and `allow` because it is in shadow
+   and a rule DID object (`would_block` present). Folding them reports "the
+   gateway permitted this" for a box where nothing was asked, which is
+   `dependency_failed`'s `allowed_ungoverned` mistake one plane over.
+
+   **Level 3 is a client of level 2, not a second judge.** `tokenfuse
+   mcp-broker` is a separate process invocation with its own state, so a taint
+   map of its own would be a second answer about one run, and an operator
+   reading a refusal at one door and a permission at the other has no way to
+   tell which was right. It asks over HTTP, before secret injection and before
+   the upstream, and passes `via: "mcp"` so the record says which door without
+   the door being able to change the DECISION by naming itself differently. It
+   needs `x-fuse-run-id`, because taint is per run and MCP carries no run
+   identity of its own; a gateway it cannot reach is recorded as
+   `dependency_failed` naming the policy plane, the same fact through a second
+   door.
+
+   **The default was `off`, which contradicted the specification it came
+   from.** B.9 names shadow as the on-ramp, so out of the box this subsystem
+   protected nothing and, worse, measured nothing, and every argument for
+   turning it on had to be made without a number from the fleet it was about.
+   It is `shadow` now: shadow refuses nothing, so no request that worked
+   yesterday fails today, which is what makes it a default rather than a
+   breaking change. It only became worth defaulting to on the day it started
+   writing, one invariant ago; before that it would have been a cost with no
+   output. `TOKENFUSE_FIREWALL=off` restores the old silence exactly.
+
+   **And both taint families carry `data.prompt_hash`**, `sha384:<hex>` over
+   the last user message, absent when a turn had none. The last message and not
+   the history, because hashing the conversation changes every turn and groups
+   nothing; what this answers is whether four incidents came from ONE
+   instruction. On the acquisition as well as the verdict, because the turn a
+   run became untrusted and the turn it tried something are usually not the
+   same turn. A hash and only a hash, so there is nothing here to erase, and it
+   deliberately does NOT reach trailryx's `basis.prompt_hash`: that field is
+   unerasable typed metadata, this value arrives in `data`, and trailryx's
+   mapper is forbidden from promoting a producer's free-form member into a
+   typed field. It lands in the payload plane, behind the key whose destruction
+   erases it, which is where a pseudonymous identifier of possibly-personal
+   content belongs.
+   *(test: `a_sub_run_cannot_launder_its_parents_taint`, verified red against
+   the unfixed tree, verbatim `left: 200 right: 403`;
+   `a_run_that_declares_itself_its_own_ancestor_does_not_hang_the_box` for the
+   cycle; the seven in `gateway::toolcheck`, of which
+   `the_two_doors_answer_the_same_way_about_one_run` is the one that makes
+   level 2 worth having and `a_firewall_that_is_off_says_allow_and_ungoverned_not_just_allow`
+   the one that keeps its answer honest; five in `tests/mcp_broker.rs` for
+   level 3, including
+   `a_gateway_that_cannot_be_reached_does_not_silently_become_permission`;
+   `the_default_is_shadow_so_a_box_that_asked_for_nothing_still_measures`,
+   which also asserts the off switch still means off; six in
+   `core::agent_event::prompt_hash_tests` and two in `gateway::proxy` for the
+   instruction hash, of which `it_is_a_hash_and_carries_no_word_of_the_prompt`
+   is the whole safety argument. `@measured` end to end against the release
+   binary, 2026-08-26: started with NO firewall variable and logged
+   `mode=Shadow`; a child run with a spotless history refused with `tainted
+   context [unclassified, web]` inherited from `p1`; the record carried
+   `stage: parent_run`, `from_tools: ["p1"]`; the MCP door forwarded under
+   shadow and refused under enforce with `stage: mcp_tool_call`; and
+   `tokenfuse firewall --events` showed all four stages.)*
+
+   **Where it still says nothing.** None of docs/07 B.4's three sanitization
+   gates is built, so a label acquired is carried for the life of the run and
+   the only release valve is a new run. Source matching is on tool NAME only:
+   B.2's `mcp_server` and `args.path` globs are not built. Level 1 is still
+   advisory and always will be; what changed is that it is no longer the only
+   door. And nothing here looks at the text of a prompt.
 
 ## Decisions that have no gate yet
 

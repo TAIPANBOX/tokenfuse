@@ -204,11 +204,32 @@ impl FirewallConfig {
 /// Build from the environment.
 ///
 /// `TOKENFUSE_FIREWALL_CONFIG=<path>` loads a policy file; without it, the
-/// built-in starter policy, so nothing changes for a box that has not opted
-/// in. `TOKENFUSE_FIREWALL = off | shadow | enforce` sets the mode and WINS
-/// over the file's own `mode`: turning enforcement down is the thing an
-/// operator does in a hurry, and it should not require editing a file they may
-/// not have write access to.
+/// built-in starter policy. `TOKENFUSE_FIREWALL = off | shadow | enforce` sets
+/// the mode and WINS over the file's own `mode`: turning enforcement down is
+/// the thing an operator does in a hurry, and it should not require editing a
+/// file they may not have write access to.
+///
+/// # The default is `shadow`, and it was `off` until 2026-08-26
+///
+/// docs/07 B.9 has always named shadow as the on-ramp: "shadow mode for the
+/// remaining rules during the first week". The default contradicted its own
+/// specification, so out of the box this subsystem protected nothing and, worse,
+/// measured nothing, and every argument for turning it on had to be made without
+/// a single number from the fleet it would be turned on for.
+///
+/// `shadow` and not `enforce`, deliberately. Shadow refuses nothing: no request
+/// that worked yesterday fails today, which is what makes this a default rather
+/// than a breaking change. What it does is WRITE, and it only became worth
+/// defaulting to on the day it started writing: before `taint_shadow` shipped,
+/// a would-block set a response header and emitted nothing, so defaulting to
+/// shadow then would have turned on a cost with no output.
+///
+/// What it costs a box that wanted nothing: taint is computed per call from a
+/// request body already parsed for other reasons, and two event types are
+/// written. `taint_raised` fires once per label per run because taint is
+/// monotonic, and `taint_shadow` only when a rule actually matches a dangerous
+/// action, which on a healthy fleet is never. An operator who wants silence
+/// sets `TOKENFUSE_FIREWALL=off` and gets exactly what they had.
 ///
 /// **A named config that cannot be read or parsed aborts the process.** The
 /// alternative is a gateway running a starter policy while its operator
@@ -223,7 +244,8 @@ pub fn from_env() -> FirewallConfig {
                 std::process::exit(2);
             }
         },
-        _ => FirewallConfig::defaults(FirewallMode::Off),
+        // SHADOW, not off, since 2026-08-26. See the note on this function.
+        _ => FirewallConfig::defaults(FirewallMode::Shadow),
     };
     match std::env::var("TOKENFUSE_FIREWALL").as_deref() {
         Ok("enforce") => cfg.mode = FirewallMode::Enforce,
@@ -256,6 +278,47 @@ mod config_tests {
 
     fn cfg(json: &str) -> FirewallConfig {
         FirewallConfig::from_json(json).expect("a valid config")
+    }
+
+    #[test]
+    fn the_default_is_shadow_so_a_box_that_asked_for_nothing_still_measures() {
+        // Red against every version before 2026-08-26. The default contradicted
+        // docs/07 B.9, which names shadow as the on-ramp, so out of the box this
+        // subsystem protected nothing AND measured nothing, and the case for
+        // turning it on had to be made with no numbers from the fleet it was
+        // about.
+        //
+        // Shadow and not enforce: shadow refuses nothing, so no request that
+        // worked yesterday fails today. That is what makes it a default rather
+        // than a breaking change.
+        let saved = (
+            std::env::var("TOKENFUSE_FIREWALL").ok(),
+            std::env::var("TOKENFUSE_FIREWALL_CONFIG").ok(),
+        );
+        unsafe {
+            std::env::remove_var("TOKENFUSE_FIREWALL");
+            std::env::remove_var("TOKENFUSE_FIREWALL_CONFIG");
+        }
+        let c = from_env();
+        assert_eq!(c.mode, FirewallMode::Shadow);
+        assert!(
+            !c.rules.is_empty() && !c.sources.is_empty(),
+            "with the starter policy behind it, or the mode is on and judges nothing"
+        );
+
+        // And the off switch still means off, or this default has no exit.
+        unsafe { std::env::set_var("TOKENFUSE_FIREWALL", "off") };
+        assert_eq!(from_env().mode, FirewallMode::Off);
+
+        unsafe {
+            match saved.0 {
+                Some(v) => std::env::set_var("TOKENFUSE_FIREWALL", v),
+                None => std::env::remove_var("TOKENFUSE_FIREWALL"),
+            }
+            if let Some(v) = saved.1 {
+                std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", v);
+            }
+        }
     }
 
     #[test]

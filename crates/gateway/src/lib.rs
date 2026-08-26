@@ -38,6 +38,7 @@ pub mod settle;
 pub mod sink;
 pub mod sqlq;
 pub mod state;
+pub mod toolcheck;
 pub mod tui;
 pub mod unitledger;
 pub mod wardryx;
@@ -67,6 +68,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/keys", get(keysreport::list_keys))
         .route("/v1/policy-plane", get(policyplane::policy_plane))
         .route("/v1/agent-ids", get(agentids::agent_ids))
+        // docs/07 B.7 level 2: an executor asks BEFORE it runs a tool.
+        .route("/v1/fuse/check-tool-call", post(toolcheck::check_tool_call))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }

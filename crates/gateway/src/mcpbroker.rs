@@ -58,6 +58,9 @@ use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
 use crate::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use crate::wardryx::{DecideContext, Wardryx, WardryxDecision, WardryxMode};
+use tokenfuse_core::agent_event::{
+    dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
@@ -125,6 +128,22 @@ pub struct BrokerState {
     /// default; see `crate::events::from_env`. Emits `mcp_drift` (rug-pull) and
     /// `tool_call` (one per Wardryx-gated `tools/call`) -- see [`process`].
     pub events: Arc<EventExporter>,
+    /// Base URL of the gateway whose firewall judges a `tools/call`
+    /// (docs/07 B.7 level 3), e.g. `http://127.0.0.1:4100`. `None` disables
+    /// the taint gate here and the broker says so on refusal paths.
+    ///
+    /// The broker ASKS rather than judging, and that is the design rather than
+    /// laziness: `tokenfuse mcp-broker` is a separate process invocation with
+    /// its own state, so a taint map of its own would be a second answer about
+    /// one run, and an operator reading a refusal at one door and a permission
+    /// at the other has no way to tell which was right. One judge,
+    /// `/v1/fuse/check-tool-call`, reached from both.
+    pub taint_gateway: Option<String>,
+    /// What to do when that gateway cannot be reached: `false` (the default)
+    /// lets the call through and RECORDS that nothing governed it, matching
+    /// the LLM path's own `failmode=open` and its `dependency_failed` with
+    /// `effect: allowed_ungoverned`. `true` refuses instead.
+    pub taint_failclosed: bool,
 }
 
 /// Per-request context the HTTP transport reads off headers and the stdio
@@ -142,6 +161,13 @@ pub struct CallContext {
     /// `x-fuse-on-behalf-of` (comma-separated, root first), forwarded to the
     /// PDP so a delegation-scoped policy can match.
     pub on_behalf_of: Vec<String>,
+    /// `x-fuse-run-id`. Required by the taint gate and by nothing else here.
+    ///
+    /// Taint is per RUN, so without it the gate has nothing to judge against.
+    /// The MCP protocol carries no run identity of its own, which is why this
+    /// is a header the client has to send rather than something the broker can
+    /// work out. Absent on stdio, which has no header channel at all.
+    pub run_id: Option<String>,
     /// `x-fuse-attestation-method`, forwarded to the PDP for a
     /// `deny_if_unattested` policy.
     pub attestation_method: Option<String>,
@@ -481,6 +507,7 @@ async fn handle(
     let ctx = CallContext {
         agent_id: header("x-fuse-agent-id"),
         upstream: header("x-fuse-mcp-upstream"),
+        run_id: header("x-fuse-run-id"),
         on_behalf_of: header("x-fuse-on-behalf-of")
             .map(|s| {
                 s.split(',')
@@ -533,6 +560,104 @@ fn resolve_upstream<'a>(
                 )
             }),
     }
+}
+
+/// Ask the gateway's firewall whether this `tools/call` may proceed
+/// (docs/07 B.7 level 3).
+///
+/// `Ok(())` means proceed. `Err(message)` means refuse, with the message
+/// already written for a JSON-RPC error. The gate is off, and this returns
+/// `Ok(())`, when no gateway is configured.
+///
+/// # Two ways to have no answer, and they are not the same
+///
+/// **No run id.** Taint is per run and MCP carries no run identity, so a call
+/// without `x-fuse-run-id` is one the gate cannot judge. Refused when the gate
+/// is fail-closed, allowed otherwise, and either way it is not silence: the
+/// same shape the Wardryx gate above already takes about an unattributed call.
+///
+/// **The gateway did not answer.** Recorded as a `dependency_failed` naming
+/// the policy plane, exactly as the LLM path records its own unreachable PDP,
+/// because it is the same fact through a second door: a call proceeded and
+/// nothing governed it. A broker that swallowed this would leave an operator
+/// unable to tell a quiet week from a week the gate was down.
+async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(), String> {
+    let Some(base) = st.taint_gateway.as_deref() else {
+        return Ok(());
+    };
+    if tool.is_empty() {
+        return Ok(());
+    }
+    let Some(run_id) = ctx.run_id.as_deref().filter(|r| !r.is_empty()) else {
+        return if st.taint_failclosed {
+            Err("blocked: the taint gate needs x-fuse-run-id and this call carries none".into())
+        } else {
+            Ok(())
+        };
+    };
+
+    let url = format!("{}/v1/fuse/check-tool-call", base.trim_end_matches('/'));
+    // Serialized by hand rather than through reqwest's `json` feature: that
+    // feature is not on this crate's copy of reqwest, and turning it on for one
+    // call would add a codec to the dependency that carries every provider
+    // request in this process.
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "tool": tool,
+        "via": "mcp",
+    })
+    .to_string();
+    let mut req = st
+        .client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(payload);
+    if let Some(aid) = ctx.agent_id.as_deref() {
+        req = req.header("x-fuse-agent-id", aid);
+    }
+    let answer = match req.send().await {
+        Ok(r) => r
+            .text()
+            .await
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()),
+        Err(_) => None,
+    };
+    let Some(answer) = answer else {
+        let effect = if st.taint_failclosed {
+            DependencyEffect::DeniedUnasked
+        } else {
+            DependencyEffect::AllowedUngoverned
+        };
+        let outcome = st.events.emit(
+            EventType::DependencyFailed,
+            crate::sink::now_millis(),
+            ctx.agent_id.as_deref(),
+            Some(run_id),
+            None,
+            dependency_failed_data(
+                Dependency::PolicyPlane,
+                DependencyStage::Decide,
+                effect,
+                &format!("mcp broker could not reach the taint gate at {url}"),
+            ),
+        );
+        crate::events::log_outcome(EventType::DependencyFailed, outcome);
+        return if st.taint_failclosed {
+            Err("blocked: the taint gate could not be reached".into())
+        } else {
+            Ok(())
+        };
+    };
+
+    if answer.get("decision").and_then(|d| d.as_str()) == Some("deny") {
+        let reason = answer
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("tainted context denies this capability");
+        return Err(format!("blocked: {reason}"));
+    }
+    Ok(())
 }
 
 /// Broker a single JSON-RPC request and return the response - shared by the HTTP
@@ -662,6 +787,15 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         // real secret and never reaches the upstream. The broker holds no
         // signer and mutates nothing: a deny/hold is a JSON-RPC refusal, the
         // same shape every other block here uses.
+        // The agent firewall, docs/07 B.7 level 3. Before the Wardryx gate and
+        // before secret injection: a tool a tainted context may not use must
+        // not reach a real credential, and the cheapest refusal is the one
+        // that happens first.
+        if let Err(msg) = taint_gate(st, ctx, &tool).await {
+            tracing::warn!(tool = %tool, "mcp broker: taint gate refused tool call");
+            return rpc_error(&id, -32004, &msg);
+        }
+
         if st.wardryx.mode != WardryxMode::Off {
             match agent_id {
                 Some(aid) => {

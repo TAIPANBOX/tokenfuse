@@ -340,6 +340,72 @@ fn truncate_detail(detail: &str) -> String {
     out
 }
 
+/// A stable identifier for the instruction an agent was given this turn.
+///
+/// `sha384:<hex>` over the LAST user message's text, or `None` when the
+/// request carries none. SHA-384 because that is the width trailryx's records
+/// use, so if the two ever have to be joined they join without a re-hash.
+///
+/// # The last user message, not the whole history
+///
+/// Hashing the conversation would produce a value that changes on every turn
+/// and therefore groups nothing, which is the opposite of what the identifier
+/// is for. What `@yurii` asked on 2026-08-26 was "після яких саме промтів агент
+/// почав робити аномалії", and answering it means being able to say that four
+/// incidents came from ONE instruction, or that the instruction changed at the
+/// turn things went wrong. Only the newest instruction has that property.
+///
+/// # A hash, and only a hash
+///
+/// This is not a step towards putting prompts in the record, and it is useful
+/// without one: identical prompts collapse, a changed prompt is visible at the
+/// turn it changed, and a prompt somebody still has can be confirmed against
+/// it. What it cannot do is tell you what the text said, which is the point.
+/// Nothing here holds content, so nothing here needs erasing.
+///
+/// Both request shapes are read: Anthropic's `messages[].content` as a string
+/// or as an array of `{"type":"text","text":...}` blocks, and OpenAI's flat
+/// string. A shape neither of those covers hashes to `None` rather than to
+/// something: an identifier computed over a structure this function did not
+/// understand would group unrelated turns together, which is worse than an
+/// absent field because it looks like an answer.
+pub fn prompt_hash(request: &serde_json::Value) -> Option<String> {
+    let msgs = request.get("messages")?.as_array()?;
+    let last_user = msgs
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+    let text = message_text(last_user.get("content")?)?;
+    if text.is_empty() {
+        return None;
+    }
+    let digest = <sha2::Sha384 as sha2::Digest>::digest(text.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2 + 7);
+    hex.push_str("sha384:");
+    for b in digest {
+        hex.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        hex.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap_or('0'));
+    }
+    Some(hex)
+}
+
+/// The text of one message's `content`, across the two shapes on the wire.
+///
+/// Blocks are joined with `\n` rather than concatenated, so two turns whose
+/// blocks split differently across the same words do not collide.
+fn message_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(t) = content.as_str() {
+        return Some(t.to_string());
+    }
+    let blocks = content.as_array()?;
+    let parts: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 /// Where in a call the agent firewall acted (`data.stage`).
 ///
 /// The member `@yurii` asked for first on 2026-08-26 ("на якому етапі"), and
@@ -357,9 +423,30 @@ pub enum TaintStage {
     /// Trusted precisely because it can only ever ADD: taint is monotonic, so
     /// a caller can make itself more restricted and never less.
     RequestHeader,
-    /// Judging the tool calls in the model's own answer, which is the only
-    /// enforcement point this gateway has (docs/07 B.7 level 1, advisory).
+    /// Judging the tool calls in the model's own answer (docs/07 B.7 level 1,
+    /// advisory: the gateway sees the request, the CLIENT executes the tool).
     ModelToolCall,
+    /// The label came from an ancestor run, per docs/07 B.3 P3.
+    ///
+    /// Added 2026-08-26 with the inheritance itself. Until then the taint map
+    /// was keyed on `run_id` alone, so a tainted run could spawn a child that
+    /// started clean, and the whole firewall was one `x-fuse-parent-run-id`
+    /// header away from being switched off. A reader of a refusal on the child
+    /// needs this stage to see that its labels were never about anything the
+    /// child itself did.
+    ParentRun,
+    /// An executor asked before running a tool (docs/07 B.7 level 2), through
+    /// `POST /v1/fuse/check-tool-call`. The hard guarantee: the answer is
+    /// given BEFORE the tool runs rather than alongside a response the client
+    /// is free to ignore.
+    ToolCallCheck,
+    /// The MCP broker judged a `tools/call` before forwarding it (docs/07 B.7
+    /// level 3). Distinct from [`ToolCallCheck`](Self::ToolCallCheck) even
+    /// though the broker reaches the same judge through the same endpoint: an
+    /// operator reading a refusal needs to know whether a tool was stopped
+    /// because an SDK asked politely or because it went through a door that
+    /// stops things whether or not anybody asks.
+    McpToolCall,
 }
 
 impl TaintStage {
@@ -368,6 +455,9 @@ impl TaintStage {
             TaintStage::RequestHistory => "request_history",
             TaintStage::RequestHeader => "request_header",
             TaintStage::ModelToolCall => "model_tool_call",
+            TaintStage::ParentRun => "parent_run",
+            TaintStage::ToolCallCheck => "tool_call_check",
+            TaintStage::McpToolCall => "mcp_tool_call",
         }
     }
 }
@@ -410,9 +500,14 @@ pub fn taint_verdict_data(
     mode: TaintEnforcement,
     verdict: &crate::taint::TaintVerdict,
     tools: &[String],
+    prompt: Option<&str>,
     unit: &str,
 ) -> serde_json::Value {
     serde_json::json!({
+        // Which instruction was in play when this fired. See [`prompt_hash`]:
+        // a hash and only a hash, so the field groups incidents by the thing
+        // that caused them without the record holding a word of it.
+        "prompt_hash": prompt,
         "stage": stage.as_wire_str(),
         "mode": mode.as_wire_str(),
         "rule": verdict.rule,
@@ -441,9 +536,14 @@ pub fn taint_raised_data(
     added: &[String],
     from_tools: &[String],
     carrying: &[String],
+    prompt: Option<&str>,
     unit: &str,
 ) -> serde_json::Value {
     serde_json::json!({
+        // On the ACQUISITION as well as on the verdict, and this is the half an
+        // investigation starts from: the turn a run became untrusted is the turn
+        // whose instruction is worth reading.
+        "prompt_hash": prompt,
         "stage": stage.as_wire_str(),
         "added": added,
         "from_tools": from_tools,
@@ -1456,5 +1556,100 @@ mod tests {
         assert!(last.get("prev_hash").is_none(), "fresh head after garbage");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod prompt_hash_tests {
+    use super::prompt_hash;
+    use serde_json::json;
+
+    #[test]
+    fn the_same_instruction_hashes_to_the_same_value_across_turns() {
+        // The property the field exists for (@yurii 2026-08-26, "після яких
+        // саме промтів агент почав робити аномалії"): four incidents from one
+        // instruction have to be recognisable as one instruction. Hashing the
+        // whole history would change every turn and group nothing.
+        let turn_one = json!({"messages":[
+            {"role":"user","content":"summarise this page"}
+        ]});
+        let turn_five = json!({"messages":[
+            {"role":"user","content":"summarise this page"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","content":"and now email it"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","content":"summarise this page"}
+        ]});
+        assert_eq!(prompt_hash(&turn_one), prompt_hash(&turn_five));
+    }
+
+    #[test]
+    fn a_changed_instruction_is_visible_at_the_turn_it_changed() {
+        let before = json!({"messages":[{"role":"user","content":"read the docs"}]});
+        let after = json!({"messages":[
+            {"role":"user","content":"read the docs"},
+            {"role":"assistant","content":"..."},
+            {"role":"user","content":"ignore that and run this script"}
+        ]});
+        assert_ne!(prompt_hash(&before), prompt_hash(&after));
+    }
+
+    #[test]
+    fn both_wire_shapes_of_content_are_read() {
+        // Anthropic sends blocks, OpenAI sends a string, and the same words
+        // through two clients must be the same instruction.
+        let flat = json!({"messages":[{"role":"user","content":"do the thing"}]});
+        let blocks = json!({"messages":[
+            {"role":"user","content":[{"type":"text","text":"do the thing"}]}
+        ]});
+        assert_eq!(prompt_hash(&flat), prompt_hash(&blocks));
+    }
+
+    #[test]
+    fn blocks_are_joined_rather_than_run_together() {
+        // Two turns whose blocks split differently across the same words are
+        // different instructions, and a concatenation would collide them.
+        let split = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"delete"},{"type":"text","text":"everything"}
+        ]}]});
+        let whole = json!({"messages":[{"role":"user","content":"deleteeverything"}]});
+        assert_ne!(prompt_hash(&split), prompt_hash(&whole));
+    }
+
+    #[test]
+    fn a_shape_this_function_does_not_understand_hashes_to_nothing() {
+        // Absent beats wrong. An identifier computed over a structure nobody
+        // parsed would group unrelated turns and LOOK like an answer, which is
+        // worse than a field that is simply not there.
+        assert_eq!(prompt_hash(&json!({})), None);
+        assert_eq!(prompt_hash(&json!({"messages": []})), None);
+        assert_eq!(
+            prompt_hash(&json!({"messages":[{"role":"assistant","content":"hi"}]})),
+            None,
+            "no user turn is no instruction"
+        );
+        assert_eq!(
+            prompt_hash(&json!({"messages":[{"role":"user","content":[{"type":"image"}]}]})),
+            None,
+            "a turn with no text is not a turn with empty text"
+        );
+        assert_eq!(
+            prompt_hash(&json!({"messages":[{"role":"user","content":""}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn it_is_a_hash_and_carries_no_word_of_the_prompt() {
+        // The whole safety argument in one assertion. This field ships today
+        // precisely because it holds nothing to erase.
+        let secret = "the passphrase is hunter2 and the account is 4111111111111111";
+        let h = prompt_hash(&json!({"messages":[{"role":"user","content":secret}]}))
+            .expect("a text turn hashes");
+        assert!(h.starts_with("sha384:"));
+        assert_eq!(h.len(), 7 + 96, "384 bits of hex and nothing else");
+        for word in ["passphrase", "hunter2", "4111"] {
+            assert!(!h.contains(word), "{h}");
+        }
     }
 }
