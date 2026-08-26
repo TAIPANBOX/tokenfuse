@@ -121,7 +121,7 @@ live upstream.
 | B.3 P1, P2 monotonic accumulation | Built. |
 | B.3 P3 subagent inherits the parent's taint | Built 2026-08-26. Resolved on every request by walking the declared parent chain, so a parent that becomes untrusted AFTER its child started is picked up on the child's next call. |
 | B.3 P4 a new run is a clean set | Built, by the same keying. |
-| B.4 gate 1, human-approve | Built 2026-08-26. `POST /v1/fuse/declassify`. |
+| B.4 gate 1, human-approve | Built 2026-08-26. `POST /v1/fuse/declassify`. A review is recorded against the tool BLOCKS a person read, by the id both wire shapes carry, so resending the conversation does not spend it. |
 | B.4 gates 2 and 3, extraction and allowlist transforms | **Not built here, and cannot be**: both declassify a VALUE, and B.3 refuses per-value tracking on purpose. Their run-level expression is B.3 P4's quarantined sub-run, which works and is now asserted. See below. |
 | B.10's "semantic content analysis complements this" | Built 2026-08-26, as a taint SOURCE and never as a decision. See below. |
 | B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. |
@@ -298,7 +298,8 @@ acceptable only because it cannot lower a gate.
 ### The release valve, and where the other two gates actually live
 
 **Gate 1 is built.** `POST /v1/fuse/declassify` takes `{run_id, agent_id,
-labels, actor, reason}` and takes those labels off that run.
+labels, actor, reason}`, plus an optional `reviewed_blocks`, and takes those
+labels off that run.
 
 It is the valve B.10 promised and the model never had. Taint is monotonic, so a
 label lasted the life of a run, and once inheritance shipped one long-lived
@@ -315,9 +316,82 @@ Four things keep it from being the bypass, and none of them is obscurity:
 - **`secrets` can never be cleared.** B.9 locks anti-exfiltration on in enforce
   mode, and clearing that label makes the rule unreachable for a run, which is
   disabling it by another door.
-- **A clearance is spent by the next arrival of that label.** They reviewed what
-  was there, not what comes next. Measured live: cleared, allowed, read the web
-  again, refused again.
+- **A clearance is spent by the next arrival of that label from a block nobody
+  signed for.** They reviewed what was there, not what comes next.
+
+### A review is about BLOCKS, and for its first day it was not
+
+Taint is re-derived from the whole `messages[]` array on every request, and an
+agent loop resends the whole conversation on every turn. So the valve did not
+release. Clear `web` on a run, and the next turn still carried the `web_search`
+block a person had just reviewed; that block re-supplied the label, the
+clearance was spent, and the run was tainted again before its next action was
+judged. The test that proved the valve worked sent a follow-up with no tool
+history at all, which is not a shape any agent loop produces, so it passed
+against the defect.
+
+Both wire shapes give a tool call an id: Anthropic at `tool_use.id`, OpenAI at
+`tool_calls[].id`, and both point back at it from the result
+(`tool_result.tool_use_id`, a tool message's `tool_call_id`). A clearance is
+recorded against those ids. **The same block arriving again is not an arrival; a
+block that was not there when somebody read the conversation is.**
+
+Four things about that, each a decision rather than an implementation detail.
+
+- **A block with no id is never read as reviewed.** The other fallback would be
+  a bypass one omitted field wide. The cost is named: a producer that sends no
+  ids gets a valve that still spends on every turn, which is exactly where every
+  deployment was before this existed, and the answer says so by reporting
+  `reviewed_blocks: 0` rather than leaving it to be discovered on the next call.
+- **`reviewed_blocks` is inferred when it is absent, and that is the normal
+  case.** It means every block this gateway has seen on the run, which is what
+  was on the screen the person was reading: they were looking at a refusal, and
+  the refusal is about a conversation this gateway had just carried. Requiring
+  the ids would mean a console had to fetch the conversation, which this gateway
+  does not store, and would put the question of what a human read into the hands
+  of the agent framework, which is the party this endpoint exists to overrule. A
+  caller that does know may name them; an id the run never carried refuses the
+  whole clearance rather than being skipped, because a forward-dated review is a
+  permanent exemption bought before the thing it exempts exists.
+- **The set is bounded, at 256 blocks per run, and overflowing it is
+  fail-closed.** A conversation can carry hundreds of blocks and a run can live
+  for hours, so an unbounded set is a leak. The oldest ids are dropped and the
+  blocks they named read as unreviewed again, so their labels return: noisy
+  rather than unsafe.
+- **`suspected_injection` behaves the same way**, because it is the same shape
+  one field over: it is re-derived by scanning tool RESULTS on every turn, so a
+  cleared label came straight back off the same document. A block somebody
+  signed for takes its result with it, since reading the document is what they
+  did. A result whose call has scrolled out of the request window is attributed
+  to no tool, is therefore never reviewed, and is still scanned.
+
+The taint bitset handed to a custom WASM policy comes through the same split, so
+the two subsystems cannot answer differently about one run.
+
+**Measured live 2026-08-26**, release binary, `TOKENFUSE_FIREWALL=enforce`,
+against a real upstream whose every answer asks to run a shell:
+
+- turn one, the run had read the status board: `403`, `tainted context [web]
+  denies capability [exec]`;
+- a person cleared `web` with a reason: `{"cleared":["web"],
+  "reviewed_blocks":1,"authenticated":true}`;
+- turn two, **the same conversation resent, which is what an agent loop sends**:
+  `200`, and no `taint_raised` at all, because nothing new arrived;
+- turn three, the same conversation plus one page nobody had reviewed: `403`
+  again, `tainted context [unclassified, web]`.
+
+The old sentence here, "cleared, allowed, read the web again, refused again",
+was measured on a follow-up carrying no tool history. That is true of a narrower
+request shape than a real agent loop sends, and it is what let the defect stand.
+
+**What the valve does not hold across, and this was measured too.** The answer
+the allowed turn produces is a new action nobody reviewed: a model tool call
+that the gateway has just permitted is accumulated on the run at that moment
+(B.3 P2), so on the run above, `run_shell` being permitted on turn two put
+`unclassified` on the run and turn three was refused for that as well as for the
+new page. On a second run cleared for both labels, turn three was refused naming
+`unclassified` alone, with `web` gone: the label that came back was the one the
+model had just earned, and not the one on the page a person read.
 
 `agent_id` is required and is not a formality: `Exporter::emit` SKIPS an event
 with no subject and counts the skip, because SPEC 6.1 forbids inventing one. An

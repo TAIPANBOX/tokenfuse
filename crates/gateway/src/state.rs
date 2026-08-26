@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::agent_event::Exporter as EventExporter;
 use tokenfuse_core::cache::{CacheConfig, HashEmbedder};
-use tokenfuse_core::taint::Labels;
+use tokenfuse_core::taint::{Labels, ToolUse};
 use tokenfuse_core::{DlpMode, Ledger, Microusd, Policy, PriceBook, SemanticCache};
 
 /// Per-run history of input sizes (tokens), used by the context-growth loop
@@ -140,6 +140,78 @@ pub struct TaintStore {
     /// once per run, this is consulted on every request and must survive a
     /// caller declaring a parent it never opened.
     parents: Mutex<HashMap<String, String>>,
+    /// Per run: the tool blocks this gateway has carried, and which of them a
+    /// human has signed for. See [`BlockLedger`] and [`TaintStore::split_history`].
+    blocks: Mutex<HashMap<String, BlockLedger>>,
+}
+
+/// How many tool blocks are tracked per run.
+///
+/// The set has to survive across requests, because a clearance and the turn it
+/// releases are different HTTP calls, and it must not grow without limit: a
+/// conversation can carry hundreds of blocks and a run can live for hours.
+///
+/// The arithmetic, so the number is a decision rather than a round figure. An
+/// id is about 30 bytes (`toolu_01A09q9rDvhhBmiSMDCLwuTs`), held twice at the
+/// worst (once in arrival order, once in the reviewed set), so a run sitting at
+/// this cap with everything reviewed costs on the order of 28 KB. A run with
+/// three tool calls costs three ids. 256 covers a long agent conversation
+/// without covering a full 200k-token context window, which at roughly 500
+/// tokens per call-and-result pair would be nearer 400.
+///
+/// **Overflow is fail-closed and it is not silent.** The oldest ids are
+/// dropped, so the blocks they named read as unreviewed again and their labels
+/// return on the next turn. That is the noisy direction rather than the unsafe
+/// one, and [`crate::declassify`] reports how many blocks a clearance actually
+/// covered so a half-covered conversation says so instead of looking like a
+/// broken feature.
+pub const MAX_TRACKED_BLOCKS: usize = 256;
+
+/// One run's tool blocks: everything seen, and the subset a human signed for.
+///
+/// `order` doubles as the membership test. A separate `HashSet` would make
+/// `note` O(1) instead of O(cap), and it would also hold a third copy of every
+/// id; `note` runs once per request over the blocks that request carried, and
+/// a few thousand short string comparisons is not what costs anything on this
+/// path.
+#[derive(Debug, Default)]
+struct BlockLedger {
+    /// Every block id this gateway has seen on the run, oldest first.
+    order: std::collections::VecDeque<String>,
+    /// The subset a human signed for. Always a subset of `order`: an id that
+    /// falls out of the window takes its review with it.
+    reviewed: HashSet<String>,
+}
+
+impl BlockLedger {
+    fn note(&mut self, id: &str) {
+        if self.order.iter().any(|k| k == id) {
+            return;
+        }
+        self.order.push_back(id.to_string());
+        while self.order.len() > MAX_TRACKED_BLOCKS {
+            if let Some(old) = self.order.pop_front() {
+                self.reviewed.remove(&old);
+            }
+        }
+    }
+}
+
+/// A request's tool history, split by whether a human has signed for the block
+/// that carried each name.
+///
+/// Names rather than blocks on both sides, because a label belongs to a tool
+/// and [`tokenfuse_core::taint::labels_for_tools`] is what turns one into the
+/// other. A name carried by BOTH a reviewed and an unreviewed block lands in
+/// `unreviewed` and is absent from `reviewed_only`: a fresh page is a fresh
+/// page, whichever earlier page was signed for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistorySplit {
+    /// Tools whose blocks nobody has signed for. These still supply labels.
+    pub unreviewed: Vec<String>,
+    /// Tools every one of whose blocks a human signed for. These supply
+    /// nothing: re-supplying them is what spent the clearance.
+    pub reviewed_only: Vec<String>,
 }
 
 impl TaintStore {
@@ -195,6 +267,108 @@ impl TaintStore {
         out
     }
 
+    /// Record the tool blocks this request carried, so a clearance arriving
+    /// afterwards can say which ones were on the screen somebody read.
+    ///
+    /// Append-only across requests, within [`MAX_TRACKED_BLOCKS`]. A client
+    /// that trims its context therefore does not lose the clearance it was
+    /// given for the blocks it dropped, which it would if this were replaced
+    /// per request.
+    pub fn note_blocks(&self, run_id: &str, blocks: &[ToolUse]) {
+        if run_id.is_empty() || blocks.is_empty() {
+            return;
+        }
+        let mut map = self.blocks.lock().unwrap();
+        let entry = map.entry(run_id.to_string()).or_default();
+        for b in blocks {
+            if let Some(id) = &b.id {
+                entry.note(id);
+            }
+        }
+    }
+
+    /// Split a request's tool history by whether a human signed for the block.
+    ///
+    /// This is docs/07 B.4 gate 1 doing the thing it claimed to do. Taint is
+    /// re-derived from the whole `messages[]` array on every request, and an
+    /// agent loop resends the whole conversation, so before this a clearance
+    /// was spent by the next turn of the SAME conversation and the valve
+    /// released nothing.
+    ///
+    /// **A block with no id is unreviewed.** Falling back the other way would
+    /// mean a caller could put a block past a clearance by omitting one field,
+    /// which is a bypass; falling back this way costs an operator whose
+    /// producer sends no ids a valve that still spends on every turn, which is
+    /// exactly where they were before.
+    pub fn split_history(&self, run_id: &str, blocks: &[ToolUse]) -> HistorySplit {
+        let mut split = HistorySplit::default();
+        if blocks.is_empty() {
+            return split;
+        }
+        let map = self.blocks.lock().unwrap();
+        let reviewed = map.get(run_id).map(|l| &l.reviewed);
+        for b in blocks {
+            let signed = match (&b.id, reviewed) {
+                (Some(id), Some(set)) => set.contains(id),
+                _ => false,
+            };
+            if signed {
+                split.reviewed_only.push(b.name.clone());
+            } else {
+                split.unreviewed.push(b.name.clone());
+            }
+        }
+        split
+            .reviewed_only
+            .retain(|n| !split.unreviewed.contains(n));
+        split.reviewed_only.dedup();
+        split
+    }
+
+    /// Sign for tool blocks on a run, on behalf of the human who read them.
+    ///
+    /// An empty `ids` is the INFERENCE: everything this gateway has seen on the
+    /// run. That is the friendly form and the accurate one. What an operator is
+    /// looking at when they clear a run is the refusal, which carries the rule,
+    /// the labels and the tool but not the conversation, and this gateway does
+    /// not store conversations for a console to fetch. Requiring ids would push
+    /// the decision about what a human read onto the agent framework, which is
+    /// the party this endpoint exists to overrule.
+    ///
+    /// A non-empty `ids` is honoured, and any id this run never carried refuses
+    /// the WHOLE list: it is either a mistake or an attempt to sign for a block
+    /// that has not arrived yet, and a forward-dated review is the permanent
+    /// exemption this valve must not hand out. Returns `Err` with those ids.
+    pub fn mark_reviewed(&self, run_id: &str, ids: &[String]) -> Result<usize, Vec<String>> {
+        let mut map = self.blocks.lock().unwrap();
+        let Some(entry) = map.get_mut(run_id) else {
+            // Nothing seen: no ids to sign for, and any named id is unknown.
+            return if ids.is_empty() {
+                Ok(0)
+            } else {
+                Err(ids.to_vec())
+            };
+        };
+        if ids.is_empty() {
+            entry.reviewed = entry.order.iter().cloned().collect();
+            return Ok(entry.reviewed.len());
+        }
+        // Checked in full before anything is written: a partly-applied review
+        // is a state nobody asked for and nobody can read back.
+        let unknown: Vec<String> = ids
+            .iter()
+            .filter(|id| !entry.order.iter().any(|k| k == *id))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(unknown);
+        }
+        for id in ids {
+            entry.reviewed.insert(id.clone());
+        }
+        Ok(ids.len())
+    }
+
     /// Let a human's review take a label off a run (docs/07 B.4 gate 1).
     ///
     /// Returns what was actually let go. `secrets` is never among it: docs/07
@@ -202,11 +376,20 @@ impl TaintStore {
     /// would make the rule unreachable for a run, which is disabling it by
     /// another door.
     ///
-    /// **A clearance is spent by the next arrival of that label.** The human
-    /// reviewed what was THERE, not what comes next, and a clearance that
-    /// survived the next arrival would mean one review buys an agent a
-    /// permanent exemption, which is worse than having no valve at all. See
-    /// [`accumulate`](Self::accumulate), which is where it is spent.
+    /// **A clearance is spent by the next arrival of that label from a block
+    /// nobody signed for.** The human reviewed what was THERE, not what comes
+    /// next, and a clearance that survived the next arrival would mean one
+    /// review buys an agent a permanent exemption, which is worse than having
+    /// no valve at all. See [`accumulate`](Self::accumulate), which is where it
+    /// is spent, and [`split_history`](Self::split_history), which decides
+    /// which arrivals count.
+    ///
+    /// "Arrival" used to mean the label appearing anywhere in the request, and
+    /// that made the valve useless: an agent loop resends the whole
+    /// conversation on every turn, so the very block a human had just reviewed
+    /// re-supplied its label and spent the clearance before the run's next
+    /// action was judged. A review is now about blocks, so the same block
+    /// arriving again is not an arrival.
     pub fn clear(&self, run_id: &str, labels: &[String]) -> (Vec<String>, Vec<String>) {
         let mut refused = Vec::new();
         let mut cleared = Vec::new();
@@ -512,5 +695,162 @@ impl AppState {
             entry.drain(0..excess);
         }
         entry.clone()
+    }
+}
+
+#[cfg(test)]
+mod block_ledger_tests {
+    use super::*;
+
+    fn use_of(id: Option<&str>, name: &str) -> ToolUse {
+        ToolUse {
+            id: id.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_same_block_arriving_again_is_not_an_arrival() {
+        // The defect this exists to close, at the level below the HTTP path: an
+        // agent loop resends the whole conversation, so the block a human
+        // reviewed came back on every turn and re-supplied its label.
+        let st = TaintStore::default();
+        let history = vec![use_of(Some("t1"), "web_search")];
+        st.note_blocks("r", &history);
+        assert_eq!(st.mark_reviewed("r", &[]), Ok(1));
+        let split = st.split_history("r", &history);
+        assert!(split.unreviewed.is_empty(), "{split:?}");
+        assert_eq!(split.reviewed_only, vec!["web_search"]);
+    }
+
+    #[test]
+    fn one_name_on_two_blocks_is_unreviewed_while_either_is() {
+        // A tool is not a block. Signing for one page does not sign for the
+        // next, and the label has to come back for the unsigned one, so the
+        // name lands in `unreviewed` and is absent from `reviewed_only`.
+        let st = TaintStore::default();
+        st.note_blocks("r", &[use_of(Some("t1"), "web_search")]);
+        assert_eq!(st.mark_reviewed("r", &[]), Ok(1));
+        let grown = vec![
+            use_of(Some("t1"), "web_search"),
+            use_of(Some("t2"), "web_search"),
+        ];
+        st.note_blocks("r", &grown);
+        let split = st.split_history("r", &grown);
+        assert_eq!(split.unreviewed, vec!["web_search"]);
+        assert!(
+            split.reviewed_only.is_empty(),
+            "a name carried by an unsigned block is not a signed name: {split:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_id_is_unreviewed_however_the_run_was_cleared() {
+        // The unsafe fallback would be a one-field bypass: omit the id and the
+        // block goes past any clearance.
+        let st = TaintStore::default();
+        let anon = vec![use_of(None, "web_search")];
+        st.note_blocks("r", &anon);
+        assert_eq!(
+            st.mark_reviewed("r", &[]),
+            Ok(0),
+            "there was nothing identifiable to sign for"
+        );
+        assert_eq!(st.split_history("r", &anon).unreviewed, vec!["web_search"]);
+    }
+
+    #[test]
+    fn signing_for_a_block_that_never_arrived_refuses_the_whole_list() {
+        // A forward-dated review is a permanent exemption bought before the
+        // thing it exempts exists. Refused whole rather than partly applied,
+        // because a partly-applied review is a state nobody asked for and
+        // nobody can read back.
+        let st = TaintStore::default();
+        st.note_blocks("r", &[use_of(Some("t1"), "web_search")]);
+        assert_eq!(
+            st.mark_reviewed("r", &["t1".into(), "t9".into()]),
+            Err(vec!["t9".to_string()])
+        );
+        assert_eq!(
+            st.split_history("r", &[use_of(Some("t1"), "web_search")])
+                .unreviewed,
+            vec!["web_search"],
+            "and nothing was written on the way to refusing"
+        );
+    }
+
+    #[test]
+    fn the_tracked_set_is_bounded_and_overflowing_it_is_fail_closed() {
+        // An unbounded set is a leak: a conversation can carry hundreds of
+        // blocks and a run can live for hours. Overflow drops the OLDEST, so
+        // the blocks it drops read as unreviewed again and their labels return,
+        // which is the noisy direction rather than the unsafe one.
+        let st = TaintStore::default();
+        let all: Vec<ToolUse> = (0..MAX_TRACKED_BLOCKS + 1)
+            .map(|i| use_of(Some(&format!("t{i}")), "web_search"))
+            .collect();
+        st.note_blocks("r", &all);
+        assert_eq!(st.mark_reviewed("r", &[]), Ok(MAX_TRACKED_BLOCKS));
+
+        let oldest = vec![use_of(Some("t0"), "web_search")];
+        assert_eq!(
+            st.split_history("r", &oldest).unreviewed,
+            vec!["web_search"],
+            "the id that fell out of the window took its review with it"
+        );
+        let newest = vec![use_of(
+            Some(&format!("t{MAX_TRACKED_BLOCKS}")),
+            "web_search",
+        )];
+        assert!(st.split_history("r", &newest).unreviewed.is_empty());
+    }
+
+    #[test]
+    fn a_review_that_scrolls_out_of_the_window_stops_counting() {
+        // The other half of the cap, and the half a mutant caught: without it
+        // the reviewed set outlives the block list it is about and grows
+        // without limit, which is the leak the cap exists to stop, and a
+        // reviewed id that no longer names anything is a review nobody can
+        // read back.
+        //
+        // Written after `the_tracked_set_is_bounded_and_overflowing_it_is_fail_closed`
+        // failed to catch `reviewed.remove(&old)` being deleted: that test
+        // signs for the blocks AFTER the overflow, so the evicted id was never
+        // in the reviewed set at all and the cull was never exercised.
+        let st = TaintStore::default();
+        st.note_blocks("r", &[use_of(Some("t0"), "web_search")]);
+        assert_eq!(st.mark_reviewed("r", &[]), Ok(1));
+
+        let later: Vec<ToolUse> = (1..=MAX_TRACKED_BLOCKS)
+            .map(|i| use_of(Some(&format!("t{i}")), "read_upload"))
+            .collect();
+        st.note_blocks("r", &later);
+
+        assert_eq!(
+            st.split_history("r", &[use_of(Some("t0"), "web_search")])
+                .unreviewed,
+            vec!["web_search"],
+            "an id that fell out of the window takes its review with it"
+        );
+    }
+
+    #[test]
+    fn a_client_that_trims_its_context_keeps_the_clearance_it_was_given() {
+        // The set is append-only across requests rather than replaced per
+        // request. Replacing it would mean a client dropping old turns from its
+        // context silently un-reviewed them, and the label would come back for
+        // a block nobody re-sent.
+        let st = TaintStore::default();
+        let full = vec![
+            use_of(Some("t1"), "web_search"),
+            use_of(Some("t2"), "read_upload"),
+        ];
+        st.note_blocks("r", &full);
+        assert_eq!(st.mark_reviewed("r", &[]), Ok(2));
+        // Next turn the client sends only the tail.
+        let trimmed = vec![use_of(Some("t2"), "read_upload")];
+        st.note_blocks("r", &trimmed);
+        // The turn after, the head is back.
+        assert!(st.split_history("r", &full).unreviewed.is_empty());
     }
 }

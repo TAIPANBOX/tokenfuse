@@ -72,9 +72,36 @@ impl TaintVerdict {
     }
 }
 
-/// Extract tool-call names from a request (message history) or a response,
-/// across Anthropic (`tool_use`) and OpenAI (`tool_calls`) shapes.
-pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
+/// One tool invocation as the wire carries it: the name, and the id the wire
+/// gave that particular block.
+///
+/// The id is what makes a human's clearance per BLOCK rather than per label.
+/// [`tool_names_in`] walks the whole `messages[]` array, so a run's labels are
+/// re-derived from the whole conversation on every turn, and an agent loop
+/// resends the whole conversation. Without a way to say WHICH blocks somebody
+/// reviewed, a clearance is spent by the next turn of the same conversation
+/// and the release valve releases nothing.
+///
+/// Both wire shapes carry one. Anthropic puts it at `tool_use.id`, OpenAI at
+/// `tool_calls[].id`, and both reference it back from the result block
+/// (`tool_result.tool_use_id`, a tool message's `tool_call_id`).
+///
+/// `None` where the wire carried none, and a block with no id is never read as
+/// reviewed. That direction is the safe one and the other is a bypass: a
+/// caller who could launder a block past a clearance by omitting a field would
+/// have a one-key way around the valve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUse {
+    /// The block's own id, absent where the wire carried none.
+    pub id: Option<String>,
+    /// The tool that was called.
+    pub name: String,
+}
+
+/// Extract tool calls from a request (message history) or a response, across
+/// Anthropic (`tool_use`) and OpenAI (`tool_calls`) shapes, with the id each
+/// block carries.
+pub fn tool_uses_in(v: &serde_json::Value) -> Vec<ToolUse> {
     let mut out = Vec::new();
 
     // Anthropic response: top-level content array with tool_use blocks.
@@ -99,6 +126,16 @@ pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
     }
 
     out
+}
+
+/// The names alone, for every caller that judges a tool and not a block.
+///
+/// Kept as its own function rather than inlined at each call site: the request
+/// path asks this question in four places and only one of them is about a
+/// human's review, so collapsing them would make three callers carry an id
+/// they have no use for.
+pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
+    tool_uses_in(v).into_iter().map(|t| t.name).collect()
 }
 
 /// Tool names a request DECLARES as available (the top-level `tools[]` array),
@@ -129,19 +166,26 @@ pub fn declared_tool_names_in(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
-fn push_tool_use_from_content(content: Option<&serde_json::Value>, out: &mut Vec<String>) {
+fn push_tool_use_from_content(content: Option<&serde_json::Value>, out: &mut Vec<ToolUse>) {
     if let Some(blocks) = content.and_then(|c| c.as_array()) {
         for b in blocks {
             if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                 if let Some(name) = b.get("name").and_then(|n| n.as_str()) {
-                    out.push(name.to_string());
+                    out.push(ToolUse {
+                        id: b
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .filter(|i| !i.is_empty())
+                            .map(str::to_string),
+                        name: name.to_string(),
+                    });
                 }
             }
         }
     }
 }
 
-fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<String>) {
+fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<ToolUse>) {
     if let Some(arr) = calls.and_then(|c| c.as_array()) {
         for tc in arr {
             if let Some(name) = tc
@@ -149,7 +193,14 @@ fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<Strin
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
             {
-                out.push(name.to_string());
+                out.push(ToolUse {
+                    id: tc
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .filter(|i| !i.is_empty())
+                        .map(str::to_string),
+                    name: name.to_string(),
+                });
             }
         }
     }
@@ -272,6 +323,60 @@ mod tests {
         let resp =
             json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"send_email"}}]}}]});
         assert_eq!(tool_names_in(&resp), vec!["send_email"]);
+    }
+
+    #[test]
+    fn both_wire_shapes_carry_the_block_id() {
+        // The id is what lets a clearance be about specific blocks. Anthropic
+        // puts it on the block, OpenAI on the call, and a reader that took only
+        // the name could not tell one turn's `web_search` from another's.
+        let anthropic = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"web_search","input":{}}]}
+        ]});
+        assert_eq!(
+            tool_uses_in(&anthropic),
+            vec![ToolUse {
+                id: Some("toolu_01".into()),
+                name: "web_search".into()
+            }]
+        );
+
+        let openai = json!({"messages":[
+            {"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"send_email"}}]}
+        ]});
+        assert_eq!(
+            tool_uses_in(&openai),
+            vec![ToolUse {
+                id: Some("call_abc".into()),
+                name: "send_email".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_id_is_readable_and_carries_none() {
+        // Not every producer sends one, and an empty string is not an id
+        // either: it would be one value every unidentified block shares, so a
+        // clearance naming it would cover all of them at once.
+        let v = json!({"content":[
+            {"type":"tool_use","name":"web_search","input":{}},
+            {"type":"tool_use","id":"","name":"read_upload","input":{}}
+        ]});
+        let uses = tool_uses_in(&v);
+        assert_eq!(uses.len(), 2);
+        assert!(uses.iter().all(|u| u.id.is_none()), "{uses:?}");
+    }
+
+    #[test]
+    fn the_names_are_the_same_ones_this_module_always_returned() {
+        // `tool_names_in` is on four call paths and only one of them is about a
+        // human's review. Adding the id must not change what the other three
+        // read.
+        let v = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"web_search","input":{}}]},
+            {"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"send_email"}}]}
+        ]});
+        assert_eq!(tool_names_in(&v), vec!["web_search", "send_email"]);
     }
 
     #[test]
