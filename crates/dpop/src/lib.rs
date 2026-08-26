@@ -218,6 +218,14 @@ pub fn verify_proof(
         // RFC 9449 requires the PUBLIC key. A `d` here is a client handing us its
         // signing key, and accepting it makes this process a place private keys
         // collect.
+        //
+        // Running BEFORE the algorithm rule below is load-bearing and was
+        // implicit until a planted mutant made it worth writing down. A
+        // symmetric JWK carries `k`, which is in this list, so an `oct` key in a
+        // proof is refused here and never reaches `algorithms_for_key` at all.
+        // @measured 2026-08-26, a throwaway probe against this crate: an
+        // attacker-signed HS256 proof carrying `{"kty":"oct","k":...}` comes
+        // back `PrivateKeyMaterial`.
         return Err(ProofRefusal::PrivateKeyMaterial);
     }
 
@@ -225,6 +233,18 @@ pub fn verify_proof(
     // whole scheme rests on: without it, anybody staples somebody else's public
     // key to their own proof and is accepted as its holder. The algorithm still
     // comes from the key type, so a proof cannot downgrade itself either.
+    //
+    // On THIS path that last clause is defence in depth rather than the only
+    // barrier, and saying so is more useful than repeating the headline.
+    // @measured 2026-08-26: replacing `algorithms_for_key` here with
+    // `header.alg` changed no test in the workspace, because every route
+    // through it is already closed. A symmetric key is refused above; an RSA or
+    // EC key with an HMAC algorithm is refused by jsonwebtoken 9 itself
+    // (`InvalidAlgorithm`, its own key-family check); and `thumbprint` refuses
+    // anything that is neither RSA nor EC at the end. The rule stays because it
+    // does not depend on that library detail, and because on the TOKEN paths
+    // (`oidc`, `delegation`) the key comes from a configured JWKS by `kid`,
+    // where nothing else refuses an `oct` entry and this is what closes `none`.
     let algorithms = algorithms_for_key(jwk).ok_or(ProofRefusal::BadSignature)?;
     let key = DecodingKey::from_jwk(jwk).map_err(|_| ProofRefusal::BadSignature)?;
     let mut validation = Validation::new(algorithms[0]);
@@ -676,6 +696,37 @@ mod tests {
         assert_eq!(
             thumbprint_of_json(&serde_json::json!({"not": "a key"})),
             Err(KeyRefusal::Malformed)
+        );
+    }
+    /// The ordering the mutant above made worth pinning: a symmetric key inside
+    /// a proof is refused for carrying private material, BEFORE the algorithm
+    /// rule is asked about it. Both answers are a refusal, so this is about
+    /// which one, and which one is what tells an operator that a client sent its
+    /// secret rather than that it sent a key of an odd type.
+    #[test]
+    fn a_symmetric_key_in_a_proof_is_refused_for_what_it_carries_not_for_its_type() {
+        let secret = b"an-attacker-chosen-secret";
+        let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
+        header.typ = Some("dpop+jwt".into());
+        header.jwk = Some(
+            serde_json::from_value(serde_json::json!({"kty": "oct", "k": b64(secret)}))
+                .expect("an oct jwk"),
+        );
+        let claims: HashMap<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"htm": "POST", "htu": URL, "iat": 1_800_000_000, "jti": "j"}),
+        )
+        .expect("claims");
+        let signed = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .expect("a well-formed HS256 proof");
+        assert_eq!(
+            verify_proof(&signed, "POST", URL, 1_800_000_000).unwrap_err(),
+            ProofRefusal::PrivateKeyMaterial,
+            "an `oct` key is the client's secret, and that is the more useful thing to say \
+             about it than that no algorithm rule admits it"
         );
     }
 }

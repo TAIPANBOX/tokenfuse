@@ -1308,6 +1308,27 @@ build)`, `cloud apns (feature build)`.
    left that all three could reach, because the gateway must not depend on the
    Cloud and `tokenfuse-core` must not grow a JWS library (invariant 1).
 
+   **On the PROOF path this rule is defence in depth, not the only barrier, and
+   that is measured rather than assumed.** `@measured` 2026-08-26, by planting
+   the mutant and by a throwaway probe against `tokenfuse-dpop`: replacing
+   `algorithms_for_key` with `header.alg` inside `verify_proof` changed no test
+   in the workspace, because every route through it is already closed. A
+   symmetric key is refused earlier, by the private-member check, since an `oct`
+   JWK carries `k`. An RSA or EC key presented with an HMAC algorithm is refused
+   by `jsonwebtoken` 9 itself, whose own key-family check answers
+   `InvalidAlgorithm`. And `thumbprint` refuses anything that is neither RSA nor
+   EC at the end.
+
+   It stays, for two reasons that are not "it might help". It does not depend on
+   a library's internal check, which is a thing a dependency bump can change
+   without saying so. And on the TOKEN paths it IS the barrier: there the key
+   comes from a configured JWKS by `kid`, `thumbprint` is never consulted, and
+   nothing else refuses an `oct` entry in an operator's own key set, which is
+   also what closes `none`. `the_algorithm_still_comes_from_the_key_on_this_path`
+   and `the_algorithm_comes_from_the_key_and_never_from_the_header` are what
+   hold it, and neither can go red for the proof path, which is the honest
+   limit.
+
    **A delegation is verified with what the process already holds.** No client,
    no URL, no timeout: the key set is local, the clock is passed in, and
    revocation is a closure the caller owns. wardryx decides at a 3.2 ms p50 and
@@ -1424,9 +1445,34 @@ build)`, `cloud apns (feature build)`.
    `tests/mcp_broker.rs` over the live HTTP path asserting on what reached the
    upstream, including
    `a_captured_proof_replayed_at_the_live_door_reaches_nothing_the_second_time`.
-   Fifteen in `tokenfuse-dpop` for the verifier and the cache. All were run
+   Sixteen in `tokenfuse-dpop` for the verifier and the cache. All were run
    against the unfixed tree first: `mcpdoor` did not exist, so the suite failed
-   to compile, verbatim ``could not find `mcpdoor` in `tokenfuse_gateway` ``.)*
+   to compile, verbatim ``could not find `mcpdoor` in `tokenfuse_gateway` ``.
+
+   Ten mutants were planted in the PRODUCT code on 2026-08-26, nine caught and
+   one not, each named with the test that caught it: the key that signed a proof
+   never looked up (`a_proof_from_a_key_no_client_published_is_refused`); the
+   replay answer computed and discarded
+   (`a_replayed_proof_is_refused_though_it_verifies_perfectly` and the live
+   one); `require_proof` ignored
+   (`require_proof_closes_the_bearer_door_without_removing_the_keys`); a broken
+   proof falling back to the bearer door
+   (`a_broken_proof_is_never_downgraded_to_the_bearer_door`, plus three more);
+   `htu` not compared (`a_proof_for_another_path_or_another_moment_is_refused`,
+   and the same-named tests in `tokenfuse-dpop` and `cloud::delegation`); an
+   `http` client id accepted
+   (`an_http_client_id_is_refused_rather_than_quietly_accepted`); the cache
+   forgetting at its cap rather than refusing
+   (`a_full_cache_refuses_rather_than_forgetting_something_it_promised`); the
+   private-member check dropped
+   (`a_client_leaking_its_private_key_is_refused_rather_than_helped`, both
+   crates); and `something_on_the_door` back to keys alone
+   (`a_proof_door_counts_as_something_on_the_door`).
+
+   **The tenth survived, and it is recorded rather than quietly fixed**: taking
+   the algorithm from the proof header instead of the key type changed no test
+   in the workspace. It is an equivalent mutant on this path and that was
+   established by measurement, not by argument. See invariant 29.)*
 
    **Where it says nothing.** It does not authenticate the agent to the upstream
    MCP server: the broker forwards with whatever the vault injects and the
