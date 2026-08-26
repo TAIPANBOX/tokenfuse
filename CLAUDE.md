@@ -1435,7 +1435,8 @@ build)`, `cloud apns (feature build)`.
    (`something_on_the_door`), asked once, so the refusal and the warning cannot
    answer it differently and an operator who configured only the STRONGER
    credential is not refused for want of the weaker one.
-   *(test: twenty in `tests/mcp_door.rs`, of which
+   *(scenarios: `features/mcp-proof-door.feature`, thirteen, each bound to a
+   named test. Test: twenty in `tests/mcp_door.rs`, of which
    `a_replayed_proof_is_refused_though_it_verifies_perfectly` is the one this is
    worth having for on a single-URL endpoint,
    `a_broken_proof_is_never_downgraded_to_the_bearer_door` holds the composition
