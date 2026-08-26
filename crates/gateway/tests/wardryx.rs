@@ -879,3 +879,114 @@ async fn a_policy_plane_that_answered_is_not_reported_as_unreachable() {
         dependency_failures_at(&path)
     );
 }
+
+// ---------------------------------------------------------------------------
+// The chain this proxy asks the PDP about must be one somebody PROVED.
+//
+// This is the same gap the MCP broker had and the bigger of the two, because
+// this is the path the agents' own traffic takes. `on_behalf_of` came from a
+// header, so `max_chain_depth` capped a number the caller chose.
+
+/// A PDP-backed gate in enforce mode, for the two chain tests below.
+fn enforcing(url: String) -> Wardryx {
+    Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chain_nobody_proved_reaches_the_pdp_marked_unproven() {
+    let stub = WardryxStub::new(json!({"decision": "allow", "policy_version": "v1"}));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let st = state(enforcing(url));
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request_with_headers(
+            &body(),
+            &[(
+                "x-fuse-on-behalf-of",
+                "user://acme.example/ceo,agent://acme.example/a,agent://acme.example/b",
+            )],
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "status {}", resp.status());
+
+    let asked = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the PDP was not asked");
+    assert_eq!(
+        asked["chain_proven"],
+        json!(false),
+        "the proxy asked the PDP about a caller-declared chain without saying \
+         nobody proved it. asked: {asked}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proven_chain_reaches_the_pdp_from_the_token() {
+    use tokenfuse_delegation::testing::{cfg, proof_at, token, Key, URL};
+
+    let stub = WardryxStub::new(json!({"decision": "allow", "policy_version": "v1"}));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut st = state(enforcing(url));
+
+    let issuer = Key::new();
+    let holder = Key::new();
+    st.chain_proof = Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
+        cfg: cfg(&issuer),
+        // The origin the fixture's own URL names, so the two agree by
+        // construction rather than by a string retyped in two places.
+        origin: URL.trim_end_matches("/v1/messages").to_string(),
+    }));
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+    let pf = proof_at(&holder, now, "POST", URL, "p-proxy");
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request_with_headers(
+            &body(),
+            &[
+                ("authorization", &format!("DPoP {tok}")),
+                (tokenfuse_gateway::mcpdoor::PROOF_HEADER, &pf),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "status {}", resp.status());
+
+    let asked = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the PDP was not asked");
+    assert_eq!(asked["chain_proven"], json!(true), "asked: {asked}");
+    assert_eq!(
+        asked["on_behalf_of"],
+        json!([
+            "user://acme.example/alice",
+            "agent://acme.example/orchestrator"
+        ]),
+        "asked: {asked}"
+    );
+}

@@ -540,14 +540,40 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     }
 
     // Delegation chain (agent-passport SPEC.md §5): captured raw for the
-    // trace, and split into an ordered list for agent-event envelopes. No
-    // enforcement semantics this phase — capture only.
+    // trace, and split into an ordered list for agent-event envelopes.
     let on_behalf_of_captured = on_behalf_of_header(&headers);
     let on_behalf_of = on_behalf_of_captured.clone().unwrap_or_default();
-    let on_behalf_of_chain: Vec<String> = on_behalf_of_captured
+    let declared_chain: Vec<String> = on_behalf_of_captured
         .as_deref()
         .map(split_on_behalf_of)
         .unwrap_or_default();
+
+    // And whether anybody PROVED it. Until 2026-08-26 this comment said "no
+    // enforcement semantics this phase, capture only", which was true and had
+    // stopped being harmless: wardryx had gained rules that read this chain, so
+    // a cap of three capped a number the caller chose. The rule lives in
+    // `chainproof` because the MCP broker applies the same one.
+    let (on_behalf_of_chain, chain_proven) = match crate::chainproof::resolve(
+        &st.chain_proof,
+        crate::chainproof::dpop_credential(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+        ),
+        headers
+            .get(crate::mcpdoor::PROOF_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        "POST",
+        "/v1/messages",
+        &declared_chain,
+        crate::sink::now_millis() / 1000,
+        |_, _, _| false,
+    ) {
+        crate::chainproof::Chain::Refused(why) => {
+            tracing::warn!(reason = ?why, "proxy: refused a delegation token");
+            return unauthorized_response();
+        }
+        crate::chainproof::Chain::Proven(chain) => (chain, true),
+        crate::chainproof::Chain::Claimed(chain) => (chain, false),
+    };
 
     // Outcome tag (P4, unit economics): captured raw for the trace, same
     // cap/ignore contract as `on_behalf_of` above. No enforcement semantics —
@@ -1115,6 +1141,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 agent_id: agent_id.clone(),
                 run_id: run_id.clone(),
                 on_behalf_of: on_behalf_of_chain.clone(),
+                chain_proven,
                 tool_names,
                 // Best-effort, declared-only: domains this request's tools
                 // explicitly name as an http(s) URL. Full runtime

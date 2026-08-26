@@ -15,6 +15,7 @@ tokenfuse-core.workspace = true
 # RFC 9449 proofs and RFC 7638 thumbprints for the MCP broker's door,
 # shared with crates/cloud rather than copied (CLAUDE.md invariant 29).
 tokenfuse-dpop.workspace = true
+tokenfuse-delegation.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 axum.workspace = true
@@ -38,6 +39,9 @@ fastembed = { version = "4", optional = true }
 tokenfuse-cluster = { path = "../cluster", optional = true }
 
 [dev-dependencies]
+# The minting fixture, so the door tests present a token the ISSUER would mint
+# rather than one this repository invented for its own convenience.
+tokenfuse-delegation = { workspace = true, features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

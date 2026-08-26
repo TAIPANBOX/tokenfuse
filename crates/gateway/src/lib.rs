@@ -4,6 +4,7 @@
 
 pub mod agentids;
 pub mod backtestcli;
+pub mod chainproof;
 pub mod clientkeys;
 pub mod cloudsink;
 pub mod compliancecli;

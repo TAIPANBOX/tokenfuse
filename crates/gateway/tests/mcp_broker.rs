@@ -117,6 +117,9 @@ fn broker_state(
     let mut vault = SecretVault::new();
     vault.insert("gh", "ghp_REALSECRET");
     Arc::new(BrokerState {
+        // No delegation issuer: every chain is a claim, as in every
+        // deployment that configures none.
+        chain_proof: None,
         upstream,
         named_upstreams,
         vault,
@@ -148,6 +151,9 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
     let mut vault = SecretVault::new();
     vault.insert("gh", "ghp_REALSECRET");
     app(Arc::new(BrokerState {
+        // No delegation issuer: every chain is a claim, as in every
+        // deployment that configures none.
+        chain_proof: None,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -945,6 +951,9 @@ async fn pii_masks_in_tool_args() {
 /// is who may resolve which secret, not any of the broker's other planes.
 fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerState> {
     Arc::new(BrokerState {
+        // No delegation issuer: every chain is a claim, as in every
+        // deployment that configures none.
+        chain_proof: None,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -1257,6 +1266,9 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
     let mut vault = SecretVault::new();
     vault.insert("gh", "ghp_REALSECRET");
     app(Arc::new(BrokerState {
+        // No delegation issuer: every chain is a claim, as in every
+        // deployment that configures none.
+        chain_proof: None,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -1608,5 +1620,226 @@ async fn a_captured_proof_replayed_at_the_live_door_reaches_nothing_the_second_t
         seen.lock().expect("upstream log").len(),
         1,
         "only the first use of that proof may reach the upstream"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The chain the PDP is asked about must be one somebody PROVED.
+//
+// wardryx gained `deny_if_chain_unproven`, `max_chain_depth` and
+// `require_root_principal` today, and they read a chain this broker takes from
+// the `x-fuse-on-behalf-of` header. So a cap of three today caps a number the
+// CALLER chose, and `deny_if_chain_unproven` denies on the strength of a claim.
+// vouchryx issues a token that settles it and both languages can verify one,
+// and until now no request path called either.
+
+/// A stub PDP that records the decide request it was sent, so a test can assert
+/// what the broker actually ASKED rather than only what it did with the answer.
+async fn capturing_pdp(decision: &'static str) -> (String, Arc<std::sync::Mutex<Option<Value>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let sink = seen.clone();
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(req): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = Some(req);
+                Json(json!({ "decision": decision, "policy_version": "test-v1" }))
+            }
+        }),
+    );
+    (spawn_server(router).await, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_nobody_proved_is_asked_about_as_unproven() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = capturing_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Warn,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A chain the caller simply asserts, four deep, rooted wherever it likes.
+    let http = reqwest::Client::new();
+    let _: Value = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header(
+            "x-fuse-on-behalf-of",
+            "user://acme.example/ceo,agent://acme.example/a,agent://acme.example/b",
+        )
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let asked = seen.lock().unwrap().clone().expect("the PDP was not asked");
+    assert_eq!(
+        asked["chain_proven"],
+        json!(false),
+        "the broker asked the PDP about a caller-declared chain without saying \
+         nobody proved it. The chain rules then judge a claim as though it were \
+         a fact. What was asked: {asked}"
+    );
+}
+
+/// A broker with a delegation issuer configured, plus the key a caller holds.
+fn broker_proving(
+    upstream: String,
+    pdp: String,
+) -> (
+    Router,
+    tokenfuse_delegation::testing::Key,
+    tokenfuse_delegation::testing::Key,
+) {
+    use tokenfuse_delegation::testing::{cfg, Key};
+    let issuer = Key::new();
+    let holder = Key::new();
+    let mut st = broker_state(
+        upstream,
+        ScanMode::Warn,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    );
+    // The fixture's proof names the URL the issuer's own tests use; this door
+    // is reached at its origin plus "/", so the two agree by construction
+    // rather than by a number retyped here.
+    let origin = "https://tokenfuse.acme.example".to_string();
+    Arc::get_mut(&mut st).unwrap().chain_proof =
+        Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
+            cfg: cfg(&issuer),
+            origin,
+        }));
+    (app(st), issuer, holder)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proven_chain_comes_from_the_token_and_not_from_the_header() {
+    use tokenfuse_delegation::testing::{proof_at, token};
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = capturing_pdp("allow").await;
+    let (router, issuer, holder) = broker_proving(upstream, pdp);
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    // The issuer says this caller acts for alice, through one orchestrator.
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+
+    let http = reqwest::Client::new();
+    let _: Value = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("authorization", format!("DPoP {tok}"))
+        .header(
+            tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            proof_at(
+                &holder,
+                now,
+                "POST",
+                "https://tokenfuse.acme.example/",
+                "p-mcp",
+            ),
+        )
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let asked = seen.lock().unwrap().clone().expect("the PDP was not asked");
+    assert_eq!(asked["chain_proven"], json!(true), "asked: {asked}");
+    assert_eq!(
+        asked["on_behalf_of"],
+        json!([
+            "user://acme.example/alice",
+            "agent://acme.example/orchestrator"
+        ]),
+        "the chain the PDP was asked about must be the ISSUER's, root first. asked: {asked}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_and_a_header_that_disagree_are_refused_rather_than_reconciled() {
+    use tokenfuse_delegation::testing::{proof_at, token};
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = capturing_pdp("allow").await;
+    let (router, issuer, holder) = broker_proving(upstream, pdp);
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("authorization", format!("DPoP {tok}"))
+        .header(
+            tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            proof_at(
+                &holder,
+                now,
+                "POST",
+                "https://tokenfuse.acme.example/",
+                "p-mcp",
+            ),
+        )
+        // A real token, and beside it a chain rooted at somebody else.
+        .header("x-fuse-on-behalf-of", "user://acme.example/ceo")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        401,
+        "a caller sending a real token beside a chain that says something else \
+         must be refused, not quietly served the one this code happens to prefer"
+    );
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the PDP was asked about a request that should never have got past the door"
     );
 }

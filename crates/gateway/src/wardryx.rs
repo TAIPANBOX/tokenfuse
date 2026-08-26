@@ -233,6 +233,15 @@ pub struct DecideContext {
     pub model: String,
     pub est_cost_usd: f64,
     pub attestation_method: Option<String>,
+    /// Whether THIS gateway verified a delegation token for this request, per
+    /// agent-passport SPEC 5.2, and took `on_behalf_of` from it.
+    ///
+    /// False is the honest default and says "nobody proved this", which is a
+    /// different statement from saying nothing. It is set by
+    /// [`crate::chainproof::resolve`] and by nothing else: no header sets it,
+    /// because a caller that could assert it would be asserting the very thing
+    /// the field exists to establish.
+    pub chain_proven: bool,
     pub approval_token: Option<String>,
 }
 
@@ -248,6 +257,7 @@ struct DecideWireRequest<'a> {
     est_cost_usd: f64,
     attestation_method: Option<&'a str>,
     approval_token: Option<&'a str>,
+    chain_proven: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +387,7 @@ impl Cache {
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        chain_proven: bool,
     ) -> (String, u64) {
         let mut sorted: Vec<&str> = tool_names.iter().map(String::as_str).collect();
         sorted.sort_unstable();
@@ -388,6 +399,12 @@ impl Cache {
         // whichever is cached first wins for the other — letting an unattested
         // agent inherit an attested "allow" (or vice-versa) inside the TTL.
         attestation_method.hash(&mut hasher);
+        // And `chain_proven` for exactly the reason above, one field over: a
+        // `deny_if_chain_unproven` policy decides on it, so a proven and an
+        // unproven request for the same (agent, tool-set) must not share an
+        // entry. Whichever landed first would answer for the other, which on
+        // this field means an unproven caller inheriting a proven "allow".
+        chain_proven.hash(&mut hasher);
         (agent_id.to_string(), hasher.finish())
     }
 
@@ -396,8 +413,9 @@ impl Cache {
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        chain_proven: bool,
     ) -> Option<WardryxOutcome> {
-        let key = Self::key(agent_id, tool_names, attestation_method);
+        let key = Self::key(agent_id, tool_names, attestation_method, chain_proven);
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&key)?;
         if entry.cached_at.elapsed() >= self.ttl {
@@ -429,6 +447,7 @@ impl Cache {
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        chain_proven: bool,
         outcome: &WardryxOutcome,
         cacheable: bool,
     ) {
@@ -446,7 +465,7 @@ impl Cache {
         if !cacheable {
             return;
         }
-        let key = Self::key(agent_id, tool_names, attestation_method);
+        let key = Self::key(agent_id, tool_names, attestation_method, chain_proven);
         let entry = CacheEntry {
             decision: outcome.decision,
             policy_version: outcome.policy_version.clone(),
@@ -564,6 +583,7 @@ impl Wardryx {
             &ctx.agent_id,
             &ctx.tool_names,
             ctx.attestation_method.as_deref(),
+            ctx.chain_proven,
         ) {
             return cached;
         }
@@ -582,6 +602,7 @@ impl Wardryx {
             est_cost_usd: ctx.est_cost_usd,
             attestation_method: ctx.attestation_method.as_deref(),
             approval_token: ctx.approval_token.as_deref(),
+            chain_proven: ctx.chain_proven,
         };
         match client.decide(&wire).await {
             Ok((outcome, cacheable)) => {
@@ -590,6 +611,7 @@ impl Wardryx {
                     &ctx.agent_id,
                     &ctx.tool_names,
                     ctx.attestation_method.as_deref(),
+                    ctx.chain_proven,
                     &outcome,
                     cacheable,
                 );
@@ -683,15 +705,15 @@ mod tests {
 
     #[test]
     fn cache_key_is_order_independent() {
-        let a = Cache::key("agent-1", &["b".to_string(), "a".to_string()], None);
-        let b = Cache::key("agent-1", &["a".to_string(), "b".to_string()], None);
+        let a = Cache::key("agent-1", &["b".to_string(), "a".to_string()], None, false);
+        let b = Cache::key("agent-1", &["a".to_string(), "b".to_string()], None, false);
         assert_eq!(a, b, "tool order must not change the cache key");
     }
 
     #[test]
     fn cache_key_differs_by_agent() {
-        let a = Cache::key("agent-1", &["a".to_string()], None);
-        let b = Cache::key("agent-2", &["a".to_string()], None);
+        let a = Cache::key("agent-1", &["a".to_string()], None, false);
+        let b = Cache::key("agent-2", &["a".to_string()], None, false);
         assert_ne!(a, b);
     }
 
@@ -701,8 +723,8 @@ mod tests {
         // attestation states. An attested and an unattested request for the
         // same agent + tool-set must land on different cache keys, so one can
         // never inherit the other's cached decision inside the TTL.
-        let unattested = Cache::key("agent-1", &["a".to_string()], None);
-        let attested = Cache::key("agent-1", &["a".to_string()], Some("spiffe"));
+        let unattested = Cache::key("agent-1", &["a".to_string()], None, false);
+        let attested = Cache::key("agent-1", &["a".to_string()], Some("spiffe"), false);
         assert_ne!(
             unattested, attested,
             "attestation must be part of the decision-cache key"
@@ -720,8 +742,17 @@ mod tests {
             approval_token_required: true,
             unreachable: false,
         };
-        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
-        let hit = cache.get("agent-1", &["grep".to_string()], None).unwrap();
+        cache.put(
+            "agent-1",
+            &["grep".to_string()],
+            None,
+            false,
+            &outcome,
+            true,
+        );
+        let hit = cache
+            .get("agent-1", &["grep".to_string()], None, false)
+            .unwrap();
         assert_eq!(hit.decision, WardryxDecision::Deny);
         assert_eq!(hit.policy_version.as_deref(), Some("v1"));
     }
@@ -739,8 +770,17 @@ mod tests {
         };
         // cacheable: true here on purpose -- proves the hold guard fires on
         // its own, independent of the cacheable guard below it.
-        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
-        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
+        cache.put(
+            "agent-1",
+            &["grep".to_string()],
+            None,
+            false,
+            &outcome,
+            true,
+        );
+        assert!(cache
+            .get("agent-1", &["grep".to_string()], None, false)
+            .is_none());
     }
 
     #[test]
@@ -758,8 +798,17 @@ mod tests {
             approval_token_required: true,
             unreachable: false,
         };
-        cache.put("agent-1", &["grep".to_string()], None, &outcome, false);
-        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
+        cache.put(
+            "agent-1",
+            &["grep".to_string()],
+            None,
+            false,
+            &outcome,
+            false,
+        );
+        assert!(cache
+            .get("agent-1", &["grep".to_string()], None, false)
+            .is_none());
     }
 
     #[test]
@@ -773,9 +822,18 @@ mod tests {
             approval_token_required: true,
             unreachable: false,
         };
-        cache.put("agent-1", &["grep".to_string()], None, &outcome, true);
+        cache.put(
+            "agent-1",
+            &["grep".to_string()],
+            None,
+            false,
+            &outcome,
+            true,
+        );
         std::thread::sleep(Duration::from_millis(20));
-        assert!(cache.get("agent-1", &["grep".to_string()], None).is_none());
+        assert!(cache
+            .get("agent-1", &["grep".to_string()], None, false)
+            .is_none());
     }
 
     #[tokio::test]
@@ -792,6 +850,7 @@ mod tests {
         let w = Wardryx::disabled();
         let outcome = w
             .decide(DecideContext {
+                chain_proven: false,
                 agent_id: "a".into(),
                 run_id: "r".into(),
                 on_behalf_of: vec![],
@@ -813,6 +872,7 @@ mod tests {
         w.failmode = FailMode::Closed;
         let outcome = w
             .decide(DecideContext {
+                chain_proven: false,
                 agent_id: "a".into(),
                 run_id: "r".into(),
                 on_behalf_of: vec![],

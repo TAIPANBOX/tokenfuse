@@ -1664,3 +1664,44 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 - Nothing paid or metered gets enabled without telling the user first and
   getting agreement.
 - Do not delete or revoke keys, tokens, or certificates on your own initiative.
+
+31. **A chain the PDP is asked about carries whether anybody PROVED it, and the
+    answer is never the caller's to give.** wardryx gained
+    `deny_if_chain_unproven`, `max_chain_depth` and `require_root_principal`
+    on 2026-08-26, and this gateway sent it `on_behalf_of` taken from the
+    `x-fuse-on-behalf-of` header. So a depth cap of three capped a number the
+    CALLER chose, and `deny_if_chain_unproven` denied on the strength of a
+    claim. vouchryx issues a token that settles the question and two languages
+    could verify one; no request path called either.
+
+    `chain_proven` is set by `chainproof::resolve` and by nothing else. No
+    header sets it, because a caller able to assert it would be asserting the
+    very thing the field exists to establish. False is the honest default and
+    means "nobody proved this", which is a different statement from saying
+    nothing, and it is what every deployment that configures no issuer sends.
+
+    **Both doors, not one.** The MCP broker and the LLM proxy both build a
+    `DecideContext` and both took the chain from that header. The proxy is the
+    larger of the two: it is the path the agents' own traffic takes. Fixing one
+    and leaving the other would have been the failure that looks exactly like
+    it is working, so the rule lives in one module and both call it.
+
+    **A token and a header that disagree are refused**, not silently
+    reconciled. A caller sending both is either confused or probing which one
+    this code believes, and answering that quietly is how a downgrade hides.
+    Compared as an ordered list AND as a set, because a reordering has the same
+    set and an extra name has the same prefix.
+
+    It is also part of the decision cache key, for the reason
+    `attestation_method` already is: a proven and an unproven request for the
+    same (agent, tool-set) must not share an entry, or whichever landed first
+    answers for the other.
+    *(test: `a_chain_nobody_proved_is_asked_about_as_unproven`,
+    `a_proven_chain_comes_from_the_token_and_not_from_the_header`,
+    `a_token_and_a_header_that_disagree_are_refused_rather_than_reconciled`
+    in `tests/mcp_broker.rs`; `a_chain_nobody_proved_reaches_the_pdp_marked_unproven`
+    and `a_proven_chain_reaches_the_pdp_from_the_token` in `tests/wardryx.rs`.
+    Not a script gate: nothing STOPS a third `DecideContext` being built
+    somewhere without going through `chainproof`, and the compiler naming both
+    existing sites when the field was added is what found them this time.)*
+

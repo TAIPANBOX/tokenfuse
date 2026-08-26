@@ -48,7 +48,17 @@ use serde::Deserialize;
 /// Re-exported so this module's public surface is unchanged by the move. The
 /// window, the thumbprint and the proof verifier all live in
 /// [`tokenfuse_dpop`] now, one crate two planes can both depend on.
-pub use tokenfuse_dpop::{thumbprint, PROOF_WINDOW_SECS};
+pub use tokenfuse_dpop::{algorithms_for_key, thumbprint, PROOF_WINDOW_SECS};
+
+/// Parse an issuer's JWKS.
+///
+/// Here rather than at the caller so a caller does not have to name
+/// `jsonwebtoken` to configure this crate. The gateway depends on this crate
+/// and not on that one, and keeping it that way means the JWS library stays a
+/// detail of verification rather than something two crates now know about.
+pub fn parse_jwks(raw: &str) -> Result<JwkSet, serde_json::Error> {
+    serde_json::from_str(raw)
+}
 
 /// Why a delegation was refused.
 ///
@@ -166,7 +176,7 @@ pub fn verify_delegation(
     let jwk = cfg.jwks.find(&kid).ok_or(Refusal::BadSignature)?;
 
     // The single copy of the alg rule. See `oidc::algorithms_for_key`.
-    let algorithms = super::oidc::algorithms_for_key(jwk).ok_or(Refusal::BadSignature)?;
+    let algorithms = tokenfuse_dpop::algorithms_for_key(jwk).ok_or(Refusal::BadSignature)?;
     let key = DecodingKey::from_jwk(jwk).map_err(|_| Refusal::BadSignature)?;
 
     let mut validation = Validation::new(algorithms[0]);
@@ -264,107 +274,18 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     Ok(chain)
 }
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use p256::ecdsa::signature::Signer;
+    // The fixture that mints what vouchryx mints now lives in `testing`, behind
+    // a feature, because a third party needs it: an enforcement point testing
+    // what it does with a real token. Copying it there would have been a
+    // fixture drifting from the thing it is a fixture for.
 
-    // A fixture that mints what vouchryx mints, so these tests fail if the two
-    // halves of this scheme ever disagree about the wire.
-
-    const ISS: &str = "https://vouchryx.acme.example";
-    const AUD: &str = "https://tokenfuse.acme.example";
-    const URL: &str = "https://tokenfuse.acme.example/v1/messages";
-
-    fn b64(b: &[u8]) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-    }
-
-    struct Key {
-        signing: p256::ecdsa::SigningKey,
-    }
-
-    impl Key {
-        fn new() -> Self {
-            Key {
-                signing: p256::ecdsa::SigningKey::random(
-                    &mut p256::elliptic_curve::rand_core::OsRng,
-                ),
-            }
-        }
-        fn jwk_value(&self, kid: Option<&str>) -> serde_json::Value {
-            let point = self.signing.verifying_key().to_encoded_point(false);
-            let mut v = serde_json::json!({
-                "kty": "EC", "crv": "P-256",
-                "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()),
-            });
-            if let Some(k) = kid {
-                v["kid"] = serde_json::json!(k);
-                v["use"] = serde_json::json!("sig");
-                v["alg"] = serde_json::json!("ES256");
-            }
-            v
-        }
-        fn sign(&self, header: serde_json::Value, claims: serde_json::Value) -> String {
-            let signing = format!(
-                "{}.{}",
-                b64(header.to_string().as_bytes()),
-                b64(claims.to_string().as_bytes())
-            );
-            let sig: p256::ecdsa::Signature = self.signing.sign(signing.as_bytes());
-            format!("{signing}.{}", b64(&sig.to_bytes()))
-        }
-    }
-
-    fn cfg(issuer_key: &Key) -> DelegationConfig {
-        let set = serde_json::json!({"keys": [issuer_key.jwk_value(Some("v-1"))]});
-        DelegationConfig {
-            jwks: serde_json::from_value(set).expect("a jwk set"),
-            issuer: ISS.into(),
-            audience: AUD.into(),
-        }
-    }
-
-    fn token(issuer: &Key, holder: &Key, now: i64, over: serde_json::Value) -> String {
-        let jkt = {
-            let jwk: jsonwebtoken::jwk::Jwk =
-                serde_json::from_value(holder.jwk_value(None)).expect("a jwk");
-            thumbprint(&jwk).expect("a thumbprint")
-        };
-        let mut claims = serde_json::json!({
-            "iss": ISS, "sub": "user://acme/alice", "aud": AUD,
-            "iat": now, "exp": now + 300, "jti": "tok-1",
-            "cnf": {"jkt": jkt},
-            "act": {"sub": "agent://acme/runbook", "act": {"sub": "agent://acme/triage"}},
-        });
-        if let serde_json::Value::Object(o) = over {
-            for (k, v) in o {
-                if v.is_null() {
-                    claims.as_object_mut().unwrap().remove(&k);
-                } else {
-                    claims[k] = v;
-                }
-            }
-        }
-        issuer.sign(
-            serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": "v-1"}),
-            claims,
-        )
-    }
-
-    fn proof(holder: &Key, now: i64) -> String {
-        holder.sign(
-            serde_json::json!({
-                "typ": "dpop+jwt", "alg": "ES256", "jwk": holder.jwk_value(None)
-            }),
-            serde_json::json!({"htm": "POST", "htu": URL, "iat": now, "jti": "p1"}),
-        )
-    }
-
-    fn never(_: &str, _: &str, _: i64) -> bool {
-        false
-    }
+    use crate::testing::*;
 
     #[test]
     fn a_delegation_verifies_and_the_chain_keeps_its_root() {
@@ -619,7 +540,7 @@ mod tests {
         let key = Key::new();
         let ec: jsonwebtoken::jwk::Jwk =
             serde_json::from_value(key.jwk_value(Some("k"))).expect("a jwk");
-        let algs = super::super::oidc::algorithms_for_key(&ec).expect("an EC key is usable");
+        let algs = tokenfuse_dpop::algorithms_for_key(&ec).expect("an EC key is usable");
         assert!(
             algs.iter().all(|a| matches!(
                 a,
@@ -632,7 +553,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"kty": "oct", "k": "c2VjcmV0", "kid": "s"}))
                 .expect("a jwk");
         assert!(
-            super::super::oidc::algorithms_for_key(&oct).is_none(),
+            tokenfuse_dpop::algorithms_for_key(&oct).is_none(),
             "a symmetric key is refused outright, which is what closes `none` too"
         );
     }

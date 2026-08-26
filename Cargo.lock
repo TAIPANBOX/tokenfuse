@@ -5713,6 +5713,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokenfuse-core",
+ "tokenfuse-delegation",
  "tokenfuse-dpop",
  "tokio",
  "tokio-stream",
@@ -5753,6 +5754,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenfuse-delegation"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokenfuse-dpop",
+]
+
+[[package]]
 name = "tokenfuse-dpop"
 version = "0.0.1"
 dependencies = [
@@ -5785,6 +5799,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenfuse-cluster",
  "tokenfuse-core",
+ "tokenfuse-delegation",
  "tokenfuse-dpop",
  "tokio",
  "tower",
