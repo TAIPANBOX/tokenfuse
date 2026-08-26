@@ -58,13 +58,19 @@
 #
 # WHAT THE THIRD PROPERTY IS FOR
 #
-# A gate whose subject has been renamed, emptied or deleted must say so. Seven
+# A gate whose subject has been renamed, emptied or deleted must say so. Ten
 # cases below take a subject away: cargo off PATH, a renamed type, a catalog
 # whose shape stopped parsing, a renamed image, the ignore list deleted, the
-# badge deleted, the published artifact deleted. Each must fail as "measured
-# nothing" rather than pass on an empty read. This is the estate's most
-# expensive recurring mistake and it lives in tooling rather than product code,
-# because tooling is where a silent pass looks like a result.
+# badge deleted, the published artifact deleted, features/ removed, every
+# install command neutralised, and the relevant-not-enforced category emptied.
+# Each must fail as "measured nothing" rather than pass on an empty read. This
+# is the estate's most expensive recurring mistake and it lives in tooling
+# rather than product code, because tooling is where a silent pass looks like a
+# result.
+#
+# The list said seven while the count elsewhere said nine, which is the same
+# defect one file in: it was written once and the cases kept arriving. Brought
+# to ten on 2026-08-26 in the commit that added the tenth.
 
 set -uo pipefail
 
@@ -244,6 +250,57 @@ run_case "honest-claims: the catalog parse broke, so it measured nothing" fail \
 	"./scripts/honest-claims.sh" \
 	"$(py 'edit_all("crates/core/src/compliance.rs", "control_id:", "control_ident:")')" \
 	"measured nothing"
+
+# The same invariant one level up. A control's GRADE is a claim about how well
+# this product enforces something; which of the two framework lists a framework
+# sits in is the claim about whether it enforces any of it at all, and moving a
+# framework from the relevant-not-enforced list into the enforced one is the
+# same over-claim where `Enforcement` cannot see it.
+
+run_case "honest-claims: a merely-relevant framework promoted to enforced" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "    (\n        \"NIS2\",", "    (\"ISO-23894\", \"ISO/IEC 23894\", \"2023\"),\n    (\n        \"NIS2\",")')" \
+	"does NOT enforce and is now in the enforced framework list"
+
+# Renaming the id rather than inserting a whole second row, and the reason is
+# this file's own warning about escaping rather than taste. The insert version
+# was written first and its replacement text contained `{ ..., ..., ... }`,
+# which bash BRACE-EXPANDS even inside the quoted command substitution: one
+# argument became seven, `run_case` was called with eleven, the python program
+# arrived as the needle, and the mutation applied a mangled edit. It was
+# reported as WRONG REASON and not as a pass, which is the only reason anybody
+# saw it. `@measured` 2026-08-26. A mutation here may not contain a brace pair
+# with a comma between the braces.
+#
+# The rename fires two findings and that is honest about what it is: the new id
+# is unrecorded and the old one has gone from the catalog. The needle pins the
+# branch this case exists for, so the other cannot stand in for it.
+run_case "honest-claims: a new relevance claim nobody recorded" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "framework_id: \"ISO-23894\"", "framework_id: \"ISO-42001\"")')" \
+	"claims to be relevant to"
+
+# The subject taken away. An emptied category is the shape this one actually
+# arrives in: a framework is dropped, the list goes to `&[]`, and every Rust
+# assertion over it becomes vacuously true at the same moment. The gate has to
+# say it measured nothing rather than report a clean run.
+run_case "honest-claims: the relevance category emptied, so it measured nothing" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'import re
+s = open("crates/core/src/compliance.rs").read()
+a = s.index("pub const RELEVANT_FRAMEWORKS")
+b = s.index("\n}];", a) + 4
+open("crates/core/src/compliance.rs", "w").write(
+    s[:a] + "pub const RELEVANT_FRAMEWORKS: &[RelevantFramework] = &[];" + s[b:])')" \
+	"measured nothing"
+
+# And the one it must NOT fire on. The three prose fields on a relevance row are
+# the argument, not the claim, and they will be reworded: a gate that fails on
+# an edit to `relevance` would be turned off by the first person to improve the
+# wording, and it would take the promotion check with it.
+run_case "honest-claims: a relevance row reworded but not moved" pass \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "    relevance: \"Its risk-treatment clauses", "    relevance: \"REWORDED. Its risk-treatment clauses")')"
 
 # --- invariant 16: a documented command can start a gateway ----------------
 

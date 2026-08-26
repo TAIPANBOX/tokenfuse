@@ -59,15 +59,71 @@
 //! reporting timelines that a proxy cannot enforce and this catalog does not
 //! pretend to.
 //!
-//! **ISO/IEC 23894 was asked for and is deliberately NOT here.** `@claude`
-//! 2026-08-26, and it is a deviation from the plan's literal wording. 23894 is
-//! GUIDANCE on an AI risk-management PROCESS, built on ISO 31000: its clauses
-//! describe how an organisation should identify, analyse and treat AI risk,
-//! not controls a product enforces. A runtime control point can be one input
-//! to that process and cannot satisfy a clause of it, and a row claiming
-//! otherwise would be exactly the over-claim [`Enforcement`] exists to
-//! prevent. It belongs in a customer's own risk file, citing this catalog as
-//! evidence, rather than in this catalog citing it.
+//! **ISO/IEC 23894 is not a control this product enforces, and that refusal is
+//! now settled rather than pending.** `@yurii 2026-08-26`, who was given the
+//! argument below and answered "3a (c)": confirm the refusal, and add a third
+//! category for what this product is merely relevant to. The argument he
+//! confirmed is `@claude` 2026-08-26 and it stands unedited: 23894 is GUIDANCE
+//! on an AI risk-management PROCESS, built on ISO 31000: its clauses describe
+//! how an organisation should identify, analyse and treat AI risk, not controls
+//! a product enforces. A runtime control point can be one input to that process
+//! and cannot satisfy a clause of it, and a row claiming otherwise would be
+//! exactly the over-claim [`Enforcement`] exists to prevent. It belongs in a
+//! customer's own risk file, citing this catalog as evidence, rather than in
+//! this catalog citing it.
+//!
+//! # The third category: relevant, and enforcing no part of it
+//!
+//! [`RELEVANT_FRAMEWORKS`] is where 23894 lives instead, and it is a separate
+//! list of a separate type rather than a flag on a [`ControlMapping`]. That
+//! shape is the decision. A boolean on the existing rows is one edit away from
+//! a row that carries the flag and stays in the enforced list anyway, and the
+//! two would then be one list that a reader is asked to filter correctly every
+//! time.
+//!
+//! **A [`FRAMEWORK_VERSIONS`] row is a claim about what the CODE ENFORCES.** It
+//! is cited by at least one control, that control names real wire evidence, and
+//! `every_declared_framework_is_actually_cited_by_a_control` refuses a row with
+//! nothing behind it. A [`RELEVANT_FRAMEWORKS`] row claims the opposite in the
+//! same breath as claiming relevance: a customer under this framework will
+//! reach for this product, AND this product enforces no clause of it. Both
+//! halves are required fields, because relevance with no stated limit is a
+//! coverage claim in a quieter voice.
+//!
+//! **The two id sets are disjoint and a test refuses an overlap**
+//! (`a_framework_is_enforced_or_merely_relevant_and_never_both`). That is what
+//! makes the separation true of every SURFACE without reading any of them:
+//! every reporting path renders the enforced list by iterating
+//! `framework_versions`, so a framework that can never appear there can never
+//! be shown as enforced.
+//!
+//! **The category is per FRAMEWORK, not per obligation, and that boundary is
+//! easy to get wrong.** The EU AI Act has articles this product enforces
+//! nothing of (Art. 10 data governance, the bias obligations) and it is still
+//! an enforced framework here, because Art. 15 has real controls behind it. A
+//! framework with any enforced row stays in the enforced list and its unclaimed
+//! parts stay in the gap notes below. Only a framework this product enforces NO
+//! part of belongs in the third category.
+//!
+//! **Where it is published, and where it is not yet.** `relevant_frameworks` is
+//! a field of [`ComplianceReport`], so it reaches anything that serializes the
+//! report, which today is `tokenfuse compliance --json`. The human and Markdown
+//! renderings of that CLI print the enforced list and do not yet print this one,
+//! and `/v1/compliance` returns a cloud-local DTO (CLAUDE.md invariant 3) that
+//! does not carry the field either. Neither omits it in a way that misleads,
+//! since neither can show a merely-relevant framework as enforced, but neither
+//! shows it at all. `@claude` 2026-08-26: both are one small change in a file
+//! this pass deliberately did not touch, and they are named here rather than
+//! left for a reader to discover.
+//!
+//! **ASI07 is NOT in this category, and putting it here would reverse a
+//! decision rather than record one.** The two refusals confirmed on 2026-08-26
+//! have two different reasons and only one of them is what this category
+//! answers. 23894 is a process standard this product is genuinely relevant to
+//! and enforces no clause of. ASI07 names a control this product does not have
+//! at all, because the agents here do not talk to each other across a trust
+//! boundary, so there is no channel being inspected and nothing to be relevant
+//! ABOUT. Held by `asi07_is_still_absent_and_did_not_come_back_as_a_relevant_framework`.
 //!
 //! # Why this catalog is not lifted into `agent-stack-go`
 //!
@@ -117,7 +173,9 @@
 //! # Gaps we do NOT claim (honesty, stated explicitly)
 //!
 //! - **ASI07 (Insecure Inter-Agent Communication).** Named in the plan for this
-//!   pass and deliberately not mapped. The agents this proxy governs do not
+//!   pass and deliberately not mapped. Confirmed as a decision rather than left
+//!   pending, `@yurii 2026-08-26`. The argument he confirmed is `@claude` and
+//!   stands unedited: the agents this proxy governs do not
 //!   talk to each other across a trust boundary: they talk to a model and to
 //!   tools, both through this gateway. What the estate does have is a
 //!   DELEGATION chain and, since 2026-08-26, taint that a sub-run inherits from
@@ -126,6 +184,8 @@
 //!   ASI07 is about the channel. Claiming it would describe a control this
 //!   product does not have and would leave a reader believing an agent-to-agent
 //!   transport is being inspected. When one exists, this is the row to write.
+//!   It is not a [`RELEVANT_FRAMEWORKS`] row either; see the section above for
+//!   why the two refusals have two different shapes.
 //!
 //! - **Data residency / geo-fencing.** TokenFuse does not pin where provider
 //!   traffic or telemetry is stored/processed. Not claimed against any control.
@@ -236,6 +296,71 @@ pub const FRAMEWORK_VERSIONS: &[(&str, &str, &str)] = &[
         "retrieved 2026-08",
     ),
 ];
+
+/// A framework this product is RELEVANT to and enforces no part of.
+///
+/// Deliberately not a [`ControlMapping`] and deliberately not a flag on one.
+/// There is no `control_id`, no [`Enforcement`] grade, no evidence pointer and
+/// no `covered`, because none of those words can be true here: nothing in this
+/// product blocks, flags or records anything that discharges one of these
+/// obligations. A row is a pair of statements a customer needs at once, and
+/// both are required fields:
+///
+/// - [`relevance`](Self::relevance): why somebody under this framework reaches
+///   for this product at all;
+/// - [`not_enforced`](Self::not_enforced): what this product does NOT do about
+///   it, which is the half that keeps the row from reading as coverage;
+/// - [`discharged_by`](Self::discharged_by): where the obligation is actually
+///   met, so the row points somewhere instead of trailing off.
+///
+/// See the module doc for why the category is per framework rather than per
+/// obligation, and why its ids are disjoint from [`FRAMEWORK_VERSIONS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RelevantFramework {
+    /// Stable id. MUST NOT also appear in [`FRAMEWORK_VERSIONS`] (asserted).
+    pub framework_id: &'static str,
+    /// Human name.
+    pub name: &'static str,
+    /// Version or retrieval date this row was written against, in the same
+    /// form [`FRAMEWORK_VERSIONS`] uses.
+    pub version: &'static str,
+    /// Why a customer subject to this framework reaches for this product.
+    pub relevance: &'static str,
+    /// What this product does NOT do about it. Required, and the reason the
+    /// type exists rather than a boolean.
+    pub not_enforced: &'static str,
+    /// Where the obligation is actually discharged.
+    pub discharged_by: &'static str,
+}
+
+/// Frameworks this product is relevant to and enforces no part of.
+///
+/// One row today. It is one row because one framework has been decided about,
+/// not because the category is exhausted: ISO/IEC 42001 and the NIST AI RMF are
+/// the same shape and were named in the same market research, and neither is
+/// written here, because nobody has decided about them and inventing a
+/// relevance claim is the failure this list exists to avoid. `@claude`
+/// 2026-08-26.
+pub const RELEVANT_FRAMEWORKS: &[RelevantFramework] = &[RelevantFramework {
+    framework_id: "ISO-23894",
+    name: "ISO/IEC 23894 (AI risk management guidance)",
+    version: "2023 (retrieved 2026-08)",
+    relevance: "Its risk-treatment clauses ask an organisation to show that \
+                identified AI risks are actually treated. Runtime enforcement \
+                decisions from this product are evidence an organisation can \
+                put against that: a spend cap that refused a call, a loop that \
+                was stopped, a tainted context that was not allowed to drive a \
+                tool.",
+    not_enforced: "Nothing here enforces a clause of it. 23894 is guidance on a \
+                   risk-management PROCESS, built on ISO 31000, and a process is \
+                   not a thing a proxy can block: it describes how an \
+                   organisation identifies, analyses, evaluates and treats AI \
+                   risk, who owns each step, and how the results are reviewed. \
+                   This product has no view of any of that.",
+    discharged_by: "The customer's own AI risk management process and its risk \
+                    file, which can cite this catalog and the evidence pack as \
+                    one input among several.",
+}];
 
 /// The control catalog: eight ENFORCED runtime controls plus the honest
 /// `Partial` entries. Each enforced control's `evidence_*` fields are drawn
@@ -538,8 +663,18 @@ pub struct ComplianceReport {
     /// The standing [`DISCLAIMER`] — this is evidence, not a certification.
     pub generated_note: &'static str,
     /// The frameworks + pinned versions each mapping was cited against
-    /// (mirrors [`FRAMEWORK_VERSIONS`]).
+    /// (mirrors [`FRAMEWORK_VERSIONS`]). Every id here is ENFORCED by at least
+    /// one control in this report.
     pub framework_versions: &'static [(&'static str, &'static str, &'static str)],
+    /// Frameworks this product is relevant to and enforces no part of (mirrors
+    /// [`RELEVANT_FRAMEWORKS`]).
+    ///
+    /// A separate field and never a subset of `framework_versions`: the two id
+    /// sets are disjoint, so a consumer that reads only the field it already
+    /// knew about is unchanged and cannot see one of these as enforced. A
+    /// consumer that reads this one gets what it says on the row, including
+    /// what this product does NOT do about the framework.
+    pub relevant_frameworks: &'static [RelevantFramework],
     /// Per-control realized evidence, in catalog order.
     pub controls: Vec<ControlEvidence>,
     /// Total decisions considered (rows in the loaded trace slice).
@@ -669,6 +804,7 @@ pub fn compute_compliance_from_counts(
     ComplianceReport {
         generated_note: DISCLAIMER,
         framework_versions: FRAMEWORK_VERSIONS,
+        relevant_frameworks: RELEVANT_FRAMEWORKS,
         controls,
         decisions_total: decision_counts.values().sum(),
         findings_total: finding_counts.values().sum(),
@@ -844,6 +980,155 @@ mod tests {
                  reading the framework list would ask which controls cover it \
                  and get none"
             );
+        }
+    }
+
+    /// The property that makes the second category safe to publish at all.
+    ///
+    /// `FRAMEWORK_VERSIONS` is the enforced list: every id in it is cited by a
+    /// control with runtime evidence behind it. `RELEVANT_FRAMEWORKS` is the
+    /// other thing entirely, a framework this product is evidence FOR and
+    /// enforces no part of. An id in both lists is the one way a reader could
+    /// take the second for the first, and it is not a hypothetical: the cheap
+    /// implementation of this whole idea is a boolean on the existing row, and
+    /// the cheap mistake after it is a row that carries the flag and stays in
+    /// the enforced list anyway.
+    ///
+    /// Disjointness is also what makes the claim about SURFACES true without
+    /// reading any of them. Every reporting path in this repository renders the
+    /// enforced list by iterating `framework_versions`; if a merely-relevant id
+    /// can never appear there, no surface can show one as enforced, whatever
+    /// else that surface does or does not print.
+    #[test]
+    fn a_framework_is_enforced_or_merely_relevant_and_never_both() {
+        let enforced: HashSet<&str> = FRAMEWORK_VERSIONS.iter().map(|(id, _, _)| *id).collect();
+        for r in RELEVANT_FRAMEWORKS {
+            assert!(
+                !enforced.contains(r.framework_id),
+                "{} is in both lists. The enforced list is what every surface \
+                 renders as 'frameworks this product enforces'; a framework we \
+                 merely relate to must never be reachable from it. Pick one: \
+                 either a control enforces part of it, and it is an enforced \
+                 framework with the unclaimed parts written up as gaps, or it \
+                 enforces none of it and it belongs here alone.",
+                r.framework_id
+            );
+        }
+    }
+
+    /// The other direction, and the one a well-meaning edit takes.
+    ///
+    /// Citing a merely-relevant framework from a control's `frameworks` list is
+    /// how the row quietly becomes a coverage claim: the CLI's Markdown table
+    /// prints exactly that list in a column headed "Frameworks", beside the
+    /// word "yes" under "Covered". `every_framework_id_is_declared_in_framework_versions`
+    /// already fails on it, but it fails saying the id is undeclared, and the
+    /// instruction a reader takes from that message is to declare it, which is
+    /// the wrong repair and turns the gate green with the bad claim live. This
+    /// one says what is actually wrong.
+    #[test]
+    fn a_framework_this_product_only_relates_to_is_cited_by_no_control() {
+        let relevant: HashSet<&str> = RELEVANT_FRAMEWORKS.iter().map(|r| r.framework_id).collect();
+        for c in CATALOG {
+            for (fid, external) in c.frameworks {
+                assert!(
+                    !relevant.contains(fid),
+                    "{} cites {fid} ({external}). {fid} is in RELEVANT_FRAMEWORKS, \
+                     which is the list of frameworks this product enforces no part \
+                     of. A control citing it is a coverage claim, and it reaches an \
+                     auditor in the same table as the enforced ones.",
+                    c.control_id
+                );
+            }
+        }
+    }
+
+    /// A relevance claim with no limit on it is a coverage claim in a quieter
+    /// voice, so the limit is a required field and this asserts it was filled.
+    ///
+    /// The empty-list check is the same shape as `honest-claims.sh`'s
+    /// "measured nothing": every assertion in this test is vacuously true over
+    /// an empty catalog, and a category that can be emptied without anything
+    /// going red is the list that rots.
+    #[test]
+    fn every_relevant_framework_says_what_this_product_does_not_do() {
+        assert!(
+            !RELEVANT_FRAMEWORKS.is_empty(),
+            "the relevant-not-enforced list is empty, so every other assertion \
+             here is vacuous. If the category is being retired, retire the type \
+             and the report field with it rather than leaving an empty list that \
+             reads as checked."
+        );
+        for r in RELEVANT_FRAMEWORKS {
+            for (field, value) in [
+                ("relevance", r.relevance),
+                ("not_enforced", r.not_enforced),
+                ("discharged_by", r.discharged_by),
+            ] {
+                assert!(
+                    !value.trim().is_empty(),
+                    "{}: {field} is empty. All three are what keep this row from \
+                     reading as coverage: why a customer under it reaches for this \
+                     product, what this product does NOT do about it, and where the \
+                     obligation is actually discharged.",
+                    r.framework_id
+                );
+            }
+        }
+    }
+
+    /// The decision this category was built for, held by name.
+    ///
+    /// `@yurii 2026-08-26` confirmed the refusal to map ISO/IEC 23894 as an
+    /// enforced framework and asked for this third category in the same answer.
+    /// Named rather than counted, for the reason the ASI07 assertion below is:
+    /// a count stays green when one framework is swapped for another.
+    #[test]
+    fn iso_23894_is_relevant_and_is_not_a_control_this_product_enforces() {
+        assert!(
+            RELEVANT_FRAMEWORKS
+                .iter()
+                .any(|r| r.framework_id == "ISO-23894"),
+            "ISO/IEC 23894 is missing from the relevant-not-enforced list"
+        );
+        assert!(
+            !FRAMEWORK_VERSIONS
+                .iter()
+                .any(|(id, _, _)| *id == "ISO-23894"),
+            "ISO/IEC 23894 is in the enforced framework list. It is guidance on \
+             an AI risk-management PROCESS built on ISO 31000; a runtime control \
+             point is one input to that process and cannot satisfy a clause of it."
+        );
+    }
+
+    /// The refusal that must NOT be reopened by the road this change opens.
+    ///
+    /// ASI07 and ISO 23894 were refused on the same day for two different
+    /// reasons, and only one of those reasons is what this category answers.
+    /// 23894 was refused because it is a process standard we are genuinely
+    /// relevant to and enforce no clause of, which is exactly this category.
+    /// ASI07 was refused because the control is ABSENT: the agents here do not
+    /// talk to each other across a trust boundary, so there is no channel being
+    /// inspected and no relevance to record either. Filing it here would be the
+    /// same claim in a softer voice, and it would be made against a decision
+    /// `@yurii 2026-08-26` confirmed rather than left open.
+    ///
+    /// It is also a category error on its own terms: `RELEVANT_FRAMEWORKS`
+    /// holds FRAMEWORKS, and ASI07 is one control inside OWASP-ASI-2026, which
+    /// is an enforced framework here and could never be listed as merely
+    /// relevant without failing the disjointness test above.
+    #[test]
+    fn asi07_is_still_absent_and_did_not_come_back_as_a_relevant_framework() {
+        for r in RELEVANT_FRAMEWORKS {
+            for field in [r.framework_id, r.name, r.relevance, r.not_enforced] {
+                assert!(
+                    !field.contains("ASI07"),
+                    "{} mentions ASI07. Its absence is a confirmed decision about \
+                     a control this product does not have, not a coverage level to \
+                     be softened; see the gap note in the module doc.",
+                    r.framework_id
+                );
+            }
         }
     }
 
@@ -1232,6 +1517,44 @@ mod projection_tests {
         assert_eq!(budget.incident_count, 3);
         assert!(budget.evidence_seen);
         assert!(budget.covered);
+    }
+
+    /// The report is the thing an auditor actually reads, so the separation has
+    /// to survive serialization and not only exist in the source.
+    ///
+    /// Two top-level keys, never one list with a marker inside it. A reader who
+    /// takes the second category for the first has been told this product
+    /// enforces an AI risk-management process standard, which is the over-claim
+    /// `Enforcement` exists to prevent, arriving one level up where
+    /// `Enforcement` cannot see it.
+    #[test]
+    fn the_report_presents_the_enforced_and_the_merely_relevant_apart() {
+        let report = compute_compliance(CATALOG, &[], &[]);
+        let v = serde_json::to_value(&report).expect("the report serializes");
+        let obj = v.as_object().expect("the report is an object");
+
+        assert!(
+            obj.contains_key("framework_versions"),
+            "the enforced framework list has to stay where every consumer reads it"
+        );
+        assert!(
+            obj.contains_key("relevant_frameworks"),
+            "the merely-relevant list is absent from the report, so the only place \
+             it exists is a const nobody publishes, which is the list that rots"
+        );
+
+        // And the enforced list must carry none of them, which is the half a
+        // reader would be misled by. Checked over the serialized bytes rather
+        // than over the consts, because this is what leaves the process.
+        let enforced = serde_json::to_string(&obj["framework_versions"]).expect("serializes");
+        for r in RELEVANT_FRAMEWORKS {
+            assert!(
+                !enforced.contains(r.framework_id),
+                "{} appears inside framework_versions, the list a surface renders \
+                 as the frameworks this product enforces",
+                r.framework_id
+            );
+        }
     }
 
     #[test]

@@ -32,7 +32,8 @@ pub use breaker::{BreakerReason, BreakerVerdict};
 pub use cache::{CacheConfig, CacheMode, HashEmbedder, SemanticCache};
 pub use compliance::{
     compute_compliance, compute_compliance_from_counts, ComplianceReport, ControlEvidence,
-    ControlMapping, Enforcement, CATALOG, DISCLAIMER, FRAMEWORK_VERSIONS,
+    ControlMapping, Enforcement, RelevantFramework, CATALOG, DISCLAIMER, FRAMEWORK_VERSIONS,
+    RELEVANT_FRAMEWORKS,
 };
 pub use dlp::DlpMode;
 pub use ledger::{BudgetError, Ledger, Reservation, RunSnapshot};

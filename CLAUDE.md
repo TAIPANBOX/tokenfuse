@@ -111,7 +111,7 @@ thing, since "it failed" and "it failed for this reason" are different claims.
 It also asserts two gates must NOT fire, because an overeager check gets deleted
 as fast as a toothless one.
 
-**It asserts a third property, on nine of its 35 cases: a gate whose subject
+**It asserts a third property, on ten of its 39 cases: a gate whose subject
 has been taken away must say it measured nothing rather than report OK.** A
 check that cannot tell "did not fail" from "did not run" is the most expensive
 mistake this estate makes in its tooling, and it is made in tooling rather than
@@ -120,7 +120,9 @@ in product code because tooling is where a silent pass looks like a result.
 Both numbers in that sentence were stale before they were corrected on
 2026-08-25: it said seven of 22 while the harness ran 30, because the count was
 written once and the cases kept arriving. It moved again the next day with the
-hook-environment case, which is the point rather than an annoyance: the number
+hook-environment case, and again on 2026-08-26 with the four cases holding the
+relevant-not-enforced framework list (invariant 32), one of which takes that
+list away. That is the point rather than an annoyance: the number
 is now updated in the commit that changes it, because somebody looks. @measured on that date, the run
 itself for the new figure and `git show origin/main:scripts/gates-have-teeth.sh
 | grep -c '^run_case'` for the old one, minus one for the function's own
@@ -256,7 +258,11 @@ build)`, `cloud apns (feature build)`.
    *(gate: `scripts/honest-claims.sh`; verified against six mutants: a control
    upgraded, a control downgraded, a control added, each of the two required
    disclosures removed from the README, and a catalog whose shape this script can
-   no longer parse, which fails as unverified rather than passing)*
+   no longer parse, which fails as unverified rather than passing. The same
+   script grew a third half on 2026-08-26, recording which of the two framework
+   lists each framework sits in, with five mutants of its own; that is invariant
+   32 and the reason it lives here rather than in a twelfth script is that it is
+   the same invariant over the same file)*
 5. **Don't thread new dimensions through `LedgerBackend`/raft casually.** The
    ledger's replicated state (`crates/gateway/src/ledger_backend.rs`,
    `crates/cluster`) is the thing that has to stay linearizable across nodes;
@@ -1847,3 +1853,78 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     one whose entries legitimately expired: both answer an empty list with a
     current cursor, and vouchryx's own README names the in-memory store under
     NOT PROVEN for exactly that reason.
+
+
+33. **A framework row is a claim about what the code ENFORCES, and what this
+    product is merely relevant to is a different list with a different type.**
+    `crates/core/src/compliance.rs` has refused to mis-cite a standard since it
+    was written, and that refusal left it with nowhere honest to put ISO/IEC
+    23894: it is guidance on an AI risk-management PROCESS built on ISO 31000,
+    enforcing a process is not a thing code does, so a catalog row for it is the
+    over-claim `Enforcement` exists to prevent. Leaving it out entirely dropped
+    the true half with the false one, which is that a customer under 23894 can
+    put this product's enforcement decisions in their risk file as evidence.
+
+    `RELEVANT_FRAMEWORKS` is that third category. `@yurii 2026-08-26`, "3a (c)",
+    which confirmed the two standing refusals (ISO 23894 and OWASP ASI07) and
+    asked for this list beside them. The argument for each refusal is `@claude`,
+    dated 2026-08-26, and stands unedited in the module doc.
+
+    **Three shape decisions, and each is what keeps the two from being one.** A
+    separate type rather than a flag on `ControlMapping`, because a boolean on
+    the existing rows is one edit away from a row that carries the flag and stays
+    in the enforced list anyway. Disjoint id sets, asserted, which is what makes
+    the separation true of every SURFACE without reading any of them: every
+    reporting path renders the enforced list by iterating `framework_versions`,
+    so a framework that can never appear there can never be shown as enforced.
+    And three required prose fields, because relevance stated with no limit
+    beside it is a coverage claim in a quieter voice.
+
+    **The category is per FRAMEWORK, not per obligation.** The EU AI Act has
+    articles nothing here enforces (Art. 10, the bias obligations) and stays an
+    enforced framework, because Art. 15 has real controls behind it. Only a
+    framework this product enforces NO part of belongs in the third list; a
+    framework's unclaimed parts stay in the module's gap notes.
+
+    **ASI07 is deliberately NOT in it**, and that is the boundary worth
+    recording, because the two confirmed refusals have two different reasons and
+    only one of them is what this category answers. 23894 is a process standard
+    this product is genuinely relevant to and enforces no clause of. ASI07 names
+    a control this product does not have at all, since the agents here do not
+    talk to each other across a trust boundary, so there is no channel being
+    inspected and nothing to be relevant about. Filing it here would soften a
+    decision rather than record one.
+
+    **Where it is published and where it is not.** `relevant_frameworks` is a
+    field of `ComplianceReport`, so `tokenfuse compliance --json` carries it;
+    `@measured` against the release binary 2026-08-26, six top-level keys with
+    `relevant_frameworks` beside `framework_versions` and `ISO-23894` absent from
+    the enforced list. The human and Markdown renderings of that CLI and the
+    Cloud's `/v1/compliance` DTO do not carry it yet. Neither can show a
+    merely-relevant framework as enforced, by the disjointness above, and neither
+    shows it at all; both were measured, not read off the source, and both are
+    one small change in files this pass did not touch.
+    *(gate: `scripts/honest-claims.sh`, which now records the membership of BOTH
+    lists for the reason it already records every control's grade: a promotion
+    out of the relevant list into the enforced one is the same over-claim one
+    level up, where `Enforcement` cannot see it. Verified against five mutants,
+    each of which fails it: 23894 promoted into the enforced list, a new
+    relevance claim nobody recorded, an enforced framework appearing in the
+    relevant list, the const removed, and the category emptied to `&[]`, the last
+    two as "measured nothing" rather than a clean run. Four are cases in
+    `gates-have-teeth.sh`, with a fifth that must NOT fire when a relevance row's
+    prose is reworded. Tests: six in `core::compliance`, of which
+    `a_framework_is_enforced_or_merely_relevant_and_never_both` is the one the
+    surface claim rests on and
+    `asi07_is_still_absent_and_did_not_come_back_as_a_relevant_framework` is what
+    stops the softer road back. Scenarios: `features/relevant-not-enforced.feature`,
+    six, each bound.
+
+    Writing the gate reproduced this file's own lesson about text gates twice in
+    ten minutes, and both were found by the mutants rather than by reading. Its
+    first const slicer looked for the terminator `\n];`, which is how the tuple
+    list ends and is not how the struct list ends, so it ran past its subject and
+    swallowed the whole catalog while printing the right answer by luck. Its
+    second started the bracket scan at the first `[` after the name, which is the
+    one in the TYPE, so it read the type annotation and parsed no id at all, and
+    the NEGATIVE control is what caught that one.)*
