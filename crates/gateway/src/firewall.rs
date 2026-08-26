@@ -228,24 +228,7 @@ impl FirewallConfig {
         // entirely rather than leaving a label with nothing behind it. A rule
         // of their own naming the label also wins, so narrowing it is one line.
         let detect_injection = file.detect_injection.unwrap_or(true);
-        if detect_injection
-            && mode == FirewallMode::Enforce
-            && !rules.iter().any(|r| {
-                r.when_any
-                    .iter()
-                    .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)
-            })
-        {
-            rules.insert(0, injection_rule());
-        }
-
-        if mode == FirewallMode::Enforce
-            && !rules
-                .iter()
-                .any(|r| r.name == anti_exfiltration_rule().name)
-        {
-            rules.insert(0, anti_exfiltration_rule());
-        }
+        ensure_floors(mode, detect_injection, &mut rules);
 
         Ok(FirewallConfig {
             mode,
@@ -316,31 +299,135 @@ pub fn from_env() -> FirewallConfig {
         Ok("off") => cfg.mode = FirewallMode::Off,
         _ => {}
     }
-    // The floor again, because the env var can raise the mode to enforce after
+    // The floors again, because the env var can raise the mode to enforce after
     // a file was parsed in shadow: the guarantee is about the mode in effect,
     // not about how the config arrived at it.
-    if cfg.mode == FirewallMode::Enforce
-        && !cfg
-            .rules
-            .iter()
-            .any(|r| r.name == anti_exfiltration_rule().name)
-    {
-        cfg.rules.insert(0, anti_exfiltration_rule());
-    }
+    //
+    // This called ONE of the two floors until 2026-08-26, and the sentence
+    // above was already the correct rule while the code below applied it to
+    // half of what it governed. `ensure_floors` is now the only place either
+    // floor is decided, so the next floor added is added once.
+    ensure_floors(cfg.mode, cfg.detect_injection, &mut cfg.rules);
     cfg
+}
+
+/// Put the floors under a config, for the mode IN EFFECT.
+///
+/// One function and not two blocks, because it is called from two places that
+/// must not disagree and did: `from_json` inserted both floors, `from_env`
+/// re-inserted one of them after the environment raised a shadow file to
+/// enforce, and a policy naming neither floor then ran in enforce mode with the
+/// injection detector on, the label attached, and nothing denying it. Which is
+/// the case the injection floor exists for.
+///
+/// Idempotent by construction: each floor is skipped when a rule already reads
+/// its label, so a config that has been through here twice is the same config,
+/// and an operator's own narrower rule still wins.
+fn ensure_floors(mode: FirewallMode, detect_injection: bool, rules: &mut Vec<TaintRule>) {
+    if mode != FirewallMode::Enforce {
+        // Shadow records and refuses nothing, so a floor there would be a rule
+        // that cannot fire. Off is off.
+        return;
+    }
+    if detect_injection
+        && !rules.iter().any(|r| {
+            r.when_any
+                .iter()
+                .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)
+        })
+    {
+        rules.insert(0, injection_rule());
+    }
+    if !rules
+        .iter()
+        .any(|r| r.name == anti_exfiltration_rule().name)
+    {
+        rules.insert(0, anti_exfiltration_rule());
+    }
 }
 
 #[cfg(test)]
 mod config_tests {
     use super::*;
 
-    // Every test below was run against the firewall as it stood before the
-    // JSON loader existed and failed there, most of them because
-    // `FirewallConfig::from_json` did not exist at all. They are kept as the
-    // record of what the loader is FOR, not only that it parses.
+    /// Every test in this module that touches `TOKENFUSE_FIREWALL` takes this
+    /// first. Rust runs tests as threads of ONE process, so the environment is
+    /// shared state, and two tests setting the same variable interleave. That
+    /// is not hypothetical: the first version of the floor test below passed
+    /// alone and failed in the workspace run, for exactly this reason and not
+    /// for anything about the firewall.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn cfg(json: &str) -> FirewallConfig {
         FirewallConfig::from_json(json).expect("a valid config")
+    }
+
+    /// Both floors answer to the mode IN EFFECT, not to how the config got there.
+    ///
+    /// `from_env` re-inserted the anti-exfiltration floor after the env var
+    /// raised a shadow file to enforce, and did not re-insert the injection
+    /// floor. The comment beside it stated the guarantee correctly and applied
+    /// it to one floor of two.
+    ///
+    /// So a policy file saying `"mode":"shadow"` with no rule naming
+    /// `suspected_injection`, plus `TOKENFUSE_FIREWALL=enforce`, produced:
+    /// enforce mode, the detector on, the label attached to a tainted run, and
+    /// nothing that denies it. Which is verbatim the case the injection floor
+    /// exists for, in the one mode where it matters.
+    ///
+    /// Asserted against `ensure_floors` directly rather than through the
+    /// environment, because the defect was never about parsing: it was that
+    /// two call sites decided the floors and only one of them decided both.
+    /// One function is now the only place either is decided, and this is that
+    /// function asked the question the env path asks it.
+    #[test]
+    fn both_floors_answer_to_the_mode_in_effect() {
+        // What a shadow policy naming neither floor parses to.
+        let shadow = FirewallConfig::from_json(
+            r#"{"mode":"shadow","sources":{"web_search":["web"]},"rules":[]}"#,
+        )
+        .expect("a valid config");
+        assert_eq!(shadow.mode, FirewallMode::Shadow);
+        assert!(
+            shadow.rules.is_empty(),
+            "shadow gets no floor: nothing can fire"
+        );
+
+        // Now the environment raises it, which is what `from_env` does after
+        // parsing, and what it did to only one floor.
+        let mut rules = shadow.rules.clone();
+        ensure_floors(FirewallMode::Enforce, shadow.detect_injection, &mut rules);
+
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.name == anti_exfiltration_rule().name),
+            "the anti-exfiltration floor was already held"
+        );
+        assert!(
+            rules.iter().any(|r| r
+                .when_any
+                .iter()
+                .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)),
+            "enforce mode, the detector on, the label attached, and nothing denies it. \
+             That is the case the injection floor exists for, and it was missing because \
+             the file parsed in shadow and only one of the two floors was re-checked."
+        );
+
+        // Idempotent: through here twice is the same config, or `from_env`
+        // would double every floor on a file that already had them.
+        let before = rules.len();
+        ensure_floors(FirewallMode::Enforce, shadow.detect_injection, &mut rules);
+        assert_eq!(before, rules.len(), "a second pass added a floor again");
+
+        // And an operator who turned the scan off does not get a rule for a
+        // label nothing will ever attach.
+        let mut off = Vec::new();
+        ensure_floors(FirewallMode::Enforce, false, &mut off);
+        assert!(!off.iter().any(|r| r
+            .when_any
+            .iter()
+            .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)));
     }
 
     #[test]
@@ -354,6 +441,7 @@ mod config_tests {
         // Shadow and not enforce: shadow refuses nothing, so no request that
         // worked yesterday fails today. That is what makes it a default rather
         // than a breaking change.
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let saved = (
             std::env::var("TOKENFUSE_FIREWALL").ok(),
             std::env::var("TOKENFUSE_FIREWALL_CONFIG").ok(),
