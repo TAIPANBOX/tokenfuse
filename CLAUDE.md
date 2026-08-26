@@ -1262,6 +1262,67 @@ build)`, `cloud apns (feature build)`.
    rejected: `kill` sits open beside it on the same router, so a bespoke
    credential on one endpoint is a false comfort rather than a boundary.
 
+   **A clearance is about the BLOCKS a person read, and for its first day it
+   was not.** The fourth point above was true as written and useless in
+   practice. Taint is re-derived from the whole `messages[]` array on every
+   request and an agent loop resends the whole conversation, so "the next
+   arrival of that label" was the very block a human had just reviewed, coming
+   back on the next turn: the clearance was spent before the run's next action
+   was judged, and the valve released for exactly one request shape, a
+   follow-up carrying no tool history, which nothing sends. The test that
+   proved it worked sent that shape. It passed against the defect.
+
+   Both wire shapes carry an id per tool call, so a review is recorded against
+   ids. The same block arriving again is not an arrival; one that was not there
+   when somebody read the conversation is. `@yurii 2026-08-26` chose this over
+   the cheaper option of remembering how far the history reached.
+
+   Four decisions inside it, each of which could have gone the other way. **A
+   block with no id is never reviewed**, because the other fallback is a bypass
+   one omitted field wide, and the cost, a valve that still spends every turn
+   for a producer that sends no ids, is reported as `reviewed_blocks: 0` rather
+   than discovered on the next call. **`reviewed_blocks` is inferred when
+   absent**, meaning every block this gateway has seen on the run, which is what
+   was on the operator's screen; requiring the ids would put the question of
+   what a human read into the agent framework's hands, which is the party this
+   endpoint exists to overrule, and an id the run never carried refuses the
+   WHOLE clearance because a forward-dated review is a permanent exemption
+   bought in advance. **The set is capped at 256 blocks per run and overflow
+   drops the oldest**, so their labels return: an unbounded set is a leak, and
+   fail-closed is the direction to fail in. **`suspected_injection` follows the
+   same rule**, being the same shape one field over: it is re-derived by
+   scanning tool RESULTS each turn, so a block somebody signed for takes its
+   result with it, while a result whose call has scrolled out of the window is
+   attributed to no tool and is still scanned.
+
+   The blocks are recorded before ANY refusal can return, not beside the
+   firewall's own accumulation, and that placement is load-bearing rather than
+   tidy: a refusal is what somebody is looking at when they clear a run, and the
+   wasm hook refuses on the taint bitset and returns long before the firewall
+   block. Found by a test, after a mutant showed the wasm plane's own bitset was
+   re-derived from the unsplit history and no test in the workspace noticed.
+   *(test: `a_clearance_survives_the_history_the_next_turn_resends`, verified red
+   against the unfixed tree, verbatim `left: 403 right: 200`;
+   `a_page_read_after_the_review_is_not_covered_by_it`,
+   `a_block_carrying_no_id_is_never_read_as_reviewed`,
+   `signing_for_a_block_the_run_never_carried_is_refused`,
+   `an_injection_a_human_reviewed_does_not_come_back_every_turn` and
+   `the_wasm_plane_sees_the_clearance_the_firewall_saw` in `gateway::proxy`;
+   seven in `gateway::state::block_ledger_tests` for the ledger, its cap and its
+   cull; three in `core::taint` for the ids on both wire shapes. Ten mutants
+   planted in the PRODUCT code 2026-08-26 and all ten caught, of which two
+   survived a first pass and are why two of those tests exist: the eviction cull
+   deleted, which the bound test could not catch because it signed for blocks
+   AFTER the overflow; and the wasm plane's bitset restored to the unsplit
+   history, which nothing covered at all. Scenarios:
+   `features/agent-firewall.feature`, seven, each bound to a named test.
+   `@measured` against the release binary in enforce mode with a real upstream,
+   2026-08-26: read the board -> 403 `[web]`; a person cleared it ->
+   `{"cleared":["web"],"reviewed_blocks":1}`; the SAME conversation resent ->
+   200, with no `taint_raised` at all; the same conversation plus one unreviewed
+   page -> 403. Ten events off that run pass `agent-conform -chain`, hash chain
+   included.)*
+
    **B.4's other two gates are not built here and cannot be.** Both declassify
    a VALUE, and B.3 refuses per-value tracking in as many words, for the reason
    it gives: intractable at the proxy level, and false precision. Their
@@ -1290,6 +1351,16 @@ build)`, `cloud apns (feature build)`.
    purpose; that is the caller's shape to get right and the honest limit of a
    proxy-level model. And the key is only as good as a deployment that keeps it
    away from the agent, which is true of every operator control here.
+
+   Three more, added with the block model. A label the caller declares in the
+   `x-fuse-taint` REQUEST header is re-supplied every turn it is sent and spends
+   the clearance, which is correct, because the caller chooses to keep sending
+   it and can stop. The answer an allowed turn produces is a new action nobody
+   reviewed, so a model tool call this gateway has just permitted is accumulated
+   on the run at that moment (B.3 P2) and judged on the next turn; measured
+   live. And the `taint_cleared` event does not say WHICH blocks a clearance
+   covered, only how many the HTTP answer reports, because that would be a new
+   member on `taint_cleared_data` in `tokenfuse-core`.
 
 29. **Every verifier in this workspace shares one copy of the algorithm rule.**
    `oidc.rs` has closed the RS256-to-HS256 downgrade since it was written: the
@@ -1705,3 +1776,74 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     somewhere without going through `chainproof`, and the compiler naming both
     existing sites when the field was added is what found them this time.)*
 
+32. **A list somebody can be told about is a list something reads, and its AGE
+    is a decision rather than an accident.** vouchryx has served
+    `GET /v1/revocations` since the day it was written, with an `as_of` cursor
+    put there so a poller could tell an empty list from a failed fetch. Measured
+    2026-08-26: nothing polled it. Both doors here passed
+    `revoked: |_, _, _| false`, no Go enforcement point set `Options.Revoked`,
+    and four documents in two repositories said in the present tense that every
+    enforcement point consults it. The four are corrected in the same wave, and
+    that half is not optional: this repository's rule is to change the text
+    rather than to narrate the change.
+
+    `tokenfuse_delegation::revocations` is the local cache the `revoked` closure
+    is filled from. Still no client in that crate, which is invariant 29 intact:
+    the FETCH is out of band and the CHECK is local, so `Revocations::check`
+    takes a clock, returns an `Answer`, and has nowhere to send a request.
+
+    **Age is the third state, and it decides what a MISS means rather than what
+    a HIT means.** The estate has answered "a dependency is unreachable" twice,
+    both times with an operator-chosen fail mode defaulting to open
+    (`wardryx::FailMode`, `TOKENFUSE_MCP_TAINT_FAILMODE`), and `FailMode` here
+    is the same word with the same default so the estate does not answer one
+    question two ways. What a revocation list adds is that a stale list is still
+    mostly right: a PDP you cannot reach tells you nothing, and a list from four
+    minutes ago still holds every revocation older than four minutes. So a hit
+    stands at any age, because nothing un-revokes a token and discarding a
+    revocation we hold would call a token we know is dead a live one. A miss is
+    an inference from the list being COMPLETE, completeness is what expires, and
+    past `DEFAULT_MAX_AGE_SECS` the fail mode answers a miss instead.
+
+    **Sixty seconds is the number, and it is the window in which a revoked token
+    still works.** It comes from the token rather than from taste: vouchryx
+    mints at a five-minute default TTL and caps at an hour, so a list allowed to
+    outlive a token would let one minted after the last poll be revoked and go
+    on working for its whole life, which makes the control decorative for a
+    whole generation of tokens rather than merely late.
+
+    **Never fetched is not stale, and an older answer never replaces a newer
+    one.** `Basis::Never` and `Basis::Stale` both defer to the fail mode and are
+    different faults: a poller nobody wired does not clear itself and nothing
+    else in the estate will mention it, which is invariant 13's boundary. A
+    snapshot whose `as_of` moved backwards is refused and counted, because
+    installing it would reset the age and a view that had stopped moving would
+    start reading as fresh, which turns every other rule here off. Equal cursors
+    ARE accepted: `as_of` is a Unix second and refusing that would break any
+    poller faster than 1 Hz.
+    *(scenarios: `features/revocation.feature`, eighteen, each bound to a named
+    test. Test: eighteen in `delegation::revocations`, every one run against a
+    `check` stubbed to `|_, _, _| false`, which is what the doors do today;
+    fourteen went red there, verbatim among them `left: Never right: Stale {
+    age_secs: 61 }` and `tok-1 was answered from the list: Answer { revoked:
+    false, basis: Never }`. One stayed red past the stub and found a real
+    defect: a derived `Deserialize` reads `[]` positionally into an empty
+    snapshot, so `Snapshot::from_json` now refuses a body that is not a JSON
+    object. Eight mutants planted in the product code on
+    2026-08-26, all eight caught, each named with the test that caught it in the
+    pull request. The two worth naming here are the ones the design turns on:
+    the age never consulted, so a stale list serves for ever
+    (`a_miss_on_a_stale_list_falls_back_to_the_fail_mode`), and the age
+    governing a HIT as well as a MISS
+    (`a_stale_list_still_refuses_what_it_names`). Not a script gate: nothing
+    STOPS a door going on passing `|_, _, _| false`, and wiring the two doors is
+    a separate wave with a wire contract of its own.)*
+
+    **Where it says nothing.** No door in this repository calls it yet, so this
+    is still a library with no consumer, which is what invariant 29 already says
+    about the verifier it plugs into. It holds no store, so a restart starts
+    from `Basis::Never` and the fail mode governs until the first poll lands.
+    And it cannot tell a vouchryx that restarted and forgot its whole list from
+    one whose entries legitimately expired: both answer an empty list with a
+    current cursor, and vouchryx's own README names the in-memory store under
+    NOT PROVEN for exactly that reason.

@@ -497,6 +497,62 @@ Feature: The agent firewall says what it did, and can be told what to do
     When it is submitted
     Then nothing is cleared and the answer says why
 
+  # ---------------------------------------------------------------------
+  # 2026-08-26, B.4 again. The valve released for exactly one request shape,
+  # and no agent loop sends it. A review is about BLOCKS.
+  # ---------------------------------------------------------------------
+
+  # @test:a_clearance_survives_the_history_the_next_turn_resends
+  Scenario: The clearance survives the conversation being resent
+    Given a run refused because it read the web, and a person who cleared it
+    When the agent sends its next turn, carrying the same conversation
+    Then it is allowed, because the block they reviewed arriving again is not
+      a new arrival
+
+  # @test:a_page_read_after_the_review_is_not_covered_by_it
+  Scenario: One review does not buy an exemption for the next page
+    Given the same run, cleared, whose next turn carries a second web search
+    When it asks to run a shell
+    Then it is refused, because a fresh page is a fresh page however many
+      earlier ones were signed for
+
+  # @test:a_block_carrying_no_id_is_never_read_as_reviewed
+  Scenario: A block the wire did not identify is judged, not trusted
+    Given a tool call carrying no id at all
+    When a person clears the run
+    Then the answer says the clearance covers no blocks, and the label comes
+      back on the next turn, because reading an absent id as "reviewed" would
+      be a bypass one omitted field wide
+
+  # @test:signing_for_a_block_the_run_never_carried_is_refused
+  Scenario: Nobody signs for a block that has not arrived
+    Given a clearance naming a block id this run never carried
+    When it is submitted
+    Then the whole clearance is refused and the answer names the id, because a
+      forward-dated review is a permanent exemption bought in advance
+
+  # @test:an_injection_a_human_reviewed_does_not_come_back_every_turn
+  Scenario: The document a person read is not re-scanned every turn
+    Given a ticket carrying an injection, and a person who read it and cleared
+      the label
+    When the agent sends its next turn with the same ticket in the history
+    Then nothing is raised, because a block somebody signed for takes its
+      result with it
+
+  # @test:the_wasm_plane_sees_the_clearance_the_firewall_saw
+  Scenario: Two subsystems judging one run agree about it
+    Given a custom wasm policy that refuses a web-tainted run
+    When a person clears the label
+    Then the wasm policy stops refusing too, rather than one door permitting
+      what the other refuses
+
+  # @test:the_tracked_set_is_bounded_and_overflowing_it_is_fail_closed
+  Scenario: The set of reviewed blocks does not grow without limit
+    Given a conversation carrying more tool blocks than are tracked per run
+    When it overflows
+    Then the oldest are dropped, so their labels return rather than a review
+      being remembered for a block nobody can name any more
+
   # @test:taint_flows_down_a_chain_and_never_up_it
   Scenario: A quarantine contains rather than spreads
     Given a sub-run that reads a dirty document on its caller's behalf
