@@ -29,14 +29,20 @@
 //! The estate has answered "what happens when a dependency is unreachable"
 //! twice, the same way both times: an operator-chosen [`FailMode`], `open` or
 //! `closed`, defaulting to open. `wardryx::FailMode` and
-//! `TOKENFUSE_MCP_TAINT_FAILMODE` are the two, and this matches them so the
-//! estate does not answer one question two ways.
+//! `TOKENFUSE_MCP_TAINT_FAILMODE` are the two. This takes the same vocabulary
+//! and the OPPOSITE default, which is a difference stated rather than hidden.
 //!
 //! A revocation list has a state those two do not have. A PDP you cannot reach
 //! tells you nothing at all; a revocation list from four minutes ago still
 //! holds every revocation older than four minutes. So age is its own axis, with
 //! a maximum, and the fail mode is what answers past the maximum rather than
 //! what answers to an outage.
+//!
+//! That same difference is why the default differs. Opening on an unreachable
+//! PDP decides a question no answer was coming for; opening on an unreachable
+//! revocation list throws away one specific fact the operator asked to be told,
+//! which is that this authority can no longer be confirmed to exist. See
+//! [`FailMode::Closed`] for the whole argument and for what bounds the damage.
 //!
 //! # The rule the maximum governs, which is narrower than it looks
 //!
@@ -184,20 +190,40 @@ impl Snapshot {
 
 /// What an unanswerable miss means, chosen by the operator.
 ///
-/// Deliberately the same vocabulary and the same default as
-/// `wardryx::FailMode` and `TOKENFUSE_MCP_TAINT_FAILMODE`. A third spelling of
-/// one question is how an estate ends up answering it three ways.
+/// Deliberately the same vocabulary as `wardryx::FailMode` and
+/// `TOKENFUSE_MCP_TAINT_FAILMODE`, and deliberately NOT the same default. A
+/// third spelling of one question is how an estate ends up answering it three
+/// ways; a shared default across three questions that are not the same question
+/// is how it answers the wrong one twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailMode {
-    /// A list too old to answer a miss lets the call through. The default,
-    /// because it is what every deployment does today: nothing polls, so
-    /// nothing is refused, and an addition that starts refusing traffic on
-    /// upgrade is a breaking change wearing a security fix's clothes.
+    /// A list too old to answer a miss refuses. The default.
+    ///
+    /// The other two answer "the PDP is unreachable", and an unreachable PDP
+    /// says NOTHING, so letting the call through decides a question no answer
+    /// was coming for. An unreachable revocation list says one narrow thing:
+    /// this authority can no longer be confirmed to exist. Opening there does
+    /// not preserve availability in the absence of information, it throws away
+    /// information the operator asked for.
+    ///
+    /// It is an attack primitive and not only an outage. Open makes "revoking
+    /// ends the right to act" conditional on one service being reachable, so
+    /// whoever can drop it, or partition a single door from it, buys a window
+    /// in which revoked tokens work again, and every call in that window
+    /// succeeds silently.
+    ///
+    /// Three things bound the damage, none of which a general fail-closed
+    /// default would have: the check is off entirely unless a deployment wires
+    /// a poller, a working poller refuses nothing at all, and vouchryx mints at
+    /// a five-minute TTL, so the outage is bounded by the same clock the
+    /// control is.
     #[default]
-    Open,
-    /// A list too old to answer a miss refuses. For a deployment that has
-    /// decided an unverifiable delegation is not one it will honour.
     Closed,
+    /// A list too old to answer a miss lets the call through. For a deployment
+    /// that has decided an unverifiable delegation is one it will honour rather
+    /// than lose the traffic. A deliberate choice, which is why it is not what
+    /// an operator who chose nothing gets.
+    Open,
 }
 
 impl FailMode {
@@ -298,9 +324,9 @@ pub struct Revocations {
 
 impl Revocations {
     /// A cache with the estate's defaults: [`DEFAULT_MAX_AGE_SECS`] and
-    /// [`FailMode::Open`].
+    /// [`FailMode::Closed`].
     pub fn with_defaults() -> Self {
-        Self::new(DEFAULT_MAX_AGE_SECS, FailMode::Open)
+        Self::new(DEFAULT_MAX_AGE_SECS, FailMode::default())
     }
 
     /// A cache with an operator's own policy.
@@ -732,5 +758,23 @@ mod tests {
                 "{raw:?} parsed as a revocation list"
             );
         }
+    }
+
+    /// Pins the DEFAULT, which is what a deployment that never names a mode
+    /// gets. Every other test here passes a mode explicitly, so before this one
+    /// the default was the most-used setting in the module and the only one
+    /// nothing asserted.
+    #[test]
+    fn the_default_fail_mode_refuses() {
+        assert_eq!(
+            FailMode::default(),
+            FailMode::Closed,
+            "an operator who never chose gets this one"
+        );
+        // A cache nobody ever fetched into, built without naming a mode. This
+        // is the shape a half-wired door has.
+        let a = Revocations::with_defaults().check("tok-1", "user://acme/alice", AS_OF - 10, AS_OF);
+        assert!(a.revoked, "a list nobody fetched let the call through");
+        assert_eq!(a.basis, Basis::Never);
     }
 }

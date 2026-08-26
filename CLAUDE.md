@@ -1801,11 +1801,15 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     **Age is the third state, and it decides what a MISS means rather than what
     a HIT means.** The estate has answered "a dependency is unreachable" twice,
     both times with an operator-chosen fail mode defaulting to open
-    (`wardryx::FailMode`, `TOKENFUSE_MCP_TAINT_FAILMODE`), and `FailMode` here
-    is the same word with the same default so the estate does not answer one
-    question two ways. What a revocation list adds is that a stale list is still
-    mostly right: a PDP you cannot reach tells you nothing, and a list from four
-    minutes ago still holds every revocation older than four minutes. So a hit
+    (`wardryx::FailMode`, `TOKENFUSE_MCP_TAINT_FAILMODE`). `FailMode` here is
+    the same word and DELIBERATELY the opposite default, and the difference is
+    stated rather than hidden: an unreachable PDP says nothing, so opening
+    decides a question no answer was coming for, while an unreachable revocation
+    list says one narrow thing, which is that this authority can no longer be
+    confirmed. Open there is also an attack primitive, because it makes revoking
+    conditional on one service being reachable and does so silently. What a
+    revocation list adds on top is that a stale list is still mostly right: one
+    from four minutes ago holds every revocation older than four minutes. So a hit
     stands at any age, because nothing un-revokes a token and discarding a
     revocation we hold would call a token we know is dead a live one. A miss is
     an inference from the list being COMPLETE, completeness is what expires, and
