@@ -1157,6 +1157,77 @@ build)`, `cloud apns (feature build)`.
    advisory and always will be; what changed is that it is no longer the only
    door. And nothing here looks at the text of a prompt.
 
+27. **A detector that reads the attacker's text may not decide anything.** The
+   agent firewall is label-based by design and only ever as good as the
+   operator's source map, and a source map is a statement about the PIPE while
+   injections arrive in the WATER. `crates/core/src/injection.rs` closes that:
+   it reads tool results and, where a document is written like an instruction
+   to the model, adds one label, `suspected_injection`. The capability gate
+   refuses. That is the whole design.
+
+   **It may not decide, and the reason is not caution.** The attacker writes
+   the text, so anything that reads the text and then chooses `allow` or `deny`
+   has handed the attacker a vote in its own verdict. As a taint SOURCE it has
+   no such vote: taint is monotonic, so its findings can only make the gate
+   stricter and never looser, and defeating the detector returns you to the
+   coarse model rather than getting you past it. A false positive costs one
+   refused dangerous action; a false negative costs nothing that was not
+   already being lost. That asymmetry is why a regex-only, publicly readable,
+   defeatable detector is an acceptable thing to ship, and it would not be if
+   it decided.
+
+   **What it adds over the labels already there.** A run that called
+   `web_search` is already untrusted. This earns its place in one case and it
+   is the common one: a source the operator classified as TRUSTED carrying
+   something the world put in it, an internal ticket system or a wiki or a
+   support inbox. Second, it says WHY: before it, an operator read "blocked,
+   context was [web]" and could not tell whether anything had actually tried.
+
+   **Signals are names, never text.** A signal name is a fact about the SHAPE
+   of a document and carries none of its content, which is what lets it travel
+   on a bus that holds no content, into the record and into an alert.
+
+   **It scans tool results and not the user's own message**, and that blind
+   spot is deliberate: a security engineer typing "check whether it will ignore
+   all previous instructions" must not taint their own run for doing their job.
+   The cost is named rather than hidden: pasting an untrusted document into
+   your own message is not covered.
+
+   **Silence about a label that did not exist is not consent.** In enforce
+   mode, a policy that mentions the label nowhere gets
+   `no-action-after-an-injection-signal` added, because a file written before
+   the detector existed could not have mentioned it, and reading its silence as
+   agreement would hand every such operator a detector producing a label
+   nothing acts on: the exact case it exists for. `@claude`, and NOT the same
+   basis as anti-exfiltration's floor, which docs/07 B.9 locks. A rule of their
+   own naming the label wins; `"detect_injection": false` turns the scan off
+   entirely, because a floor with no exit is one somebody escapes by turning
+   the whole firewall off. Anti-exfiltration still judges first, being the one
+   B.9 locks and the one an auditor comes looking for.
+   *(test: `an_injection_in_a_trusted_source_is_still_an_injection` in
+   `gateway::proxy`, verified red against the unfixed tree, verbatim
+   `left: 200 right: 403`; `an_ordinary_tool_result_raises_nothing` beside it,
+   which passed BEFORE the change and had to keep passing after, since a
+   detector that fires on ordinary text gets switched off and takes the coarse
+   model with it. Twelve in `core::injection`, of which `ordinary_documents_stay_quiet`
+   carries ten real documents each containing a word a naive pattern would fire
+   on, and `the_users_own_words_are_not_scanned` records the blind spot as a
+   decision. Four in `gateway::firewall` for the floor, the operator's own
+   rule, the off switch, and shadow not getting the floor forced on it.
+   `@measured` against the release binary, 2026-08-26, with a policy trusting
+   an internal ticket system: an ordinary ticket answered 200 with
+   `signals: []`; the same source carrying an override, an exfiltration ask and
+   a tool directive answered 403 with `tainted context [internal,
+   suspected_injection]`, three signals on the event, and `grep` over the whole
+   NDJSON found ZERO words of the ticket; `detect_injection: false` answered
+   200.)*
+
+   **Where it says nothing.** Regex only, English only, and its patterns are
+   shapes rather than meanings. It is defeatable by anybody who reads the file,
+   which is public, and that is acceptable only because of the asymmetry above.
+   docs/07 B.4's three sanitization gates are still unbuilt, so a run that
+   picks this label up carries it to the end.
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

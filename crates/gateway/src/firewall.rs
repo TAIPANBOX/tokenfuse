@@ -7,6 +7,15 @@ use tokenfuse_core::taint::{FirewallMode, TaintRule};
 #[derive(Debug, Clone, Default)]
 pub struct FirewallConfig {
     pub mode: FirewallMode,
+    /// Whether to scan tool results for instruction-shaped text
+    /// (`tokenfuse_core::injection`). On unless a policy file says otherwise.
+    ///
+    /// Off means off: no scan, no label, no cost. It is a field rather than
+    /// only a rule an operator can decline to write, because the detector's
+    /// label gets a floor rule when nothing else denies it (see
+    /// [`FirewallConfig::from_json`]), and a floor with no exit is a floor
+    /// somebody escapes by turning the whole firewall off.
+    pub detect_injection: bool,
     /// tool name → the taint labels its output carries (docs/07 B.2).
     pub sources: HashMap<String, Vec<String>>,
     /// tool name → capability it exercises.
@@ -55,6 +64,14 @@ impl FirewallConfig {
                     "email".into(),
                     "file".into(),
                     "unclassified".into(),
+                    // A tool result that read like an instruction, whatever
+                    // the source map says about the tool that produced it.
+                    // In the starter policy rather than left for an operator
+                    // to add, because a label nothing denies is a label that
+                    // does nothing, and the case this covers is one the source
+                    // map cannot: a source they classified as TRUSTED carrying
+                    // something the world put in it.
+                    tokenfuse_core::injection::SUSPECTED_INJECTION.into(),
                 ],
                 deny: vec!["exec".into(), "write".into(), "network_egress".into()],
             },
@@ -66,6 +83,7 @@ impl FirewallConfig {
         ];
         FirewallConfig {
             mode,
+            detect_injection: true,
             sources,
             capabilities,
             rules,
@@ -79,6 +97,14 @@ impl FirewallConfig {
 /// Secrets in the context plus an outbound capability is the exfiltration
 /// chain the whole taint model exists for. Every other rule is a judgement an
 /// operator is invited to tune.
+fn injection_rule() -> TaintRule {
+    TaintRule {
+        name: "no-action-after-an-injection-signal".into(),
+        when_any: vec![tokenfuse_core::injection::SUSPECTED_INJECTION.into()],
+        deny: vec!["exec".into(), "write".into(), "network_egress".into()],
+    }
+}
+
 fn anti_exfiltration_rule() -> TaintRule {
     TaintRule {
         name: "anti-exfiltration".into(),
@@ -114,6 +140,9 @@ pub enum FirewallConfigError {
 struct PolicyFile {
     #[serde(default)]
     mode: Option<String>,
+    /// Whether `tokenfuse_core::injection` runs. Absent means yes.
+    #[serde(default)]
+    detect_injection: Option<bool>,
     #[serde(default)]
     sources: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -177,6 +206,39 @@ impl FirewallConfig {
             });
         }
 
+        // Two floors, and anti-exfiltration goes in LAST so it ends up first.
+        // They can both match only for a run carrying secrets AND an injection
+        // signal that tries to send data out, and first match wins, so the
+        // order decides which rule the record names. `anti-exfiltration` is the
+        // one docs/07 B.9 locks and the one an auditor comes looking for; the
+        // injection signal is still on the same event, in `data.signals`.
+        // The detector's label gets a rule when nothing else denies it, and the
+        // reasoning is different from anti-exfiltration's: that one is locked
+        // by docs/07 B.9, this one is a judgement.
+        //
+        // `@claude` 2026-08-26. A policy file written before this detector
+        // existed COULD NOT have mentioned the label, so reading its silence as
+        // consent would give every operator who already wrote a policy a
+        // detector that produces a label nothing acts on, which is the exact
+        // case it exists for: their source map says a tool is trusted, and the
+        // document it returned is not. They did not write "and if a page tells
+        // you to ignore your instructions, proceed".
+        //
+        // The exit is `"detect_injection": false`, which turns the scan off
+        // entirely rather than leaving a label with nothing behind it. A rule
+        // of their own naming the label also wins, so narrowing it is one line.
+        let detect_injection = file.detect_injection.unwrap_or(true);
+        if detect_injection
+            && mode == FirewallMode::Enforce
+            && !rules.iter().any(|r| {
+                r.when_any
+                    .iter()
+                    .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)
+            })
+        {
+            rules.insert(0, injection_rule());
+        }
+
         if mode == FirewallMode::Enforce
             && !rules
                 .iter()
@@ -187,6 +249,7 @@ impl FirewallConfig {
 
         Ok(FirewallConfig {
             mode,
+            detect_injection,
             sources: file.sources,
             capabilities: file.capabilities,
             rules,
@@ -373,8 +436,19 @@ mod config_tests {
               "mode": "enforce",
               "rules": [{"name": "mine", "when_any": ["web"], "deny": ["exec"]}]
             }"#);
-        assert_eq!(c.rules.len(), 2, "the operator's rule, plus the floor");
-        assert_eq!(c.rules[0].name, "anti-exfiltration", "and it goes first");
+        // Their rule, plus both floors: this one and the injection rule that
+        // arrived beside it. Asserted by NAME rather than by count, because a
+        // count breaks every time a floor is added for a good reason.
+        let names: Vec<&str> = c.rules.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"mine") && names.contains(&"anti-exfiltration"),
+            "{names:?}"
+        );
+        assert_eq!(
+            c.rules[0].name, "anti-exfiltration",
+            "and it judges first: it is the one B.9 locks and the one an \
+             auditor comes looking for"
+        );
         assert!(c.rules[0].deny.contains(&"network_egress".to_string()));
 
         // It really refuses, not merely appears in the list.
@@ -382,6 +456,97 @@ mod config_tests {
         let requested: std::collections::BTreeSet<String> =
             ["network_egress".to_string()].into_iter().collect();
         assert!(tokenfuse_core::taint::evaluate(&labels, &requested, &c.rules).is_some());
+    }
+
+    #[test]
+    fn a_policy_written_before_the_detector_existed_still_acts_on_its_label() {
+        // The case the detector exists for, and the one an existing policy
+        // cannot have covered: their source map says a tool is trusted, and
+        // the document it returned is not. Reading a policy's SILENCE about a
+        // label that did not exist when it was written as consent would give
+        // every such operator a detector producing a label nothing acts on.
+        let c = cfg(r#"{
+              "mode": "enforce",
+              "rules": [{"name": "mine", "when_any": ["web"], "deny": ["exec"]}]
+            }"#);
+        assert!(c.detect_injection);
+        let names: Vec<&str> = c.rules.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"no-action-after-an-injection-signal"),
+            "{names:?}"
+        );
+
+        let labels: tokenfuse_core::taint::Labels =
+            [tokenfuse_core::injection::SUSPECTED_INJECTION.to_string()]
+                .into_iter()
+                .collect();
+        let requested: std::collections::BTreeSet<String> =
+            ["exec".to_string()].into_iter().collect();
+        assert!(tokenfuse_core::taint::evaluate(&labels, &requested, &c.rules).is_some());
+    }
+
+    #[test]
+    fn an_operators_own_rule_about_the_label_wins_over_the_floor() {
+        // The floor is there because silence is not consent. A rule that
+        // MENTIONS the label is not silence, so narrowing it is one line and
+        // nothing is added behind their back.
+        let c = cfg(r#"{
+              "mode": "enforce",
+              "rules": [{
+                "name": "injections-may-not-write",
+                "when_any": ["suspected_injection"],
+                "deny": ["write"]
+              }]
+            }"#);
+        let names: Vec<&str> = c.rules.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.contains(&"no-action-after-an-injection-signal"),
+            "{names:?}"
+        );
+
+        // And theirs really is narrower: exec is theirs to allow.
+        let labels: tokenfuse_core::taint::Labels =
+            [tokenfuse_core::injection::SUSPECTED_INJECTION.to_string()]
+                .into_iter()
+                .collect();
+        let exec: std::collections::BTreeSet<String> = ["exec".to_string()].into_iter().collect();
+        assert!(tokenfuse_core::taint::evaluate(&labels, &exec, &c.rules).is_none());
+    }
+
+    #[test]
+    fn the_detector_has_an_off_switch_that_is_really_off() {
+        // A floor with no exit is a floor somebody escapes by turning the whole
+        // firewall off, which costs them the coarse model as well. `false`
+        // means no scan, no label and no rule, rather than a label with nothing
+        // behind it.
+        let c = cfg(r#"{
+              "mode": "enforce",
+              "detect_injection": false,
+              "rules": [{"name": "mine", "when_any": ["web"], "deny": ["exec"]}]
+            }"#);
+        assert!(!c.detect_injection);
+        let names: Vec<&str> = c.rules.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.contains(&"no-action-after-an-injection-signal"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn shadow_does_not_get_the_injection_rule_forced_on_it_either() {
+        // Same reasoning as anti-exfiltration's: shadow is the mode an operator
+        // runs to learn what THEIR policy does, and a week's numbers describing
+        // a policy they did not write is worse than no week.
+        let c = cfg(r#"{
+              "mode": "shadow",
+              "rules": [{"name": "mine", "when_any": ["web"], "deny": ["exec"]}]
+            }"#);
+        assert_eq!(c.rules.len(), 1);
+        assert!(
+            c.detect_injection,
+            "the scan still runs; only the forced rule is withheld, so the week \
+             counts what would have happened"
+        );
     }
 
     #[test]

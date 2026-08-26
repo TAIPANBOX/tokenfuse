@@ -230,3 +230,91 @@ Feature: The agent firewall says what it did, and can be told what to do
     Given one run that read the web and one that inherited it
     When the report is produced
     Then the tool is credited once and the inheritance is counted separately
+
+  # ---------------------------------------------------------------------
+  # 2026-08-26, the detector. @yurii: "берись за детектор" — as a taint
+  # SOURCE and never as a decision, so the attacker's own text has no vote
+  # in the verdict it produces.
+  # ---------------------------------------------------------------------
+
+  # @test:an_injection_in_a_trusted_source_is_still_an_injection
+  Scenario: A source the operator trusts, carrying something the world put in it
+    Given a policy in which the internal ticket system is a trusted source
+    And a ticket containing an instruction to ignore previous instructions
+    When the model then asks to run a shell
+    Then the call is refused, because a trusted pipe is not trusted water
+    And the record names the tool whose OUTPUT carried it, and the pattern
+      that matched, and no word of the ticket
+
+  # @test:an_ordinary_tool_result_raises_nothing
+  Scenario: An ordinary ticket is left alone
+    Given a ticket that happens to say "please ignore the duplicate reports"
+    When the agent reads it
+    Then nothing is raised, because a person being polite about duplicates is
+      not an override
+
+  # @test:ordinary_documents_stay_quiet
+  Scenario: Ten ordinary documents, each containing a word a naive pattern
+      would fire on
+    When each is scanned
+    Then none of them raises a signal, because a detector that fires on
+      ordinary text gets switched off and takes the coarse model with it
+
+  # @test:the_shapes_an_injection_takes_are_recognised
+  Scenario: The shapes an injection takes
+    Given text that overrides instructions, impersonates the system, asks for
+      the context to be sent somewhere, solicits a secret, directs a tool, or
+      hides itself
+    When it is scanned
+    Then each shape is recognised by name
+
+  # @test:a_signal_is_a_name_and_never_the_text_it_matched
+  Scenario: A signal is a name and never the text
+    Given a document containing both an override and a passphrase
+    When it is scanned
+    Then what comes back names the pattern and carries neither
+
+  # @test:the_users_own_words_are_not_scanned
+  Scenario: The operator's own words are not scanned, and that is a decision
+    Given a user message that itself says to ignore all previous instructions
+    When the request is scanned
+    Then nothing is raised, because that is a person typing and a security
+      engineer must be able to do their job
+
+  # @test:a_result_whose_call_scrolled_out_of_the_window_is_still_scanned
+  Scenario: Trimming the history is not a way past the scan
+    Given a tool result whose call has scrolled out of the request
+    When it is scanned
+    Then it is still scanned, attributed to no tool rather than dropped
+
+  # @test:a_tool_result_is_attributed_to_the_tool_that_produced_it
+  Scenario: The record names the tool to stop calling
+    Given two tools whose results both arrive in one message
+    When they are read
+    Then each is attributed to the call that produced it
+
+  # @test:a_policy_written_before_the_detector_existed_still_acts_on_its_label
+  Scenario: Silence about a label that did not exist is not consent
+    Given a policy written before the detector existed
+    When it is loaded in enforce mode
+    Then the detector's label is denied by a rule that was added, because
+      otherwise the case the detector exists for is the case they miss
+
+  # @test:an_operators_own_rule_about_the_label_wins_over_the_floor
+  Scenario: An operator who says something about the label is not silent
+    Given a policy with its own, narrower rule about the label
+    When it is loaded
+    Then nothing is added behind their back and their rule is what decides
+
+  # @test:the_detector_has_an_off_switch_that_is_really_off
+  Scenario: The detector has an exit
+    Given a policy that sets detect_injection to false
+    When it is loaded
+    Then there is no scan, no label and no rule, because a floor with no exit
+      is one somebody escapes by turning the whole firewall off
+
+  # @test:one_document_reports_each_kind_once_however_many_times_it_tries
+  Scenario: Forty attempts of one kind are one finding
+    Given a document that overrides instructions three different ways
+    When it is scanned
+    Then it reports one kind, so a count measures kinds and not persistence
