@@ -10,6 +10,7 @@ pub mod cache;
 pub mod compliance;
 pub mod dlp;
 pub mod firewallstats;
+pub mod injection;
 pub mod jcs;
 pub mod ledger;
 pub mod loops;

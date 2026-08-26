@@ -122,6 +122,7 @@ live upstream.
 | B.3 P3 subagent inherits the parent's taint | Built 2026-08-26. Resolved on every request by walking the declared parent chain, so a parent that becomes untrusted AFTER its child started is picked up on the child's next call. |
 | B.3 P4 a new run is a clean set | Built, by the same keying. |
 | B.4 sanitization gates | **None of the three is built.** A label, once acquired, is carried for the life of the run. |
+| B.10's "semantic content analysis complements this" | Built 2026-08-26, as a taint SOURCE and never as a decision. See below. |
 | B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. |
 | B.6 policy file | Built, in JSON rather than YAML (see below). `mode` and named `rules` with `when_any`/`deny`. `action:` is not built: every rule blocks. `require_approval` and `sanitize_gate` do not exist, so `sanitizers:` and `approval:` are unimplemented. |
 | B.7 level 1, proxy advisory | Built. |
@@ -173,7 +174,7 @@ shadow mode wrote nothing at all.
 
 | type | band | when |
 |---|---|---|
-| `taint_raised` | `low` | a run acquired a label it did not have. Fires once per label per run, since taint is monotonic. |
+| `taint_raised` | `low` | a run acquired a label it did not have. Fires once per label per run, since taint is monotonic. `data.stage` says where from: `request_history` (a tool was called), `request_header` (the caller declared it), `parent_run` (an ancestor carried it), `tool_result` (a document said something instruction-shaped, with `data.signals` naming which patterns). |
 | `taint_shadow` | `medium` | the filter would have refused and did not, because the mode is shadow. The action was PERMITTED. |
 | `taint_block` | `high` | the filter refused. |
 
@@ -233,6 +234,64 @@ field. So it lands in the payload plane with the rest of `data`, behind the key
 whose destruction erases it. A hash of a prompt is a pseudonymous identifier of
 content that may be personal, and putting one where erasure cannot reach is the
 mistake that store's own documentation warns about for `agent_id`.
+
+### The injection detector, and why it may not decide anything
+
+`crates/core/src/injection.rs`, built 2026-08-26. It reads tool results, and
+when a document is written like an instruction to the model it adds one label,
+`suspected_injection`. That is all it does. The capability gate refuses, exactly
+as it does for `web`.
+
+**It may not decide, and the reason is not caution.** A text classifier is
+talked around, because the attacker writes the text: anything that reads the
+text and then chooses `allow` or `deny` has handed the attacker a vote in its
+own verdict. As a taint source it has no such vote. Taint is monotonic, so the
+attacker's words can only make the gate STRICTER and never looser; defeating
+the detector returns you to the coarse label model, it does not get you past
+it. A false positive costs one refused dangerous action. A false negative costs
+nothing that was not already being lost.
+
+**What it adds, given the label model already exists.** A run that called
+`web_search` is already untrusted and this adds nothing there. It earns its
+place in one case, and it is the common one: **a source the operator classified
+as TRUSTED, carrying something the world put in it.** An internal ticket
+system, a wiki, a support inbox, a repository the team owns. The source map is
+a statement about the PIPE; injections arrive in the WATER. Second, it says
+WHY: before it, an operator read "blocked, context was [web]" and could not
+tell whether anything had actually tried anything.
+
+**Signals are names, never text.** `instruction_override`,
+`role_impersonation`, `exfiltration_request`, `secret_solicitation`,
+`tool_directive`, `hidden_text`. A name is a fact about the SHAPE of a document
+and carries none of its content, which is what lets it travel on a bus that
+holds no content, into the record and into an alert. Measured on a live run
+against a ticket containing an override, an exfiltration ask and a tool
+directive: three signals on the event, zero words of the ticket anywhere in the
+NDJSON.
+
+**It scans tool results and not the user's own message.** A user message is the
+operator speaking, and a security engineer typing "check whether it will ignore
+all previous instructions" would otherwise taint their own run for doing their
+job. The cost is named rather than hidden: an operator who PASTES an untrusted
+document into their own message is not covered.
+
+**Its label gets a rule when nothing else denies it, in enforce mode only.**
+`@claude`, and different from anti-exfiltration's floor, which B.9 locks. A
+policy file written before this detector existed could not have mentioned the
+label, so reading its silence as consent would give every such operator a
+detector producing a label nothing acts on, which is the exact case it exists
+for. A rule of their own naming the label wins, so narrowing it is one line;
+`"detect_injection": false` turns the scan off entirely, because a floor with
+no exit is one somebody escapes by turning the whole firewall off.
+
+Regex only. No ML, no external call, no network, the same discipline as the DLP
+scanner, and English-only. Deliberately uncapped: a cap would be a silent false
+negative in the middle of a long document, which is where somebody hiding an
+instruction would put it, and the gateway has already parsed those bytes as
+JSON, so a linear sweep over them is cheaper than the parse that produced them.
+
+It is defeatable by anybody who reads that file, which is public. That is
+acceptable only because it cannot lower a gate.
 
 ### Reading it back
 

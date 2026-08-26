@@ -426,6 +426,15 @@ pub enum TaintStage {
     /// Judging the tool calls in the model's own answer (docs/07 B.7 level 1,
     /// advisory: the gateway sees the request, the CLIENT executes the tool).
     ModelToolCall,
+    /// The label came from what a TOOL put in the context, rather than from
+    /// which tool was called: [`crate::injection`] found an instruction-shaped
+    /// signal in a tool's result.
+    ///
+    /// A stage of its own because it answers a different question from
+    /// `request_history`. That one says "this run called something untrusted";
+    /// this says "something untrusted said something to it", and only the
+    /// second one is worth reading the document over.
+    ToolResult,
     /// The label came from an ancestor run, per docs/07 B.3 P3.
     ///
     /// Added 2026-08-26 with the inheritance itself. Until then the taint map
@@ -455,6 +464,7 @@ impl TaintStage {
             TaintStage::RequestHistory => "request_history",
             TaintStage::RequestHeader => "request_header",
             TaintStage::ModelToolCall => "model_tool_call",
+            TaintStage::ToolResult => "tool_result",
             TaintStage::ParentRun => "parent_run",
             TaintStage::ToolCallCheck => "tool_call_check",
             TaintStage::McpToolCall => "mcp_tool_call",
@@ -537,9 +547,17 @@ pub fn taint_raised_data(
     from_tools: &[String],
     carrying: &[String],
     prompt: Option<&str>,
+    signals: &[&str],
     unit: &str,
 ) -> serde_json::Value {
     serde_json::json!({
+        // Which detector shapes matched, BY NAME and never the text they
+        // matched. The whole privacy story of `crate::injection` is in that
+        // distinction: a signal name is a fact about the shape of a document
+        // and carries none of its content, which is what lets it travel on a
+        // shared bus that holds no content. Empty for every stage but
+        // `tool_result`.
+        "signals": signals,
         // On the ACQUISITION as well as on the verdict, and this is the half an
         // investigation starts from: the turn a run became untrusted is the turn
         // whose instruction is worth reading.
