@@ -212,14 +212,25 @@ its own unreachable PDP.
 
 ### Which instruction a turn carried
 
-Both taint families carry `data.prompt_hash`: `sha384:<hex>` over the LAST user
-message's text, or absent when the turn had none.
+Both taint families carry `data.prompt_hash`: `sha384:<hex>` over the newest
+user message that carries text, or absent when the conversation carries none.
 
-The last message and not the history, because hashing the conversation produces
-a value that changes every turn and groups nothing. What this answers is "did
-these four incidents come from one instruction" and "did the instruction change
-at the turn things went wrong", and only the newest instruction has that
+The newest instruction and not the history, because hashing the conversation
+produces a value that changes every turn and groups nothing. What this answers
+is "did these four incidents come from one instruction" and "did the instruction
+change at the turn things went wrong", and only the newest instruction has that
 property.
+
+**And the newest instruction is not the newest message.** Anthropic carries a
+`tool_result` in a message whose role is `user`, so on every tool-using turn the
+newest user message holds no instruction at all and the one the run is still
+executing is turns back. Measured 2026-08-26 on a live tool-use request: taking
+the newest message literally left this field null across the whole tool loop,
+which is the `tool_result` stage, which is where the question is most worth
+asking. It now walks back to the newest user message that says something and
+stops there, so a changed instruction stays visible at the turn it changed. It
+does not invent one: a conversation with no instruction text anywhere is still
+absent rather than hashed.
 
 A hash and only a hash. Identical instructions collapse, a changed one is
 visible at the turn it changed, and an instruction somebody still has can be

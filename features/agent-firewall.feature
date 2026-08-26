@@ -206,6 +206,23 @@ Feature: The agent firewall says what it did, and can be told what to do
     Then each carries the same hash of the instruction that turn was given
     And no word of the instruction appears anywhere on the bus
 
+  # @test:a_tool_result_turn_still_names_the_instruction_in_play
+  Scenario: A tool loop is still executing the instruction that started it
+    Given a turn whose newest user message carries a tool result and no text,
+      which is what every tool-using turn on Anthropic's wire looks like
+    When the record is written
+    Then it names the instruction the run is still executing rather than
+      nothing, because reading the newest message literally left this blank
+      across the whole tool loop, and the tool result stage is where the
+      question is most worth asking
+
+  # @test:the_fallback_takes_the_newest_instruction_and_not_the_first
+  Scenario: Walking back stops at the newest thing anybody said
+    Given a conversation with two instructions and a tool loop after each
+    When the record is written
+    Then it names the second instruction, because walking past it to the
+      first would hide the turn the instruction changed
+
   # @test:a_turn_with_no_instruction_records_no_hash_rather_than_an_empty_one
   Scenario: A turn with no instruction says so
     Given an agent-driven turn carrying only tool results

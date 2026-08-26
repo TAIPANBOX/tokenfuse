@@ -1123,10 +1123,17 @@ build)`, `cloud apns (feature build)`.
    output. `TOKENFUSE_FIREWALL=off` restores the old silence exactly.
 
    **And both taint families carry `data.prompt_hash`**, `sha384:<hex>` over
-   the last user message, absent when a turn had none. The last message and not
-   the history, because hashing the conversation changes every turn and groups
-   nothing; what this answers is whether four incidents came from ONE
-   instruction. On the acquisition as well as the verdict, because the turn a
+   the newest user message that carries TEXT, absent when a conversation has
+   none. The newest instruction and not the history, because hashing the
+   conversation changes every turn and groups nothing; what this answers is
+   whether four incidents came from ONE instruction. And not the newest MESSAGE
+   either: Anthropic carries a `tool_result` in a message whose role is `user`,
+   so reading it literally left the field null across every tool loop, which is
+   the `tool_result` stage and the place the question is most worth asking
+   (measured 2026-08-26 on a live tool-use request, fixed the same day). It
+   walks back only until it finds text, so a changed instruction stays visible
+   at the turn it changed, and a conversation with no instruction anywhere is
+   still absent rather than hashed. On the acquisition as well as the verdict, because the turn a
    run became untrusted and the turn it tried something are usually not the
    same turn. A hash and only a hash, so there is nothing here to erase, and it
    deliberately does NOT reach trailryx's `basis.prompt_hash`: that field is
@@ -1145,7 +1152,7 @@ build)`, `cloud apns (feature build)`.
    level 3, including
    `a_gateway_that_cannot_be_reached_does_not_silently_become_permission`;
    `the_default_is_shadow_so_a_box_that_asked_for_nothing_still_measures`,
-   which also asserts the off switch still means off; six in
+   which also asserts the off switch still means off; nine in
    `core::agent_event::prompt_hash_tests` and two in `gateway::proxy` for the
    instruction hash, of which `it_is_a_hash_and_carries_no_word_of_the_prompt`
    is the whole safety argument. `@measured` end to end against the release
