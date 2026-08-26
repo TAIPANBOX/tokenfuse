@@ -397,3 +397,30 @@ Feature: The agent firewall says what it did, and can be told what to do
     Given a second verifier in the same process
     When it decides which algorithms a key may be used with
     Then it asks the same function the first one does
+
+  # ---------------------------------------------------------------------
+  # 2026-08-26, block B1 and B2. The compliance catalog gains DORA and
+  # NIS2, and three OWASP rows that were missing. Two of the three.
+  # ---------------------------------------------------------------------
+
+  # @test:every_declared_framework_is_actually_cited_by_a_control
+  Scenario: A framework nobody cites is a promise nobody kept
+    Given a framework declared in the catalog's registry
+    When the catalog is read
+    Then some control cites it, because a customer reading the framework list
+      and asking which controls cover it must not get none
+
+  # @test:dora_and_nis2_are_cited_by_article_and_never_by_sub_point
+  Scenario: Cited at the level the identifier can be defended at
+    Given a DORA or NIS2 row
+    When it is read
+    Then it names an article and its subject and never a sub-point letter,
+      because a wrong letter is a mis-citation and a right article is not
+
+  # @test:the_owasp_rows_added_in_this_pass_are_the_ones_that_were_asked_for
+  Scenario: Two of the three, and the third said plainly
+    Given the OWASP categories this catalog claims
+    When they are read
+    Then unexpected code execution and human-agent trust exploitation are
+      among them, and insecure inter-agent communication is not, because the
+      agents here do not talk to each other across a trust boundary
