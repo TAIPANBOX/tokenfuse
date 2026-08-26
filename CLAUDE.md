@@ -121,7 +121,7 @@ Both numbers in that sentence were stale before they were corrected on
 2026-08-25: it said seven of 22 while the harness ran 30, because the count was
 written once and the cases kept arriving. It moved again the next day with the
 hook-environment case, and again on 2026-08-26 with the four cases holding the
-relevant-not-enforced framework list (invariant 32), one of which takes that
+relevant-not-enforced framework list (invariant 33), one of which takes that
 list away. That is the point rather than an annoyance: the number
 is now updated in the commit that changes it, because somebody looks. @measured on that date, the run
 itself for the new figure and `git show origin/main:scripts/gates-have-teeth.sh
@@ -261,7 +261,7 @@ build)`, `cloud apns (feature build)`.
    no longer parse, which fails as unverified rather than passing. The same
    script grew a third half on 2026-08-26, recording which of the two framework
    lists each framework sits in, with five mutants of its own; that is invariant
-   32 and the reason it lives here rather than in a twelfth script is that it is
+   33 and the reason it lives here rather than in a twelfth script is that it is
    the same invariant over the same file)*
 5. **Don't thread new dimensions through `LedgerBackend`/raft casually.** The
    ledger's replicated state (`crates/gateway/src/ledger_backend.rs`,
@@ -1853,7 +1853,6 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     one whose entries legitimately expired: both answer an empty list with a
     current cursor, and vouchryx's own README names the in-memory store under
     NOT PROVEN for exactly that reason.
-
 
 33. **A framework row is a claim about what the code ENFORCES, and what this
     product is merely relevant to is a different list with a different type.**
