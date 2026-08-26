@@ -127,6 +127,32 @@ impl OidcConfig {
     }
 }
 
+/// The algorithms a key of this type may be used with.
+///
+/// **The single copy of this rule in this repository**, and it is a single copy
+/// on purpose rather than tidiness. The permitted algorithms come from the
+/// KEY TYPE and never from the token header, which is written by whoever
+/// presents the token: without this an attacker takes a public RSA modulus or
+/// EC point that anybody can fetch from a JWKS, signs an HMAC using those bytes
+/// as the secret, sets `alg` to `HS256`, and the signature verifies. Symmetric
+/// and OKP keys are refused outright, which is what closes `none` as well.
+///
+/// It was inline in [`verify`] until 2026-08-26, when
+/// [`crate::delegation`] arrived needing the same rule. A second copy is how
+/// two verifiers in one process end up disagreeing about which signatures are
+/// valid, and the agent-identity plan named this defence specifically as one
+/// that "must be preserved verbatim". One function is stronger than verbatim:
+/// verbatim is two things that agree today.
+pub(crate) fn algorithms_for_key(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Vec<Algorithm>> {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => {
+            Some(vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512])
+        }
+        AlgorithmParameters::EllipticCurve(_) => Some(vec![Algorithm::ES256, Algorithm::ES384]),
+        _ => None,
+    }
+}
+
 /// A verified OIDC token: the mapped [`Principal`] plus a stable, non-secret
 /// `actor` id (`oidc:<sub or org>`) for the audit trail.
 pub struct Verified {
@@ -187,17 +213,9 @@ pub fn verify(cfg: &OidcConfig, token: &str) -> Option<Verified> {
     // 2. Key id matches a configured JWKS key.
     let jwk = cfg.jwks.find(&kid)?;
 
-    // 3. Allowed algorithms come from the *key type*, never the token header —
-    //    this prevents an attacker from downgrading an RSA/EC key to HS256 and
-    //    forging a signature ("alg confusion"). Symmetric / OKP keys are
-    //    rejected outright.
-    let algorithms: Vec<Algorithm> = match &jwk.algorithm {
-        AlgorithmParameters::RSA(_) => {
-            vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512]
-        }
-        AlgorithmParameters::EllipticCurve(_) => vec![Algorithm::ES256, Algorithm::ES384],
-        _ => return None,
-    };
+    // 3. Allowed algorithms come from the *key type*, never the token header.
+    //    See [`algorithms_for_key`], which is now the ONE copy of this rule.
+    let algorithms = algorithms_for_key(jwk)?;
     let key = DecodingKey::from_jwk(jwk).ok()?;
 
     // 4-6. Signature + exp + iss + aud, all enforced by `jsonwebtoken`.

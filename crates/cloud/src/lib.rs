@@ -5,6 +5,7 @@
 #[cfg(feature = "apns")]
 pub mod apns;
 pub mod audit_sign;
+pub mod delegation;
 pub mod devices;
 pub mod http;
 pub mod keys;

@@ -362,3 +362,38 @@ Feature: The agent firewall says what it did, and can be told what to do
     Given a sub-run that reads a dirty document on its caller's behalf
     When the caller makes its next call
     Then the caller is still clean, and the quarantine is still refused
+
+  # ---------------------------------------------------------------------
+  # 2026-08-26, block A2. Verifying a delegation is a library call.
+  # ---------------------------------------------------------------------
+
+  # @test:a_delegation_verifies_and_the_chain_keeps_its_root
+  Scenario: An enforcement point checks a delegation with what it already holds
+    Given a key set held locally and a token from vouchryx
+    When it is verified
+    Then the chain comes back with the person at its root, because the RFC
+      keeps the subject out of the actor claim and this estate puts it in
+
+  # @test:a_token_presented_by_the_wrong_holder_is_refused
+  Scenario: A stolen delegation token is bytes
+    Given a token bound to one key and a proof from another
+    When it is verified
+    Then it is refused, which is the whole reason the binding exists
+
+  # @test:a_bound_token_checked_with_no_proof_is_refused_rather_than_downgraded
+  Scenario: Forgetting to check the binding is not the same as it passing
+    Given a sender-constrained token and a caller that passed no proof
+    When it is verified
+    Then it is refused rather than accepted with the binding skipped
+
+  # @test:a_revoked_delegation_is_refused_though_its_signature_is_perfect
+  Scenario: The signature is fine and the authority is gone
+    Given a token whose delegation has been revoked
+    When it is verified
+    Then it is refused, because that is what a revocation list is for
+
+  # @test:the_algorithm_still_comes_from_the_key_on_this_path
+  Scenario: One copy of the algorithm rule, not two that agree today
+    Given a second verifier in the same process
+    When it decides which algorithms a key may be used with
+    Then it asks the same function the first one does
