@@ -305,6 +305,22 @@ run_case "constants: a wire string changed without regenerating" fail \
 # None of the three reaches `cargo audit` itself, so they cost no advisory-db
 # fetch. They fail in the reachability check that runs before it.
 
+# A check that asks another repository a question must give the same answer
+# whether or not it inherited a hook's environment. git exports GIT_DIR into a
+# hook, `git -C <elsewhere>` keeps it, and this check read the advisory
+# database's working tree against this repository's index. Found in trailryx on
+# 2026-08-26 and here by estate-gates C9.
+#
+# There is deliberately no matching `fail` case putting the leak back: the
+# check sits behind the database existing, a machine that has never run
+# cargo-audit has none, and the case would then report TOOTHLESS rather than
+# proving anything. trailryx wrote one, watched CI call it toothless, and
+# removed it. The fail direction is pinned by the measurement in audit.sh's own
+# comment and not by this harness.
+run_case "audit: the same answer under a hook's environment" pass \
+	"GIT_DIR=\"\$PWD/.git\" ./scripts/audit.sh" \
+	""
+
 run_case "audit: an ignore with no reason recorded" fail \
 	"./scripts/audit.sh" \
 	"$(py 'edit(".cargo/audit.toml", "RUSTSEC-2026-0235", "RUSTSEC-2026-0235\", \"RUSTSEC-2020-0001")')" \
