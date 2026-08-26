@@ -318,3 +318,47 @@ Feature: The agent firewall says what it did, and can be told what to do
     Given a document that overrides instructions three different ways
     When it is scanned
     Then it reports one kind, so a count measures kinds and not persistence
+
+  # ---------------------------------------------------------------------
+  # 2026-08-26, B.4. The release valve, and the honest answer about the
+  # other two gates.
+  # ---------------------------------------------------------------------
+
+  # @test:a_human_who_reviewed_the_context_can_let_a_label_go
+  Scenario: A human reviewed the page and says so
+    Given a run refused because it read the web
+    When a person who reviewed the page clears that label, with a reason
+    Then the run is allowed again
+    And the clearance is recorded at the same band a refusal takes
+
+  # @test:a_clearance_is_spent_by_the_next_arrival_of_that_label
+  Scenario: A review covers what was there, not what comes next
+    Given a run whose label a human has cleared
+    When it reads the web again
+    Then it is refused again, because a fresh page is a fresh page
+
+  # @test:clearing_a_child_says_the_parent_still_carries_it
+  Scenario: Half a job says which half
+    Given a child run whose parent is still untrusted
+    When somebody clears the child
+    Then the answer names what is still arriving from the parent, so the valve
+      does not read as broken when the label returns
+
+  # @test:secrets_cannot_be_let_go_at_all
+  Scenario: One label no review can remove
+    Given a run that has read a secret
+    When somebody tries to clear that label
+    Then it is refused by name, because clearing it would disable
+      anti-exfiltration by another door
+
+  # @test:a_clearance_with_no_human_and_no_reason_is_not_a_clearance
+  Scenario: An agent may not clear its own taint
+    Given a clearance whose actor is an agent, or which carries no reason
+    When it is submitted
+    Then nothing is cleared and the answer says why
+
+  # @test:taint_flows_down_a_chain_and_never_up_it
+  Scenario: A quarantine contains rather than spreads
+    Given a sub-run that reads a dirty document on its caller's behalf
+    When the caller makes its next call
+    Then the caller is still clean, and the quarantine is still refused

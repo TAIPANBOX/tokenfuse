@@ -1228,6 +1228,69 @@ build)`, `cloud apns (feature build)`.
    docs/07 B.4's three sanitization gates are still unbuilt, so a run that
    picks this label up carries it to the end.
 
+28. **A control with no way back gets switched off, so the way back is part of
+   the control.** docs/07 B.10 has always named conservativeness as the price of
+   a monotonic label model and B.4 as the valve. The valve was never built, so
+   a label lasted the life of a run, and once inheritance shipped on the same
+   morning one long-lived parent made every child untrusted forever. An
+   operator whose fleet is refused all day turns the firewall off, and that
+   costs them the coarse model that WAS working.
+
+   `POST /v1/fuse/declassify`. A human reviewed the content and says so; the
+   labels come off that run. **Four things keep it from being the bypass, and
+   none is obscurity.** `actor` must be a `user://` principal, so an agent
+   clearing its own taint is refused outright. `reason` is required, because a
+   human lifting a control without saying why is the audit hole rather than the
+   control. `secrets` can never be cleared, since B.9 locks anti-exfiltration
+   on and clearing that label makes the rule unreachable for a run. And a
+   clearance is SPENT by the next arrival of that label: they reviewed what was
+   there, not what comes next, and a clearance that survived would mean one
+   review buys an agent a permanent exemption.
+
+   **`agent_id` is required and it is not a formality.** `Exporter::emit` skips
+   an event with no subject and counts the skip, because SPEC 6.1 forbids
+   inventing one, so an optional field there would have meant clearances
+   applied and never recorded: a control lifted with no trace, the worst
+   outcome this endpoint has. Found by the test, not by reading.
+
+   Recorded at `high`, the band a block takes, because an estate that pages
+   when a rule fires and stays quiet when somebody switches it off has its
+   weights backwards. `data.authenticated` says whether the caller presented
+   `TOKENFUSE_DECLASSIFY_KEY`; unset, this endpoint sits behind network
+   placement exactly as `/v1/runs/{id}/kill` does, and an auditor has to be
+   able to tell those apart. Making the key mandatory was considered and
+   rejected: `kill` sits open beside it on the same router, so a bespoke
+   credential on one endpoint is a false comfort rather than a boundary.
+
+   **B.4's other two gates are not built here and cannot be.** Both declassify
+   a VALUE, and B.3 refuses per-value tracking in as many words, for the reason
+   it gives: intractable at the proxy level, and false precision. Their
+   run-level expression is B.3 P4's quarantined sub-run: read the dirty
+   document in a child, hand the caller only what came out. That works because
+   **taint flows down a chain and never up it**, and nothing asserted that
+   until now. A change making inheritance symmetric would have turned the
+   estate's one sanctioned way of handling dirty data into a way of spreading
+   it, and every quarantine already written would have started poisoning its
+   caller.
+   *(test: `a_human_who_reviewed_the_context_can_let_a_label_go`, verified red
+   against the unfixed tree; `a_clearance_is_spent_by_the_next_arrival_of_that_label`,
+   `clearing_a_child_says_the_parent_still_carries_it`,
+   `secrets_cannot_be_let_go_at_all`,
+   `a_clearance_with_no_human_and_no_reason_is_not_a_clearance` and
+   `taint_flows_down_a_chain_and_never_up_it` in `gateway::proxy`; three in
+   `gateway::declassify` for the key, the reason cap and the authenticated
+   flag. `@measured` against the release binary, 2026-08-26: reads the web ->
+   403, still 403, a human clears it -> 200, reads the web again -> 403. The
+   bus carried `taint_cleared` at `high` with the actor, the reason and
+   `authenticated: true`; an agent trying to clear its own taint was refused by
+   name, and so was a call with no key on a gateway that had one configured.)*
+
+   **Where it says nothing.** Nothing stops a caller declaring a quarantine as
+   the PARENT of a clean run, which flows the taint the wrong way round on
+   purpose; that is the caller's shape to get right and the honest limit of a
+   proxy-level model. And the key is only as good as a deployment that keeps it
+   away from the agent, which is true of every operator control here.
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

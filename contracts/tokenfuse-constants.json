@@ -70,6 +70,10 @@
       {
         "severity": "low",
         "type": "taint_raised"
+      },
+      {
+        "severity": "high",
+        "type": "taint_cleared"
       }
     ]
   },
