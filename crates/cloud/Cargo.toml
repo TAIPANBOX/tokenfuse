@@ -15,6 +15,7 @@ tokenfuse-core.workspace = true
 # RFC 9449 proofs, RFC 7638 thumbprints and the one algorithm allowlist,
 # shared with the gateway rather than copied into it (invariant 29).
 tokenfuse-dpop.workspace = true
+tokenfuse-delegation.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum.workspace = true

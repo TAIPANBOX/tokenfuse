@@ -144,6 +144,9 @@ pub struct BrokerState {
     /// until an operator says otherwise, which is what makes the proof door an
     /// addition rather than a breaking change.
     pub require_proof: bool,
+    /// The delegation issuer's keys, or `None` when no issuer is configured,
+    /// which is the default and leaves every chain a claim.
+    pub chain_proof: crate::chainproof::ChainProof,
     pub client: reqwest::Client,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
     /// default; see `crate::events::from_env`. Emits `mcp_drift` (rug-pull) and
@@ -189,6 +192,10 @@ pub struct CallContext {
     /// is a header the client has to send rather than something the broker can
     /// work out. Absent on stdio, which has no header channel at all.
     pub run_id: Option<String>,
+    /// Whether THIS broker verified a delegation token and took
+    /// [`on_behalf_of`](CallContext::on_behalf_of) from it rather than from the
+    /// header. Set by [`crate::chainproof::resolve`] and by nothing else.
+    pub chain_proven: bool,
     /// `x-fuse-attestation-method`, forwarded to the PDP for a
     /// `deny_if_unattested` policy.
     pub attestation_method: Option<String>,
@@ -617,19 +624,45 @@ async fn handle(
         }
         crate::mcpdoor::Admission::Bearer(_) | crate::mcpdoor::Admission::Open => {}
     }
+    let declared: Vec<String> = header("x-fuse-on-behalf-of")
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Who this caller acts FOR, and whether anybody proved it. The rule is in
+    // `chainproof` because the LLM proxy applies the same one, and a rule
+    // written twice becomes two rules.
+    let (on_behalf_of, chain_proven) = match crate::chainproof::resolve(
+        &st.chain_proof,
+        crate::chainproof::dpop_credential(header("authorization").as_deref()),
+        header(crate::mcpdoor::PROOF_HEADER).as_deref(),
+        "POST",
+        uri.path(),
+        &declared,
+        crate::sink::now_millis() / 1000,
+        |_, _, _| false,
+    ) {
+        crate::chainproof::Chain::Refused(why) => {
+            // The same 401 the door gives, for the same reason: which refusal
+            // it was is an oracle, and the operator's log is where it belongs.
+            tracing::warn!(reason = ?why, "mcp broker: refused a delegation token");
+            return crate::proxy::unauthorized_response();
+        }
+        crate::chainproof::Chain::Proven(chain) => (chain, true),
+        crate::chainproof::Chain::Claimed(chain) => (chain, false),
+    };
+
     let ctx = CallContext {
         agent_id: header("x-fuse-agent-id"),
         upstream: header("x-fuse-mcp-upstream"),
         run_id: header("x-fuse-run-id"),
-        on_behalf_of: header("x-fuse-on-behalf-of")
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        on_behalf_of,
+        chain_proven,
         attestation_method: header("x-fuse-attestation-method"),
         approval_token: header("x-fuse-approval-token"),
     };
@@ -922,6 +955,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         // "nothing to restrict", never as a denial).
                         run_id: format!("mcp:{aid}"),
                         on_behalf_of: ctx.on_behalf_of.clone(),
+                        chain_proven: ctx.chain_proven,
                         tool_names: if tool.is_empty() {
                             Vec::new()
                         } else {

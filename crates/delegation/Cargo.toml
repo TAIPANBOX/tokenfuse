@@ -1,0 +1,35 @@
+[package]
+name = "tokenfuse-delegation"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline verification of an RFC 8693 delegation token, sender-constrained per RFC 9449."
+
+# Its own crate rather than a module of `cloud`, for one reason: the GATEWAY
+# needs it, and the gateway must not depend on `cloud`, which would put the
+# control-plane API surface inside the data-plane binary. That is the same
+# reasoning that cut `tokenfuse-dpop` out of `cloud` earlier today, and this
+# crate depends on that one rather than repeating its thumbprint or its
+# algorithm allowlist. `cloud::delegation` still resolves: it re-exports.
+
+[dependencies]
+tokenfuse-dpop.workspace = true
+base64 = { workspace = true, optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# The minting fixture, for this crate's own tests and for any enforcement
+# point that must test what it does with a real token.
+testing = ["dep:base64", "dep:p256"]
+
+[dev-dependencies]
+base64.workspace = true
+sha2.workspace = true
+# The tests mint real ES256 tokens and verify them as an auditor would, rather
+# than trusting this crate to check its own output. Already in the lockfile via
+# `cloud`'s dev-dependencies, so nothing new enters it.
+p256 = { version = "0.13", features = ["ecdsa"] }

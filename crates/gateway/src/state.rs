@@ -69,6 +69,12 @@ pub struct AppState {
     /// Wardryx enforcement hook (a PEP): enforces decisions made by the
     /// Wardryx policy service (a PDP). Off by default. See `crate::wardryx`.
     pub wardryx: Arc<Wardryx>,
+    /// The delegation issuer's keys, or `None` when no issuer is configured.
+    ///
+    /// `None` is the default and it is not a degraded mode: it means every
+    /// chain reaching the PDP is a claim, which is what this gateway sent for
+    /// its whole life before 2026-08-26. What changed is that it now SAYS so.
+    pub chain_proof: crate::chainproof::ChainProof,
     history: History,
     killed: Killed,
     /// Run taint, shared so the MCP broker judges against the same state.
@@ -309,6 +315,9 @@ impl AppState {
         policy_id: impl Into<Arc<str>>,
     ) -> Self {
         AppState {
+            // No delegation issuer until `main` configures one, so every chain
+            // is a claim and every existing deployment is unchanged.
+            chain_proof: None,
             // Wrap the in-process ledger as the default backend. `with_ledger`
             // swaps in a raft-replicated backend for HA (cluster feature).
             ledger: Arc::new(LocalLedger(ledger)),

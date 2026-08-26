@@ -5,7 +5,11 @@
 #[cfg(feature = "apns")]
 pub mod apns;
 pub mod audit_sign;
-pub mod delegation;
+// Delegation verification moved to its own crate so the GATEWAY can use it:
+// the gateway must not depend on this one, which would put the control-plane
+// API surface inside the data-plane binary. Same reasoning, and the same
+// re-export, as `oidc::algorithms_for_key` after `tokenfuse-dpop` was cut.
+pub use tokenfuse_delegation as delegation;
 pub mod devices;
 pub mod http;
 pub mod keys;

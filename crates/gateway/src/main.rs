@@ -469,7 +469,14 @@ async fn mcp_broker() {
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
     let events = Arc::new(tokenfuse_gateway::events::from_env());
+    // The delegation issuer, or nothing, in which case every chain the PDP is
+    // asked about stays a claim and says so.
+    let chain_proof = tokenfuse_gateway::chainproof::from_env();
+    if chain_proof.is_some() {
+        tracing::info!("delegation door: ON, chains reaching the PDP are verified here");
+    }
     let state = Arc::new(BrokerState {
+        chain_proof,
         upstream: upstream.clone(),
         named_upstreams,
         vault,
