@@ -262,9 +262,22 @@ run_case "honest-claims: a merely-relevant framework promoted to enforced" fail 
 	"$(py 'edit("crates/core/src/compliance.rs", "    (\n        \"NIS2\",", "    (\"ISO-23894\", \"ISO/IEC 23894\", \"2023\"),\n    (\n        \"NIS2\",")')" \
 	"does NOT enforce and is now in the enforced framework list"
 
+# Renaming the id rather than inserting a whole second row, and the reason is
+# this file's own warning about escaping rather than taste. The insert version
+# was written first and its replacement text contained `{ ..., ..., ... }`,
+# which bash BRACE-EXPANDS even inside the quoted command substitution: one
+# argument became seven, `run_case` was called with eleven, the python program
+# arrived as the needle, and the mutation applied a mangled edit. It was
+# reported as WRONG REASON and not as a pass, which is the only reason anybody
+# saw it. `@measured` 2026-08-26. A mutation here may not contain a brace pair
+# with a comma between the braces.
+#
+# The rename fires two findings and that is honest about what it is: the new id
+# is unrecorded and the old one has gone from the catalog. The needle pins the
+# branch this case exists for, so the other cannot stand in for it.
 run_case "honest-claims: a new relevance claim nobody recorded" fail \
 	"./scripts/honest-claims.sh" \
-	"$(py 'edit("crates/core/src/compliance.rs", "= &[RelevantFramework {", "= &[RelevantFramework {\n    framework_id: \"ISO-42001\",\n    name: \"x\", version: \"x\", relevance: \"x\", not_enforced: \"x\", discharged_by: \"x\",\n}, RelevantFramework {")')" \
+	"$(py 'edit("crates/core/src/compliance.rs", "framework_id: \"ISO-23894\"", "framework_id: \"ISO-42001\"")')" \
 	"claims to be relevant to"
 
 # The subject taken away. An emptied category is the shape this one actually
