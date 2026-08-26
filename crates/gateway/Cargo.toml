@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 tokenfuse-core.workspace = true
+# RFC 9449 proofs and RFC 7638 thumbprints for the MCP broker's door,
+# shared with crates/cloud rather than copied (CLAUDE.md invariant 29).
+tokenfuse-dpop.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 axum.workspace = true
@@ -38,6 +41,11 @@ tokenfuse-cluster = { path = "../cluster", optional = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The MCP door's tests mint real RFC 9449 proofs, so they exercise the same
+# verifier a client would rather than a stub of it. Both crates are already in
+# this workspace's lockfile (crates/cloud), so nothing new enters the tree.
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
 
 [features]
 cluster = ["dep:tokenfuse-cluster"]

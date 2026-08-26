@@ -5713,6 +5713,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokenfuse-core",
+ "tokenfuse-dpop",
  "tokio",
  "tokio-stream",
  "tower",
@@ -5752,18 +5753,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenfuse-dpop"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "p256",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "tokenfuse-gateway"
 version = "0.0.1"
 dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "crossterm",
  "datafusion",
  "fastembed",
  "futures",
  "http-body-util",
+ "p256",
  "ratatui",
  "reqwest",
  "serde",
@@ -5771,6 +5785,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenfuse-cluster",
  "tokenfuse-core",
+ "tokenfuse-dpop",
  "tokio",
  "tower",
  "tracing",

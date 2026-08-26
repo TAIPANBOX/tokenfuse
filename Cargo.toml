@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/gateway", "crates/cloud", "crates/tokenfuse"]
+members = ["crates/core", "crates/dpop", "crates/gateway", "crates/cloud", "crates/tokenfuse"]
 # radar is Linux/eBPF-only (its own nested workspace); excluded so the default
 # build and macOS/CI stay light. Build it explicitly on Linux — see crates/radar.
 exclude = ["crates/radar", "crates/cluster"]
@@ -13,6 +13,10 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 tokenfuse-core = { path = "crates/core" }
+# RFC 9449 proofs, RFC 7638 thumbprints and the one algorithm allowlist. Small
+# on purpose: it exists so the gateway and the cloud can share one verifier
+# without either plane depending on the other. See its own module docs.
+tokenfuse-dpop = { path = "crates/dpop" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,3 +24,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Pinned once here rather than per crate, because two crates in one process
+# verifying JWS with two versions of this is how a shared rule stops being
+# shared (CLAUDE.md invariant 29).
+jsonwebtoken = "9"
+base64 = "0.22"
+sha2 = "0.10"

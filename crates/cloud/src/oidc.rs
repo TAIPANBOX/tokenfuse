@@ -32,8 +32,8 @@
 //! 6. `aud` equals the configured audience.
 //! 7. The org claim is present and a non-empty string.
 
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -129,29 +129,18 @@ impl OidcConfig {
 
 /// The algorithms a key of this type may be used with.
 ///
-/// **The single copy of this rule in this repository**, and it is a single copy
-/// on purpose rather than tidiness. The permitted algorithms come from the
-/// KEY TYPE and never from the token header, which is written by whoever
-/// presents the token: without this an attacker takes a public RSA modulus or
-/// EC point that anybody can fetch from a JWKS, signs an HMAC using those bytes
-/// as the secret, sets `alg` to `HS256`, and the signature verifies. Symmetric
-/// and OKP keys are refused outright, which is what closes `none` as well.
+/// **Re-exported, not defined here.** The rule itself lives in
+/// [`tokenfuse_dpop::algorithms_for_key`], which is the ONE copy in this
+/// repository (CLAUDE.md invariant 29). It was inline in [`verify`] until
+/// 2026-08-26, then shared with [`crate::delegation`], and moved to its own
+/// crate the same day when the MCP credential-broker's door needed it from the
+/// OTHER plane and the gateway must not depend on this one.
 ///
-/// It was inline in [`verify`] until 2026-08-26, when
-/// [`crate::delegation`] arrived needing the same rule. A second copy is how
-/// two verifiers in one process end up disagreeing about which signatures are
-/// valid, and the agent-identity plan named this defence specifically as one
-/// that "must be preserved verbatim". One function is stronger than verbatim:
-/// verbatim is two things that agree today.
-pub(crate) fn algorithms_for_key(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Vec<Algorithm>> {
-    match &jwk.algorithm {
-        AlgorithmParameters::RSA(_) => {
-            Some(vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512])
-        }
-        AlgorithmParameters::EllipticCurve(_) => Some(vec![Algorithm::ES256, Algorithm::ES384]),
-        _ => None,
-    }
-}
+/// The name is kept here because `oidc::algorithms_for_key` is what invariant 29
+/// and `delegation` both point at, and because the rule is still exactly as
+/// load-bearing on this path: the permitted algorithms come from the KEY TYPE
+/// and never from the token header, which closes the RS256-to-HS256 downgrade.
+pub(crate) use tokenfuse_dpop::algorithms_for_key;
 
 /// A verified OIDC token: the mapped [`Principal`] plus a stable, non-secret
 /// `actor` id (`oidc:<sub or org>`) for the audit trail.

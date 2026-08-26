@@ -19,10 +19,13 @@
 //!
 //! # The one defence that is shared rather than repeated
 //!
-//! Which algorithms a key may be used with comes from [`super::oidc::algorithms_for_key`],
-//! the single copy in this repository. Two verifiers in one process with two
-//! copies of that rule is how they end up disagreeing about which signatures
-//! are valid.
+//! Which algorithms a key may be used with, how a proof is checked, and how a key
+//! is named all come from [`tokenfuse_dpop`], the single copy in this
+//! repository. Two verifiers with two copies of those rules is how they end up
+//! disagreeing about which signatures are valid, and there are now three: this
+//! one, the Cloud's OIDC bearer path, and the MCP credential-broker's door in
+//! the gateway crate. The rule sits in a crate rather than in either plane,
+//! because the gateway must not depend on the Cloud.
 //!
 //! # What it refuses, and why each is not paranoia
 //!
@@ -38,21 +41,14 @@
 //! - **A proof for another request or another moment.** A proof is for ONE
 //!   request; without that, one captured from a harmless call is replayed here.
 
-use base64::Engine as _;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 
-/// How far a proof's `iat` may be from now, either way.
-///
-/// Either way, and not only into the past: a client whose clock is fast would
-/// otherwise be refused every time, which an operator diagnoses as "DPoP is
-/// broken" rather than "our clock is wrong". Matches the Go half's window
-/// exactly; two halves of one scheme disagreeing about freshness would make a
-/// token work at one enforcement point and not at another.
-pub const PROOF_WINDOW_SECS: i64 = 60;
+/// Re-exported so this module's public surface is unchanged by the move. The
+/// window, the thumbprint and the proof verifier all live in
+/// [`tokenfuse_dpop`] now, one crate two planes can both depend on.
+pub use tokenfuse_dpop::{thumbprint, PROOF_WINDOW_SECS};
 
 /// Why a delegation was refused.
 ///
@@ -209,9 +205,15 @@ pub fn verify_delegation(
         .ok_or(Refusal::NotBound)?;
     let presented = match proof {
         None => return Err(Refusal::NoProof),
-        Some(p) => verify_proof(p, method, url, now)?,
+        // Every way a proof can fail is one refusal on the wire. `tokenfuse_dpop`
+        // keeps a finer vocabulary for an operator's log; narrating which of six
+        // checks failed to the CALLER tells an attacker whether their captured
+        // proof was still fresh and which server it was made for.
+        Some(p) => {
+            tokenfuse_dpop::verify_proof(p, method, url, now).map_err(|_| Refusal::WrongKey)?
+        }
     };
-    if presented != jkt {
+    if presented.jkt != jkt {
         return Err(Refusal::WrongKey);
     }
 
@@ -262,134 +264,10 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     Ok(chain)
 }
 
-/// Verify an RFC 9449 proof and return the thumbprint of the key that signed it.
-fn verify_proof(proof: &str, method: &str, url: &str, now: i64) -> Result<String, Refusal> {
-    let header = decode_header(proof).map_err(|_| Refusal::WrongKey)?;
-    // The `typ` is what stops a token being a proof: without it, an access
-    // token could be presented back as a proof of possession of its own key.
-    if header.typ.as_deref() != Some("dpop+jwt") {
-        return Err(Refusal::WrongKey);
-    }
-    let jwk = header.jwk.as_ref().ok_or(Refusal::WrongKey)?;
-    if carries_private_member(proof) {
-        // RFC 9449 requires the PUBLIC key. A `d` here is a client handing us
-        // its signing key, and accepting it makes this process a place private
-        // keys collect.
-        return Err(Refusal::WrongKey);
-    }
-
-    // Verified against the key the proof itself carries, which is the step the
-    // whole scheme rests on: without it, anybody staples somebody else's public
-    // key to their own proof and is accepted as its holder. The algorithm still
-    // comes from the key type, so a proof cannot downgrade itself either.
-    let algorithms = super::oidc::algorithms_for_key(jwk).ok_or(Refusal::WrongKey)?;
-    let key = DecodingKey::from_jwk(jwk).map_err(|_| Refusal::WrongKey)?;
-    let mut validation = Validation::new(algorithms[0]);
-    validation.algorithms = algorithms;
-    validation.validate_exp = false;
-    validation.validate_aud = false;
-    validation.required_spec_claims.clear();
-    let data = decode::<HashMap<String, serde_json::Value>>(proof, &key, &validation)
-        .map_err(|_| Refusal::WrongKey)?;
-    let claims = data.claims;
-
-    let htm = claims
-        .get("htm")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !htm.eq_ignore_ascii_case(method) {
-        return Err(Refusal::WrongKey);
-    }
-    let htu = claims
-        .get("htu")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if trim_query(htu) != trim_query(url) {
-        return Err(Refusal::WrongKey);
-    }
-    let iat = claims
-        .get("iat")
-        .and_then(|v| v.as_i64())
-        .ok_or(Refusal::WrongKey)?;
-    if (now - iat).abs() > PROOF_WINDOW_SECS {
-        return Err(Refusal::WrongKey);
-    }
-
-    thumbprint(jwk).ok_or(Refusal::WrongKey)
-}
-
-/// The RFC 7638 SHA-256 thumbprint, base64url without padding.
-///
-/// This is what a token is BOUND to, so what it hashes decides whether a stolen
-/// token can be replayed by a different holder. RFC 7638 hashes the REQUIRED
-/// members only, in lexicographic order, with no whitespace: `crv, kty, x, y`
-/// for EC and `e, kty, n` for RSA. `kid`, `use` and `alg` are excluded, which is
-/// why renaming a key does not change what a live token is bound to.
-pub fn thumbprint(jwk: &jsonwebtoken::jwk::Jwk) -> Option<String> {
-    use jsonwebtoken::jwk::AlgorithmParameters;
-    let canonical = match &jwk.algorithm {
-        AlgorithmParameters::EllipticCurve(ec) => format!(
-            r#"{{"crv":"{}","kty":"EC","x":"{}","y":"{}"}}"#,
-            curve_name(&ec.curve),
-            ec.x,
-            ec.y
-        ),
-        AlgorithmParameters::RSA(rsa) => {
-            format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, rsa.e, rsa.n)
-        }
-        _ => return None,
-    };
-    Some(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(canonical.as_bytes())),
-    )
-}
-
-fn curve_name(c: &jsonwebtoken::jwk::EllipticCurve) -> &'static str {
-    use jsonwebtoken::jwk::EllipticCurve as C;
-    match c {
-        C::P384 => "P-384",
-        C::P521 => "P-521",
-        _ => "P-256",
-    }
-}
-
-/// Whether a proof's embedded JWK carries anything only its holder should have.
-///
-/// Read off the RAW header rather than the parsed `Jwk`, because that type has
-/// no field for `d` and drops it in silence: a client leaking its private key
-/// would then be accepted, and the leak would be invisible.
-fn carries_private_member(proof: &str) -> bool {
-    let Some(encoded) = proof.split('.').next() else {
-        return true;
-    };
-    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) else {
-        return true;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return true;
-    };
-    let Some(jwk) = value.get("jwk").and_then(|j| j.as_object()) else {
-        return true;
-    };
-    ["d", "p", "q", "dp", "dq", "qi", "k"]
-        .iter()
-        .any(|m| jwk.contains_key(*m))
-}
-
-/// RFC 9449 section 4.3: `htu` is the request URI with query and fragment
-/// removed. Comparing them whole would refuse every proof for a URL carrying a
-/// cache-buster, which an operator diagnoses as "DPoP is broken".
-fn trim_query(u: &str) -> &str {
-    match u.find(['?', '#']) {
-        Some(i) => &u[..i],
-        None => u,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use p256::ecdsa::signature::Signer;
 
     // A fixture that mints what vouchryx mints, so these tests fail if the two
@@ -779,5 +657,34 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Refusal::Malformed);
+    }
+    /// The one behaviour this path GAINED when the proof verifier moved into
+    /// `tokenfuse_dpop` on 2026-08-26: RFC 9449 4.2 makes `jti` REQUIRED, and a
+    /// proof without one cannot be made single-use by any cache. This verifier
+    /// has no replay cache of its own yet, so the refusal is the whole of the
+    /// defence here rather than half of it.
+    ///
+    /// Safe to tighten because nothing in this repository calls
+    /// `verify_delegation` yet; there is no deployed client to break.
+    #[test]
+    fn a_proof_with_no_jti_is_refused_on_this_path_too() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let jtiless = holder.sign(
+            serde_json::json!({
+                "typ": "dpop+jwt", "alg": "ES256", "jwk": holder.jwk_value(None)
+            }),
+            serde_json::json!({"htm": "POST", "htu": URL, "iat": now}),
+        );
+        let err = verify_delegation(
+            &cfg(&issuer),
+            &token(&issuer, &holder, now, serde_json::json!({})),
+            Some(&jtiless),
+            "POST",
+            URL,
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::WrongKey);
     }
 }
