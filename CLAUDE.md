@@ -1291,6 +1291,55 @@ build)`, `cloud apns (feature build)`.
    proxy-level model. And the key is only as good as a deployment that keeps it
    away from the agent, which is true of every operator control here.
 
+29. **Two verifiers in one process share one copy of the algorithm rule.**
+   `oidc.rs` has closed the RS256-to-HS256 downgrade since it was written: the
+   permitted algorithms come from the KEY TYPE and never from the token header,
+   which is written by whoever presents the token. When `delegation.rs` arrived
+   on 2026-08-26 needing the same rule, the agent-identity plan's word was that
+   the defence "must be preserved verbatim". It is not preserved verbatim; it is
+   shared. `oidc::algorithms_for_key` is now the ONE copy, and both paths call
+   it, because verbatim is two things that agree today and a shared function is
+   two things that cannot disagree tomorrow.
+
+   **A delegation is verified with what the process already holds.** No client,
+   no URL, no timeout: the key set is local, the clock is passed in, and
+   revocation is a closure the caller owns. wardryx decides at a 3.2 ms p50 and
+   audits every decision, so putting signature verification behind a round trip
+   taxes every decision in the estate and makes the token service a hard
+   dependency of every enforcement point at once, which is the shape
+   `dependency_failed` was cut to record.
+
+   **A token carrying `cnf.jkt` and presented with no proof is REFUSED**, never
+   accepted with the binding skipped. An enforcement point that simply forgot to
+   pass a proof would otherwise report success while honouring a stolen token,
+   and that failure looks exactly like it is working. A token with NO `cnf.jkt`
+   is refused too: vouchryx binds everything it mints, so an unbound one came
+   from somewhere else or from a version that stopped binding.
+
+   **The chain is READ and not verified.** `agent-stack-go`'s invariant 5
+   applies here: root-first ordering is a property of how a chain was BUILT and
+   cannot be checked from a finished list. And the two specifications keep
+   different lists, which is the part that catches people: RFC 8693 keeps the
+   subject OUT of `act` while agent-passport puts the root INTO the chain, so
+   the mapping is `[sub] + reverse(act)` rather than a reversal. A verifier that
+   handed the actors straight to a record would write a delegation with the
+   human missing from it, and every token would still verify.
+   *(test: fourteen in `cloud::delegation`, of which
+   `a_token_presented_by_the_wrong_holder_is_refused` and
+   `a_bound_token_checked_with_no_proof_is_refused_rather_than_downgraded` are
+   the two the binding exists for, `a_delegation_verifies_and_the_chain_keeps_its_root`
+   holds the mapping, and `the_algorithm_still_comes_from_the_key_on_this_path`
+   holds the shared rule from the new side. The Go half is
+   `agent-stack-go/delegation`, TAIPANBOX/agent-stack-go#31.)*
+
+   **Where it says nothing.** Nothing in this repository CALLS it yet: no
+   gateway path checks a delegation token, so this is a verifier with no
+   consumer, exactly as vouchryx was a producer with no verifier this morning.
+   Wiring it into `/v1/messages` is a separate decision with a wire contract of
+   its own. There is no replay cache on this side either, so a captured proof
+   works as often as it is presented inside its sixty-second window; the Go half
+   has one and this does not, and that asymmetry is a gap rather than a design.
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
