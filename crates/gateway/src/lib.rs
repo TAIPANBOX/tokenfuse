@@ -13,6 +13,7 @@ pub mod embedder;
 pub mod estimate;
 pub mod events;
 pub mod firewall;
+pub mod firewallcli;
 pub mod focusexport;
 pub mod identitymap;
 pub mod keysreport;

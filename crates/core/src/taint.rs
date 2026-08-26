@@ -157,14 +157,23 @@ fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<Strin
 
 /// Map tool names to the taint labels their output carries (unknown tools →
 /// `unclassified`, which is treated as untrusted).
-pub fn labels_for_tools(names: &[String], sources: &HashMap<String, String>) -> Labels {
+///
+/// A source carries a LIST of labels, per docs/07 B.2, which has always
+/// specified `labels: [...]`. The built-in map was one label per tool until
+/// 2026-08-26, so a read that is both an upload and PII could only be
+/// described as one of them, and whichever the operator picked, the other
+/// rule could never fire.
+///
+/// A source mapped to an EMPTY list is not "no labels": it is a tool nobody
+/// classified, and it lands in `unclassified` with the unknown ones. The other
+/// reading would turn a half-finished config into a way to launder untrusted
+/// output into a trusted context.
+pub fn labels_for_tools(names: &[String], sources: &HashMap<String, Vec<String>>) -> Labels {
     let mut labels = Labels::new();
     for n in names {
         match sources.get(n) {
-            Some(label) => {
-                labels.insert(label.clone());
-            }
-            None => {
+            Some(mapped) if !mapped.is_empty() => labels.extend(mapped.iter().cloned()),
+            _ => {
                 labels.insert("unclassified".to_string());
             }
         }
@@ -224,11 +233,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn sources() -> HashMap<String, String> {
+    fn sources() -> HashMap<String, Vec<String>> {
         HashMap::from([
-            ("web_search".to_string(), "web".to_string()),
-            ("read_upload".to_string(), "file".to_string()),
-            ("vault_read".to_string(), "secrets".to_string()),
+            ("web_search".to_string(), vec!["web".to_string()]),
+            ("read_upload".to_string(), vec!["file".to_string()]),
+            ("vault_read".to_string(), vec!["secrets".to_string()]),
         ])
     }
     fn caps() -> HashMap<String, String> {
@@ -302,6 +311,15 @@ mod tests {
         });
         assert!(tool_names_in(&req).is_empty());
         assert_eq!(declared_tool_names_in(&req), vec!["wire_transfer"]);
+    }
+
+    #[test]
+    fn a_source_mapped_to_nothing_is_untrusted_not_trusted() {
+        // The config half-filled: somebody added the tool name and had not
+        // decided its labels yet. Reading that as "carries nothing" would make
+        // an empty list the way to declassify a source.
+        let src = HashMap::from([("half_done".to_string(), Vec::new())]);
+        assert!(labels_for_tools(&["half_done".to_string()], &src).contains("unclassified"));
     }
 
     #[test]

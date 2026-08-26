@@ -285,14 +285,12 @@ fn emit_taint_raised(
         // `labels_for_tools` decides it, so the two never disagree.
         let culprits: Vec<String> = history_tools
             .iter()
-            .filter(|t| {
-                let label = st
-                    .firewall
-                    .sources
-                    .get(*t)
-                    .cloned()
-                    .unwrap_or_else(|| "unclassified".to_string());
-                by_tools.contains(&label)
+            .filter(|t| match st.firewall.sources.get(*t) {
+                Some(mapped) if !mapped.is_empty() => mapped.iter().any(|l| by_tools.contains(l)),
+                // Same reading as `labels_for_tools`: unmapped, or mapped to
+                // nothing, means `unclassified`. The two must not disagree, or
+                // a record names labels no tool is credited with.
+                _ => by_tools.iter().any(|l| l == "unclassified"),
             })
             .cloned()
             .collect();

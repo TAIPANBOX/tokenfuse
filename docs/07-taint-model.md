@@ -104,3 +104,91 @@ A monotonic label-set model without partial tracking → unclassified = untruste
 - The advisory level without an MCP gateway/SDK can be bypassed; full guarantees only apply at levels 2–3.
 - Conservativeness → false positives; the release valve is the gates in B.4 and the approval flow.
 - The model is label-based, not content-based; semantic content analysis is a DLP module (Ring 3.2) — the two complement each other.
+
+---
+
+## B.11. What is actually built, 2026-08-26
+
+Everything above is the design from 2026-07-02. This section is the honest
+state of the code, so a reader can tell a specification from a shipped thing.
+`@measured 2026-08-26` unless marked otherwise: each row was read off the
+tree, and the enforcement rows were driven through a release binary with a
+live upstream.
+
+| Spec | State |
+|---|---|
+| B.2 source classification | Built, as a JSON policy file. Multiple labels per source, per the spec's `labels: [...]`. Matching is on tool NAME only: `mcp_server` and `args.path` globs are not built. |
+| B.3 P1, P2 monotonic accumulation | Built. |
+| B.3 P3 subagent inherits the parent's taint | **Not built.** Taint is keyed by `run_id` alone, so a sub-run starts clean. |
+| B.3 P4 a new run is a clean set | Built, by the same keying. |
+| B.4 sanitization gates | **None of the three is built.** A label, once acquired, is carried for the life of the run. |
+| B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. |
+| B.6 policy file | Built, in JSON rather than YAML (see below). `mode` and named `rules` with `when_any`/`deny`. `action:` is not built: every rule blocks. `require_approval` and `sanitize_gate` do not exist, so `sanitizers:` and `approval:` are unimplemented. |
+| B.7 level 1, proxy advisory | Built. |
+| B.7 level 2, SDK `POST /v1/fuse/check-tool-call` | **Not built.** No such endpoint exists. |
+| B.7 level 3, MCP gateway enforcement | **Not built** for taint. The broker has its own Wardryx gate, which is a different decision. |
+| B.9 anti-exfiltration on and undisableable | Built, in enforce mode, including against a policy file that omits it. |
+| B.9 the firewall on by default | **No.** `TOKENFUSE_FIREWALL` still defaults to `off`, so out of the box this subsystem protects nothing. Turning it on is an operator decision and stays one. |
+
+### JSON, not YAML
+
+The spec's examples are YAML and the loader takes JSON. `serde_yaml` has been
+unmaintained since 2024, and taking an abandoned parser for the configuration
+of a security control is a worse trade than asking an operator to write
+braces. It is also what this repository already does for the other artifact it
+pins, the MCP tool lock. The SHAPE is B.2/B.5/B.6's.
+
+```json
+{
+  "mode": "shadow",
+  "sources":      { "crm_lookup": ["customer_data", "pii"] },
+  "capabilities": { "wire_transfer": "financial" },
+  "rules": [
+    { "name": "no-payments-after-customer-data",
+      "when_any": ["customer_data"],
+      "deny": ["financial"] }
+  ]
+}
+```
+
+- `TOKENFUSE_FIREWALL_CONFIG=<path>` loads it. Unset, the built-in starter
+  policy applies, so nothing changes for a box that has not opted in.
+- `TOKENFUSE_FIREWALL = off | shadow | enforce` sets the mode and **wins over
+  the file's own `mode`**: turning enforcement down is what an operator does in
+  a hurry, and it should not need write access to a file.
+- A file **replaces** the built-in policy rather than merging into it, so `{}`
+  is a firewall that classifies nothing and refuses nothing. Merging would mean
+  a rule you deleted is still live.
+- **Except anti-exfiltration**, which B.9 locks on: a file that omits it gets
+  it back, first in the order, in enforce mode only.
+- A named config that cannot be read, does not parse, has an unknown mode, an
+  unnamed rule, or a misspelled key **aborts the process with exit 2** and
+  names the field. A gateway running the starter policy while its operator
+  believes their own rules are live is worse than one that is plainly off.
+
+### What it writes
+
+Three event types on the shared bus. Before 2026-08-26 there was one, and
+shadow mode wrote nothing at all.
+
+| type | band | when |
+|---|---|---|
+| `taint_raised` | `low` | a run acquired a label it did not have. Fires once per label per run, since taint is monotonic. |
+| `taint_shadow` | `medium` | the filter would have refused and did not, because the mode is shadow. The action was PERMITTED. |
+| `taint_block` | `high` | the filter refused. |
+
+Both verdict types carry the same `data`: `stage`, `mode`, `rule`, `labels`,
+`requested`, `denied`, `tools`. `denied` says a category was refused; `tools`
+says which door was tried. `taint_raised` carries `stage`, `added`,
+`from_tools`, `carrying`.
+
+### Reading it back
+
+```
+tokenfuse firewall --events <ndjson> [--run <id>] [--agent <id>] [--json]
+```
+
+Answers how runs became untrusted and from which tools, what each rule
+decided, what the agents tried to do, at which stage, and the one an operator
+runs a shadow week to get: what turning enforcement on over that window would
+have refused, across how many runs and agents, and who would notice most.
