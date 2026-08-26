@@ -4121,6 +4121,66 @@ pub(crate) mod tests {
             .contains("status board"));
     }
 
+    /// One conversation, two turns of it, with the tool block carrying the id
+    /// both wire shapes give it. Resending the history is what an agent loop
+    /// DOES: the whole conversation goes up on every turn.
+    const RESENT_HISTORY: &str = r#"{"model":"test-model","max_tokens":100,"messages":[
+        {"role":"user","content":"what does the status board say"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"toolu_01STATUS","name":"web_search","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01STATUS","content":"all green"}]}
+    ]}"#;
+
+    #[tokio::test]
+    async fn a_clearance_survives_the_history_the_next_turn_resends() {
+        // The valve did not release, and the test that "proved" it did agreed
+        // with the bug.
+        //
+        // `tool_names_in` walks the WHOLE `messages[]` array, so every request
+        // re-derives the run's labels from the whole conversation. Clear `web`
+        // on a run and the next turn of the SAME conversation still carries the
+        // `web_search` block: `from_history` re-supplies the label,
+        // `accumulate` spends the clearance, and the run is tainted again
+        // before its next action is judged.
+        //
+        // `a_human_who_reviewed_the_context_can_let_a_label_go` sends its
+        // follow-up with NO tool history at all, which is not a shape an agent
+        // loop produces. It passed against the defect.
+        let (events, _path) = recording_exporter("declassify-resend");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        let turn = || {
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "run-resend")
+                .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(RESENT_HISTORY))
+                .unwrap()
+        };
+
+        // Turn one: it read the web, so the shell it now asks for is refused.
+        assert_eq!(call(st.clone(), turn()).await.status(), StatusCode::FORBIDDEN);
+
+        // A person reads the page and says so.
+        let answer = declassify(
+            st.clone(),
+            r#"{"run_id":"run-resend","agent_id":"agent://test.local/rehearsal","labels":["web"],
+                "actor":"user://acme.example/s.dawson",
+                "reason":"read the status board myself; it is ours"}"#,
+        )
+        .await;
+        assert_eq!(answer["cleared"], serde_json::json!(["web"]));
+
+        // Turn two of the same conversation, carrying the same blocks. Nothing
+        // new arrived, so nothing spends the clearance.
+        assert_eq!(
+            call(st, turn()).await.status(),
+            StatusCode::OK,
+            "the block a human reviewed must not re-taint the run every time \
+             the conversation is resent, or the valve releases for exactly one \
+             request shape nobody sends"
+        );
+    }
+
     #[tokio::test]
     async fn a_clearance_is_spent_by_the_next_arrival_of_that_label() {
         // The human reviewed what was THERE, not what comes next. A clearance
