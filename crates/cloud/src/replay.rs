@@ -3,7 +3,7 @@
 //! `RunAgg` in `crates/cloud/src/store.rs` is an AGGREGATE only: it has no
 //! ordered per-call list. The ordered, per-call timeline for `GET
 //! /v1/replay/{run}` instead comes from the append-only agent-event NDJSON
-//! export (agent-passport SPEC.md §6, schema `taipanbox.dev/agent-event/v0.1`
+//! export (agent-passport SPEC.md §6, schema `taipanbox.dev/agent-event/v0.2`
 //! today, forward-compatible with `v0.2`) that a gateway writes via
 //! `TOKENFUSE_EVENTS_PATH` (see `tokenfuse_core::agent_event`). The control
 //! plane reads that same export (or a copy of it) from a second, independent
@@ -126,9 +126,9 @@ mod tests {
         let path = write_temp(
             "match",
             &[
-                r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.300Z","source":"tokenfuse","type":"breaker_tripped","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":2}}"#,
-                r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.100Z","source":"tokenfuse","type":"dlp_block","severity":"high","agent_id":"a1","run_id":"run-1","data":{"n":1}}"#,
-                r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.200Z","source":"tokenfuse","type":"taint_block","severity":"high","agent_id":"a1","run_id":"run-2","data":{"n":9}}"#,
+                r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.300Z","source":"tokenfuse","type":"breaker_tripped","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":2}}"#,
+                r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.100Z","source":"tokenfuse","type":"dlp_block","severity":"high","agent_id":"a1","run_id":"run-1","data":{"n":1}}"#,
+                r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.200Z","source":"tokenfuse","type":"taint_block","severity":"high","agent_id":"a1","run_id":"run-2","data":{"n":9}}"#,
             ],
         );
         let (events, malformed) = read_run_events(path.to_str().unwrap(), "run-1");

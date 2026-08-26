@@ -200,6 +200,11 @@ pub struct CallContext {
     /// [`on_behalf_of`](CallContext::on_behalf_of) from it rather than from the
     /// header. Set by [`crate::chainproof::resolve`] and by nothing else.
     pub chain_proven: bool,
+    /// What proved the chain, when something did. SPEC 5.2, and the reason it
+    /// sits here rather than being rebuilt at each emit: `chain_proven` is a
+    /// derived boolean, and a record that carries the boolean without the proof
+    /// cannot be audited back to the token.
+    pub delegation_proof: Option<tokenfuse_core::agent_event::DelegationProof>,
     /// `x-fuse-attestation-method`, forwarded to the PDP for a
     /// `deny_if_unattested` policy.
     pub attestation_method: Option<String>,
@@ -502,6 +507,7 @@ fn reason_suffix(reason: &Option<String>) -> String {
 fn emit_tool_call(
     st: &BrokerState,
     agent_id: Option<&str>,
+    chain: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     tool: &str,
     upstream: &str,
     decision: WardryxDecision,
@@ -517,7 +523,10 @@ fn emit_tool_call(
         crate::sink::now_millis(),
         agent_id,
         None,
-        None,
+        // Measured 2026-08-26: this passed `None` while the PDP one screen up
+        // was told the whole chain. The per-action audit record of a DELEGATED
+        // tool call said nothing about whose delegation it was.
+        chain,
         json!({ "tool": tool, "upstream": upstream, "decision": decision_str }),
     );
     crate::events::log_outcome(EventType::ToolCall, outcome);
@@ -642,7 +651,7 @@ async fn handle(
     // `chainproof` because the LLM proxy applies the same one, and a rule
     // written twice becomes two rules.
     let now = crate::sink::now_millis() / 1000;
-    let (on_behalf_of, chain_proven) = match crate::chainproof::resolve(
+    let (on_behalf_of, delegation_proof) = match crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(header("authorization").as_deref()),
         header(crate::mcpdoor::PROOF_HEADER).as_deref(),
@@ -658,11 +667,13 @@ async fn handle(
             tracing::warn!(reason = ?why, "mcp broker: refused a delegation token");
             return crate::proxy::unauthorized_response();
         }
-        crate::chainproof::Chain::Proven(chain) => (chain, true),
-        crate::chainproof::Chain::Claimed(chain) => (chain, false),
+        crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
+        crate::chainproof::Chain::Claimed(chain) => (chain, None),
     };
+    let chain_proven = delegation_proof.is_some();
 
     let ctx = CallContext {
+        delegation_proof,
         agent_id: header("x-fuse-agent-id"),
         upstream: header("x-fuse-mcp-upstream"),
         run_id: header("x-fuse-run-id"),
@@ -977,6 +988,17 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                     emit_tool_call(
                         st,
                         agent_id,
+                        (!ctx.on_behalf_of.is_empty()).then(|| {
+                            match ctx.delegation_proof.as_ref() {
+                                Some(pf) => tokenfuse_core::agent_event::ChainOnRecord::proven(
+                                    &ctx.on_behalf_of,
+                                    pf,
+                                ),
+                                None => tokenfuse_core::agent_event::ChainOnRecord::claimed(
+                                    &ctx.on_behalf_of,
+                                ),
+                            }
+                        }),
                         &tool,
                         &upstream_url,
                         outcome.decision,

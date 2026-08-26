@@ -196,7 +196,7 @@ fn emit_dependency_failed(
     st: &AppState,
     run_id: Option<&str>,
     agent_id: &str,
-    on_behalf_of: &[String],
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     dependency: Dependency,
     stage: DependencyStage,
     effect: DependencyEffect,
@@ -227,7 +227,7 @@ fn emit_dependency_failed_via(
     events: &crate::events::EventExporter,
     run_id: Option<&str>,
     agent_id: &str,
-    on_behalf_of: &[String],
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     dependency: Dependency,
     stage: DependencyStage,
     effect: DependencyEffect,
@@ -238,7 +238,7 @@ fn emit_dependency_failed_via(
         now_millis(),
         (!agent_id.is_empty()).then_some(agent_id),
         run_id,
-        (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+        on_behalf_of,
         dependency_failed_data(dependency, stage, effect, detail),
     );
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
@@ -261,7 +261,7 @@ fn emit_taint_raised(
     st: &AppState,
     run_id: &str,
     agent_id: &str,
-    on_behalf_of: &[String],
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     delta: &crate::state::TaintDelta,
     from_history: &Labels,
     history_tools: &[String],
@@ -307,7 +307,7 @@ fn emit_taint_raised(
             now_millis(),
             Some(agent_id),
             Some(run_id),
-            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            on_behalf_of,
             taint_raised_data(
                 TaintStage::RequestHistory,
                 &by_tools,
@@ -338,7 +338,7 @@ fn emit_taint_raised(
             now_millis(),
             Some(agent_id),
             Some(run_id),
-            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            on_behalf_of,
             taint_raised_data(
                 TaintStage::ParentRun,
                 &by_parent,
@@ -364,7 +364,7 @@ fn emit_taint_raised(
             now_millis(),
             Some(agent_id),
             Some(run_id),
-            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            on_behalf_of,
             taint_raised_data(
                 TaintStage::ToolResult,
                 &[SUSPECTED_INJECTION.to_string()],
@@ -390,7 +390,7 @@ fn emit_taint_raised(
             now_millis(),
             Some(agent_id),
             Some(run_id),
-            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            on_behalf_of,
             taint_raised_data(
                 TaintStage::RequestHeader,
                 &by_header,
@@ -409,7 +409,7 @@ fn emit_breaker_event(
     st: &AppState,
     run_id: &str,
     agent_id: &str,
-    on_behalf_of: &[String],
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     verdict: &BreakerVerdict,
     unit: &str,
 ) {
@@ -418,7 +418,7 @@ fn emit_breaker_event(
         now_millis(),
         Some(agent_id),
         Some(run_id),
-        (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+        on_behalf_of,
         serde_json::json!({
             "reason": verdict.reason.map(BreakerReason::as_wire_str),
             "budget_usd": verdict.budget_usd,
@@ -439,7 +439,7 @@ fn emit_breaker_event(
             now_millis(),
             Some(agent_id),
             Some(run_id),
-            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            on_behalf_of,
             serde_json::json!({
                 "reason": verdict.reason.map(BreakerReason::as_wire_str),
                 "policy_id": verdict.policy_id,
@@ -573,7 +573,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // a cap of three capped a number the caller chose. The rule lives in
     // `chainproof` because the MCP broker applies the same one.
     let chain_now = crate::sink::now_millis() / 1000;
-    let (on_behalf_of_chain, chain_proven) = match crate::chainproof::resolve(
+    let (on_behalf_of_chain, delegation_proof) = match crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(
             headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -591,9 +591,19 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             tracing::warn!(reason = ?why, "proxy: refused a delegation token");
             return unauthorized_response();
         }
-        crate::chainproof::Chain::Proven(chain) => (chain, true),
-        crate::chainproof::Chain::Claimed(chain) => (chain, false),
+        crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
+        crate::chainproof::Chain::Claimed(chain) => (chain, None),
     };
+    let chain_proven = delegation_proof.is_some();
+    // Built ONCE, from the resolution, and passed to every event this request
+    // writes. One local rather than a decision per emit site: sixteen sites
+    // each re-deciding whether the chain was proven is sixteen chances to
+    // record a claimed chain as a proven one.
+    let chain_on_record =
+        (!on_behalf_of_chain.is_empty()).then(|| match delegation_proof.as_ref() {
+            Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&on_behalf_of_chain, p),
+            None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&on_behalf_of_chain),
+        });
 
     // Outcome tag (P4, unit economics): captured raw for the trace, same
     // cap/ignore contract as `on_behalf_of` above. No enforcement semantics —
@@ -660,7 +670,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     now_millis(),
                     Some(&agent_id),
                     Some(&run_id),
-                    (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
+                    chain_on_record,
                     serde_json::json!({
                         "key_id": key_id,
                         "agent_id": agent_id,
@@ -757,14 +767,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &st.policy_id,
             "run killed by operator",
         );
-        emit_breaker_event(
-            &st,
-            &run_id,
-            &agent_id,
-            &on_behalf_of_chain,
-            &verdict,
-            &unit,
-        );
+        emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
         return breaker_error_response(&run_id, &verdict);
     }
 
@@ -818,7 +821,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         now_millis(),
                         Some(&agent_id),
                         Some(&run_id),
-                        (!on_behalf_of_chain.is_empty()).then_some(&on_behalf_of_chain),
+                        chain_on_record,
                         serde_json::json!({
                             "summary": summary,
                             // The resolved business unit (docs/20); null when
@@ -1024,14 +1027,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 &eval.violated.clone().unwrap_or_default(),
             );
-            emit_breaker_event(
-                &st,
-                &run_id,
-                &agent_id,
-                &on_behalf_of_chain,
-                &verdict,
-                &unit,
-            );
+            emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
             return breaker_error_response(&run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
@@ -1061,14 +1057,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 reason,
             );
-            emit_breaker_event(
-                &st,
-                &run_id,
-                &agent_id,
-                &on_behalf_of_chain,
-                &verdict,
-                &unit,
-            );
+            emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -1125,14 +1114,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st.policy_id,
                 "blocked by custom wasm policy",
             );
-            emit_breaker_event(
-                &st,
-                &run_id,
-                &agent_id,
-                &on_behalf_of_chain,
-                &verdict,
-                &unit,
-            );
+            emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
             return breaker_error_response(&run_id, &verdict);
         }
     }
@@ -1212,7 +1194,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st,
                 Some(&run_id),
                 &agent_id,
-                &on_behalf_of_chain,
+                chain_on_record,
                 Dependency::PolicyPlane,
                 DependencyStage::Decide,
                 effect,
@@ -1330,14 +1312,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         &st.policy_id,
                         &format!("unit '{}' monthly budget exceeded", exceeded.unit),
                     );
-                    emit_breaker_event(
-                        &st,
-                        &run_id,
-                        &agent_id,
-                        &on_behalf_of_chain,
-                        &verdict,
-                        &unit,
-                    );
+                    emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
                     return breaker_error_response(&run_id, &verdict);
                 }
             },
@@ -1393,14 +1368,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &st.policy_id,
                     &reason,
                 );
-                emit_breaker_event(
-                    &st,
-                    &run_id,
-                    &agent_id,
-                    &on_behalf_of_chain,
-                    &verdict,
-                    &unit,
-                );
+                emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
                 return breaker_error_response(&run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
@@ -1445,14 +1413,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         "run '{run_id}' has no ledger reservation; denying instead of bypassing the budget check"
                     ),
                 );
-                emit_breaker_event(
-                    &st,
-                    &run_id,
-                    &agent_id,
-                    &on_behalf_of_chain,
-                    &verdict,
-                    &unit,
-                );
+                emit_breaker_event(&st, &run_id, &agent_id, chain_on_record, &verdict, &unit);
                 return breaker_error_response(&run_id, &verdict);
             }
         },
@@ -1546,7 +1507,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &st,
             &run_id,
             &agent_id,
-            &on_behalf_of_chain,
+            chain_on_record,
             &delta,
             &from_history,
             &history_tools,
@@ -1581,7 +1542,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &st,
                 Some(&run_id),
                 &agent_id,
-                &on_behalf_of_chain,
+                chain_on_record,
                 Dependency::Provider,
                 DependencyStage::Send,
                 DependencyEffect::CallFailed,
@@ -1602,7 +1563,10 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             agent_id,
             parent_run_id,
             on_behalf_of,
-            on_behalf_of_chain,
+            chain_on_record
+                .map(|c| c.chain.to_vec())
+                .unwrap_or_default(),
+            chain_on_record.and_then(|c| c.proof.cloned()),
             outcome_tag,
             key_id,
             unit,
@@ -1626,7 +1590,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &agent_id,
             &parent_run_id,
             &on_behalf_of,
-            &on_behalf_of_chain,
+            chain_on_record,
             &outcome_tag,
             &key_id,
             &unit,
@@ -1687,7 +1651,11 @@ fn stream_managed(
     // The chain as a list, beside the joined `on_behalf_of` above. The joined
     // form is a trace column and the list is what the event envelope takes
     // (SPEC.md §5), and this function now emits, so it needs both.
-    on_behalf_of_chain: Vec<String>,
+    // The RESOLVED chain and its proof, owned because the stream outlives this
+    // call. No raw chain beside it: the trace's `on_behalf_of` column is the
+    // flat header string one line up, and this list only ever fed events.
+    record_chain: Vec<String>,
+    record_proof: Option<tokenfuse_core::agent_event::DelegationProof>,
     outcome: String,
     key_id: String,
     unit: String,
@@ -1707,6 +1675,11 @@ fn stream_managed(
     let ev_events = std::sync::Arc::clone(&st.events);
     let ev_agent_id = agent_id.clone();
     let ev_run_id = run_id.clone();
+    // Owned, because the stream outlives this function and `ChainOnRecord`
+    // borrows. Rebuilt inside the task from these two rather than passed in, so
+    // there is still exactly one place that decides proven from claimed.
+    let ev_chain = record_chain;
+    let ev_proof = record_proof;
     // Whether the estimate may be charged when the stream reports no usage,
     // the same rule PR #167 established for `buffered_managed` one screen
     // down. A refusal is a refusal whether the client asked to stream it or
@@ -1755,7 +1728,10 @@ fn stream_managed(
                         &ev_events,
                         Some(ev_run_id.as_str()),
                         &ev_agent_id,
-                        &on_behalf_of_chain,
+                        (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
+                            Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
+                            None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
+                        }),
                         Dependency::Provider,
                         DependencyStage::Stream,
                         DependencyEffect::CallFailed,
@@ -1825,7 +1801,11 @@ async fn buffered_managed(
     agent_id: &str,
     parent_run_id: &str,
     on_behalf_of: &str,
-    on_behalf_of_chain: &[String],
+    // The RESOLVED chain and what proved it, for the record. There is no raw
+    // chain parameter beside it: the trace's `on_behalf_of` column is the flat
+    // header string one line up, and this list only ever fed events. Keeping
+    // both would have been a second way to put a claim on a security record.
+    chain_on_record: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     outcome_tag: &str,
     key_id: &str,
     unit: &str,
@@ -1857,7 +1837,7 @@ async fn buffered_managed(
                 st,
                 Some(&reservation.run_id),
                 agent_id,
-                on_behalf_of_chain,
+                chain_on_record,
                 Dependency::Provider,
                 DependencyStage::ResponseBody,
                 DependencyEffect::CallFailed,
@@ -2000,7 +1980,7 @@ async fn buffered_managed(
                     now_millis(),
                     Some(agent_id),
                     Some(&reservation.run_id),
-                    (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
+                    chain_on_record,
                     taint_verdict_data(
                         TaintStage::ModelToolCall,
                         TaintEnforcement::Enforce,
@@ -2022,7 +2002,7 @@ async fn buffered_managed(
                 now_millis(),
                 Some(agent_id),
                 Some(&reservation.run_id),
-                (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
+                chain_on_record,
                 taint_verdict_data(
                     TaintStage::ModelToolCall,
                     TaintEnforcement::Shadow,
@@ -4866,6 +4846,7 @@ pub(crate) mod tests {
             String::new(),
             String::new(),
             Vec::new(),
+            None,
             String::new(),
             String::new(),
             String::new(),

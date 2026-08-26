@@ -77,10 +77,10 @@ async fn replay_returns_ordered_events_scoped_to_the_run_with_incidents_and_audi
         "ok",
         &[
             // run-1, out of ts order in the file: replay must sort ascending.
-            r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.300Z","source":"tokenfuse","type":"breaker_tripped","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":2}}"#,
-            r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.100Z","source":"tokenfuse","type":"budget_exhausted","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":1}}"#,
+            r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.300Z","source":"tokenfuse","type":"breaker_tripped","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":2}}"#,
+            r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.100Z","source":"tokenfuse","type":"budget_exhausted","severity":"critical","agent_id":"a1","run_id":"run-1","data":{"n":1}}"#,
             // A different run: must not leak into run-1's replay.
-            r#"{"schema":"taipanbox.dev/agent-event/v0.1","ts":"2026-07-09T03:12:44.200Z","source":"tokenfuse","type":"taint_block","severity":"high","agent_id":"a1","run_id":"run-2","data":{}}"#,
+            r#"{"schema":"taipanbox.dev/agent-event/v0.2","ts":"2026-07-09T03:12:44.200Z","source":"tokenfuse","type":"taint_block","severity":"high","agent_id":"a1","run_id":"run-2","data":{}}"#,
             // A malformed line: must be skipped and counted, not crash the read.
             "{{{not valid json",
         ],

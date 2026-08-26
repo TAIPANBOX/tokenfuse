@@ -70,8 +70,16 @@ pub type ChainProof = Option<Arc<Proving>>;
 pub enum Chain {
     /// Nobody proved anything. The header chain stands, as a claim.
     Claimed(Vec<String>),
-    /// A token verified, and this is what it said.
-    Proven(Vec<String>),
+    /// A token verified, and this is what it said, plus what proved it.
+    ///
+    /// The proof travels with the chain rather than beside it, because a chain
+    /// that arrives without its proof cannot be told apart from one nobody
+    /// proved. SPEC 5.2 reads an absent proof as NOT proven, so the two must
+    /// not be separable by a call site that forgets one of them.
+    Proven {
+        chain: Vec<String>,
+        proof: tokenfuse_core::agent_event::DelegationProof,
+    },
     /// Refused, and the wire must not distinguish these from each other.
     Refused(ChainRefusal),
 }
@@ -143,7 +151,20 @@ pub fn resolve(
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
         return Chain::Refused(ChainRefusal::Contradicted);
     }
-    Chain::Proven(verified.chain)
+    // `iss` comes from the CONFIG rather than from the token, because
+    // `verify_delegation` matched the token's `iss` against it exactly. Reading
+    // it back off the token would record what the token claimed; reading it off
+    // the config records what this deployment verified against.
+    let proof = tokenfuse_core::agent_event::DelegationProof {
+        jti: verified.jti,
+        jkt: verified.jkt,
+        iss: proving.cfg.issuer.clone(),
+        exp: verified.expires_at,
+    };
+    Chain::Proven {
+        chain: verified.chain,
+        proof,
+    }
 }
 
 /// Order AND membership. Compared both ways on purpose: an equal-length
@@ -289,5 +310,91 @@ mod tests {
                 "agent://c".to_string()
             ]
         ));
+    }
+
+    /// SPEC 5.2 in one test: the proof travels with the chain, it names the
+    /// token that proved it, and its `iss` is the one this deployment VERIFIED
+    /// against rather than the one the token claimed.
+    ///
+    /// Red before `Chain::Proven` grew the proof: the variant carried a bare
+    /// `Vec<String>` and the four values `verify_delegation` had just checked
+    /// were dropped on the floor, so no record could ever say a chain had been
+    /// proven at all.
+    #[test]
+    fn a_proven_chain_carries_what_proved_it() {
+        use tokenfuse_delegation::testing::{cfg, proof_at, token, Key};
+        let (issuer, holder) = (Key::new(), Key::new());
+        let now = 1_800_000_000;
+        let origin = "https://tokenfuse.acme.example";
+        let cfg = cfg(&issuer);
+        let issuer_configured = cfg.issuer.clone();
+        let proving: ChainProof = Some(Arc::new(Proving {
+            cfg,
+            origin: origin.to_string(),
+        }));
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "jti": "tok-live-1",
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{origin}/v1/messages"),
+            "p-1",
+        );
+
+        let resolved = resolve(
+            &proving,
+            Some(&tok),
+            Some(&dpop),
+            "POST",
+            "/v1/messages",
+            &[],
+            now,
+            |_, _, _| false,
+        );
+
+        let Chain::Proven { chain, proof } = resolved else {
+            panic!("a good token did not resolve as proven: {resolved:?}");
+        };
+        assert_eq!(chain, vec!["user://acme/alice", "agent://acme/triage"]);
+        assert_eq!(proof.jti, "tok-live-1", "an auditor cannot find the token");
+        assert_eq!(proof.exp, now + 300, "the proof carries no freshness");
+        assert!(!proof.jkt.is_empty(), "who was holding it is unrecorded");
+        assert_eq!(
+            proof.iss, issuer_configured,
+            "the issuer on the record must be the one this deployment verified \
+             against, not the one the token claimed to be from"
+        );
+    }
+
+    /// The other half, and the one that keeps the first honest: a chain nobody
+    /// proved carries nothing to say it was proven. SPEC 5.2 reads an absent
+    /// proof as NOT proven, so this is what stops a claim reading as a proof.
+    #[test]
+    fn a_claimed_chain_carries_no_proof() {
+        let declared = vec![
+            "user://acme/alice".to_string(),
+            "agent://acme/triage".to_string(),
+        ];
+        let resolved = resolve(
+            &None,
+            Some("a.token.nobody.configured.an.issuer.for"),
+            None,
+            "POST",
+            "/v1/messages",
+            &declared,
+            1_800_000_000,
+            |_, _, _| false,
+        );
+        assert_eq!(resolved, Chain::Claimed(declared));
     }
 }

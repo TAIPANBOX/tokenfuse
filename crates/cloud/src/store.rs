@@ -5683,7 +5683,7 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 1, "exactly one fanout_explosion event");
         let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.1");
+        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.2");
         assert_eq!(v["source"], "tokenfuse");
         assert_eq!(v["type"], "fanout_explosion");
         assert_eq!(v["severity"], "high");
