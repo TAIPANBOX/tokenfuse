@@ -475,8 +475,20 @@ async fn mcp_broker() {
     if chain_proof.is_some() {
         tracing::info!("delegation door: ON, chains reaching the PDP are verified here");
     }
+    // The revocation list, if one is named. The first fetch happens here and
+    // must succeed: a door holding no list refuses every delegated call under
+    // the default fail mode, and doing that while the log says the door is on
+    // is the failure this exits rather than enters.
+    let broker_client = reqwest::Client::new();
+    let revocations = tokenfuse_gateway::revocations::from_env(
+        &broker_client,
+        chain_proof.is_some(),
+        tokenfuse_gateway::sink::now_millis() / 1000,
+    )
+    .await;
     let state = Arc::new(BrokerState {
         chain_proof,
+        revocations,
         upstream: upstream.clone(),
         named_upstreams,
         vault,
@@ -488,7 +500,7 @@ async fn mcp_broker() {
         keys,
         clients,
         require_proof,
-        client: reqwest::Client::new(),
+        client: broker_client,
         events,
         // docs/07 B.7 level 3. Off unless an operator names the gateway whose
         // firewall should judge: the broker is a separate process invocation
@@ -806,6 +818,10 @@ async fn serve() {
     tracing::info!(?cache_mode, "semantic cache");
 
     // Agent firewall: TOKENFUSE_FIREWALL = off | shadow | enforce (default off).
+    //
+    // process-local: the broker never sees a prompt. It brokers `tools/call`
+    // and asks this gateway's firewall about a call through
+    // TOKENFUSE_MCP_TAINT_GATEWAY rather than holding taint state of its own.
     let firewall = tokenfuse_gateway::firewall::from_env();
     tracing::info!(mode = ?firewall.mode, "agent firewall");
     state = state.with_firewall(Arc::new(firewall));
@@ -853,6 +869,9 @@ async fn serve() {
     // table otherwise). Picks the cheapest model that still meets a task's
     // required quality tier before the request is priced and forwarded --
     // see router.rs for the full contract.
+    //
+    // process-local: the broker forwards MCP messages and picks no model, so
+    // there is no task class to route and nothing cheaper to route it to.
     let router = tokenfuse_gateway::router::Router::from_env();
     tracing::info!(mode = ?router.mode, "model router");
     state = state.with_router(Arc::new(router));
@@ -879,6 +898,25 @@ async fn serve() {
     let wardryx = tokenfuse_gateway::wardryx::Wardryx::from_env();
     tracing::info!(mode = ?wardryx.mode, "wardryx enforcement hook");
     state = state.with_wardryx(Arc::new(wardryx));
+
+    // The delegation door, and the revocation list behind it. The same two
+    // calls `mcp_broker` makes, because this process runs the other door and
+    // `chainproof::resolve` at proxy.rs reads exactly the same config. Measured
+    // 2026-08-26: it was configured in the broker and nowhere else, so every
+    // chain reaching the PDP from the LLM proxy was a claim while the code at
+    // the door read as though it were verified. `scripts/both-processes-
+    // configure-the-same-doors.sh` is what now says so.
+    let chain_proof = tokenfuse_gateway::chainproof::from_env();
+    if chain_proof.is_some() {
+        tracing::info!("delegation door: ON, chains reaching the PDP are verified here");
+    }
+    let revocations = tokenfuse_gateway::revocations::from_env(
+        &reqwest::Client::new(),
+        chain_proof.is_some(),
+        tokenfuse_gateway::sink::now_millis() / 1000,
+    )
+    .await;
+    state = state.with_chain_proof(chain_proof, revocations);
 
     // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
     // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.

@@ -120,6 +120,7 @@ fn broker_state(
         // No delegation issuer: every chain is a claim, as in every
         // deployment that configures none.
         chain_proof: None,
+        revocations: None,
         upstream,
         named_upstreams,
         vault,
@@ -154,6 +155,7 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         // No delegation issuer: every chain is a claim, as in every
         // deployment that configures none.
         chain_proof: None,
+        revocations: None,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -954,6 +956,7 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         // No delegation issuer: every chain is a claim, as in every
         // deployment that configures none.
         chain_proof: None,
+        revocations: None,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -1269,6 +1272,7 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         // No delegation issuer: every chain is a claim, as in every
         // deployment that configures none.
         chain_proof: None,
+        revocations: None,
         upstream,
         named_upstreams: Default::default(),
         vault,

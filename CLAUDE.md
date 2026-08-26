@@ -1931,3 +1931,44 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     second started the bracket scan at the first `[` after the name, which is the
     one in the TYPE, so it read the type annotation and parsed no id at all, and
     the NEGATIVE control is what caught that one.)*
+
+34. **One binary runs two processes, and a door added to one of them is not a
+    door.** `serve` (the LLM proxy) and `mcp_broker` (the MCP door) are separate
+    process invocations that read their own environment and build their own
+    state. Their enforcement call sites read identically, which is exactly why
+    the difference is invisible: what is missing is a line nobody wrote, a
+    thousand lines from the code it silently disables.
+
+    Measured 2026-08-26: `chainproof::from_env()` was called in `mcp_broker` and
+    nowhere else. `AppState::new` set `chain_proof: None` and nothing after it
+    assigned one, so `chainproof::resolve` at proxy.rs ran against `None` on
+    every request and returned `Chain::Claimed` every time. The delegation door
+    shipped that morning with tests at both call sites and was switched on at
+    one. The same wave then wired `revocations` into the broker only, which is
+    the same defect committed twice in one day.
+
+    **The subjects are DISCOVERED, never listed.** Every `<name>::from_env(`
+    call in `main.rs` is found by reading the source, and which process it sits
+    in comes from the line numbers. A gate carrying its own list of what to
+    check is itself unchecked, and it goes stale silently at the exact moment
+    somebody adds the thing it existed to notice. This is the fourth defect of
+    that shape found on 2026-08-26 and the rule now has a name of its own.
+
+    **A one-sided door is allowed and has to say why, at the call site.** The
+    broker has no prompt firewall and no model router, because it never sees a
+    prompt and picks no model. Those carry a `process-local:` reason within six
+    lines above the call, so the exception travels with the code that needs it
+    rather than sitting in a script nobody opens. A marker with nothing after
+    it, or written in a form the gate does not read, is not an exception.
+    *(gate: `scripts/both-processes-configure-the-same-doors.sh`, four cases in
+    `gates-have-teeth.sh`: the one-sided door, an exception written in a form
+    nothing reads, the discovery finding nothing at all, and a legitimate
+    one-sided door it must not fire on. Scenarios:
+    `features/the-delegation-door.feature`, seven, each bound to a named test.
+    Doc: `docs/25-the-delegation-door.md`)*
+
+    **And the harness that holds the gates now holds itself.** `gates-have-teeth.sh`
+    was a hand-written list of cases with nothing checking that every gate on
+    disk had one, which is the same shape one level up: a new gate with no case
+    looks exactly like a gate with nothing to catch. Every `scripts/*.sh` must
+    now be named by at least one case.

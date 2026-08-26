@@ -147,6 +147,10 @@ pub struct BrokerState {
     /// The delegation issuer's keys, or `None` when no issuer is configured,
     /// which is the default and leaves every chain a claim.
     pub chain_proof: crate::chainproof::ChainProof,
+    /// The revocation list this door polls, or `None` when it polls none.
+    /// `None` is the check being off, which is what both doors did for the
+    /// whole life of the cache: they passed a literal `false`.
+    pub revocations: crate::revocations::Feed,
     pub client: reqwest::Client,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
     /// default; see `crate::events::from_env`. Emits `mcp_drift` (rug-pull) and
@@ -637,6 +641,7 @@ async fn handle(
     // Who this caller acts FOR, and whether anybody proved it. The rule is in
     // `chainproof` because the LLM proxy applies the same one, and a rule
     // written twice becomes two rules.
+    let now = crate::sink::now_millis() / 1000;
     let (on_behalf_of, chain_proven) = match crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(header("authorization").as_deref()),
@@ -644,8 +649,8 @@ async fn handle(
         "POST",
         uri.path(),
         &declared,
-        crate::sink::now_millis() / 1000,
-        |_, _, _| false,
+        now,
+        crate::revocations::hook(&st.revocations, now),
     ) {
         crate::chainproof::Chain::Refused(why) => {
             // The same 401 the door gives, for the same reason: which refusal

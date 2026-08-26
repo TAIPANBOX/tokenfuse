@@ -75,6 +75,9 @@ pub struct AppState {
     /// chain reaching the PDP is a claim, which is what this gateway sent for
     /// its whole life before 2026-08-26. What changed is that it now SAYS so.
     pub chain_proof: crate::chainproof::ChainProof,
+    /// The revocation list this gateway polls, or `None` when it polls none.
+    /// See `crate::revocations`.
+    pub revocations: crate::revocations::Feed,
     history: History,
     killed: Killed,
     /// Run taint, shared so the MCP broker judges against the same state.
@@ -501,6 +504,8 @@ impl AppState {
             // No delegation issuer until `main` configures one, so every chain
             // is a claim and every existing deployment is unchanged.
             chain_proof: None,
+            // No poller until `serve` configures one, so nothing is refused.
+            revocations: None,
             // Wrap the in-process ledger as the default backend. `with_ledger`
             // swaps in a raft-replicated backend for HA (cluster feature).
             ledger: Arc::new(LocalLedger(ledger)),
@@ -626,6 +631,20 @@ impl AppState {
     /// Attach the Wardryx enforcement hook. Chainable.
     pub fn with_wardryx(mut self, wardryx: Arc<Wardryx>) -> Self {
         self.wardryx = wardryx;
+        self
+    }
+
+    /// The delegation issuer's keys, and the revocation list they are checked
+    /// against. Taken together in one call on purpose: a door with an issuer
+    /// and no feed still verifies, but a feed with no issuer verifies nothing
+    /// and is the configuration `revocations::wanted` refuses at startup.
+    pub fn with_chain_proof(
+        mut self,
+        chain_proof: crate::chainproof::ChainProof,
+        revocations: crate::revocations::Feed,
+    ) -> Self {
+        self.chain_proof = chain_proof;
+        self.revocations = revocations;
         self
     }
 

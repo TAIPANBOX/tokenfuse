@@ -572,6 +572,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // stopped being harmless: wardryx had gained rules that read this chain, so
     // a cap of three capped a number the caller chose. The rule lives in
     // `chainproof` because the MCP broker applies the same one.
+    let chain_now = crate::sink::now_millis() / 1000;
     let (on_behalf_of_chain, chain_proven) = match crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(
@@ -583,8 +584,8 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         "POST",
         "/v1/messages",
         &declared_chain,
-        crate::sink::now_millis() / 1000,
-        |_, _, _| false,
+        chain_now,
+        crate::revocations::hook(&st.revocations, chain_now),
     ) {
         crate::chainproof::Chain::Refused(why) => {
             tracing::warn!(reason = ?why, "proxy: refused a delegation token");
