@@ -28,10 +28,48 @@ pub enum FirewallMode {
 
 /// A rule: if the context carries any `when_any` label and the action needs any
 /// `deny` capability, the action is blocked.
+///
+/// `name` is not decoration. Before 2026-08-26 a block produced one prose
+/// sentence, so an operator could read a single refusal and could not answer
+/// "which rule costs us the most false positives" over a week of them: two
+/// refusals by different rules were indistinguishable strings. The name is
+/// what makes the record groupable, which is what makes shadow mode worth
+/// running.
 #[derive(Debug, Clone)]
 pub struct TaintRule {
+    pub name: String,
     pub when_any: Vec<String>,
     pub deny: Vec<String>,
+}
+
+/// A refusal, in the parts a consumer can count rather than only display.
+///
+/// [`reason`](TaintVerdict::reason) still renders the sentence the wire
+/// contract has always carried (the `x-fuse-taint` header and the 403 body),
+/// so nothing an existing client parses changes; the fields exist alongside
+/// it, for the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintVerdict {
+    /// The rule that fired, by name.
+    pub rule: String,
+    /// Everything the run was carrying at that moment, sorted.
+    pub labels: Vec<String>,
+    /// Every capability the action wanted, sorted.
+    pub requested: Vec<String>,
+    /// The subset of `requested` this rule refuses, sorted.
+    pub denied: Vec<String>,
+}
+
+impl TaintVerdict {
+    /// The human sentence. Unchanged from before the struct existed, on
+    /// purpose: it is on the wire in two places.
+    pub fn reason(&self) -> String {
+        format!(
+            "tainted context [{}] denies capability [{}]",
+            self.labels.join(", "),
+            self.denied.join(", ")
+        )
+    }
 }
 
 /// Extract tool-call names from a request (message history) or a response,
@@ -119,14 +157,23 @@ fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<Strin
 
 /// Map tool names to the taint labels their output carries (unknown tools →
 /// `unclassified`, which is treated as untrusted).
-pub fn labels_for_tools(names: &[String], sources: &HashMap<String, String>) -> Labels {
+///
+/// A source carries a LIST of labels, per docs/07 B.2, which has always
+/// specified `labels: [...]`. The built-in map was one label per tool until
+/// 2026-08-26, so a read that is both an upload and PII could only be
+/// described as one of them, and whichever the operator picked, the other
+/// rule could never fire.
+///
+/// A source mapped to an EMPTY list is not "no labels": it is a tool nobody
+/// classified, and it lands in `unclassified` with the unknown ones. The other
+/// reading would turn a half-finished config into a way to launder untrusted
+/// output into a trusted context.
+pub fn labels_for_tools(names: &[String], sources: &HashMap<String, Vec<String>>) -> Labels {
     let mut labels = Labels::new();
     for n in names {
         match sources.get(n) {
-            Some(label) => {
-                labels.insert(label.clone());
-            }
-            None => {
+            Some(mapped) if !mapped.is_empty() => labels.extend(mapped.iter().cloned()),
+            _ => {
                 labels.insert("unclassified".to_string());
             }
         }
@@ -146,32 +193,36 @@ pub fn capabilities_for_tools(
         .collect()
 }
 
-/// Evaluate the rules; return the reason for the first block, if any.
+/// Evaluate the rules; return the first block, if any.
+///
+/// First match wins, and the order is the config's order. Deliberately not
+/// "collect every rule that would fire": a refusal is one decision, and a
+/// record naming three rules would invite a reader to think three things went
+/// wrong. The rules that did not get a turn are recoverable from the labels
+/// and capabilities the verdict carries.
 pub fn evaluate(
     labels: &Labels,
     requested: &BTreeSet<String>,
     rules: &[TaintRule],
-) -> Option<String> {
+) -> Option<TaintVerdict> {
     for rule in rules {
         let label_hit = rule.when_any.iter().any(|l| labels.contains(l));
         if !label_hit {
             continue;
         }
-        let denied: Vec<&String> = rule
+        let denied: Vec<String> = rule
             .deny
             .iter()
             .filter(|c| requested.contains(*c))
+            .cloned()
             .collect();
         if !denied.is_empty() {
-            return Some(format!(
-                "tainted context [{}] denies capability [{}]",
-                labels.iter().cloned().collect::<Vec<_>>().join(", "),
-                denied
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            return Some(TaintVerdict {
+                rule: rule.name.clone(),
+                labels: labels.iter().cloned().collect(),
+                requested: requested.iter().cloned().collect(),
+                denied,
+            });
         }
     }
     None
@@ -182,11 +233,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn sources() -> HashMap<String, String> {
+    fn sources() -> HashMap<String, Vec<String>> {
         HashMap::from([
-            ("web_search".to_string(), "web".to_string()),
-            ("read_upload".to_string(), "file".to_string()),
-            ("vault_read".to_string(), "secrets".to_string()),
+            ("web_search".to_string(), vec!["web".to_string()]),
+            ("read_upload".to_string(), vec!["file".to_string()]),
+            ("vault_read".to_string(), vec!["secrets".to_string()]),
         ])
     }
     fn caps() -> HashMap<String, String> {
@@ -198,10 +249,12 @@ mod tests {
     fn rules() -> Vec<TaintRule> {
         vec![
             TaintRule {
+                name: "no-exec-after-untrusted".into(),
                 when_any: vec!["web".into(), "file".into(), "unclassified".into()],
                 deny: vec!["exec".into(), "network_egress".into()],
             },
             TaintRule {
+                name: "anti-exfiltration".into(),
                 when_any: vec!["secrets".into()],
                 deny: vec!["network_egress".into()],
             },
@@ -261,6 +314,15 @@ mod tests {
     }
 
     #[test]
+    fn a_source_mapped_to_nothing_is_untrusted_not_trusted() {
+        // The config half-filled: somebody added the tool name and had not
+        // decided its labels yet. Reading that as "carries nothing" would make
+        // an empty list the way to declassify a source.
+        let src = HashMap::from([("half_done".to_string(), Vec::new())]);
+        assert!(labels_for_tools(&["half_done".to_string()], &src).contains("unclassified"));
+    }
+
+    #[test]
     fn unknown_tool_is_unclassified() {
         let l = labels_for_tools(&["mystery".to_string()], &sources());
         assert!(l.contains("unclassified"));
@@ -278,6 +340,49 @@ mod tests {
         let labels = Labels::new(); // nothing untrusted touched
         let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
         assert!(evaluate(&labels, &requested, &rules()).is_none());
+    }
+
+    #[test]
+    fn the_verdict_names_the_rule_that_fired() {
+        // Red against the pre-2026-08-26 module, which returned a String: a
+        // consumer could print a refusal and could not group a week of them.
+        let labels = labels_for_tools(&["web_search".to_string()], &sources());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let v = evaluate(&labels, &requested, &rules()).expect("web + exec is refused");
+        assert_eq!(v.rule, "no-exec-after-untrusted");
+        assert_eq!(v.labels, vec!["web"]);
+        assert_eq!(v.denied, vec!["exec"]);
+    }
+
+    #[test]
+    fn the_sentence_on_the_wire_is_unchanged() {
+        // Two wire surfaces carry it: the `x-fuse-taint` response header and
+        // the 403 body's `reason`. Structuring the verdict must not reword
+        // what an existing client already parses.
+        let labels = labels_for_tools(&["web_search".to_string()], &sources());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let v = evaluate(&labels, &requested, &rules()).unwrap();
+        assert_eq!(v.reason(), "tainted context [web] denies capability [exec]");
+    }
+
+    #[test]
+    fn only_the_denied_capabilities_are_named_not_every_requested_one() {
+        // An action asking for two things where the rule refuses one: the
+        // record must not read as though both were the problem, or an
+        // operator loosens the wrong rule.
+        let labels = labels_for_tools(&["vault_read".to_string()], &sources());
+        let requested = capabilities_for_tools(
+            &["run_shell".to_string(), "send_email".to_string()],
+            &caps(),
+        );
+        let v = evaluate(&labels, &requested, &rules()).unwrap();
+        assert_eq!(v.rule, "anti-exfiltration");
+        assert_eq!(v.requested, vec!["exec", "network_egress"]);
+        assert_eq!(
+            v.denied,
+            vec!["network_egress"],
+            "exec is not this rule's business"
+        );
     }
 
     #[test]

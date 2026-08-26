@@ -995,6 +995,70 @@ build)`, `cloud apns (feature build)`.
    pinned by `the_dependency_failed_event_carries_the_high_band`, and the
    published artifact by `scripts/constants.sh`, which builds.)*
 
+25. **A filter that refuses something says so on the bus, and a filter that
+   DECLINES to refuse says so too.** The agent firewall could refuse from the
+   day Ring 3.1 shipped and, until 2026-08-26, could not tell anyone afterwards
+   what it had refused, to whom, or under which rule. Its shadow mode was
+   worse than quiet: a would-block set the `x-fuse-taint` RESPONSE header and
+   emitted nothing at all, so the only party ever informed was the agent that
+   had just been talked into the action. docs/07 B.9 makes shadow the
+   documented on-ramp, and a week of it produced no material to decide with.
+
+   Three types now, and the split is the invariant. `taint_raised` (`low`)
+   records a run acquiring a label, which is the beginning of a story whose end
+   `taint_block` (`high`) was already recording: taint accumulates monotonically
+   across a whole run, so without the acquisition an operator reads "blocked,
+   context was [web, file]" with no way at all to learn where the web came
+   from. `taint_shadow` (`medium`) is the would-block, and its band is the
+   judgement: not `low`, because in shadow the dangerous action is PERMITTED
+   and the client executes it, so this is a thing that happened rather than a
+   refusal that worked; not `high`, because a shadow week paging at
+   `taint_block`'s band pages an operator during precisely the week they were
+   told to watch quietly, and an operator who mutes the sender in week one
+   never reaches week two.
+
+   **The record has to be countable, not only readable.** A block used to carry
+   one prose sentence, so two refusals under different rules were
+   indistinguishable strings. Rules now have names, `evaluate` returns a
+   `TaintVerdict`, and every verdict event carries `stage`, `mode`, `rule`,
+   `labels`, `requested`, `denied` and `tools`. `denied` says a category was
+   refused; `tools` says which door was tried, and that is the member that
+   makes a row actionable.
+
+   **The floor a config file cannot remove.** docs/07 B.9 locks anti-exfiltration
+   on in enforce mode, and a policy file is exactly how somebody would take it
+   away, by accident far more often than on purpose: a file REPLACES the
+   built-in policy, so writing one to add a rule of your own silently drops the
+   other two. `from_json` and `from_env` both put it back, first in the order,
+   and only in enforce: shadow is the mode an operator runs to learn what THEIR
+   policy does, and a rule they did not write would make that week's numbers
+   describe somebody else's.
+
+   **A policy that cannot be read stops the box.** A gateway running the
+   starter policy while its operator believes their own rules are live is worse
+   than one that is plainly off, so a named `TOKENFUSE_FIREWALL_CONFIG` that is
+   missing, malformed, or has a misspelled key exits 2 with the field named.
+   *(test: `a_shadow_would_block_is_recorded`,
+   `the_record_says_which_rule_fired_at_which_stage_and_over_what` and
+   `becoming_tainted_is_recorded_not_only_being_blocked` in `gateway::proxy`,
+   each verified red against the unfixed code, verbatim `left: 0 right: 1` for
+   the first and third and `left: Null right: "model_tool_call"` for the
+   second; `anti_exfiltration_cannot_be_dropped_in_enforce_mode` and
+   `shadow_mode_does_not_get_the_floor_forced_on_it` in `gateway::firewall`;
+   `a_config_that_cannot_be_read_stops_the_box_rather_than_falling_back` and
+   `the_error_says_what_to_fix` for the abort, whose exit code was also
+   measured live (`@measured` three bad configs against the release binary,
+   2026-08-26, `EXIT=2` each with the field named). The bands are pinned by
+   `scripts/constants.sh`, which builds the published artifact from the Rust
+   source.)*
+
+   **Where it says nothing.** This is docs/07 B.7 level 1, advisory: the
+   gateway sees `tool_use` in the model's answer and the CLIENT executes the
+   tool, so a caller that ignores a 403 is not stopped by any of this. Levels 2
+   and 3 (`POST /v1/fuse/check-tool-call`, the MCP gateway) remain unbuilt, and
+   nothing here changes that. Nor does anything here look at the TEXT of a
+   prompt: the model is label-based by design, and B.10 is unamended.
+
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.

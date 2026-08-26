@@ -62,6 +62,14 @@
       {
         "severity": "high",
         "type": "dependency_failed"
+      },
+      {
+        "severity": "medium",
+        "type": "taint_shadow"
+      },
+      {
+        "severity": "low",
+        "type": "taint_raised"
       }
     ]
   },

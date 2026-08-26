@@ -221,6 +221,19 @@ async fn main() {
         //     `[--to <rfc3339>] [--json]` — unit economics per `X-Fuse-Outcome`
         // tag (P4): runs, total settled cost, mean cost per run, total calls,
         // and blocked calls, using the LAST non-empty tag per run.
+        // `tokenfuse firewall --events <ndjson> [--run <id>] [--agent <id>]`
+        //     `[--json]` — what the agent firewall did: how runs became
+        // untrusted and from which tools, which rule decided what, which tools
+        // the models asked for, at which stage, and what turning enforce on
+        // over that window would have refused.
+        Some("firewall") => {
+            let rest: Vec<String> = args.collect();
+            let fargs = tokenfuse_gateway::firewallcli::parse_args(&rest);
+            if let Err(e) = tokenfuse_gateway::firewallcli::run(&fargs).await {
+                eprintln!("firewall error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("outcomes") => {
             let rest: Vec<String> = args.collect();
             let oargs = tokenfuse_gateway::outcomescli::parse_args(&rest);
