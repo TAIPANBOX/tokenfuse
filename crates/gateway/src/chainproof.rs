@@ -201,10 +201,13 @@ pub fn proven_actor(chain: &Chain) -> Option<&str> {
     let Chain::Proven { chain, .. } = chain else {
         return None;
     };
-    chain
-        .last()
-        .map(String::as_str)
-        .filter(|leaf| leaf.starts_with("agent://"))
+    chain.last().map(|leaf| leaf.trim()).filter(|leaf| {
+        // The scheme AND something after it. `starts_with("agent://")`
+        // alone accepts the bare scheme, which is not an identity and would
+        // put `agent://` in the subject of a security record.
+        leaf.strip_prefix("agent://")
+            .is_some_and(|rest| !rest.is_empty())
+    })
 }
 
 /// Order AND membership. Compared both ways on purpose: an equal-length
@@ -503,5 +506,27 @@ mod tests {
             },
         };
         assert_eq!(proven_actor(&proven), Some("agent://Acme/Bot"));
+    }
+
+    /// The bare scheme is not an identity. `starts_with` alone accepted it and
+    /// would have put `agent://` in the subject of a security record.
+    #[test]
+    fn the_bare_scheme_is_not_an_agent() {
+        for leaf in ["agent://", "agent:// ", "  "] {
+            let proven = Chain::Proven {
+                chain: vec![leaf.to_string()],
+                proof: tokenfuse_core::agent_event::DelegationProof {
+                    jti: "t".into(),
+                    jkt: "k".into(),
+                    iss: "i".into(),
+                    exp: 0,
+                },
+            };
+            assert_eq!(
+                proven_actor(&proven),
+                None,
+                "{leaf:?} was taken as an agent"
+            );
+        }
     }
 }

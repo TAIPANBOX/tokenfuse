@@ -87,3 +87,18 @@ Feature: One binary, two processes, and the same door in both
     Given a chain nobody proved
     When the record is written
     Then no proof sits beside it, because an absent proof means not proven
+
+  # @test:the_brokers_tool_call_record_carries_the_chain_and_what_proved_it
+  Scenario: The MCP door's audit record says whose delegation it was
+    Given a `tools/call` whose delegation token proves it acts for an agent
+    And no `x-fuse-agent-id` header
+    When the call is brokered
+    Then a tool_call record is written, carrying the chain and the token that
+      proved it, and its decision says the gate could not judge it rather than
+      saying a policy allowed it
+
+  # @test:the_bare_scheme_is_not_an_agent
+  Scenario: A scheme with nothing after it is not an identity
+    Given a proven chain whose last name is the bare `agent://`
+    When a record looks for whom to file under
+    Then it finds nobody, because a scheme is not an identity

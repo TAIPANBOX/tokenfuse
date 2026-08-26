@@ -135,6 +135,24 @@ This governs the RECORD only. The identity map, the unit a call is billed to,
 the strict-mode binding check and what the PDP is told all still read the
 header.
 
+### What the record still cannot tell you
+
+Two limits, stated because an auditor reading the JSON above would otherwise
+assume otherwise.
+
+**The proof vouches for the CHAIN, not for the subject.** When a caller sends
+`x-fuse-agent-id` AND presents a token whose chain names a different agent, the
+header still wins for `agent_id` and the proof sits beside it vouching only for
+`on_behalf_of`. Nothing compares the two. A caller can therefore present one
+agent's token and name itself another.
+
+**A store may erase the proof.** trailryx partitions a record into typed
+metadata it keeps and a payload plane a per-event key destroys, and until it
+gives `delegation_proof` a typed home the proof rides in the erasable half while
+the chain does not. SPEC 5.2 reads a chain with no proof beside it as not proven,
+so an erasure there downgrades a proven chain silently. `estate-gates` C12 holds
+this as a cross-repo finding.
+
 ## 6. Not proven
 
 - **Nothing has run a live poll against vouchryx.** The poller, the startup

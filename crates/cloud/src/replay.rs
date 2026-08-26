@@ -4,7 +4,7 @@
 //! ordered per-call list. The ordered, per-call timeline for `GET
 //! /v1/replay/{run}` instead comes from the append-only agent-event NDJSON
 //! export (agent-passport SPEC.md §6, schema `taipanbox.dev/agent-event/v0.2`
-//! today, forward-compatible with `v0.2`) that a gateway writes via
+//! today, and readers here accept v0.1 too) that a gateway writes via
 //! `TOKENFUSE_EVENTS_PATH` (see `tokenfuse_core::agent_event`). The control
 //! plane reads that same export (or a copy of it) from a second, independent
 //! path, `TOKENFUSE_CLOUD_REPLAY_EVENTS`, and never writes to it.

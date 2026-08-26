@@ -820,7 +820,14 @@ impl EventType {
 ///
 /// `data` is the plane a record store's per-event key ERASES. trailryx
 /// partitions every member into typed metadata (kept) or payload (erasable),
-/// and `on_behalf_of` is typed. A proof in `data` would mean that a routine
+/// and `on_behalf_of` is typed.
+///
+/// The honest limit, measured 2026-08-26 and not fixed here: trailryx
+/// partitions by ITS OWN list of consumed members, not by envelope-versus-data,
+/// and that list does not yet name `delegation_proof`. So today the proof rides
+/// in its erasable half anyway. The envelope is still the right plane, because
+/// it is where a store CAN keep it and `data` is where a store must not; the
+/// change trailryx needs is held as a cross-repo finding by estate-gates C12. A proof in `data` would mean that a routine
 /// payload erasure leaves the chain standing and destroys the fact that it was
 /// verified, and SPEC 5.2 reads a chain with no proof beside it as NOT proven.
 /// The erasure would silently downgrade a proven chain to an unproven one,
@@ -1632,7 +1639,7 @@ mod tests {
     /// implementations pin the SAME canonical bytes and hashes, so the three
     /// cannot drift silently. Pinned at the JSON-value level because the
     /// vector events carry other services' source/schema values, which
-    /// `AgentEvent` (source "tokenfuse", schema v0.1) deliberately cannot
+    /// `AgentEvent` (source "tokenfuse", schema v0.2) deliberately cannot
     /// represent - the canonicalize+hash pipeline is what must agree.
     #[test]
     fn cross_language_chain_vectors_pin() {
