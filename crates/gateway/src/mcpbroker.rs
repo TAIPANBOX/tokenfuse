@@ -32,17 +32,22 @@
 //! `_SECRET_SCOPES` (which agent ids and/or tool names may resolve which
 //! secret, off unless set, see [`BrokerState::vault`] and
 //! `docs/23-mcp-broker-v2.md` section 4), `_REQUIRE_SECRET_SCOPES` (refuse to
-//! start if any configured secret has no scope rule, off unless set), plus
-//! the shared `TOKENFUSE_WARDRYX_*` for the policy gate.
+//! start if any configured secret has no scope rule, off unless set),
+//! `_CLIENT_IDS` + `_PROOF_URL` + `_REQUIRE_PROOF` (the proof door, off unless
+//! set, see [`crate::mcpdoor`] and `docs/24-mcp-proof-door.md`), plus the
+//! shared `TOKENFUSE_WARDRYX_*` for the policy gate.
 //! Run: `tokenfuse mcp-broker` (or `mcp-broker --stdio`).
 //!
 //! **What is on the door.** Whatever reaches this port can have handles
-//! resolved against the whole vault, so two things guard it: the loopback
-//! default and optional client credentials ([`BrokerState::keys`], off
-//! unless configured). Widening the bind with credentials configured warns
-//! (see [`bind_exposure_warning`]); widening it with NOTHING configured
-//! REFUSES to start (see [`refuse_open_bind`]), unless the operator opts in
-//! with `TOKENFUSE_MCP_ALLOW_OPEN_BIND`.
+//! resolved against the whole vault, so three things guard it: the loopback
+//! default, optional client credentials ([`BrokerState::keys`], a shared
+//! secret, off unless configured), and optional proof of possession
+//! ([`BrokerState::clients`], CIMD client ids plus RFC 9449 proofs, off unless
+//! configured, and the stronger of the two). Widening the bind with something
+//! configured warns (see [`bind_exposure_warning`]); widening it with NOTHING
+//! configured REFUSES to start (see [`refuse_open_bind`], which asks
+//! [`something_on_the_door`]), unless the operator opts in with
+//! `TOKENFUSE_MCP_ALLOW_OPEN_BIND`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -123,6 +128,22 @@ pub struct BrokerState {
     /// every JSON-RPC call must present a known credential in
     /// [`CLIENT_KEY_HEADER`].
     pub keys: ClientKeys,
+    /// The other door: CIMD clients admitted by RFC 9449 proof of possession
+    /// rather than by a shared secret (`TOKENFUSE_MCP_CLIENT_IDS`,
+    /// `TOKENFUSE_MCP_PROOF_URL`). Disabled by default, so a broker that
+    /// configures nothing here behaves exactly as it always has.
+    ///
+    /// It sits BESIDE [`keys`](Self::keys) rather than replacing it, and the
+    /// composition rule is [`crate::mcpdoor::admit`]'s: a caller that presents a
+    /// proof is judged by it, a caller that presents none falls through to the
+    /// bearer door while one is configured, and
+    /// [`require_proof`](Self::require_proof) is how an operator ends that.
+    pub clients: crate::mcpdoor::ClientRegistry,
+    /// `TOKENFUSE_MCP_REQUIRE_PROOF`: a bearer credential alone stops being
+    /// enough. Off by default; a captured `x-fuse-key` header keeps working
+    /// until an operator says otherwise, which is what makes the proof door an
+    /// addition rather than a breaking change.
+    pub require_proof: bool,
     pub client: reqwest::Client,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled by
     /// default; see `crate::events::from_env`. Emits `mcp_drift` (rug-pull) and
@@ -237,10 +258,26 @@ pub fn bind_exposure_warning(addr: &str, auth_configured: bool) -> Option<String
     if !auth_configured {
         w.push_str(
             " No client credentials are configured either, so this port authenticates \
-             nobody: set TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require one.",
+             nobody: set TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require one, or \
+             TOKENFUSE_MCP_CLIENT_IDS to require a proof of possession instead, which is \
+             the stronger of the two.",
         );
     }
     Some(w)
+}
+
+/// Whether anything at all guards the broker's door.
+///
+/// One named answer, used for both [`bind_exposure_warning`] and
+/// [`refuse_open_bind`], because "is there anything on the door" is now a
+/// question about TWO variables and a call site that remembered only the older
+/// one would refuse to start a deployment whose door carries the STRONGER
+/// credential. That is not hypothetical: `auth_configured` meant
+/// `TOKENFUSE_MCP_KEYS` alone until the proof door existed, and every reader of
+/// those two functions had that in their head.
+#[must_use]
+pub fn something_on_the_door(keys: &ClientKeys, clients: &crate::mcpdoor::ClientRegistry) -> bool {
+    keys.enabled() || clients.enabled()
 }
 
 /// Whether `addr` ("host:port") names a loopback interface, for the startup
@@ -302,11 +339,13 @@ pub fn refuse_open_bind(
     }
     Some(format!(
         "refusing to start: the MCP credential-broker is bound to {addr}, which is not \
-         loopback, and no client credentials are configured (TOKENFUSE_MCP_KEYS is unset). \
-         Anything that reaches this address could have {{{{secret:NAME}}}} handles resolved \
-         against the whole vault and forwarded to a configured upstream. Set \
-         TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require a credential, bind to loopback \
-         instead (TOKENFUSE_MCP_ADDR=127.0.0.1:4200, the default), or, if you have \
+         loopback, and nothing is configured on its door (neither TOKENFUSE_MCP_KEYS nor \
+         TOKENFUSE_MCP_CLIENT_IDS is set). Anything that reaches this address could have \
+         {{{{secret:NAME}}}} handles resolved against the whole vault and forwarded to a \
+         configured upstream. Set TOKENFUSE_MCP_CLIENT_IDS to require a proof of possession \
+         (the stronger of the two: nothing an operator holds is worth stealing), or \
+         TOKENFUSE_MCP_KEYS=\"secret:key_id,...\" to require a shared credential, or bind to \
+         loopback instead (TOKENFUSE_MCP_ADDR=127.0.0.1:4200, the default), or, if you have \
          deliberately decided to run the broker open, set TOKENFUSE_MCP_ALLOW_OPEN_BIND=1."
     ))
 }
@@ -365,6 +404,63 @@ pub fn refuse_unscoped_secrets(vault: &SecretVault, require_scopes: bool) -> Opt
         vault.len(),
         unscoped.join(", ")
     ))
+}
+
+/// The startup warning for a broker with BOTH doors configured and the bearer
+/// one still open, or `None` when there is nothing to say.
+///
+/// Adding a CIMD client while `TOKENFUSE_MCP_KEYS` is still set is the migration
+/// state, and it is a real posture: it is how an operator moves the first client
+/// across without breaking the rest. What it must not be is silent. An operator
+/// who has just configured proof of possession will otherwise believe the shared
+/// secret is gone, and a captured `x-fuse-key` header opens this broker for as
+/// long as they believe it.
+///
+/// Fires whenever it applies rather than above some threshold, for the reason
+/// [`unscoped_secrets_warning`] gives about its own default: the weaker
+/// behaviour is the one that has to announce itself.
+pub fn bearer_door_still_open_warning(
+    keys_configured: bool,
+    clients_configured: bool,
+    require_proof: bool,
+) -> Option<String> {
+    if !(keys_configured && clients_configured) || require_proof {
+        return None;
+    }
+    Some(
+        "mcp broker: both doors are configured and the bearer one is still open. A call with a \
+         known TOKENFUSE_MCP_KEYS credential and no DPoP proof is still served, so a captured \
+         x-fuse-key header remains a way in. That is the migration state, not the destination: \
+         set TOKENFUSE_MCP_REQUIRE_PROOF=1 once every client presents a proof, and the shared \
+         secret stops being enough."
+            .to_string(),
+    )
+}
+
+/// Whether the broker must refuse to start because it has been told to require a
+/// proof and given no clients that could produce one.
+///
+/// `TOKENFUSE_MCP_REQUIRE_PROOF=1` with no `TOKENFUSE_MCP_CLIENT_IDS` is a door
+/// nothing can ever open: every call is refused, including the operator's own
+/// health checks against the JSON-RPC routes. Refusing at startup says so at the
+/// moment somebody can fix it, rather than at the first refused call in
+/// production. Same posture as [`refuse_unscoped_secrets`] and
+/// [`refuse_open_bind`]: the process does not run in a configuration that cannot
+/// do what it was asked.
+pub fn refuse_proof_with_no_clients(
+    clients_configured: bool,
+    require_proof: bool,
+) -> Option<String> {
+    if !require_proof || clients_configured {
+        return None;
+    }
+    Some(
+        "refusing to start: TOKENFUSE_MCP_REQUIRE_PROOF is set and TOKENFUSE_MCP_CLIENT_IDS \
+         configures no client, so no call could ever present a proof this broker would accept \
+         and every request would be refused. Configure the clients that may reach this broker, \
+         or unset TOKENFUSE_MCP_REQUIRE_PROOF to keep the bearer door open."
+            .to_string(),
+    )
 }
 
 /// JSON-RPC error response with the same id as the request.
@@ -477,6 +573,7 @@ const SECRET_SCOPE_RPC_CODE: i64 = -32008;
 /// attestation / approval headers the Wardryx gate forwards to the PDP.
 async fn handle(
     State(st): State<Arc<BrokerState>>,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
@@ -495,14 +592,30 @@ async fn handle(
     // `TOKENFUSE_MAX_BODY_BYTES` limit `app` puts on every route; the check
     // lives here rather than in a `route_layer` so a future route reaching
     // this handler cannot be added without it.
-    if st.keys.enabled() {
-        let presented = header(CLIENT_KEY_HEADER).unwrap_or_default();
-        if st.keys.resolve(presented.trim()).is_none() {
-            // Never echo the presented value, not even truncated, and never
-            // distinguish "missing" from "wrong": both are the same answer.
-            tracing::warn!("mcp broker: refused a call with no usable client credential");
+    match crate::mcpdoor::admit(
+        crate::mcpdoor::Door {
+            keys: &st.keys,
+            clients: &st.clients,
+            require_proof: st.require_proof,
+        },
+        header(CLIENT_KEY_HEADER).as_deref(),
+        header(crate::mcpdoor::PROOF_HEADER).as_deref(),
+        uri.path(),
+        crate::sink::now_millis() / 1000,
+    ) {
+        crate::mcpdoor::Admission::Refused(why) => {
+            // Never echo what was presented, not even truncated, and never let
+            // the WIRE distinguish these: every one is the same 401. The reason
+            // is for the operator's log, where an attacker is not reading, and
+            // it matters there because "your proof was replayed" and "no client
+            // published that key" send somebody to different places.
+            tracing::warn!(reason = ?why, "mcp broker: refused a call at the door");
             return crate::proxy::unauthorized_response();
         }
+        crate::mcpdoor::Admission::Proof(client_id) => {
+            tracing::debug!(%client_id, "mcp broker: admitted by proof of possession");
+        }
+        crate::mcpdoor::Admission::Bearer(_) | crate::mcpdoor::Admission::Open => {}
     }
     let ctx = CallContext {
         agent_id: header("x-fuse-agent-id"),
@@ -1406,6 +1519,128 @@ mod tests {
             refuse_unscoped_secrets(&vault, true),
             None,
             "every secret scoped must start cleanly even under strict mode"
+        );
+    }
+    // --- the proof door's own startup messages -------------------------
+    //
+    // Invariant 30 (CLAUDE.md). The proof door is a SECOND way to put
+    // something on the broker's door, so the two conditions that already
+    // decide whether the process may start have to know about it, and the
+    // migration state where both doors are open must not be silent.
+
+    /// A proof door is something on the door. Before it existed,
+    /// `auth_configured` meant `TOKENFUSE_MCP_KEYS` and nothing else, so an
+    /// operator who had configured only the STRONGER credential would have been
+    /// refused to start for want of the weaker one.
+    #[test]
+    fn a_proof_door_counts_as_something_on_the_door() {
+        let no_keys = ClientKeys::default();
+        let keys = ClientKeys::from_spec("sk-broker-abc:tool-user").expect("a usable spec");
+        let no_clients = crate::mcpdoor::ClientRegistry::default();
+        // A real document, so this asserts the case that is actually new rather
+        // than only the two that already worked.
+        let clients = crate::mcpdoor::ClientRegistry::from_spec(
+            r#"[{"client_id":"https://release-bot.acme.example/c.json","jwks":{"keys":[
+                 {"kty":"EC","crv":"P-256",
+                  "x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                  "y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}}]"#,
+            "https://mcp.acme.example",
+        )
+        .expect("a usable client spec");
+        assert!(!something_on_the_door(&no_keys, &no_clients));
+        assert!(something_on_the_door(&keys, &no_clients));
+        assert!(
+            something_on_the_door(&no_keys, &clients),
+            "a proof door with no shared secret beside it is still a door"
+        );
+        assert_eq!(
+            refuse_open_bind(
+                "0.0.0.0:4200",
+                something_on_the_door(&no_keys, &clients),
+                false
+            ),
+            None,
+            "an operator who configured only the stronger credential must not be refused \
+             to start for want of the weaker one"
+        );
+        // And the refusal follows from it, which is the only reason it matters.
+        assert!(refuse_open_bind(
+            "0.0.0.0:4200",
+            something_on_the_door(&no_keys, &no_clients),
+            false
+        )
+        .is_some());
+        assert_eq!(
+            refuse_open_bind(
+                "0.0.0.0:4200",
+                something_on_the_door(&keys, &no_clients),
+                false
+            ),
+            None
+        );
+    }
+
+    /// Both refusal and warning have to name BOTH ways out, or an operator who
+    /// intends to use the proof door is told to configure a shared secret they
+    /// have deliberately chosen not to have.
+    #[test]
+    fn the_open_bind_messages_name_both_ways_to_put_something_on_the_door() {
+        let refusal = refuse_open_bind("0.0.0.0:4200", false, false).expect("refuses");
+        assert!(refusal.contains("TOKENFUSE_MCP_KEYS"), "{refusal:?}");
+        assert!(refusal.contains("TOKENFUSE_MCP_CLIENT_IDS"), "{refusal:?}");
+        let warning = bind_exposure_warning("0.0.0.0:4200", false).expect("warns");
+        assert!(warning.contains("TOKENFUSE_MCP_KEYS"), "{warning:?}");
+        assert!(warning.contains("TOKENFUSE_MCP_CLIENT_IDS"), "{warning:?}");
+    }
+
+    /// With both doors configured, a captured `x-fuse-key` header still opens
+    /// this broker. That is the migration state and it is a real posture; what
+    /// it must not be is silent, because an operator who has just added a proof
+    /// door will otherwise believe the bearer one is gone.
+    #[test]
+    fn both_doors_configured_says_out_loud_that_the_bearer_one_is_still_open() {
+        let w = bearer_door_still_open_warning(true, true, false)
+            .expect("both doors open must be said out loud");
+        assert!(w.contains("TOKENFUSE_MCP_REQUIRE_PROOF"), "{w:?}");
+    }
+
+    #[test]
+    fn one_door_alone_or_a_closed_bearer_door_warns_about_nothing() {
+        for (keys, clients, require_proof) in [
+            (true, false, false),  // bearer only: the world before this existed
+            (false, true, false),  // proof only: nothing weaker is open
+            (false, false, false), // nothing configured at all
+            (true, true, true),    // both configured, bearer closed by the switch
+        ] {
+            assert_eq!(
+                bearer_door_still_open_warning(keys, clients, require_proof),
+                None,
+                "keys={keys} clients={clients} require_proof={require_proof}"
+            );
+        }
+    }
+
+    /// `TOKENFUSE_MCP_REQUIRE_PROOF=1` with no client documents configured is a
+    /// broker nothing can ever get into. Refusing to start says so at the
+    /// moment the operator can fix it, rather than at the first refused call.
+    #[test]
+    fn requiring_a_proof_with_no_clients_configured_refuses_to_start() {
+        let refusal =
+            refuse_proof_with_no_clients(false, true).expect("a door nobody can open must refuse");
+        assert!(refusal.contains("TOKENFUSE_MCP_CLIENT_IDS"), "{refusal:?}");
+        assert!(
+            refusal.contains("TOKENFUSE_MCP_REQUIRE_PROOF"),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn requiring_a_proof_with_clients_configured_starts_cleanly() {
+        assert_eq!(refuse_proof_with_no_clients(true, true), None);
+        assert_eq!(
+            refuse_proof_with_no_clients(false, false),
+            None,
+            "the default asks for nothing and refuses nothing"
         );
     }
 }

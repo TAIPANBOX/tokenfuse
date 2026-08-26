@@ -1291,15 +1291,43 @@ build)`, `cloud apns (feature build)`.
    proxy-level model. And the key is only as good as a deployment that keeps it
    away from the agent, which is true of every operator control here.
 
-29. **Two verifiers in one process share one copy of the algorithm rule.**
+29. **Every verifier in this workspace shares one copy of the algorithm rule.**
    `oidc.rs` has closed the RS256-to-HS256 downgrade since it was written: the
    permitted algorithms come from the KEY TYPE and never from the token header,
    which is written by whoever presents the token. When `delegation.rs` arrived
    on 2026-08-26 needing the same rule, the agent-identity plan's word was that
    the defence "must be preserved verbatim". It is not preserved verbatim; it is
-   shared. `oidc::algorithms_for_key` is now the ONE copy, and both paths call
-   it, because verbatim is two things that agree today and a shared function is
-   two things that cannot disagree tomorrow.
+   shared, because verbatim is two things that agree today and a shared function
+   is two things that cannot disagree tomorrow.
+
+   **The one copy is `tokenfuse_dpop::algorithms_for_key`**, and it moved there
+   the same day, when the MCP broker's door (invariant 30) became a third caller
+   in the OTHER crate. `oidc` re-exports it under its old name, so
+   `oidc::algorithms_for_key` still resolves and `delegation` still calls that
+   path. Its address is the only thing that changed; a crate was the only place
+   left that all three could reach, because the gateway must not depend on the
+   Cloud and `tokenfuse-core` must not grow a JWS library (invariant 1).
+
+   **On the PROOF path this rule is defence in depth, not the only barrier, and
+   that is measured rather than assumed.** `@measured` 2026-08-26, by planting
+   the mutant and by a throwaway probe against `tokenfuse-dpop`: replacing
+   `algorithms_for_key` with `header.alg` inside `verify_proof` changed no test
+   in the workspace, because every route through it is already closed. A
+   symmetric key is refused earlier, by the private-member check, since an `oct`
+   JWK carries `k`. An RSA or EC key presented with an HMAC algorithm is refused
+   by `jsonwebtoken` 9 itself, whose own key-family check answers
+   `InvalidAlgorithm`. And `thumbprint` refuses anything that is neither RSA nor
+   EC at the end.
+
+   It stays, for two reasons that are not "it might help". It does not depend on
+   a library's internal check, which is a thing a dependency bump can change
+   without saying so. And on the TOKEN paths it IS the barrier: there the key
+   comes from a configured JWKS by `kid`, `thumbprint` is never consulted, and
+   nothing else refuses an `oct` entry in an operator's own key set, which is
+   also what closes `none`. `the_algorithm_still_comes_from_the_key_on_this_path`
+   and `the_algorithm_comes_from_the_key_and_never_from_the_header` are what
+   hold it, and neither can go red for the proof path, which is the honest
+   limit.
 
    **A delegation is verified with what the process already holds.** No client,
    no URL, no timeout: the key set is local, the clock is passed in, and
@@ -1339,6 +1367,129 @@ build)`, `cloud apns (feature build)`.
    its own. There is no replay cache on this side either, so a captured proof
    works as often as it is presented inside its sixty-second window; the Go half
    has one and this does not, and that asymmetry is a gap rather than a design.
+
+30. **A door worth guarding is not guarded by a password.** Invariant 20 closed
+   who may reach the broker's port. Invariant 23 closed which secret they may
+   pull once inside. The credential ON the door stayed `TOKENFUSE_MCP_KEYS`, a
+   shared secret in a header, which sits in a deployment manifest, an
+   environment variable, a shell history, a CI log, and in every request on the
+   wire, and which is the whole of the identity for whoever captures it.
+
+   `TOKENFUSE_MCP_CLIENT_IDS` is the other door: CIMD client metadata documents
+   (`draft-ietf-oauth-client-id-metadata-document`), each published by a client
+   at its own https `client_id` URL and naming that client's public keys, plus
+   an RFC 9449 proof of possession on every call. Off unless configured, so a
+   deployment that sets none of it is byte for byte unchanged.
+
+   **The identity comes from the key that signed the proof, never from anything
+   the caller asserts.** That is invariant 15's rule one door over, and it also
+   makes "claims client A, signs with client B's key" unrepresentable rather
+   than merely checked. Two clients publishing one key is refused at
+   configuration time, where it is one error message, rather than at request
+   time, where it would be a coin toss.
+
+   **This broker never dereferences a `client_id`, and that is the decision
+   rather than an omission.** On the request path a fetch would make this door's
+   availability somebody else's website, per call, to a host chosen by the party
+   being authenticated; invariant 29 already refused the same shape one plane
+   over for the same reason. At startup it would buy one deploy step, cost a
+   boot-time dependency on a third party, and still need a restart to see a
+   rotated key. So the fetch is a `curl` in the operator's deploy. The cost is
+   named rather than hidden: this process cannot enforce CIMD's self-consistency
+   rule that a document was served from the URL it claims, because it did not do
+   the retrieving.
+
+   **Single use is not optional HERE, whatever it is elsewhere.** `htm` and
+   `htu` pin a proof to one method and one URL, which is most of DPoP's
+   per-request value on an API with many endpoints and nearly none on this one:
+   every JSON-RPC method arrives as a POST to the same path. Without a replay
+   cache a proof captured from a harmless `tools/list` is a valid credential for
+   `tools/call` for the rest of the window. The cache keeps two generations of
+   two windows each, because `iat` is accepted a window either side of now and
+   so the longest interval over which one proof can be presented twice and be
+   fresh both times is two windows; rotating every window would leave a
+   shortfall that is a replay that works. At its cap it REFUSES rather than
+   forgetting, and only a caller whose proof already verified against a
+   configured key ever reaches it, so filling it is something an admitted client
+   can do and a stranger cannot.
+
+   **`htu` is compared against `TOKENFUSE_MCP_PROOF_URL` plus the path this
+   server routed, never a `Host` header.** A caller who supplies the host can
+   make `htu` agree with anything, which turns the check into decoration. The
+   variable is therefore required whenever clients are configured.
+
+   **The composition of the two doors is the part with teeth.** A caller that
+   presents a proof is judged BY it: a broken proof is a refusal and never a
+   fall-back, even when the same call carries a good bearer credential, or an
+   attacker with a stolen `x-fuse-key` strips the header and is back in the old
+   world. A caller that presents NO proof falls through to the bearer door while
+   one is configured, which is what makes this an addition rather than a
+   breaking change, and that migration state is announced at startup
+   (`bearer_door_still_open_warning`) with the variable that ends it
+   (`TOKENFUSE_MCP_REQUIRE_PROOF`). Requiring a proof with no clients configured
+   refuses to start, being a door nothing can open.
+
+   Set-but-unusable refuses to start rather than reading as "off", the same
+   conclusion `TOKENFUSE_MCP_KEYS` and `TOKENFUSE_MCP_SECRET_SCOPES` both
+   reached. And "is there anything on the door" is now one named question
+   (`something_on_the_door`), asked once, so the refusal and the warning cannot
+   answer it differently and an operator who configured only the STRONGER
+   credential is not refused for want of the weaker one.
+   *(scenarios: `features/mcp-proof-door.feature`, thirteen, each bound to a
+   named test. Test: twenty in `tests/mcp_door.rs`, of which
+   `a_replayed_proof_is_refused_though_it_verifies_perfectly` is the one this is
+   worth having for on a single-URL endpoint,
+   `a_broken_proof_is_never_downgraded_to_the_bearer_door` holds the composition
+   rule, and `two_proofs_from_one_client_are_both_admitted` is its negative
+   control, since a door that refused every second call would pass the replay
+   test. Six in `gateway::mcpbroker` for the startup conditions. Three in
+   `tests/mcp_broker.rs` over the live HTTP path asserting on what reached the
+   upstream, including
+   `a_captured_proof_replayed_at_the_live_door_reaches_nothing_the_second_time`.
+   Sixteen in `tokenfuse-dpop` for the verifier and the cache. All were run
+   against the unfixed tree first: `mcpdoor` did not exist, so the suite failed
+   to compile, verbatim ``could not find `mcpdoor` in `tokenfuse_gateway` ``.
+
+   Ten mutants were planted in the PRODUCT code on 2026-08-26, nine caught and
+   one not, each named with the test that caught it: the key that signed a proof
+   never looked up (`a_proof_from_a_key_no_client_published_is_refused`); the
+   replay answer computed and discarded
+   (`a_replayed_proof_is_refused_though_it_verifies_perfectly` and the live
+   one); `require_proof` ignored
+   (`require_proof_closes_the_bearer_door_without_removing_the_keys`); a broken
+   proof falling back to the bearer door
+   (`a_broken_proof_is_never_downgraded_to_the_bearer_door`, plus three more);
+   `htu` not compared (`a_proof_for_another_path_or_another_moment_is_refused`,
+   and the same-named tests in `tokenfuse-dpop` and `cloud::delegation`); an
+   `http` client id accepted
+   (`an_http_client_id_is_refused_rather_than_quietly_accepted`); the cache
+   forgetting at its cap rather than refusing
+   (`a_full_cache_refuses_rather_than_forgetting_something_it_promised`); the
+   private-member check dropped
+   (`a_client_leaking_its_private_key_is_refused_rather_than_helped`, both
+   crates); and `something_on_the_door` back to keys alone
+   (`a_proof_door_counts_as_something_on_the_door`).
+
+   **The tenth survived, and it is recorded rather than quietly fixed**: taking
+   the algorithm from the proof header instead of the key type changed no test
+   in the workspace. It is an equivalent mutant on this path and that was
+   established by measurement, not by argument. See invariant 29.)*
+
+   **Where it says nothing.** It does not authenticate the agent to the upstream
+   MCP server: the broker forwards with whatever the vault injects and the
+   upstream sees the broker, with nothing signed on the outbound leg. It is not
+   a delegation check and says nothing about whom the caller acts for; that is
+   invariant 29's verifier, which no request path here calls yet. It does not
+   narrow which secret may be pulled, which is invariant 23. It does nothing
+   against a compromised client, since a private key an attacker holds is as
+   good as a bearer token they hold; what it removes is the value of anything
+   captured in flight or found at rest. The replay cache is per PROCESS, so two
+   brokers behind a load balancer each remember their own. stdio is untouched,
+   having no header channel. There is no agent-event for a refusal at this door,
+   matching the bearer door exactly. And the shared `401` body names
+   `x-fuse-key` even on a deployment that configures only the proof door,
+   because it is the gateway's own `unauthorized_response` and sharing it is
+   what keeps the two planes from drifting.
 
 ## Decisions that have no gate yet
 

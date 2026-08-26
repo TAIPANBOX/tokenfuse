@@ -159,7 +159,7 @@ against such a lock, since those compare names, which every format agreed on.
 The broker resolves handles against the vault (the whole vault, for any
 secret carrying no scope rule; see above) and forwards to any configured
 upstream, so whatever can reach the port can spend the credentials it is
-scoped to reach. Two things guard THAT question, whether a caller can reach
+scoped to reach. Three things guard THAT question, whether a caller can reach
 the broker at all, and until 2026-08-05 only the first existed:
 
 1. **The loopback default.** `TOKENFUSE_MCP_ADDR` defaults to
@@ -191,8 +191,32 @@ the broker at all, and until 2026-08-05 only the first existed:
    The stdio transport has no header channel and no port; its access control is
    the operating system's, since the client is the parent process.
 
-**Decided 2026-08-06: a non-loopback bind with no credentials configured now
-REFUSES to start.** The 2026-08-05 audit that added the warning above
+3. **A key rather than a secret.** `TOKENFUSE_MCP_CLIENT_IDS` names client
+   metadata documents in CIMD's shape, each published by a client at its own
+   https `client_id` URL and listing that client's public keys; a caller then
+   proves possession of one of those keys on every request with an RFC 9449
+   DPoP proof, bound to the method, the path and the moment, and single-use.
+   The identity comes from the key that signed the proof, never from anything
+   the caller says about itself.
+
+   This is the stronger of the two credentials, and the difference is what an
+   operator has to keep safe: with a shared secret, everything worth stealing is
+   in their deployment manifest and on the wire; with a published key, nothing
+   they hold is worth stealing at all.
+
+   Off unless configured. Both doors can be configured at once while clients
+   move across, which is a migration state rather than a destination: the broker
+   warns at startup that a captured `x-fuse-key` header still works, and
+   `TOKENFUSE_MCP_REQUIRE_PROOF=1` ends it. Full detail, including why this
+   broker never dereferences a `client_id` and what that costs:
+   [docs/24](24-mcp-proof-door.md).
+
+**Decided 2026-08-06: a non-loopback bind with nothing at all on its door now
+REFUSES to start.** Since 2026-08-26 "nothing" means neither
+`TOKENFUSE_MCP_KEYS` nor `TOKENFUSE_MCP_CLIENT_IDS`, asked as one question
+(`mcpbroker::something_on_the_door`) so the refusal and the warning cannot come
+to different answers, and so an operator who configured only the STRONGER
+credential is not refused for want of the weaker one. The 2026-08-05 audit that added the warning above
 deliberately left this open (matching this repo's own precedent, commit
 4b4b3fd, "gateway: refuse to start rather than invent usage"): it breaks a
 running deployment at boot, and that call belonged to the operator, not the

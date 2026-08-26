@@ -1,0 +1,27 @@
+[package]
+name = "tokenfuse-dpop"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RFC 9449 proof-of-possession, RFC 7638 thumbprints, and the one algorithm allowlist two TokenFuse planes share."
+
+# Deliberately tiny, and deliberately NOT part of tokenfuse-core. Core is money,
+# pricing, ledger and policy, and CLAUDE.md invariant 1 pins its dependency list
+# to five crates so it stays provable and portable; `jsonwebtoken` and `base64`
+# are not on that list and should not be. This crate exists so the gateway and
+# the cloud can share one verifier without either depending on the other plane.
+#
+# Nothing here is new to this workspace's lockfile: all three already arrive
+# through crates/cloud.
+[dependencies]
+jsonwebtoken.workspace = true
+base64.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# These tests mint real proofs and verify them through the real code path,
+# rather than asserting against a stub of the wire. Same key type and same
+# crate the Cloud's delegation tests already use.
+p256 = { version = "0.13", features = ["ecdsa"] }

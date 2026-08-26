@@ -129,6 +129,10 @@ fn broker_state(
         lock,
         wardryx: Arc::new(wardryx),
         keys: ClientKeys::default(),
+        // The proof door is off in every fixture that does not name it, so
+        // each existing case here is unchanged (invariant 30's default).
+        clients: Default::default(),
+        require_proof: false,
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
         // The taint gate is level 3 and needs a gateway to ask; these fixtures
@@ -153,6 +157,10 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         lock: None,
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
+        // The proof door is off in every fixture that does not name it, so
+        // each existing case here is unchanged (invariant 30's default).
+        clients: Default::default(),
+        require_proof: false,
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
         // The taint gate is level 3 and needs a gateway to ask; these fixtures
@@ -946,6 +954,10 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         lock: None,
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
+        // The proof door is off in every fixture that does not name it, so
+        // each existing case here is unchanged (invariant 30's default).
+        clients: Default::default(),
+        require_proof: false,
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
         // The taint gate is level 3 and needs a gateway to ask; these fixtures
@@ -1254,6 +1266,10 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         lock: None,
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
+        // The proof door is off in every fixture that does not name it, so
+        // each existing case here is unchanged (invariant 30's default).
+        clients: Default::default(),
+        require_proof: false,
         client: reqwest::Client::new(),
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
         taint_gateway: gateway,
@@ -1392,5 +1408,205 @@ async fn a_gateway_that_cannot_be_reached_does_not_silently_become_permission() 
             .unwrap_or_default()
             .contains("could not be reached"),
         "{refused}"
+    );
+}
+
+// --- the proof door on the live HTTP path ---------------------------------
+//
+// `tests/mcp_door.rs` drives `mcpdoor::admit` as a pure function. These three
+// assert the thing that function cannot: that the decision is actually wired
+// into the transport, and that a refusal reaches no upstream and resolves no
+// handle. The MCP broker's own history is why: `a_tool_call_with_no_agent_id_is
+// _refused_and_no_secret_is_resolved` exists because a gate that returned the
+// right answer still ran secret injection four lines later.
+
+use base64::Engine as _;
+use p256::ecdsa::signature::Signer;
+use tokenfuse_gateway::mcpdoor::ClientRegistry;
+
+fn b64(b: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+struct ProofKey {
+    signing: p256::ecdsa::SigningKey,
+}
+
+impl ProofKey {
+    fn new() -> Self {
+        ProofKey {
+            signing: p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+        }
+    }
+    fn jwk(&self) -> Value {
+        let point = self.signing.verifying_key().to_encoded_point(false);
+        json!({"kty": "EC", "crv": "P-256", "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap())})
+    }
+    /// A proof for `POST {origin}/`, which is where these tests post.
+    fn proof(&self, origin: &str, jti: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs() as i64;
+        let header = json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": self.jwk()});
+        let claims = json!({"htm": "POST", "htu": format!("{origin}/"), "iat": now, "jti": jti});
+        let signing = format!(
+            "{}.{}",
+            b64(header.to_string().as_bytes()),
+            b64(claims.to_string().as_bytes())
+        );
+        let sig: p256::ecdsa::Signature = self.signing.sign(signing.as_bytes());
+        format!("{signing}.{}", b64(&sig.to_bytes()))
+    }
+}
+
+/// A broker whose only door is the proof door, for a client publishing `key`.
+/// `origin` is what the client will address it at, which a test only knows
+/// after the listener has a port, so the registry is built last.
+fn broker_with_proof_door(upstream: String, key: &ProofKey, origin: &str) -> Router {
+    let spec = json!([{
+        "client_id": "https://release-bot.acme.example/mcp-client.json",
+        "client_name": "release-bot",
+        "jwks": {"keys": [key.jwk()]},
+    }])
+    .to_string();
+    let mut state = broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::disabled(),
+    );
+    let state_mut = Arc::get_mut(&mut state).expect("sole owner");
+    state_mut.clients = ClientRegistry::from_spec(&spec, origin).expect("a usable client spec");
+    app(state)
+}
+
+/// Bind first so the test knows the origin the client will sign over, then
+/// serve the broker on that same listener.
+async fn spawn_broker_at(make: impl FnOnce(&str) -> Router) -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let router = make(&origin);
+    tokio::spawn(async move {
+        let _ = axum::serve(l, router).await;
+    });
+    origin
+}
+
+fn a_tool_call() -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+    })
+}
+
+/// The whole point, end to end: a client that holds the key its published
+/// document names gets in, and the call reaches the upstream with the real
+/// secret substituted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_carrying_a_proof_of_possession_reaches_the_upstream() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let key = ProofKey::new();
+    let broker_url = spawn_broker_at(|origin| broker_with_proof_door(upstream, &key, origin)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let http = reqwest::Client::new();
+    let ok: Value = http
+        .post(&broker_url)
+        .header("dpop", key.proof(&broker_url, "live-1"))
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        ok.get("error").is_none(),
+        "a good proof must be served: {ok}"
+    );
+    let forwarded = seen.lock().expect("upstream log");
+    assert_eq!(forwarded.len(), 1, "exactly the one authenticated call");
+    assert!(
+        forwarded[0].to_string().contains("ghp_REALSECRET"),
+        "the handle is resolved for an admitted caller: {:?}",
+        forwarded[0]
+    );
+}
+
+/// The refusal, and the assertion that matters is the second one: a call the
+/// door turned away must resolve no handle and reach no upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_with_no_proof_reaches_nothing_when_the_proof_door_is_the_only_one() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let key = ProofKey::new();
+    let broker_url = spawn_broker_at(|origin| broker_with_proof_door(upstream, &key, origin)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let http = reqwest::Client::new();
+    let refused = http
+        .post(&broker_url)
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let forwarded = seen.lock().expect("upstream log");
+    assert!(
+        forwarded.is_empty(),
+        "a refused caller must reach nothing: {} forwarded",
+        forwarded.len()
+    );
+    assert!(
+        !forwarded
+            .iter()
+            .any(|r| r.to_string().contains("ghp_REALSECRET")),
+        "no vault value may leave the broker for a caller the door turned away"
+    );
+}
+
+/// Every call to this broker is a POST to one URL, so `htm` and `htu` pin
+/// almost nothing. Replaying one captured header is the attack, and the second
+/// use of one `jti` is where it is stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_captured_proof_replayed_at_the_live_door_reaches_nothing_the_second_time() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let key = ProofKey::new();
+    let broker_url = spawn_broker_at(|origin| broker_with_proof_door(upstream, &key, origin)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let http = reqwest::Client::new();
+    let captured = key.proof(&broker_url, "live-replay");
+    let first = http
+        .post(&broker_url)
+        .header("dpop", &captured)
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let replay = http
+        .post(&broker_url)
+        .header("dpop", &captured)
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the same proof a second time is a replay, not a second request"
+    );
+    assert_eq!(
+        seen.lock().expect("upstream log").len(),
+        1,
+        "only the first use of that proof may reach the upstream"
     );
 }

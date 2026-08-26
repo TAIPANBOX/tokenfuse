@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 tokenfuse-core.workspace = true
+# RFC 9449 proofs, RFC 7638 thumbprints and the one algorithm allowlist,
+# shared with the gateway rather than copied into it (invariant 29).
+tokenfuse-dpop.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum.workspace = true
@@ -24,13 +27,13 @@ utoipa = { version = "5", features = ["axum_extras"] }
 # manifest (ES256 = ECDSA P-256/SHA-256). `pkcs8`/`pem` let the audit signing
 # key load from a PKCS#8/SEC1 PEM or DER (see `audit_sign.rs`).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
-sha2 = "0.10"
-base64 = "0.22"
+sha2.workspace = true
+base64.workspace = true
 getrandom = "0.2"
 # Offline OIDC / JWT bearer auth (WS4): RS256/ES256 signature + claim validation
 # against a static JWKS. No network — the JWKS is supplied from env. Cloud-only;
 # never pulled into tokenfuse-core.
-jsonwebtoken = "9"
+jsonwebtoken.workspace = true
 # APNs push (real sender) — only pulled in with `--features apns`.
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
     "json",

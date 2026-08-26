@@ -412,6 +412,59 @@ async fn mcp_broker() {
             "mcp broker auth: ON"
         );
     }
+    // The other door (CLAUDE.md invariant 30): CIMD client metadata documents,
+    // and callers proving possession of a key one of them published. Off unless
+    // TOKENFUSE_MCP_CLIENT_IDS is set, so a deployment that configures nothing
+    // here is byte-for-byte unchanged.
+    //
+    // Set-but-unusable refuses to start rather than reading as "off", the same
+    // conclusion TOKENFUSE_MCP_KEYS and TOKENFUSE_MCP_SECRET_SCOPES both
+    // reached: reading a typo as "not configured" leaves the door in whatever
+    // state the OTHER variable happens to be in, at the moment an operator
+    // believed they had just tightened it.
+    let clients = match tokenfuse_gateway::mcpdoor::ClientRegistry::from_spec(
+        &std::env::var("TOKENFUSE_MCP_CLIENT_IDS").unwrap_or_default(),
+        &std::env::var("TOKENFUSE_MCP_PROOF_URL").unwrap_or_default(),
+    ) {
+        Ok(clients) => clients,
+        Err(e) => {
+            eprintln!("tokenfuse: {e}");
+            std::process::exit(2);
+        }
+    };
+    // Same parsing as TOKENFUSE_MCP_ALLOW_OPEN_BIND and TOKENFUSE_ALLOW_STUB:
+    // only "1" or "true" count, so a typo reads as "not opted in".
+    let require_proof = std::env::var("TOKENFUSE_MCP_REQUIRE_PROOF")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if let Some(refusal) =
+        tokenfuse_gateway::mcpbroker::refuse_proof_with_no_clients(clients.enabled(), require_proof)
+    {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
+    // Both doors open at once is the migration state, and it must not be
+    // silent: a captured x-fuse-key header still works until an operator sets
+    // TOKENFUSE_MCP_REQUIRE_PROOF.
+    if let Some(warning) = tokenfuse_gateway::mcpbroker::bearer_door_still_open_warning(
+        keys_enabled,
+        clients.enabled(),
+        require_proof,
+    ) {
+        tracing::warn!("{warning}");
+    }
+    if clients.enabled() {
+        tracing::info!(
+            clients = clients.len(),
+            header = tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            require_proof,
+            "mcp broker proof door: ON"
+        );
+    }
+    // "Is there anything on the door" is a question about both variables now.
+    // Asked once, here, so the two bind conditions below cannot answer it
+    // differently: see `mcpbroker::something_on_the_door`.
+    let door_configured = tokenfuse_gateway::mcpbroker::something_on_the_door(&keys, &clients);
     // Agent-event NDJSON export (agent-passport SPEC.md §6): the mcp-broker is
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
@@ -426,6 +479,8 @@ async fn mcp_broker() {
         lock,
         wardryx,
         keys,
+        clients,
+        require_proof,
         client: reqwest::Client::new(),
         events,
         // docs/07 B.7 level 3. Off unless an operator names the gateway whose
@@ -466,12 +521,13 @@ async fn mcp_broker() {
     // voice as the Cloud's own non-loopback warning in
     // crates/cloud/src/main.rs.
     if let Some(refusal) =
-        tokenfuse_gateway::mcpbroker::refuse_open_bind(&addr, keys_enabled, allow_open_bind)
+        tokenfuse_gateway::mcpbroker::refuse_open_bind(&addr, door_configured, allow_open_bind)
     {
         eprintln!("tokenfuse: {refusal}");
         std::process::exit(2);
     }
-    if let Some(warning) = tokenfuse_gateway::mcpbroker::bind_exposure_warning(&addr, keys_enabled)
+    if let Some(warning) =
+        tokenfuse_gateway::mcpbroker::bind_exposure_warning(&addr, door_configured)
     {
         tracing::warn!("{warning}");
     }

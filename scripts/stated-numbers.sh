@@ -41,13 +41,18 @@
 # WHAT THE PER-CRATE CHECK PROVES, AND WHAT IT DOES NOT
 #
 # PROGRESS.md also breaks the total down per crate. This script checks that the
-# four parts SUM to the measured total. It does not check that core's share is
+# parts SUM to the measured total. It does not check that core's share is
 # really core's, because that would mean running `cargo test -p` four more times
 # for a decoration, while the total is the load-bearing figure.
 #
 # So: a breakdown that drifts out of step with the total fails here, and a
 # breakdown with two compensating errors passes. A deliberate limit, stated
 # rather than left for somebody to discover (invariant 4).
+#
+# The crate names are written out rather than matched generically, and that is
+# the same speed bump the note above the pattern describes: adding a workspace
+# member has to touch this line, so nobody adds one whose tests are counted in
+# the total and missing from the breakdown. `dpop` joined on 2026-08-26.
 
 set -uo pipefail
 
@@ -109,10 +114,10 @@ else
 fi
 
 breakdown=$(printf '%s' "$progress_text" |
-	grep -oE 'core [0-9]+, gateway [0-9]+, cloud [0-9]+, umbrella [0-9]+' | head -1)
+	grep -oE 'core [0-9]+, dpop [0-9]+, gateway [0-9]+, cloud [0-9]+, umbrella [0-9]+' | head -1)
 
 if [ -z "$breakdown" ]; then
-	note "PROGRESS.md carries no per-crate breakdown: expected \`core <N>, gateway <N>, cloud <N>, umbrella <N>\`"
+	note "PROGRESS.md carries no per-crate breakdown: expected \`core <N>, dpop <N>, gateway <N>, cloud <N>, umbrella <N>\`"
 	note "  same rule as above: reword it and update this script together, or drop both"
 else
 	sum=$(printf '%s' "$breakdown" | grep -oE '[0-9]+' | awk '{s += $1} END {print s + 0}')
