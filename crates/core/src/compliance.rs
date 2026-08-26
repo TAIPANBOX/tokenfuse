@@ -69,6 +69,51 @@
 //! prevent. It belongs in a customer's own risk file, citing this catalog as
 //! evidence, rather than in this catalog citing it.
 //!
+//! # Why this catalog is not lifted into `agent-stack-go`
+//!
+//! `@claude` 2026-08-26, a second deviation from the same plan's wording, kept
+//! beside the 23894 refusal because it is the same shape: a thing that was
+//! asked for, refused, with the reason left where the next reader of the
+//! catalog will find it rather than in a session nobody can re-open.
+//!
+//! B1 asked for the frameworks above and then for this module to be lifted into
+//! `agent-stack-go` "so Go services share it". Two facts, both established by
+//! looking rather than assumed, say the second half should not be built.
+//!
+//! **This catalog is not shared data. It is TokenFuse's self-description.**
+//! Every `control_id` is `TF.*` and every evidence pointer is a string only
+//! this product emits: a [`crate::breaker::BreakerReason`] wire value, a
+//! `crate::mcpreport` / `crate::mcpexposure` finding kind, or a
+//! `tokenfuse-cloud` `store.rs` incident kind, each already held against the
+//! real code by a test above. A Go copy of these eleven rows would be eleven
+//! claims that are false about every repository importing it. Widening this
+//! catalog to cover the estate is the worse answer rather than the better one,
+//! and the reason is in [`compute_compliance_from_counts`]: `covered` is
+//! computed from THIS product's decision, finding and incident counts, so a
+//! wardryx row here would sit permanently uncovered and read as "wardryx
+//! enforces nothing". `the_catalog_describes_this_product_and_not_the_estate`
+//! is what stops that road.
+//!
+//! **And no Go service has anything to share yet.** Measured 2026-08-26 across
+//! all ten Go modules in the estate (`wardryx`, `idryx`, `scopyx`, `heraldyx`,
+//! `mockryx`, `vouchryx`, `qryx`, `terraform-provider-taipan`,
+//! `agent-stack-go`, `costcrew-go`): not one carries a control catalog, a
+//! framework field, or a `TF.` id. The only consumer of this catalog anywhere
+//! is genaryx, which is Rust and reads `GET /v1/compliance/evidence` as opaque
+//! JSON without retyping a row, which is the shape that needs no agreement at
+//! all. A shared package no one imports is not a contract, it is a second copy
+//! waiting for its first reader to disagree with it.
+//!
+//! When a Go consumer does appear, the mechanism is already built and it is not
+//! a Go package. CLAUDE.md invariant 14 publishes values another repository has
+//! to agree with into `contracts/tokenfuse-constants.json`, generated from this
+//! source and gated by a check that BUILDS, and estate-gates C3 already prefers
+//! that artifact over parsing this Rust. A catalog section there is a generator
+//! change plus a gate case, and it makes no second copy of anything. A Go
+//! rewrite would instead be the fifth retyped table in this estate, where C2,
+//! C3, C6 and C7 each exist to hold one of the previous four, and it would need
+//! the fifth such gate before it was worth having.
+//!
 //! # Gaps we do NOT claim (honesty, stated explicitly)
 //!
 //! - **ASI07 (Insecure Inter-Agent Communication).** Named in the plan for this
@@ -858,6 +903,51 @@ mod tests {
                      tell whether the number is right"
                 );
             }
+        }
+    }
+
+    /// The premise the module doc's "not lifted into `agent-stack-go`" section
+    /// rests on, held as a shape rather than as prose.
+    ///
+    /// Every row here is a claim about what THIS product enforces, anchored to
+    /// a wire string, finding kind or incident kind only this product emits.
+    /// The three tests above hold that anchoring for rows that carry evidence;
+    /// this one holds the other direction, which they cannot see: a row about
+    /// somebody else's control arriving in this catalog at all.
+    ///
+    /// It is the tempting road and it looks like sharing. It is not, and
+    /// `compute_compliance_from_counts` is why: `covered` is computed from this
+    /// product's own decision, finding and incident counts, so a `WX.CHAIN` row
+    /// for wardryx would be permanently uncovered no matter how well wardryx
+    /// enforced it, and the report would state that a working control is
+    /// absent. An over-claim is what `Enforcement` exists to prevent; this is
+    /// the same error with its sign flipped, and it is not cheaper for being an
+    /// under-claim, because it is published to the same auditor.
+    ///
+    /// A catalog that genuinely covered the estate would need per-repository
+    /// evidence counts reaching this function, which is a different design and
+    /// a decision for the user rather than a row somebody adds.
+    ///
+    /// **It overlaps `scripts/honest-claims.sh` on detection and differs on the
+    /// remedy, which is the half worth having.** That gate pins every control's
+    /// grade, so it does fire on a new row: measured 2026-08-26 against this
+    /// exact mutant, it answered `WX.CHAIN is a new control graded Partial ...
+    /// Record it in this script in the same commit`. That instruction is right
+    /// for a new TokenFuse control and is the wrong move for this one, and it
+    /// is the move somebody unblocking CI makes, because recording it is what
+    /// the message asks for and it turns the gate green with the bad row live.
+    /// This test has no such exit.
+    #[test]
+    fn the_catalog_describes_this_product_and_not_the_estate() {
+        for c in CATALOG {
+            assert!(
+                c.control_id.starts_with("TF."),
+                "control {:?} is not a TokenFuse control: this catalog is projected \
+                 against THIS product's decision, finding and incident counts, so a \
+                 row for another repository would report a working control as \
+                 uncovered forever. See the module doc.",
+                c.control_id
+            );
         }
     }
 
