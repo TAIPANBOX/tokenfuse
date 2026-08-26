@@ -46,6 +46,10 @@ impl FirewallConfig {
         ]);
         let rules = vec![
             TaintRule {
+                // The names are docs/07 B.6's, verbatim. A rule renamed later
+                // silently splits every count somebody has been keeping, so
+                // they are treated as wire strings, not labels.
+                name: "no-exec-after-untrusted".into(),
                 when_any: vec![
                     "web".into(),
                     "email".into(),
@@ -55,6 +59,7 @@ impl FirewallConfig {
                 deny: vec!["exec".into(), "write".into(), "network_egress".into()],
             },
             TaintRule {
+                name: "anti-exfiltration".into(),
                 when_any: vec!["secrets".into()],
                 deny: vec!["network_egress".into()],
             },

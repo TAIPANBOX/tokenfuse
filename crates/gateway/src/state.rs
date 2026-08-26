@@ -109,6 +109,17 @@ pub struct AppState {
     pub keystats: Arc<KeyStats>,
 }
 
+/// What one [`AppState::accumulate_taint`] call did: the labels this run did
+/// not already carry, and everything it carries now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintDelta {
+    /// New to this run. Empty on every call after the first that supplied a
+    /// given label, because taint is monotonic.
+    pub added: Labels,
+    /// The full set after the merge.
+    pub carrying: Labels,
+}
+
 impl AppState {
     pub fn new(
         ledger: Arc<Ledger>,
@@ -246,12 +257,22 @@ impl AppState {
         self
     }
 
-    /// Merge `new_labels` into a run's taint set and return the full current set.
-    pub fn accumulate_taint(&self, run_id: &str, new_labels: Labels) -> Labels {
+    /// Merge `new_labels` into a run's taint set and report what changed.
+    ///
+    /// Returns the delta as well as the total because the caller has to be
+    /// able to tell a run that just became untrusted from one that has been
+    /// untrusted for thirty turns. Before 2026-08-26 this returned only the
+    /// total, which is why the acquisition could not be recorded: by the time
+    /// the set was in hand there was no way left to know which of it was new.
+    pub fn accumulate_taint(&self, run_id: &str, new_labels: Labels) -> TaintDelta {
         let mut map = self.taint.lock().unwrap();
         let entry = map.entry(run_id.to_string()).or_default();
+        let added: Labels = new_labels.difference(entry).cloned().collect();
         entry.extend(new_labels);
-        entry.clone()
+        TaintDelta {
+            added,
+            carrying: entry.clone(),
+        }
     }
 
     /// Attach an event sink (e.g. the Parquet trace). Chainable.

@@ -177,6 +177,52 @@ pub enum EventType {
     /// the type. Which case it was is in `effect`, where a consumer can read
     /// it, rather than in a number two cases have to share.
     DependencyFailed,
+    /// The agent firewall WOULD have refused an action, and did not, because
+    /// it is running in shadow mode (`TOKENFUSE_FIREWALL=shadow`).
+    ///
+    /// Added 2026-08-26. Before it, a would-block set the `x-fuse-taint`
+    /// response header and emitted nothing, so the only party ever told was
+    /// the agent that had just been talked into the action. docs/07 B.9 makes
+    /// shadow the documented on-ramp ("shadow mode for the remaining rules
+    /// during the first week"); a week of it produced no material to decide
+    /// on, which is the same shape of gap `dependency_failed` closed one day
+    /// earlier: the thing happened, correctly, and nothing wrote it down.
+    ///
+    /// `medium`, and the band is the whole judgement in this variant, so it is
+    /// worth stating what it is NOT. It is not `low`: in shadow the dangerous
+    /// action was PERMITTED, the response carrying it reaches the client, and
+    /// the client executes it, so this is a thing that HAPPENED rather than a
+    /// refusal that worked. It is not `high` either, and that is the harder
+    /// call: `high` is where `taint_block` sits, and a shadow week emitting at
+    /// `taint_block`'s band would page an operator for every finding during
+    /// precisely the week they were told to watch quietly. An operator who
+    /// turns the sender off in week one never gets to week two. `medium`
+    /// clears stack-up's floor, so it is not silence.
+    ///
+    /// `data` is [`taint_verdict_data`], identical in shape to
+    /// `taint_block`'s: the same question was asked and answered, and only
+    /// `mode` differs. A consumer counting rule hits should be able to read
+    /// both with one code path, which is also what makes a shadow-to-enforce
+    /// comparison arithmetic rather than a migration.
+    TaintShadow,
+    /// A run picked up a taint label it did not have before: it read the web,
+    /// opened an upload, called an unknown tool, or the caller declared it.
+    ///
+    /// Added 2026-08-26, and it is the beginning of the story whose end
+    /// `taint_block` already recorded. Without it an operator reads "blocked,
+    /// context was [web, file]" and has no way at all to learn WHERE the web
+    /// came from: taint is monotonic and accumulates silently across a run's
+    /// whole history, so by the time anything is refused the acquisition is
+    /// many calls in the past and was never written anywhere.
+    ///
+    /// `low`, the same band as `tool_call` and for the same reason: this is a
+    /// per-action audit signal and nothing has gone wrong. Bounded per run by
+    /// construction, since taint only ever grows and a label is new once.
+    ///
+    /// `data` is [`taint_raised_data`]: `{stage, added, from_tools, carrying,
+    /// unit}`. `carrying` is the full set AFTER the addition, so a reader
+    /// following a run forward never has to re-derive the running total.
+    TaintRaised,
 }
 
 /// How much of a transport error's text travels in `data.detail`.
@@ -294,6 +340,118 @@ fn truncate_detail(detail: &str) -> String {
     out
 }
 
+/// Where in a call the agent firewall acted (`data.stage`).
+///
+/// The member `@yurii` asked for first on 2026-08-26 ("на якому етапі"), and
+/// the one a record is least useful without: "blocked" and "blocked while
+/// reading the request" are different facts to whoever has to decide whether
+/// the run got anywhere. Three stages and not more, because the gateway only
+/// has three places it can see anything: the request as it arrives, the
+/// caller's own declaration on it, and the tool calls in the model's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintStage {
+    /// Reading the message history that arrived with the request: a tool the
+    /// agent had already called is what carried the label in.
+    RequestHistory,
+    /// The caller declared taint itself on the `x-fuse-taint` request header.
+    /// Trusted precisely because it can only ever ADD: taint is monotonic, so
+    /// a caller can make itself more restricted and never less.
+    RequestHeader,
+    /// Judging the tool calls in the model's own answer, which is the only
+    /// enforcement point this gateway has (docs/07 B.7 level 1, advisory).
+    ModelToolCall,
+}
+
+impl TaintStage {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TaintStage::RequestHistory => "request_history",
+            TaintStage::RequestHeader => "request_header",
+            TaintStage::ModelToolCall => "model_tool_call",
+        }
+    }
+}
+
+/// Which firewall mode produced a verdict (`data.mode`).
+///
+/// On the event and not left to be inferred from the type, even though
+/// `taint_block` implies enforce and `taint_shadow` implies shadow. A
+/// consumer joining the two families into one count should not have to know
+/// that mapping, and an operator comparing a shadow week against an enforced
+/// one is reading this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintEnforcement {
+    Shadow,
+    Enforce,
+}
+
+impl TaintEnforcement {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            TaintEnforcement::Shadow => "shadow",
+            TaintEnforcement::Enforce => "enforce",
+        }
+    }
+}
+
+/// The `data` object for [`EventType::TaintBlock`] and
+/// [`EventType::TaintShadow`], built in one place.
+///
+/// One builder for both on purpose: they answer the same question and differ
+/// only in `mode`, so two builders would be two chances for the shapes to
+/// drift apart and make the arithmetic an operator does between a shadow week
+/// and an enforced one stop working.
+///
+/// `tools` is what the model asked to DO, by name, and it is the member that
+/// turns a record into something actionable: `denied: ["exec"]` says a
+/// category was refused, `tools: ["run_shell"]` says which door was tried.
+pub fn taint_verdict_data(
+    stage: TaintStage,
+    mode: TaintEnforcement,
+    verdict: &crate::taint::TaintVerdict,
+    tools: &[String],
+    unit: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stage": stage.as_wire_str(),
+        "mode": mode.as_wire_str(),
+        "rule": verdict.rule,
+        "labels": verdict.labels,
+        "requested": verdict.requested,
+        "denied": verdict.denied,
+        "tools": tools,
+        // As on every other enforcement event, and for the same reason: a
+        // consumer cannot tell an event that omits the field from one whose
+        // identity map resolved nothing.
+        "unit": (!unit.is_empty()).then_some(unit),
+    })
+}
+
+/// The `data` object for [`EventType::TaintRaised`], built in one place.
+///
+/// `added` is only what was NEW to this run, never the whole set: a run that
+/// reads the web on every one of forty turns became untrusted once, and forty
+/// identical rows would bury the one turn that mattered.
+///
+/// `carrying` is the full set after the addition, so a reader walking a run
+/// forward in time never has to re-derive the running total to know what the
+/// next refusal will be judged against.
+pub fn taint_raised_data(
+    stage: TaintStage,
+    added: &[String],
+    from_tools: &[String],
+    carrying: &[String],
+    unit: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stage": stage.as_wire_str(),
+        "added": added,
+        "from_tools": from_tools,
+        "carrying": carrying,
+        "unit": (!unit.is_empty()).then_some(unit),
+    })
+}
+
 impl EventType {
     /// The exact `type` wire string (agent-passport SPEC.md §6.2 — these are
     /// TokenFuse's registry entries verbatim, zero renaming for the four P2
@@ -315,6 +473,8 @@ impl EventType {
             EventType::PolicyDeny => "policy_deny",
             EventType::ToolCall => "tool_call",
             EventType::DependencyFailed => "dependency_failed",
+            EventType::TaintShadow => "taint_shadow",
+            EventType::TaintRaised => "taint_raised",
         }
     }
 
@@ -324,8 +484,8 @@ impl EventType {
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
-    /// `budget_threshold` / `breaker_tripped` = `medium`;
-    /// `tool_call` = `low`.
+    /// `budget_threshold` / `breaker_tripped` / `taint_shadow` = `medium`;
+    /// `tool_call` / `taint_raised` = `low`.
     ///
     /// `breaker_tripped` was `critical` until 2026-08-03, which meant every
     /// enforced 402 paged a human at the top band. A refused call is this
@@ -366,10 +526,17 @@ impl EventType {
             // warns about: the run is still inside its budget. Beside it, the
             // per-call record of a refusal that already happened, which is the
             // enforcement path doing its job rather than an incident.
-            EventType::BudgetThreshold | EventType::BreakerTripped => Severity::Medium,
+            // Beside them, the firewall's shadow finding: a dangerous action
+            // that was permitted because enforcement is off. Not an incident,
+            // and not silence either. See the variant's own note.
+            EventType::BudgetThreshold | EventType::BreakerTripped | EventType::TaintShadow => {
+                Severity::Medium
+            }
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
-            EventType::ToolCall => Severity::Low,
+            // Taint acquisition sits here for the same reason: a run reading
+            // the web is normal, and only what it does next may not be.
+            EventType::ToolCall | EventType::TaintRaised => Severity::Low,
         }
     }
 }

@@ -28,6 +28,9 @@ use tokenfuse_core::agent_event::EventType;
 use tokenfuse_core::agent_event::{
     dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
 };
+use tokenfuse_core::agent_event::{
+    taint_raised_data, taint_verdict_data, TaintEnforcement, TaintStage,
+};
 use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
@@ -238,6 +241,95 @@ fn emit_dependency_failed_via(
         dependency_failed_data(dependency, stage, effect, detail),
     );
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
+}
+
+/// Record that a run picked up taint it did not have before.
+///
+/// Emits ONE event per source that contributed something new, so the record
+/// says where a label came from rather than only that it arrived. A label
+/// supplied by both a tool and the caller's header is attributed to the tool:
+/// the tool name is the more specific evidence, and counting it twice would
+/// make "how did runs become untrusted this week" add up to more than the
+/// number of runs.
+///
+/// Silent when nothing is new, which is the common case: taint is monotonic,
+/// so a run that reads the web on forty turns passes through here forty times
+/// and writes once.
+#[allow(clippy::too_many_arguments)]
+fn emit_taint_raised(
+    st: &AppState,
+    run_id: &str,
+    agent_id: &str,
+    on_behalf_of: &[String],
+    delta: &crate::state::TaintDelta,
+    from_history: &Labels,
+    history_tools: &[String],
+    declared: &Labels,
+    unit: &str,
+) {
+    if delta.added.is_empty() {
+        return;
+    }
+    let carrying: Vec<String> = delta.carrying.iter().cloned().collect();
+
+    let by_tools: Vec<String> = delta
+        .added
+        .iter()
+        .filter(|l| from_history.contains(*l))
+        .cloned()
+        .collect();
+    if !by_tools.is_empty() {
+        // The tools that actually carried these labels in, not every tool in
+        // the history: an operator reading this is looking for the one to
+        // stop calling. Unknown tools map to `unclassified` exactly as
+        // `labels_for_tools` decides it, so the two never disagree.
+        let culprits: Vec<String> = history_tools
+            .iter()
+            .filter(|t| {
+                let label = st
+                    .firewall
+                    .sources
+                    .get(*t)
+                    .cloned()
+                    .unwrap_or_else(|| "unclassified".to_string());
+                by_tools.contains(&label)
+            })
+            .cloned()
+            .collect();
+        let outcome = st.events.emit(
+            EventType::TaintRaised,
+            now_millis(),
+            Some(agent_id),
+            Some(run_id),
+            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            taint_raised_data(
+                TaintStage::RequestHistory,
+                &by_tools,
+                &culprits,
+                &carrying,
+                unit,
+            ),
+        );
+        crate::events::log_outcome(EventType::TaintRaised, outcome);
+    }
+
+    let by_header: Vec<String> = delta
+        .added
+        .iter()
+        .filter(|l| declared.contains(*l) && !from_history.contains(*l))
+        .cloned()
+        .collect();
+    if !by_header.is_empty() {
+        let outcome = st.events.emit(
+            EventType::TaintRaised,
+            now_millis(),
+            Some(agent_id),
+            Some(run_id),
+            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            taint_raised_data(TaintStage::RequestHeader, &by_header, &[], &carrying, unit),
+        );
+        crate::events::log_outcome(EventType::TaintRaised, outcome);
+    }
 }
 
 fn emit_breaker_event(
@@ -1243,12 +1335,29 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // tool history) so the response's tool calls can be judged against it.
     // Computed before `send` consumes `headers`.
     let firewall_labels = if st.firewall.mode != FirewallMode::Off {
-        let mut labels = taint_header_labels(&headers);
-        labels.extend(taint::labels_for_tools(
-            &taint::tool_names_in(&request),
-            &st.firewall.sources,
-        ));
-        st.accumulate_taint(&run_id, labels)
+        let declared = taint_header_labels(&headers);
+        let history_tools = taint::tool_names_in(&request);
+        let from_history = taint::labels_for_tools(&history_tools, &st.firewall.sources);
+        let mut labels = declared.clone();
+        labels.extend(from_history.clone());
+        let delta = st.accumulate_taint(&run_id, labels);
+        // Record the ACQUISITION, not only the eventual refusal. A label is
+        // new to a run exactly once, so this is bounded and quiet, and without
+        // it a block reading "context was [web, file]" has no beginning: taint
+        // accumulates monotonically across a whole run, so by the time
+        // anything is denied the tool that carried it in is many calls back.
+        emit_taint_raised(
+            &st,
+            &run_id,
+            &agent_id,
+            &on_behalf_of_chain,
+            &delta,
+            &from_history,
+            &history_tools,
+            &declared,
+            &unit,
+        );
+        delta.carrying
     } else {
         Labels::new()
     };
@@ -1650,7 +1759,8 @@ async fn buffered_managed(
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         let resp_tools = taint::tool_names_in(&resp_json);
         let requested = taint::capabilities_for_tools(&resp_tools, &st.firewall.capabilities);
-        if let Some(reason) = taint::evaluate(&firewall_labels, &requested, &st.firewall.rules) {
+        if let Some(verdict) = taint::evaluate(&firewall_labels, &requested, &st.firewall.rules) {
+            let reason = verdict.reason();
             if st.firewall.mode == FirewallMode::Enforce {
                 // The call already happened and its real cost was recorded as
                 // "allow" above — this second record is the security verdict
@@ -1683,18 +1793,36 @@ async fn buffered_managed(
                     Some(agent_id),
                     Some(&reservation.run_id),
                     (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
-                    serde_json::json!({
-                        "reason": reason,
-                        // As on `dlp_block` above, and for the same reason:
-                        // every other enforcement event carries the resolved
-                        // unit, and a consumer cannot tell one that omits the
-                        // field from one whose map resolved nothing.
-                        "unit": (!unit.is_empty()).then_some(unit),
-                    }),
+                    taint_verdict_data(
+                        TaintStage::ModelToolCall,
+                        TaintEnforcement::Enforce,
+                        &verdict,
+                        &resp_tools,
+                        unit,
+                    ),
                 );
                 crate::events::log_outcome(EventType::TaintBlock, outcome);
                 return firewall_block(&reservation.run_id, &reason);
             }
+            // Shadow: the action is PERMITTED and this response carries it to
+            // a client that will execute it. Before 2026-08-26 that fact left
+            // the box as a response header and nothing else, so the only party
+            // ever told was the agent that had just been talked into it.
+            let outcome = st.events.emit(
+                EventType::TaintShadow,
+                now_millis(),
+                Some(agent_id),
+                Some(&reservation.run_id),
+                (!on_behalf_of_chain.is_empty()).then_some(on_behalf_of_chain),
+                taint_verdict_data(
+                    TaintStage::ModelToolCall,
+                    TaintEnforcement::Shadow,
+                    &verdict,
+                    &resp_tools,
+                    unit,
+                ),
+            );
+            crate::events::log_outcome(EventType::TaintShadow, outcome);
             firewall_note = Some(reason);
         }
         // Executing these tools will taint future turns — record their labels now.
@@ -3410,6 +3538,158 @@ mod tests {
             .unwrap();
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------------
+    // What the firewall RECORDS. The three below were run against the
+    // unchanged gateway first and all three went red there; the failures are
+    // in the pull request. They are about observability rather than about
+    // enforcement, which is why they sit apart from the two tests above.
+    // ---------------------------------------------------------------------
+
+    /// A response body asking to run a shell, which is `exec` under the
+    /// default capability map and therefore the thing a web-tainted run is
+    /// not allowed to do.
+    const WANTS_EXEC: &str = r#"{"content":[{"type":"tool_use","name":"run_shell","input":{}}]}"#;
+
+    fn firewall_state(mode: FirewallMode, resp_body: &str) -> AppState {
+        use crate::firewall::FirewallConfig;
+        let mut st = state(
+            Mode::Shadow,
+            StubProvider {
+                body_override: Some(resp_body.into()),
+                ..StubProvider::default()
+            },
+        );
+        st.firewall = Arc::new(FirewallConfig::defaults(mode));
+        st
+    }
+
+    fn firewall_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+        events_at(path)
+            .into_iter()
+            .filter(|e| {
+                e["type"] == "taint_block"
+                    || e["type"] == "taint_shadow"
+                    || e["type"] == "taint_raised"
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_shadow_would_block_is_recorded() {
+        // THE ONE THIS FILE EXISTS FOR. Shadow is the documented on-ramp
+        // (docs/07-taint-model.md B.9: "shadow mode for the remaining rules
+        // during the first week"), and before this change a would-block set a
+        // response header and emitted nothing at all. The only party who ever
+        // learned about it was the agent that had just been talked into the
+        // action. A week of shadow produced no material to decide on.
+        let (events, path) = recording_exporter("shadow-would-block");
+        let st = firewall_state(FirewallMode::Shadow, WANTS_EXEC).with_events(events);
+
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-shadow")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-taint", "web")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "shadow does not block; that is the whole point of it"
+        );
+
+        let shadowed: Vec<_> = firewall_events(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "taint_shadow")
+            .collect();
+        assert_eq!(
+            shadowed.len(),
+            1,
+            "a would-block that emits nothing cannot be counted, alerted on, or \
+             read a week later"
+        );
+        assert_eq!(shadowed[0]["severity"], "medium");
+    }
+
+    #[tokio::test]
+    async fn the_record_says_which_rule_fired_at_which_stage_and_over_what() {
+        // "на якому етапі, що було зроблено, як діяв" (@yurii 2026-08-26).
+        // Before this change the event carried a prose `reason` and a `unit`,
+        // so a consumer could display it and could not GROUP by it: no rule
+        // name, no stage, no machine-readable labels or capabilities.
+        let (events, path) = recording_exporter("rich-record");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-rich")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-taint", "web")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::FORBIDDEN);
+
+        let blocked: Vec<_> = firewall_events(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "taint_block")
+            .collect();
+        assert_eq!(blocked.len(), 1);
+        let d = &blocked[0]["data"];
+
+        assert_eq!(d["stage"], "model_tool_call", "at which stage");
+        assert_eq!(d["mode"], "enforce", "what was done");
+        assert_eq!(d["rule"], "no-exec-after-untrusted", "which rule fired");
+        assert_eq!(
+            d["labels"],
+            serde_json::json!(["web"]),
+            "what it was carrying"
+        );
+        assert_eq!(d["denied"], serde_json::json!(["exec"]), "what was refused");
+        assert_eq!(
+            d["tools"],
+            serde_json::json!(["run_shell"]),
+            "how it acted: the tool it asked for by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn becoming_tainted_is_recorded_not_only_being_blocked() {
+        // Without this an operator reads "blocked, context was [web]" and has
+        // no way to learn WHERE the web came from. The block is the end of a
+        // story whose beginning was never written down.
+        let (events, path) = recording_exporter("taint-raised");
+        let st = firewall_state(
+            FirewallMode::Shadow,
+            r#"{"content":[{"type":"text","text":"ok"}]}"#,
+        )
+        .with_events(events);
+
+        // A history in which the agent already called `web_search`: that is
+        // the moment the run stops being trusted.
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"web_search","input":{}}]}
+        ]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-raised")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+
+        let raised: Vec<_> = firewall_events(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "taint_raised")
+            .collect();
+        assert_eq!(raised.len(), 1, "the run picked up a label and said so");
+        let d = &raised[0]["data"];
+        assert_eq!(d["added"], serde_json::json!(["web"]));
+        assert_eq!(d["from_tools"], serde_json::json!(["web_search"]));
+        assert_eq!(d["stage"], "request_history");
     }
 
     #[tokio::test]
