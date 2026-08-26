@@ -111,7 +111,13 @@ pub fn render(s: &FirewallStats, path: &str, unreadable: usize) -> String {
     if s.acquisitions.is_empty() {
         o.push_str("  nothing was classified as untrusted in this window\n");
     }
-    let label_w = s.acquisitions.iter().map(|a| a.label.len()).max().unwrap_or(0).clamp(12, 32);
+    let label_w = s
+        .acquisitions
+        .iter()
+        .map(|a| a.label.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(12, 32);
     for a in &s.acquisitions {
         let tools = if a.from_tools.is_empty() {
             "-".to_string()
@@ -141,7 +147,13 @@ pub fn render(s: &FirewallStats, path: &str, unreadable: usize) -> String {
     // own file and "no-payments-after-customer-data" is a perfectly ordinary
     // one. A fixed column turned the table into ragged prose the first time a
     // real config was read.
-    let rule_w = s.verdicts.iter().map(|v| v.rule.len()).max().unwrap_or(0).clamp(20, 44);
+    let rule_w = s
+        .verdicts
+        .iter()
+        .map(|v| v.rule.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(20, 44);
     for v in &s.verdicts {
         o.push_str(&format!(
             "  {:<rule_w$} refused {:>4}   would refuse {:>4}   over {} run(s), denying {}\n",
@@ -161,7 +173,13 @@ pub fn render(s: &FirewallStats, path: &str, unreadable: usize) -> String {
     if s.attempts.is_empty() {
         o.push_str("  no tool call reached a rule\n");
     }
-    let tool_w = s.attempts.iter().map(|t| t.tool.len()).max().unwrap_or(0).clamp(16, 40);
+    let tool_w = s
+        .attempts
+        .iter()
+        .map(|t| t.tool.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(16, 40);
     for t in &s.attempts {
         o.push_str(&format!(
             "  {:<tool_w$} refused {:>4}   let through by shadow {:>4}\n",
