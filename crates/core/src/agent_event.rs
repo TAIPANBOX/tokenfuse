@@ -1510,6 +1510,34 @@ mod tests {
                 r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"algo":"ML-DSA-87"},"schema":"taipanbox.dev/agent-event/v0.2","severity":"info","source":"qryx","ts":"2026-07-24T12:00:02Z","type":"evidence_signed"}"#,
                 "sha256:998cbc146b07e115318ce378e0579fcd1927066ef4316900ec7d66ba157e7c4b",
             ),
+            // Vector 4. `delegation_proof` (SPEC 5.2) is a top-level sibling of
+            // `data`, so it is exactly the member a language's event STRUCT may
+            // have no field for. This crate is safe by construction here because
+            // `chain_hash_value` takes a parsed value rather than an
+            // `AgentEvent`, and this vector is what turns "safe by construction"
+            // into "proved on every run". Go's was not, and hashed a re-marshal
+            // of its own struct until 2026-08-26, which reported an honestly
+            // chained stream as tampered with.
+            (
+                serde_json::json!({
+                    "schema": "taipanbox.dev/agent-event/v0.3",
+                    "ts": "2026-08-26T12:00:03Z",
+                    "source": "vouchryx",
+                    "type": "delegation_issued",
+                    "agent_id": "agent://acme.example/support/tier1-bot",
+                    "severity": "info",
+                    "run_id": "run-0001",
+                    "delegation_proof": {
+                        "jti": "tok-9f2c",
+                        "jkt": "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs",
+                        "iss": "https://idryx.acme.example",
+                        "exp": 1786000000
+                    },
+                    "data": { "scope": "read:tickets" }
+                }),
+                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"scope":"read:tickets"},"delegation_proof":{"exp":1786000000,"iss":"https://idryx.acme.example","jkt":"NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs","jti":"tok-9f2c"},"run_id":"run-0001","schema":"taipanbox.dev/agent-event/v0.3","severity":"info","source":"vouchryx","ts":"2026-08-26T12:00:03Z","type":"delegation_issued"}"#,
+                "sha256:97161b1b4dd0b64d683e27611279beb7024a91d0dba2fd736d10e96edabd7680",
+            ),
         ];
         for (i, (value, want_canonical, want_hash)) in cases.iter().enumerate() {
             let got_canonical = crate::jcs::canonicalize(value);
