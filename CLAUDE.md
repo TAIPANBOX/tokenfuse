@@ -1262,6 +1262,67 @@ build)`, `cloud apns (feature build)`.
    rejected: `kill` sits open beside it on the same router, so a bespoke
    credential on one endpoint is a false comfort rather than a boundary.
 
+   **A clearance is about the BLOCKS a person read, and for its first day it
+   was not.** The fourth point above was true as written and useless in
+   practice. Taint is re-derived from the whole `messages[]` array on every
+   request and an agent loop resends the whole conversation, so "the next
+   arrival of that label" was the very block a human had just reviewed, coming
+   back on the next turn: the clearance was spent before the run's next action
+   was judged, and the valve released for exactly one request shape, a
+   follow-up carrying no tool history, which nothing sends. The test that
+   proved it worked sent that shape. It passed against the defect.
+
+   Both wire shapes carry an id per tool call, so a review is recorded against
+   ids. The same block arriving again is not an arrival; one that was not there
+   when somebody read the conversation is. `@yurii 2026-08-26` chose this over
+   the cheaper option of remembering how far the history reached.
+
+   Four decisions inside it, each of which could have gone the other way. **A
+   block with no id is never reviewed**, because the other fallback is a bypass
+   one omitted field wide, and the cost, a valve that still spends every turn
+   for a producer that sends no ids, is reported as `reviewed_blocks: 0` rather
+   than discovered on the next call. **`reviewed_blocks` is inferred when
+   absent**, meaning every block this gateway has seen on the run, which is what
+   was on the operator's screen; requiring the ids would put the question of
+   what a human read into the agent framework's hands, which is the party this
+   endpoint exists to overrule, and an id the run never carried refuses the
+   WHOLE clearance because a forward-dated review is a permanent exemption
+   bought in advance. **The set is capped at 256 blocks per run and overflow
+   drops the oldest**, so their labels return: an unbounded set is a leak, and
+   fail-closed is the direction to fail in. **`suspected_injection` follows the
+   same rule**, being the same shape one field over: it is re-derived by
+   scanning tool RESULTS each turn, so a block somebody signed for takes its
+   result with it, while a result whose call has scrolled out of the window is
+   attributed to no tool and is still scanned.
+
+   The blocks are recorded before ANY refusal can return, not beside the
+   firewall's own accumulation, and that placement is load-bearing rather than
+   tidy: a refusal is what somebody is looking at when they clear a run, and the
+   wasm hook refuses on the taint bitset and returns long before the firewall
+   block. Found by a test, after a mutant showed the wasm plane's own bitset was
+   re-derived from the unsplit history and no test in the workspace noticed.
+   *(test: `a_clearance_survives_the_history_the_next_turn_resends`, verified red
+   against the unfixed tree, verbatim `left: 403 right: 200`;
+   `a_page_read_after_the_review_is_not_covered_by_it`,
+   `a_block_carrying_no_id_is_never_read_as_reviewed`,
+   `signing_for_a_block_the_run_never_carried_is_refused`,
+   `an_injection_a_human_reviewed_does_not_come_back_every_turn` and
+   `the_wasm_plane_sees_the_clearance_the_firewall_saw` in `gateway::proxy`;
+   seven in `gateway::state::block_ledger_tests` for the ledger, its cap and its
+   cull; three in `core::taint` for the ids on both wire shapes. Ten mutants
+   planted in the PRODUCT code 2026-08-26 and all ten caught, of which two
+   survived a first pass and are why two of those tests exist: the eviction cull
+   deleted, which the bound test could not catch because it signed for blocks
+   AFTER the overflow; and the wasm plane's bitset restored to the unsplit
+   history, which nothing covered at all. Scenarios:
+   `features/agent-firewall.feature`, seven, each bound to a named test.
+   `@measured` against the release binary in enforce mode with a real upstream,
+   2026-08-26: read the board -> 403 `[web]`; a person cleared it ->
+   `{"cleared":["web"],"reviewed_blocks":1}`; the SAME conversation resent ->
+   200, with no `taint_raised` at all; the same conversation plus one unreviewed
+   page -> 403. Ten events off that run pass `agent-conform -chain`, hash chain
+   included.)*
+
    **B.4's other two gates are not built here and cannot be.** Both declassify
    a VALUE, and B.3 refuses per-value tracking in as many words, for the reason
    it gives: intractable at the proxy level, and false precision. Their
@@ -1290,6 +1351,16 @@ build)`, `cloud apns (feature build)`.
    purpose; that is the caller's shape to get right and the honest limit of a
    proxy-level model. And the key is only as good as a deployment that keeps it
    away from the agent, which is true of every operator control here.
+
+   Three more, added with the block model. A label the caller declares in the
+   `x-fuse-taint` REQUEST header is re-supplied every turn it is sent and spends
+   the clearance, which is correct, because the caller chooses to keep sending
+   it and can stop. The answer an allowed turn produces is a new action nobody
+   reviewed, so a model tool call this gateway has just permitted is accumulated
+   on the run at that moment (B.3 P2) and judged on the next turn; measured
+   live. And the `taint_cleared` event does not say WHICH blocks a clearance
+   covered, only how many the HTTP answer reports, because that would be a new
+   member on `taint_cleared_data` in `tokenfuse-core`.
 
 29. **Every verifier in this workspace shares one copy of the algorithm rule.**
    `oidc.rs` has closed the RS256-to-HS256 downgrade since it was written: the
