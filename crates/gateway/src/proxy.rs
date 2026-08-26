@@ -265,6 +265,9 @@ fn emit_taint_raised(
     from_history: &Labels,
     history_tools: &[String],
     declared: &Labels,
+    inherited: &Labels,
+    parent_run_id: &str,
+    prompt: Option<&str>,
     unit: &str,
 ) {
     if delta.added.is_empty() {
@@ -275,7 +278,7 @@ fn emit_taint_raised(
     let by_tools: Vec<String> = delta
         .added
         .iter()
-        .filter(|l| from_history.contains(*l))
+        .filter(|l| from_history.contains(*l) && !inherited.contains(*l))
         .cloned()
         .collect();
     if !by_tools.is_empty() {
@@ -305,6 +308,39 @@ fn emit_taint_raised(
                 &by_tools,
                 &culprits,
                 &carrying,
+                prompt,
+                unit,
+            ),
+        );
+        crate::events::log_outcome(EventType::TaintRaised, outcome);
+    }
+
+    // Attributed BEFORE the header, and before the tools, because inheritance
+    // is the answer a reader most needs and least expects: a label on a child
+    // that came from its parent was never about anything the child did, and
+    // filing it under "a tool carried it in" would send somebody looking
+    // through the child's history for a tool that is not there.
+    let by_parent: Vec<String> = delta
+        .added
+        .iter()
+        .filter(|l| inherited.contains(*l))
+        .cloned()
+        .collect();
+    if !by_parent.is_empty() {
+        let outcome = st.events.emit(
+            EventType::TaintRaised,
+            now_millis(),
+            Some(agent_id),
+            Some(run_id),
+            (!on_behalf_of.is_empty()).then_some(on_behalf_of),
+            taint_raised_data(
+                TaintStage::ParentRun,
+                &by_parent,
+                // No tool carried these in on THIS run. The ancestor that did
+                // is named instead, so the trail is walkable one hop up.
+                std::slice::from_ref(&parent_run_id.to_string()),
+                &carrying,
+                prompt,
                 unit,
             ),
         );
@@ -314,7 +350,7 @@ fn emit_taint_raised(
     let by_header: Vec<String> = delta
         .added
         .iter()
-        .filter(|l| declared.contains(*l) && !from_history.contains(*l))
+        .filter(|l| declared.contains(*l) && !from_history.contains(*l) && !inherited.contains(*l))
         .cloned()
         .collect();
     if !by_header.is_empty() {
@@ -324,7 +360,14 @@ fn emit_taint_raised(
             Some(agent_id),
             Some(run_id),
             (!on_behalf_of.is_empty()).then_some(on_behalf_of),
-            taint_raised_data(TaintStage::RequestHeader, &by_header, &[], &carrying, unit),
+            taint_raised_data(
+                TaintStage::RequestHeader,
+                &by_header,
+                &[],
+                &carrying,
+                prompt,
+                unit,
+            ),
         );
         crate::events::log_outcome(EventType::TaintRaised, outcome);
     }
@@ -1332,12 +1375,20 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     // Agent firewall: accumulate the run's taint from this request (header +
     // tool history) so the response's tool calls can be judged against it.
     // Computed before `send` consumes `headers`.
+    let mut firewall_prompt: Option<String> = None;
     let firewall_labels = if st.firewall.mode != FirewallMode::Off {
         let declared = taint_header_labels(&headers);
         let history_tools = taint::tool_names_in(&request);
         let from_history = taint::labels_for_tools(&history_tools, &st.firewall.sources);
+        // docs/07 B.3 P3. Recorded before the walk so the FIRST call on a child
+        // already inherits: a chain nobody noted is a chain that resolves to
+        // nothing, and the whole firewall was one header away from off.
+        let prompt = tokenfuse_core::agent_event::prompt_hash(&request);
+        st.note_taint_parent(&run_id, &parent_run_id);
+        let inherited = st.inherited_taint(&run_id);
         let mut labels = declared.clone();
         labels.extend(from_history.clone());
+        labels.extend(inherited.clone());
         let delta = st.accumulate_taint(&run_id, labels);
         // Record the ACQUISITION, not only the eventual refusal. A label is
         // new to a run exactly once, so this is bounded and quiet, and without
@@ -1353,8 +1404,12 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &from_history,
             &history_tools,
             &declared,
+            &inherited,
+            &parent_run_id,
+            prompt.as_deref(),
             &unit,
         );
+        firewall_prompt = prompt;
         delta.carrying
     } else {
         Labels::new()
@@ -1418,6 +1473,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             cache_ctx,
             cache_note,
             firewall_labels,
+            firewall_prompt,
             &agent_id,
             &parent_run_id,
             &on_behalf_of,
@@ -1612,6 +1668,11 @@ async fn buffered_managed(
     cache_ctx: Option<CacheCtx>,
     cache_note: Option<String>,
     firewall_labels: Labels,
+    // The instruction this turn carried, by hash. Threaded through rather than
+    // recomputed here because the request body is gone by this point: `send`
+    // consumed it, and a settle path that re-derived it would be deriving it
+    // from something else.
+    firewall_prompt: Option<String>,
     agent_id: &str,
     parent_run_id: &str,
     on_behalf_of: &str,
@@ -1796,6 +1857,7 @@ async fn buffered_managed(
                         TaintEnforcement::Enforce,
                         &verdict,
                         &resp_tools,
+                        firewall_prompt.as_deref(),
                         unit,
                     ),
                 );
@@ -1817,6 +1879,7 @@ async fn buffered_managed(
                     TaintEnforcement::Shadow,
                     &verdict,
                     &resp_tools,
+                    firewall_prompt.as_deref(),
                     unit,
                 ),
             );
@@ -2438,7 +2501,7 @@ fn semantic_core(request: &serde_json::Value) -> String {
     text.chars().take(512).collect()
 }
 
-fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -2458,7 +2521,7 @@ fn mode_str(mode: Mode) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     // -- which refusals get a second, specific event -----------------------
 
@@ -3688,6 +3751,151 @@ mod tests {
         assert_eq!(d["added"], serde_json::json!(["web"]));
         assert_eq!(d["from_tools"], serde_json::json!(["web_search"]));
         assert_eq!(d["stage"], "request_history");
+    }
+
+    #[tokio::test]
+    async fn the_record_says_which_instruction_the_turn_carried() {
+        // "Можливо, також, щоб можна було визначити, після яких саме промтів
+        // агент почав робити аномалії" (@yurii 2026-08-26). By hash, so the
+        // question is answerable without the record holding a word of it:
+        // identical instructions collapse, and a changed one is visible at the
+        // turn it changed.
+        let (events, path) = recording_exporter("prompt-hash");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"web_search","input":{}}]},
+            {"role":"user","content":"summarise what you found and then clean up"}
+        ]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-prompted")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::FORBIDDEN);
+
+        let rows = firewall_events(&path);
+        let raised = rows.iter().find(|e| e["type"] == "taint_raised").unwrap();
+        let blocked = rows.iter().find(|e| e["type"] == "taint_block").unwrap();
+
+        let want = tokenfuse_core::agent_event::prompt_hash(&serde_json::json!({
+            "messages": [{"role": "user", "content": "summarise what you found and then clean up"}]
+        }))
+        .unwrap();
+        // On BOTH, and that is the point: the turn a run became untrusted and
+        // the turn it tried something are the two an investigation reads, and
+        // they are usually not the same turn.
+        assert_eq!(raised["data"]["prompt_hash"], want);
+        assert_eq!(blocked["data"]["prompt_hash"], want);
+        assert!(
+            !serde_json::to_string(&rows).unwrap().contains("summarise"),
+            "a hash, and no word of the instruction anywhere on the bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_instruction_records_no_hash_rather_than_an_empty_one() {
+        // An agent-driven turn carrying only tool results has no user message,
+        // and a field present-but-empty would read as "we looked and there was
+        // nothing", which is a different claim from "this turn had none".
+        let (events, path) = recording_exporter("prompt-none");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"web_search","input":{}}]}
+        ]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-silent")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::FORBIDDEN);
+        let rows = firewall_events(&path);
+        assert!(!rows.is_empty());
+        for e in rows {
+            assert!(e["data"]["prompt_hash"].is_null(), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sub_run_cannot_launder_its_parents_taint() {
+        // NOT a missing feature: a bypass. docs/07 B.3 P3 has always said a
+        // subagent inherits its parent's taint by default, and until now the
+        // taint map was keyed on `run_id` alone, so the entire firewall was
+        // one `x-fuse-parent-run-id` header away from being switched off.
+        //
+        // Taint the parent by reading the web, then have a child ask to run a
+        // shell. Before this change the child was a clean run and the shell
+        // went through.
+        let (events, path) = recording_exporter("sub-run-launder");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        // The parent reads the web. Its own answer asks for nothing dangerous.
+        let history = r#"{"model":"test-model","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"web_search","input":{}}]}
+        ]}"#;
+        let parent = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-parent")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(history))
+            .unwrap();
+        assert_eq!(
+            call(st.clone(), parent).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // The child declares the parent and its own history is spotless.
+        let child = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-child")
+            .header("x-fuse-parent-run-id", "run-parent")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(
+            call(st, child).await.status(),
+            StatusCode::FORBIDDEN,
+            "the child is judged against what its parent touched, or spawning \
+             one is how you get your exec back"
+        );
+
+        let blocked: Vec<_> = firewall_events(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "taint_block" && e["run_id"] == "run-child")
+            .collect();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0]["data"]["labels"],
+            serde_json::json!(["web"]),
+            "and the record names what it inherited, not an empty set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_declares_itself_its_own_ancestor_does_not_hang_the_box() {
+        // The parent chain comes off a request header, so its shape is the
+        // caller's to choose, and a cycle is one line of curl. A resolver that
+        // walked it without a visited set would spin inside a lock held on the
+        // request path, which is a denial of service on the whole gateway
+        // rather than on one run.
+        let (events, path) = recording_exporter("taint-cycle");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        for (run, parent) in [("cyc-a", "cyc-b"), ("cyc-b", "cyc-a")] {
+            let req = Request::post("/v1/messages")
+                .header("x-fuse-run-id", run)
+                .header("x-fuse-parent-run-id", parent)
+                .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+                .header("x-fuse-taint", "web")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(body(100)))
+                .unwrap();
+            // Answering at all is the assertion: the failure mode is a hang.
+            assert_eq!(call(st.clone(), req).await.status(), StatusCode::FORBIDDEN);
+        }
+        assert!(!firewall_events(&path).is_empty());
     }
 
     #[tokio::test]

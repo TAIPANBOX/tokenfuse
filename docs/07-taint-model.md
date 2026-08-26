@@ -119,16 +119,16 @@ live upstream.
 |---|---|
 | B.2 source classification | Built, as a JSON policy file. Multiple labels per source, per the spec's `labels: [...]`. Matching is on tool NAME only: `mcp_server` and `args.path` globs are not built. |
 | B.3 P1, P2 monotonic accumulation | Built. |
-| B.3 P3 subagent inherits the parent's taint | **Not built.** Taint is keyed by `run_id` alone, so a sub-run starts clean. |
+| B.3 P3 subagent inherits the parent's taint | Built 2026-08-26. Resolved on every request by walking the declared parent chain, so a parent that becomes untrusted AFTER its child started is picked up on the child's next call. |
 | B.3 P4 a new run is a clean set | Built, by the same keying. |
 | B.4 sanitization gates | **None of the three is built.** A label, once acquired, is carried for the life of the run. |
 | B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. |
 | B.6 policy file | Built, in JSON rather than YAML (see below). `mode` and named `rules` with `when_any`/`deny`. `action:` is not built: every rule blocks. `require_approval` and `sanitize_gate` do not exist, so `sanitizers:` and `approval:` are unimplemented. |
 | B.7 level 1, proxy advisory | Built. |
-| B.7 level 2, SDK `POST /v1/fuse/check-tool-call` | **Not built.** No such endpoint exists. |
-| B.7 level 3, MCP gateway enforcement | **Not built** for taint. The broker has its own Wardryx gate, which is a different decision. |
+| B.7 level 2, SDK `POST /v1/fuse/check-tool-call` | Built 2026-08-26. Judges and does not accumulate. Always HTTP 200 with the decision in the body. |
+| B.7 level 3, MCP gateway enforcement | Built 2026-08-26, as a CLIENT of level 2. `tokenfuse mcp-broker` is a separate process invocation with no taint state of its own, so it asks the gateway rather than judging; one judge, reached from both doors. Off unless `TOKENFUSE_MCP_TAINT_GATEWAY` names one. |
 | B.9 anti-exfiltration on and undisableable | Built, in enforce mode, including against a policy file that omits it. |
-| B.9 the firewall on by default | **No.** `TOKENFUSE_FIREWALL` still defaults to `off`, so out of the box this subsystem protects nothing. Turning it on is an operator decision and stays one. |
+| B.9 the firewall on by default | **`shadow` since 2026-08-26**, `off` before it. Shadow refuses nothing, so no request that worked yesterday fails today; what it does is write. `TOKENFUSE_FIREWALL=off` restores the old silence exactly. `enforce` stays an operator decision. |
 
 ### JSON, not YAML
 
@@ -181,6 +181,58 @@ Both verdict types carry the same `data`: `stage`, `mode`, `rule`, `labels`,
 `requested`, `denied`, `tools`. `denied` says a category was refused; `tools`
 says which door was tried. `taint_raised` carries `stage`, `added`,
 `from_tools`, `carrying`.
+
+### The three enforcement points, and what each is worth
+
+| door | who asks | what it is worth |
+|---|---|---|
+| `/v1/messages` | nobody; the gateway judges the model's answer | advisory. The gateway replaces the response with a 403; a client that ignores it runs the tool anyway. |
+| `POST /v1/fuse/check-tool-call` | an executor, before running a tool | hard, for a client that acts on the answer, which is the only reason it asked. |
+| `tokenfuse mcp-broker` | nobody; the broker judges before forwarding | hard for anything that goes through the broker at all, whether or not it asks. |
+
+Level 2's answer distinguishes three things and not two: `allow` because
+nothing objected, `allow` because the firewall is OFF (`governed: false`), and
+`allow` because it is in shadow and a rule DID object (`would_block` present).
+A client that folded those together would report "the gateway permitted this"
+for a box where nothing was asked, which is `dependency_failed`'s
+`allowed_ungoverned` mistake one plane over.
+
+Level 3 is a client of level 2 and not a second judge. The broker is a separate
+process invocation with its own state, so a taint map of its own would be a
+second answer about one run, and an operator reading a refusal at one door and
+a permission at the other would have no way to tell which was right. It needs
+`x-fuse-run-id` on the call, because taint is per run and MCP carries no run
+identity; without one, `TOKENFUSE_MCP_TAINT_FAILMODE=closed` refuses and the
+default lets it through. A gateway it cannot reach is recorded as
+`dependency_failed` naming the policy plane, exactly as the LLM path records
+its own unreachable PDP.
+
+### Which instruction a turn carried
+
+Both taint families carry `data.prompt_hash`: `sha384:<hex>` over the LAST user
+message's text, or absent when the turn had none.
+
+The last message and not the history, because hashing the conversation produces
+a value that changes every turn and groups nothing. What this answers is "did
+these four incidents come from one instruction" and "did the instruction change
+at the turn things went wrong", and only the newest instruction has that
+property.
+
+A hash and only a hash. Identical instructions collapse, a changed one is
+visible at the turn it changed, and an instruction somebody still has can be
+confirmed against it. What it cannot do is tell you what the text said, which
+is the point: nothing here holds content, so nothing here needs erasing. It is
+on the ACQUISITION as well as on the verdict, because the turn a run became
+untrusted and the turn it tried something are usually not the same turn, and an
+investigation reads both.
+
+**It does not reach trailryx's `basis.prompt_hash`, and that is correct.** That
+field is typed metadata, which is unerasable by design, and this value arrives
+in `data`, which trailryx's mapper is forbidden from reading into a typed
+field. So it lands in the payload plane with the rest of `data`, behind the key
+whose destruction erases it. A hash of a prompt is a pseudonymous identifier of
+content that may be personal, and putting one where erasure cannot reach is the
+mistake that store's own documentation warns about for `agent_id`.
 
 ### Reading it back
 

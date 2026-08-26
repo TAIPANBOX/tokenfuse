@@ -120,7 +120,7 @@ pub fn render(s: &FirewallStats, path: &str, unreadable: usize) -> String {
         .clamp(12, 32);
     for a in &s.acquisitions {
         let tools = if a.from_tools.is_empty() {
-            "-".to_string()
+            "no tool on this run".to_string()
         } else {
             a.from_tools
                 .iter()
@@ -128,11 +128,20 @@ pub fn render(s: &FirewallStats, path: &str, unreadable: usize) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let declared = if a.declared > 0 {
-            format!("   [declared by the caller: {}]", a.declared)
-        } else {
-            String::new()
-        };
+        let mut extra = String::new();
+        if a.declared > 0 {
+            extra.push_str(&format!("   [declared by the caller: {}]", a.declared));
+        }
+        // Said apart from the tools, because an inherited label is not
+        // something the run did: it came down the parent chain, and a reader
+        // sent looking through this run's own history will not find it.
+        if a.inherited > 0 {
+            extra.push_str(&format!(
+                "   [inherited from a parent run: {}]",
+                a.inherited
+            ));
+        }
+        let declared = extra;
         o.push_str(&format!(
             "  {:<label_w$} {:>4} run(s)   from {tools}{declared}\n",
             a.label, a.runs
