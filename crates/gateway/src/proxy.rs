@@ -3696,6 +3696,7 @@ pub(crate) mod tests {
                 e["type"] == "taint_block"
                     || e["type"] == "taint_shadow"
                     || e["type"] == "taint_raised"
+                    || e["type"] == "taint_cleared"
             })
             .collect()
     }
@@ -3998,6 +3999,215 @@ pub(crate) mod tests {
             let added = e["data"]["added"].to_string();
             assert!(!added.contains("suspected_injection"), "{e}");
         }
+    }
+
+    #[tokio::test]
+    async fn taint_flows_down_a_chain_and_never_up_it() {
+        // docs/07 B.3 P4's quarantined sub-run, and the property the whole
+        // pattern rests on. B.4's OTHER two gates are per-VALUE: a schema
+        // extractor declassifies a `{"price": 42.10}` and an allowlist
+        // transformation declassifies a parsed date. This model is per-RUN and
+        // B.3 says so on purpose ("deliberately WITHOUT partial tracking...
+        // intractable at the proxy level and gives false precision"), so
+        // neither gate can be expressed here at all. What CAN be expressed is
+        // P4: read the dirty thing in a sub-run, hand the parent only what came
+        // out, and the parent never becomes untrusted.
+        //
+        // That works today, and nothing asserted it. A change that made
+        // inheritance symmetric would silently turn the estate's one
+        // sanctioned way of handling dirty data into a way of spreading it, and
+        // every quarantine already written would start poisoning its caller.
+        let (events, _path) = recording_exporter("quarantine");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+
+        // The quarantine reads the web and becomes untrusted.
+        st.note_taint_parent("q-child", "q-clean");
+        st.accumulate_taint("q-child", ["web".to_string()].into_iter().collect());
+
+        // The parent, which only ever saw the extracted value, is not.
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "q-clean")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(
+            call(st.clone(), req).await.status(),
+            StatusCode::OK,
+            "a caller is not tainted by what its quarantine read, or the pattern \
+             B.3 P4 sanctions would be a way of spreading dirt rather than \
+             containing it"
+        );
+
+        // And the quarantine itself is still refused, which is the other half:
+        // containment that let the dirty run act would contain nothing.
+        let child = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "q-child")
+            .header("x-fuse-parent-run-id", "q-clean")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, child).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_human_who_reviewed_the_context_can_let_a_label_go() {
+        // docs/07 B.4 gate 1, and the release valve the model has never had.
+        // Taint is monotonic with no way back, so a label lasts the life of a
+        // run, and since 2026-08-26 it is inherited too: one long-lived parent
+        // makes every child untrusted forever. B.10 names conservativeness as
+        // the cost and B.4 as the valve, and the valve was not built. An
+        // operator whose fleet is refused all day turns the firewall off.
+        let (events, path) = recording_exporter("declassify");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        st.accumulate_taint("run-reviewed", ["web".to_string()].into_iter().collect());
+
+        let cleared = declassify(
+            st.clone(),
+            r#"{"run_id":"run-reviewed","agent_id":"agent://test.local/rehearsal","labels":["web"],
+                "actor":"user://acme.example/s.dawson",
+                "reason":"read the page myself; it is our own status board"}"#,
+        )
+        .await;
+        assert_eq!(cleared["cleared"], serde_json::json!(["web"]));
+
+        // The run that was refused a moment ago is now allowed.
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-reviewed")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        assert_eq!(call(st, req).await.status(), StatusCode::OK);
+
+        let rows = firewall_events(&path);
+        let ev = rows
+            .iter()
+            .find(|e| e["type"] == "taint_cleared")
+            .expect("lifting a control is at least as visible as applying one");
+        assert_eq!(ev["severity"], "high");
+        assert_eq!(ev["data"]["actor"], "user://acme.example/s.dawson");
+        assert!(ev["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("status board"));
+    }
+
+    #[tokio::test]
+    async fn a_clearance_is_spent_by_the_next_arrival_of_that_label() {
+        // The human reviewed what was THERE, not what comes next. A clearance
+        // that survived the next arrival would mean one review buys an agent
+        // permanent exemption, which is worse than no valve at all.
+        let (events, _path) = recording_exporter("declassify-spent");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        st.accumulate_taint("run-again", ["web".to_string()].into_iter().collect());
+        declassify(
+            st.clone(),
+            r#"{"run_id":"run-again","agent_id":"agent://test.local/rehearsal","labels":["web"],
+                "actor":"user://acme.example/s.dawson","reason":"reviewed"}"#,
+        )
+        .await;
+
+        // It reads the web again.
+        let payload = r#"{"model":"test-model","max_tokens":100,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","name":"web_search","input":{}}]}
+        ]}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-again")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(payload))
+            .unwrap();
+        assert_eq!(
+            call(st, req).await.status(),
+            StatusCode::FORBIDDEN,
+            "a fresh page is a fresh page"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_child_says_the_parent_still_carries_it() {
+        // Otherwise the valve looks broken: clear the child, watch the label
+        // come straight back on its next call, and conclude the feature does
+        // not work. It does; the job is half done, and the answer says which
+        // half. Clearing a child while its parent is dirty is not a bug to fix
+        // by making inheritance quieter, it is a fact to report.
+        let (events, _path) = recording_exporter("declassify-child");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        st.accumulate_taint("dc-parent", ["web".to_string()].into_iter().collect());
+        st.note_taint_parent("dc-child", "dc-parent");
+        st.accumulate_taint("dc-child", ["web".to_string()].into_iter().collect());
+
+        let answer = declassify(
+            st,
+            r#"{"run_id":"dc-child","agent_id":"agent://test.local/rehearsal","labels":["web"],
+                "actor":"user://acme.example/s.dawson","reason":"reviewed"}"#,
+        )
+        .await;
+        assert_eq!(answer["cleared"], serde_json::json!(["web"]));
+        assert_eq!(
+            answer["still_inherited"],
+            serde_json::json!(["web"]),
+            "and it names where from, so the operator finishes the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_cannot_be_let_go_at_all() {
+        // docs/07 B.9 locks anti-exfiltration on in enforce mode. Clearing the
+        // `secrets` label would make that rule unreachable for a run, which is
+        // disabling it by another door, and a door is what somebody finds.
+        let (events, _path) = recording_exporter("declassify-secrets");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        st.accumulate_taint("run-vault", ["secrets".to_string()].into_iter().collect());
+        let answer = declassify(
+            st,
+            r#"{"run_id":"run-vault","agent_id":"agent://test.local/rehearsal","labels":["secrets"],
+                "actor":"user://acme.example/s.dawson","reason":"I looked"}"#,
+        )
+        .await;
+        assert_eq!(answer["cleared"], serde_json::json!([]));
+        assert!(
+            answer["refused"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|l| l == "secrets")),
+            "refused by name rather than silently ignored: {answer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clearance_with_no_human_and_no_reason_is_not_a_clearance() {
+        // The two fields that make this an audit record rather than a hole. An
+        // `agent://` actor is refused outright: an agent clearing its own taint
+        // is the bypass this whole endpoint has to not be.
+        let (events, _path) = recording_exporter("declassify-bad");
+        let st = firewall_state(FirewallMode::Enforce, WANTS_EXEC).with_events(events);
+        st.accumulate_taint("run-bad", ["web".to_string()].into_iter().collect());
+
+        for body_json in [
+            r#"{"run_id":"run-bad","agent_id":"agent://test.local/rehearsal","labels":["web"],"actor":"agent://test.local/rehearsal","reason":"trust me"}"#,
+            r#"{"run_id":"run-bad","agent_id":"agent://test.local/rehearsal","labels":["web"],"actor":"user://a/b"}"#,
+            r#"{"run_id":"run-bad","agent_id":"agent://test.local/rehearsal","labels":["web"],"reason":"no actor"}"#,
+        ] {
+            let answer = declassify(st.clone(), body_json).await;
+            assert_eq!(
+                answer["cleared"],
+                serde_json::json!([]),
+                "nothing cleared for {body_json}"
+            );
+            assert!(answer["error"].is_string(), "and it says why: {answer}");
+        }
+    }
+
+    async fn declassify(st: AppState, body: &str) -> serde_json::Value {
+        let req = Request::post("/v1/fuse/declassify")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = crate::app(st).oneshot(req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).expect("a JSON answer")
     }
 
     #[tokio::test]

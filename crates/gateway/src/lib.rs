@@ -8,6 +8,7 @@ pub mod clientkeys;
 pub mod cloudsink;
 pub mod compliancecli;
 pub mod constants;
+pub mod declassify;
 pub mod defaults;
 pub mod embedder;
 pub mod estimate;
@@ -70,6 +71,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/agent-ids", get(agentids::agent_ids))
         // docs/07 B.7 level 2: an executor asks BEFORE it runs a tool.
         .route("/v1/fuse/check-tool-call", post(toolcheck::check_tool_call))
+        // docs/07 B.4 gate 1: a human reviewed it, so the label comes off.
+        .route("/v1/fuse/declassify", post(declassify::declassify))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }

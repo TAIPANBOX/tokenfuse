@@ -223,6 +223,30 @@ pub enum EventType {
     /// unit}`. `carrying` is the full set AFTER the addition, so a reader
     /// following a run forward never has to re-derive the running total.
     TaintRaised,
+    /// A human let a taint label go, per docs/07 B.4 gate 1: they reviewed the
+    /// content and the run is no longer judged against that label.
+    ///
+    /// Added 2026-08-26. The model is monotonic with no way back, so a label
+    /// lasted the life of a run, and since inheritance shipped the same
+    /// morning one long-lived parent made every child untrusted forever. B.10
+    /// names conservativeness as the price and B.4 as the valve; the valve was
+    /// never built, and an operator whose fleet is refused all day turns the
+    /// whole firewall off, which costs them the model that WAS working.
+    ///
+    /// `high`, the same band as [`TaintBlock`](Self::TaintBlock), and that is
+    /// the judgement. Lifting a control deserves at least the visibility of
+    /// applying one: this is the single event where the firewall's guarantee
+    /// is deliberately suspended for a run, and an estate that pages when a
+    /// rule fires and stays quiet when a human switches it off has its weights
+    /// backwards. It is rare by construction, so the band costs no noise.
+    ///
+    /// `data` carries `{labels, actor, reason, authenticated,
+    /// still_inherited}`. `actor` and `reason` are what make it an audit
+    /// record rather than a hole, and both are refused when absent.
+    /// `still_inherited` names labels a clearance is not hiding because an
+    /// ancestor keeps supplying them, so a half-done job says so instead of
+    /// looking like a broken feature.
+    TaintCleared,
 }
 
 /// How much of a transport error's text travels in `data.detail`.
@@ -532,6 +556,32 @@ pub fn taint_verdict_data(
     })
 }
 
+/// The `data` object for [`EventType::TaintCleared`], built in one place.
+///
+/// `authenticated` says whether the caller presented the declassify key, and it
+/// is on the event rather than assumed because the key is optional on a gateway
+/// whose other control (`/v1/runs/{id}/kill`) has none either. An auditor
+/// reading a clearance needs to tell one made behind a credential from one made
+/// on network placement alone, and a field that is always `true` would be worth
+/// nothing.
+pub fn taint_cleared_data(
+    labels: &[String],
+    actor: &str,
+    reason: &str,
+    authenticated: bool,
+    still_inherited: &[String],
+    unit: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "labels": labels,
+        "actor": actor,
+        "reason": truncate_detail(reason),
+        "authenticated": authenticated,
+        "still_inherited": still_inherited,
+        "unit": (!unit.is_empty()).then_some(unit),
+    })
+}
+
 /// The `data` object for [`EventType::TaintRaised`], built in one place.
 ///
 /// `added` is only what was NEW to this run, never the whole set: a run that
@@ -593,6 +643,7 @@ impl EventType {
             EventType::DependencyFailed => "dependency_failed",
             EventType::TaintShadow => "taint_shadow",
             EventType::TaintRaised => "taint_raised",
+            EventType::TaintCleared => "taint_cleared",
         }
     }
 
@@ -603,6 +654,7 @@ impl EventType {
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
     /// `budget_threshold` / `breaker_tripped` / `taint_shadow` = `medium`;
+    /// `taint_cleared` = `high`;
     /// `tool_call` / `taint_raised` = `low`.
     ///
     /// `breaker_tripped` was `critical` until 2026-08-03, which meant every
@@ -639,6 +691,7 @@ impl EventType {
             | EventType::RunKilled
             | EventType::UnitCapExceeded
             | EventType::PolicyDeny
+            | EventType::TaintCleared
             | EventType::DependencyFailed => Severity::High,
             // An early warning, on purpose one band below the incident it
             // warns about: the run is still inside its budget. Beside it, the

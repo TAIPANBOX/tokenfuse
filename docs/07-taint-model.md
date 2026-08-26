@@ -121,7 +121,8 @@ live upstream.
 | B.3 P1, P2 monotonic accumulation | Built. |
 | B.3 P3 subagent inherits the parent's taint | Built 2026-08-26. Resolved on every request by walking the declared parent chain, so a parent that becomes untrusted AFTER its child started is picked up on the child's next call. |
 | B.3 P4 a new run is a clean set | Built, by the same keying. |
-| B.4 sanitization gates | **None of the three is built.** A label, once acquired, is carried for the life of the run. |
+| B.4 gate 1, human-approve | Built 2026-08-26. `POST /v1/fuse/declassify`. |
+| B.4 gates 2 and 3, extraction and allowlist transforms | **Not built here, and cannot be**: both declassify a VALUE, and B.3 refuses per-value tracking on purpose. Their run-level expression is B.3 P4's quarantined sub-run, which works and is now asserted. See below. |
 | B.10's "semantic content analysis complements this" | Built 2026-08-26, as a taint SOURCE and never as a decision. See below. |
 | B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. |
 | B.6 policy file | Built, in JSON rather than YAML (see below). `mode` and named `rules` with `when_any`/`deny`. `action:` is not built: every rule blocks. `require_approval` and `sanitize_gate` do not exist, so `sanitizers:` and `approval:` are unimplemented. |
@@ -174,6 +175,7 @@ shadow mode wrote nothing at all.
 
 | type | band | when |
 |---|---|---|
+| `taint_cleared` | `high` | a human reviewed the content and let a label go (B.4 gate 1). `data` carries `{labels, actor, reason, authenticated, still_inherited}`. |
 | `taint_raised` | `low` | a run acquired a label it did not have. Fires once per label per run, since taint is monotonic. `data.stage` says where from: `request_history` (a tool was called), `request_header` (the caller declared it), `parent_run` (an ancestor carried it), `tool_result` (a document said something instruction-shaped, with `data.signals` naming which patterns). |
 | `taint_shadow` | `medium` | the filter would have refused and did not, because the mode is shadow. The action was PERMITTED. |
 | `taint_block` | `high` | the filter refused. |
@@ -292,6 +294,82 @@ JSON, so a linear sweep over them is cheaper than the parse that produced them.
 
 It is defeatable by anybody who reads that file, which is public. That is
 acceptable only because it cannot lower a gate.
+
+### The release valve, and where the other two gates actually live
+
+**Gate 1 is built.** `POST /v1/fuse/declassify` takes `{run_id, agent_id,
+labels, actor, reason}` and takes those labels off that run.
+
+It is the valve B.10 promised and the model never had. Taint is monotonic, so a
+label lasted the life of a run, and once inheritance shipped one long-lived
+parent made every child untrusted forever. An operator whose fleet is refused
+all day switches the firewall off, which costs them the coarse model that WAS
+working.
+
+Four things keep it from being the bypass, and none of them is obscurity:
+
+- **`actor` must be a `user://` principal.** An `agent://` actor is refused
+  outright. An agent clearing its own taint is exactly what this must not be.
+- **`reason` is required.** A human lifting a control without saying why is the
+  audit hole, not the control.
+- **`secrets` can never be cleared.** B.9 locks anti-exfiltration on in enforce
+  mode, and clearing that label makes the rule unreachable for a run, which is
+  disabling it by another door.
+- **A clearance is spent by the next arrival of that label.** They reviewed what
+  was there, not what comes next. Measured live: cleared, allowed, read the web
+  again, refused again.
+
+`agent_id` is required and is not a formality: `Exporter::emit` SKIPS an event
+with no subject and counts the skip, because SPEC 6.1 forbids inventing one. An
+optional field there would have meant clearances applied and never recorded,
+which is the worst outcome available at this endpoint. Found by a test, not by
+reading.
+
+Recorded as `taint_cleared` at `high`, the band a block takes. An estate that
+pages when a rule fires and stays quiet when a human switches it off has its
+weights backwards. `data.authenticated` says whether the caller presented
+`TOKENFUSE_DECLASSIFY_KEY`; when that variable is unset this endpoint is
+protected by network placement exactly as `/v1/runs/{id}/kill` is, and an
+auditor needs to tell those apart. A field that was always `true` would be
+worth nothing.
+
+Clearing a CHILD while its parent is dirty returns `still_inherited`, naming
+what a clearance is not hiding. Without that line the valve reads as broken: the
+label comes straight back on the next call, correctly, because the parent is
+still dirty and the child is still downstream of it. The job is half done and
+the answer says which half.
+
+**Gates 2 and 3 are not built here, and the reason is structural rather than
+scheduling.** Both declassify a VALUE: a schema extractor turns tainted text
+into `{"price": 42.10}` and declassifies the number; an allowlist transformation
+declassifies a parsed date. This model has no values. B.3 says so in as many
+words, and says why: partial tracking is "intractable at the proxy level and
+gives false precision". A gateway that claimed to declassify a value would be
+claiming a precision it cannot have.
+
+Their run-level expression is the one B.3 P4 already sanctions: **a quarantined
+sub-run.** Read the dirty document in a child run, extract what you need,
+and hand the parent only the extracted value. The parent never becomes
+untrusted, because taint flows DOWN a chain and never up it.
+
+```
+  run A  (clean)              the caller
+    |  spawns, declaring A as parent
+  run B  (reads the page, becomes `web`, may not exec/write/egress)
+    |  returns {"price": 42.10}
+  run A  still clean: it never saw the page
+```
+
+That property is what the whole pattern rests on and nothing asserted it until
+2026-08-26. A change making inheritance symmetric would have turned the estate's
+one sanctioned way of handling dirty data into a way of spreading it, and every
+quarantine already written would have started poisoning its caller. It is now a
+test: `taint_flows_down_a_chain_and_never_up_it`.
+
+What the gateway does NOT do for that pattern is enforce it. Nothing stops a
+caller from declaring the quarantine as the parent of a clean run, which flows
+the taint the wrong way round on purpose. That is the caller's shape to get
+right, and it is the honest limit of a proxy-level model.
 
 ### Reading it back
 

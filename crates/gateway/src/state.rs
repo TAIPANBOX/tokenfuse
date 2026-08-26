@@ -109,6 +109,13 @@ pub struct AppState {
     pub keystats: Arc<KeyStats>,
 }
 
+/// The one label no review can take off a run.
+///
+/// docs/07 B.9 locks anti-exfiltration on in enforce mode. Clearing `secrets`
+/// would make that rule unreachable for the run, which is disabling it by
+/// another door, and a door is what somebody eventually finds.
+pub const UNCLEARABLE: &str = "secrets";
+
 /// The run-taint store, held apart from [`AppState`] so more than one door can
 /// judge against one state.
 ///
@@ -119,6 +126,9 @@ pub struct AppState {
 #[derive(Debug, Default)]
 pub struct TaintStore {
     labels: Mutex<HashMap<String, Labels>>,
+    /// Labels a human has let go of, per run, and not yet re-acquired
+    /// (docs/07 B.4 gate 1). See [`TaintStore::clear`].
+    cleared: Mutex<HashMap<String, Labels>>,
     /// Child run -> the parent it declared, for docs/07 B.3 P3. Separate from
     /// the ledger's budget hierarchy: that one is about money and is opened
     /// once per run, this is consulted on every request and must survive a
@@ -179,6 +189,58 @@ impl TaintStore {
         out
     }
 
+    /// Let a human's review take a label off a run (docs/07 B.4 gate 1).
+    ///
+    /// Returns what was actually let go. `secrets` is never among it: docs/07
+    /// B.9 locks anti-exfiltration on in enforce mode, and clearing that label
+    /// would make the rule unreachable for a run, which is disabling it by
+    /// another door.
+    ///
+    /// **A clearance is spent by the next arrival of that label.** The human
+    /// reviewed what was THERE, not what comes next, and a clearance that
+    /// survived the next arrival would mean one review buys an agent a
+    /// permanent exemption, which is worse than having no valve at all. See
+    /// [`accumulate`](Self::accumulate), which is where it is spent.
+    pub fn clear(&self, run_id: &str, labels: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut refused = Vec::new();
+        let mut cleared = Vec::new();
+        let mut own = self.labels.lock().unwrap();
+        let mut gone = self.cleared.lock().unwrap();
+        let entry = gone.entry(run_id.to_string()).or_default();
+        for l in labels {
+            if l == UNCLEARABLE {
+                refused.push(l.clone());
+                continue;
+            }
+            entry.insert(l.clone());
+            if let Some(set) = own.get_mut(run_id) {
+                set.remove(l);
+            }
+            cleared.push(l.clone());
+        }
+        cleared.sort();
+        refused.sort();
+        (cleared, refused)
+    }
+
+    /// Labels this run is judged against that a clearance is NOT hiding,
+    /// because they are still arriving from an ancestor.
+    ///
+    /// Reported back to whoever cleared, so a half-done job says so instead of
+    /// looking like a broken feature: clear a child while its parent is dirty
+    /// and the label returns on the child's very next call, correctly, because
+    /// the parent is still dirty and the child is still downstream of it.
+    pub fn still_inherited(&self, run_id: &str, labels: &[String]) -> Vec<String> {
+        let inherited = self.inherited(run_id);
+        let mut out: Vec<String> = labels
+            .iter()
+            .filter(|l| inherited.contains(*l))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Merge `new_labels` into a run's set and report what changed.
     ///
     /// Returns the delta as well as the total because a caller has to be able
@@ -187,6 +249,18 @@ impl TaintStore {
     /// total, which is why the acquisition could not be recorded: by the time
     /// the set was in hand there was no way left to know which of it was new.
     pub fn accumulate(&self, run_id: &str, new_labels: Labels) -> TaintDelta {
+        // Spending a clearance, and it happens HERE rather than in `clear`
+        // because "the next arrival" is an arrival, and this is the only place
+        // one happens. A label supplied again by a tool, a header or an
+        // ancestor takes its clearance with it.
+        if !new_labels.is_empty() {
+            let mut gone = self.cleared.lock().unwrap();
+            if let Some(set) = gone.get_mut(run_id) {
+                for l in &new_labels {
+                    set.remove(l);
+                }
+            }
+        }
         let mut map = self.labels.lock().unwrap();
         let entry = map.entry(run_id.to_string()).or_default();
         let added: Labels = new_labels.difference(entry).cloned().collect();
@@ -197,11 +271,21 @@ impl TaintStore {
         }
     }
 
-    /// Everything a run is judged against: its own labels plus its ancestors'.
+    /// Everything a run is judged against: its own labels plus its ancestors',
+    /// minus anything a human has let go of and that has not arrived again.
     pub fn effective(&self, run_id: &str) -> Labels {
         let mut out = self.accumulate(run_id, Labels::new()).carrying;
         out.extend(self.inherited(run_id));
+        if let Some(gone) = self.cleared.lock().unwrap().get(run_id) {
+            out.retain(|l| !gone.contains(l));
+        }
         out
+    }
+
+    /// What a run is judged against right now, for a caller that is not also
+    /// accumulating. Same answer as [`effective`](Self::effective).
+    pub fn judged_against(&self, run_id: &str) -> Labels {
+        self.effective(run_id)
     }
 }
 
