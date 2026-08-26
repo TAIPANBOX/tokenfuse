@@ -1,6 +1,6 @@
 {
   "agent_events": {
-    "schema": "taipanbox.dev/agent-event/v0.1",
+    "schema": "taipanbox.dev/agent-event/v0.2",
     "source": "tokenfuse",
     "types": [
       {

@@ -58,3 +58,47 @@ Feature: One binary, two processes, and the same door in both
     When a token is checked
     Then it is refused under the default fail mode, which is why the first
       fetch happens at startup and a failure there exits rather than serving
+
+  # @test:a_proven_chain_files_the_record_when_no_header_names_an_agent
+  Scenario: A detected attack on a proven caller reaches the record
+    Given a request whose delegation token proves it acts for an agent
+    And no `x-fuse-agent-id` header at all
+    When an injection is detected in a tool result
+    Then the record is written and filed under the agent the token proved,
+      because the identity was in the request all along, inside a credential
+      this gateway verified
+
+  # @test:a_claimed_chain_does_not_file_the_record
+  Scenario: A chain the caller merely declared is not an identity
+    Given a request declaring a chain in a header and presenting no token
+    When an injection is detected
+    Then nothing is filed under that chain, because a caller who can write the
+      header can write the chain
+
+  # @test:a_proven_chain_carries_what_proved_it
+  Scenario: The record says which token proved the chain
+    Given a chain a delegation token proved
+    When the record is written
+    Then it carries the token's id, the key it was bound to, the issuer this
+      deployment verified against, and when the proof stopped being one
+
+  # @test:a_claimed_chain_carries_no_proof
+  Scenario: An unproven chain says nothing about being proven
+    Given a chain nobody proved
+    When the record is written
+    Then no proof sits beside it, because an absent proof means not proven
+
+  # @test:the_brokers_tool_call_record_carries_the_chain_and_what_proved_it
+  Scenario: The MCP door's audit record says whose delegation it was
+    Given a `tools/call` whose delegation token proves it acts for an agent
+    And no `x-fuse-agent-id` header
+    When the call is brokered
+    Then a tool_call record is written, carrying the chain and the token that
+      proved it, and its decision says the gate could not judge it rather than
+      saying a policy allowed it
+
+  # @test:the_bare_scheme_is_not_an_agent
+  Scenario: A scheme with nothing after it is not an identity
+    Given a proven chain whose last name is the bare `agent://`
+    When a record looks for whom to file under
+    Then it finds nobody, because a scheme is not an identity

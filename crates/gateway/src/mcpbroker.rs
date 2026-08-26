@@ -200,6 +200,18 @@ pub struct CallContext {
     /// [`on_behalf_of`](CallContext::on_behalf_of) from it rather than from the
     /// header. Set by [`crate::chainproof::resolve`] and by nothing else.
     pub chain_proven: bool,
+    /// The identity a security RECORD is filed under: the header when the
+    /// caller sent one, otherwise the agent a PROVEN chain named.
+    ///
+    /// Deliberately NOT [`agent_id`](CallContext::agent_id), which still
+    /// governs whether this door demands an identity at all and what the PDP is
+    /// told. Records only, same as the proxy door.
+    pub event_agent_id: Option<String>,
+    /// What proved the chain, when something did. SPEC 5.2, and the reason it
+    /// sits here rather than being rebuilt at each emit: `chain_proven` is a
+    /// derived boolean, and a record that carries the boolean without the proof
+    /// cannot be audited back to the token.
+    pub delegation_proof: Option<tokenfuse_core::agent_event::DelegationProof>,
     /// `x-fuse-attestation-method`, forwarded to the PDP for a
     /// `deny_if_unattested` policy.
     pub attestation_method: Option<String>,
@@ -502,22 +514,31 @@ fn reason_suffix(reason: &Option<String>) -> String {
 fn emit_tool_call(
     st: &BrokerState,
     agent_id: Option<&str>,
+    chain: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     tool: &str,
     upstream: &str,
-    decision: WardryxDecision,
+    // `None` means nothing judged this call. Distinct from `Allow`, and the
+    // distinction is the whole honesty of the record: a call the gate could not
+    // attribute was forwarded, and writing `allow` for it would say a policy
+    // decided something no policy was asked about. Same word the dependency
+    // plane already uses for the same fact.
+    decision: Option<WardryxDecision>,
     mode: WardryxMode,
 ) {
-    let decision_str = if mode == WardryxMode::Shadow {
-        format!("would-{}", decision.as_wire_str())
-    } else {
-        decision.as_wire_str().to_string()
+    let decision_str = match (decision, mode) {
+        (None, _) => "allowed-ungoverned".to_string(),
+        (Some(d), WardryxMode::Shadow) => format!("would-{}", d.as_wire_str()),
+        (Some(d), _) => d.as_wire_str().to_string(),
     };
     let outcome = st.events.emit(
         EventType::ToolCall,
         crate::sink::now_millis(),
         agent_id,
         None,
-        None,
+        // Measured 2026-08-26: this passed `None` while the PDP one screen up
+        // was told the whole chain. The per-action audit record of a DELEGATED
+        // tool call said nothing about whose delegation it was.
+        chain,
         json!({ "tool": tool, "upstream": upstream, "decision": decision_str }),
     );
     crate::events::log_outcome(EventType::ToolCall, outcome);
@@ -529,6 +550,20 @@ fn emit_tool_call(
 /// and treating it as an identity would put an empty subject in front of the
 /// PDP and an empty `agent_id` in an audit event. The LLM path reads it the
 /// same way (`proxy::messages` tests `agent_id.is_empty()`).
+/// The chain and its proof, as one value, for every record this door writes.
+///
+/// A function rather than a construction repeated at each emit: `CallContext`
+/// holds `on_behalf_of` and `delegation_proof` as separate fields, which is the
+/// two-sibling shape `ChainOnRecord` exists to abolish, and the only defence
+/// against a site setting one and forgetting the other is that nothing builds
+/// the pair by hand.
+fn chain_on_record(ctx: &CallContext) -> Option<tokenfuse_core::agent_event::ChainOnRecord<'_>> {
+    (!ctx.on_behalf_of.is_empty()).then(|| match ctx.delegation_proof.as_ref() {
+        Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ctx.on_behalf_of, p),
+        None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ctx.on_behalf_of),
+    })
+}
+
 fn attributed_agent(ctx: &CallContext) -> Option<&str> {
     ctx.agent_id
         .as_deref()
@@ -642,7 +677,7 @@ async fn handle(
     // `chainproof` because the LLM proxy applies the same one, and a rule
     // written twice becomes two rules.
     let now = crate::sink::now_millis() / 1000;
-    let (on_behalf_of, chain_proven) = match crate::chainproof::resolve(
+    let resolved = crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(header("authorization").as_deref()),
         header(crate::mcpdoor::PROOF_HEADER).as_deref(),
@@ -651,19 +686,35 @@ async fn handle(
         &declared,
         now,
         crate::revocations::hook(&st.revocations, now),
-    ) {
+    );
+    let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
+    let (on_behalf_of, delegation_proof) = match resolved {
         crate::chainproof::Chain::Refused(why) => {
             // The same 401 the door gives, for the same reason: which refusal
             // it was is an oracle, and the operator's log is where it belongs.
             tracing::warn!(reason = ?why, "mcp broker: refused a delegation token");
             return crate::proxy::unauthorized_response();
         }
-        crate::chainproof::Chain::Proven(chain) => (chain, true),
-        crate::chainproof::Chain::Claimed(chain) => (chain, false),
+        crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
+        crate::chainproof::Chain::Claimed(chain) => (chain, None),
+    };
+    let chain_proven = delegation_proof.is_some();
+    // Same rule as the proxy door, derived from the same function: the header
+    // when the caller sent one, otherwise the agent a PROVEN chain named. See
+    // `chainproof::proven_actor`.
+    // Trimmed, like `attributed_agent`, so the PDP and the record cannot end up
+    // judging and filing two different spellings of one id. Untrimmed, a
+    // whitespace-only header also counted as "the caller sent one" and wrote a
+    // record under a blank subject where this door used to skip it.
+    let event_agent_id = match header("x-fuse-agent-id") {
+        Some(h) if !h.trim().is_empty() => Some(h.trim().to_string()),
+        _ => proven_actor.clone(),
     };
 
     let ctx = CallContext {
+        delegation_proof,
         agent_id: header("x-fuse-agent-id"),
+        event_agent_id,
         upstream: header("x-fuse-mcp-upstream"),
         run_id: header("x-fuse-run-id"),
         on_behalf_of,
@@ -763,7 +814,11 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
         .post(&url)
         .header("content-type", "application/json")
         .body(payload);
-    if let Some(aid) = ctx.agent_id.as_deref() {
+    // The RECORD identity, so the gateway's own taint events for this call are
+    // filed under the agent a proven chain named rather than skipped. That
+    // handler uses this header for nothing but the event: its `unit` is empty
+    // by construction.
+    if let Some(aid) = ctx.event_agent_id.as_deref() {
         req = req.header("x-fuse-agent-id", aid);
     }
     let answer = match req.send().await {
@@ -783,9 +838,9 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
         let outcome = st.events.emit(
             EventType::DependencyFailed,
             crate::sink::now_millis(),
-            ctx.agent_id.as_deref(),
+            ctx.event_agent_id.as_deref(),
             Some(run_id),
-            None,
+            chain_on_record(ctx),
             dependency_failed_data(
                 Dependency::PolicyPlane,
                 DependencyStage::Decide,
@@ -836,6 +891,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .unwrap_or("")
         .to_string();
     let agent_id = attributed_agent(ctx);
+    let record_agent_id = ctx.event_agent_id.as_deref().or(agent_id);
     // The tool this call names, read once here so both the Wardryx gate
     // below and secret-scope resolution at the injection step (which runs
     // whether or not Wardryx is configured) see the same value. Empty when
@@ -976,10 +1032,11 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                     let outcome = st.wardryx.decide(dctx).await;
                     emit_tool_call(
                         st,
-                        agent_id,
+                        record_agent_id,
+                        chain_on_record(ctx),
                         &tool,
                         &upstream_url,
-                        outcome.decision,
+                        Some(outcome.decision),
                         st.wardryx.mode,
                     );
                     if st.wardryx.mode == WardryxMode::Enforce {
@@ -1043,12 +1100,29 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                 None => {
                     // Shadow: blocks nothing by definition, so an unattributed
                     // call is observed with whatever attribution it has and
-                    // forwarded. Same posture as the LLM path's shadow mode,
-                    // and the same documented gap as `mcp_drift` on stdio.
+                    // forwarded. Same posture as the LLM path's shadow mode.
                     tracing::warn!(
                         "mcp broker: wardryx shadow gate skipped, no x-fuse-agent-id on this \
                          tools/call"
                     );
+                    // The PDP could not be asked, and the RECORD is a separate
+                    // question. Measured 2026-08-26: `emit_tool_call` lived
+                    // inside the `Some(aid)` arm, so a caller whose delegation
+                    // token this door had just VERIFIED produced no audit record
+                    // of the tool call at all, because it sent no header. The
+                    // decision recorded here is the honest one: nothing judged
+                    // it.
+                    if let Some(rid) = record_agent_id {
+                        emit_tool_call(
+                            st,
+                            Some(rid),
+                            chain_on_record(ctx),
+                            &tool,
+                            &upstream_url,
+                            None,
+                            st.wardryx.mode,
+                        );
+                    }
                 }
             }
         }
@@ -1154,9 +1228,14 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                 let outcome = st.events.emit(
                     EventType::McpDrift,
                     crate::sink::now_millis(),
-                    agent_id,
+                    // The RECORD identity and the chain, not the header alone.
+                    // This is a CRITICAL-severity security record and it was
+                    // being dropped for a proven caller that sent no header,
+                    // which is the measured defect this wave exists to close,
+                    // surviving on the one event type where it costs most.
+                    record_agent_id,
                     None,
-                    None,
+                    chain_on_record(ctx),
                     json!({ "tools_changed": changed }),
                 );
                 crate::events::log_outcome(EventType::McpDrift, outcome);

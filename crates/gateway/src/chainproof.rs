@@ -70,8 +70,16 @@ pub type ChainProof = Option<Arc<Proving>>;
 pub enum Chain {
     /// Nobody proved anything. The header chain stands, as a claim.
     Claimed(Vec<String>),
-    /// A token verified, and this is what it said.
-    Proven(Vec<String>),
+    /// A token verified, and this is what it said, plus what proved it.
+    ///
+    /// The proof travels with the chain rather than beside it, because a chain
+    /// that arrives without its proof cannot be told apart from one nobody
+    /// proved. SPEC 5.2 reads an absent proof as NOT proven, so the two must
+    /// not be separable by a call site that forgets one of them.
+    Proven {
+        chain: Vec<String>,
+        proof: tokenfuse_core::agent_event::DelegationProof,
+    },
     /// Refused, and the wire must not distinguish these from each other.
     Refused(ChainRefusal),
 }
@@ -143,7 +151,63 @@ pub fn resolve(
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
         return Chain::Refused(ChainRefusal::Contradicted);
     }
-    Chain::Proven(verified.chain)
+    // `iss` comes from the CONFIG rather than from the token, because
+    // `verify_delegation` matched the token's `iss` against it exactly. Reading
+    // it back off the token would record what the token claimed; reading it off
+    // the config records what this deployment verified against.
+    let proof = tokenfuse_core::agent_event::DelegationProof {
+        jti: verified.jti,
+        jkt: verified.jkt,
+        iss: proving.cfg.issuer.clone(),
+        exp: verified.expires_at,
+    };
+    Chain::Proven {
+        chain: verified.chain,
+        proof,
+    }
+}
+
+/// The agent a PROVEN chain names as its current actor, if it names one.
+///
+/// # Why a proven chain may stand in for a header, and a claimed one may not
+///
+/// The record's `agent_id` came from `x-fuse-agent-id`, a header the caller
+/// writes. Measured 2026-08-26 on a running gateway: a request carrying a
+/// DPoP-bound, issuer-signed chain raised two `taint_raised` events in enforce
+/// mode and BOTH were dropped, because that header was absent. An attack was
+/// detected on the request with the strongest identity this gateway ever sees,
+/// and the security record was empty.
+///
+/// A claimed chain must never do this. It is the same free-form weakness with
+/// extra steps: a caller who can write the header can write the chain.
+///
+/// # The last element, and only when it is an agent
+///
+/// `chain_of` builds `[sub] + reverse(act)`, and RFC 8693 nests `act`
+/// current-first, so after the reverse the current actor is LAST. The first
+/// element is the root, usually a human.
+///
+/// A token with no `act` at all is the trap: the chain is then `[sub]` alone,
+/// and `sub` may be `user://...`, a person calling directly with no agent
+/// anywhere. Taking the last element unconditionally would put a natural person
+/// into `agent_id`, which this estate refuses by name.
+///
+/// The check is the SCHEME and deliberately not the full grammar. An
+/// off-grammar leaf like `agent://Acme/Bot` is still the proven actor, and this
+/// repository's rule is to write, count and report a nonconforming id rather
+/// than empty the log. A `user://` or `claimed:` leaf is different in kind, and
+/// is never a fallback.
+pub fn proven_actor(chain: &Chain) -> Option<&str> {
+    let Chain::Proven { chain, .. } = chain else {
+        return None;
+    };
+    chain.last().map(|leaf| leaf.trim()).filter(|leaf| {
+        // The scheme AND something after it. `starts_with("agent://")`
+        // alone accepts the bare scheme, which is not an identity and would
+        // put `agent://` in the subject of a security record.
+        leaf.strip_prefix("agent://")
+            .is_some_and(|rest| !rest.is_empty())
+    })
 }
 
 /// Order AND membership. Compared both ways on purpose: an equal-length
@@ -289,5 +353,180 @@ mod tests {
                 "agent://c".to_string()
             ]
         ));
+    }
+
+    /// SPEC 5.2 in one test: the proof travels with the chain, it names the
+    /// token that proved it, and its `iss` is the one this deployment VERIFIED
+    /// against rather than the one the token claimed.
+    ///
+    /// Red before `Chain::Proven` grew the proof: the variant carried a bare
+    /// `Vec<String>` and the four values `verify_delegation` had just checked
+    /// were dropped on the floor, so no record could ever say a chain had been
+    /// proven at all.
+    #[test]
+    fn a_proven_chain_carries_what_proved_it() {
+        use tokenfuse_delegation::testing::{cfg, proof_at, token, Key};
+        let (issuer, holder) = (Key::new(), Key::new());
+        let now = 1_800_000_000;
+        let origin = "https://tokenfuse.acme.example";
+        let cfg = cfg(&issuer);
+        let issuer_configured = cfg.issuer.clone();
+        let proving: ChainProof = Some(Arc::new(Proving {
+            cfg,
+            origin: origin.to_string(),
+        }));
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "jti": "tok-live-1",
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{origin}/v1/messages"),
+            "p-1",
+        );
+
+        let resolved = resolve(
+            &proving,
+            Some(&tok),
+            Some(&dpop),
+            "POST",
+            "/v1/messages",
+            &[],
+            now,
+            |_, _, _| false,
+        );
+
+        let Chain::Proven { chain, proof } = resolved else {
+            panic!("a good token did not resolve as proven: {resolved:?}");
+        };
+        assert_eq!(chain, vec!["user://acme/alice", "agent://acme/triage"]);
+        assert_eq!(proof.jti, "tok-live-1", "an auditor cannot find the token");
+        assert_eq!(proof.exp, now + 300, "the proof carries no freshness");
+        assert!(!proof.jkt.is_empty(), "who was holding it is unrecorded");
+        assert_eq!(
+            proof.iss, issuer_configured,
+            "the issuer on the record must be the one this deployment verified \
+             against, not the one the token claimed to be from"
+        );
+    }
+
+    /// The other half, and the one that keeps the first honest: a chain nobody
+    /// proved carries nothing to say it was proven. SPEC 5.2 reads an absent
+    /// proof as NOT proven, so this is what stops a claim reading as a proof.
+    #[test]
+    fn a_claimed_chain_carries_no_proof() {
+        let declared = vec![
+            "user://acme/alice".to_string(),
+            "agent://acme/triage".to_string(),
+        ];
+        let resolved = resolve(
+            &None,
+            Some("a.token.nobody.configured.an.issuer.for"),
+            None,
+            "POST",
+            "/v1/messages",
+            &declared,
+            1_800_000_000,
+            |_, _, _| false,
+        );
+        assert_eq!(resolved, Chain::Claimed(declared));
+    }
+
+    /// The measured defect, as a unit: a proven chain names its actor, so a
+    /// record has something to be filed under even with no header.
+    #[test]
+    fn a_proven_chain_names_the_agent_that_acted() {
+        let proven = Chain::Proven {
+            chain: vec![
+                "user://acme/alice".to_string(),
+                "agent://acme/triage".to_string(),
+            ],
+            proof: tokenfuse_core::agent_event::DelegationProof {
+                jti: "t".into(),
+                jkt: "k".into(),
+                iss: "https://vouchryx.acme.example".into(),
+                exp: 0,
+            },
+        };
+        assert_eq!(proven_actor(&proven), Some("agent://acme/triage"));
+    }
+
+    /// The test that pins the whole design. If anybody ever widens the fallback
+    /// to claimed chains, this goes red, and it should: a caller who can write
+    /// the header can write the chain.
+    #[test]
+    fn a_claimed_chain_names_nobody() {
+        let claimed = Chain::Claimed(vec![
+            "user://acme/alice".to_string(),
+            "agent://acme/triage".to_string(),
+        ]);
+        assert_eq!(proven_actor(&claimed), None);
+        assert_eq!(proven_actor(&Chain::Refused(ChainRefusal::BadToken)), None);
+    }
+
+    /// A token with no `act` is a person calling directly. The last element is
+    /// then the human, and a human is not an agent id.
+    #[test]
+    fn a_chain_with_no_agent_in_it_names_nobody() {
+        for leaf in ["user://acme/alice", "claimed:agent://acme/triage"] {
+            let proven = Chain::Proven {
+                chain: vec![leaf.to_string()],
+                proof: tokenfuse_core::agent_event::DelegationProof {
+                    jti: "t".into(),
+                    jkt: "k".into(),
+                    iss: "i".into(),
+                    exp: 0,
+                },
+            };
+            assert_eq!(proven_actor(&proven), None, "{leaf} was taken as an agent");
+        }
+    }
+
+    /// An off-grammar leaf is still the actor the issuer named. Written and
+    /// counted rather than dropped, which is this repository's rule for a
+    /// nonconforming id and is why the check is the scheme and not the grammar.
+    #[test]
+    fn an_off_grammar_agent_is_still_the_actor() {
+        let proven = Chain::Proven {
+            chain: vec!["agent://Acme/Bot".to_string()],
+            proof: tokenfuse_core::agent_event::DelegationProof {
+                jti: "t".into(),
+                jkt: "k".into(),
+                iss: "i".into(),
+                exp: 0,
+            },
+        };
+        assert_eq!(proven_actor(&proven), Some("agent://Acme/Bot"));
+    }
+
+    /// The bare scheme is not an identity. `starts_with` alone accepted it and
+    /// would have put `agent://` in the subject of a security record.
+    #[test]
+    fn the_bare_scheme_is_not_an_agent() {
+        for leaf in ["agent://", "agent:// ", "  "] {
+            let proven = Chain::Proven {
+                chain: vec![leaf.to_string()],
+                proof: tokenfuse_core::agent_event::DelegationProof {
+                    jti: "t".into(),
+                    jkt: "k".into(),
+                    iss: "i".into(),
+                    exp: 0,
+                },
+            };
+            assert_eq!(
+                proven_actor(&proven),
+                None,
+                "{leaf:?} was taken as an agent"
+            );
+        }
     }
 }

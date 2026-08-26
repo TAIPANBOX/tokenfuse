@@ -64,7 +64,7 @@ use crate::pricebook::default_price_book;
 use crate::sink::ParquetSink;
 
 /// The artifact's own schema id, in the estate's existing form (compare
-/// `taipanbox.dev/agent-event/v0.1`). Bump [`SCHEMA_VERSION`] with it.
+/// `taipanbox.dev/agent-event/v0.2`). Bump [`SCHEMA_VERSION`] with it.
 pub const SCHEMA: &str = "taipanbox.dev/tokenfuse-constants/v1";
 
 /// The integer a consumer compares against. Additive changes (a new section, a

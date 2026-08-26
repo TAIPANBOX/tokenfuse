@@ -1701,9 +1701,11 @@ async fn a_chain_nobody_proved_is_asked_about_as_unproven() {
 }
 
 /// A broker with a delegation issuer configured, plus the key a caller holds.
-fn broker_proving(
+fn broker_proving_recording(
     upstream: String,
     pdp: String,
+    events_path: Option<&str>,
+    mode: WardryxMode,
 ) -> (
     Router,
     tokenfuse_delegation::testing::Key,
@@ -1718,18 +1720,36 @@ fn broker_proving(
         tokenfuse_core::DlpMode::Off,
         None,
         Default::default(),
-        a_wardryx(WardryxMode::Enforce, pdp),
+        a_wardryx(mode, pdp),
     );
     // The fixture's proof names the URL the issuer's own tests use; this door
     // is reached at its origin plus "/", so the two agree by construction
     // rather than by a number retyped here.
     let origin = "https://tokenfuse.acme.example".to_string();
+    if let Some(path) = events_path {
+        Arc::get_mut(&mut st).unwrap().events = Arc::new(
+            tokenfuse_gateway::events::EventExporter::open(path)
+                .expect("an exporter on a fresh file"),
+        );
+    }
     Arc::get_mut(&mut st).unwrap().chain_proof =
         Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
             cfg: cfg(&issuer),
             origin,
         }));
     (app(st), issuer, holder)
+}
+
+/// The common case: no exporter, because most of these tests read the PDP.
+fn broker_proving(
+    upstream: String,
+    pdp: String,
+) -> (
+    Router,
+    tokenfuse_delegation::testing::Key,
+    tokenfuse_delegation::testing::Key,
+) {
+    broker_proving_recording(upstream, pdp, None, WardryxMode::Enforce)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1846,4 +1866,107 @@ async fn a_token_and_a_header_that_disagree_are_refused_rather_than_reconciled()
         seen.lock().unwrap().is_none(),
         "the PDP was asked about a request that should never have got past the door"
     );
+}
+
+/// The broker half of the record, which had no test at all.
+///
+/// Measured 2026-08-26: `emit_tool_call` passed `None` for the chain while the
+/// PDP one screen up was told all of it, so the per-action audit record of a
+/// DELEGATED tool call said nothing about whose delegation it was. And with no
+/// `x-fuse-agent-id` header the whole event was skipped, on a caller whose
+/// identity the issuer had signed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_brokers_tool_call_record_carries_the_chain_and_what_proved_it() {
+    use tokenfuse_delegation::testing::{proof_at, token};
+    let dir = std::env::temp_dir().join(format!("tf-broker-record-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let events = dir.join("events.ndjson");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, _seen) = capturing_pdp("allow").await;
+    // Shadow, not Enforce, and the reason is a finding of its own: in Enforce
+    // this door refuses a proven caller that sent no `x-fuse-agent-id`, because
+    // `needs_identity` reads the header and not the proven chain. That is a
+    // POLICY question and is deliberately not changed here; the record question
+    // is what this test is about.
+    let (router, issuer, holder) = broker_proving_recording(
+        upstream,
+        pdp,
+        Some(events.to_str().expect("a utf-8 temp path")),
+        WardryxMode::Shadow,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+
+    let http = reqwest::Client::new();
+    // Deliberately NO x-fuse-agent-id: this is the shape that was skipped.
+    let _: Value = http
+        .post(&broker_url)
+        .header("authorization", format!("DPoP {tok}"))
+        .header(
+            tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            proof_at(
+                &holder,
+                now,
+                "POST",
+                "https://tokenfuse.acme.example/",
+                "p-record",
+            ),
+        )
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let text = std::fs::read_to_string(&events).unwrap_or_default();
+    let lines: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+        .collect();
+    let call = lines
+        .iter()
+        .find(|e| e["type"] == "tool_call")
+        .unwrap_or_else(|| panic!("no tool_call record was written at all: {text}"));
+
+    assert_eq!(
+        call["agent_id"], "agent://acme.example/orchestrator",
+        "the record is not filed under the agent the token proved: {call}"
+    );
+    assert_eq!(
+        call["on_behalf_of"],
+        json!([
+            "user://acme.example/alice",
+            "agent://acme.example/orchestrator"
+        ]),
+        "the audit record of a delegated tool call carries no chain: {call}"
+    );
+    assert!(
+        call["delegation_proof"]["jti"].is_string(),
+        "the chain is on the record and nothing says it was proved: {call}"
+    );
+    assert_eq!(call["schema"], "taipanbox.dev/agent-event/v0.2");
+    assert_eq!(
+        call["data"]["decision"], "allowed-ungoverned",
+        "the gate could not attribute this call and the record must not say a \
+         policy allowed it: {call}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

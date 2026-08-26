@@ -1,5 +1,5 @@
 //! Agent-event NDJSON envelope and exporter (agent-passport SPEC.md §6,
-//! schema `taipanbox.dev/agent-event/v0.1`).
+//! schema `taipanbox.dev/agent-event/v0.2`).
 //!
 //! Lives in `tokenfuse-core` (not the gateway) because TokenFuse's existing
 //! incident taxonomy is raised from TWO different deployables that both
@@ -25,8 +25,19 @@ use serde::Serialize;
 
 use crate::timefmt::ts_millis_to_rfc3339_millis;
 
-/// `schema` field value (agent-passport SPEC.md §8.4 — final for v0.1).
-pub const SCHEMA: &str = "taipanbox.dev/agent-event/v0.1";
+/// `schema` field value.
+///
+/// v0.2 since 2026-08-26, and the move is one added envelope member,
+/// `delegation_proof` (SPEC 5.2). Nothing is removed and the envelope's
+/// `additionalProperties` is `true` in both, so this is additive on the wire.
+/// It is a version bump rather than a quiet addition because a consumer that
+/// wants to know whether proof is EXPECTED reads the version, and SPEC 6.4
+/// makes the version the place that answers.
+///
+/// This product was the estate's last emitter on v0.1: trailryx, heraldyx,
+/// idryx and agent-stack-go accept v0.1 through v0.3, qryx and genaryx accept
+/// both, and verdryx and scopyx already emit only v0.2. Measured 2026-08-26.
+pub const SCHEMA: &str = "taipanbox.dev/agent-event/v0.2";
 /// `source` field value: every event this crate builds is TokenFuse's own.
 pub const SOURCE: &str = "tokenfuse";
 
@@ -795,6 +806,78 @@ impl EventType {
     }
 }
 
+/// SPEC 5.2: that the `on_behalf_of` chain was PROVED, and by which token.
+///
+/// # Why this rather than a boolean
+///
+/// `chain_proven: true` says "trust me, something checked". These four say
+/// which token, bound to which key, from which issuer, valid until when, so an
+/// auditor can walk to the issuer's own record and to the revocation list. The
+/// token itself never travels: it is a live credential and this is a
+/// replicated, hash-chained record that outlives it.
+///
+/// # Why the envelope and not `data`
+///
+/// `data` is the plane a record store's per-event key ERASES. trailryx
+/// partitions every member into typed metadata (kept) or payload (erasable),
+/// and `on_behalf_of` is typed.
+///
+/// The honest limit, measured 2026-08-26 and not fixed here: trailryx
+/// partitions by ITS OWN list of consumed members, not by envelope-versus-data,
+/// and that list does not yet name `delegation_proof`. So today the proof rides
+/// in its erasable half anyway. The envelope is still the right plane, because
+/// it is where a store CAN keep it and `data` is where a store must not; the
+/// change trailryx needs is held as a cross-repo finding by estate-gates C12. A proof in `data` would mean that a routine
+/// payload erasure leaves the chain standing and destroys the fact that it was
+/// verified, and SPEC 5.2 reads a chain with no proof beside it as NOT proven.
+/// The erasure would silently downgrade a proven chain to an unproven one,
+/// which is the exact downgrade 5.2 forbids with a MUST.
+///
+/// Absent means NOT proven. Never "proven elsewhere", and never `null`: an old
+/// consumer that ignores this member under-trusts, which is the safe direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DelegationProof {
+    /// The token's id, so an auditor can find it in the issuer's own record.
+    pub jti: String,
+    /// RFC 7638 thumbprint the token was bound to: WHO was holding it, which a
+    /// chain of names cannot say.
+    pub jkt: String,
+    /// The issuer, so the right keys and the right revocation list are read.
+    pub iss: String,
+    /// When the proof stopped being one. The chain carries no freshness; this
+    /// is the freshness, and it belongs to the proof rather than to the names.
+    pub exp: i64,
+}
+
+/// A chain on a record, and whether anybody proved it.
+///
+/// One parameter rather than two sibling `Option`s on purpose. Two siblings is
+/// how a call site passes the chain and forgets the proof, and a chain that
+/// arrives without its proof is indistinguishable from one nobody proved. That
+/// is the defect this whole change exists to close, so the type refuses to
+/// represent it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainOnRecord<'a> {
+    pub chain: &'a [String],
+    pub proof: Option<&'a DelegationProof>,
+}
+
+impl<'a> ChainOnRecord<'a> {
+    /// A chain nobody proved. Named rather than written as a struct literal, so
+    /// the sites that mean it say so.
+    pub fn claimed(chain: &'a [String]) -> Self {
+        Self { chain, proof: None }
+    }
+
+    /// A chain a token proved.
+    pub fn proven(chain: &'a [String], proof: &'a DelegationProof) -> Self {
+        Self {
+            chain,
+            proof: Some(proof),
+        }
+    }
+}
+
 /// One agent-event envelope (agent-passport SPEC.md §6). Field order matches
 /// the spec's example exactly, which `serde_json` preserves on serialize
 /// (struct fields are emitted in declaration order, not sorted).
@@ -811,6 +894,9 @@ pub struct AgentEvent {
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<Vec<String>>,
+    /// SPEC 5.2, beside the chain it qualifies. Absent means NOT proven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_proof: Option<DelegationProof>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -877,7 +963,7 @@ pub fn build(
     ts_millis: i64,
     agent_id: Option<&str>,
     run_id: Option<&str>,
-    on_behalf_of: Option<&[String]>,
+    on_behalf_of: Option<ChainOnRecord<'_>>,
     data: serde_json::Value,
 ) -> Option<AgentEvent> {
     let agent_id = agent_id.filter(|s| !s.is_empty())?;
@@ -890,8 +976,13 @@ pub fn build(
         agent_id: agent_id.to_string(),
         run_id: run_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         on_behalf_of: on_behalf_of
-            .filter(|chain| !chain.is_empty())
-            .map(|chain| chain.to_vec()),
+            .filter(|c| !c.chain.is_empty())
+            .map(|c| c.chain.to_vec()),
+        // Only beside a chain that is actually on the record. A proof with no
+        // chain would be a claim about names nobody can read.
+        delegation_proof: on_behalf_of
+            .filter(|c| !c.chain.is_empty())
+            .and_then(|c| c.proof.cloned()),
         data: if data.is_null() { None } else { Some(data) },
         prev_hash: None,
     })
@@ -1080,7 +1171,7 @@ impl Exporter {
         ts_millis: i64,
         agent_id: Option<&str>,
         run_id: Option<&str>,
-        on_behalf_of: Option<&[String]>,
+        on_behalf_of: Option<ChainOnRecord<'_>>,
         data: serde_json::Value,
     ) -> EmitOutcome {
         let Some(sink) = &self.sink else {
@@ -1354,7 +1445,9 @@ mod tests {
             1_783_566_764_100, // 2026-07-09T03:12:44.100Z
             Some("agent://acme-bank.example/support/tier1-bot"),
             Some("run-8842"),
-            Some(&["user://acme-bank.example/j.doe".to_string()]),
+            Some(ChainOnRecord::claimed(&[
+                "user://acme-bank.example/j.doe".to_string()
+            ])),
             serde_json::json!({ "budget_usd": 2.00, "spent_usd": 2.00, "action": "blocked_402" }),
         )
         .unwrap();
@@ -1390,7 +1483,7 @@ mod tests {
             0,
             Some("agent://acme.example/bot"),
             None,
-            Some(&[]),
+            Some(ChainOnRecord::claimed(&[])),
             serde_json::Value::Null,
         )
         .unwrap();
@@ -1412,7 +1505,7 @@ mod tests {
         .unwrap();
         let line = to_ndjson_line(&ev).unwrap();
         let want = concat!(
-            r#"{"schema":"taipanbox.dev/agent-event/v0.1","#,
+            r#"{"schema":"taipanbox.dev/agent-event/v0.2","#,
             r#""ts":"2026-07-09T03:12:44.100Z","#,
             r#""source":"tokenfuse","#,
             r#""type":"breaker_tripped","#,
@@ -1428,7 +1521,7 @@ mod tests {
         // Valid, single-line JSON (NDJSON contract): parses back and round-trips
         // the required fields the JSON Schema (agent-event.schema.json) checks.
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.1");
+        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.2");
         assert!(v.get("ts").is_some());
         assert_eq!(v["source"], "tokenfuse");
         assert_eq!(v["type"], "breaker_tripped");
@@ -1546,7 +1639,7 @@ mod tests {
     /// implementations pin the SAME canonical bytes and hashes, so the three
     /// cannot drift silently. Pinned at the JSON-value level because the
     /// vector events carry other services' source/schema values, which
-    /// `AgentEvent` (source "tokenfuse", schema v0.1) deliberately cannot
+    /// `AgentEvent` (source "tokenfuse", schema v0.2) deliberately cannot
     /// represent - the canonicalize+hash pipeline is what must agree.
     #[test]
     fn cross_language_chain_vectors_pin() {
