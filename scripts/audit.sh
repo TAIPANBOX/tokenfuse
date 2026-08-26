@@ -65,9 +65,30 @@ done
 # The diagnosis is one line and nobody runs it, so it runs here. Naming the
 # files is the whole value: the cargo-audit error names an advisory id, which
 # sends a reader to the wrong repository.
+# ASKING ANOTHER REPOSITORY A QUESTION NEEDS THE ENVIRONMENT CLEARED.
+#
+# git runs a hook with GIT_DIR set to the repository being pushed. `git -C
+# <elsewhere>` changes the DIRECTORY and keeps that variable, so the command
+# below would read the advisory database's working tree against TOKENFUSE's
+# index: every one of the database's entries comes back untracked, this check
+# refuses, and the failure is invisible from a terminal because GIT_DIR is only
+# set inside a hook.
+#
+# Found in trailryx on 2026-08-26, where it cost three push attempts before
+# anybody looked at the environment rather than at the disk, and found here by
+# estate-gates C9, which exists because of it. This repository installs no hook
+# today, so the fault was latent rather than live. That is a fact about this
+# repository on this date and not about this script.
+#
+# The half worth naming is the remediation printed below. `git clean -fd` in a
+# terminal tidies nothing, because nothing is untracked there. In the
+# environment where that message would actually appear, it deletes the advisory
+# database.
+dbgit() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git "$@"; }
+
 db="${CARGO_HOME:-$HOME/.cargo}/advisory-db"
 if [ -d "$db/.git" ]; then
-  dirty="$(git -C "$db" status --porcelain 2>/dev/null || true)"
+  dirty="$(dbgit -C "$db" status --porcelain 2>/dev/null || true)"
   if [ -n "$dirty" ]; then
     echo "FAIL: the advisory database at $db has files git does not track."
     echo
@@ -80,8 +101,16 @@ if [ -d "$db/.git" ]; then
     echo "      looks exactly like an upstream outage and is not one."
     echo
     echo "      Fix it with:  git -C $db clean -fd"
+    echo "      (from a terminal. NOT from inside a hook, where GIT_DIR points"
+    echo "       at the repository being pushed and this would delete the"
+    echo "       database rather than tidy it.)"
     exit 1
   fi
+else
+  # Not a failure and not a pass. A machine that has never run cargo-audit has
+  # no database yet, so there is nothing here to be clean or dirty, and a check
+  # that reported nothing would read as agreement.
+  echo "note: no advisory database at $db yet, so its cleanliness was not checked."
 fi
 
 config=".cargo/audit.toml"
