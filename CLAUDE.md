@@ -1705,3 +1705,74 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     somewhere without going through `chainproof`, and the compiler naming both
     existing sites when the field was added is what found them this time.)*
 
+32. **A list somebody can be told about is a list something reads, and its AGE
+    is a decision rather than an accident.** vouchryx has served
+    `GET /v1/revocations` since the day it was written, with an `as_of` cursor
+    put there so a poller could tell an empty list from a failed fetch. Measured
+    2026-08-26: nothing polled it. Both doors here passed
+    `revoked: |_, _, _| false`, no Go enforcement point set `Options.Revoked`,
+    and four documents in two repositories said in the present tense that every
+    enforcement point consults it. The four are corrected in the same wave, and
+    that half is not optional: this repository's rule is to change the text
+    rather than to narrate the change.
+
+    `tokenfuse_delegation::revocations` is the local cache the `revoked` closure
+    is filled from. Still no client in that crate, which is invariant 29 intact:
+    the FETCH is out of band and the CHECK is local, so `Revocations::check`
+    takes a clock, returns an `Answer`, and has nowhere to send a request.
+
+    **Age is the third state, and it decides what a MISS means rather than what
+    a HIT means.** The estate has answered "a dependency is unreachable" twice,
+    both times with an operator-chosen fail mode defaulting to open
+    (`wardryx::FailMode`, `TOKENFUSE_MCP_TAINT_FAILMODE`), and `FailMode` here
+    is the same word with the same default so the estate does not answer one
+    question two ways. What a revocation list adds is that a stale list is still
+    mostly right: a PDP you cannot reach tells you nothing, and a list from four
+    minutes ago still holds every revocation older than four minutes. So a hit
+    stands at any age, because nothing un-revokes a token and discarding a
+    revocation we hold would call a token we know is dead a live one. A miss is
+    an inference from the list being COMPLETE, completeness is what expires, and
+    past `DEFAULT_MAX_AGE_SECS` the fail mode answers a miss instead.
+
+    **Sixty seconds is the number, and it is the window in which a revoked token
+    still works.** It comes from the token rather than from taste: vouchryx
+    mints at a five-minute default TTL and caps at an hour, so a list allowed to
+    outlive a token would let one minted after the last poll be revoked and go
+    on working for its whole life, which makes the control decorative for a
+    whole generation of tokens rather than merely late.
+
+    **Never fetched is not stale, and an older answer never replaces a newer
+    one.** `Basis::Never` and `Basis::Stale` both defer to the fail mode and are
+    different faults: a poller nobody wired does not clear itself and nothing
+    else in the estate will mention it, which is invariant 13's boundary. A
+    snapshot whose `as_of` moved backwards is refused and counted, because
+    installing it would reset the age and a view that had stopped moving would
+    start reading as fresh, which turns every other rule here off. Equal cursors
+    ARE accepted: `as_of` is a Unix second and refusing that would break any
+    poller faster than 1 Hz.
+    *(scenarios: `features/revocation.feature`, eighteen, each bound to a named
+    test. Test: eighteen in `delegation::revocations`, every one run against a
+    `check` stubbed to `|_, _, _| false`, which is what the doors do today;
+    fourteen went red there, verbatim among them `left: Never right: Stale {
+    age_secs: 61 }` and `tok-1 was answered from the list: Answer { revoked:
+    false, basis: Never }`. One stayed red past the stub and found a real
+    defect: a derived `Deserialize` reads `[]` positionally into an empty
+    snapshot, so `Snapshot::from_json` now refuses a body that is not a JSON
+    object. Eight mutants planted in the product code on
+    2026-08-26, all eight caught, each named with the test that caught it in the
+    pull request. The two worth naming here are the ones the design turns on:
+    the age never consulted, so a stale list serves for ever
+    (`a_miss_on_a_stale_list_falls_back_to_the_fail_mode`), and the age
+    governing a HIT as well as a MISS
+    (`a_stale_list_still_refuses_what_it_names`). Not a script gate: nothing
+    STOPS a door going on passing `|_, _, _| false`, and wiring the two doors is
+    a separate wave with a wire contract of its own.)*
+
+    **Where it says nothing.** No door in this repository calls it yet, so this
+    is still a library with no consumer, which is what invariant 29 already says
+    about the verifier it plugs into. It holds no store, so a restart starts
+    from `Basis::Never` and the fail mode governs until the first poll lands.
+    And it cannot tell a vouchryx that restarted and forgot its whole list from
+    one whose entries legitimately expired: both answer an empty list with a
+    current cursor, and vouchryx's own README names the in-memory store under
+    NOT PROVEN for exactly that reason.

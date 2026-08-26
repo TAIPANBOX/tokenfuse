@@ -40,6 +40,14 @@
 //!   anybody staples a victim's public key to their own proof.
 //! - **A proof for another request or another moment.** A proof is for ONE
 //!   request; without that, one captured from a harmless call is replayed here.
+//!
+//! # Revocation is the caller's, and [`revocations`] is what the caller fills it from
+//!
+//! `revoked` is a closure on purpose: this crate does not fetch. What it lacked
+//! until 2026-08-26 was anything to put in that closure, so every caller in the
+//! estate passed one that answers false and `vouchryx`'s list was served to
+//! nobody. [`revocations::Revocations`] is the local cache and the staleness
+//! policy that fills it, still with no client in this crate.
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
@@ -162,6 +170,8 @@ const MAX_DEPTH: usize = 32;
 /// received. `now` is a Unix second, injected so an expiry is testable without
 /// sleeping. `revoked` is consulted last and may be a closure that always
 /// answers false, which is a caller deciding that a valid signature is enough.
+/// [`revocations::Revocations::hook`] is the closure for a caller that has not
+/// decided that.
 pub fn verify_delegation(
     cfg: &DelegationConfig,
     token: &str,
@@ -273,6 +283,11 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     chain.extend(current_first.into_iter().rev());
     Ok(chain)
 }
+
+/// Deliberately reached by module path rather than re-exported at the crate
+/// root: `FailMode` is a name the gateway already has from `wardryx`, and two
+/// of them in one `use` line is how a caller ends up configuring the wrong one.
+pub mod revocations;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
