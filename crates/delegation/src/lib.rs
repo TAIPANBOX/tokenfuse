@@ -299,6 +299,34 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     let mut chain = Vec::with_capacity(current_first.len() + 1);
     chain.push(sub.to_string());
     chain.extend(current_first.into_iter().rev());
+
+    // The two rules the RECORD applies to a chain, applied here as well.
+    //
+    // `agent-conform` runs `chain.Validate` on every `on_behalf_of` it reads
+    // and the v0.2 envelope pins `pattern: ^(agent|user)://` on every item. So
+    // a chain this door hands out and the record refuses is a token that
+    // verified and whose trail cannot be written, which is the quarantine the
+    // entry cap produced one commit ago, two rules over.
+    //
+    // Duplicated rather than shared, and the duplication is structural: the
+    // rules live in Go, this is Rust, and there is no seam between them. What
+    // stops the two drifting is a gate, the same answer agent-stack-go reached
+    // for its own pair in `scripts/door-and-record-agree.sh`.
+    //
+    // The SCHEME only, deliberately: a stricter pattern here would refuse
+    // chains the record accepts, which is this rule failing in the other
+    // direction.
+    let mut seen = std::collections::HashSet::with_capacity(chain.len());
+    for entry in &chain {
+        // SPEC 5.1: the chain MUST be acyclic.
+        if !seen.insert(entry.as_str()) {
+            return Err(Refusal::Malformed);
+        }
+        // SPEC 5: entries are `agent://` or `user://` URIs.
+        if !entry.starts_with("agent://") && !entry.starts_with("user://") {
+            return Err(Refusal::Malformed);
+        }
+    }
     Ok(chain)
 }
 
@@ -736,6 +764,93 @@ mod tests {
             verify(SPEC_5_1_MAX_ENTRIES).unwrap_err(),
             Refusal::Malformed,
             "a subject plus {SPEC_5_1_MAX_ENTRIES} actors is one entry too many"
+        );
+    }
+
+    /// The record refuses a chain naming one principal twice: SPEC 5.1 says
+    /// `on_behalf_of` MUST be acyclic, `chain.Validate` has enforced it since
+    /// it was written, and `agent-conform` calls it on every line.
+    ///
+    /// This door did not. So a token whose `sub` also appears in its `act`
+    /// verified here and every event it produced was quarantined, which is the
+    /// same sentence as the depth cap one commit earlier. agent-stack-go closed
+    /// its half in TAIPANBOX/agent-stack-go#40; this is the language actually on
+    /// the request path.
+    #[test]
+    fn a_chain_naming_one_principal_twice_is_refused() {
+        let root = "user://acme/alice";
+        let act = Act {
+            sub: root.to_string(),
+            act: None,
+        };
+        assert_eq!(
+            chain_of(root, Some(&act)),
+            Err(Refusal::Malformed),
+            "the door handed out a chain the record refuses as a cycle"
+        );
+    }
+
+    /// A repeat among the ACTORS alone, so the rule is about the whole
+    /// assembled chain and not only about the subject.
+    #[test]
+    fn a_chain_naming_one_actor_twice_is_refused() {
+        let inner = Act {
+            sub: "agent://acme/triage".to_string(),
+            act: None,
+        };
+        let outer = Act {
+            sub: "agent://acme/triage".to_string(),
+            act: Some(Box::new(inner)),
+        };
+        assert_eq!(
+            chain_of("user://acme/alice", Some(&outer)),
+            Err(Refusal::Malformed)
+        );
+    }
+
+    /// The record accepts only `agent://` and `user://` entries: the v0.2
+    /// envelope pins `pattern: ^(agent|user)://` on every item of
+    /// `on_behalf_of`. This door accepted anything non-empty.
+    #[test]
+    fn a_principal_that_is_not_an_agent_or_user_uri_is_refused() {
+        for bad in [
+            "mailto:alice@acme.example",
+            "acme.example/alice",
+            "https://acme.example/alice",
+            "agent:/acme/triage",
+        ] {
+            let act = Act {
+                sub: bad.to_string(),
+                act: None,
+            };
+            assert_eq!(
+                chain_of("user://acme/alice", Some(&act)),
+                Err(Refusal::Malformed),
+                "{bad} was handed out as a principal"
+            );
+        }
+    }
+
+    /// The guard against overshooting, and it must pass before AND after: the
+    /// shape every real token has, in both schemes the spec names, at either
+    /// end of the chain.
+    #[test]
+    fn the_shape_every_real_token_has_is_still_accepted() {
+        let inner = Act {
+            sub: "user://acme/carol".to_string(),
+            act: None,
+        };
+        let outer = Act {
+            sub: "agent://acme/triage".to_string(),
+            act: Some(Box::new(inner)),
+        };
+        assert_eq!(
+            chain_of("user://acme/alice", Some(&outer)),
+            Ok(vec![
+                "user://acme/alice".to_string(),
+                "user://acme/carol".to_string(),
+                "agent://acme/triage".to_string(),
+            ])
         );
     }
 }

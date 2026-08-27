@@ -2023,3 +2023,33 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     disk had one, which is the same shape one level up: a new gate with no case
     looks exactly like a gate with nothing to catch. Every `scripts/*.sh` must
     now be named by at least one case.
+
+35. **A door that hands out a chain the RECORD refuses has verified a token
+    whose trail cannot be written.** `agent-conform` runs `chain.Validate` on
+    every `on_behalf_of` it reads, and the v0.2 envelope pins
+    `pattern: ^(agent|user)://` on every item and `maxItems: 32` on the list. A
+    chain this door produces that fails either is a token that verified and
+    whose events are quarantined, which is the worst shape of all: green at the
+    door, green in the log, and refused by the one thing that keeps the record.
+
+    Measured 2026-08-27, three rules, all three found the same afternoon. The
+    DEPTH cap counted actors where the record counts entries, so a subject plus
+    32 actors made 33. The CYCLE rule was enforced only at the record, so a
+    token whose `sub` also appeared in its `act` verified here. The ENTRY SCHEME
+    was enforced only at the record, so `mailto:alice@acme.example` was accepted
+    as a principal.
+
+    **The duplication is structural and permanent.** The record's rules live in
+    Go (`agent-stack-go/chain`), this door is Rust, and there is no seam between
+    them. Nothing can share the code, so what stops the two drifting is a gate.
+    agent-stack-go reached the same answer for its own pair, where
+    `deps-layering.sh` forbids the import:
+    `scripts/door-and-record-agree.sh` there discovers the record's rules from
+    the errors `Validate` can return.
+
+    **The scheme only, deliberately.** A stricter pattern here would refuse
+    chains the record accepts, which is this same rule failing in the other
+    direction, and one test passes before AND after to hold that line.
+    *(tests: four in `crates/delegation`, three red against the unfixed
+    assembler with the chain it handed out quoted verbatim, one green on both
+    sides as the overshoot guard. Scenarios: `features/the-delegation-cap.feature`)*

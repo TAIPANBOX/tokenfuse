@@ -43,3 +43,8 @@ crates/radar/**/target/
 
 # cluster (excluded crate, own target dir)
 crates/cluster/target/
+
+# Workflow worktrees are transient checkouts of this repo, created by the
+# orchestrator. They are embedded git repositories and must never be committed:
+# a `git add -A` during a running workflow will otherwise sweep them in.
+.claude/worktrees/
