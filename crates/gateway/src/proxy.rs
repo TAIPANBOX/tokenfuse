@@ -6921,4 +6921,86 @@ pub(crate) mod tests {
         );
         std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
     }
+
+    /// The blast radius of turning `TOKENFUSE_IDENTITY_STRICT` on by default,
+    /// measured rather than argued.
+    ///
+    /// A mismatch needs something to mismatch WITH, and both sources are
+    /// opt-in: the key-binding check needs client keys with per-key agent
+    /// scoping, and `agent_id_contradicts_proven_chain` needs a delegation
+    /// issuer. A deployment that configured neither must see no change at all,
+    /// or the default is a breaking change wearing a security fix's clothes.
+    #[tokio::test]
+    async fn a_deployment_that_opted_into_nothing_is_unaffected() {
+        let mut st = state(Mode::Shadow, StubProvider::default());
+        st.identity_strict = crate::identitymap::StrictMode::Enforce;
+        // No client keys, no delegation issuer: the shape every deployment
+        // that has not opted in has.
+        assert!(st.chain_proof.is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fuse-run-id", "run-plain-1".parse().expect("a header"));
+        let res = messages(
+            State(st),
+            headers,
+            Bytes::from(
+                serde_json::json!({
+                    "model": "claude-sonnet-5",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+
+        assert_ne!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "enforce refused a request from a deployment that configured no \
+             client keys and no delegation issuer, so the default is a breaking \
+             change rather than a security fix"
+        );
+    }
+
+    /// And the other half: a deployment that DID opt in is held to it, which is
+    /// the whole point of the default moving.
+    #[tokio::test]
+    async fn a_deployment_that_opted_in_is_now_held_to_it() {
+        use tokenfuse_delegation::testing::{proof_at, token};
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let mut st = st;
+        st.identity_strict = crate::identitymap::StrictMode::Enforce;
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-default-strict",
+        );
+        let mut headers = proven_headers(&tok, &dpop);
+        headers.insert(
+            "x-fuse-agent-id",
+            "agent://acme/other".parse().expect("a header"),
+        );
+
+        let res = messages(State(st), headers, injected_bytes()).await;
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a deployment with a delegation issuer configured is not held to \
+             the contradiction check by default"
+        );
+    }
 }

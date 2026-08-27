@@ -749,8 +749,12 @@ async fn serve() {
         if identity_strict != tokenfuse_gateway::identitymap::StrictMode::Off
             && !client_keys.enabled()
         {
+            // Not "is set" any more: `enforce` is what a deployment that named
+            // nothing gets since 2026-08-27, so this line now describes a
+            // default rather than a choice, and saying "is set" to an operator
+            // who set nothing is how a warning teaches people to ignore it.
             eprintln!(
-                "tokenfuse: TOKENFUSE_IDENTITY_STRICT is set but TOKENFUSE_CLIENT_KEYS is not; nothing is authenticated to check, so binding checks stay idle and only prefix attribution applies"
+                "tokenfuse: TOKENFUSE_IDENTITY_STRICT is {identity_strict:?} and TOKENFUSE_CLIENT_KEYS is not set; nothing is authenticated to check, so binding checks stay idle and only prefix attribution applies"
             );
         }
         // The mirror of the warning above, and the one that was missing. That

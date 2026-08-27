@@ -2127,3 +2127,39 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     The LLM door is untouched; it keeps no `tool_call` of its own, because the
     tool-use blocks a model emits are the I1 `tool_calls` Parquet column
     (docs/21) and a different measurement.
+
+37. **`TOKENFUSE_IDENTITY_STRICT` defaults to `enforce`**, since 2026-08-27,
+    and `off` is one explicit variable away, which is the difference between a
+    default and a prohibition.
+
+    It was `off`, so the binding check this product advertises did nothing until
+    somebody set a variable. That is the shape `crate::defaults` already argued
+    on 2026-08-06 about `TOKENFUSE_DLP` and `TOKENFUSE_REQUIRE_RUN_ID`: a
+    deployment governed on paper, every check green because the checks read
+    configuration rather than behaviour.
+
+    **The blast radius is measured, not asserted.** A mismatch needs something
+    to mismatch WITH, and both sources are opt-in: the key-binding check needs
+    `TOKENFUSE_CLIENT_KEYS` with per-key agent scoping, and
+    `agent_id_contradicts_proven_chain` needs a delegation issuer. So a
+    deployment that configured neither sees no change, and one that configured
+    either had already opted into the identity it is now held to. Two tests say
+    so rather than this paragraph:
+    `a_deployment_that_opted_into_nothing_is_unaffected` and
+    `a_deployment_that_opted_in_is_now_held_to_it`.
+
+    **A misspelt mode exits rather than resolving either way.** Falling back to
+    `enforce` refuses traffic the operator did not ask to refuse; falling back
+    to `off` disables a check they believe they turned on. Both are worse than
+    stopping. Case is not the operator's job: `Off` is `off`, and a deployment
+    that wrote it in a compose file means it.
+
+    The decision is split from the environment read (`StrictMode::from_value`)
+    for the reason `defaults` splits its own: a default is a claim about what
+    happens when nobody configures anything, and **before this change the
+    setting whose default it reverses had no test pinning that default at all**.
+    *(tests: `the_mode_an_operator_falls_into_is_enforce`, proved red against
+    the old value; `every_named_mode_is_honoured_and_off_still_means_off`;
+    `a_misspelt_mode_is_refused_rather_than_guessed`;
+    `case_is_not_the_operators_job`. Scenarios:
+    `features/the-delegation-door.feature`)*

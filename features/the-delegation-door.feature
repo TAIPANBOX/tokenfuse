@@ -127,3 +127,24 @@ Feature: One binary, two processes, and the same door in both
     Then it is refused with both names in the reason, so a caller knows which
       of the two to fix, and the mismatch is recorded whichever transport the
       call arrived on
+
+  # @test:the_mode_an_operator_falls_into_is_enforce
+  Scenario: The identity mode an operator falls into
+    Given a deployment that names no identity strictness
+    When it starts
+    Then it enforces, because a check that does nothing until somebody sets a
+      variable is a deployment governed on paper, and `off` is one explicit
+      variable away
+
+  # @test:a_deployment_that_opted_into_nothing_is_unaffected
+  Scenario: Turning it on changes nothing for those who opted into nothing
+    Given a deployment with no client keys and no delegation issuer
+    When a plain request arrives under the new default
+    Then it is not refused, because a mismatch needs something to mismatch
+      with and both sources are opt-in
+
+  # @test:a_deployment_that_opted_in_is_now_held_to_it
+  Scenario: And everything for those who did
+    Given a deployment with a delegation issuer configured
+    When a caller presents one agent's token and names another in the header
+    Then it is refused under the new default, with no variable set
