@@ -284,10 +284,24 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     // `act` nests current-first (RFC 8693 4.1: "The outermost `act` claim
     // represents the current actor"), and this estate records root-first, so
     // collecting then reversing is the mapping rather than a tidy-up.
+    // How many ACTORS fit depends on whether a subject is about to take one of
+    // the entries. SPEC 5.1 counts entries, so a chain with no human at the
+    // root has the whole budget for actors.
+    //
+    // This bounded at `MAX_ACTORS_WITH_SUBJECT` unconditionally, so a
+    // machine-to-machine chain of exactly the cap was refused. Found by the
+    // cross-language verdict table on its first run, the second disagreement it
+    // turned up between this door and agent-stack-go's, which had the
+    // conditional and this one did not.
+    let actor_budget = if sub.is_empty() {
+        MAX_CHAIN_ENTRIES
+    } else {
+        MAX_ACTORS_WITH_SUBJECT
+    };
     let mut current_first = Vec::new();
     let mut cursor = act;
     while let Some(a) = cursor {
-        if current_first.len() >= MAX_ACTORS_WITH_SUBJECT {
+        if current_first.len() >= actor_budget {
             return Err(Refusal::Malformed);
         }
         if a.sub.is_empty() {
@@ -297,7 +311,19 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
         cursor = a.act.as_deref();
     }
     let mut chain = Vec::with_capacity(current_first.len() + 1);
-    chain.push(sub.to_string());
+    // An ABSENT subject is not an empty entry. A machine-to-machine chain has
+    // no human at the root, and the whole entry budget belongs to the actors.
+    //
+    // Pushing it unconditionally put `""` at the head, which the entry-scheme
+    // rule below then refused. Found by the cross-language verdict table on its
+    // first run: agent-stack-go's door accepted the same shape and this one did
+    // not. Unreachable through THIS door, which refuses a token carrying no
+    // `sub` earlier and for a different reason, so the disagreement was in the
+    // assembler alone. It is fixed rather than excused, because a table whose
+    // cases are allowed to mean different things per door holds nothing.
+    if !sub.is_empty() {
+        chain.push(sub.to_string());
+    }
     chain.extend(current_first.into_iter().rev());
 
     // The two rules the RECORD applies to a chain, applied here as well.
@@ -852,5 +878,87 @@ mod tests {
                 "agent://acme/triage".to_string(),
             ])
         );
+    }
+
+    /// The cross-language verdict table, vendored byte for byte from
+    /// `agent-stack-go/chain/testdata/chain-verdict-vectors.json`.
+    ///
+    /// The record's rules live in Go. This door is Rust. There is no seam
+    /// between them and there cannot be one, so the rules exist twice and a
+    /// third time in agent-stack-go's own door. Three of them were found
+    /// disagreeing across those copies on 2026-08-27, all in one afternoon.
+    ///
+    /// A gate reading source text cannot hold this: a regex over two languages
+    /// tells you a rule is MENTIONED, never that it ANSWERS. A table each door
+    /// RUNS is the only form of the check a comment cannot satisfy.
+    #[test]
+    fn the_door_answers_the_cross_language_table() {
+        let raw = include_str!("../testdata/chain-verdict-vectors.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).expect("the table is JSON");
+        let vectors = doc["vectors"].as_array().expect("the table has vectors");
+        assert!(!vectors.is_empty(), "an empty table would prove nothing");
+
+        for v in vectors {
+            let name = v["name"].as_str().unwrap_or("?");
+            let why = v["why"].as_str().unwrap_or("");
+            let sub = v["sub"].as_str().unwrap_or("");
+
+            // `act`, outermost first, with a generated case expanded the same
+            // way every language expands it.
+            let actors: Vec<String> = if let Some(g) = v.get("act_generated") {
+                let template = g["template"].as_str().expect("a template");
+                let count = g["count"].as_u64().expect("a count");
+                (1..=count)
+                    .map(|i| template.replace("%d", &i.to_string()))
+                    .collect()
+            } else {
+                v["act"]
+                    .as_array()
+                    .expect("an act list")
+                    .iter()
+                    .map(|a| a.as_str().unwrap_or("").to_string())
+                    .collect()
+            };
+
+            // Nest them the way RFC 8693 does: outermost is the current actor.
+            let mut act: Option<Box<Act>> = None;
+            for a in actors.iter().rev() {
+                act = Some(Box::new(Act {
+                    sub: a.clone(),
+                    act: act.take(),
+                }));
+            }
+
+            let got = chain_of(sub, act.as_deref());
+            match v["verdict"].as_str().expect("a verdict") {
+                "accept" => {
+                    let chain = got.unwrap_or_else(|e| {
+                        panic!("{name}: refused a chain the table accepts: {e:?}\nwhy: {why}")
+                    });
+                    if let Some(want) = v["chain"].as_array() {
+                        let want: Vec<String> = want
+                            .iter()
+                            .map(|c| c.as_str().unwrap_or("").to_string())
+                            .collect();
+                        assert_eq!(chain, want, "{name}: the table says {want:?}\nwhy: {why}");
+                    }
+                }
+                // Every refusal is `Malformed` here: this crate deliberately
+                // does not tell a caller WHICH check failed, because that is an
+                // oracle. The table names the RULE, and what has to agree
+                // across the three implementations is accept-versus-refuse plus
+                // the assembled chain, not the spelling of the error.
+                "cycle" | "too_deep" | "invalid_entry" => {
+                    assert_eq!(
+                        got,
+                        Err(Refusal::Malformed),
+                        "{name}: the table refuses this\nwhy: {why}"
+                    );
+                }
+                other => {
+                    panic!("{name}: the table names a verdict this test does not know: {other}")
+                }
+            }
+        }
     }
 }
