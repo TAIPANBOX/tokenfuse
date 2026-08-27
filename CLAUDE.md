@@ -108,10 +108,10 @@ mutant was supposed to fail and did not. So the mutants stopped being prose in
 commit messages and became a harness: it breaks each gate on purpose, requires
 the failure, and for the diagnosis cases requires the failure to SAY the right
 thing, since "it failed" and "it failed for this reason" are different claims.
-It also asserts two gates must NOT fire, because an overeager check gets deleted
-as fast as a toothless one.
+Eight of its cases assert a gate must NOT fire, because an overeager check gets
+deleted as fast as a toothless one.
 
-**It asserts a third property, on ten of its 39 cases: a gate whose subject
+**It asserts a third property, on ten of its 43 cases: a gate whose subject
 has been taken away must say it measured nothing rather than report OK.** A
 check that cannot tell "did not fail" from "did not run" is the most expensive
 mistake this estate makes in its tooling, and it is made in tooling rather than
@@ -122,11 +122,13 @@ Both numbers in that sentence were stale before they were corrected on
 written once and the cases kept arriving. It moved again the next day with the
 hook-environment case, and again on 2026-08-26 with the four cases holding the
 relevant-not-enforced framework list (invariant 33), one of which takes that
-list away. That is the point rather than an annoyance: the number
-is now updated in the commit that changes it, because somebody looks. @measured on that date, the run
-itself for the new figure and `git show origin/main:scripts/gates-have-teeth.sh
-| grep -c '^run_case'` for the old one, minus one for the function's own
-definition, which that pattern also matches. That is invariant 12's own failure
+list away. It had drifted again by 2026-08-27, reading 39 and "two gates must
+NOT fire" while the harness ran 43 with eight of those. That is the point rather
+than an annoyance: the number moves whenever somebody looks, and looking is the
+only thing that moves it. @measured 2026-08-27, all three figures from one run:
+`./scripts/gates-have-teeth.sh | grep -c '^ok '` for the total,
+`| grep -c '(pass)'` for the must-not-fire cases, and reading each case's label
+for the ten that take a subject away. That is invariant 12's own failure
 inside the file that records invariant 12, and it is left written down rather
 than quietly fixed, because the fix that would actually hold is a gate and
 there is not one. Nothing checks this sentence. Counting cases is easy
@@ -2053,3 +2055,75 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(tests: four in `crates/delegation`, three red against the unfixed
     assembler with the chain it handed out quoted verbatim, one green on both
     sides as the overshoot guard. Scenarios: `features/the-delegation-cap.feature`)*
+36. **Whether a policy JUDGED an action is a separate fact from whether the
+    action OCCURRED, and a door that keeps only the first keeps nothing for the
+    deployment that configured no policy.** `emit_tool_call` sat inside
+    `if st.wardryx.mode != WardryxMode::Off` in the MCP broker, so the whole
+    per-action audit trail of that door was a side effect of having a PDP. The
+    default deployment has none.
+
+    Measured 2026-08-27 on the release binary, both directions, with
+    `TOKENFUSE_WARDRYX_*` unset and a stub upstream over plain HTTP: a live
+    `tools/call` that was brokered successfully wrote ZERO lines to
+    `TOKENFUSE_EVENTS_PATH` against `main`, and one line against this branch,
+    `{"type":"tool_call", ..., "data":{"decision":"allowed-ungoverned","tool":"gh_api", ...}}`.
+    The call itself was served identically in both, which is what made the
+    absence invisible.
+
+    **The word is `allowed-ungoverned` and it is deliberately not `allow`.**
+    The dependency plane already uses it for an outage that was let through
+    (invariant 24), and `/v1/fuse/check-tool-call` answers `governed: false` for
+    the same distinction (invariant 26). A third spelling would have made three
+    consumers of one fact read three vocabularies, and writing `allow` would
+    record a governance gap as a permission.
+
+    **Exactly one record per brokered call, and only for one that was
+    brokered.** Those are two halves and each fails differently. Two records say
+    the agent called the tool twice, which makes every count of that tool wrong.
+    A record written for a call that was refused before the upstream was
+    contacted (the DLP block, the taint gate, the identity refusals, an unknown
+    named upstream, a scope-denied secret) sends an auditor after an action
+    nobody took. The gate's own deny and hold are the one refusal that keeps its
+    record, because there a policy did judge, and a refusal is the row worth
+    having.
+
+    **A call attributable to nobody is counted, not passed over.** SPEC.md §6.1
+    forbids inventing an `agent_id`, so the event is skipped; the emit is
+    attempted anyway, so `Exporter::skipped_count` moves and `log_outcome` warns.
+    Guarding the call site instead would make the same gap a branch that never
+    runs, and an operator can read a counter where they cannot read an unentered
+    `if let`.
+    *(test: five in `tests/mcp_broker.rs`, of which
+    `a_brokered_tool_call_is_recorded_when_no_policy_gate_is_configured` and
+    `a_brokered_call_that_names_nobody_is_counted_as_skipped_not_never_attempted`
+    were verified red against the unfixed tree, verbatim `left: 0 right: 1` for
+    both; the other three are the guards that keep the fix from being worse than
+    the defect and each was verified red against its own mutant rather than
+    written green. Five mutants planted in the PRODUCT code 2026-08-27, all five
+    caught: the one-record flag never set, so a governed call is recorded twice
+    (`a_governed_tool_call_is_recorded_once_and_not_twice`, `left: 2 right: 1`);
+    the emit moved above secret injection, so a scope-denied call is recorded as
+    having happened (`a_call_refused_before_it_is_brokered_is_not_recorded_as_a_tool_call`);
+    the gated emit narrowed to the allow arm, so a deny keeps no record
+    (`a_refusal_the_policy_decided_is_still_recorded_exactly_once`,
+    `deny: the refusal left 0 record(s)`); the ungoverned decision written as
+    `Some(Allow)` (the same test plus
+    `the_brokers_tool_call_record_carries_the_chain_and_what_proved_it`); and the
+    emit put behind `if let Some(rid) = record_agent_id`, so the skip is never
+    counted. Scenarios: `features/the-record-of-a-brokered-call.feature`, five,
+    each bound to a named test. Doc: `docs/23-mcp-broker-v2.md` §3.
+
+    Not a script gate: what would have to be checked is that every route through
+    `process` reaching the upstream passes an emit, and the only mechanical form
+    of that is a hand-written list of routes, which is the shape invariant 34
+    names and this repository has now found six times. The routes are held by
+    the tests instead, each naming the refusal it is about.)*
+
+    **Where it says nothing.** The record is written before the POST, so a
+    forward that fails at the transport is recorded as brokered. That is not new
+    and not narrowed here: the gated site above it has always written before
+    forwarding, and moving both after the answer would mean a call the upstream
+    ran and never acknowledged goes unrecorded, which is the worse of the two.
+    The LLM door is untouched; it keeps no `tool_call` of its own, because the
+    tool-use blocks a model emits are the I1 `tool_calls` Parquet column
+    (docs/21) and a different measurement.
