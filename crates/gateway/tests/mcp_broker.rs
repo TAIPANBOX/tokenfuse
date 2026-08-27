@@ -121,6 +121,7 @@ fn broker_state(
         // deployment that configures none.
         chain_proof: None,
         revocations: None,
+        identity_strict: tokenfuse_gateway::identitymap::StrictMode::Off,
         upstream,
         named_upstreams,
         vault,
@@ -156,6 +157,7 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         // deployment that configures none.
         chain_proof: None,
         revocations: None,
+        identity_strict: tokenfuse_gateway::identitymap::StrictMode::Off,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -957,6 +959,7 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         // deployment that configures none.
         chain_proof: None,
         revocations: None,
+        identity_strict: tokenfuse_gateway::identitymap::StrictMode::Off,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -1273,6 +1276,7 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         // deployment that configures none.
         chain_proof: None,
         revocations: None,
+        identity_strict: tokenfuse_gateway::identitymap::StrictMode::Off,
         upstream,
         named_upstreams: Default::default(),
         vault,
@@ -1706,6 +1710,7 @@ fn broker_proving_recording(
     pdp: String,
     events_path: Option<&str>,
     mode: WardryxMode,
+    strict: tokenfuse_gateway::identitymap::StrictMode,
 ) -> (
     Router,
     tokenfuse_delegation::testing::Key,
@@ -1726,6 +1731,7 @@ fn broker_proving_recording(
     // is reached at its origin plus "/", so the two agree by construction
     // rather than by a number retyped here.
     let origin = "https://tokenfuse.acme.example".to_string();
+    Arc::get_mut(&mut st).unwrap().identity_strict = strict;
     if let Some(path) = events_path {
         Arc::get_mut(&mut st).unwrap().events = Arc::new(
             tokenfuse_gateway::events::EventExporter::open(path)
@@ -1749,7 +1755,13 @@ fn broker_proving(
     tokenfuse_delegation::testing::Key,
     tokenfuse_delegation::testing::Key,
 ) {
-    broker_proving_recording(upstream, pdp, None, WardryxMode::Enforce)
+    broker_proving_recording(
+        upstream,
+        pdp,
+        None,
+        WardryxMode::Enforce,
+        tokenfuse_gateway::identitymap::StrictMode::Off,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1893,6 +1905,7 @@ async fn the_brokers_tool_call_record_carries_the_chain_and_what_proved_it() {
         pdp,
         Some(events.to_str().expect("a utf-8 temp path")),
         WardryxMode::Shadow,
+        tokenfuse_gateway::identitymap::StrictMode::Off,
     );
     let broker_url = spawn_server(router).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1968,5 +1981,86 @@ async fn the_brokers_tool_call_record_carries_the_chain_and_what_proved_it() {
          policy allowed it: {call}"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same contradiction the LLM door refuses, at the MCP door.
+///
+/// A caller presenting the triage agent's delegation token while naming itself
+/// somebody else in `x-fuse-agent-id`. `chainproof::resolve` already refuses a
+/// declared CHAIN that contradicts the verified one; nothing compared the
+/// header, at either door, until 2026-08-27.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_for_one_agent_and_a_header_for_another_is_refused_at_the_mcp_door() {
+    use tokenfuse_delegation::testing::{proof_at, token};
+    let dir = std::env::temp_dir().join(format!("tf-broker-contradict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let events = dir.join("events.ndjson");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, _seen) = capturing_pdp("allow").await;
+    let (router, issuer, holder) = broker_proving_recording(
+        upstream,
+        pdp,
+        Some(events.to_str().expect("a utf-8 temp path")),
+        WardryxMode::Shadow,
+        tokenfuse_gateway::identitymap::StrictMode::Enforce,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+
+    let http = reqwest::Client::new();
+    let res = http
+        .post(&broker_url)
+        // The token vouches for the orchestrator. The caller says it is a bot.
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("authorization", format!("DPoP {tok}"))
+        .header(
+            tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            proof_at(
+                &holder,
+                now,
+                "POST",
+                "https://tokenfuse.acme.example/",
+                "p-contradict-mcp",
+            ),
+        )
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a token for one agent and a header for another was honoured"
+    );
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "identity_mismatch", "{body}");
+    // Both halves named, so a caller knows which one to fix.
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("orchestrator") && reason.contains("bot"),
+        "{reason}"
+    );
+
+    let text = std::fs::read_to_string(&events).unwrap_or_default();
+    assert!(
+        text.contains("identity_mismatch") && text.contains("agent_id_contradicts_proven_chain"),
+        "the refusal reached nobody: {text}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -486,8 +486,12 @@ async fn mcp_broker() {
         tokenfuse_gateway::sink::now_millis() / 1000,
     )
     .await;
+    // The SAME dial the LLM door reads, and read here through the same function,
+    // so the two doors cannot drift into parsing one variable two ways.
+    let identity_strict = tokenfuse_gateway::identitymap::StrictMode::from_env();
     let state = Arc::new(BrokerState {
         chain_proof,
+        identity_strict,
         revocations,
         upstream: upstream.clone(),
         named_upstreams,
@@ -697,23 +701,7 @@ async fn serve() {
     // Strict mode governs ONLY the key<->agent binding check; unit budgets
     // follow TOKENFUSE_MODE like every other budget. An unknown value exits
     // (same posture as an unusable map: refuse, never guess).
-    let identity_strict = {
-        let raw = std::env::var("TOKENFUSE_IDENTITY_STRICT").unwrap_or_default();
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            tokenfuse_gateway::identitymap::StrictMode::Off
-        } else {
-            match trimmed.parse::<tokenfuse_gateway::identitymap::StrictMode>() {
-                Ok(mode) => mode,
-                Err(_) => {
-                    eprintln!(
-                        "tokenfuse: TOKENFUSE_IDENTITY_STRICT must be off|warn|enforce, got `{trimmed}`"
-                    );
-                    std::process::exit(2);
-                }
-            }
-        }
-    };
+    let identity_strict = tokenfuse_gateway::identitymap::StrictMode::from_env();
     // The same three-step rollout as the identity map above, and an unknown
     // value exits for the same reason: a mistyped mode must not silently pick
     // the permissive one. Default off, because the emission path is fail-open
