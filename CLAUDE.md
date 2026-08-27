@@ -1462,6 +1462,24 @@ build)`, `cloud apns (feature build)`.
    the mapping is `[sub] + reverse(act)` rather than a reversal. A verifier that
    handed the actors straight to a record would write a delegation with the
    human missing from it, and every token would still verify.
+
+   **And the cap on that chain counts ENTRIES, which is why it is not the cap on
+   the actors.** agent-passport SPEC 5.1 reads "Maximum chain depth is 32
+   entries" and SPEC section 5 calls the members of `on_behalf_of` entries, so
+   the bound belongs to the assembled list. `chain_of` prepends the subject and
+   `verify_delegation` refuses an empty `sub`, so every chain this crate builds
+   spends one entry on the root: `MAX_CHAIN_ENTRIES` is the SPEC's number and
+   `MAX_ACTORS_WITH_SUBJECT` is derived from it rather than retyped. Measured
+   2026-08-27 with agent-conform against a real emitted line: the bound was on
+   the actors, so a token carrying 32 of them verified here and produced a
+   33-entry chain that agent-conform, both envelope schemas and agent-stack-go's
+   `chain.Validate` all refuse with `maxItems: got 33, want 32`. The door
+   reported success and the audit trail it was supposed to leave did not exist.
+
+   That is the same shape as invariant 34 one repository over: one rule, two
+   places, nothing comparing them. The comparison cannot live here, because this
+   repository may not read agent-passport or agent-stack-go, so it lives in
+   `estate-gates`.
    *(test: fourteen in `cloud::delegation`, of which
    `a_token_presented_by_the_wrong_holder_is_refused` and
    `a_bound_token_checked_with_no_proof_is_refused_rather_than_downgraded` are
