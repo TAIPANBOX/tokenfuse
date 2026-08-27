@@ -154,9 +154,23 @@ struct Act {
     act: Option<Box<Act>>,
 }
 
-/// The chain cap agent-passport SPEC 5.1 sets, and the thing that stops a
+/// The chain cap agent-passport SPEC 5.1 sets, in the unit SPEC 5.1 uses:
+/// ENTRIES of `on_behalf_of`.
+///
+/// "Maximum chain depth is 32 entries", and SPEC section 5 calls the members of
+/// `on_behalf_of` entries. The root, usually a human, is the first of them.
+const MAX_CHAIN_ENTRIES: usize = 32;
+
+/// The same cap counted in RFC 8693 actors, and the thing that stops a
 /// self-referential `act` being walked for ever.
-const MAX_DEPTH: usize = 32;
+///
+/// Derived rather than retyped, because the two numbers are one rule.
+/// `verify_delegation` refuses a token with an empty `sub`, so every chain this
+/// crate builds carries the subject as its first ENTRY and the actors get one
+/// fewer. Measured 2026-08-27: this bound was 32 actors, so a full token
+/// verified here and produced a 33-entry chain that every validating consumer
+/// in the estate quarantined with `maxItems: got 33, want 32`.
+const MAX_ACTORS_WITH_SUBJECT: usize = MAX_CHAIN_ENTRIES - 1;
 
 /// Verify a delegation token and everything that makes it more than a bearer
 /// token.
@@ -262,6 +276,10 @@ pub fn verify_delegation(
 /// list-plus-its-head, and a verifier that handed the actors straight to a
 /// record would write a delegation chain with the human missing from it. Every
 /// token would still verify.
+///
+/// The head is also why the cap here is [`MAX_ACTORS_WITH_SUBJECT`] and not
+/// [`MAX_CHAIN_ENTRIES`]: the subject about to be pushed is an entry, and SPEC
+/// 5.1 counts entries.
 fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     // `act` nests current-first (RFC 8693 4.1: "The outermost `act` claim
     // represents the current actor"), and this estate records root-first, so
@@ -269,7 +287,7 @@ fn chain_of(sub: &str, act: Option<&Act>) -> Result<Vec<String>, Refusal> {
     let mut current_first = Vec::new();
     let mut cursor = act;
     while let Some(a) = cursor {
-        if current_first.len() >= MAX_DEPTH {
+        if current_first.len() >= MAX_ACTORS_WITH_SUBJECT {
             return Err(Refusal::Malformed);
         }
         if a.sub.is_empty() {
@@ -622,5 +640,102 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Refusal::WrongKey);
+    }
+
+    /// agent-passport SPEC 5.1: "Maximum chain depth is 32 entries".
+    ///
+    /// Written out here rather than read from this crate's own constant on
+    /// purpose. The question is whether this crate agrees with the SPEC, and a
+    /// test that takes the number from the code under test can only ever prove
+    /// that the code agrees with itself.
+    const SPEC_5_1_MAX_ENTRIES: usize = 32;
+
+    /// An `act` claim `n` actors deep, nested the way RFC 8693 4.1 nests it:
+    /// the OUTERMOST is the current actor and nesting goes back in time.
+    fn nested_act(n: usize) -> serde_json::Value {
+        let mut act = serde_json::json!({"sub": "agent://acme/a0"});
+        for i in 1..n {
+            act = serde_json::json!({"sub": format!("agent://acme/a{i}"), "act": act});
+        }
+        act
+    }
+
+    /// THE SEAM. This door decides what verifies; a different repository holds
+    /// what verified. Nothing inside this crate can see the second half, so
+    /// nothing inside this crate could see that a token it accepted produced a
+    /// record every consumer refuses.
+    ///
+    /// Swept rather than sampled. The whole defect is one entry wide, and a
+    /// test that picks a depth picks one side of it.
+    #[test]
+    fn no_chain_this_door_builds_is_longer_than_the_record_accepts() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        for actors in 1..=SPEC_5_1_MAX_ENTRIES + 2 {
+            let tok = token(
+                &issuer,
+                &holder,
+                now,
+                serde_json::json!({"act": nested_act(actors)}),
+            );
+            let verified = verify_delegation(
+                &cfg(&issuer),
+                &tok,
+                Some(&proof(&holder, now)),
+                "POST",
+                URL,
+                now,
+                never,
+            );
+            let Ok(v) = verified else {
+                continue; // refused, which is the honest answer at the boundary
+            };
+            assert!(
+                v.chain.len() <= SPEC_5_1_MAX_ENTRIES,
+                "a token carrying {actors} actors verified and produced a {} entry \
+                 chain. agent-conform, the v0.2 and v0.3 envelope schemas and \
+                 agent-stack-go's chain.Validate all refuse it: \
+                 `maxItems: got {}, want {SPEC_5_1_MAX_ENTRIES}`",
+                v.chain.len(),
+                v.chain.len(),
+            );
+        }
+    }
+
+    /// The subject is the chain's first ENTRY, so a token that names one has
+    /// room for one actor fewer. `verify_delegation` refuses a token with no
+    /// `sub`, so in this crate that is every token.
+    #[test]
+    fn the_subject_counts_towards_the_cap_because_the_spec_counts_entries() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let verify = |actors: usize| {
+            verify_delegation(
+                &cfg(&issuer),
+                &token(
+                    &issuer,
+                    &holder,
+                    now,
+                    serde_json::json!({"act": nested_act(actors)}),
+                ),
+                Some(&proof(&holder, now)),
+                "POST",
+                URL,
+                now,
+                never,
+            )
+        };
+
+        let full =
+            verify(SPEC_5_1_MAX_ENTRIES - 1).expect("a subject plus 31 actors is 32 entries");
+        assert_eq!(full.chain.len(), SPEC_5_1_MAX_ENTRIES);
+        assert_eq!(
+            full.chain[0], "user://acme/alice",
+            "the root is still first"
+        );
+
+        assert_eq!(
+            verify(SPEC_5_1_MAX_ENTRIES).unwrap_err(),
+            Refusal::Malformed,
+            "a subject plus {SPEC_5_1_MAX_ENTRIES} actors is one entry too many"
+        );
     }
 }
