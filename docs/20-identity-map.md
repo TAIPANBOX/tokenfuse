@@ -32,7 +32,8 @@ Two new environment variables:
   invalid = the gateway refuses to start (same fail-closed posture as
   `TOKENFUSE_CLIENT_KEYS`: a typo must never silently disable what the
   operator believes is on).
-- `TOKENFUSE_IDENTITY_STRICT=off|warn|enforce` (default `off`) - governs ONLY
+- `TOKENFUSE_IDENTITY_STRICT=off|warn|enforce` (default `enforce` since
+  2026-08-27; `off` restores the old behaviour in one variable) - governs
   the key<->agent binding check. Unit BUDGETS follow `TOKENFUSE_MODE`
   (shadow|warn|enforce) like every other budget: the money knob governs money,
   the identity knob governs identity.

@@ -92,24 +92,65 @@ impl StrictMode {
     /// invisible to that gate and was read by the LLM door alone, which is how
     /// the MCP door went without it.
     ///
-    /// Unset is `Off`. An unknown value EXITS rather than picking the permissive
-    /// reading: a mistyped mode must not silently disable a check the operator
-    /// believes they turned on.
+    /// **Unset is `Enforce`** since 2026-08-27, and `off` is one explicit
+    /// variable away, which is the difference between a default and a
+    /// prohibition.
+    ///
+    /// # Why it changed direction
+    ///
+    /// It was `off`, so the binding check this product advertises did nothing
+    /// until somebody set a variable. That is the shape `crate::defaults`
+    /// already argued about `TOKENFUSE_DLP` and `TOKENFUSE_REQUIRE_RUN_ID` on
+    /// 2026-08-06: a deployment governed on paper, every check green because
+    /// the checks read configuration rather than behaviour.
+    ///
+    /// # What it can and cannot refuse, measured rather than asserted
+    ///
+    /// A mismatch needs something to mismatch WITH, and both sources are
+    /// opt-in:
+    ///
+    /// - the key-binding check needs `TOKENFUSE_CLIENT_KEYS` with per-key agent
+    ///   scoping, since `IdentityMap::resolve` only reports one for a `key_id`
+    ///   it recognises;
+    /// - `agent_id_contradicts_proven_chain` needs a delegation issuer, since
+    ///   there is no proven actor without one.
+    ///
+    /// So a deployment that configured neither sees no change at all, and one
+    /// that configured either had already opted into the identity it is now
+    /// held to. `a_deployment_that_opted_into_nothing_is_unaffected` measures
+    /// that rather than trusting this paragraph.
+    ///
+    /// An unknown value EXITS rather than picking either reading: a mistyped
+    /// mode must not silently disable a check the operator believes they turned
+    /// on, and must not silently enable one they did not ask for.
     pub fn from_env() -> Self {
-        let raw = std::env::var("TOKENFUSE_IDENTITY_STRICT").unwrap_or_default();
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return StrictMode::Off;
-        }
-        match trimmed.parse::<StrictMode>() {
+        match Self::from_value(std::env::var("TOKENFUSE_IDENTITY_STRICT").ok().as_deref()) {
             Ok(mode) => mode,
-            Err(_) => {
+            Err(raw) => {
                 eprintln!(
-                    "tokenfuse: TOKENFUSE_IDENTITY_STRICT must be off|warn|enforce, got `{trimmed}`"
+                    "tokenfuse: TOKENFUSE_IDENTITY_STRICT must be off|warn|enforce, got `{raw}`"
                 );
                 std::process::exit(2);
             }
         }
+    }
+
+    /// The decision, without the process exit and without the environment.
+    ///
+    /// Split out for the reason `crate::defaults` splits its own: a default is
+    /// a claim about what happens when nobody configures anything, and a claim
+    /// nothing can assert is a claim nobody checks. Before this, the setting
+    /// whose default this change reverses had no test pinning that default at
+    /// all. `Err` carries the value that could not be read, so the caller owns
+    /// the exit.
+    pub fn from_value(value: Option<&str>) -> Result<Self, String> {
+        let trimmed = value.unwrap_or_default().trim();
+        if trimmed.is_empty() {
+            return Ok(StrictMode::Enforce);
+        }
+        trimmed
+            .parse::<StrictMode>()
+            .map_err(|_| trimmed.to_string())
     }
 }
 
@@ -1469,6 +1510,55 @@ mod tests {
         ] {
             assert_eq!(mode.as_wire_str(), s);
             assert_eq!(s.parse::<StrictMode>(), Ok(mode));
+        }
+    }
+
+    /// The DEFAULT, which is the setting every deployment that names nothing
+    /// gets, and which nothing asserted until 2026-08-27.
+    #[test]
+    fn the_mode_an_operator_falls_into_is_enforce() {
+        assert_eq!(StrictMode::from_value(None), Ok(StrictMode::Enforce));
+        assert_eq!(StrictMode::from_value(Some("   ")), Ok(StrictMode::Enforce));
+    }
+
+    /// And every value an operator can name is still honoured, `off` first:
+    /// the old behaviour is one explicit variable away, which is the
+    /// difference between a default and a prohibition.
+    #[test]
+    fn case_is_not_the_operators_job() {
+        // The parser lowercases, so `Off` is `off`. Written down because the
+        // first version of the test below assumed the opposite and went red,
+        // which is a test asserting a stricter rule than the code has: a
+        // deployment that wrote `Off` in a compose file means off, and
+        // refusing it would be pedantry dressed as safety.
+        assert_eq!(StrictMode::from_value(Some("Off ")), Ok(StrictMode::Off));
+        assert_eq!(
+            StrictMode::from_value(Some("ENFORCE")),
+            Ok(StrictMode::Enforce)
+        );
+    }
+
+    #[test]
+    fn every_named_mode_is_honoured_and_off_still_means_off() {
+        assert_eq!(StrictMode::from_value(Some("off")), Ok(StrictMode::Off));
+        assert_eq!(StrictMode::from_value(Some(" warn ")), Ok(StrictMode::Warn));
+        assert_eq!(
+            StrictMode::from_value(Some("enforce")),
+            Ok(StrictMode::Enforce)
+        );
+    }
+
+    /// A value that cannot be read is refused rather than resolved either way.
+    /// Falling back to `enforce` would refuse traffic the operator did not ask
+    /// to refuse; falling back to `off` would disable a check they believe they
+    /// turned on. Both are worse than stopping.
+    #[test]
+    fn a_misspelt_mode_is_refused_rather_than_guessed() {
+        for bad in ["enforced", "on", "strict", "0", "false"] {
+            assert!(
+                StrictMode::from_value(Some(bad)).is_err(),
+                "{bad} was quietly turned into a mode"
+            );
         }
     }
 }
