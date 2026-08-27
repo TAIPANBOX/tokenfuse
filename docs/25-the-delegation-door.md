@@ -148,6 +148,13 @@ proves is an `agent_id_contradicts_proven_chain` mismatch, on the same
 default and what every existing deployment sees. The key-binding check could not
 catch this, because one key may legitimately speak for several agents.
 
+**Both doors, and both transports.** The MCP door reads the same variable
+through the same `StrictMode::from_env`, so the two cannot drift into parsing
+one dial two ways, and the refusal exists for HTTP (403, naming both agents) and
+for stdio (JSON-RPC `-32009`, distinct from `-32007` "no agent id at all"
+because a caller fixing that one by sending a header would make this one worse).
+The record is written on either transport.
+
 **A store may erase the proof.** trailryx partitions a record into typed
 metadata it keeps and a payload plane a per-event key destroys, and until it
 gives `delegation_proof` a typed home the proof rides in the erasable half while

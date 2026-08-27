@@ -147,6 +147,12 @@ pub struct BrokerState {
     /// The delegation issuer's keys, or `None` when no issuer is configured,
     /// which is the default and leaves every chain a claim.
     pub chain_proof: crate::chainproof::ChainProof,
+    /// `TOKENFUSE_IDENTITY_STRICT`, the SAME dial the LLM door reads and with the
+    /// same three values. One vocabulary across both doors rather than a
+    /// `TOKENFUSE_MCP_`-namespaced twin: this is not a broker-specific knob, it
+    /// is the estate's answer to "the credential and the claim disagree", and
+    /// giving it a second name is how one question ends up with two answers.
+    pub identity_strict: crate::identitymap::StrictMode,
     /// The revocation list this door polls, or `None` when it polls none.
     /// `None` is the check being off, which is what both doors did for the
     /// whole life of the cache: they passed a literal `false`.
@@ -200,6 +206,10 @@ pub struct CallContext {
     /// [`on_behalf_of`](CallContext::on_behalf_of) from it rather than from the
     /// header. Set by [`crate::chainproof::resolve`] and by nothing else.
     pub chain_proven: bool,
+    /// The agent a PROVEN chain named, or `None` when nothing was proved. Kept
+    /// beside the header rather than folded into it, because the whole question
+    /// this door now asks is whether the two AGREE.
+    pub proven_actor: Option<String>,
     /// The identity a security RECORD is filed under: the header when the
     /// caller sent one, otherwise the agent a PROVEN chain named.
     ///
@@ -590,6 +600,24 @@ fn needs_identity(st: &BrokerState, req: &Value, ctx: &CallContext) -> bool {
         && attributed_agent(ctx).is_none()
 }
 
+/// Whether the credential and the claim disagree about who is calling.
+///
+/// `chainproof::resolve` already refuses a declared CHAIN that contradicts the
+/// verified one. This is that rule one field over, and the LLM door got it
+/// first: a caller could present the triage agent's token, name itself
+/// `agent://acme/other` in the header, and every record and policy decision was
+/// made about `other` while the credential vouched for `triage`.
+///
+/// Only against a PROVEN chain. A claimed one is the caller's own writing on
+/// both sides, so a disagreement there is a caller disagreeing with itself and
+/// says nothing about authority.
+fn identity_contradicted(ctx: &CallContext) -> bool {
+    let (Some(header), Some(leaf)) = (attributed_agent(ctx), ctx.proven_actor.as_deref()) else {
+        return false;
+    };
+    header != leaf
+}
+
 /// JSON-RPC code for "this call names no agent, so the policy gate could not
 /// judge it". Distinct from `-32004` (the PDP denied or held) on purpose: a
 /// refusal because the gate could not RUN is a different fact from a refusal
@@ -602,6 +630,52 @@ const IDENTITY_RPC_CODE: i64 = -32007;
 const IDENTITY_RPC_MESSAGE: &str =
     "blocked: policy enforcement is on and this call carries no agent identity; \
      send one in `x-fuse-agent-id`";
+
+/// Write the contradiction down, once, wherever the call arrived from.
+///
+/// A function because the HTTP transport refuses BEFORE `process` runs, so a
+/// record made only inside `process` would exist for stdio and not for HTTP.
+/// That is the shape of defect this whole wave was about, and it nearly went in
+/// while fixing it.
+///
+/// The record goes out under `warn` as well as `enforce`: `warn` exists to make
+/// a thing visible before it is enforced, and a mismatch nobody can see is the
+/// state being corrected.
+fn record_identity_contradiction(st: &BrokerState, ctx: &CallContext) {
+    tracing::warn!(
+        claimed = ?attributed_agent(ctx),
+        proven = ?ctx.proven_actor,
+        "mcp broker: the delegation token proves a different agent than the header claims"
+    );
+    let outcome = st.events.emit(
+        EventType::IdentityMismatch,
+        crate::sink::now_millis(),
+        ctx.event_agent_id.as_deref().or(attributed_agent(ctx)),
+        ctx.run_id.as_deref(),
+        chain_on_record(ctx),
+        json!({
+            "reason": "agent_id_contradicts_proven_chain",
+            "agent_id": attributed_agent(ctx),
+            "proven_actor": ctx.proven_actor,
+        }),
+    );
+    crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+}
+
+/// JSON-RPC code for "the credential and the claim disagree about who is
+/// calling".
+///
+/// Distinct from `-32007` (no agent id at all) and from `-32004` (the PDP
+/// decided), because it is a third fact: an identity WAS presented, twice, and
+/// the two do not match. A client that fixes one of those by sending a header
+/// would be making this one worse.
+const IDENTITY_CONTRADICTION_RPC_CODE: i64 = -32009;
+
+/// The wording, which names both halves. A caller told only "identity mismatch"
+/// cannot tell whether to fix its header or its token.
+const IDENTITY_CONTRADICTION_RPC_MESSAGE: &str =
+    "blocked: the delegation token proves this call acts for a different agent \
+     than `x-fuse-agent-id` claims; the two must agree";
 
 /// JSON-RPC code for "a `{{secret:NAME}}` handle names a secret that HAS a
 /// `TOKENFUSE_MCP_SECRET_SCOPES` rule, and this call's (agent, tool) does not
@@ -714,6 +788,7 @@ async fn handle(
     let ctx = CallContext {
         delegation_proof,
         agent_id: header("x-fuse-agent-id"),
+        proven_actor: proven_actor.clone(),
         event_agent_id,
         upstream: header("x-fuse-mcp-upstream"),
         run_id: header("x-fuse-run-id"),
@@ -733,6 +808,20 @@ async fn handle(
              cannot judge a call it cannot attribute"
         );
         return crate::proxy::identity_required();
+    }
+
+    // The HTTP shape of the contradiction, so a caller of this transport gets a
+    // 403 with both names rather than a JSON-RPC envelope. `process` still
+    // makes the record and answers stdio, and its check runs whichever way the
+    // call arrives: this only upgrades the refusal, the same way
+    // `needs_identity` above upgrades the no-identity one.
+    if identity_contradicted(&ctx) && st.identity_strict == crate::identitymap::StrictMode::Enforce
+    {
+        record_identity_contradiction(&st, &ctx);
+        return crate::proxy::identity_contradicted(
+            attributed_agent(&ctx).unwrap_or_default(),
+            ctx.proven_actor.as_deref().unwrap_or_default(),
+        );
     }
     Json(process(&st, req, &ctx).await).into_response()
 }
@@ -892,6 +981,22 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .to_string();
     let agent_id = attributed_agent(ctx);
     let record_agent_id = ctx.event_agent_id.as_deref().or(agent_id);
+
+    // The stdio answer to the same contradiction the HTTP transport refuses one
+    // screen up. Both, because stdio has no header channel for the transport to
+    // guard and a caller reaching `process` directly must get the same verdict:
+    // this is the whole shape of defect this wave was about, and leaving one of
+    // two paths would be committing it while fixing it.
+    if identity_contradicted(ctx) && st.identity_strict != crate::identitymap::StrictMode::Off {
+        record_identity_contradiction(st, ctx);
+        if st.identity_strict == crate::identitymap::StrictMode::Enforce {
+            return rpc_error(
+                &id,
+                IDENTITY_CONTRADICTION_RPC_CODE,
+                IDENTITY_CONTRADICTION_RPC_MESSAGE,
+            );
+        }
+    }
     // The tool this call names, read once here so both the Wardryx gate
     // below and secret-scope resolution at the injection step (which runs
     // whether or not Wardryx is configured) see the same value. Empty when

@@ -118,3 +118,12 @@ Feature: One binary, two processes, and the same door in both
     Given a caller whose header names the same agent its token proves
     When strict identity is enforced
     Then the call proceeds and nothing is recorded as a mismatch
+
+  # @test:a_token_for_one_agent_and_a_header_for_another_is_refused_at_the_mcp_door
+  Scenario: The same contradiction, at the MCP door
+    Given a `tools/call` presenting one agent's delegation token
+    And a header naming a different agent
+    When strict identity is enforced
+    Then it is refused with both names in the reason, so a caller knows which
+      of the two to fix, and the mismatch is recorded whichever transport the
+      call arrived on

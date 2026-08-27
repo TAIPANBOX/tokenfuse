@@ -2247,6 +2247,31 @@ pub(crate) fn unauthorized_response() -> Response {
 /// skipping its gate. Two enforcement points cannot hold opposite postures on
 /// one input, and they cannot drift if they return the same bytes from the same
 /// function.
+/// The HTTP shape of "the credential and the claim disagree about who is
+/// calling". 403 rather than 400: the request is well formed and the caller is
+/// authenticated; what it is not is entitled to speak as the agent it named.
+///
+/// Names both halves, because a caller told only "identity mismatch" cannot
+/// tell whether to fix its header or its token.
+pub(crate) fn identity_contradicted(claimed: &str, proven: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "identity_mismatch",
+            "reason": format!(
+                "the delegation token proves this call acts for {proven} and \
+                 `x-fuse-agent-id` claims {claimed}; the two must agree"
+            ),
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
 pub(crate) fn identity_required() -> Response {
     let body = serde_json::json!({
         "error": {

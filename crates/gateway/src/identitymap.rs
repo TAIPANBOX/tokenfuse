@@ -82,6 +82,37 @@ pub enum StrictMode {
     Enforce,
 }
 
+impl StrictMode {
+    /// `TOKENFUSE_IDENTITY_STRICT`, parsed the same way in every process.
+    ///
+    /// A function rather than the block that used to sit inline in `serve`, and
+    /// named `from_env` on purpose: `scripts/both-processes-configure-the-same-doors.sh`
+    /// discovers `<name>::from_env(` calls, so a door configured in one process
+    /// and forgotten in the other is a finding. Parsed inline, this dial was
+    /// invisible to that gate and was read by the LLM door alone, which is how
+    /// the MCP door went without it.
+    ///
+    /// Unset is `Off`. An unknown value EXITS rather than picking the permissive
+    /// reading: a mistyped mode must not silently disable a check the operator
+    /// believes they turned on.
+    pub fn from_env() -> Self {
+        let raw = std::env::var("TOKENFUSE_IDENTITY_STRICT").unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return StrictMode::Off;
+        }
+        match trimmed.parse::<StrictMode>() {
+            Ok(mode) => mode,
+            Err(_) => {
+                eprintln!(
+                    "tokenfuse: TOKENFUSE_IDENTITY_STRICT must be off|warn|enforce, got `{trimmed}`"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
 impl std::str::FromStr for StrictMode {
     type Err = String;
 
