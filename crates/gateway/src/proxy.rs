@@ -643,6 +643,27 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         )
     };
     let mut identity_header: Option<String> = None;
+    // A PROVEN chain names an actor, and a header naming a different one is a
+    // contradiction the caller chose. `chainproof::resolve` already refuses the
+    // same contradiction for the declared CHAIN; this is that rule one field
+    // over, and the key-binding check above cannot see it, because one key may
+    // legitimately speak for several agents.
+    //
+    // Measured 2026-08-26: nothing compared them. A caller could present the
+    // triage agent's token, name itself `agent://acme/other` in the header, and
+    // every record, cap and policy decision was made about `other` while the
+    // credential vouched for `triage`.
+    //
+    // It flows into the SAME off/warn/enforce switch as the key-binding
+    // mismatch, so an operator has one dial and one vocabulary rather than two,
+    // and a deployment that has not turned strict mode on sees no change.
+    let identity_mismatch = identity_mismatch.or_else(|| {
+        let leaf = proven_actor.as_deref()?;
+        (!agent_id.is_empty() && agent_id != leaf).then_some(crate::identitymap::Mismatch {
+            reason: "agent_id_contradicts_proven_chain",
+        })
+    });
+
     if let Some(mismatch) = identity_mismatch {
         match st.identity_strict {
             StrictMode::Off => {}
@@ -6768,5 +6789,111 @@ pub(crate) mod tests {
                 ]}
             ]
         })
+    }
+
+    /// A caller presenting one agent's token while naming itself another.
+    ///
+    /// Measured 2026-08-26: nothing compared the two. `chainproof::resolve`
+    /// refuses a declared CHAIN that contradicts the verified one, and the
+    /// key-binding check cannot see this because one key may legitimately speak
+    /// for several agents, so the header simply won and every record, cap and
+    /// policy decision was made about an agent the credential did not vouch for.
+    #[tokio::test]
+    async fn a_token_for_one_agent_and_a_header_for_another_is_a_mismatch() {
+        use tokenfuse_delegation::testing::{proof_at, token};
+        let (events, path) = recording_exporter("header-contradicts-proven");
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let mut st = st.with_events(events);
+        st.identity_strict = crate::identitymap::StrictMode::Enforce;
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-contradict",
+        );
+        let mut headers = proven_headers(&tok, &dpop);
+        // The token vouches for triage. The caller says it is somebody else.
+        headers.insert(
+            "x-fuse-agent-id",
+            "agent://acme/other".parse().expect("a header"),
+        );
+
+        let res = messages(State(st), headers, injected_bytes()).await;
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a token for one agent and a header for another was honoured"
+        );
+        let recorded = events_at(&path);
+        let mismatch = recorded
+            .iter()
+            .find(|e| e["type"] == "identity_mismatch")
+            .unwrap_or_else(|| panic!("no identity_mismatch was recorded: {recorded:?}"));
+        assert_eq!(
+            mismatch["data"]["reason"], "agent_id_contradicts_proven_chain",
+            "{mismatch}"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+    }
+
+    /// The header AGREEING with the proven leaf is not a mismatch. Without this
+    /// the fix above would refuse every proven caller that also sends a header,
+    /// which is most of them.
+    #[tokio::test]
+    async fn a_header_that_agrees_with_the_proven_chain_is_not_a_mismatch() {
+        use tokenfuse_delegation::testing::{proof_at, token};
+        let (events, path) = recording_exporter("header-agrees-with-proven");
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let mut st = st.with_events(events);
+        st.identity_strict = crate::identitymap::StrictMode::Enforce;
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-agree",
+        );
+        let mut headers = proven_headers(&tok, &dpop);
+        headers.insert(
+            "x-fuse-agent-id",
+            "agent://acme/triage".parse().expect("a header"),
+        );
+
+        let res = messages(State(st), headers, injected_bytes()).await;
+        assert_ne!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a caller whose header agrees with its own token was refused"
+        );
+        assert!(
+            !events_at(&path)
+                .iter()
+                .any(|e| e["type"] == "identity_mismatch"),
+            "agreement was recorded as a mismatch"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
     }
 }
