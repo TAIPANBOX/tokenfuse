@@ -514,13 +514,20 @@ fn reason_suffix(reason: &Option<String>) -> String {
     }
 }
 
-/// Emit one `tool_call` audit event for a Wardryx-gated `tools/call`. Skipped
-/// when `agent_id` is absent (agent-passport SPEC.md §6.1 forbids a fabricated
-/// `agent_id`; [`tokenfuse_core::agent_event::build`] enforces this and the
-/// event is counted-and-skipped, never faked). In shadow mode the recorded
-/// `decision` is `would-<decision>`, matching the `x-fuse-wardryx` header
-/// convention, so a shadow rollout's audit trail never reads as if a call was
-/// actually enforced.
+/// Emit one `tool_call` audit event for a `tools/call` this broker acted on,
+/// whether or not a policy gate judged it: a brokered call is an action that
+/// happened, and a PDP deciding it is a separate fact.
+///
+/// Called unconditionally rather than behind a `if let Some(agent_id)`, and the
+/// difference is what an operator can see. Agent-passport SPEC.md §6.1 forbids
+/// a fabricated `agent_id`, so a call attributable to nobody is counted and
+/// skipped by [`tokenfuse_core::agent_event::build`], never faked; a guard here
+/// would make that same call a line of code that never runs, and a counter is
+/// readable where an unentered branch is not.
+///
+/// In shadow mode the recorded `decision` is `would-<decision>`, matching the
+/// `x-fuse-wardryx` header convention, so a shadow rollout's audit trail never
+/// reads as if a call was actually enforced.
 fn emit_tool_call(
     st: &BrokerState,
     agent_id: Option<&str>,
@@ -1108,6 +1115,15 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
             return rpc_error(&id, -32004, &msg);
         }
 
+        // Whether the policy gate below already wrote this call's `tool_call`
+        // record. Exactly one record per call is the whole point: the gate
+        // writes one carrying the decision a PDP actually gave, including for
+        // the deny and the hold, which refuse from inside it; every other route
+        // to the upstream falls through to the emit at the end of this block. A
+        // doubled audit trail is a wrong one, because it says the agent called
+        // the tool twice.
+        let mut judged_and_recorded = false;
+
         if st.wardryx.mode != WardryxMode::Off {
             match agent_id {
                 Some(aid) => {
@@ -1144,6 +1160,7 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         Some(outcome.decision),
                         st.wardryx.mode,
                     );
+                    judged_and_recorded = true;
                     if st.wardryx.mode == WardryxMode::Enforce {
                         match outcome.decision {
                             WardryxDecision::Deny => {
@@ -1210,24 +1227,12 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         "mcp broker: wardryx shadow gate skipped, no x-fuse-agent-id on this \
                          tools/call"
                     );
-                    // The PDP could not be asked, and the RECORD is a separate
-                    // question. Measured 2026-08-26: `emit_tool_call` lived
-                    // inside the `Some(aid)` arm, so a caller whose delegation
-                    // token this door had just VERIFIED produced no audit record
-                    // of the tool call at all, because it sent no header. The
-                    // decision recorded here is the honest one: nothing judged
-                    // it.
-                    if let Some(rid) = record_agent_id {
-                        emit_tool_call(
-                            st,
-                            Some(rid),
-                            chain_on_record(ctx),
-                            &tool,
-                            &upstream_url,
-                            None,
-                            st.wardryx.mode,
-                        );
-                    }
+                    // No record here, and that is not a gap: `judged_and_recorded`
+                    // stays false, so this call is recorded by the emit at the
+                    // end of this block, with the same `None` decision and after
+                    // the refusals below have had their say. Writing it here
+                    // instead would file a record for a call the secret vault is
+                    // about to refuse.
                 }
             }
         }
@@ -1270,6 +1275,38 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                     ),
                 );
             }
+        }
+
+        // Nothing judged this call, and it is about to be brokered. Whether a
+        // POLICY decided it is a separate fact from whether it OCCURRED, and
+        // this is the site that keeps the second one. Measured 2026-08-27 on
+        // the release binary: `emit_tool_call` was reachable only from inside
+        // the wardryx branch, so a broker with no PDP configured, which is the
+        // DEFAULT, brokered tool calls and kept no per-action audit trail
+        // whatsoever. `allowed-ungoverned` is the same word the dependency
+        // plane and the firewall's own check endpoint already use for the same
+        // fact, and it is deliberately not `allow`: recording a governance gap
+        // as a permission is the mistake all three exist to refuse.
+        //
+        // The position is the rest of the claim. Every refusal that happens
+        // BEFORE the upstream is contacted has already returned above (the DLP
+        // block, the taint gate, the identity refusals, the PDP's own deny and
+        // hold, an unknown named upstream, a scope-denied secret), so no record
+        // written here says a call happened that did not. What it does not
+        // cover, and what the gated site above does not cover either, is a
+        // forward that fails at the transport: this is written before the POST,
+        // so the record reads as "brokered" for a call the upstream never
+        // answered.
+        if !judged_and_recorded {
+            emit_tool_call(
+                st,
+                record_agent_id,
+                chain_on_record(ctx),
+                &tool,
+                &upstream_url,
+                None,
+                st.wardryx.mode,
+            );
         }
     }
 

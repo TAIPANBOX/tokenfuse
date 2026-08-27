@@ -300,10 +300,10 @@ comparison in #132.
 
 ## Test status
 
-**Counts re-measured 2026-08-26**, each by the command named, because the set
+**Counts re-measured 2026-08-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1095 passing** (core 300, dpop 16, delegation 40,
-gateway 539, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1100 passing** (core 300, dpop 16, delegation 40,
+gateway 544, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
 **`tokenfuse-cluster`: 13 integration tests** on live raft clusters (in-process

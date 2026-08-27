@@ -2064,3 +2064,335 @@ async fn a_token_for_one_agent_and_a_header_for_another_is_refused_at_the_mcp_do
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// The record of a brokered call is a separate fact from the policy decision.
+//
+// Measured 2026-08-27 on the release binary: with Wardryx unset, a live
+// `tools/call` that was brokered successfully produced ZERO records, because
+// `emit_tool_call` sat inside `if st.wardryx.mode != WardryxMode::Off`. A
+// broker with no PDP configured is the DEFAULT deployment, so the default
+// deployment kept no per-action audit trail at all.
+// ---------------------------------------------------------------------------
+
+/// A temp directory of this test's own, named for the test, since every test in
+/// this binary shares one pid.
+fn events_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tf-broker-{tag}-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    dir
+}
+
+/// A broker that writes its agent-event NDJSON to `events_path`, with whatever
+/// gate and vault the case is about.
+///
+/// Hands back the exporter as well as the router. A record the exporter SKIPS
+/// leaves no line in the file, so a test that reads only the file cannot tell
+/// "skipped, and counted" from "never attempted", and that difference is the
+/// whole of the no-identity case below.
+fn broker_recording(
+    upstream: String,
+    events_path: &std::path::Path,
+    wardryx: Wardryx,
+    vault: Option<SecretVault>,
+    dlp: tokenfuse_core::DlpMode,
+) -> (Router, Arc<tokenfuse_gateway::events::EventExporter>) {
+    let mut st = broker_state(
+        upstream,
+        ScanMode::Off,
+        dlp,
+        None,
+        Default::default(),
+        wardryx,
+    );
+    let exporter = Arc::new(
+        tokenfuse_gateway::events::EventExporter::open(
+            events_path.to_str().expect("a utf-8 temp path"),
+        )
+        .expect("an exporter on a fresh file"),
+    );
+    {
+        let s = Arc::get_mut(&mut st).expect("sole owner");
+        s.events = Arc::clone(&exporter);
+        if let Some(v) = vault {
+            s.vault = v;
+        }
+    }
+    (app(st), exporter)
+}
+
+/// Every `tool_call` record in the file, in order.
+fn tool_calls(events_path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(events_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).expect("one JSON object per line"))
+        .filter(|e| e["type"] == "tool_call")
+        .collect()
+}
+
+/// Post one `tools/call` and return the JSON-RPC reply.
+async fn call_tool(broker_url: &str, agent: Option<&str>, args: Value) -> Value {
+    let mut req = reqwest::Client::new().post(broker_url);
+    if let Some(a) = agent {
+        req = req.header("x-fuse-agent-id", a);
+    }
+    req.json(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "gh_api", "arguments": args }
+    }))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap()
+}
+
+/// The finding itself: no PDP configured, and the call is still an action that
+/// happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brokered_tool_call_is_recorded_when_no_policy_gate_is_configured() {
+    let dir = events_dir("ungoverned");
+    let events = dir.join("events.ndjson");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (router, _exp) = broker_recording(
+        upstream,
+        &events,
+        Wardryx::disabled(),
+        None,
+        tokenfuse_core::DlpMode::Off,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = call_tool(&broker_url, Some("agent://acme.example/triage"), json!({})).await;
+    assert!(
+        resp.get("result").is_some(),
+        "the call must be brokered, or this test proves nothing about a brokered call: {resp}"
+    );
+
+    let calls = tool_calls(&events);
+    assert_eq!(
+        calls.len(),
+        1,
+        "a brokered tool call with no PDP configured left {} record(s); the default \
+         deployment keeps no per-action audit trail: {:?}",
+        calls.len(),
+        calls
+    );
+    assert_eq!(
+        calls[0]["data"]["decision"], "allowed-ungoverned",
+        "nothing judged this call and the record must not say a policy allowed it: {}",
+        calls[0]
+    );
+    assert_eq!(calls[0]["agent_id"], "agent://acme.example/triage");
+    assert_eq!(calls[0]["data"]["tool"], "gh_api");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One record per brokered call, not two.
+///
+/// The wardryx branch writes its own record with the decision the PDP gave. A
+/// second site that writes whenever the branch did not would double-count every
+/// governed call, and a doubled audit trail is a wrong one: it says the agent
+/// called the tool twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_governed_tool_call_is_recorded_once_and_not_twice() {
+    let dir = events_dir("once");
+    let events = dir.join("events.ndjson");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let pdp = stub_pdp("allow").await;
+    let (router, _exp) = broker_recording(
+        upstream,
+        &events,
+        a_wardryx(WardryxMode::Enforce, pdp),
+        None,
+        tokenfuse_core::DlpMode::Off,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = call_tool(&broker_url, Some("agent://acme.example/triage"), json!({})).await;
+    assert!(resp.get("result").is_some(), "{resp}");
+
+    let calls = tool_calls(&events);
+    assert_eq!(
+        calls.len(),
+        1,
+        "one brokered call left {} tool_call records: {:?}",
+        calls.len(),
+        calls
+    );
+    assert_eq!(
+        calls[0]["data"]["decision"], "allow",
+        "the record of a judged call must carry the judgement, not the ungoverned word: {}",
+        calls[0]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A refusal the policy decided is the most interesting record there is, and
+/// both of them return early from inside the wardryx branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_the_policy_decided_is_still_recorded_exactly_once() {
+    for verdict in ["deny", "hold"] {
+        let dir = events_dir(&format!("refusal-{verdict}"));
+        let events = dir.join("events.ndjson");
+        let (seen, upstream_router) = recording_upstream();
+        let upstream = spawn_server(upstream_router).await;
+        let pdp = stub_pdp(if verdict == "deny" { "deny" } else { "hold" }).await;
+        let (router, _exp) = broker_recording(
+            upstream,
+            &events,
+            a_wardryx(WardryxMode::Enforce, pdp),
+            None,
+            tokenfuse_core::DlpMode::Off,
+        );
+        let broker_url = spawn_server(router).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let resp = call_tool(&broker_url, Some("agent://acme.example/triage"), json!({})).await;
+        assert_eq!(resp["error"]["code"], json!(-32004), "{verdict}: {resp}");
+        assert!(
+            seen.lock().expect("upstream log").is_empty(),
+            "{verdict}: a refused call reached the upstream"
+        );
+
+        let calls = tool_calls(&events);
+        assert_eq!(
+            calls.len(),
+            1,
+            "{verdict}: the refusal left {} record(s): {:?}",
+            calls.len(),
+            calls
+        );
+        assert_eq!(
+            calls[0]["data"]["decision"], verdict,
+            "{verdict}: the record does not say what the policy decided: {}",
+            calls[0]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A call refused BEFORE it is brokered never happened, and a record saying it
+/// did is worse than none: an auditor reading it sees a tool call the upstream
+/// never received.
+///
+/// Both refusals that sit on that side of the line, and neither is inside the
+/// wardryx branch: the DLP block, which returns before the gate, and the
+/// secret-scope refusal, which returns after it and before the forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_refused_before_it_is_brokered_is_not_recorded_as_a_tool_call() {
+    // 1. The secret vault's own refusal, after the gate and before the forward.
+    let dir = events_dir("refused-scope");
+    let events = dir.join("events.ndjson");
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let mut vault = SecretVault::new();
+    vault.insert("gh", "ghp_REALSECRET");
+    vault.set_scope("gh", ScopeRule::agents(["agent://acme.example/allowed"]));
+    let (router, _exp) = broker_recording(
+        upstream,
+        &events,
+        Wardryx::disabled(),
+        Some(vault),
+        tokenfuse_core::DlpMode::Off,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = call_tool(
+        &broker_url,
+        Some("agent://acme.example/mallory"),
+        json!({ "auth": "Bearer {{secret:gh}}" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32008), "{resp}");
+    assert!(
+        seen.lock().expect("upstream log").is_empty(),
+        "the scope refusal forwarded anyway"
+    );
+    let calls = tool_calls(&events);
+    assert!(
+        calls.is_empty(),
+        "a call the broker refused before forwarding was recorded as a tool call that \
+         happened: {calls:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    // 2. The DLP block, which returns before the gate is even consulted.
+    let dir = events_dir("refused-dlp");
+    let events = dir.join("events.ndjson");
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (router, _exp) = broker_recording(
+        upstream,
+        &events,
+        Wardryx::disabled(),
+        None,
+        tokenfuse_core::DlpMode::Block,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = call_tool(
+        &broker_url,
+        Some("agent://acme.example/triage"),
+        json!({ "key": "AKIAIOSFODNN7EXAMPLE" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32002), "{resp}");
+    assert!(
+        seen.lock().expect("upstream log").is_empty(),
+        "the dlp block forwarded anyway"
+    );
+    let calls = tool_calls(&events);
+    assert!(
+        calls.is_empty(),
+        "a call the DLP filter blocked was recorded as a tool call that happened: {calls:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Neither a header nor a proven actor, so there is nobody to file the record
+/// under. Agent Passport SPEC.md §6.1 forbids inventing one, so the event is
+/// skipped - and the decision this test pins is that the emit is ATTEMPTED
+/// anyway, so the skip is counted and warned about rather than being a line of
+/// code that never runs. An operator can read a counter; they cannot read an
+/// `if let` that was never entered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brokered_call_that_names_nobody_is_counted_as_skipped_not_never_attempted() {
+    let dir = events_dir("nobody");
+    let events = dir.join("events.ndjson");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (router, exporter) = broker_recording(
+        upstream,
+        &events,
+        Wardryx::disabled(),
+        None,
+        tokenfuse_core::DlpMode::Off,
+    );
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = call_tool(&broker_url, None, json!({})).await;
+    assert!(
+        resp.get("result").is_some(),
+        "an unattributed call with no gate configured is still brokered: {resp}"
+    );
+
+    assert!(
+        tool_calls(&events).is_empty(),
+        "an agent_id was fabricated for a call that named nobody"
+    );
+    assert_eq!(
+        exporter.skipped_count(),
+        1,
+        "the record was never even attempted, so nothing counts the gap"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

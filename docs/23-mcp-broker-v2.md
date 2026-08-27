@@ -100,13 +100,31 @@ perform one.
 
 ## 3. `tool_call` audit events
 
-Each Wardryx-gated `tools/call` emits one `tool_call` agent-event (a new
-`EventType`, agent-passport SPEC.md §6 envelope) carrying
-`data: {tool, upstream, decision}`, where `decision` is `allow|deny|hold` (or
-`would-<decision>` in shadow). Severity is `low`: this is a per-action audit
-signal, not an alert, so an allowed call never pages like an incident; the
-verdict lives in `data.decision`. Like every event here it is skipped (not
-fabricated) when `agent_id` is absent, and it is zero-cost when the exporter
+Every `tools/call` this broker acts on emits exactly one `tool_call`
+agent-event (agent-passport SPEC.md §6 envelope) carrying
+`data: {tool, upstream, decision}`. `decision` is `allow|deny|hold` where a
+Wardryx PDP judged the call, `would-<decision>` in shadow, and
+`allowed-ungoverned` where nothing judged it: a broker with no PDP configured,
+which is the default, or one in shadow that could not attribute the call. That
+last value is deliberately not `allow`. Whether a policy JUDGED a call is a
+separate fact from whether the call OCCURRED, and writing `allow` for an
+unjudged call records a governance gap as a permission, which is the same
+mistake `dependency_failed.effect` and `/v1/fuse/check-tool-call`'s
+`governed: false` both exist to refuse.
+
+One record per call, and only for a call that was brokered. A refusal that
+returns before the upstream is contacted (the DLP block, the taint gate, the
+identity refusals, an unknown named upstream, a scope-denied secret) writes no
+`tool_call`, because a record of a call the upstream never received sends an
+auditor after an action nobody took. A PDP's own deny or hold is the exception
+and keeps its record: the policy judged it, and a refusal is the row worth
+having.
+
+Severity is `low`: this is a per-action audit signal, not an alert, so an
+allowed call never pages like an incident; the verdict lives in
+`data.decision`. Like every event here it is skipped (not fabricated) when
+`agent_id` is absent, though the emit is still ATTEMPTED so the exporter counts
+and warns about the skip, and it is zero-cost when the exporter
 (`TOKENFUSE_EVENTS_PATH`) is unset.
 
 This is the MCP-layer tool-invocation signal. It is distinct from the I1
