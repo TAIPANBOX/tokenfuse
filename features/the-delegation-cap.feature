@@ -39,3 +39,24 @@ Feature: The door and the record count the same thing
     When it carries 31 actors and then 32
     Then the first verifies into exactly 32 entries with the root still first,
       and the second is refused as malformed
+
+  # @test:a_chain_naming_one_principal_twice_is_refused
+  Scenario: The door refuses a cycle, because the record does
+    Given a token whose subject also appears among its actors
+    When the door assembles the chain
+    Then the token is refused, because `agent-conform` runs the record's own
+      validator on every line and a chain it will not hold is a token whose
+      trail cannot be written
+
+  # @test:a_principal_that_is_not_an_agent_or_user_uri_is_refused
+  Scenario: A principal that is not a principal
+    Given a token naming `mailto:alice@acme.example` in its chain
+    When the door assembles the chain
+    Then the token is refused, because the envelope pins every entry to
+      `agent://` or `user://`
+
+  # @test:the_shape_every_real_token_has_is_still_accepted
+  Scenario: The shape every real token has keeps working
+    Given a chain mixing `user://` and `agent://` entries at both ends
+    When the door assembles it
+    Then it is handed out unchanged
