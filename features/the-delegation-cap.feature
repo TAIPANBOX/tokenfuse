@@ -60,3 +60,12 @@ Feature: The door and the record count the same thing
     Given a chain mixing `user://` and `agent://` entries at both ends
     When the door assembles it
     Then it is handed out unchanged
+
+  # @test:the_door_answers_the_cross_language_table
+  Scenario: Both doors answer from one table
+    Given the cross-language verdict table, vendored byte for byte
+    When this door assembles each of its chains
+    Then it answers exactly what the table says, because the record's rules
+      live in another language with no seam to this one, and a check that
+      reads source text tells you a rule is mentioned rather than that it
+      answers

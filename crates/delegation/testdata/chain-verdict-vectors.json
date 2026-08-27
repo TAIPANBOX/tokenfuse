@@ -1,0 +1,129 @@
+{
+  "$source": "agent-stack-go/chain/testdata/chain-verdict-vectors.json",
+  "$why_source": "The canonical copy lives at the path above. Every other language VENDORS this file byte for byte and is found by this field rather than by a list somebody maintains, the same way C2 finds a vendored schema by its $id.",
+  "comment": "Cross-language pinned vectors for the agent-passport SPEC 5 delegation chain: the MAPPING from an RFC 8693 token to `on_behalf_of`, and the three rules a chain must satisfy. Every DOOR (Go: this repo's delegation package; Rust: tokenfuse's crates/delegation) and every RECORD (Go: this repo's chain package) MUST answer each case the same way. `sub` and `act` are the token's claims, `act` written outermost-first as RFC 8693 nests it. `chain` is the assembled `on_behalf_of`, root first, and is present only when the verdict is `accept`. `verdict` is `accept` or the rule that refuses. A door refuses by returning its own error; the vector names the RULE, not the error type, because the three languages spell their errors differently and the rule is the thing that must agree. A vector may name `act_generated` instead of `act`: `{template, count}` expands to `count` actors, the template's `%d` replaced by 1..count. It keeps the depth cases readable rather than listing thirty-three URIs, and every language expands it the same way.",
+  "rules": {
+    "accept": "The chain is well formed and every rule holds.",
+    "cycle": "SPEC 5.1: the chain MUST be acyclic. One principal named twice.",
+    "too_deep": "SPEC 5.1: maximum chain depth is 32 ENTRIES, and the subject is one of them.",
+    "invalid_entry": "SPEC 5: entries are `agent://` or `user://` URIs."
+  },
+  "vectors": [
+    {
+      "name": "the shape every real token has",
+      "why": "One human, one agent. If a change makes this refuse, it refuses every token this estate mints.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "agent://acme.example/triage"
+      ],
+      "verdict": "accept",
+      "chain": [
+        "user://acme.example/alice",
+        "agent://acme.example/triage"
+      ]
+    },
+    {
+      "name": "the mapping is a reversal, not a copy",
+      "why": "RFC 8693 nests current-first and the estate records root-first. A door that skipped the reversal would produce a chain that verifies and asserts the opposite of what happened.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "agent://acme.example/runbook",
+        "agent://acme.example/triage"
+      ],
+      "verdict": "accept",
+      "chain": [
+        "user://acme.example/alice",
+        "agent://acme.example/triage",
+        "agent://acme.example/runbook"
+      ]
+    },
+    {
+      "name": "no subject, so the actors are the whole chain",
+      "why": "A machine-to-machine chain has no human at the root. The whole entry budget belongs to the actors, and a door that reserved a slot for an absent subject would refuse a chain the SPEC allows.",
+      "sub": "",
+      "act": [
+        "agent://acme.example/triage"
+      ],
+      "verdict": "accept",
+      "chain": [
+        "agent://acme.example/triage"
+      ]
+    },
+    {
+      "name": "the subject is also an actor",
+      "why": "The trap `BuildAct` invites: its doc example passes a whole root-first chain, root included, so the root lands inside `act` while also being the token's `sub`.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "user://acme.example/alice"
+      ],
+      "verdict": "cycle"
+    },
+    {
+      "name": "one actor named twice",
+      "why": "The rule is about the assembled chain, not only about the subject.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "agent://acme.example/triage",
+        "agent://acme.example/triage"
+      ],
+      "verdict": "cycle"
+    },
+    {
+      "name": "a principal that is not a principal",
+      "why": "The v0.2 envelope pins `pattern: ^(agent|user)://` on every item of `on_behalf_of`, so anything else is a record nobody can write.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "mailto:alice@acme.example"
+      ],
+      "verdict": "invalid_entry"
+    },
+    {
+      "name": "a scheme one character short",
+      "why": "`agent:/` is not `agent://`. A prefix check written by hand gets this wrong in one direction or the other.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        "agent:/acme.example/triage"
+      ],
+      "verdict": "invalid_entry"
+    },
+    {
+      "name": "an empty principal",
+      "why": "Refused by every implementation already, and here so that a rewrite cannot lose it.",
+      "sub": "user://acme.example/alice",
+      "act": [
+        ""
+      ],
+      "verdict": "invalid_entry"
+    },
+    {
+      "name": "the subject plus thirty-one actors is exactly the cap",
+      "why": "SPEC 5.1 counts ENTRIES and the subject is one. This is the largest chain the estate accepts, and a door that bounded actors at 32 would accept one more.",
+      "sub": "user://acme.example/alice",
+      "act_generated": {
+        "template": "agent://acme.example/a%d",
+        "count": 31
+      },
+      "verdict": "accept"
+    },
+    {
+      "name": "the subject plus thirty-two actors is one too many",
+      "why": "The off-by-one measured on 2026-08-27: this verified at both doors and every record it produced was quarantined as 33 entries.",
+      "sub": "user://acme.example/alice",
+      "act_generated": {
+        "template": "agent://acme.example/a%d",
+        "count": 32
+      },
+      "verdict": "too_deep"
+    },
+    {
+      "name": "with no subject the actors get the whole budget",
+      "why": "Thirty-two actors and no human is thirty-two entries, which is the cap and not over it. The mirror of the case above, and the one a fix that overshot would refuse.",
+      "sub": "",
+      "act_generated": {
+        "template": "agent://acme.example/a%d",
+        "count": 32
+      },
+      "verdict": "accept"
+    }
+  ]
+}
