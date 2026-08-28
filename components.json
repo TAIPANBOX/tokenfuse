@@ -354,7 +354,7 @@
     },
     {
       "name": "tokenfuse-cluster",
-      "class": "service",
+      "class": "dev-tool",
       "checked": {
         "binary": "tokenfuse-cluster",
         "crate": "tokenfuse-cluster",
@@ -399,9 +399,13 @@
         }
       },
       "declared": {
-        "nothing_installs_it": {
-          "value": "no launcher",
-          "why": "Measured 2026-08-28 across stack-up, stack-single, stack-k8s and taipan: not one mentions it. It is built, tested by three integration suites and gated by its own CI job, and there is no way to install it. That is the same shape vouchryx was in for nineteen hours on 2026-08-26, and it has been this way since 2026-07-02. Whether it SHOULD be installable is a product decision and is not made here; what this entry does is stop it being invisible."
+        "what_it_actually_is": {
+          "value": "a harness over a library, not a plane",
+          "why": "CORRECTED 2026-08-28, hours after the first version of this entry called it a service nothing installs. That was true and it was the shallow half of the truth.\\n\\n`crates/cluster` is a LIBRARY with a binary beside it. The gateway depends on the library behind an optional feature (`cluster = [\"dep:tokenfuse-cluster\"]`) and runs raft IN PROCESS, in `crates/gateway/src/raft_ledger.rs`. So HA is a MODE OF THE GATEWAY, configured by TOKENFUSE_CLUSTER_ID / _PEERS / _DATA_DIR / _BOOTSTRAP, and the standalone binary is the harness for driving that ledger by hand: an in-process three-node demo, a `demo-http` over real sockets, and a `serve` for running one node manually.\\n\\nSo it is a dev-tool, in the sense trailryx's seven are: nothing should install it, and its absence from every deployment is the answer rather than a question."
+        },
+        "the_ha_capability_is_compiled_out_of_every_shipped_binary": {
+          "value": "cargo build --release -p tokenfuse-gateway",
+          "why": "THIS is the finding, and it is bigger than a binary nobody installs. Every image in the estate builds the gateway WITHOUT `--features cluster`: stack-k8s's images/tokenfuse.Dockerfile, stack-single through the same file, stack-up and taipan from source. So the raft ledger is not merely unconfigured, it is absent from the binary, and the four TOKENFUSE_CLUSTER_ variables name a code path that ships nowhere.\\n\\nMeasured 2026-08-28 rather than argued: built with the feature, started with TOKENFUSE_CLUSTER_ID=1, BOOTSTRAP=1 and a data dir. It logged `raft storage: durable (redb)`, openraft initialised, `node-1.redb` appeared on disk and /healthz answered 200. The capability is real and one flag away.\\n\\nWhether HA should ship by default is a product decision and is not made here: the feature pulls the whole openraft stack into an image every deployment runs. stack-k8s carries the recipe for turning it on deliberately."
         }
       }
     }
