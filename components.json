@@ -1,0 +1,409 @@
+{
+  "$comment": [
+    "What this repository contributes to a running stack, and what a check may",
+    "believe about it. `checked` is proved against this repository by",
+    "crates/gateway/tests/manifest.rs in this repository's own CI; `declared` is a",
+    "statement nobody can verify and carries its own `why`.",
+    "",
+    "THIS IS THE ONE THE WHOLE MECHANISM WAS BUILT FOR. estate.json says this",
+    "repository runs three things and the workspaces build three BINARIES, and",
+    "they are not the same three. `focus-export` is a subcommand of the gateway",
+    "binary and not a binary at all; `tokenfuse-cluster` is a binary in the",
+    "SEPARATE crates/cluster workspace that estate.json has never heard of and",
+    "that no launcher installs.",
+    "",
+    "tokenfuse-cluster is not a stub. It is a raft-replicated budget ledger, added",
+    "2026-07-02, with three integration suites (redb durability, http cluster,",
+    "kill durability) and its own CI job, `cluster (raft HA)`. The README's",
+    "architecture diagram calls it `the optional tokenfuse-cluster HA raft`.",
+    "Optional and installable-by-nothing are different things, and until this file",
+    "existed only this repository could tell them apart: a central registry cannot",
+    "see a second workspace it was never told about.",
+    "",
+    "TWO WORKSPACES IS ALSO WHY THE CHECK IS WHAT IT IS. `cargo metadata` at the",
+    "root reports two binaries and stops; crates/cluster needs its own",
+    "--manifest-path. That is the same seam the two-lockfile trap sits in, which",
+    "CLAUDE.md already records for `cargo audit`, and it bites the same way here.",
+    "",
+    "THE ENVIRONMENT SPLIT IS DECLARED, THE UNION IS CHECKED. There are a hundred",
+    "TOKENFUSE_ names and assigning each to the component that reads it would be",
+    "guesswork, since the gateway, the MCP surface and the cloud share a prefix",
+    "space. So the split below is organisational and by prefix, and what the test",
+    "asserts is that the UNION of the three matches every name in non-test source,",
+    "both ways. A name that moves between components does not fail; a name that",
+    "appears or disappears does."
+  ],
+  "schema": "taipanbox.dev/components/v1",
+  "repo": "TAIPANBOX/tokenfuse",
+  "components": [
+    {
+      "name": "tokenfuse-gateway",
+      "class": "service",
+      "checked": {
+        "binary": "tokenfuse",
+        "crate": "tokenfuse-gateway",
+        "workspace": ".",
+        "listen_default": "127.0.0.1:4100",
+        "env": {
+          "TOKENFUSE_ADDR": {
+            "required": false,
+            "default": "127.0.0.1:4100"
+          },
+          "TOKENFUSE_AGENT_ID_MODE": {
+            "required": false
+          },
+          "TOKENFUSE_ALLOW_STUB": {
+            "required": false
+          },
+          "TOKENFUSE_APNS_ENV": {
+            "required": false
+          },
+          "TOKENFUSE_APNS_KEY_ID": {
+            "required": false
+          },
+          "TOKENFUSE_APNS_KEY_PATH": {
+            "required": false
+          },
+          "TOKENFUSE_APNS_TEAM_ID": {
+            "required": false
+          },
+          "TOKENFUSE_APNS_TOPIC": {
+            "required": false
+          },
+          "TOKENFUSE_CACHE": {
+            "required": false
+          },
+          "TOKENFUSE_CACHE_EMBEDDER": {
+            "required": false
+          },
+          "TOKENFUSE_CLIENT_KEYS": {
+            "required": false
+          },
+          "TOKENFUSE_DATA_DIR": {
+            "required": false
+          },
+          "TOKENFUSE_DECLASSIFY_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_AUDIENCE": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_ISSUER": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_JWKS": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_REVOCATIONS": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_REVOCATIONS_FAILMODE": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_REVOCATIONS_INTERVAL_MS": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_REVOCATIONS_MAX_AGE_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_URL": {
+            "required": false
+          },
+          "TOKENFUSE_DLP": {
+            "required": false
+          },
+          "TOKENFUSE_DLP_PII": {
+            "required": false
+          },
+          "TOKENFUSE_EVENTS": {
+            "required": false
+          },
+          "TOKENFUSE_EVENTS_PATH": {
+            "required": false
+          },
+          "TOKENFUSE_FIREWALL": {
+            "required": false
+          },
+          "TOKENFUSE_FIREWALL_CONFIG": {
+            "required": false
+          },
+          "TOKENFUSE_IDENTITY_MAP": {
+            "required": false
+          },
+          "TOKENFUSE_IDENTITY_STRICT": {
+            "required": false
+          },
+          "TOKENFUSE_KEYS": {
+            "required": false
+          },
+          "TOKENFUSE_MAX_BODY_BYTES": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_ADDR": {
+            "required": false,
+            "default": "127.0.0.1:4200"
+          },
+          "TOKENFUSE_MCP_ALLOW_OPEN_BIND": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_CLIENT_IDS": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_DLP": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_DLP_PII": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_KEYS": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_LOCK": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_PROOF_URL": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_REQUIRE_PROOF": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SCAN": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SCAN_CONNECT_TIMEOUT_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SCAN_MAX_BODY_BYTES": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SCAN_TIMEOUT_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SECRETS": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_SECRET_SCOPES": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_STDIO": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_TAINT_FAILMODE": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_TAINT_GATEWAY": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_UPSTREAM": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_UPSTREAMS": {
+            "required": false
+          },
+          "TOKENFUSE_MODE": {
+            "required": false
+          },
+          "TOKENFUSE_OTLP_ENDPOINT": {
+            "required": false
+          },
+          "TOKENFUSE_REQUIRE_RUN_ID": {
+            "required": false
+          },
+          "TOKENFUSE_ROUTER": {
+            "required": false
+          },
+          "TOKENFUSE_ROUTER_RULES": {
+            "required": false
+          },
+          "TOKENFUSE_UPSTREAM": {
+            "required": false
+          },
+          "TOKENFUSE_UPSTREAM_CONNECT_TIMEOUT_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_URL": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_CACHE_TTL_MS": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_FAILMODE": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_MODE": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_TIMEOUT_MS": {
+            "required": false
+          },
+          "TOKENFUSE_WARDRYX_URL": {
+            "required": false
+          },
+          "TOKENFUSE_WASM_POLICY": {
+            "required": false
+          }
+        }
+      },
+      "declared": {
+        "the_component_name_is_not_the_binary_name": {
+          "value": "tokenfuse",
+          "why": "The binary is `tokenfuse`; every launcher installs it as `tokenfuse-gateway`, which is the name estate.json and the port map use. Recorded rather than renamed: the rename would break every deployment for a tidiness nobody asked for."
+        },
+        "the_mcp_surface_is_a_second_listener": {
+          "value": "127.0.0.1:4200",
+          "why": "The same binary serves an MCP surface on its own address from TOKENFUSE_MCP_ADDR. One component, two listeners, which this schema has no field for and which is not worth inventing one for until a second component needs it."
+        }
+      }
+    },
+    {
+      "name": "focus-export",
+      "class": "tool",
+      "checked": {
+        "binary": "tokenfuse",
+        "crate": "tokenfuse-gateway",
+        "workspace": ".",
+        "subcommand": "focus-export"
+      },
+      "declared": {
+        "it_is_a_routine_not_a_binary": {
+          "value": "tokenfuse focus-export --traces <dir> --out <file.csv>",
+          "why": "estate.json lists it beside two binaries and it is a subcommand of one of them. stack-up runs it at 06:00 against its own trace directory."
+        }
+      }
+    },
+    {
+      "name": "tokenfuse-cloud",
+      "class": "service",
+      "checked": {
+        "binary": "tokenfuse-cloud",
+        "crate": "tokenfuse-cloud",
+        "workspace": ".",
+        "env": {
+          "TOKENFUSE_CLOUD_ALERT_PCT": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_ALLOW_DEVKEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_DATA": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_HOST": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_FANOUT_MULTIPLE": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_INCIDENT_SPIKE_MULTIPLE": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_KEYS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_ADMIN_ROLE": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_AUDIENCE": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_ISSUER": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_JWKS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_ORG_CLAIM": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_OIDC_ROLES_CLAIM": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_REPLAY_EVENTS": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_URL": {
+            "required": false
+          }
+        }
+      },
+      "declared": {}
+    },
+    {
+      "name": "tokenfuse-cluster",
+      "class": "service",
+      "checked": {
+        "binary": "tokenfuse-cluster",
+        "crate": "tokenfuse-cluster",
+        "workspace": "crates/cluster",
+        "env": {
+          "TOKENFUSE_CLUSTER_ADDR": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_BOOTSTRAP": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_CA": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_CLIENT_CERT": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_CLIENT_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_DATA_DIR": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_ID": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_MTLS_CA": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_PEERS": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_TLS_CERT": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_TLS_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLUSTER_TOKEN": {
+            "required": false
+          }
+        }
+      },
+      "declared": {
+        "nothing_installs_it": {
+          "value": "no launcher",
+          "why": "Measured 2026-08-28 across stack-up, stack-single, stack-k8s and taipan: not one mentions it. It is built, tested by three integration suites and gated by its own CI job, and there is no way to install it. That is the same shape vouchryx was in for nineteen hours on 2026-08-26, and it has been this way since 2026-07-02. Whether it SHOULD be installable is a product decision and is not made here; what this entry does is stop it being invisible."
+        }
+      }
+    }
+  ]
+}
