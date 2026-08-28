@@ -303,7 +303,7 @@ comparison in #132.
 **Counts re-measured 2026-08-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
 `cargo test --all` runs **1111 passing** (core 300, dpop 16, delegation 41,
-gateway 550, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+gateway 554, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
 **`tokenfuse-cluster`: 13 integration tests** on live raft clusters (in-process
