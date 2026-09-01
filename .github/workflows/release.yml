@@ -103,23 +103,35 @@ jobs:
 
       # The digest travels to the merge job as a file named after itself, which
       # is how two matrix legs write into one directory without colliding.
-      # The image proves itself on the machine that built it, natively. An
-      # arm64 leg that produced a broken binary would otherwise be found by
-      # whoever pulled it first, and the whole point of publishing arm64 is
-      # that somebody will.
+      # Does the image's own entrypoint EXECUTE on this architecture. That is
+      # the question, and it is not the same as "does it exit 0".
       #
-      # `--help` and not a server: this asks whether the binary runs on this
-      # architecture at all, which is the thing cross-building gets wrong. The
-      # gateway refuses to start without configuration by design, so starting
-      # it here would be testing the refusal rather than the build.
-      - name: run it, on the architecture that built it
+      # A binary built for the wrong architecture does not exit non-zero: the
+      # kernel refuses to run it at all and says `exec format error`. Exit codes
+      # are ignored here on purpose, because these programs legitimately refuse
+      # to start without configuration and one of them exits 1 on `--help`.
+      # Requiring success would fail a correct image, and a smoke test that
+      # fails on a correct build is one the next person deletes.
+      #
+      # The image's OWN entrypoint rather than a name written here, so this
+      # stays right when a binary is renamed. The gateway's is `tokenfuse` and
+      # the control plane's is `tokenfuse-cloud`, which is exactly the kind of
+      # difference a hardcoded name gets wrong.
+      - name: the entrypoint executes on the architecture that built it
         run: |
           set -eu
           img="ghcr.io/${{ github.repository_owner }}/${{ matrix.image.repo }}@${{ steps.build.outputs.digest }}"
-          echo "smoke-testing $img on $(uname -m)"
-          docker run --rm --entrypoint "" "$img" /bin/sh -c 'uname -m; ls /usr/local/bin' \
-            || docker run --rm "$img" --help \
-            || { echo "the image built on this architecture does not run on it"; exit 1; }
+          echo "on $(uname -m), image $img"
+          out="$(docker run --rm "$img" --version 2>&1 | head -5 || true)"
+          case "$out" in
+            *"exec format error"*)
+              echo "$out"; echo "built for another architecture"; exit 1 ;;
+            "")
+              out="$(docker run --rm "$img" 2>&1 | head -5 || true)"
+              [ -n "$out" ] || { echo "the entrypoint ran and said nothing at all"; exit 1; } ;;
+          esac
+          printf '%s\n' "$out" | sed 's/^/  /'
+          echo "  the entrypoint runs here"
 
       - name: hand the digest on
         run: |
