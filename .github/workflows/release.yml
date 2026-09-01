@@ -199,10 +199,31 @@ jobs:
               type=raw,value=latest,enable={{is_default_branch}}
               type=sha,format=short
     steps:
+      # TWO EXACT NAMES, NOT A PATTERN, and that is the whole of this fix.
+      #
+      # `pattern: digest-tokenfuse-*` matched the artifacts of all FOUR images,
+      # because `tokenfuse` is a prefix of `tokenfuse-cluster`,
+      # `tokenfuse-control-plane` and `tokenfuse-dashboard`. The plain gateway's
+      # merge therefore collected eight digests, four of them belonging to other
+      # repositories, and answered
+      #
+      #     ERROR: ghcr.io/taipanbox/tokenfuse@sha256:63f42d...: not found
+      #
+      # Exactly one job broke: the one whose name is a prefix of the others. The
+      # other three globbed cleanly and published, which is why three of four
+      # images came out right and the most important one did not.
+      #
+      # A glob over names that can be prefixes of each other is the same trap
+      # `scripts/manifest-is-true.sh` in stack-k8s already carries a note about,
+      # where `- name: focus-export` matched `focus-exporter`. There are exactly
+      # two architectures, so there is nothing here a pattern buys.
       - uses: actions/download-artifact@v4
         with:
-          pattern: digest-${{ matrix.name }}-*
-          merge-multiple: true
+          name: digest-${{ matrix.name }}-amd64
+          path: /tmp/digests
+      - uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.name }}-arm64
           path: /tmp/digests
 
       - uses: docker/setup-buildx-action@v3
@@ -251,7 +272,12 @@ jobs:
       # Printed rather than assumed. A manifest list with one architecture in it
       # is the failure this whole change is about, and it looks identical to a
       # correct one from the outside.
+      # The tag this job actually created, not the git ref. They are the same
+      # for three of these four and not for the cluster variant, whose tag
+      # carries a `-cluster` suffix, so this step looked up a tag a DIFFERENT
+      # job was responsible for and failed on a merge that had worked.
       - name: say what is in it
         run: |
-          docker buildx imagetools inspect \
-            "ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.repo }}:${{ github.ref_name }}"
+          tag=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          echo "created $tag"
+          docker buildx imagetools inspect "$tag"
