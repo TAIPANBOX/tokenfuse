@@ -90,6 +90,23 @@ jobs:
       # Pushed by digest and by nothing else. The merge job below is what gives
       # these a name; until it runs they are unreferenced blobs, which is
       # exactly what a half-published release should be.
+      # The owner, lowercased, in a step because there is no expression for it.
+      #
+      # A registry repository name MUST be lowercase and this organisation is
+      # TAIPANBOX. That has now broken three separate first releases in one day:
+      # costcrew's, the stack-k8s console's, and this one. Each time the fix was
+      # applied to the file in front of me rather than as a rule, and each time
+      # the next workflow written from the same template had it again.
+      #
+      # metadata-action lowercases on the way past, which is why the merge job's
+      # `images:` line survived while the build job's `outputs:` line did not.
+      # Anything talking to buildx directly has to do it itself.
+      - name: lowercase the owner
+        id: owner
+        run: echo "name=${OWNER,,}" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ github.repository_owner }}
+
       - name: build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -97,7 +114,7 @@ jobs:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
           build-args: ${{ matrix.image.build-args }}
-          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.repo }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.image.repo }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.image.scope }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.scope }}-${{ matrix.arch }}
 
@@ -120,7 +137,7 @@ jobs:
       - name: the entrypoint executes on the architecture that built it
         run: |
           set -eu
-          img="ghcr.io/${{ github.repository_owner }}/${{ matrix.image.repo }}@${{ steps.build.outputs.digest }}"
+          img="ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.image.repo }}@${{ steps.build.outputs.digest }}"
           echo "on $(uname -m), image $img"
           out="$(docker run --rm "$img" --version 2>&1 | head -5 || true)"
           case "$out" in
@@ -199,11 +216,28 @@ jobs:
       # is the reason it is still here rather than a plain string: the
       # organisation is TAIPANBOX and a registry repository name must be
       # lowercase. costcrew's first release failed on exactly that.
+      # The owner, lowercased, in a step because there is no expression for it.
+      #
+      # A registry repository name MUST be lowercase and this organisation is
+      # TAIPANBOX. That has now broken three separate first releases in one day:
+      # costcrew's, the stack-k8s console's, and this one. Each time the fix was
+      # applied to the file in front of me rather than as a rule, and each time
+      # the next workflow written from the same template had it again.
+      #
+      # metadata-action lowercases on the way past, which is why the merge job's
+      # `images:` line survived while the build job's `outputs:` line did not.
+      # Anything talking to buildx directly has to do it itself.
+      - name: lowercase the owner
+        id: owner
+        run: echo "name=${OWNER,,}" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ github.repository_owner }}
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.repo }}
+          images: ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.repo }}
           flavor: latest=false
           tags: ${{ matrix.tags }}
 
@@ -212,7 +246,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository_owner }}/${{ matrix.repo }}@sha256:%s ' *)
+            $(printf 'ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.repo }}@sha256:%s ' *)
 
       # Printed rather than assumed. A manifest list with one architecture in it
       # is the failure this whole change is about, and it looks identical to a
@@ -220,4 +254,4 @@ jobs:
       - name: say what is in it
         run: |
           docker buildx imagetools inspect \
-            "ghcr.io/${{ github.repository_owner }}/${{ matrix.repo }}:${{ github.ref_name }}"
+            "ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.repo }}:${{ github.ref_name }}"
