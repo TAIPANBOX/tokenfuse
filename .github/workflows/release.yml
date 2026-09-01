@@ -37,6 +37,153 @@ permissions:
   packages: write
 
 jobs:
+  # The binaries, before the images, because they are what a person downloads.
+  #
+  # WHY THIS EXISTS
+  #
+  # Until 2026-09-01 this workflow published container images and nothing else,
+  # so `v0.4.0` carried zero release assets while idryx, qryx, mockryx,
+  # agent-conform, the Terraform provider and trailryx all shipped per-platform
+  # archives. `docker run` is the intended way in and it works; a release page
+  # with nothing on it is still the wrong answer to somebody who wants to try
+  # the CLI without a daemon.
+  #
+  # The shape is trailryx's, which is the estate's proven Rust release. One
+  # thing it says about itself does NOT transfer and the difference is the whole
+  # risk here: trailryx's core has no third-party crates, and this workspace has
+  # `ring` in both binaries plus `zstd-sys` and `snap` in the gateway, which
+  # carry C. `musl-tools` is what makes those link statically, and if a musl leg
+  # fails that is a finding about this dependency graph rather than a flake.
+  # Measured before writing this: `cargo tree -e normal` on both binaries shows
+  # no `openssl-sys` and no `aws-lc-sys`, which are the two that usually end
+  # this conversation. `wasmtime` and `fastembed` are optional features and are
+  # not in a default build.
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl rather than gnu on Linux: a statically linked binary runs on
+          # whatever the operator already has, which is the point of shipping
+          # one at all.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      # The linker the musl targets need. Absent on the runner, and the failure
+      # it produces names `cc` rather than musl, which sends people the wrong
+      # way.
+      - name: musl linker
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # --locked, so the binary on the release page is built from the lockfile
+      # in the tag rather than from whatever resolved that morning. Without it a
+      # published artifact cannot be rebuilt from its own commit.
+      #
+      # Default features on purpose: `wasm` and the fastembed leg are opt-in,
+      # and a downloadable binary should be the thing the documentation
+      # describes rather than a maximal build nobody asked for.
+      - name: build
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --bin tokenfuse --bin tokenfuse-cloud
+
+      # Named by target, because a file called `tokenfuse` from four platforms
+      # in one directory is four files that overwrite each other.
+      - name: name and checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          for bin in tokenfuse tokenfuse-cloud; do
+            src="target/${{ matrix.target }}/release/$bin"
+            # Not `continue`. Both binaries are asked for on every target here,
+            # so a missing one is a build that half worked, and skipping it
+            # would publish a release page that is quietly short a platform.
+            [ -f "$src" ] || { echo "!! $src was not produced" >&2; exit 1; }
+            cp "$src" "dist/$bin-${{ matrix.target }}"
+          done
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ./* > "SHA256SUMS-${{ matrix.target }}"
+          else
+            shasum -a 256 ./* > "SHA256SUMS-${{ matrix.target }}"
+          fi
+          cat "SHA256SUMS-${{ matrix.target }}"
+
+      # Does it EXECUTE on the architecture that built it, which is not the same
+      # question as whether it compiled. Only on the legs whose architecture the
+      # runner shares: a cross-built binary cannot be run here, and pretending
+      # otherwise is how a smoke test comes to fail on a correct build.
+      - name: it runs on the architecture that built it
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -eu
+          for bin in tokenfuse tokenfuse-cloud; do
+            out=$("./dist/$bin-${{ matrix.target }}" --version 2>&1 | head -3 || true)
+            case "$out" in
+              *"exec format error"*)
+                echo "  $bin: EXEC FORMAT ERROR, built for another architecture"; exit 1 ;;
+              "")
+                echo "  $bin: ran and said nothing at all"; exit 1 ;;
+              *) echo "  $bin: $out" ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: release page
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # One file for every artifact, so a reader checks one thing rather than
+      # four. The per-target files stay beside it: somebody verifying a single
+      # download should not have to trust that this step concatenated correctly.
+      - name: one checksum file
+        run: |
+          cd dist
+          cat SHA256SUMS-* | grep -v '^$' | sed 's#\./##' | sort -k2 > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
   # One job per image PER ARCHITECTURE, each on a runner of that architecture.
   # Nothing here carries a tag: a tag on a single-architecture image is what
   # somebody else's arm64 node would then pull and fail on.
