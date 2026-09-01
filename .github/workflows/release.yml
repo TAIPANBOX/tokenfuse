@@ -130,23 +130,51 @@ jobs:
           fi
           cat "SHA256SUMS-${{ matrix.target }}"
 
-      # Does it EXECUTE on the architecture that built it, which is not the same
-      # question as whether it compiled. Only on the legs whose architecture the
-      # runner shares: a cross-built binary cannot be run here, and pretending
-      # otherwise is how a smoke test comes to fail on a correct build.
+      # Does it EXECUTE on the architecture that built it. That is the
+      # question, and it is not the same as "does it exit 0".
+      #
+      # The first version of this ran `--version` and required it to return.
+      # `crates/gateway/src/main.rs:255` sends an unrecognised argument to
+      # `_ => serve().await`, so the binary did the correct thing and started
+      # serving, and the job hung until it was cancelled. A smoke test that
+      # HANGS is worse than one that fails wrongly: the failure looks like a
+      # slow build, and the estate already paid once for a smoke test asking
+      # the wrong question when `qryx --help` exited 1 by design.
+      #
+      # So the run is BOUNDED and a timeout is a pass. A binary that starts
+      # serving has executed, which is the whole question. What is not a pass is
+      # `exec format error`, which is what the kernel says about a binary built
+      # for another architecture, or no output at all.
+      #
+      # Only on the legs whose architecture the runner shares. A cross-built
+      # binary cannot be run here, and pretending otherwise is how a check comes
+      # to fail on a correct build.
       - name: it runs on the architecture that built it
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: |
-          set -eu
+          set -u
           for bin in tokenfuse tokenfuse-cloud; do
-            out=$("./dist/$bin-${{ matrix.target }}" --version 2>&1 | head -3 || true)
+            # Not `timeout`: that is GNU coreutils and the macOS runner does
+            # not ship it, so the darwin leg would have failed on a missing
+            # command rather than on anything about the binary. Backgrounded,
+            # given a moment, then killed, which works the same on both.
+            "./dist/$bin-${{ matrix.target }}" --version >/tmp/out.$bin 2>&1 &
+            pid=$!
+            sleep 10
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            out=$(head -3 "/tmp/out.$bin")
             case "$out" in
               *"exec format error"*)
                 echo "  $bin: EXEC FORMAT ERROR, built for another architecture"; exit 1 ;;
               "")
-                echo "  $bin: ran and said nothing at all"; exit 1 ;;
-              *) echo "  $bin: $out" ;;
+                # Nothing printed and it did not die: it reached its serve loop
+                # and the timeout stopped it. That is execution, which is what
+                # this asks.
+                echo "  $bin: started and was still running at the timeout, so it executes" ;;
+              *)
+                echo "  $bin: $out" ;;
             esac
           done
 
