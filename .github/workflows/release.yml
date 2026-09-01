@@ -32,11 +32,197 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+env:
+  # The same archive snapshot ci.yml pins, for the same reason: an unpinned
+  # apt step resolves to whatever is newest when the job runs, so the commit
+  # that passes today is the commit that fails tomorrow. Bump it deliberately,
+  # in a commit that says what moved, the way a lockfile is bumped.
+  APT_SNAPSHOT: "20260820T000000Z"
+
 permissions:
   contents: read
   packages: write
 
 jobs:
+  # The binaries, before the images, because they are what a person downloads.
+  #
+  # WHY THIS EXISTS
+  #
+  # Until 2026-09-01 this workflow published container images and nothing else,
+  # so `v0.4.0` carried zero release assets while idryx, qryx, mockryx,
+  # agent-conform, the Terraform provider and trailryx all shipped per-platform
+  # archives. `docker run` is the intended way in and it works; a release page
+  # with nothing on it is still the wrong answer to somebody who wants to try
+  # the CLI without a daemon.
+  #
+  # The shape is trailryx's, which is the estate's proven Rust release. One
+  # thing it says about itself does NOT transfer and the difference is the whole
+  # risk here: trailryx's core has no third-party crates, and this workspace has
+  # `ring` in both binaries plus `zstd-sys` and `snap` in the gateway, which
+  # carry C. `musl-tools` is what makes those link statically, and if a musl leg
+  # fails that is a finding about this dependency graph rather than a flake.
+  # Measured before writing this: `cargo tree -e normal` on both binaries shows
+  # no `openssl-sys` and no `aws-lc-sys`, which are the two that usually end
+  # this conversation. `wasmtime` and `fastembed` are optional features and are
+  # not in a default build.
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl rather than gnu on Linux: a statically linked binary runs on
+          # whatever the operator already has, which is the point of shipping
+          # one at all.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      # The linker the musl targets need. Absent on the runner, and the failure
+      # it produces names `cc` rather than musl, which sends people the wrong
+      # way.
+      - name: musl linker
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          # --snapshot, like bench.yml and ci.yml: unpinned, this resolves to
+          # whatever is newest when the job runs, so the commit that passes
+          # today is the commit that fails tomorrow. pinned-installs.sh refuses
+          # it, and refused this file on its first run.
+          sudo apt-get install -y --snapshot "$APT_SNAPSHOT" musl-tools
+
+      # --locked, so the binary on the release page is built from the lockfile
+      # in the tag rather than from whatever resolved that morning. Without it a
+      # published artifact cannot be rebuilt from its own commit.
+      #
+      # Default features on purpose: `wasm` and the fastembed leg are opt-in,
+      # and a downloadable binary should be the thing the documentation
+      # describes rather than a maximal build nobody asked for.
+      - name: build
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            --bin tokenfuse --bin tokenfuse-cloud
+
+      # Named by target, because a file called `tokenfuse` from four platforms
+      # in one directory is four files that overwrite each other.
+      - name: name and checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          for bin in tokenfuse tokenfuse-cloud; do
+            src="target/${{ matrix.target }}/release/$bin"
+            # Not `continue`. Both binaries are asked for on every target here,
+            # so a missing one is a build that half worked, and skipping it
+            # would publish a release page that is quietly short a platform.
+            [ -f "$src" ] || { echo "!! $src was not produced" >&2; exit 1; }
+            cp "$src" "dist/$bin-${{ matrix.target }}"
+          done
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ./* > "SHA256SUMS-${{ matrix.target }}"
+          else
+            shasum -a 256 ./* > "SHA256SUMS-${{ matrix.target }}"
+          fi
+          cat "SHA256SUMS-${{ matrix.target }}"
+
+      # Does it EXECUTE on the architecture that built it. That is the
+      # question, and it is not the same as "does it exit 0".
+      #
+      # The first version of this ran `--version` and required it to return.
+      # `crates/gateway/src/main.rs:255` sends an unrecognised argument to
+      # `_ => serve().await`, so the binary did the correct thing and started
+      # serving, and the job hung until it was cancelled. A smoke test that
+      # HANGS is worse than one that fails wrongly: the failure looks like a
+      # slow build, and the estate already paid once for a smoke test asking
+      # the wrong question when `qryx --help` exited 1 by design.
+      #
+      # So the run is BOUNDED and a timeout is a pass. A binary that starts
+      # serving has executed, which is the whole question. What is not a pass is
+      # `exec format error`, which is what the kernel says about a binary built
+      # for another architecture, or no output at all.
+      #
+      # Only on the legs whose architecture the runner shares. A cross-built
+      # binary cannot be run here, and pretending otherwise is how a check comes
+      # to fail on a correct build.
+      - name: it runs on the architecture that built it
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -u
+          for bin in tokenfuse tokenfuse-cloud; do
+            # Not `timeout`: that is GNU coreutils and the macOS runner does
+            # not ship it, so the darwin leg would have failed on a missing
+            # command rather than on anything about the binary. Backgrounded,
+            # given a moment, then killed, which works the same on both.
+            "./dist/$bin-${{ matrix.target }}" --version >/tmp/out.$bin 2>&1 &
+            pid=$!
+            sleep 10
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            out=$(head -3 "/tmp/out.$bin")
+            case "$out" in
+              *"exec format error"*)
+                echo "  $bin: EXEC FORMAT ERROR, built for another architecture"; exit 1 ;;
+              "")
+                # Nothing printed and it did not die: it reached its serve loop
+                # and the timeout stopped it. That is execution, which is what
+                # this asks.
+                echo "  $bin: started and was still running at the timeout, so it executes" ;;
+              *)
+                echo "  $bin: $out" ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: release page
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04  # named, not -latest: a rolling label changes the OS under a tested job
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # One file for every artifact, so a reader checks one thing rather than
+      # four. The per-target files stay beside it: somebody verifying a single
+      # download should not have to trust that this step concatenated correctly.
+      - name: one checksum file
+        run: |
+          cd dist
+          cat SHA256SUMS-* | grep -v '^$' | sed 's#\./##' | sort -k2 > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
   # One job per image PER ARCHITECTURE, each on a runner of that architecture.
   # Nothing here carries a tag: a tag on a single-architecture image is what
   # somebody else's arm64 node would then pull and fail on.
