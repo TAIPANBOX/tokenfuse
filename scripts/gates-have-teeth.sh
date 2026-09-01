@@ -479,13 +479,22 @@ run_case "pinned-installs: an unpinned command quoted in a comment" pass \
 	"$(py 'edit(".github/workflows/ci.yml", "      # Pinned, and the pin is the point.", "      # Historic note: this step read `cargo install bpf-linker` and `pip install foo`.\\n      # Pinned, and the pin is the point.")')"
 
 # Take the subject away. Every install command in this repository lives in
-# ci.yml, so neutralising the verb there leaves the gate with nothing to read,
-# and a check that cannot tell "found no faults" from "found nothing to check"
-# is the most expensive mistake this estate makes in its tooling.
+# so neutralising the verb in every workflow that carries one leaves the gate
+# with nothing to read, and a check that cannot tell "found no faults" from
+# "found nothing to check" is the most expensive mistake this estate makes in
+# its tooling.
+#
+# EVERY file, and the list grew on 2026-09-01. It named ci.yml and bench.yml,
+# which was the whole set until release.yml gained a musl-tools install. One
+# install left standing anywhere means the gate correctly reports OK, the
+# mutation no longer empties anything, and this case went TOOTHLESS: it passed
+# on the fault it exists to catch. Nothing about the gate changed. A case added
+# for one file was quietly disarmed by an install added to another.
 run_case "pinned-installs: no install commands left, so it measured nothing" fail \
 	"./scripts/pinned-installs.sh" \
 	"$(py 'edit_all(".github/workflows/ci.yml", " install ", " nstall ")
-edit_all(".github/workflows/bench.yml", " install ", " nstall ")')" \
+edit_all(".github/workflows/bench.yml", " install ", " nstall ")
+edit_all(".github/workflows/release.yml", " install ", " nstall ")')" \
 	"measured nothing"
 
 run_case "pinned-installs: an apt install loses its snapshot" fail \
