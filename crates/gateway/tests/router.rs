@@ -14,7 +14,9 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Ledger, Mode, Policy, PriceBook};
 use tokenfuse_gateway::pricebook::default_price_book;
-use tokenfuse_gateway::provider::{Provider, ProviderError, ProviderResponse, UsageSlot};
+use tokenfuse_gateway::provider::{
+    ParsedUsage, Provider, ProviderError, ProviderResponse, UsageSlot,
+};
 use tokenfuse_gateway::router::{default_rules, Router, RouterMode};
 use tokenfuse_gateway::sink::{CallRecord, EventSink};
 use tokenfuse_gateway::state::AppState;
@@ -46,7 +48,10 @@ impl Provider for CapturingProvider {
             output_tokens: self.output_tokens,
             ..Default::default()
         };
-        let slot: UsageSlot = Arc::new(Mutex::new(Some(usage)));
+        let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
+            usage,
+            truncated: false,
+        })));
         let chunk = Bytes::from_static(br#"{"stub":true}"#);
         let stream = futures::stream::once(async move { Ok(chunk) });
         Ok(ProviderResponse {

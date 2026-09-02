@@ -49,6 +49,18 @@ pub struct UnauthorizedCounters {
     pub last_millis: Option<i64>,
 }
 
+/// Aggregate count of settlements that fell back to the pre-flight estimate
+/// because `crate::provider::UsageParser`'s buffering cap dropped bytes
+/// before the response's usage block arrived (`crate::settle::SettleGuard`,
+/// `crate::proxy::buffered_managed`). Aggregate only, like
+/// [`UnauthorizedCounters`]: a truncated settlement is a fact about a
+/// response body, not about which client key made the call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TruncatedSettlementCounters {
+    pub settlements: u64,
+    pub last_millis: Option<i64>,
+}
+
 /// A read-only copy of every counter, for `crate::keysreport`'s assembly
 /// step. Taken under the lock and then handed out by value, so the caller
 /// never holds `KeyStats`'s mutex while it builds a response.
@@ -56,12 +68,14 @@ pub struct UnauthorizedCounters {
 pub struct KeyStatsSnapshot {
     pub per_key: HashMap<String, KeyCounters>,
     pub unauthorized: UnauthorizedCounters,
+    pub truncated_settlements: TruncatedSettlementCounters,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     per_key: HashMap<String, KeyCounters>,
     unauthorized: UnauthorizedCounters,
+    truncated_settlements: TruncatedSettlementCounters,
 }
 
 /// Since-startup, in-process counters for client-key activity. A plain
@@ -125,6 +139,17 @@ impl KeyStats {
         inner.unauthorized.last_millis = Some(now_millis());
     }
 
+    /// Record one settlement that used the pre-flight estimate because
+    /// `crate::provider::UsageParser`'s cap dropped bytes before the
+    /// response's usage block arrived. Aggregate only, for the same reason
+    /// [`record_unauthorized`](Self::record_unauthorized) is: which key made
+    /// a call whose body happened to run long is not what this counts.
+    pub fn record_truncated_settlement(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.truncated_settlements.settlements += 1;
+        inner.truncated_settlements.last_millis = Some(now_millis());
+    }
+
     /// A read-only snapshot of every counter, for `crate::keysreport`.
     #[must_use]
     pub fn snapshot(&self) -> KeyStatsSnapshot {
@@ -132,6 +157,7 @@ impl KeyStats {
         KeyStatsSnapshot {
             per_key: inner.per_key.clone(),
             unauthorized: inner.unauthorized,
+            truncated_settlements: inner.truncated_settlements,
         }
     }
 }
@@ -208,6 +234,32 @@ mod tests {
         assert!(snap.per_key.is_empty());
         assert_eq!(snap.unauthorized.attempts, 0);
         assert!(snap.unauthorized.last_millis.is_none());
+        assert_eq!(snap.truncated_settlements.settlements, 0);
+        assert!(snap.truncated_settlements.last_millis.is_none());
+    }
+
+    #[test]
+    fn truncated_settlement_counter_is_aggregate_only() {
+        let stats = KeyStats::default();
+        stats.record_truncated_settlement();
+        stats.record_truncated_settlement();
+        let snap = stats.snapshot();
+        assert_eq!(snap.truncated_settlements.settlements, 2);
+        assert!(snap.truncated_settlements.last_millis.is_some());
+        assert!(
+            snap.per_key.is_empty(),
+            "a truncated settlement never keys by anything, same as an unauthorized attempt"
+        );
+    }
+
+    #[test]
+    fn truncated_settlement_counter_is_independent_of_unauthorized() {
+        let stats = KeyStats::default();
+        stats.record_unauthorized();
+        stats.record_truncated_settlement();
+        let snap = stats.snapshot();
+        assert_eq!(snap.unauthorized.attempts, 1);
+        assert_eq!(snap.truncated_settlements.settlements, 1);
     }
 
     #[test]

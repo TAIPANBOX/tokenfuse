@@ -11,9 +11,9 @@
 use crate::estimate::estimate_cost;
 use crate::identitymap::StrictMode;
 use crate::keystats::KeyStats;
-use crate::provider::{ProviderError, ProviderResponse};
+use crate::provider::{ProviderError, ProviderResponse, UsageParser};
 use crate::router::RouterMode;
-use crate::settle::SettleGuard;
+use crate::settle::{settle_amount, CostBasis, SettleGuard};
 use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
 use crate::unitledger::UnitReservation;
@@ -1798,6 +1798,7 @@ fn stream_managed(
         unit,
         st.units.clone(),
         unit_reservation,
+        st.keystats.clone(),
     );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
@@ -1944,14 +1945,19 @@ async fn buffered_managed(
         }
     };
 
-    let usage = resp.usage.lock().unwrap().take();
+    let parsed = resp.usage.lock().unwrap().take();
 
-    // What to settle when the response reports no usage we can price.
+    // What to settle when the response reports no usage we can price, and
+    // which of three bases the charge rests on - see `settle_amount` and
+    // `CostBasis` for the full picture. This mirrors
+    // `SettleGuard::settle_now`'s copy of the same decision; both call the
+    // one function so a body that overruns `UsageParser::CAP` is handled
+    // identically whether the client asked to stream the response or not.
     //
-    // On a 2xx that is the conservative fallback it has always been: a
-    // completion did happen, we simply could not measure it, so charging what
-    // was reserved beats charging nothing and letting an unmeasurable model
-    // spend a run's budget for free.
+    // On a 2xx the estimate is the conservative fallback it has always been:
+    // a completion did happen, we simply could not measure it, so charging
+    // what was reserved beats charging nothing and letting an unmeasurable
+    // model spend a run's budget for free.
     //
     // On a non-2xx it is wrong, and wrongly expensive. The provider refused:
     // there is no completion to measure, so the pre-flight estimate is not a
@@ -1967,16 +1973,30 @@ async fn buffered_managed(
     // Reported usage is still settled as itself either way, including on a
     // refusal: a provider that generated part of a response and then failed
     // over it bills for what it generated, and that is real money rather than
-    // an estimate.
+    // an estimate. A TRUNCATED body is the one exception, refused or not: see
+    // `settle_amount`, partial usage surviving a cut-off buffer is never
+    // trusted.
     let unmeasured = if status.is_success() {
         reservation.amount
     } else {
         Microusd::ZERO
     };
-    let actual = usage
-        .as_ref()
-        .and_then(|u| st.prices.cost(model, u))
-        .unwrap_or(unmeasured);
+    let (actual, parsed_usage, basis) = settle_amount(&st.prices, model, parsed, unmeasured);
+    if basis == CostBasis::EstimateTruncated {
+        // `settled_microusd` is named, not assumed nonzero: a refused call
+        // whose error body also overran the cap settles zero here, same as
+        // any other refusal, and the log line must not read as though an
+        // estimate was charged when nothing was.
+        tracing::warn!(
+            model = %model,
+            buffered_bytes = UsageParser::CAP,
+            settled_microusd = actual.0,
+            "usage-parser cap hit before the response's usage block arrived; \
+             the parsed usage cannot be trusted, so this settled on the \
+             fallback amount above instead"
+        );
+        st.keystats.record_truncated_settlement();
+    }
     st.ledger.settle(&reservation, actual);
     if let Some(ur) = &unit_reservation {
         st.units.settle(ur, actual, now_millis());
@@ -2000,27 +2020,26 @@ async fn buffered_managed(
     // keeps this at zero rather than negative on the one case the router
     // routes up (an explicit higher-tier requirement) -- there is no
     // "savings" to report when the call ended up pricier than requested.
-    let router_saved = match (&router_route, usage.as_ref()) {
-        (Some((original_model, chosen_model)), Some(u)) => {
+    let router_saved = match &router_route {
+        Some((original_model, chosen_model)) => {
             match (
-                st.prices.cost(original_model, u),
-                st.prices.cost(chosen_model, u),
+                st.prices.cost(original_model, &parsed_usage),
+                st.prices.cost(chosen_model, &parsed_usage),
             ) {
                 (Some(would_have_cost), Some(did_cost)) => would_have_cost.saturating_sub(did_cost),
                 _ => Microusd::ZERO,
             }
         }
-        _ => Microusd::ZERO,
+        None => Microusd::ZERO,
     };
 
-    let u = usage.unwrap_or_default();
     st.sink.record(CallRecord {
         ts_millis: now_millis(),
         run_id: reservation.run_id.clone(),
         model: model.to_string(),
         decision: "allow".into(),
-        input_tokens: u.input_tokens,
-        output_tokens: u.output_tokens,
+        input_tokens: parsed_usage.input_tokens,
+        output_tokens: parsed_usage.output_tokens,
         cost_microusd: actual.0,
         step: reservation.step,
         agent_id: agent_id.to_string(),
@@ -2033,7 +2052,7 @@ async fn buffered_managed(
         // The model-emitted tool-call count parsed out of this response's
         // body, same source as `input_tokens`/`output_tokens` above (I1,
         // docs/21-tool-runs.md).
-        tool_calls: u.tool_calls,
+        tool_calls: parsed_usage.tool_calls,
     });
 
     // Agent firewall: judge the model's requested tool calls against the run's
@@ -2826,7 +2845,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::ledger_backend::{LedgerBackend, LocalLedger};
-    use crate::provider::{Provider, StubProvider};
+    use crate::provider::{ParsedUsage, Provider, StubProvider};
     use crate::sink::EventSink;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -2918,7 +2937,10 @@ pub(crate) mod tests {
                 status: self.status,
                 content_type: Some("application/json".to_string()),
                 body: Box::pin(futures::stream::once(async move { Ok(chunk) })),
-                usage: Arc::new(Mutex::new(self.usage)),
+                usage: Arc::new(Mutex::new(self.usage.map(|usage| ParsedUsage {
+                    usage,
+                    truncated: false,
+                }))),
             })
         }
     }

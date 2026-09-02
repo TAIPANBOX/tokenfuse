@@ -66,12 +66,24 @@ pub struct KeysReport {
     pub identity_map_configured: bool,
     pub history_available: bool,
     pub unauthorized_since_startup: UnauthorizedView,
+    pub truncated_settlements_since_startup: TruncatedSettlementsView,
     pub keys: Vec<KeyView>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct UnauthorizedView {
     pub attempts: u64,
+    pub last_millis: Option<i64>,
+}
+
+/// How many settlements (`crate::settle::SettleGuard`,
+/// `crate::proxy::buffered_managed`) fell back to the pre-flight estimate
+/// because the usage-parser cap dropped bytes before the response's usage
+/// block arrived. Aggregate, in-process-only, resets on restart - same shape
+/// and same limits as [`UnauthorizedView`], see `docs/22-key-lifecycle.md`.
+#[derive(Debug, Serialize)]
+pub struct TruncatedSettlementsView {
+    pub settlements: u64,
     pub last_millis: Option<i64>,
 }
 
@@ -184,6 +196,10 @@ async fn build_report(st: &AppState, data_dir: Option<&str>) -> KeysReport {
         unauthorized_since_startup: UnauthorizedView {
             attempts: stats.unauthorized.attempts,
             last_millis: stats.unauthorized.last_millis,
+        },
+        truncated_settlements_since_startup: TruncatedSettlementsView {
+            settlements: stats.truncated_settlements.settlements,
+            last_millis: stats.truncated_settlements.last_millis,
         },
         keys,
     }
@@ -325,6 +341,11 @@ mod tests {
         assert!(!report.history_available);
         assert_eq!(report.unauthorized_since_startup.attempts, 0);
         assert!(report.unauthorized_since_startup.last_millis.is_none());
+        assert_eq!(report.truncated_settlements_since_startup.settlements, 0);
+        assert!(report
+            .truncated_settlements_since_startup
+            .last_millis
+            .is_none());
         assert!(report.keys.is_empty());
     }
 
@@ -454,6 +475,23 @@ mod tests {
         let report = build_report(&st, None).await;
         assert_eq!(report.unauthorized_since_startup.attempts, 3);
         assert!(report.unauthorized_since_startup.last_millis.is_some());
+    }
+
+    #[tokio::test]
+    async fn truncated_settlements_since_startup_reflects_keystats() {
+        let st = base_state();
+        st.keystats.record_truncated_settlement();
+        st.keystats.record_truncated_settlement();
+        let report = build_report(&st, None).await;
+        assert_eq!(report.truncated_settlements_since_startup.settlements, 2);
+        assert!(report
+            .truncated_settlements_since_startup
+            .last_millis
+            .is_some());
+        assert_eq!(
+            report.unauthorized_since_startup.attempts, 0,
+            "the two counters must not bleed into each other"
+        );
     }
 
     // -----------------------------------------------------------------

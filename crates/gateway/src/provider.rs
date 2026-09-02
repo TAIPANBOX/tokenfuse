@@ -13,8 +13,23 @@ use futures::stream::{BoxStream, StreamExt};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::Usage;
 
+/// Usage parsed from a (possibly truncated) response body, paired with
+/// whether [`UsageParser::feed`] dropped bytes before they could be parsed.
+///
+/// `truncated = true` means `usage` may be missing fields that would have
+/// arrived after the cut: Anthropic's cumulative `output_tokens` lands in the
+/// FINAL `message_delta`, so a response over [`UsageParser::CAP`] can carry a
+/// real-looking but silently short `usage`, or none at all, when the whole
+/// usage block landed past the cut. Callers must not price `usage` when
+/// `truncated` is set; see `crate::settle::settle_amount`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParsedUsage {
+    pub usage: Usage,
+    pub truncated: bool,
+}
+
 /// Shared slot filled with the final usage once a provider stream ends.
-pub type UsageSlot = Arc<Mutex<Option<Usage>>>;
+pub type UsageSlot = Arc<Mutex<Option<ParsedUsage>>>;
 
 /// A streaming response from the upstream.
 pub struct ProviderResponse {
@@ -58,12 +73,24 @@ pub trait Provider: Send + Sync {
 #[derive(Default)]
 pub struct UsageParser {
     buf: Vec<u8>,
+    /// Set by [`feed`](Self::feed) the moment a byte is dropped because the
+    /// buffered body exceeded [`CAP`](Self::CAP). Sticky for the parser's
+    /// lifetime: once one byte has been dropped, everything parsed from `buf`
+    /// is potentially incomplete, so later calls cannot un-set it.
+    truncated: bool,
 }
 
 impl UsageParser {
-    /// Upper bound on buffered bytes; beyond this we stop accumulating and may
-    /// fall back to the pre-flight estimate at settle time.
-    const CAP: usize = 8 * 1024 * 1024;
+    /// Upper bound on buffered bytes; beyond this we stop accumulating and
+    /// mark the result [`ParsedUsage::truncated`], so the settle path falls
+    /// back to the pre-flight estimate instead of trusting usage parsed from
+    /// an incomplete body (see `crate::settle::settle_amount`).
+    ///
+    /// `pub(crate)` rather than private: `crate::settle` names this exact
+    /// number in the warning it logs when a settlement falls back because of
+    /// truncation, so an operator reading the log sees the real cap rather
+    /// than a second constant that could drift from this one.
+    pub(crate) const CAP: usize = 8 * 1024 * 1024;
 
     pub fn new() -> Self {
         UsageParser::default()
@@ -71,13 +98,19 @@ impl UsageParser {
 
     pub fn feed(&mut self, chunk: &[u8]) {
         if self.buf.len() >= Self::CAP {
+            if !chunk.is_empty() {
+                self.truncated = true;
+            }
             return;
         }
         let take = (Self::CAP - self.buf.len()).min(chunk.len());
+        if take < chunk.len() {
+            self.truncated = true;
+        }
         self.buf.extend_from_slice(&chunk[..take]);
     }
 
-    pub fn finish(&self) -> Usage {
+    pub fn finish(&self) -> ParsedUsage {
         let text = String::from_utf8_lossy(&self.buf);
         let mut usage = Usage::default();
         let mut saw_sse = false;
@@ -106,7 +139,10 @@ impl UsageParser {
         }
 
         usage.tool_calls = tool_calls.finish();
-        usage
+        ParsedUsage {
+            usage,
+            truncated: self.truncated,
+        }
     }
 }
 
@@ -439,8 +475,11 @@ impl Provider for StubProvider {
                 yield chunk;
             }
             // Prefer the declared usage; fall back to what the parser saw.
+            // Never truncated in practice (the stub's bodies are a few bytes),
+            // but carried through honestly rather than hard-coded false.
             let parsed = parser.finish();
-            *writer.lock().unwrap() = Some(if parsed == Usage::default() { usage } else { parsed });
+            let usage = if parsed.usage == Usage::default() { usage } else { parsed.usage };
+            *writer.lock().unwrap() = Some(ParsedUsage { usage, truncated: parsed.truncated });
         };
 
         Ok(ProviderResponse {
@@ -463,7 +502,7 @@ mod tests {
         p.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":8}}\n\n");
         p.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":842}}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.input_tokens, 1200);
         assert_eq!(u.cache_read_tokens, 300);
         // Final cumulative delta wins.
@@ -476,7 +515,7 @@ mod tests {
         p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
         p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.input_tokens, 950);
         assert_eq!(u.output_tokens, 120);
         assert_eq!(u.cache_read_tokens, 128);
@@ -486,7 +525,7 @@ mod tests {
     fn parses_non_streaming_json_usage() {
         let mut p = UsageParser::new();
         p.feed(br#"{"id":"msg_1","usage":{"input_tokens":40,"output_tokens":15}}"#);
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.input_tokens, 40);
         assert_eq!(u.output_tokens, 15);
     }
@@ -503,7 +542,7 @@ mod tests {
             {"type":"tool_use","id":"toolu_2","name":"get_time","input":{}}
         ],"usage":{"input_tokens":10,"output_tokens":5}}"#,
         );
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(2));
     }
 
@@ -518,7 +557,7 @@ mod tests {
         p.feed(b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"get_time\"}}\n\n");
         p.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(2));
     }
 
@@ -534,7 +573,7 @@ mod tests {
                 {"id":"call_3","type":"function","function":{"name":"get_weather","arguments":"{}"}}
             ]},"finish_reason":"tool_calls"}
         ],"usage":{"prompt_tokens":30,"completion_tokens":12}}"#);
-        let u = p.finish();
+        let u = p.finish().usage;
         // 2 tool calls on choice 0 + 1 on choice 1 = 3, summed across choices.
         assert_eq!(u.tool_calls, Some(3));
     }
@@ -552,7 +591,7 @@ mod tests {
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n");
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(2));
     }
 
@@ -565,7 +604,7 @@ mod tests {
         let mut p = UsageParser::new();
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}},{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"\"}}]}}]}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(2));
     }
 
@@ -573,7 +612,7 @@ mod tests {
     fn no_tool_calls_in_a_valid_body_is_zero_not_none() {
         let mut p = UsageParser::new();
         p.feed(br#"{"type":"message","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":2}}"#);
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(0));
     }
 
@@ -582,7 +621,7 @@ mod tests {
         let mut p = UsageParser::new();
         p.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n");
         p.feed(b"data: [DONE]\n\n");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, Some(0));
     }
 
@@ -590,15 +629,97 @@ mod tests {
     fn unparseable_body_leaves_tool_calls_none() {
         let mut p = UsageParser::new();
         p.feed(b"not json at all, an upstream error page or a truncated body");
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, None);
     }
 
     #[test]
     fn empty_body_leaves_tool_calls_none() {
         let p = UsageParser::new();
-        let u = p.finish();
+        let u = p.finish().usage;
         assert_eq!(u.tool_calls, None);
+    }
+
+    // -- usage-cap truncation: a dropped byte is no longer silent ----------
+
+    /// The defect this module used to have: a response whose usage block
+    /// arrives after `UsageParser::CAP` was silently parsed to
+    /// `Usage::default()`, indistinguishable from a body that genuinely
+    /// carried no usage. It must now come back marked `truncated`, so the
+    /// settle path can tell "nothing was there" from "something was there
+    /// and we cut it off" (`crate::settle::settle_amount`).
+    #[test]
+    fn a_body_whose_usage_block_lands_after_the_cap_is_reported_truncated() {
+        let mut p = UsageParser::new();
+        // Padding that fills the cap exactly and parses to nothing (no
+        // `data:` prefix, not valid JSON on its own).
+        let padding = vec![b'x'; UsageParser::CAP];
+        p.feed(&padding);
+        // The usage block: fed once the cap is already full, so none of it
+        // is ever buffered. Anthropic's shape - `message_start` carries
+        // input tokens, the final `message_delta` carries the cumulative
+        // output tokens - is exactly what a real oversized response would
+        // lose past the cut.
+        p.feed(
+            b"\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1200}}}\n\n",
+        );
+        p.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":842}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+
+        let result = p.finish();
+        assert!(
+            result.truncated,
+            "a body cut at the cap must say so, not parse silently"
+        );
+        assert_eq!(
+            result.usage,
+            Usage::default(),
+            "the usage block landed entirely after the cap, so nothing was parsed"
+        );
+    }
+
+    /// Hostile input: a chunk that fills the buffer to exactly `CAP`, not one
+    /// byte more. Nothing was ever dropped, so this must not be truncated -
+    /// the off-by-one this guards is `>=` vs `>` in `feed`'s cap check.
+    #[test]
+    fn a_chunk_that_exactly_fills_the_cap_is_not_truncated() {
+        let mut p = UsageParser::new();
+        let exact = vec![b'x'; UsageParser::CAP];
+        p.feed(&exact);
+        assert!(
+            !p.finish().truncated,
+            "every byte offered was buffered; nothing was cut"
+        );
+    }
+
+    /// Hostile input: once the cap is exactly full (no drop), a zero-byte
+    /// chunk arriving after it must not flip `truncated` on its own - it
+    /// drops nothing, by definition. Guards against a naive `buf.len() >=
+    /// CAP` check treating "at capacity" as "something was cut" regardless
+    /// of what (if anything) the next chunk contains.
+    #[test]
+    fn a_zero_byte_chunk_after_the_cap_is_not_truncated_by_itself() {
+        let mut p = UsageParser::new();
+        let exact = vec![b'x'; UsageParser::CAP];
+        p.feed(&exact);
+        p.feed(b"");
+        assert!(
+            !p.finish().truncated,
+            "an empty chunk drops nothing, even once the buffer is full"
+        );
+    }
+
+    /// Hostile input: a single chunk larger than the whole cap in one call
+    /// (no prior `feed`), rather than the cap being approached gradually.
+    #[test]
+    fn a_single_chunk_larger_than_the_cap_is_truncated() {
+        let mut p = UsageParser::new();
+        let oversized = vec![b'x'; UsageParser::CAP + 500];
+        p.feed(&oversized);
+        assert!(
+            p.finish().truncated,
+            "the first and only chunk already overshot the cap"
+        );
     }
 
     #[tokio::test]
@@ -622,9 +743,13 @@ mod tests {
         assert!(text.contains("message_start"));
         assert!(text.contains("[DONE]"));
         // Usage slot is populated after the stream is drained.
-        let u = resp.usage.lock().unwrap().unwrap();
-        assert_eq!(u.input_tokens, 100);
-        assert_eq!(u.output_tokens, 50);
+        let parsed = resp.usage.lock().unwrap().unwrap();
+        assert_eq!(parsed.usage.input_tokens, 100);
+        assert_eq!(parsed.usage.output_tokens, 50);
+        assert!(
+            !parsed.truncated,
+            "a few bytes of SSE never comes near the cap"
+        );
     }
 
     #[test]
