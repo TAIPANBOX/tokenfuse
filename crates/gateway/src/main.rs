@@ -912,14 +912,22 @@ async fn serve() {
 
     // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
     // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.
-    use tokenfuse_gateway::sink::{EventSink, NullSink, ParquetSink, TeeSink};
+    use tokenfuse_gateway::sink::{
+        spawn_periodic_flush, EventSink, NullSink, ParquetSink, TeeSink,
+    };
     let mut sink: Arc<dyn EventSink> = Arc::new(NullSink);
     if let Ok(dir) = std::env::var("TOKENFUSE_DATA_DIR") {
         if !dir.is_empty() {
             match ParquetSink::new(&dir, 256) {
                 Ok(s) => {
                     tracing::info!(%dir, "recording trace to Parquet");
-                    sink = Arc::new(s);
+                    let s = Arc::new(s);
+                    // Periodic flush so a call reaches disk on an ordinary
+                    // ten-call day, not only at the 256-record threshold or on
+                    // process exit (plan item A9) - same two-second cadence as
+                    // the CloudSink flusher below.
+                    spawn_periodic_flush(s.clone(), std::time::Duration::from_secs(2));
+                    sink = s;
                 }
                 Err(e) => tracing::warn!(%dir, "could not open trace dir: {e}"),
             }
@@ -1083,7 +1091,39 @@ async fn cluster_ledger() -> Option<Arc<dyn tokenfuse_gateway::ledger_backend::L
     }
 }
 
+/// Graceful-shutdown future for `axum::serve(...).with_graceful_shutdown(...)`.
+///
+/// SIGINT (ctrl_c) and, on Unix, SIGTERM both trigger it - `docker stop` and
+/// every orchestrator's normal "stop this container" send SIGTERM, not
+/// SIGINT, so a gateway that only listened for the latter never ran its
+/// graceful path on the way it is actually stopped in production (plan item
+/// A9). Graceful shutdown drops the `axum::serve` future's captured state,
+/// including the event sink, so `ParquetSink::drop`'s own flush still runs on
+/// either signal - this is what makes SIGTERM's tail land on disk, not new
+/// flush logic of its own.
+///
+/// `#[cfg(not(unix))]` keeps non-Unix builds (Windows) compiling: there is no
+/// `SIGTERM` there, so that branch is a future that never resolves and ctrl_c
+/// alone drives shutdown, exactly as before this change.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
     tracing::info!("shutdown signal received");
 }
