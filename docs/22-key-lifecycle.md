@@ -65,6 +65,7 @@ every field here is metadata, never a secret).
   "identity_map_configured": true,
   "history_available": true,
   "unauthorized_since_startup": { "attempts": 3, "last_millis": 1737590400000 },
+  "truncated_settlements_since_startup": { "settlements": 0, "last_millis": null },
   "keys": [
     {
       "key_id": "billing-agent",
@@ -153,6 +154,13 @@ vocabulary the console is expected to use, from the fields above:
   report does not, and must not, narrow that down. `unauthorized_since_startup`
   is an AGGREGATE, process-wide counter only, with no per-secret, per-key,
   or per-source breakdown anywhere, on purpose.
+- `truncated_settlements_since_startup` counts settlements
+  (`crates/gateway/src/settle.rs`, `crate::proxy::buffered_managed`) that fell
+  back to the pre-flight estimate because the usage-parser cap
+  (`UsageParser::CAP`, 8 MiB) dropped bytes before a response's usage block
+  arrived. Same shape and same limit as `unauthorized_since_startup`: an
+  aggregate, in-process, since-restart count, not attributable to a `key_id`
+  (a truncated body is a fact about the response, not about who called).
 - `since_startup` counters are in-process and reset on every restart: not
   durable, not fleet-consistent across multiple gateways (the same
   limitation docs/20 states for unit budget counters). The `history` fold

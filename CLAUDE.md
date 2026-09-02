@@ -2163,3 +2163,73 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_misspelt_mode_is_refused_rather_than_guessed`;
     `case_is_not_the_operators_job`. Scenarios:
     `features/the-delegation-door.feature`)*
+
+38. **A cap that silently stops accumulating is a cap that silently lies about
+    what it measured.** `UsageParser::CAP` (8 MiB, `crates/gateway/src/provider.rs`)
+    truncated a response's buffered body with no flag, no count, no log:
+    `feed()` just stopped, and `finish()` parsed whatever fit. Its own doc
+    comment claimed the settle path "may fall back to the pre-flight estimate"
+    once cut, but nothing made that true - a body whose usage arrived early
+    (Anthropic's `message_start`, near the front) and whose CUMULATIVE
+    `output_tokens` arrived late (the final `message_delta`, exactly what an
+    oversized response pushes past the cut) settled on a real, computed,
+    silently-short cost, not the estimate the comment promised.
+
+    `feed` now sets `truncated` the moment a byte is dropped, and `finish()`
+    returns it beside the `Usage` in a `ParsedUsage`. The settle side is one
+    function, `settle::settle_amount`, called by both `SettleGuard::settle_now`
+    (streaming) and `proxy::buffered_managed` (buffered) - the same
+    one-copy-not-two-agreeing-verbatim-copies shape invariant 29 already holds
+    for algorithm rules, applied here so a body that overruns the cap is
+    handled identically regardless of which path the client's request took.
+    It returns which of three bases the charge rests on: `Parsed` (real usage,
+    the cap never touched it), `EstimateNoUsage` (nothing to price, not the
+    cap's doing), `EstimateTruncated` (the cap cut it, and whatever partial
+    usage survived - even a real-looking, nonzero one - is never priced). A
+    truncated settlement gets a `tracing::warn!` naming the model and the
+    buffered bytes, and an aggregate in-process counter
+    (`KeyStats::record_truncated_settlement`, same shape as the existing
+    `unauthorized_since_startup`) surfaced on `GET /v1/keys` as
+    `truncated_settlements_since_startup` (`docs/22-key-lifecycle.md`).
+
+    **No Parquet column.** `CallRecord` (`crates/gateway/src/sink.rs`) has 116
+    struct-literal constructions across 13 files in two crates, none via
+    `Default` or a spread pattern; a fourth `cost_basis` column next to
+    `input_tokens`/`output_tokens` was the obvious next step and, measured
+    against those 116 sites, was not the small, pattern-following change
+    invariant 6's nullable-evolution note describes for this same file, so it
+    was not made. The basis is proven at the settle-decision level instead
+    (`settle_amount`'s own tests, naming each of the three cases directly) and
+    at the ledger level: a trusted partial usage and the honest estimate
+    cannot coincide by construction in the test fixtures, which price the
+    partial usage at $1.50 against a $1.00 estimate, so a mutant that treats
+    truncated as parsed moves a real number, not just a label.
+    *(test: `crates/gateway/src/provider.rs`:
+    `a_body_whose_usage_block_lands_after_the_cap_is_reported_truncated` (red
+    against the unfixed `feed`, verbatim "a body cut at the cap must say so,
+    not parse silently"), `a_chunk_that_exactly_fills_the_cap_is_not_truncated`,
+    `a_zero_byte_chunk_after_the_cap_is_not_truncated_by_itself`,
+    `a_single_chunk_larger_than_the_cap_is_truncated`.
+    `crates/gateway/src/settle.rs`: `settle_amount_prices_real_usage_as_parsed`,
+    `settle_amount_falls_back_to_the_estimate_when_the_body_carried_no_usage`,
+    `settle_amount_falls_back_to_the_estimate_when_truncated_even_with_partial_usage`,
+    `settle_amount_on_no_slot_write_at_all_is_estimate_no_usage`,
+    `a_truncated_result_settles_on_the_estimate_and_counts_it`,
+    `a_parsed_result_under_the_cap_does_not_touch_the_truncation_counter`,
+    `a_body_under_the_cap_with_no_usage_settles_the_estimate_without_counting_as_truncated`.
+    `crates/gateway/src/keystats.rs`: `truncated_settlement_counter_is_aggregate_only`,
+    `truncated_settlement_counter_is_independent_of_unauthorized`.
+    `crates/gateway/src/keysreport.rs`:
+    `truncated_settlements_since_startup_reflects_keystats`. Three mutants
+    planted in the product code 2026-09-02, each caught: the two
+    `truncated = true` assignments deleted from `feed` (caught by the first
+    and fourth `provider.rs` tests above); `settle_amount`'s truncated
+    short-circuit deleted, so a truncated result is priced like a parsed one
+    (caught by `settle_amount_falls_back_to_the_estimate_when_truncated_even_with_partial_usage`
+    and `a_truncated_result_settles_on_the_estimate_and_counts_it`, both on the
+    real $1.00-vs-$1.50 figures); the counter's two increments deleted from
+    `KeyStats::record_truncated_settlement` (caught by three tests across two
+    files). No `features/*.feature` scenario: `scripts/features-are-bound.sh`
+    checks that existing scenarios stay bound, it does not require a new one
+    per change, and inventing a Given/When/Then not spoken by the user is the
+    failure the Gherkin layer exists to avoid.)*

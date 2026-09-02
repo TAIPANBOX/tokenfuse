@@ -13,12 +13,64 @@
 //! what [`SettleGuard::provider_refused`] decides. Either way the reservation is
 //! released, so neither answer can leak one.
 
+use crate::keystats::KeyStats;
 use crate::ledger_backend::LedgerBackend;
-use crate::provider::UsageSlot;
+use crate::provider::{ParsedUsage, UsageSlot};
 use crate::sink::{now_millis, CallRecord, EventSink};
 use crate::unitledger::{UnitLedger, UnitReservation};
 use std::sync::Arc;
-use tokenfuse_core::{Microusd, PriceBook, Reservation};
+use tokenfuse_core::{Microusd, PriceBook, Reservation, Usage};
+
+/// The basis a settlement's charged amount rests on. Not a Parquet column
+/// (see the PR body for why adding one was not a small change) - this exists
+/// so the three cases below are a named, testable value rather than
+/// reconstructed after the fact from which `Microusd` happened to come out,
+/// which two different bases can produce by coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostBasis {
+    /// Real usage, parsed from a body the cap never touched.
+    Parsed,
+    /// Not truncated, but the body carried nothing to price - settled on the
+    /// estimate because there was nothing else to settle on.
+    EstimateNoUsage,
+    /// [`UsageParser::CAP`](crate::provider::UsageParser::CAP) dropped bytes
+    /// before the usage block arrived - settled on the estimate because
+    /// whatever partial usage survived the cut cannot be trusted (a
+    /// cumulative field, like Anthropic's `output_tokens`, can look real and
+    /// still be short).
+    EstimateTruncated,
+}
+
+/// Decides what a settlement charges and why, from the parsed usage (if any)
+/// and the pre-flight estimate to fall back to. Pure and unit-tested on its
+/// own below; both settle paths in this crate (`SettleGuard::settle_now` here
+/// and `crate::proxy::buffered_managed`) call this one function so the
+/// three-way decision is made in exactly one place.
+///
+/// Returns the amount to charge, the usage to record on the `CallRecord`
+/// (defaulted when nothing was parsed, same as before this function existed),
+/// and the basis the amount rests on.
+pub(crate) fn settle_amount(
+    prices: &PriceBook,
+    model: &str,
+    parsed: Option<ParsedUsage>,
+    unmeasured: Microusd,
+) -> (Microusd, Usage, CostBasis) {
+    let truncated = parsed.as_ref().is_some_and(|p| p.truncated);
+    let usage = parsed.map(|p| p.usage).unwrap_or_default();
+    if truncated {
+        // Never priced, no matter what partial numbers survived the cut -
+        // see `CostBasis::EstimateTruncated`'s doc.
+        return (unmeasured, usage, CostBasis::EstimateTruncated);
+    }
+    match prices.cost(model, &usage) {
+        Some(cost) if usage != Usage::default() => (cost, usage, CostBasis::Parsed),
+        // Either the model has no price at all, or nothing was parsed
+        // (`usage` defaulted, whether because the body carried no usage or
+        // the guard was dropped before any was ever written to the slot).
+        _ => (unmeasured, usage, CostBasis::EstimateNoUsage),
+    }
+}
 
 pub struct SettleGuard {
     ledger: Arc<dyn LedgerBackend>,
@@ -76,6 +128,12 @@ pub struct SettleGuard {
     /// the unit has no cap in effect (nothing was reserved).
     units: Arc<UnitLedger>,
     unit_reservation: Option<UnitReservation>,
+    /// Where a truncated settlement's counter goes
+    /// (`crate::keystats::KeyStats::record_truncated_settlement`). Added
+    /// alongside the truncation fix rather than threaded through every other
+    /// field above: nothing before this needed a place to report an
+    /// in-process signal that isn't part of the settled `CallRecord`.
+    keystats: Arc<KeyStats>,
 }
 
 impl SettleGuard {
@@ -97,6 +155,7 @@ impl SettleGuard {
         unit: String,
         units: Arc<UnitLedger>,
         unit_reservation: Option<UnitReservation>,
+        keystats: Arc<KeyStats>,
     ) -> Self {
         SettleGuard {
             ledger,
@@ -115,6 +174,7 @@ impl SettleGuard {
             unit,
             units,
             unit_reservation,
+            keystats,
         }
     }
 
@@ -131,16 +191,22 @@ impl SettleGuard {
         } else {
             self.fallback
         };
-        let actual = parsed
-            .as_ref()
-            .and_then(|u| self.prices.cost(&self.model, u))
-            .unwrap_or(unmeasured);
+        let (actual, usage, basis) = settle_amount(&self.prices, &self.model, parsed, unmeasured);
+        if basis == CostBasis::EstimateTruncated {
+            tracing::warn!(
+                model = %self.model,
+                buffered_bytes = crate::provider::UsageParser::CAP,
+                "settling on the pre-flight estimate: the usage-parser cap was hit \
+                 before the response's usage block arrived, so the parsed usage \
+                 cannot be trusted"
+            );
+            self.keystats.record_truncated_settlement();
+        }
         self.ledger.settle(&reservation, actual);
         if let Some(ur) = self.unit_reservation.take() {
             self.units.settle(&ur, actual, now_millis());
         }
 
-        let usage = parsed.unwrap_or_default();
         self.sink.record(CallRecord {
             ts_millis: now_millis(),
             run_id: reservation.run_id.clone(),
@@ -183,7 +249,8 @@ impl Drop for SettleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::UsageSlot;
+    use crate::keystats::KeyStats;
+    use crate::provider::{ParsedUsage, UsageSlot};
     use std::sync::Mutex;
     use tokenfuse_core::{Ledger, ModelPrice, PriceBook, Usage};
 
@@ -200,10 +267,13 @@ mod tests {
     #[test]
     fn complete_settles_with_parsed_usage() {
         let (ledger, prices, usage, reservation) = setup();
-        *usage.lock().unwrap() = Some(Usage {
-            input_tokens: 1_000_000,
-            output_tokens: 0,
-            ..Default::default()
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                ..Default::default()
+            },
+            truncated: false,
         });
         let guard = SettleGuard::new(
             Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
@@ -222,6 +292,7 @@ mod tests {
             String::new(),
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(KeyStats::default()),
         );
         guard.complete();
 
@@ -253,6 +324,7 @@ mod tests {
                 String::new(),
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(KeyStats::default()),
             );
             // dropped here without complete()
         }
@@ -289,6 +361,7 @@ mod tests {
                 String::new(),
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(KeyStats::default()),
             );
             // dropped here without complete()
         }
@@ -312,10 +385,13 @@ mod tests {
     #[test]
     fn a_refused_stream_that_reported_usage_still_settles_it() {
         let (ledger, prices, usage, reservation) = setup();
-        *usage.lock().unwrap() = Some(Usage {
-            input_tokens: 1_000_000,
-            output_tokens: 0,
-            ..Default::default()
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                ..Default::default()
+            },
+            truncated: false,
         });
         let guard = SettleGuard::new(
             Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
@@ -334,6 +410,7 @@ mod tests {
             String::new(),
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(KeyStats::default()),
         );
         guard.complete();
 
@@ -349,10 +426,13 @@ mod tests {
     #[test]
     fn a_unit_reservation_settles_alongside_the_run_reservation() {
         let (ledger, prices, usage, reservation) = setup();
-        *usage.lock().unwrap() = Some(Usage {
-            input_tokens: 1_000_000,
-            output_tokens: 0,
-            ..Default::default()
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                ..Default::default()
+            },
+            truncated: false,
         });
         let units = Arc::new(UnitLedger::new(std::collections::HashMap::from([(
             "treasury".to_string(),
@@ -380,6 +460,7 @@ mod tests {
             "treasury".into(),
             units.clone(),
             Some(ur),
+            Arc::new(KeyStats::default()),
         );
         guard.complete();
         // The unit ledger absorbed the same actual cost as the run ledger.
@@ -409,11 +490,14 @@ mod tests {
     #[test]
     fn complete_settles_with_parsed_tool_calls() {
         let (ledger, prices, usage, reservation) = setup();
-        *usage.lock().unwrap() = Some(Usage {
-            input_tokens: 1_000_000,
-            output_tokens: 0,
-            tool_calls: Some(2),
-            ..Default::default()
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                tool_calls: Some(2),
+                ..Default::default()
+            },
+            truncated: false,
         });
         let sink = Arc::new(CapturingSink::default());
         let guard = SettleGuard::new(
@@ -433,6 +517,7 @@ mod tests {
             String::new(),
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(KeyStats::default()),
         );
         guard.complete();
 
@@ -469,6 +554,7 @@ mod tests {
                 String::new(),
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(KeyStats::default()),
             );
             // dropped here without complete()
         }
@@ -479,5 +565,213 @@ mod tests {
             .clone()
             .expect("a record was settled");
         assert_eq!(rec.tool_calls, None);
+    }
+
+    // -- settle_amount: the three-way basis, isolated from the guard -------
+    //
+    // These four cover `CostBasis` directly, by name. The `SettleGuard`-level
+    // tests below cover the same three settle-time cases end-to-end (the
+    // ledger charge and the truncation counter), since `basis` itself is
+    // in-process only and not part of the settled `CallRecord` (see the PR
+    // body for why no Parquet column was added).
+
+    #[test]
+    fn settle_amount_prices_real_usage_as_parsed() {
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
+        let parsed = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        assert_eq!(actual, Microusd::from_usd(3.0));
+        assert_eq!(usage.input_tokens, 1_000_000);
+        assert_eq!(basis, CostBasis::Parsed);
+    }
+
+    #[test]
+    fn settle_amount_falls_back_to_the_estimate_when_the_body_carried_no_usage() {
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
+        let parsed = Some(ParsedUsage {
+            usage: Usage::default(),
+            truncated: false,
+        });
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        assert_eq!(
+            actual,
+            Microusd::from_usd(1.0),
+            "nothing to price, but the cap was never hit"
+        );
+        assert_eq!(usage, Usage::default());
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+    }
+
+    /// The case this whole fix is about: partial usage DID survive the cut,
+    /// and trusting it is exactly the defect. 500k input tokens would price
+    /// at $1.50 - that must not be what comes out.
+    #[test]
+    fn settle_amount_falls_back_to_the_estimate_when_truncated_even_with_partial_usage() {
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
+        let parsed = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 500_000,
+                ..Default::default()
+            },
+            truncated: true,
+        });
+        let estimate = Microusd::from_usd(1.0);
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate);
+        assert_eq!(
+            actual, estimate,
+            "a truncated body's partial usage must never be priced, even though it parsed"
+        );
+        assert_eq!(
+            usage.input_tokens, 500_000,
+            "still recorded on the CallRecord, just not charged"
+        );
+        assert_eq!(basis, CostBasis::EstimateTruncated);
+    }
+
+    #[test]
+    fn settle_amount_on_no_slot_write_at_all_is_estimate_no_usage() {
+        // The cancel/drop path: nothing was ever written to the slot.
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
+        let (actual, usage, basis) = settle_amount(&prices, "m", None, Microusd::from_usd(1.0));
+        assert_eq!(actual, Microusd::from_usd(1.0));
+        assert_eq!(usage, Usage::default());
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+    }
+
+    // -- SettleGuard end-to-end: the truncation fallback and its counter ---
+
+    /// RED-FIRST at the guard level (see `provider.rs` for the parser-level
+    /// red-first): before this fix, `SettleGuard` had no way to be told a
+    /// result was truncated at all, so a partial 500k-input-token parse would
+    /// have settled at $1.50 - real money computed from data the cap had
+    /// already cut off.
+    #[test]
+    fn a_truncated_result_settles_on_the_estimate_and_counts_it() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 500_000,
+                ..Default::default()
+            },
+            truncated: true,
+        });
+        let keystats = Arc::new(KeyStats::default());
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            prices,
+            Arc::new(crate::sink::NullSink),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            false, // a 200 stream: the estimate is a legitimate fallback
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
+            keystats.clone(),
+        );
+        guard.complete();
+
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(
+            snap.spent,
+            Microusd::from_usd(1.0),
+            "the estimate, not the $1.50 the untrusted partial usage would have priced"
+        );
+        assert_eq!(keystats.snapshot().truncated_settlements.settlements, 1);
+    }
+
+    #[test]
+    fn a_parsed_result_under_the_cap_does_not_touch_the_truncation_counter() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        let keystats = Arc::new(KeyStats::default());
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            prices,
+            Arc::new(crate::sink::NullSink),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            false,
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
+            keystats.clone(),
+        );
+        guard.complete();
+
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(
+            snap.spent,
+            Microusd::from_usd(3.0),
+            "priced from the real usage, not the estimate"
+        );
+        assert_eq!(keystats.snapshot().truncated_settlements.settlements, 0);
+    }
+
+    #[test]
+    fn a_body_under_the_cap_with_no_usage_settles_the_estimate_without_counting_as_truncated() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage::default(),
+            truncated: false,
+        });
+        let keystats = Arc::new(KeyStats::default());
+        let guard = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            prices,
+            Arc::new(crate::sink::NullSink),
+            "m".into(),
+            usage,
+            Microusd::from_usd(1.0),
+            false,
+            reservation,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(UnitLedger::default()),
+            None,
+            keystats.clone(),
+        );
+        guard.complete();
+
+        let snap = ledger.snapshot("r").unwrap();
+        assert_eq!(
+            snap.spent,
+            Microusd::from_usd(1.0),
+            "the estimate: the body genuinely carried nothing to price"
+        );
+        assert_eq!(
+            keystats.snapshot().truncated_settlements.settlements,
+            0,
+            "not the cap's doing, so it must not count as a truncated settlement"
+        );
     }
 }

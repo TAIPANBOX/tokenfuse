@@ -19,7 +19,9 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Ledger, Mode, ModelPrice, Policy, PriceBook};
-use tokenfuse_gateway::provider::{Provider, ProviderError, ProviderResponse, UsageSlot};
+use tokenfuse_gateway::provider::{
+    ParsedUsage, Provider, ProviderError, ProviderResponse, UsageSlot,
+};
 use tokenfuse_gateway::state::AppState;
 use tower::ServiceExt;
 
@@ -46,7 +48,10 @@ impl Provider for CountingProvider {
             output_tokens: 10,
             ..Default::default()
         };
-        let slot: UsageSlot = Arc::new(Mutex::new(Some(usage)));
+        let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
+            usage,
+            truncated: false,
+        })));
         let chunk = Bytes::from_static(br#"{"stub":true}"#);
         let stream = futures::stream::once(async move { Ok(chunk) });
         Ok(ProviderResponse {
