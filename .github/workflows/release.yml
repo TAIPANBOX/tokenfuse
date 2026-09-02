@@ -31,6 +31,17 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # The binaries job runs on a pull request that changes THIS file, and
+  # nothing else does: the two image jobs and the release page stay off (see
+  # their `if`), so a pull request builds the four binaries and publishes
+  # nothing. Added 2026-09-02 after the first tag that ever exercised the musl
+  # step, v0.4.2, failed on both Linux runners with "Unable to locate package
+  # musl-tools": the step had been copied from ci.yml without the
+  # `apt-get update --snapshot` line, and no run before a tag could have shown
+  # it. A workflow that only runs on a tag is tested by the tag, which is the
+  # one moment nothing may fail.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
 
 env:
   # The same archive snapshot ci.yml pins, for the same reason: an unpinned
@@ -99,7 +110,21 @@ jobs:
       - name: musl linker
         if: endsWith(matrix.target, '-linux-musl')
         run: |
-          sudo apt-get update
+          # The snapshot service is served from archive.ubuntu.com; the runner
+          # ships pointing at the azure mirror, which does not serve snapshots.
+          # Same loop as ci.yml, `if` rather than `[ -f ] &&` for the same
+          # reason it gives.
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+                   /etc/apt/sources.list.d/*.list; do
+            if [ -f "$f" ]; then
+              sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"
+            fi
+          done
+          # Both halves carry --snapshot. The install alone did until
+          # 2026-09-02, so apt looked for musl-tools in package lists it had
+          # never fetched and answered "Unable to locate package" on every
+          # Linux runner of the first tag that ran this job (v0.4.2).
+          sudo apt-get update --snapshot "$APT_SNAPSHOT"
           # --snapshot, like bench.yml and ci.yml: unpinned, this resolves to
           # whatever is newest when the job runs, so the commit that passes
           # today is the commit that fails tomorrow. pinned-installs.sh refuses
@@ -228,6 +253,9 @@ jobs:
   # somebody else's arm64 node would then pull and fail on.
   build:
     name: ${{ matrix.name }} on ${{ matrix.arch }}
+    # Never on a pull request: this job pushes by digest, and the merge job
+    # below would tag the result by sha, so a pull request would publish.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -355,6 +383,7 @@ jobs:
   merge:
     name: merge ${{ matrix.name }}
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
