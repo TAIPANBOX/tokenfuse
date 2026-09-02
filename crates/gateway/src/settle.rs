@@ -37,7 +37,9 @@ pub(crate) enum CostBasis {
     /// before the usage block arrived - settled on the estimate because
     /// whatever partial usage survived the cut cannot be trusted (a
     /// cumulative field, like Anthropic's `output_tokens`, can look real and
-    /// still be short).
+    /// still be short). The `Usage` returned alongside this is always
+    /// [`Usage::default`], never the partial numbers that were parsed - see
+    /// `settle_amount`'s doc for why.
     EstimateTruncated,
 }
 
@@ -50,6 +52,19 @@ pub(crate) enum CostBasis {
 /// Returns the amount to charge, the usage to record on the `CallRecord`
 /// (defaulted when nothing was parsed, same as before this function existed),
 /// and the basis the amount rests on.
+///
+/// **Truncated always records `Usage::default()`, never the partial usage
+/// that was parsed.** `focusexport::to_row` infers a row's FOCUS
+/// `x_cost_basis` from its shape alone - zero tokens beside a nonzero cost
+/// reads as `"estimated"`, everything else as `"settled"` (see that module's
+/// doc). A truncated body that kept its partial, untrusted token counts would
+/// carry real-looking nonzero tokens beside the estimated cost, which is
+/// exactly the `"settled"` shape: the FOCUS export, and CostCrew reading it,
+/// would call an estimated call settled. Reporting the same all-zero shape a
+/// body with no usage at all gets is what keeps that export honest, at the
+/// cost of also losing whatever partial counts a truncated body happened to
+/// carry - a real loss, but the alternative is a wrong label on a downstream
+/// billing export, which is worse.
 pub(crate) fn settle_amount(
     prices: &PriceBook,
     model: &str,
@@ -59,9 +74,10 @@ pub(crate) fn settle_amount(
     let truncated = parsed.as_ref().is_some_and(|p| p.truncated);
     let usage = parsed.map(|p| p.usage).unwrap_or_default();
     if truncated {
-        // Never priced, no matter what partial numbers survived the cut -
-        // see `CostBasis::EstimateTruncated`'s doc.
-        return (unmeasured, usage, CostBasis::EstimateTruncated);
+        // Never priced, no matter what partial numbers survived the cut, and
+        // never RECORDED either - see this function's doc and
+        // `CostBasis::EstimateTruncated`'s.
+        return (unmeasured, Usage::default(), CostBasis::EstimateTruncated);
     }
     match prices.cost(model, &usage) {
         Some(cost) if usage != Usage::default() => (cost, usage, CostBasis::Parsed),
@@ -193,12 +209,17 @@ impl SettleGuard {
         };
         let (actual, usage, basis) = settle_amount(&self.prices, &self.model, parsed, unmeasured);
         if basis == CostBasis::EstimateTruncated {
+            // `settled_microusd` is named, not assumed nonzero: a refused
+            // call whose error body also overran the cap settles zero here,
+            // same as any other refusal, and the log line must not read as
+            // though an estimate was charged when nothing was.
             tracing::warn!(
                 model = %self.model,
                 buffered_bytes = crate::provider::UsageParser::CAP,
-                "settling on the pre-flight estimate: the usage-parser cap was hit \
-                 before the response's usage block arrived, so the parsed usage \
-                 cannot be trusted"
+                settled_microusd = actual.0,
+                "usage-parser cap hit before the response's usage block arrived; \
+                 the parsed usage cannot be trusted, so this settled on the \
+                 fallback amount above instead"
             );
             self.keystats.record_truncated_settlement();
         }
@@ -628,8 +649,12 @@ mod tests {
             "a truncated body's partial usage must never be priced, even though it parsed"
         );
         assert_eq!(
-            usage.input_tokens, 500_000,
-            "still recorded on the CallRecord, just not charged"
+            usage,
+            Usage::default(),
+            "not recorded either, even though it parsed: focusexport::to_row reads \
+             zero tokens beside a nonzero cost as \"estimated\" and anything else as \
+             \"settled\", so a real-looking partial token count here would mislabel \
+             this row as settled in the FOCUS export"
         );
         assert_eq!(basis, CostBasis::EstimateTruncated);
     }
@@ -662,10 +687,11 @@ mod tests {
             truncated: true,
         });
         let keystats = Arc::new(KeyStats::default());
+        let sink = Arc::new(CapturingSink::default());
         let guard = SettleGuard::new(
             Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
             prices,
-            Arc::new(crate::sink::NullSink),
+            sink.clone(),
             "m".into(),
             usage,
             Microusd::from_usd(1.0),
@@ -690,6 +716,25 @@ mod tests {
             "the estimate, not the $1.50 the untrusted partial usage would have priced"
         );
         assert_eq!(keystats.snapshot().truncated_settlements.settlements, 1);
+
+        // The CallRecord side of the same fix: focusexport::to_row reads
+        // "zero tokens + nonzero cost" as x_cost_basis "estimated" and
+        // anything else as "settled" (see its module doc). The 500k partial
+        // input tokens parsed above must NOT reach the record, or a
+        // downstream FOCUS reader (CostCrew) would call this settled money
+        // rather than the estimate it actually is.
+        let rec = sink
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a record was settled");
+        assert_eq!(
+            (rec.input_tokens, rec.output_tokens),
+            (0, 0),
+            "the parsed partial usage must not reach the trace, or the FOCUS \
+             export would read this row's shape as settled instead of estimated"
+        );
     }
 
     #[test]

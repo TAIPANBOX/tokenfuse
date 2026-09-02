@@ -2204,6 +2204,27 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     cannot coincide by construction in the test fixtures, which price the
     partial usage at $1.50 against a $1.00 estimate, so a mutant that treats
     truncated as parsed moves a real number, not just a label.
+
+    **Not recording the column is not the same as not recording the shape,
+    and the first version of this fix confused the two.** Review on the same
+    PR read `focusexport::to_row` (that module's own doc, "Cost basis and
+    `x_blocked`"): it infers a row's FOCUS `x_cost_basis` from the CallRecord
+    it already has, not from anything new - zero tokens beside a nonzero cost
+    reads `"estimated"`, everything else reads `"settled"`. The first version
+    of `settle_amount` priced a truncated body on the estimate correctly but
+    still returned the PARTIAL parsed usage for the record, so a truncated
+    call with real-looking nonzero tokens beside its estimated cost was the
+    exact `"settled"` shape - the FOCUS export, and CostCrew reading it, would
+    have called an estimated call settled. `settle_amount` now returns
+    `Usage::default()` whenever `truncated`, the same all-zero shape a body
+    with no usage at all gets, which is a real loss (whatever partial counts
+    survived the cut are gone from the record, not only unpriced) traded for
+    not lying to a downstream billing export. The `tracing::warn!` was fixed
+    alongside it for a related reason: it named "the pre-flight estimate" as
+    if charging one were certain, but a refused call whose error body also
+    overran the cap settles zero, same as any refusal, so the log line now
+    names the actual `settled_microusd` charged instead of asserting which
+    case it was.
     *(test: `crates/gateway/src/provider.rs`:
     `a_body_whose_usage_block_lands_after_the_cap_is_reported_truncated` (red
     against the unfixed `feed`, verbatim "a body cut at the cap must say so,
@@ -2220,16 +2241,23 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `crates/gateway/src/keystats.rs`: `truncated_settlement_counter_is_aggregate_only`,
     `truncated_settlement_counter_is_independent_of_unauthorized`.
     `crates/gateway/src/keysreport.rs`:
-    `truncated_settlements_since_startup_reflects_keystats`. Three mutants
+    `truncated_settlements_since_startup_reflects_keystats`. Four mutants
     planted in the product code 2026-09-02, each caught: the two
     `truncated = true` assignments deleted from `feed` (caught by the first
     and fourth `provider.rs` tests above); `settle_amount`'s truncated
-    short-circuit deleted, so a truncated result is priced like a parsed one
-    (caught by `settle_amount_falls_back_to_the_estimate_when_truncated_even_with_partial_usage`
+    short-circuit deleted entirely, so a truncated result is priced AND
+    recorded like a parsed one (caught by
+    `settle_amount_falls_back_to_the_estimate_when_truncated_even_with_partial_usage`
     and `a_truncated_result_settles_on_the_estimate_and_counts_it`, both on the
-    real $1.00-vs-$1.50 figures); the counter's two increments deleted from
-    `KeyStats::record_truncated_settlement` (caught by three tests across two
-    files). No `features/*.feature` scenario: `scripts/features-are-bound.sh`
-    checks that existing scenarios stay bound, it does not require a new one
-    per change, and inventing a Given/When/Then not spoken by the user is the
-    failure the Gherkin layer exists to avoid.)*
+    real $1.00-vs-$1.50 figures); the short-circuit's `Usage::default()`
+    reverted to the partial `usage` alone, pricing still correct but the
+    focusexport regression back (caught by the same two tests, now on the
+    zero-vs-500000-token figures); the counter's two increments deleted from
+    `KeyStats::record_truncated_settlement` (caught by four tests across three
+    files: both in `keystats.rs`, `a_truncated_result_settles_on_the_estimate_and_counts_it`
+    in `settle.rs`, `truncated_settlements_since_startup_reflects_keystats` in
+    `keysreport.rs`). No `features/*.feature` scenario:
+    `scripts/features-are-bound.sh` checks that existing scenarios stay bound,
+    it does not require a new one per change, and inventing a Given/When/Then
+    not spoken by the user is the failure the Gherkin layer exists to
+    avoid.)*

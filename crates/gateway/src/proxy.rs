@@ -1983,12 +1983,17 @@ async fn buffered_managed(
     };
     let (actual, parsed_usage, basis) = settle_amount(&st.prices, model, parsed, unmeasured);
     if basis == CostBasis::EstimateTruncated {
+        // `settled_microusd` is named, not assumed nonzero: a refused call
+        // whose error body also overran the cap settles zero here, same as
+        // any other refusal, and the log line must not read as though an
+        // estimate was charged when nothing was.
         tracing::warn!(
             model = %model,
             buffered_bytes = UsageParser::CAP,
-            "settling on the pre-flight estimate: the usage-parser cap was hit \
-             before the response's usage block arrived, so the parsed usage \
-             cannot be trusted"
+            settled_microusd = actual.0,
+            "usage-parser cap hit before the response's usage block arrived; \
+             the parsed usage cannot be trusted, so this settled on the \
+             fallback amount above instead"
         );
         st.keystats.record_truncated_settlement();
     }
