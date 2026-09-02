@@ -16,6 +16,25 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // `--version`/`-V` and `--help`/`-h` answer before anything else,
+    // including the TOKENFUSE_UPSTREAM precondition `serve()` enforces below
+    // (plan item A12): a downloaded binary should be able to say what it is
+    // with no provider configured at all. `std::env::args()` is read again,
+    // independently, by the subcommand match right after - each call returns
+    // a fresh iterator over the process's own argv, not a stream either read
+    // consumes, so re-reading it here costs nothing and touches nothing below.
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") | Some("-V") => {
+            print_version();
+            std::process::exit(0);
+        }
+        Some("--help") | Some("-h") => {
+            print_help();
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         // `tokenfuse top` launches the live TUI.
@@ -254,6 +273,70 @@ async fn main() {
         // Anything else starts the gateway.
         _ => serve().await,
     }
+}
+
+/// `tokenfuse --version` / `-V`: one line, `tokenfuse <version> (<sha>)`, then
+/// the caller exits 0 (plan item A12).
+///
+/// Both figures are stamped at build time by `.github/workflows/release.yml`
+/// (`TOKENFUSE_VERSION=$GITHUB_REF_NAME`, `TOKENFUSE_GIT_SHA=${GITHUB_SHA::7}`)
+/// via `option_env!`, which reads whatever the COMPILER's environment held,
+/// not the environment the binary later runs in - a released binary carries
+/// its own answer regardless of who launches it or how.
+///
+/// A `cargo build`/`cargo run` with neither variable set (any developer
+/// checkout, and this crate's own test binary) falls back honestly rather
+/// than fabricating a release number: `crates/gateway/Cargo.toml`'s
+/// `[package] version` is `0.0.1` on every tag (workspace crates are not
+/// bumped per release), so printing `CARGO_PKG_VERSION` bare would read as a
+/// real 0.0.1 build rather than "not stamped". The sha fallback names the
+/// same fact in the other field: `dev`, not a guessed or empty value.
+fn print_version() {
+    let version =
+        option_env!("TOKENFUSE_VERSION").unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-dev"));
+    let sha = option_env!("TOKENFUSE_GIT_SHA").unwrap_or("dev");
+    println!("tokenfuse {version} ({sha})");
+}
+
+/// `tokenfuse --help` / `-h`: every subcommand this binary answers to, one
+/// line each, plus the two variables that decide whether a plain `tokenfuse`
+/// with none of them actually starts (plan item A12; see `serve`'s
+/// `TOKENFUSE_UPSTREAM` precondition above).
+///
+/// One line per subcommand rather than each subcommand's own usage string -
+/// `mcp-scan`'s alone runs to five lines above, and repeating it here would
+/// drift from it the next time only one copy is edited. This is "what can I
+/// run", not the full flag reference each subcommand already prints on
+/// misuse (`tokenfuse mcp-scan` with no arguments, for instance).
+fn print_help() {
+    println!(
+        "tokenfuse - budget-enforcing proxy between agents and LLM providers\n\
+         \n\
+         Usage: tokenfuse [COMMAND]\n\
+         \n\
+         With no command, starts the gateway server.\n\
+         \n\
+         Commands:\n\
+         \x20 top           launch the live TUI\n\
+         \x20 sql           query the Parquet trace\n\
+         \x20 backtest      replay a candidate policy over the Parquet trace\n\
+         \x20 savings       sum the avoided spend recorded at budget-protection blocks\n\
+         \x20 compliance    project the control catalog into an auditor-ready evidence pack\n\
+         \x20 mcp-scan      scan an MCP tool listing, or a live server, for poisoning\n\
+         \x20 focus-export  export the Parquet trace as a FOCUS 1.2 CSV\n\
+         \x20 firewall      report what the agent firewall did over a run\n\
+         \x20 outcomes      unit economics per X-Fuse-Outcome tag\n\
+         \x20 constants     print the published stack constants\n\
+         \x20 mcp-broker    run the MCP credential-broker proxy\n\
+         \n\
+         Environment (to start the gateway server):\n\
+         \x20 TOKENFUSE_UPSTREAM    full provider endpoint, e.g. https://api.anthropic.com/v1/messages\n\
+         \x20 TOKENFUSE_ALLOW_STUB  1 to run offline against a built-in stub instead (invented numbers)\n\
+         \x20 TOKENFUSE_ADDR        bind address (default 127.0.0.1:4100)\n\
+         \n\
+         --version, -V   print the version and exit\n\
+         --help, -h      print this help and exit"
+    );
 }
 
 /// Run the MCP credential-broker: an agent points its MCP client here; the broker

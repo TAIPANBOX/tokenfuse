@@ -2304,3 +2304,55 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     tick, so the periodic path cannot be what wrote the file - and the segment
     was on disk and readable by `tokenfuse sql` after the process exited, its
     whole lifecycle 58ms start to exit.)*
+
+40. **A binary that cannot say what it is has to be run to find out.** Plan item
+    A12, measured on the v0.4.3 download: `tokenfuse --version` and `tokenfuse
+    --help` both printed the `TOKENFUSE_UPSTREAM` refusal and exited 2, because
+    neither flag was a subcommand `main.rs`'s dispatch recognised, so both fell
+    through to `_ => serve().await`, which is the one place this binary reads
+    that variable at all.
+
+    Both are now answered before the dispatch match even runs, so they cannot
+    reach the precondition. `--version`/`-V` prints one line,
+    `tokenfuse <version> (<sha>)`; `--help`/`-h` prints every real subcommand,
+    read off `main.rs`'s own match arms rather than retyped from memory, plus
+    the two variables that decide whether a plain start actually starts. A
+    plain start with neither flag is untouched: it reaches the same
+    precondition on the same message it always has.
+
+    **The version and sha are stamped at compile time, and an unstamped build
+    says so rather than guessing.** `option_env!("TOKENFUSE_VERSION")` /
+    `option_env!("TOKENFUSE_GIT_SHA")` read whatever the COMPILER's own
+    environment held; `.github/workflows/release.yml` sets both
+    (`TOKENFUSE_VERSION=$GITHUB_REF_NAME`, `TOKENFUSE_GIT_SHA=${GITHUB_SHA::7}`)
+    and the Dockerfile takes them as build args, verified separately: an ARG
+    declared before a `RUN` is a real environment variable to that RUN's shell
+    AND its children, `cargo`/`rustc` included, with no `export` needed. A
+    plain `cargo build` (every developer checkout, and this crate's own test
+    binary) has neither set, and `crates/gateway/Cargo.toml`'s workspace
+    `[package] version` is `0.0.1` on every tag, so falling back to a bare
+    `CARGO_PKG_VERSION` would print a real-looking release number for a build
+    that is not one. The fallback is `-dev`/`dev` instead, which is what
+    invariant 4 already asks documentation to do: state a limitation rather
+    than bury it.
+
+    Both new names are declared in `components.json`
+    (`every_environment_variable_this_repository_reads_is_declared_and_the_reverse`,
+    `tests/manifest.rs`) even though neither is read by the running PROCESS
+    the way every other entry there is - `option_env!` is a compiler-time
+    substitution, not a `std::env::var` call - because that gate scans
+    non-test source for the literal `TOKENFUSE_` text and does not
+    distinguish the two, and a name it finds undeclared fails it regardless of
+    which kind of read introduced it.
+    *(test: `crates/gateway/tests/version_and_help.rs`, six, run against the
+    real built binary with `TOKENFUSE_UPSTREAM`/`TOKENFUSE_ALLOW_STUB`
+    explicitly removed from its environment, so a pass means "answered before
+    the precondition check" and not "happened to pass it";
+    `version_prints_one_line_and_exits_0` is the one run red against the
+    unfixed binary first, verbatim exit `Some(2)` where `Some(0)` was
+    asserted, stderr the `TOKENFUSE_UPSTREAM` refusal in full;
+    `a_plain_start_with_no_upstream_still_refuses_exactly_as_before` pins the
+    unmoved regression case and was already green before this change existed.
+    Four in `tests/manifest.rs`, of which
+    `every_declared_subcommand_is_one_the_binary_dispatches_on` is the guard
+    against `--help`'s list drifting from what `main.rs` actually runs.)*

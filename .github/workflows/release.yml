@@ -138,9 +138,17 @@ jobs:
       # Default features on purpose: `wasm` and the fastembed leg are opt-in,
       # and a downloadable binary should be the thing the documentation
       # describes rather than a maximal build nobody asked for.
+      # TOKENFUSE_VERSION/TOKENFUSE_GIT_SHA are read by `option_env!` at
+      # compile time (`crates/gateway/src/main.rs::print_version`, plan item
+      # A12), so they have to be in THIS shell's environment when `cargo
+      # build` runs, not merely available to the workflow. `GITHUB_REF_NAME`
+      # and `GITHUB_SHA` are supplied by the runner already; a tag push names
+      # the ref `vX.Y.Z`, which is the exact string `--version` should print.
       - name: build
         shell: bash
         run: |
+          export TOKENFUSE_VERSION="$GITHUB_REF_NAME"
+          export TOKENFUSE_GIT_SHA="${GITHUB_SHA::7}"
           cargo build --release --locked --target ${{ matrix.target }} \
             --bin tokenfuse --bin tokenfuse-cloud
 

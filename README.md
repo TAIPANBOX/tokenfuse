@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1127-brightgreen)
+![tests](https://img.shields.io/badge/tests-1133-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -392,6 +392,8 @@ git clone https://github.com/TAIPANBOX/tokenfuse.git
 cd tokenfuse
 TOKENFUSE_ALLOW_STUB=1 cargo run -p tokenfuse-gateway   # gateway on http://localhost:4100
 ```
+
+Or skip the build: grab a prebuilt binary from the [Releases page](https://github.com/TAIPANBOX/tokenfuse/releases) and run `tokenfuse --version` to confirm which one you downloaded, with no provider configured and nothing else set up.
 </details>
 
 ### Step 2. Point it at your real LLM provider
