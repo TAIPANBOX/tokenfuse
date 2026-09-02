@@ -19,7 +19,7 @@ use tokenfuse_core::Usage;
 /// `truncated = true` means `usage` may be missing fields that would have
 /// arrived after the cut: Anthropic's cumulative `output_tokens` lands in the
 /// FINAL `message_delta`, so a response over [`UsageParser::CAP`] can carry a
-/// real-looking but silently short `usage` — or none at all, when the whole
+/// real-looking but silently short `usage`, or none at all, when the whole
 /// usage block landed past the cut. Callers must not price `usage` when
 /// `truncated` is set; see `crate::settle::settle_amount`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
