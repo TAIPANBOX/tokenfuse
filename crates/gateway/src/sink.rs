@@ -397,6 +397,32 @@ impl Drop for ParquetSink {
     }
 }
 
+/// Spawns a background task that calls [`ParquetSink::flush`] on `interval`,
+/// for the life of the process (or until the runtime shuts down).
+///
+/// Without this, a local trace only reaches disk at the buffering threshold
+/// (`ParquetSink::new`'s `threshold`, 256 in `main.rs`) or when the sink is
+/// dropped at process exit - so an operator who sets `TOKENFUSE_DATA_DIR`,
+/// makes a handful of calls, and looks in the directory before either of
+/// those finds it empty. Mirrors the periodic flush `main.rs` already spawns
+/// for `crate::cloudsink::CloudSink`, on the same two-second tick, so the two
+/// sinks a deployment might run side by side settle to disk on comparable
+/// cadences.
+///
+/// A tick that finds nothing buffered writes no file: `flush()` calls
+/// [`ParquetSink::write_batch`], which returns immediately on an empty slice,
+/// before the segment path is built or the sequence counter advances - so an
+/// idle interval never multiplies empty segment files on disk.
+pub fn spawn_periodic_flush(sink: Arc<ParquetSink>, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            sink.flush();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +590,74 @@ mod tests {
                 ("r-some".to_string(), Some(3)),
                 ("r-zero".to_string(), Some(0)),
             ]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn parquet_segment_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// RED-FIRST (plan item A9): before `spawn_periodic_flush` existed, a
+    /// local `ParquetSink` only reached disk at its 256-record threshold or
+    /// when dropped - a handful of calls followed by SIGTERM or an operator
+    /// just looking sat in memory forever. This drives the SAME two-second
+    /// tick `main.rs` wires in production and asserts a segment lands with
+    /// neither a full buffer nor a shutdown.
+    #[tokio::test]
+    async fn a_periodic_flush_reaches_disk_without_shutdown_or_a_full_buffer() {
+        let dir = std::env::temp_dir().join(format!("tf-periodic-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = Arc::new(ParquetSink::new(&dir, 256).unwrap());
+        spawn_periodic_flush(sink.clone(), std::time::Duration::from_secs(2));
+
+        sink.record(rec("r", 100));
+        assert_eq!(
+            parquet_segment_count(&dir),
+            0,
+            "one record under the 256 threshold must not have flushed yet"
+        );
+
+        // One tick of the real 2-second production interval, plus margin.
+        tokio::time::sleep(std::time::Duration::from_millis(2_600)).await;
+
+        assert_eq!(
+            parquet_segment_count(&dir),
+            1,
+            "the periodic flush should have put exactly one segment on disk, \
+             with no shutdown and no full buffer"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same fix, named explicitly rather than only
+    /// read off `write_batch`'s early return: a tick that finds the buffer
+    /// empty must write no file, or an idle sink would grow one empty
+    /// segment per interval for as long as the process runs.
+    #[tokio::test]
+    async fn a_periodic_flush_of_an_empty_buffer_writes_no_segment() {
+        let dir =
+            std::env::temp_dir().join(format!("tf-periodic-flush-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = Arc::new(ParquetSink::new(&dir, 256).unwrap());
+        spawn_periodic_flush(sink, std::time::Duration::from_millis(30));
+
+        // Several ticks over an empty buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            parquet_segment_count(&dir),
+            0,
+            "an idle sink must not accumulate empty segment files"
         );
 
         std::fs::remove_dir_all(&dir).ok();

@@ -2261,3 +2261,46 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     it does not require a new one per change, and inventing a Given/When/Then
     not spoken by the user is the failure the Gherkin layer exists to
     avoid.)*
+
+39. **A trace that only reaches disk at a threshold or on exit is a trace an
+    operator making a handful of calls cannot see.** Measured on the v0.4.1
+    image, plan item A9: with `TOKENFUSE_DATA_DIR` set and five calls made,
+    the directory stayed empty until the gateway got SIGINT; `docker stop`
+    (SIGTERM) did not flush it either. `ParquetSink::new(&dir, 256)` writes a
+    segment at 256 buffered records or on `Drop`, and neither is a promise an
+    operator watching a live directory can rely on: 256 calls is a lot of
+    silence for a ten-call trial, and `shutdown_signal()` awaited `ctrl_c()`
+    only, so the ONE path that did flush (SIGINT, via `Drop`) was not the one
+    a container's normal stop actually sends.
+
+    Two independent fixes, because they were two independent gaps.
+    `sink::spawn_periodic_flush` ticks `ParquetSink::flush` every two
+    seconds, the same cadence `main.rs` already used for `CloudSink` (the
+    pattern this mirrors rather than invents); it is wired only when
+    `TOKENFUSE_DATA_DIR` is set, same as the sink itself. `shutdown_signal()`
+    now selects `ctrl_c()` together with `SIGTERM` on Unix
+    (`tokio::signal::unix::signal(SignalKind::terminate())`), with a
+    `#[cfg(not(unix))]` arm that never resolves so non-Unix builds keep
+    compiling and keep their old ctrl_c-only behaviour. SIGTERM needed no new
+    flush logic of its own: axum's graceful shutdown drops the serve future's
+    captured state on either signal, so `ParquetSink::drop`'s existing flush
+    already ran on SIGTERM once the future was actually told to stop for it.
+
+    **An idle tick must write nothing, or the fix would trade "too rare" for
+    "too many empty files".** `ParquetSink::write_batch` already returned
+    early on an empty slice, before the segment path is built or the sequence
+    counter advances - true before this change and unchanged by it, and
+    tested here by name rather than left to be re-derived from reading
+    `write_batch`.
+    *(test: `a_periodic_flush_reaches_disk_without_shutdown_or_a_full_buffer`,
+    verified red against a periodic-flush task with the `flush()` call
+    deleted, verbatim `left: 0 right: 1`; and
+    `a_periodic_flush_of_an_empty_buffer_writes_no_segment` for the other
+    half, both in `gateway::sink`. SIGTERM has no clean unit-test path in this
+    workspace (no signal-sending dependency here, and adding one for one test
+    is the escalation this repository avoids), so it was verified with a real
+    build instead: `TOKENFUSE_DATA_DIR` + `TOKENFUSE_ALLOW_STUB=1`, one call
+    with `x-fuse-run-id`, `SIGTERM` sent 26ms later - well under the two-second
+    tick, so the periodic path cannot be what wrote the file - and the segment
+    was on disk and readable by `tokenfuse sql` after the process exited, its
+    whole lifecycle 58ms start to exit.)*
