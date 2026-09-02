@@ -18,12 +18,28 @@
 # the raft HA stack (the `:cluster` image tag); onnx/wasm are also opt-in.
 #
 #   docker build --build-arg FEATURES=cluster -t tokenfuse:cluster .
+#
+# TOKENFUSE_VERSION/TOKENFUSE_GIT_SHA are optional build args that stamp
+# `tokenfuse --version`'s output (release.yml sets both on the published
+# binaries; a plain `docker build` with neither reads honestly as a dev
+# build, not a fabricated release):
+#
+#   docker build --build-arg TOKENFUSE_VERSION=v0.4.4 --build-arg TOKENFUSE_GIT_SHA=abc1234 -t tokenfuse .
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 ARG FEATURES=""
+# Read by `option_env!` at compile time (`main.rs::print_version`, plan item
+# A12), so `tokenfuse --version` on an image built with neither ARG set
+# honestly reads as a dev build rather than a bare 0.0.1 (the crate's own
+# unbumped `[package] version`) - same fallback as the release binaries.
+# Docker exposes an ARG as a real environment variable to this RUN's shell
+# and its children (verified: `cargo`/`rustc` see it with no explicit
+# `export`), so passing --build-arg is enough.
+ARG TOKENFUSE_VERSION=""
+ARG TOKENFUSE_GIT_SHA=""
 RUN if [ -n "$FEATURES" ]; then \
         cargo build --release -p tokenfuse-gateway --features "$FEATURES"; \
     else \

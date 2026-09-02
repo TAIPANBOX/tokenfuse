@@ -127,6 +127,10 @@
           "TOKENFUSE_FIREWALL_CONFIG": {
             "required": false
           },
+          "TOKENFUSE_GIT_SHA": {
+            "required": false,
+            "default": "dev"
+          },
           "TOKENFUSE_IDENTITY_MAP": {
             "required": false
           },
@@ -226,6 +230,10 @@
           },
           "TOKENFUSE_URL": {
             "required": false
+          },
+          "TOKENFUSE_VERSION": {
+            "required": false,
+            "default": "<CARGO_PKG_VERSION>-dev"
           },
           "TOKENFUSE_WARDRYX_CACHE_TTL_MS": {
             "required": false
