@@ -202,7 +202,13 @@ jobs:
     name: security (cargo audit)
     runs-on: ubuntu-24.04
     steps:
+      # fetch-depth: 0 here too: this job runs gates-have-teeth.sh, whose
+      # stated-numbers cases call the version-badge check, and a checkout
+      # with no tags makes that check refuse on a clean tree, so every one
+      # of those cases would read UNJUDGEABLE rather than judging the fault.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
