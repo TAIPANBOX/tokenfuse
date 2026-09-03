@@ -17,7 +17,13 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-24.04
     steps:
+      # fetch-depth: 0 pulls tags along with full history. Without it,
+      # actions/checkout fetches no tags at all, and stated-numbers.sh's
+      # version-badge check (below) would see no v* tag and correctly refuse
+      # with "measured nothing" rather than silently passing.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Free runner disk
         # This job builds three full profiles (clippy --all-features, debug
         # tests, and the cluster-feature test graph); with a warm cache the

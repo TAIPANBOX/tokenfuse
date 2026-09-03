@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Every number this repository's front matter states about this repository,
-# checked against the repository. Two files state one today: README.md's tests
-# badge and PROGRESS.md's Test status section.
+# checked against the repository. README.md states two: the tests badge and
+# the release-version badge; PROGRESS.md states one, in its Test status
+# section.
 #
 # WHY THIS EXISTS
 #
@@ -88,6 +89,38 @@ fi
 
 [ "$stated" = "$actual" ] ||
 	note "the badge says $stated tests and \`cargo test --all\` runs $actual"
+
+# --- README.md: the version badge -----------------------------------------
+#
+# The badge names a release; "the newest tag" is the only definition of a
+# release this repository can check without asking a human. A badge that
+# lags the tag for a few minutes after a release is cut is expected, not a
+# defect: this takes the same stance as this org's estate-gates C1
+# invariant, that a stated figure is right the day it is written and stays
+# right only as long as somebody keeps bumping it by hand afterward. What
+# this catches is a badge that stayed behind for good, not the gap between
+# cutting a tag and updating README.md in the same commit.
+
+newest_tag=$(git tag --list 'v*' | sort -V | tail -1)
+
+if [ -z "$newest_tag" ]; then
+	note "no v* tag is reachable in this checkout (a shallow clone, or a checkout fetched with no tags, looks exactly like this), so this check measured nothing about the version badge rather than reporting it as fine"
+	note "fetch tags before trusting this result: git fetch --tags --force"
+	exit 1
+fi
+
+stated_version=$(grep -oE 'badge/release-v[0-9]+\.[0-9]+\.[0-9]+-' "$readme" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+if [ -z "$stated_version" ]; then
+	note "the README carries no release version badge, so this check measured nothing about the version rather than reporting it as fine"
+	note "add: ![release](https://img.shields.io/badge/release-${newest_tag}-brightgreen)"
+	exit 1
+fi
+
+if [ "$stated_version" != "$newest_tag" ]; then
+	note "the release badge says $stated_version and the newest tag is $newest_tag"
+	note "  on the day a new tag is cut, the badge legitimately lags until README.md is bumped by hand - that is deliberate and takes the same stance as this org's estate-gates C1 invariant, so a fresh-tag lag is expected; the fix is to bump the README, not to loosen this check"
+fi
 
 # --- PROGRESS.md: the same figure, in prose ------------------------------
 #

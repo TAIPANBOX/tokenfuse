@@ -227,6 +227,17 @@ run_case "stated-numbers: the badge disagrees with the suite" fail \
 	"./scripts/stated-numbers.sh" \
 	"$(py "edit(\"README.md\", \"$badge_now\", \"$badge_next\")")"
 
+# The version badge, planted the same way: read today's value rather than
+# naming it, so this case does not go BROKEN the next time a tag is cut and
+# the README is bumped to match. v0.0.1 is safe as the stale target because
+# no real tag will ever sort behind it.
+version_badge_now=$(grep -oE 'badge/release-v[0-9]+\.[0-9]+\.[0-9]+-brightgreen' README.md | head -1)
+
+run_case "stated-numbers: the version badge disagrees with the newest tag" fail \
+	"./scripts/stated-numbers.sh" \
+	"$(py "edit(\"README.md\", \"$version_badge_now\", \"badge/release-v0.0.1-brightgreen\")")" \
+	"the release badge says"
+
 # The one case that must NOT fail. PROGRESS.md is prose that will keep quoting
 # older counts while explaining how they drifted, and reading the whole file
 # once made this gate fail on a paragraph recording its own history lesson.
@@ -409,6 +420,15 @@ m = re.search(r"!\[[^]]*\]\(https://img.shields.io/badge/tests-\d+-[a-z]+[^)]*\)
 assert m, "no test badge in README.md"
 open("README.md","w").write(s.replace(m.group(0), "", 1))')" \
 	"nothing to compare against"
+
+run_case "stated-numbers: the version badge line removed, so it measured nothing" fail \
+	"./scripts/stated-numbers.sh" \
+	"$(py 'import re
+s = open("README.md").read()
+m = re.search(r"!\[release\]\(https://img.shields.io/badge/release-v\d+\.\d+\.\d+-[a-z]+\)", s)
+assert m, "no release badge in README.md"
+open("README.md","w").write(s.replace(m.group(0), "", 1))')" \
+	"measured nothing"
 
 run_case "constants: the published artifact deleted" fail \
 	"./scripts/constants.sh" \
