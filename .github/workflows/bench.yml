@@ -6,6 +6,9 @@ name: bench
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   APT_SNAPSHOT: "20260820T000000Z"
 

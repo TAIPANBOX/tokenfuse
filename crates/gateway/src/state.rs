@@ -1,5 +1,6 @@
 //! Shared application state handed to every request handler.
 
+use crate::adminkeys::AdminGate;
 use crate::clientkeys::ClientKeys;
 use crate::firewall::FirewallConfig;
 use crate::identitymap::{IdentityMap, StrictMode};
@@ -116,6 +117,12 @@ pub struct AppState {
     /// whether or not client keys/identity are configured. See
     /// `crate::keystats`/`crate::keysreport`.
     pub keystats: Arc<KeyStats>,
+    /// What `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`
+    /// and `/v1/agent-ids` require of a caller (`crate::adminkeys`). Defaults
+    /// to [`AdminGate::Open`], the behaviour every existing deployment and
+    /// test already gets; `main.rs` sets it from `TOKENFUSE_ADMIN_KEYS`, the
+    /// bind address and `TOKENFUSE_ALLOW_OPEN_OBS`.
+    pub admin_gate: AdminGate,
 }
 
 /// The one label no review can take off a run.
@@ -540,6 +547,7 @@ impl AppState {
             identity_strict: StrictMode::Off,
             units: Arc::new(UnitLedger::default()),
             keystats: Arc::new(KeyStats::default()),
+            admin_gate: AdminGate::default(),
         }
     }
 
@@ -690,6 +698,15 @@ impl AppState {
     /// Attach a semantic cache. Chainable.
     pub fn with_cache(mut self, cache: Arc<SemanticCache>) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// Set what `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`,
+    /// `/v1/policy-plane` and `/v1/agent-ids` require of a caller
+    /// (`crate::adminkeys`). Chainable. Not set means `AdminGate::Open`,
+    /// which is what every existing deployment and test gets on upgrade.
+    pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
+        self.admin_gate = gate;
         self
     }
 

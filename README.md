@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.4.3-brightgreen)
-![tests](https://img.shields.io/badge/tests-1133-brightgreen)
+![tests](https://img.shields.io/badge/tests-1151-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -723,7 +723,16 @@ Notes, because the details matter more than the flag:
 - **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
 - **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
 - **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
-- **Scope, stated plainly:** this is `/v1/messages` only. `/v1/runs` and `/v1/runs/{id}/kill` on the gateway are unauthenticated today and stay that way in this change; if that matters to you, do not expose the gateway's admin surface. This adds identity; the budget enforced against it is the identity map, next.
+- **Scope, stated plainly:** this is `/v1/messages` only. This adds identity; the budget enforced against it is the identity map, next.
+
+**Admin keys: `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`, `/v1/agent-ids`** (loopback-safe by default; a wide bind needs a key):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOKENFUSE_ADMIN_KEYS` | unset ⇒ **off on loopback** | Comma-separated bearer keys, same trimming rules as `TOKENFUSE_CLIENT_KEYS`. Set it and every one of the five routes above needs `Authorization: Bearer <key>` matching one, or `401`. |
+| `TOKENFUSE_ALLOW_OPEN_OBS` | unset ⇒ **off** | Set to `1` to keep the five routes open on a non-loopback bind with no `TOKENFUSE_ADMIN_KEYS` configured (see below). Logged as a warning either way. |
+
+These five routes list every run's budget and spend, list key ids, enumerate agent identities, and kill any run, and until now they carried no authentication at all: the comment beside them said the gateway binds loopback by default, which is true and was not the whole picture, because `TOKENFUSE_ADDR=0.0.0.0:...` (the shipped Docker image's default) makes them reachable from the network. The posture now mirrors the MCP broker's door: nothing configured on a loopback bind changes nothing; nothing configured on a wide bind refuses every request to these five with `403 admin_keys_required` until `TOKENFUSE_ADMIN_KEYS` is set or `TOKENFUSE_ALLOW_OPEN_OBS=1` opts back into the old behaviour; a configured key is required regardless of the bind. `/healthz` and `/v1/messages` are never behind this gate.
 
 **Identity map: key ↔ agent ↔ business unit, plus monthly unit budgets** (opt-in, off by default; design notes in [docs/20](docs/20-identity-map.md)):
 

@@ -2356,3 +2356,66 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Four in `tests/manifest.rs`, of which
     `every_declared_subcommand_is_one_the_binary_dispatches_on` is the guard
     against `--help`'s list drifting from what `main.rs` actually runs.)*
+
+41. **A door with something behind it still has to be a door.** `/v1/runs`,
+    `POST /v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane` and
+    `/v1/agent-ids` were registered with no authentication at all. The
+    comment beside them said the gateway binds loopback by default, which is
+    true and was not the whole picture: the shipped `Dockerfile` sets
+    `TOKENFUSE_ADDR=0.0.0.0:4100`, and stack-single documents that port as the
+    one "agents elsewhere must reach". Published, anyone who can reach it can
+    list every run's budget and spend, list key ids, enumerate agent
+    identities, and kill any run.
+
+    The fix mirrors invariant 20's shape rather than inventing a second one.
+    `TOKENFUSE_ADMIN_KEYS` (comma-separated bearer keys, same trimming as
+    `TOKENFUSE_CLIENT_KEYS`) configured means every one of the five routes
+    needs `Authorization: Bearer <key>` regardless of the bind, or `401`.
+    Unconfigured on a loopback bind changes nothing. Unconfigured on a
+    non-loopback bind refuses every request to the five routes with `403
+    admin_keys_required`, with one startup warning naming
+    `TOKENFUSE_ADMIN_KEYS`; `TOKENFUSE_ALLOW_OPEN_OBS=1` opts back into the
+    old open behaviour, parsed like `TOKENFUSE_MCP_ALLOW_OPEN_BIND` (only `1`
+    or `true`), and does not silence the warning.
+
+    **A per-request refusal, not a startup one**, and that is the one place
+    this departs from invariant 20's precedent rather than copying it. A bad
+    bearer key on `/v1/keys` is not the emergency a vault with a stranger's
+    hand in it is, so an operator who forgets the variable on a wide bind
+    gets a `403` there and a working `/v1/messages` beside it, not a gateway
+    that refuses to start at all.
+
+    Loopback is asked of the standard library
+    (`mcpbroker::is_loopback`, reused rather than reimplemented, via
+    `adminkeys::bind_is_loopback`), never matched as a string, for the same
+    reason invariant 20 asks it: a REFUSAL is wrong in both directions if it
+    undercounts or overcounts loopback, and a warning can afford to be looser
+    than that.
+
+    Constant-time comparison (`subtle::ConstantTimeEq`, length checked first)
+    is new for this repository's own bearer doors: `ClientKeys::resolve` and
+    the Cloud's own bearer lookup are plain `HashMap`/`==` by deliberate,
+    documented choice, and this does not change either of them. `subtle`
+    2.6.1 was already resolved in `Cargo.lock` as a transitive dependency of
+    `p256`/`elliptic-curve` (which `crates/dpop` and `crates/delegation`
+    already pull into this crate's graph), so naming it directly in
+    `crates/gateway/Cargo.toml` adds no new crate to the workspace.
+
+    `/healthz` and `/v1/messages` are never behind this gate: `axum`'s
+    `route_layer` applies the middleware only to the sub-router the five
+    routes are registered on, merged into the main router afterward.
+    *(test: `an_open_bind_with_no_admin_keys_refuses_kill_and_runs`,
+    `a_loopback_bind_with_no_admin_keys_keeps_the_routes_open`,
+    `a_configured_admin_key_opens_the_routes_and_a_wrong_one_does_not`,
+    `the_allow_open_obs_opt_out_is_honoured_and_logged` and
+    `healthz_and_messages_are_never_behind_the_admin_gate` in
+    `crates/gateway/tests/admin_gate.rs`, run against the real router
+    `tokenfuse_gateway::app` builds; thirteen unit tests in
+    `gateway::adminkeys` for `AdminKeys::from_spec`, `AdminKeys::matches` and
+    `AdminGate::resolve`. All five integration tests were run against the
+    unfixed tree first: `adminkeys` did not exist and `AppState` had no
+    `with_admin_gate`, so the suite failed to compile. Scenarios:
+    `features/admin-gate.feature`, five, each bound to a named test. Not a
+    script gate: the five routes are a hand-written list at the call site
+    (`lib.rs::app`), the same shape invariant 34 already names, and there is
+    no mechanical way to notice a sixth admin-shaped route added outside it.)*
