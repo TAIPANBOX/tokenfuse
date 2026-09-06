@@ -91,7 +91,7 @@ runs:
       # otherwise-passing scan into a failed job. The `Run mcp-scan` step's
       # own exit code remains the sole source of truth for pass/fail.
       continue-on-error: true
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       env:
         SCAN_JSON_OUT: ${{ inputs.json-out }}
         SCAN_FAIL_ON: ${{ inputs.fail-on }}
@@ -204,7 +204,7 @@ runs:
           }
     - name: Upload scan report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: mcp-scan-report
         path: ${{ inputs.json-out }}
