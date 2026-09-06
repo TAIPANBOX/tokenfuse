@@ -314,7 +314,9 @@ pub fn something_on_the_door(keys: &ClientKeys, clients: &crate::mcpdoor::Client
 }
 
 /// Whether `addr` ("host:port") names a loopback interface, for the startup
-/// refusal below.
+/// refusal below. `pub(crate)` because `crate::adminkeys` reuses this exact
+/// answer for the gateway's own observability/kill routes rather than
+/// re-implementing a second loopback check that could drift from this one.
 ///
 /// Deliberately NOT [`bind_exposure_warning`]'s host set. That set is a
 /// pure string match, chosen there to agree with the Cloud plane's own check
@@ -329,7 +331,7 @@ pub fn something_on_the_door(keys: &ClientKeys, clients: &crate::mcpdoor::Client
 /// just the one address a string match would name, and knows `::1` without
 /// having to spell it out beside "localhost", which is handled separately
 /// because it is a name, not something `IpAddr::parse` accepts.
-fn is_loopback(addr: &str) -> bool {
+pub(crate) fn is_loopback(addr: &str) -> bool {
     let addr = addr.trim();
     let host = addr
         .rsplit_once(':')

@@ -62,6 +62,10 @@ RUN mkdir -p /data && chown tokenfuse:tokenfuse /data
 VOLUME /data
 USER tokenfuse
 # Bind on all interfaces inside the container; map the port when you run it.
+# Because this is a non-loopback bind, the five observability/kill routes
+# (/v1/runs, /v1/runs/{id}/kill, /v1/keys, /v1/policy-plane, /v1/agent-ids)
+# need TOKENFUSE_ADMIN_KEYS set or they refuse every request with
+# 403 admin_keys_required; see the README's "Admin keys" section.
 ENV TOKENFUSE_ADDR=0.0.0.0:4100
 EXPOSE 4100
 ENTRYPOINT ["tokenfuse"]

@@ -653,6 +653,11 @@ async fn serve() {
         )
         .init();
 
+    // Read once, up front: both the eventual bind and the admin gate below
+    // (CLAUDE.md invariant, see `adminkeys`) need to know whether this
+    // process is about to listen on loopback.
+    let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
+
     // Default price book: illustrative generic entries plus exact entries for
     // the current Anthropic/OpenAI lineup. See pricebook.rs for the per-model
     // rates and units notes. Real prices ship as a versioned price book.
@@ -875,6 +880,45 @@ async fn serve() {
     .with_client_keys(Arc::new(client_keys))
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
     .with_agent_id_mode(agent_id_mode);
+
+    // Who may call the observability/kill routes (CLAUDE.md invariant, see
+    // `adminkeys`): TOKENFUSE_ADMIN_KEYS, comma-separated bearer keys, same
+    // trimming rules as TOKENFUSE_CLIENT_KEYS. Set-but-unusable exits rather
+    // than falling back to "not configured", the same posture every other
+    // credential spec in this file takes.
+    let admin_keys = match tokenfuse_gateway::adminkeys::AdminKeys::from_spec(
+        &std::env::var("TOKENFUSE_ADMIN_KEYS").unwrap_or_default(),
+    ) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("tokenfuse: {e}");
+            std::process::exit(2);
+        }
+    };
+    // The opt-out for an operator who has deliberately decided to run these
+    // five routes open on a wide bind. Same parsing as TOKENFUSE_ALLOW_STUB
+    // and TOKENFUSE_MCP_ALLOW_OPEN_BIND: only "1" or "true" (case-insensitive)
+    // count, so a typo reads as "not opted out".
+    let allow_open_obs = std::env::var("TOKENFUSE_ALLOW_OPEN_OBS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if let Some(warning) =
+        tokenfuse_gateway::adminkeys::open_obs_warning(&addr, admin_keys.enabled(), allow_open_obs)
+    {
+        tracing::warn!("{warning}");
+    }
+    if admin_keys.enabled() {
+        tracing::info!(
+            keys = admin_keys.len(),
+            "admin auth: ON for /v1/runs, /v1/runs/{{id}}/kill, /v1/keys, /v1/policy-plane, /v1/agent-ids"
+        );
+    }
+    let admin_gate = tokenfuse_gateway::adminkeys::AdminGate::resolve(
+        admin_keys,
+        tokenfuse_gateway::adminkeys::bind_is_loopback(&addr),
+        allow_open_obs,
+    );
+    state = state.with_admin_gate(admin_gate);
 
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
     // records would-hits without serving them — safe to drop in).
@@ -1103,7 +1147,6 @@ async fn serve() {
         state = state.with_ledger(rl);
     }
 
-    let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");

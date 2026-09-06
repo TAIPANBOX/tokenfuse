@@ -17,6 +17,13 @@ tokenfuse-core.workspace = true
 tokenfuse-dpop.workspace = true
 tokenfuse-delegation.workspace = true
 thiserror.workspace = true
+# Constant-time bearer-key comparison for the observability/kill routes' admin
+# gate (crate::adminkeys). Already resolved at 2.6.1 in Cargo.lock as a
+# transitive dependency of p256/elliptic-curve, which crates/dpop and
+# crates/delegation already pull into this crate's graph; naming it directly
+# here adds no new crate to the workspace, only a direct edge to one already
+# built.
+subtle = "2.6"
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 axum.workspace = true
 serde.workspace = true
