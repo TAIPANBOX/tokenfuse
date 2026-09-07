@@ -41,6 +41,229 @@ provider facts this plan assumes and the reasons for each decision.
 
 ---
 
+### Task 0: the money arithmetic stops wrapping
+
+**Files:**
+- Modify: `crates/core/src/pricing.rs` (`ModelPrice::cost`)
+- Test: `crates/core/src/pricing.rs` (its own `#[cfg(test)] mod tests`)
+- Test: `crates/gateway/tests/the_estimate_never_goes_negative.rs` (new)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: no signature change. `ModelPrice::cost(&self, usage: &Usage) -> Microusd` keeps its shape and stops returning a negative or panicking.
+
+**Why this task exists, and it is not part of the OpenAI feature.** Found while
+writing Task 2, and measured on commit `5413147`, whose only difference from
+`main` is a module nothing calls:
+
+`part()` multiplies in `i128` and then casts with `as i64`, which truncates
+rather than saturating, and the four `part()` results are then added with a
+plain `+`. Measured on a $15/Mtok model: correct to 1e17 output tokens,
+**negative at 1e18** (`-3446744073709551616` micro-usd). Some magnitudes panic
+instead, `attempt to add with overflow` at `pricing.rs:55`, which is a debug
+build refusing to wrap; a release build wraps silently.
+
+Measured through the live gateway, `$0.01` per-run budget, enforce mode:
+
+| `max_tokens` | status | forwarded upstream |
+|---|---|---|
+| 1 000 | 402 | no |
+| 1 000 000 | 402 | no |
+| 1 000 000 000 000 | 402 | no |
+| 18 446 744 073 709 551 615 | **200** | **yes** |
+
+A larger ask passes where a smaller one is refused, on today's `/v1/messages`,
+through an ordinary request-body field.
+
+**Measured and NOT true, so nobody re-derives it:** this does not inflate the
+budget for later calls. An honest 1M-token call is still refused after a
+poisoned one has gone through. The bypass is one call, not a lasting credit.
+
+**Why it blocks the feature.** Today the wrap needs an absurd `max_tokens` that
+the provider would reject anyway. Once `n` multiplies the output estimate
+(Task 2), the product `n * max_tokens` reaches the same zone from two
+individually ordinary-looking numbers. The feature widens the reachable input,
+so the arithmetic is fixed first.
+
+- [ ] **Step 1: Write the failing unit tests**
+
+Add to `crates/core/src/pricing.rs`'s `mod tests`:
+
+```rust
+#[test]
+fn a_cost_is_never_negative_however_many_tokens_are_claimed() {
+    let p = sonnet();
+    for tokens in [1e17 as u64, 1e18 as u64, u64::MAX / 2, u64::MAX] {
+        let usage = Usage { output_tokens: tokens, ..Default::default() };
+        let c = p.cost(&usage);
+        assert!(
+            c.0 >= 0,
+            "output_tokens={tokens} priced at {} micro-usd: a negative cost              passes every budget check there is",
+            c.0
+        );
+    }
+}
+
+#[test]
+fn an_unpayable_request_saturates_at_the_top_rather_than_wrapping_to_the_bottom() {
+    let p = sonnet();
+    let huge = Usage { output_tokens: u64::MAX, ..Default::default() };
+    let ordinary = Usage { output_tokens: 1_000_000, ..Default::default() };
+    assert!(
+        p.cost(&huge).0 > p.cost(&ordinary).0,
+        "the most expensive request must not be the cheapest"
+    );
+    assert_eq!(p.cost(&huge).0, i64::MAX, "saturating, not merely non-negative");
+}
+
+#[test]
+fn every_token_field_saturates_and_the_sum_of_four_maxima_does_not_wrap() {
+    let p = sonnet();
+    let all = Usage {
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_read_tokens: u64::MAX,
+        cache_write_tokens: u64::MAX,
+    };
+    assert_eq!(p.cost(&all).0, i64::MAX);
+}
+
+#[test]
+fn ordinary_prices_are_exactly_what_they_always_were() {
+    // The fix must not move a single real figure. These are the numbers the
+    // existing tests in this module already assert, restated here so a future
+    // saturating-arithmetic change cannot quietly round them.
+    let p = sonnet();
+    let u = Usage { input_tokens: 1_000_000, output_tokens: 1_000_000, ..Default::default() };
+    assert_eq!(p.cost(&u).0, 3_000_000 + 15_000_000);
+}
+```
+
+`sonnet()` and `Usage`'s field names already exist in that module; read them
+rather than trusting the names above, and adjust only the spelling if they
+differ.
+
+- [ ] **Step 2: Run them and record the failures verbatim**
+
+Run: `cargo test -p tokenfuse-core --lib pricing`
+Expected: `a_cost_is_never_negative_...` fails on the 1e18 case, and
+`an_unpayable_request_saturates...` fails or panics with
+`attempt to add with overflow`. Paste exactly what the runner printed,
+including which case failed first. Do not paraphrase.
+
+- [ ] **Step 3: Write the failing end-to-end test**
+
+Create `crates/gateway/tests/the_estimate_never_goes_negative.rs`. Copy the
+harness shape from `crates/gateway/tests/require_run_id.rs`: its
+`CountingProvider`, its `state()` builder and its `Request::post` pattern. Set
+`budget_per_run: Some(Microusd(10_000))` (one cent) and `Mode::Enforce`.
+
+```rust
+/// A bigger ask must never pass where a smaller one is refused.
+///
+/// Measured before the fix, on this exact harness: max_tokens of 1e3, 1e6 and
+/// 1e12 were all refused with 402 and never forwarded, and u64::MAX returned
+/// 200 and WAS forwarded, because the estimate had wrapped negative.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absurd_output_cap_is_refused_like_every_smaller_one() {
+    for max_tokens in ["1000", "1000000", "1000000000000", "18446744073709551615"] {
+        let provider = CountingProvider::default();
+        let app = tokenfuse_gateway::app(state(provider.clone()));
+        let resp = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("x-fuse-run-id", format!("r-{max_tokens}"))
+                    .body(Body::from(format!(
+                        r#"{{"model":"test-model","max_tokens":{max_tokens},"messages":[{{"role":"user","content":"hi"}}]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "max_tokens={max_tokens} was not refused on a one-cent budget"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "max_tokens={max_tokens} reached the provider after a refusal was due"
+        );
+    }
+}
+```
+
+- [ ] **Step 4: Run it and record the failure verbatim**
+
+Run: `cargo test -p tokenfuse-gateway --test the_estimate_never_goes_negative`
+Expected: FAIL on the `18446744073709551615` case, asserting 200 where 402 was
+due. Paste what the runner printed.
+
+- [ ] **Step 5: Fix the arithmetic**
+
+In `crates/core/src/pricing.rs`, replace the body of `cost`:
+
+```rust
+    /// Price a usage record. Saturating throughout: an absurd token count
+    /// prices at the ceiling, never at a negative or a wrapped-small figure.
+    ///
+    /// The direction matters and is not symmetric. Over-charging an impossible
+    /// request refuses it, which is the safe answer for a request nobody can
+    /// pay for. Under-charging it serves it, and a negative cost passes every
+    /// budget check there is: measured on 2026-09-07, `output_tokens = 1e18`
+    /// priced at -3446744073709551616 micro-usd and the gateway forwarded a
+    /// call it should have refused. Same reasoning as ADR-8's fallback price.
+    pub fn cost(&self, usage: &Usage) -> Microusd {
+        let part = |tokens: u64, price: Microusd| -> i64 {
+            let micros = (tokens as i128)
+                .saturating_mul(price.0 as i128)
+                / 1_000_000;
+            micros.clamp(0, i64::MAX as i128) as i64
+        };
+        Microusd(
+            part(usage.input_tokens, self.input_per_mtok)
+                .saturating_add(part(usage.output_tokens, self.output_per_mtok))
+                .saturating_add(part(usage.cache_read_tokens, self.cache_read_per_mtok))
+                .saturating_add(part(usage.cache_write_tokens, self.cache_write_per_mtok)),
+        )
+    }
+```
+
+The `clamp(0, ..)` lower bound is deliberate and is not dead: a price is an
+`i64` and a negative one is representable, so a misconfigured negative rate
+would otherwise produce a negative cost by a second route. Say so in the
+report, and add a test for it if the module's `ModelPrice` can be constructed
+with a negative rate; if it cannot, say that instead.
+
+- [ ] **Step 6: Run everything**
+
+Run: `cargo test -p tokenfuse-core --lib pricing`, then
+`cargo test -p tokenfuse-gateway --test the_estimate_never_goes_negative`,
+then `cargo test --all`.
+Expected: all green, and no existing test's expected figure changed. If any
+pre-existing assertion had to move, stop and report it: this fix must not
+alter one real price.
+
+- [ ] **Step 7: Check the margin cast while you are here**
+
+`crates/gateway/src/estimate.rs` finishes with
+`Microusd((raw.0 as f64 * MARGIN).ceil() as i64)`. With `raw.0 == i64::MAX`
+that product exceeds `i64`. Rust's float-to-int `as` saturates rather than
+wrapping, so this is believed safe. Do not take that on faith: add one test to
+`estimate.rs` asserting the estimate for a `u64::MAX` output cap is positive
+and large, run it, and record the number it produced.
+
+- [ ] **Step 8: Gates and commit**
+
+```bash
+cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --all
+git add crates/core/src/pricing.rs crates/gateway/tests/the_estimate_never_goes_negative.rs crates/gateway/src/estimate.rs
+git commit -m "fix(core): pricing saturates instead of wrapping negative"
+```
+
+---
+
 ### Task 1: `wire.rs`, the shape as a value
 
 **Files:**
@@ -295,8 +518,16 @@ git commit -m "feat(gateway): the wire shape becomes a value"
 
 **Files:**
 - Modify: `crates/gateway/src/estimate.rs` (the `estimate_cost` signature and body)
-- Modify: `crates/gateway/src/proxy.rs` (two call sites, at the kill check and on the main path)
+- Modify: `crates/gateway/src/proxy.rs` (**five** call sites: two on the request path, three in its own test module)
+- Modify: `crates/gateway/src/router.rs` (one call site, line ~245)
+- Modify: `crates/gateway/examples/bench.rs` (two call sites, lines ~79 and ~92)
 - Test: `crates/gateway/src/estimate.rs` (its own `#[cfg(test)] mod tests`)
+
+**The file list above is corrected.** An earlier version of this task said the
+function had two call sites in `proxy.rs` and named no other file, and the
+crate does not compile under that scope. `grep -rn estimate_cost crates/
+--include='*.rs'` finds them all; run it rather than trusting any list,
+including this one.
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (deliberately: this lands on its own so the
@@ -400,7 +631,7 @@ numbers must not move.
 
 ```bash
 cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --all
-git add crates/gateway/src/estimate.rs crates/gateway/src/proxy.rs
+git add crates/gateway/src/estimate.rs crates/gateway/src/proxy.rs crates/gateway/src/router.rs crates/gateway/examples/bench.rs
 git commit -m "feat(gateway): the estimate multiplies by the completions asked for"
 ```
 
