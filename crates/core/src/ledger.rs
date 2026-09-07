@@ -496,6 +496,54 @@ mod tests {
         }
     }
 
+    /// Reproduces the 2026-09-07 measurement: a run warmed with one ordinary
+    /// reservation that is settled, then handed an absurd estimate. Before
+    /// the fix, `s.spent + s.reserved + estimate` used `Microusd`'s plain,
+    /// wrapping `Add`: an `i64::MAX` estimate against spent=52 wraps
+    /// negative, `would > budget` reads false, the absurd reservation is
+    /// GRANTED, and it leaves the run's `reserved` counter at `i64::MAX`,
+    /// a lasting credit rather than a one-call bypass. Everything reserved
+    /// after that point rides on the same wrapped arithmetic, so a request
+    /// that plainly does not fit (remaining headroom here is 9948, not
+    /// 10000) is also granted, over and over, for as long as the run lives.
+    #[test]
+    fn an_absurd_estimate_does_not_leave_a_lasting_credit_for_a_later_ordinary_reservation() {
+        let ledger = Ledger::new();
+        ledger.open_run("r1", Microusd(10_000), None);
+
+        let warm = ledger.reserve("r1", Microusd(52)).unwrap();
+        ledger.settle(&warm, Microusd(52));
+        let warmed = ledger.snapshot("r1").unwrap();
+        assert_eq!(
+            warmed.spent,
+            Microusd(52),
+            "warm-up did not settle as expected"
+        );
+        assert_eq!(warmed.reserved, Microusd::ZERO);
+
+        let absurd = ledger.reserve("r1", Microusd(i64::MAX));
+        assert!(
+            absurd.is_err(),
+            "an i64::MAX estimate against a 10000-micro-usd budget must be refused, got {absurd:?}"
+        );
+
+        // Not a lasting credit: a request that plainly exceeds the true
+        // remaining headroom (10000 - 52 = 9948) must still be refused after
+        // the absurd one was rejected, not granted through a polluted
+        // `reserved` counter left over from the rejected attempt.
+        let ordinary = ledger.reserve("r1", Microusd(20_000));
+        assert!(
+            ordinary.is_err(),
+            "a 20000 reservation on a 10000 budget with 52 already spent must be refused, got {ordinary:?}"
+        );
+
+        // And the ledger's state is genuinely untouched by the refused
+        // attempt, not merely refusing by coincidence.
+        let after = ledger.snapshot("r1").unwrap();
+        assert_eq!(after.spent, Microusd(52));
+        assert_eq!(after.reserved, Microusd::ZERO);
+    }
+
     /// Reserving and settling at the same time, which is the shape production
     /// actually has: calls finish while others are still starting.
     ///

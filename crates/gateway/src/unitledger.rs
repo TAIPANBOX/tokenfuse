@@ -263,6 +263,40 @@ mod tests {
         assert_eq!(err.spent, Microusd::ZERO);
     }
 
+    /// Same shape as `core::ledger`'s
+    /// `an_absurd_estimate_does_not_leave_a_lasting_credit_for_a_later_ordinary_reservation`:
+    /// `try_reserve`'s `let would = s.spent + s.reserved + estimate;` used
+    /// `Microusd`'s plain, wrapping `Add` before the fix, so an `i64::MAX`
+    /// estimate against a warmed, capped unit wrapped negative, was granted,
+    /// and left `reserved` at `i64::MAX`, a lasting credit for every later
+    /// reservation on that unit.
+    #[test]
+    fn an_absurd_estimate_does_not_leave_a_lasting_credit_on_a_capped_unit() {
+        let ledger = UnitLedger::new(HashMap::from([("treasury".into(), Microusd(10_000))]));
+
+        let warm = ledger
+            .try_reserve("treasury", Microusd(52), JULY)
+            .unwrap()
+            .expect("capped unit reserves");
+        ledger.settle(&warm, Microusd(52), JULY);
+        assert_eq!(ledger.spent("treasury", JULY), Microusd(52));
+
+        let absurd = ledger.try_reserve("treasury", Microusd(i64::MAX), JULY);
+        assert!(
+            absurd.is_err(),
+            "an i64::MAX estimate against a 10000-micro-usd cap must be refused, got {absurd:?}"
+        );
+
+        // Not a lasting credit: a request that plainly exceeds the true
+        // remaining headroom (10000 - 52 = 9948) must still be refused.
+        let ordinary = ledger.try_reserve("treasury", Microusd(20_000), JULY);
+        assert!(
+            ordinary.is_err(),
+            "a 20000 reservation on a 10000 cap with 52 already spent must be refused, got {ordinary:?}"
+        );
+        assert_eq!(ledger.spent("treasury", JULY), Microusd(52));
+    }
+
     #[test]
     fn reserve_unchecked_records_past_the_cap_without_error() {
         let ledger = UnitLedger::new(HashMap::from([("treasury".into(), usd(1.0))]));

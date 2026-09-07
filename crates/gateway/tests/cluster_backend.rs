@@ -252,3 +252,85 @@ async fn follower_burst_of_fresh_runs_does_not_panic_on_snapshot_lag() {
         "every burst request against the follower must complete, none dropped to a panic"
     );
 }
+
+/// The raft backend's own accept/reject arithmetic lives in
+/// `crates/cluster/src/types.rs` and is `u64` throughout with
+/// `saturating_add`, so it was already immune to the wrap this task fixes
+/// elsewhere. This test is about a second, independent spot:
+/// `RaftLedger::reserve`'s `BudgetError::Exceeded::would`, built in
+/// `crates/gateway/src/raft_ledger.rs` from the raft response with a plain
+/// `+` on two `u64`s and a non-saturating `as i64` cast. That figure never
+/// governs accept/reject (the state machine already decided), but before the
+/// fix it could still print a negative "would" in a refusal a caller reads,
+/// and nothing here proved it doesn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_backend_refuses_an_absurd_estimate_with_a_non_negative_would_and_no_lasting_credit() {
+    let addr = "127.0.0.1:5615";
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("http://{addr}"));
+    let rl: Arc<dyn LedgerBackend> =
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
+            .await
+            .unwrap();
+
+    let run = "r-absurd";
+    let mut ready = false;
+    for _ in 0..100 {
+        rl.open_run(run, Microusd(10_000), None).await;
+        if rl
+            .snapshot(run)
+            .await
+            .is_some_and(|s| s.budget == Microusd(10_000))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "single-node cluster never became ready");
+
+    // Warm the run exactly as the core-ledger reproduction does: one ordinary
+    // reservation, settled, so spent=52, reserved=0, budget=10000.
+    let warm = rl
+        .reserve(run, Microusd(52))
+        .await
+        .expect("warm reserve fits");
+    rl.settle(&warm, Microusd(52));
+    let mut settled = false;
+    for _ in 0..100 {
+        if rl
+            .snapshot(run)
+            .await
+            .is_some_and(|s| s.spent == Microusd(52) && s.reserved == Microusd::ZERO)
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(settled, "warm-up settle must replicate");
+
+    // An absurd estimate must be refused, and the `would` it reports must
+    // never read negative, which is the cast this test exists for.
+    match rl.reserve(run, Microusd(i64::MAX)).await {
+        Err(BudgetError::Exceeded { would, budget, .. }) => {
+            assert!(
+                would.0 >= 0,
+                "would must never be negative, got {}",
+                would.0
+            );
+            assert_eq!(budget, Microusd(10_000));
+        }
+        other => panic!("an i64::MAX estimate must be refused, got {other:?}"),
+    }
+
+    // No lasting credit: the refused attempt must not have mutated the
+    // replicated state, so a request that plainly exceeds the true
+    // remaining headroom (10000 - 52 = 9948) is still refused afterward.
+    match rl.reserve(run, Microusd(20_000)).await {
+        Err(BudgetError::Exceeded { .. }) => {}
+        other => panic!(
+            "a 20000 reservation on a 10000 budget with 52 already spent must be refused, got {other:?}"
+        ),
+    }
+}

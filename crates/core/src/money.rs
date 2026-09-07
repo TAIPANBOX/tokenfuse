@@ -34,17 +34,26 @@ impl Microusd {
     }
 }
 
+/// Saturating, not wrapping. Money that wraps is never the right answer: a
+/// `Ledger::reserve` that adds an absurd, already-saturated estimate to a
+/// non-zero `spent`/`reserved` must land at the ceiling, not wrap negative and
+/// grant every reservation behind it. Measured on 2026-09-07 in `ledger.rs`
+/// and `unitledger.rs`: a plain `+` here is exactly the wrap the callers were
+/// trying to avoid, one type down.
 impl Add for Microusd {
     type Output = Microusd;
     fn add(self, rhs: Microusd) -> Microusd {
-        Microusd(self.0 + rhs.0)
+        Microusd(self.0.saturating_add(rhs.0))
     }
 }
 
+/// Saturating, not wrapping, for the same reason `Add` is. This is a plain
+/// (possibly negative) difference bounded at `i64::MIN`/`i64::MAX`; it is not
+/// the zero-floored [`Microusd::saturating_sub`] used on the settle path.
 impl Sub for Microusd {
     type Output = Microusd;
     fn sub(self, rhs: Microusd) -> Microusd {
-        Microusd(self.0 - rhs.0)
+        Microusd(self.0.saturating_sub(rhs.0))
     }
 }
 
@@ -75,6 +84,31 @@ mod tests {
     #[test]
     fn saturating_sub_never_goes_negative() {
         assert_eq!(Microusd(10).saturating_sub(Microusd(25)), Microusd::ZERO);
+    }
+
+    /// The `Add` operator saturates at `i64::MAX` rather than wrapping.
+    /// Ledger call sites (`crates/core/src/ledger.rs`,
+    /// `crates/gateway/src/unitledger.rs`) rely on this: they compute
+    /// `spent + reserved + estimate` with the plain `+` operator, and an
+    /// absurd, already-saturated `estimate` must not wrap the sum negative.
+    #[test]
+    fn add_saturates_instead_of_wrapping() {
+        assert_eq!(Microusd(52) + Microusd(i64::MAX), Microusd(i64::MAX));
+        assert_eq!(Microusd(i64::MAX) + Microusd(i64::MAX), Microusd(i64::MAX));
+        // Ordinary sums are unaffected.
+        assert_eq!(Microusd(3) + Microusd(4), Microusd(7));
+    }
+
+    /// The `Sub` operator saturates at `i64::MIN`/`i64::MAX` rather than
+    /// wrapping. This is a plain, possibly-negative difference, distinct from
+    /// the zero-floored [`Microusd::saturating_sub`] used on the settle path.
+    #[test]
+    fn sub_saturates_instead_of_wrapping() {
+        assert_eq!(Microusd(i64::MIN) - Microusd(1), Microusd(i64::MIN));
+        assert_eq!(Microusd(i64::MAX) - Microusd(-1), Microusd(i64::MAX));
+        // An ordinary difference may still go negative: `Sub` is not
+        // zero-floored, unlike `saturating_sub`.
+        assert_eq!(Microusd(3) - Microusd(10), Microusd(-7));
     }
 
     #[test]

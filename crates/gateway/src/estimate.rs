@@ -64,6 +64,28 @@ mod tests {
         assert!(estimate_cost(&book(), "unknown", 4000, Some(100)).is_none());
     }
 
+    /// `raw.0` can now reach `i64::MAX` (the pricing fix saturates there
+    /// rather than wrapping negative), and this margin step multiplies that by
+    /// 1.15 in `f64` before casting back to `i64`. Rust's float-to-int `as`
+    /// saturates rather than wraps, but that is not taken on faith here: the
+    /// number it actually produces is asserted, not merely "is positive".
+    #[test]
+    fn a_maximal_output_cap_estimates_a_large_positive_number_not_a_wrapped_negative() {
+        let est = estimate_cost(&book(), "m", 0, Some(u64::MAX)).unwrap();
+        assert!(
+            est.0 > 0,
+            "the estimate for the most expensive request must not be negative, got {}",
+            est.0
+        );
+        assert_eq!(
+            est.0,
+            i64::MAX,
+            "raw.0 saturates at i64::MAX in ModelPrice::cost, and i64::MAX as f64 * 1.15, \
+             ceil()'d, cast back to i64, saturates at i64::MAX again: the margin step must not \
+             be where the saturation quietly breaks"
+        );
+    }
+
     #[test]
     fn missing_max_tokens_falls_back_to_default() {
         let est = estimate_cost(&book(), "m", 0, None).unwrap();
