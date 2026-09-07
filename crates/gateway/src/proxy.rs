@@ -463,8 +463,11 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     handle(Wire::Anthropic, st, headers, body).await
 }
 
-/// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
-/// as-is once the budget check passes.
+/// The shared enforcement path both doors serve through, parameterised by
+/// which wire the caller spoke. Reads the request only through
+/// `wire.parse_request`, so everything from here on (budget check, firewall,
+/// identity, caching, forwarding) is the same code for every door; the body
+/// itself is forwarded as-is once the budget check passes.
 async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
     // Who is calling, resolved from the credential they presented rather than
     // from anything they can write. Empty when client keys are not configured,
@@ -3028,6 +3031,48 @@ pub(crate) mod tests {
         let st = state(Mode::Enforce, StubProvider::default()).with_require_run_id(false);
         let resp = handle(Wire::Anthropic, st, HeaderMap::new(), Bytes::from(body(64))).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_messages_door_reaches_the_shared_handler_as_anthropic_not_openai() {
+        // Unlike the test above, this one never calls `handle` directly: it
+        // drives the real router (`crate::app`) through a POST to
+        // `/v1/messages`, so it exercises `messages` itself, the one line
+        // this task could get wrong.
+        //
+        // The body carries two output-limit fields that disagree:
+        // `max_tokens: 1` and `max_completion_tokens: 1_000_000`. Only the
+        // Anthropic wire reads `max_tokens`; only the OpenAI wire reads
+        // `max_completion_tokens` (and prefers it over `max_tokens` when both
+        // are present, see `wire::parse_request`). So the estimate this
+        // request produces depends entirely on which `Wire` `messages`
+        // passed to `handle`:
+        //
+        //   - Wire::Anthropic (correct): max_tokens=1 -> a few cents' worth
+        //     of tokens at most -> comfortably inside a $0.01 budget -> 200.
+        //   - Wire::OpenAi (the mistake this task could make): max_tokens=1
+        //     is ignored in favour of max_completion_tokens=1_000_000 ->
+        //     an estimate around $17 -> the same $0.01 budget refuses it
+        //     with 402.
+        //
+        // One request, two possible answers, and only the correct wiring in
+        // `messages` gives the allowed one.
+        let body = r#"{"model":"test-model","max_tokens":1,"max_completion_tokens":1000000}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-anthropic-not-openai")
+            .header("x-fuse-budget-usd", "0.01")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "messages() must reach handle with Wire::Anthropic: it reads only \
+             max_tokens (1) and stays inside a $0.01 budget. A 402 here means \
+             max_completion_tokens (1,000,000) won instead, i.e. messages() \
+             passed Wire::OpenAi."
+        );
     }
 
     #[tokio::test]
