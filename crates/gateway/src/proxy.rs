@@ -475,10 +475,13 @@ pub async fn chat_completions(
 }
 
 /// The shared enforcement path both doors serve through, parameterised by
-/// which wire the caller spoke. Reads the request only through
-/// `wire.parse_request`, so everything from here on (budget check, firewall,
-/// identity, caching, forwarding) is the same code for every door; the body
-/// itself is forwarded as-is once the budget check passes.
+/// which wire the caller spoke. `wire.parse_request` is not the only reader
+/// of the raw JSON: `taint::tool_uses_in`, `cache_eligible`, `semantic_core`,
+/// `system_text` and `tools_text` all read it too, each already wire-agnostic
+/// (see `docs/26-the-openai-door.md` section 8). What IS true is that budget
+/// check, firewall, identity, caching and forwarding are the same code for
+/// every door; the body itself is forwarded as-is once the budget check
+/// passes.
 ///
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`

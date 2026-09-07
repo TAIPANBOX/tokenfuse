@@ -276,7 +276,19 @@ variable behaves exactly as it does today.
   correct the doc, and this work neither fixes nor worsens it.
 - **The response-side firewall judgement still runs only on the buffered
   path.** `stream_managed` has no `taint::evaluate`. That asymmetry predates
-  this work and is not addressed by it.
+  this work and is not addressed by it. `@measured 2026-09-07`, checking the
+  premise before repeating it: on the buffered path, `taint::tool_uses_in`
+  already reads both wire shapes (`push_openai_tool_calls` has read
+  `tool_calls` on a message, both in request history and in a non-streaming
+  `choices[].message`, since the taint module's original commit, which
+  predates the OpenAI door entirely) - it is not Anthropic-only, and every
+  caller in `proxy.rs` (the pre-reservation request scan, the wasm hook, the
+  Wardryx PEP, the response-side firewall judgement) reads through it, so
+  none of them is one-sided either. The gap named above is real but
+  symmetric: neither wire's tool calls are seen when they arrive as stream
+  deltas (Anthropic's `content_block_delta`, OpenAI's `choices[].delta.tool_calls`),
+  because nothing on the streaming path calls `taint::evaluate` at all,
+  regardless of which door is open.
 - **No performance claim.** The enforcement decision's measured cost belongs to
   the existing path; nothing here is benchmarked until it is.
 - **The OpenAI models in the price book are whatever ships today.** Pricing

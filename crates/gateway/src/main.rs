@@ -736,8 +736,6 @@ async fn serve() {
             );
         }
     }
-    tracing::info!(?wire, path = %wire.route_path(), "serving one door");
-
     // The built-in stub always answers a fixed, Anthropic-shaped body
     // (`{"stub":true,"usage":{"input_tokens":...,"output_tokens":...}}`,
     // `provider::StubProvider`), never the OpenAI wire's `choices`/
@@ -761,6 +759,10 @@ async fn serve() {
     // TOKENFUSE_UPSTREAM at a real OpenAI-compatible endpoint instead of the
     // stub), matching the shape of every other refuse-to-start gate in this
     // file (TOKENFUSE_UPSTREAM missing, TOKENFUSE_MCP_ALLOW_OPEN_BIND).
+    //
+    // Checked BEFORE the "serving one door" log line below, not after: a log
+    // reader must never see a door announced and then refused a few lines
+    // later, which is what this refusal used to read like.
     if upstream_url.is_none() && allow_stub && wire == Wire::OpenAi {
         eprintln!(
             "tokenfuse: refusing to start: TOKENFUSE_ALLOW_STUB=1 with the OpenAI wire \
@@ -778,6 +780,8 @@ async fn serve() {
         );
         std::process::exit(2);
     }
+
+    tracing::info!(?wire, path = %wire.route_path(), "serving one door");
 
     // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Default is
     // shadow (safe to drop in — surfaces "would block" without changing
