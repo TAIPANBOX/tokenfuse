@@ -570,7 +570,7 @@ run_case "same-doors: an explained one-sided door, reworded" pass \
 # (crates/gateway/tests/wire_door.rs).
 run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
 	"cargo test -p tokenfuse-gateway --test wire_door -- --exact a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {\n        return wire_mismatch(wire, st.wire);\n    }\n", "")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {", "    if false && wire != st.wire {")')" \
 	"a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
