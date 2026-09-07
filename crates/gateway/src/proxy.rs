@@ -778,7 +778,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         // No estimate has been computed yet on this path (it's derived below,
         // once past the kill/DLP gates) — compute it locally so the avoided
         // spend is still captured for the trace.
-        let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
+        let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens, 1)
             .unwrap_or(Microusd::ZERO);
         st.sink.record(CallRecord {
             ts_millis: now_millis(),
@@ -1003,7 +1003,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         cache_ctx = Some(CacheCtx { partition, core });
     }
 
-    let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
+    let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens, 1)
         .unwrap_or(Microusd::ZERO);
 
     // `open_run` above just committed (the in-process ledger applies
@@ -3136,7 +3136,7 @@ pub(crate) mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
 
-        let expected = estimate_cost(&prices, "test-model", body(100_000).len(), Some(100_000))
+        let expected = estimate_cost(&prices, "test-model", body(100_000).len(), Some(100_000), 1)
             .unwrap_or(Microusd::ZERO);
         assert!(
             expected > Microusd::ZERO,
@@ -6250,7 +6250,7 @@ pub(crate) mod tests {
         let billed = prices
             .cost("test-model", &reported)
             .expect("test-model is priced");
-        let estimate = estimate_cost(&prices, "test-model", body(500).len(), Some(500))
+        let estimate = estimate_cost(&prices, "test-model", body(500).len(), Some(500), 1)
             .expect("test-model is priced");
         assert!(
             billed > Microusd::ZERO,
@@ -6425,7 +6425,7 @@ pub(crate) mod tests {
         let billed = prices
             .cost("test-model", &reported)
             .expect("test-model is priced");
-        let estimate = estimate_cost(&prices, "test-model", body_stream(500).len(), Some(500))
+        let estimate = estimate_cost(&prices, "test-model", body_stream(500).len(), Some(500), 1)
             .expect("test-model is priced");
         assert!(
             billed > Microusd::ZERO,

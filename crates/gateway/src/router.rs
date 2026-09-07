@@ -242,7 +242,7 @@ impl Router {
         }
 
         let cost_of = |model: &str| -> Option<Microusd> {
-            estimate_cost(prices, model, body_len, max_tokens)
+            estimate_cost(prices, model, body_len, max_tokens, 1)
         };
 
         // A rule explicitly requiring a higher tier than the requested model

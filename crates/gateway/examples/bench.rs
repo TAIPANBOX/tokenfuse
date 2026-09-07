@@ -76,7 +76,7 @@ fn bench_decision_path(iters: usize) {
     // Warm up.
     for _ in 0..(iters / 10).max(1) {
         let est =
-            tokenfuse_gateway::estimate::estimate_cost(&prices, "bench-model", 4000, Some(500))
+            tokenfuse_gateway::estimate::estimate_cost(&prices, "bench-model", 4000, Some(500), 1)
                 .unwrap();
         let snap = ledger.snapshot("bench").unwrap();
         let _ = evaluate(&policy, &snap, est);
@@ -89,7 +89,7 @@ fn bench_decision_path(iters: usize) {
     for _ in 0..iters {
         let start = Instant::now();
         let est =
-            tokenfuse_gateway::estimate::estimate_cost(&prices, "bench-model", 4000, Some(500))
+            tokenfuse_gateway::estimate::estimate_cost(&prices, "bench-model", 4000, Some(500), 1)
                 .unwrap();
         let snap = ledger.snapshot("bench").unwrap();
         let _ = evaluate(&policy, &snap, est);
