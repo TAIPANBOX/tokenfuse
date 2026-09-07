@@ -59,6 +59,43 @@ impl Wire {
         }
     }
 
+    /// The system prompt, wherever this wire keeps it. Used for the semantic
+    /// cache's partition key, so a wire whose system prompt this cannot see is
+    /// a wire where two different callers share a partition.
+    pub fn system_text(self, request: &Value) -> String {
+        match self {
+            Wire::Anthropic => match request.get("system") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(blocks)) => concat_text_blocks(blocks),
+                _ => String::new(),
+            },
+            // OpenAI has no top-level system field: the prompt is one or more
+            // messages, `developer` being the o-series spelling of `system`.
+            Wire::OpenAi => {
+                let Some(messages) = request.get("messages").and_then(|m| m.as_array()) else {
+                    return String::new();
+                };
+                let mut buf = String::new();
+                for m in messages {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role != "system" && role != "developer" {
+                        continue;
+                    }
+                    let text = match m.get("content") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Array(parts)) => concat_text_blocks(parts),
+                        _ => String::new(),
+                    };
+                    if !text.is_empty() {
+                        buf.push_str(&text);
+                        buf.push(' ');
+                    }
+                }
+                buf.trim().to_string()
+            }
+        }
+    }
+
     /// Read the fields the enforcement path needs. Never fails: a body this
     /// cannot read yields defaults that are safe to price against, and the
     /// request goes on to be judged by everything downstream.
@@ -96,6 +133,24 @@ impl Wire {
             completions,
         }
     }
+}
+
+/// Concatenates the `text` field of each text-shaped content block in a
+/// content-block array (e.g. `[{"type":"text","text":"..."}]`),
+/// space-separated and trimmed. Both wires use this same shape: Anthropic's
+/// `system` and message `content` arrays, and OpenAI's message `content`
+/// arrays. `pub(crate)` rather than private: `proxy.rs`'s `semantic_core`
+/// (a message's `content` field, not the system prompt) reads the same array
+/// shape and shares this rather than keeping its own copy.
+pub(crate) fn concat_text_blocks(blocks: &[Value]) -> String {
+    let mut buf = String::new();
+    for b in blocks {
+        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+            buf.push_str(t);
+            buf.push(' ');
+        }
+    }
+    buf.trim().to_string()
 }
 
 #[cfg(test)]
@@ -238,5 +293,125 @@ mod tests {
             Some("https://api.openai.com/v1/chat/completions"),
         );
         assert_eq!(w, Wire::Anthropic);
+    }
+
+    // --- system_text (semantic cache partition key) ---
+
+    #[test]
+    fn the_openai_door_finds_the_system_prompt_where_that_wire_keeps_it() {
+        let v = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"You are terse."},
+            {"role":"user","content":"hi"}
+        ]});
+        assert_eq!(Wire::OpenAi.system_text(&v), "You are terse.");
+    }
+
+    #[test]
+    fn the_o_series_developer_role_is_a_system_prompt_too() {
+        let v = json!({"model":"o1","messages":[
+            {"role":"developer","content":"Answer in one word."},
+            {"role":"user","content":"hi"}
+        ]});
+        assert_eq!(Wire::OpenAi.system_text(&v), "Answer in one word.");
+    }
+
+    #[test]
+    fn two_openai_requests_with_different_system_prompts_do_not_share_a_partition() {
+        let a = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"Answer in English."},
+            {"role":"user","content":"hi"}]});
+        let b = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"Answer in French."},
+            {"role":"user","content":"hi"}]});
+        assert_ne!(
+            Wire::OpenAi.system_text(&a),
+            Wire::OpenAi.system_text(&b),
+            "an empty system text on both is how one caller gets the other's answer"
+        );
+    }
+
+    #[test]
+    fn several_system_messages_are_read_in_order_and_joined() {
+        let v = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"Be terse."},
+            {"role":"user","content":"hi"},
+            {"role":"system","content":"Be polite."}
+        ]});
+        assert_eq!(Wire::OpenAi.system_text(&v), "Be terse. Be polite.");
+    }
+
+    #[test]
+    fn an_openai_system_message_carrying_content_parts_is_read_as_text() {
+        let v = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":[{"type":"text","text":"Be terse."}]},
+            {"role":"user","content":"hi"}
+        ]});
+        assert_eq!(Wire::OpenAi.system_text(&v), "Be terse.");
+    }
+
+    #[test]
+    fn the_anthropic_door_reads_the_field_it_always_read() {
+        let v = json!({"model":"claude-haiku-4-5","system":"You are terse."});
+        assert_eq!(Wire::Anthropic.system_text(&v), "You are terse.");
+        let arr = json!({"model":"claude-haiku-4-5",
+            "system":[{"type":"text","text":"You are terse."}]});
+        assert_eq!(Wire::Anthropic.system_text(&arr), "You are terse.");
+    }
+
+    #[test]
+    fn a_messages_array_that_is_empty_or_full_of_nonsense_is_read_without_panicking() {
+        for bad in [
+            json!({"model":"gpt-4o","messages":[]}),
+            json!({"model":"gpt-4o","messages":["hi", 3, null, []]}),
+            json!({"model":"gpt-4o","messages":{"role":"system"}}),
+            json!({"model":"gpt-4o"}),
+        ] {
+            assert_eq!(Wire::OpenAi.system_text(&bad), "");
+        }
+    }
+
+    #[test]
+    fn a_body_with_no_system_prompt_anywhere_yields_an_empty_string_on_both_doors() {
+        let v = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+        assert_eq!(Wire::OpenAi.system_text(&v), "");
+        assert_eq!(Wire::Anthropic.system_text(&json!({"model":"x"})), "");
+    }
+
+    #[test]
+    fn two_openai_requests_with_different_system_prompts_land_in_different_cache_partitions() {
+        // Same shape as the pre-existing Anthropic regression test
+        // (`system_text_different_array_systems_land_in_different_partitions`
+        // in proxy.rs): a unit test on `system_text` alone proves the string
+        // differs, but the actual failure mode this task exists to close is
+        // two callers sharing a semantic-cache partition. This proves the
+        // partition key itself, via the same `SemanticCache::partition_key`
+        // the proxy's cache lookup calls at crates/gateway/src/proxy.rs.
+        use tokenfuse_core::SemanticCache;
+
+        let a = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"Answer in English."},
+            {"role":"user","content":"hi"}]});
+        let b = json!({"model":"gpt-4o","messages":[
+            {"role":"system","content":"Answer in French."},
+            {"role":"user","content":"hi"}]});
+
+        let partition_a = SemanticCache::partition_key(
+            "gpt-4o",
+            &Wire::OpenAi.system_text(&a),
+            "",
+            "",
+            "default",
+        );
+        let partition_b = SemanticCache::partition_key(
+            "gpt-4o",
+            &Wire::OpenAi.system_text(&b),
+            "",
+            "",
+            "default",
+        );
+        assert_ne!(
+            partition_a, partition_b,
+            "two OpenAI callers with different system prompts must not share a cache partition"
+        );
     }
 }

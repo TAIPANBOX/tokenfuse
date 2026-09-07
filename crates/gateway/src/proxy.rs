@@ -988,7 +988,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         let core = semantic_core(&request);
         let partition = SemanticCache::partition_key(
             &parsed.model,
-            &system_text(&request),
+            &wire.system_text(&request),
             &tools_text(&request),
             &task_type,
             // Fixed single-tenant value: this gateway process serves one
@@ -2698,39 +2698,6 @@ fn cache_eligible(request: &serde_json::Value) -> bool {
     }
 }
 
-/// The system prompt text (Anthropic `system` field), for the partition key.
-/// Handles both shapes Anthropic's API accepts: a plain string, and an array
-/// of content blocks (the shape used with `cache_control` for prompt
-/// caching, e.g. `[{"type":"text","text":"..."}]`). Two requests with
-/// different array-shaped system prompts must produce different output here
-/// -- otherwise they'd land in the same cache partition and one tenant/agent
-/// could be served another's response generated under a different system
-/// prompt, violating the hard-partition guarantee documented on
-/// `SemanticCache::partition_key` (crates/core/src/cache.rs).
-fn system_text(request: &serde_json::Value) -> String {
-    match request.get("system") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(blocks)) => concat_text_blocks(blocks),
-        _ => String::new(),
-    }
-}
-
-/// Concatenates the `text` field of each text-shaped content block in an
-/// Anthropic content-block array (e.g. `[{"type":"text","text":"..."}]`),
-/// space-separated and trimmed. Shared by `system_text` (the `system`
-/// field) and `semantic_core` (a message's `content` field) -- both accept
-/// this same array shape from the Anthropic API.
-fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
-    let mut buf = String::new();
-    for b in blocks {
-        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-            buf.push_str(t);
-            buf.push(' ');
-        }
-    }
-    buf.trim().to_string()
-}
-
 /// A stable string for the tools schema, for the partition key.
 fn tools_text(request: &serde_json::Value) -> String {
     request
@@ -2821,7 +2788,9 @@ fn semantic_core(request: &serde_json::Value) -> String {
             }
             match msg.get("content") {
                 Some(serde_json::Value::String(s)) => text = s.clone(),
-                Some(serde_json::Value::Array(blocks)) => text = concat_text_blocks(blocks),
+                Some(serde_json::Value::Array(blocks)) => {
+                    text = crate::wire::concat_text_blocks(blocks)
+                }
                 _ => {}
             }
             break;
@@ -5393,7 +5362,10 @@ pub(crate) mod tests {
     #[test]
     fn system_text_extracts_a_plain_string() {
         let request = serde_json::json!({ "system": "You are a helpful assistant." });
-        assert_eq!(system_text(&request), "You are a helpful assistant.");
+        assert_eq!(
+            Wire::Anthropic.system_text(&request),
+            "You are a helpful assistant."
+        );
     }
 
     #[test]
@@ -5406,7 +5378,7 @@ pub(crate) mod tests {
         let request = serde_json::json!({
             "system": [{"type": "text", "text": "prompt A"}]
         });
-        assert_eq!(system_text(&request), "prompt A");
+        assert_eq!(Wire::Anthropic.system_text(&request), "prompt A");
     }
 
     #[test]
@@ -5417,7 +5389,7 @@ pub(crate) mod tests {
                 {"type": "text", "text": "block two"}
             ]
         });
-        assert_eq!(system_text(&request), "block one block two");
+        assert_eq!(Wire::Anthropic.system_text(&request), "block one block two");
     }
 
     #[test]
@@ -5427,13 +5399,16 @@ pub(crate) mod tests {
         // `cache_control`) must not silently fragment its cache.
         let string_shaped = serde_json::json!({ "system": "X" });
         let array_shaped = serde_json::json!({ "system": [{"type": "text", "text": "X"}] });
-        assert_eq!(system_text(&string_shaped), system_text(&array_shaped));
+        assert_eq!(
+            Wire::Anthropic.system_text(&string_shaped),
+            Wire::Anthropic.system_text(&array_shaped)
+        );
     }
 
     #[test]
     fn system_text_is_empty_when_system_field_is_absent() {
         let request = serde_json::json!({ "model": "m" });
-        assert_eq!(system_text(&request), "");
+        assert_eq!(Wire::Anthropic.system_text(&request), "");
     }
 
     #[test]
@@ -5451,8 +5426,8 @@ pub(crate) mod tests {
         let request_b = serde_json::json!({
             "system": [{"type": "text", "text": "prompt B"}]
         });
-        let text_a = system_text(&request_a);
-        let text_b = system_text(&request_b);
+        let text_a = Wire::Anthropic.system_text(&request_a);
+        let text_b = Wire::Anthropic.system_text(&request_b);
         assert_ne!(
             text_a, text_b,
             "different array-shaped system prompts must produce different system_text"
