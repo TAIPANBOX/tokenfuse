@@ -22,7 +22,7 @@ use crate::wire::Wire;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{response::Builder, HeaderMap, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenfuse_core::agent_event::EventType;
@@ -468,7 +468,23 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
 /// `wire.parse_request`, so everything from here on (budget check, firewall,
 /// identity, caching, forwarding) is the same code for every door; the body
 /// itself is forwarded as-is once the budget check passes.
-async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
+///
+/// `pub` rather than crate-private: the OpenAI door's route is not registered
+/// on the router yet (that is the next task), so until it is, this is also
+/// the integration tests' only way to exercise that door's dispatch honestly,
+/// see `tests/wire_door.rs`.
+pub async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
+    // A process forwards to one upstream endpoint, so it serves the door
+    // matching that upstream's shape and refuses the other one loudly, before
+    // anything is reserved: nothing is opened, no budget is checked, no key is
+    // even resolved. Checked before `resolve_client_key` for exactly that
+    // reason - forwarding an OpenAI body to an Anthropic endpoint would turn a
+    // configuration mistake into a provider error with a settled reservation
+    // behind it.
+    if wire != st.wire {
+        return wire_mismatch(wire, st.wire);
+    }
+
     // Who is calling, resolved from the credential they presented rather than
     // from anything they can write. Empty when client keys are not configured,
     // which is every deployment that has not opted in.
@@ -2339,6 +2355,33 @@ fn metering_required() -> Response {
         .header("x-fuse", "blocked")
         .body(Body::from(body.to_string()))
         .expect("valid response")
+}
+
+/// The door a caller used is not the one this process serves. Refused here,
+/// before a run is opened or a cent reserved, because forwarding an OpenAI
+/// body to an Anthropic endpoint turns a configuration mistake into a provider
+/// error with a settled reservation behind it, and the operator reads the
+/// upstream's complaint instead of ours.
+fn wire_mismatch(asked: Wire, serving: Wire) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "wire_mismatch",
+            "message": format!(
+                "this gateway serves {} only. Set TOKENFUSE_WIRE={} and point \
+                 TOKENFUSE_UPSTREAM at an endpoint that speaks it, or call {}.",
+                serving.route_path(),
+                match asked { Wire::OpenAi => "openai", Wire::Anthropic => "anthropic" },
+                serving.route_path(),
+            ),
+            "retryable": false,
+        }
+    });
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json"), ("x-fuse", "blocked")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 fn dlp_block(run_id: &str, summary: &str) -> Response {

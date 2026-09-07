@@ -123,6 +123,10 @@ pub struct AppState {
     /// test already gets; `main.rs` sets it from `TOKENFUSE_ADMIN_KEYS`, the
     /// bind address and `TOKENFUSE_ALLOW_OPEN_OBS`.
     pub admin_gate: AdminGate,
+    /// Which front door this process serves, from `TOKENFUSE_WIRE` or inferred
+    /// from the upstream URL. The other door refuses rather than forwarding a
+    /// body the upstream cannot read.
+    pub wire: crate::wire::Wire,
 }
 
 /// The one label no review can take off a run.
@@ -548,6 +552,9 @@ impl AppState {
             units: Arc::new(UnitLedger::default()),
             keystats: Arc::new(KeyStats::default()),
             admin_gate: AdminGate::default(),
+            // Every deployment that predates this field is Anthropic-only, so
+            // that is the default until `main.rs` (or a test) sets otherwise.
+            wire: crate::wire::Wire::Anthropic,
         }
     }
 
@@ -707,6 +714,14 @@ impl AppState {
     /// which is what every existing deployment and test gets on upgrade.
     pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
         self.admin_gate = gate;
+        self
+    }
+
+    /// Set which front door this process serves. Chainable. Not set means
+    /// `Wire::Anthropic`, which is what every deployment that predates this
+    /// field already is.
+    pub fn with_wire(mut self, wire: crate::wire::Wire) -> Self {
+        self.wire = wire;
         self
     }
 

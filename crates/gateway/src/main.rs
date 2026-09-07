@@ -12,6 +12,7 @@ use tokenfuse_gateway::app;
 use tokenfuse_gateway::pricebook::default_price_book;
 use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
+use tokenfuse_gateway::wire::Wire;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -683,6 +684,10 @@ async fn serve() {
     let allow_stub = std::env::var("TOKENFUSE_ALLOW_STUB")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // `upstream` is consumed by the match below; the wire declaration reads
+    // the URL too, so it needs its own copy rather than the one the match
+    // moves into `HttpProvider::new`.
+    let upstream_url = upstream.clone();
     let provider: Arc<dyn Provider> = match (upstream, allow_stub) {
         (Some(url), _) => {
             tracing::info!(%url, "forwarding to real upstream");
@@ -714,6 +719,24 @@ async fn serve() {
             std::process::exit(2);
         }
     };
+
+    // Which front door this process serves (docs/26-the-openai-door.md): what
+    // the operator declared in TOKENFUSE_WIRE, else what TOKENFUSE_UPSTREAM's
+    // path implies, else Anthropic, which is what every deployment that
+    // predates this variable already is. The other door refuses rather than
+    // forwarding a body the upstream cannot read.
+    let declared = std::env::var("TOKENFUSE_WIRE").ok();
+    let wire = Wire::from_declaration(declared.as_deref(), upstream_url.as_deref());
+    if let Some(d) = declared.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        if !d.eq_ignore_ascii_case("openai") && !d.eq_ignore_ascii_case("anthropic") {
+            tracing::warn!(
+                value = %d,
+                "TOKENFUSE_WIRE is neither `anthropic` nor `openai`; falling back to the \
+                 shape implied by TOKENFUSE_UPSTREAM"
+            );
+        }
+    }
+    tracing::info!(?wire, path = %wire.route_path(), "serving one door");
 
     // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Default is
     // shadow (safe to drop in — surfaces "would block" without changing
@@ -879,7 +902,8 @@ async fn serve() {
     )
     .with_client_keys(Arc::new(client_keys))
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
-    .with_agent_id_mode(agent_id_mode);
+    .with_agent_id_mode(agent_id_mode)
+    .with_wire(wire);
 
     // Who may call the observability/kill routes (CLAUDE.md invariant, see
     // `adminkeys`): TOKENFUSE_ADMIN_KEYS, comma-separated bearer keys, same

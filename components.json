@@ -261,6 +261,9 @@
           },
           "TOKENFUSE_WASM_POLICY": {
             "required": false
+          },
+          "TOKENFUSE_WIRE": {
+            "required": false
           }
         }
       },
