@@ -12,6 +12,7 @@ use tokenfuse_gateway::app;
 use tokenfuse_gateway::pricebook::default_price_book;
 use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
 use tokenfuse_gateway::state::AppState;
+use tokenfuse_gateway::wire::Wire;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -683,6 +684,10 @@ async fn serve() {
     let allow_stub = std::env::var("TOKENFUSE_ALLOW_STUB")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // `upstream` is consumed by the match below; the wire declaration reads
+    // the URL too, so it needs its own copy rather than the one the match
+    // moves into `HttpProvider::new`.
+    let upstream_url = upstream.clone();
     let provider: Arc<dyn Provider> = match (upstream, allow_stub) {
         (Some(url), _) => {
             tracing::info!(%url, "forwarding to real upstream");
@@ -714,6 +719,69 @@ async fn serve() {
             std::process::exit(2);
         }
     };
+
+    // Which front door this process serves (docs/26-the-openai-door.md): what
+    // the operator declared in TOKENFUSE_WIRE, else what TOKENFUSE_UPSTREAM's
+    // path implies, else Anthropic, which is what every deployment that
+    // predates this variable already is. The other door refuses rather than
+    // forwarding a body the upstream cannot read.
+    let declared = std::env::var("TOKENFUSE_WIRE").ok();
+    let wire = Wire::from_declaration(declared.as_deref(), upstream_url.as_deref());
+    if let Some(d) = declared.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        if !d.eq_ignore_ascii_case("openai") && !d.eq_ignore_ascii_case("anthropic") {
+            tracing::warn!(
+                value = %d,
+                "TOKENFUSE_WIRE is neither `anthropic` nor `openai`; falling back to the \
+                 shape implied by TOKENFUSE_UPSTREAM"
+            );
+        }
+    }
+    // The built-in stub always answers a fixed, Anthropic-shaped body
+    // (`{"stub":true,"usage":{"input_tokens":...,"output_tokens":...}}`,
+    // `provider::StubProvider`), never the OpenAI wire's `choices`/
+    // `prompt_tokens` shape. A deployment that sets TOKENFUSE_ALLOW_STUB=1
+    // and also declares (or is left to infer, though there is no upstream URL
+    // here to infer FROM) TOKENFUSE_WIRE=openai would serve /v1/chat/completions
+    // requests a body no OpenAI-speaking client can parse, while every other
+    // check - the route answers, the ledger meters, the healthz check passes -
+    // reports a healthy gateway. That is exactly the shape CLAUDE.md's other
+    // ALLOW_STUB warning already exists to prevent for invented usage numbers,
+    // one door over: silent-looking, discovered only by a caller reading a
+    // response it cannot use.
+    //
+    // Refusing to start, not merely warning, because the operator has already
+    // made TWO explicit choices to reach this state (ALLOW_STUB and WIRE=openai
+    // both have to be set on purpose - there is no upstream URL for either to
+    // be inferred from here), and both are opt-in variables that already carry
+    // loud warnings elsewhere in this file. A third loud warning nobody reads
+    // is not a control; refusing is one command away from being unblocked by
+    // whichever fix the operator actually meant (drop TOKENFUSE_WIRE, or point
+    // TOKENFUSE_UPSTREAM at a real OpenAI-compatible endpoint instead of the
+    // stub), matching the shape of every other refuse-to-start gate in this
+    // file (TOKENFUSE_UPSTREAM missing, TOKENFUSE_MCP_ALLOW_OPEN_BIND).
+    //
+    // Checked BEFORE the "serving one door" log line below, not after: a log
+    // reader must never see a door announced and then refused a few lines
+    // later, which is what this refusal used to read like.
+    if upstream_url.is_none() && allow_stub && wire == Wire::OpenAi {
+        eprintln!(
+            "tokenfuse: refusing to start: TOKENFUSE_ALLOW_STUB=1 with the OpenAI wire \
+             declared (TOKENFUSE_WIRE=openai) and no TOKENFUSE_UPSTREAM.\n\
+             \n\
+             The built-in stub always answers a fixed, Anthropic-shaped body. A caller\n\
+             speaking to /v1/chat/completions would get a response it cannot parse, while\n\
+             this gateway reports itself healthy throughout - the numbers were already\n\
+             invented (that is what TOKENFUSE_ALLOW_STUB says out loud); this would also\n\
+             invent the wire shape.\n\
+             \n\
+             Fix one of the following:\n\
+             \x20 - drop TOKENFUSE_WIRE (or set it to `anthropic`) to match what the stub answers\n\
+             \x20 - set TOKENFUSE_UPSTREAM to a real OpenAI-compatible endpoint instead of the stub"
+        );
+        std::process::exit(2);
+    }
+
+    tracing::info!(?wire, path = %wire.route_path(), "serving one door");
 
     // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Default is
     // shadow (safe to drop in — surfaces "would block" without changing
@@ -879,7 +947,8 @@ async fn serve() {
     )
     .with_client_keys(Arc::new(client_keys))
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
-    .with_agent_id_mode(agent_id_mode);
+    .with_agent_id_mode(agent_id_mode)
+    .with_wire(wire);
 
     // Who may call the observability/kill routes (CLAUDE.md invariant, see
     // `adminkeys`): TOKENFUSE_ADMIN_KEYS, comma-separated bearer keys, same

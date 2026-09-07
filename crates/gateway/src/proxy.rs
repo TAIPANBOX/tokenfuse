@@ -18,10 +18,11 @@ use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
 use crate::unitledger::UnitReservation;
 use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
+use crate::wire::Wire;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{response::Builder, HeaderMap, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenfuse_core::agent_event::EventType;
@@ -455,9 +456,52 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
-/// as-is once the budget check passes.
-pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: Bytes) -> Response {
+/// The Anthropic Messages door. Everything it does lives in [`handle`]; this
+/// exists so the route table names a handler per door and the shape is chosen
+/// in exactly one place.
+pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    handle(Wire::Anthropic, st, headers, body).await
+}
+
+/// The OpenAI Chat Completions door. Same handler, same enforcement, a
+/// different body shape. Requires an OpenAI-compatible upstream; see
+/// `docs/26-the-openai-door.md`.
+pub async fn chat_completions(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(Wire::OpenAi, st, headers, body).await
+}
+
+/// The shared enforcement path both doors serve through, parameterised by
+/// which wire the caller spoke. `wire.parse_request` is not the only reader
+/// of the raw JSON: `taint::tool_uses_in`, `cache_eligible`, `semantic_core`
+/// and `tools_text` all read it too, each already wire-agnostic (see
+/// `docs/26-the-openai-door.md` section 8). `system_text` is the one reader
+/// that is wire-specific by design, since the two doors keep the system
+/// prompt in different places and `Wire::system_text` matches on `self` to
+/// find it. What IS true is that budget check, firewall, identity, caching
+/// and forwarding are the same code for every door; the body is not
+/// forwarded as-is, though - the model rewrite, DLP masking and (on a
+/// streamed OpenAI request) `Wire::prepare_upstream_body` can each still
+/// rewrite it after the budget check passes, before it reaches the provider.
+///
+/// Crate-private: both doors are registered on the router (`lib.rs`), so
+/// tests reach either one through real HTTP on `tokenfuse_gateway::app`
+/// rather than calling this directly - see `tests/wire_door.rs`.
+async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
+    // A process forwards to one upstream endpoint, so it serves the door
+    // matching that upstream's shape and refuses the other one loudly, before
+    // anything is reserved: nothing is opened, no budget is checked, no key is
+    // even resolved. Checked before `resolve_client_key` for exactly that
+    // reason - forwarding an OpenAI body to an Anthropic endpoint would turn a
+    // configuration mistake into a provider error with a settled reservation
+    // behind it.
+    if wire != st.wire {
+        return wire_mismatch(wire, st.wire);
+    }
+
     // Who is calling, resolved from the credential they presented rather than
     // from anything they can write. Empty when client keys are not configured,
     // which is every deployment that has not opted in.
@@ -477,7 +521,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
 
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let mut parsed = parse_request(&request);
+    let mut parsed = wire.parse_request(&request);
 
     // No run id → unmanaged pass-through (drop-in safe), unless the operator
     // has said that a call which cannot be metered is not a call this gateway
@@ -745,6 +789,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &st.prices,
             body.len(),
             parsed.max_tokens,
+            parsed.completions,
         );
         let mut applied = false;
         if st.router.mode == RouterMode::On && decision.routed() {
@@ -778,8 +823,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         // No estimate has been computed yet on this path (it's derived below,
         // once past the kill/DLP gates) — compute it locally so the avoided
         // spend is still captured for the trace.
-        let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
-            .unwrap_or(Microusd::ZERO);
+        let estimate = estimate_cost(
+            &st.prices,
+            &parsed.model,
+            body.len(),
+            parsed.max_tokens,
+            parsed.completions,
+        )
+        .unwrap_or(Microusd::ZERO);
         st.sink.record(CallRecord {
             ts_millis: now_millis(),
             run_id: run_id.clone(),
@@ -814,7 +865,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
             &verdict,
             &unit,
         );
-        return breaker_error_response(&run_id, &verdict);
+        return breaker_error_response(wire, &run_id, &verdict);
     }
 
     // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
@@ -941,7 +992,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         let core = semantic_core(&request);
         let partition = SemanticCache::partition_key(
             &parsed.model,
-            &system_text(&request),
+            &wire.system_text(&request),
             &tools_text(&request),
             &task_type,
             // Fixed single-tenant value: this gateway process serves one
@@ -1003,8 +1054,14 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
         cache_ctx = Some(CacheCtx { partition, core });
     }
 
-    let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens)
-        .unwrap_or(Microusd::ZERO);
+    let estimate = estimate_cost(
+        &st.prices,
+        &parsed.model,
+        body.len(),
+        parsed.max_tokens,
+        parsed.completions,
+    )
+    .unwrap_or(Microusd::ZERO);
 
     // `open_run` above just committed (the in-process ledger applies
     // synchronously; the raft ledger's write returned only after a majority
@@ -1081,7 +1138,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
             st.sink.record(CallRecord {
@@ -1118,7 +1175,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
     }
 
@@ -1182,7 +1239,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
     }
 
@@ -1387,7 +1444,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                         &verdict,
                         &unit,
                     );
-                    return breaker_error_response(&run_id, &verdict);
+                    return breaker_error_response(wire, &run_id, &verdict);
                 }
             },
             Mode::Shadow | Mode::Warn => st.units.reserve_unchecked(&unit, estimate, now_millis()),
@@ -1450,7 +1507,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &verdict,
                     &unit,
                 );
-                return breaker_error_response(&run_id, &verdict);
+                return breaker_error_response(wire, &run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
                 if let Some(ur) = &unit_reservation {
@@ -1502,7 +1559,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
                     &verdict,
                     &unit,
                 );
-                return breaker_error_response(&run_id, &verdict);
+                return breaker_error_response(wire, &run_id, &verdict);
             }
         },
         Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate).await,
@@ -1612,6 +1669,12 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
     } else {
         Labels::new()
     };
+
+    // Ask for usage on a stream that would otherwise report none. Last, so it
+    // sees the body every earlier stage produced (DLP masking, model rewrite).
+    if let Some(prepared) = wire.prepare_upstream_body(&body, parsed.stream) {
+        body = prepared;
+    }
 
     let resp = match st.provider.send(headers, body).await {
         Ok(r) => r,
@@ -2330,6 +2393,33 @@ fn metering_required() -> Response {
         .expect("valid response")
 }
 
+/// The door a caller used is not the one this process serves. Refused here,
+/// before a run is opened or a cent reserved, because forwarding an OpenAI
+/// body to an Anthropic endpoint turns a configuration mistake into a provider
+/// error with a settled reservation behind it, and the operator reads the
+/// upstream's complaint instead of ours.
+fn wire_mismatch(asked: Wire, serving: Wire) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "wire_mismatch",
+            "message": format!(
+                "this gateway serves {} only. Set TOKENFUSE_WIRE={} and point \
+                 TOKENFUSE_UPSTREAM at an endpoint that speaks it, or call {}.",
+                serving.route_path(),
+                match asked { Wire::OpenAi => "openai", Wire::Anthropic => "anthropic" },
+                serving.route_path(),
+            ),
+            "retryable": false,
+        }
+    });
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "application/json"), ("x-fuse", "blocked")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 fn dlp_block(run_id: &str, summary: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -2545,13 +2635,37 @@ async fn collect(
 /// owner of the 402 budget/policy/loop/kill/wasm wire contract. Status, body,
 /// and headers are byte-identical to the pre-refactor `budget_error` builder;
 /// the verdict's `to_error_json` mirrors that JSON shape exactly.
-fn breaker_error_response(run_id: &str, verdict: &BreakerVerdict) -> Response {
+fn breaker_error_response(wire: Wire, run_id: &str, verdict: &BreakerVerdict) -> Response {
     let status = verdict
         .reason
         .map(BreakerReason::http_status)
         .and_then(|code| StatusCode::from_u16(code).ok())
         .unwrap_or(StatusCode::PAYMENT_REQUIRED);
-    let body = verdict.to_error_json(run_id);
+    let mut body = verdict.to_error_json(run_id);
+    // The Anthropic branch builds exactly what it always has (invariant 2:
+    // breaker_error_response_matches_budget_error_byte_for_byte pins those
+    // bytes across refactors). OpenAI clients read `error.message`,
+    // `error.code` and `error.param` by convention (openai-python's
+    // `_exceptions.py`), so those three are added for that door only; our
+    // own fields (`type`, `run_id`, `reason`, `retryable`, ...) stay exactly
+    // as they are, a superset either way.
+    if wire == Wire::OpenAi {
+        if let Some(err) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+            let kind = verdict
+                .reason
+                .map(|r| r.as_wire_str().to_string())
+                .unwrap_or_else(|| "blocked".to_string());
+            err.insert(
+                "message".to_string(),
+                serde_json::Value::String(format!(
+                    "run {run_id} was stopped by the gateway: {}",
+                    verdict.detail.as_deref().unwrap_or("")
+                )),
+            );
+            err.insert("code".to_string(), serde_json::Value::String(kind));
+            err.insert("param".to_string(), serde_json::Value::Null);
+        }
+    }
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -2592,27 +2706,6 @@ fn upstream_error(e: ProviderError) -> Response {
         .expect("valid response")
 }
 
-struct ParsedRequest {
-    model: String,
-    max_tokens: Option<u64>,
-    stream: bool,
-}
-
-fn parse_request(value: &serde_json::Value) -> ParsedRequest {
-    ParsedRequest {
-        model: value
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        max_tokens: value.get("max_tokens").and_then(|m| m.as_u64()),
-        stream: value
-            .get("stream")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false),
-    }
-}
-
 /// Re-serialize `body` with its top-level `"model"` field set to `model`
 /// (the router's chosen candidate), the same "parse, mutate, re-serialize"
 /// shape the DLP mask path already uses to rewrite the outgoing body.
@@ -2637,39 +2730,6 @@ fn cache_eligible(request: &serde_json::Value) -> bool {
         Some(serde_json::Value::Array(a)) => a.is_empty(),
         Some(_) => false,
     }
-}
-
-/// The system prompt text (Anthropic `system` field), for the partition key.
-/// Handles both shapes Anthropic's API accepts: a plain string, and an array
-/// of content blocks (the shape used with `cache_control` for prompt
-/// caching, e.g. `[{"type":"text","text":"..."}]`). Two requests with
-/// different array-shaped system prompts must produce different output here
-/// -- otherwise they'd land in the same cache partition and one tenant/agent
-/// could be served another's response generated under a different system
-/// prompt, violating the hard-partition guarantee documented on
-/// `SemanticCache::partition_key` (crates/core/src/cache.rs).
-fn system_text(request: &serde_json::Value) -> String {
-    match request.get("system") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(blocks)) => concat_text_blocks(blocks),
-        _ => String::new(),
-    }
-}
-
-/// Concatenates the `text` field of each text-shaped content block in an
-/// Anthropic content-block array (e.g. `[{"type":"text","text":"..."}]`),
-/// space-separated and trimmed. Shared by `system_text` (the `system`
-/// field) and `semantic_core` (a message's `content` field) -- both accept
-/// this same array shape from the Anthropic API.
-fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
-    let mut buf = String::new();
-    for b in blocks {
-        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-            buf.push_str(t);
-            buf.push(' ');
-        }
-    }
-    buf.trim().to_string()
 }
 
 /// A stable string for the tools schema, for the partition key.
@@ -2762,7 +2822,9 @@ fn semantic_core(request: &serde_json::Value) -> String {
             }
             match msg.get("content") {
                 Some(serde_json::Value::String(s)) => text = s.clone(),
-                Some(serde_json::Value::Array(blocks)) => text = concat_text_blocks(blocks),
+                Some(serde_json::Value::Array(blocks)) => {
+                    text = crate::wire::concat_text_blocks(blocks)
+                }
                 _ => {}
             }
             break;
@@ -3026,6 +3088,66 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_anthropic_door_is_served_through_the_shared_handler() {
+        // The point of this test is not the 200: it is that `messages` reaches
+        // the shared handler with Wire::Anthropic, so a later door cannot
+        // change what this one does without failing here.
+        //
+        // Adapted from the task brief, which assumed a `test_state()` helper
+        // and a bare 200 for `HeaderMap::new()`. This module's helper is
+        // `state(mode, provider)`, and `AppState::new` defaults
+        // `require_run_id: true` (state.rs:534), so an empty header map with
+        // no `x-fuse-run-id` would hit `metering_required()` (400) rather than
+        // 200. `.with_require_run_id(false)` restores the unmanaged
+        // pass-through the brief's plain 200 assumed.
+        let st = state(Mode::Enforce, StubProvider::default()).with_require_run_id(false);
+        let resp = handle(Wire::Anthropic, st, HeaderMap::new(), Bytes::from(body(64))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_messages_door_reaches_the_shared_handler_as_anthropic_not_openai() {
+        // Unlike the test above, this one never calls `handle` directly: it
+        // drives the real router (`crate::app`) through a POST to
+        // `/v1/messages`, so it exercises `messages` itself, the one line
+        // this task could get wrong.
+        //
+        // The body carries two output-limit fields that disagree:
+        // `max_tokens: 1` and `max_completion_tokens: 1_000_000`. Only the
+        // Anthropic wire reads `max_tokens`; only the OpenAI wire reads
+        // `max_completion_tokens` (and prefers it over `max_tokens` when both
+        // are present, see `wire::parse_request`). So the estimate this
+        // request produces depends entirely on which `Wire` `messages`
+        // passed to `handle`:
+        //
+        //   - Wire::Anthropic (correct): max_tokens=1 -> a few cents' worth
+        //     of tokens at most -> comfortably inside a $0.01 budget -> 200.
+        //   - Wire::OpenAi (the mistake this task could make): max_tokens=1
+        //     is ignored in favour of max_completion_tokens=1_000_000 ->
+        //     an estimate around $17 -> the same $0.01 budget refuses it
+        //     with 402.
+        //
+        // One request, two possible answers, and only the correct wiring in
+        // `messages` gives the allowed one.
+        let body = r#"{"model":"test-model","max_tokens":1,"max_completion_tokens":1000000}"#;
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-anthropic-not-openai")
+            .header("x-fuse-budget-usd", "0.01")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "messages() must reach handle with Wire::Anthropic: it reads only \
+             max_tokens (1) and stays inside a $0.01 budget. A 402 here means \
+             max_completion_tokens (1,000,000) won instead, i.e. messages() \
+             passed Wire::OpenAi."
+        );
+    }
+
+    #[tokio::test]
     async fn healthz_is_ok() {
         let req = Request::get("/healthz").body(Body::empty()).unwrap();
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
@@ -3136,7 +3258,7 @@ pub(crate) mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
 
-        let expected = estimate_cost(&prices, "test-model", body(100_000).len(), Some(100_000))
+        let expected = estimate_cost(&prices, "test-model", body(100_000).len(), Some(100_000), 1)
             .unwrap_or(Microusd::ZERO);
         assert!(
             expected > Microusd::ZERO,
@@ -5150,7 +5272,7 @@ pub(crate) mod tests {
 
             let old = golden_budget_error(kind, run_id, budget, spent, policy_id, detail);
             let verdict = budget_verdict(reason, budget, spent, policy_id, detail);
-            let new = breaker_error_response(run_id, &verdict);
+            let new = breaker_error_response(Wire::Anthropic, run_id, &verdict);
 
             // Status.
             assert_eq!(new.status(), old.status(), "status mismatch for {kind}");
@@ -5170,6 +5292,60 @@ pub(crate) mod tests {
             let new_bytes = to_bytes(new.into_body(), usize::MAX).await.unwrap();
             assert_eq!(new_bytes, old_bytes, "body bytes mismatch for {kind}");
         }
+    }
+
+    // --- breaker_error_response(wire, ..): a refusal each door's own clients parse ---
+
+    /// Not an existing helper before this task: no such extractor was found
+    /// in this module (checked by grep before writing this), so it is added
+    /// here rather than assumed. `#[test]` in the brief's Step 1 does not
+    /// compile against this crate: extracting an axum `Response` body is
+    /// async (`axum::body::to_bytes`), matching every other body-reading
+    /// test in this module (see `breaker_error_response_matches_budget_error_byte_for_byte`
+    /// just above), so both new tests are `#[tokio::test]` instead.
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_openai_door_refuses_in_the_envelope_its_clients_parse() {
+        let verdict = budget_verdict(
+            BreakerReason::BudgetExceeded,
+            Microusd::from_usd(5.0),
+            Microusd::from_usd(5.5),
+            "p1",
+            "over budget",
+        );
+        let resp = breaker_error_response(Wire::OpenAi, "r1", &verdict);
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "budget_exceeded");
+        assert_eq!(v["error"]["code"], "budget_exceeded");
+        assert!(v["error"]["param"].is_null());
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("r1"), "the message names the run");
+        // The fields the record already carries are still there.
+        assert_eq!(v["error"]["run_id"], "r1");
+        assert_eq!(v["error"]["retryable"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_door_still_refuses_in_exactly_the_bytes_it_always_did() {
+        let verdict = budget_verdict(
+            BreakerReason::BudgetExceeded,
+            Microusd::from_usd(5.0),
+            Microusd::from_usd(5.5),
+            "p1",
+            "over budget",
+        );
+        let v = body_json(breaker_error_response(Wire::Anthropic, "r1", &verdict)).await;
+        assert!(
+            v["error"].get("message").is_none(),
+            "no message on this door"
+        );
+        assert!(v["error"].get("code").is_none());
+        assert!(v["error"].get("param").is_none());
     }
 
     // --- referenced_domains (Wardryx `domains` extraction) ---
@@ -5274,7 +5450,10 @@ pub(crate) mod tests {
     #[test]
     fn system_text_extracts_a_plain_string() {
         let request = serde_json::json!({ "system": "You are a helpful assistant." });
-        assert_eq!(system_text(&request), "You are a helpful assistant.");
+        assert_eq!(
+            Wire::Anthropic.system_text(&request),
+            "You are a helpful assistant."
+        );
     }
 
     #[test]
@@ -5287,7 +5466,7 @@ pub(crate) mod tests {
         let request = serde_json::json!({
             "system": [{"type": "text", "text": "prompt A"}]
         });
-        assert_eq!(system_text(&request), "prompt A");
+        assert_eq!(Wire::Anthropic.system_text(&request), "prompt A");
     }
 
     #[test]
@@ -5298,7 +5477,7 @@ pub(crate) mod tests {
                 {"type": "text", "text": "block two"}
             ]
         });
-        assert_eq!(system_text(&request), "block one block two");
+        assert_eq!(Wire::Anthropic.system_text(&request), "block one block two");
     }
 
     #[test]
@@ -5308,13 +5487,16 @@ pub(crate) mod tests {
         // `cache_control`) must not silently fragment its cache.
         let string_shaped = serde_json::json!({ "system": "X" });
         let array_shaped = serde_json::json!({ "system": [{"type": "text", "text": "X"}] });
-        assert_eq!(system_text(&string_shaped), system_text(&array_shaped));
+        assert_eq!(
+            Wire::Anthropic.system_text(&string_shaped),
+            Wire::Anthropic.system_text(&array_shaped)
+        );
     }
 
     #[test]
     fn system_text_is_empty_when_system_field_is_absent() {
         let request = serde_json::json!({ "model": "m" });
-        assert_eq!(system_text(&request), "");
+        assert_eq!(Wire::Anthropic.system_text(&request), "");
     }
 
     #[test]
@@ -5332,8 +5514,8 @@ pub(crate) mod tests {
         let request_b = serde_json::json!({
             "system": [{"type": "text", "text": "prompt B"}]
         });
-        let text_a = system_text(&request_a);
-        let text_b = system_text(&request_b);
+        let text_a = Wire::Anthropic.system_text(&request_a);
+        let text_b = Wire::Anthropic.system_text(&request_b);
         assert_ne!(
             text_a, text_b,
             "different array-shaped system prompts must produce different system_text"
@@ -6250,7 +6432,7 @@ pub(crate) mod tests {
         let billed = prices
             .cost("test-model", &reported)
             .expect("test-model is priced");
-        let estimate = estimate_cost(&prices, "test-model", body(500).len(), Some(500))
+        let estimate = estimate_cost(&prices, "test-model", body(500).len(), Some(500), 1)
             .expect("test-model is priced");
         assert!(
             billed > Microusd::ZERO,
@@ -6425,7 +6607,7 @@ pub(crate) mod tests {
         let billed = prices
             .cost("test-model", &reported)
             .expect("test-model is priced");
-        let estimate = estimate_cost(&prices, "test-model", body_stream(500).len(), Some(500))
+        let estimate = estimate_cost(&prices, "test-model", body_stream(500).len(), Some(500), 1)
             .expect("test-model is priced");
         assert!(
             billed > Microusd::ZERO,

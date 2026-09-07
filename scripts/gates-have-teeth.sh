@@ -560,6 +560,19 @@ run_case "same-doors: an explained one-sided door, reworded" pass \
 	"./scripts/both-processes-configure-the-same-doors.sh" \
 	"$(py 'edit("crates/gateway/src/main.rs", "process-local: the broker forwards MCP messages and picks no model", "process-local: the broker picks no model at all")')"
 
+# --- the OpenAI door: two doors, one upstream, and a loud refusal ----------
+#
+# Not a scripts/*.sh gate: the wire guard is enforcement code, held by
+# `cargo test` rather than by a shell script that parses text. `run_case`'s
+# mechanism (mutate, run a command, expect a status) does not care which kind
+# of command it runs, so the "gate" here is the exact test named in
+# docs/26-the-openai-door.md's mutation table for this fault
+# (crates/gateway/tests/wire_door.rs).
+run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
+	"cargo test -p tokenfuse-gateway --test wire_door -- --exact a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {", "    if false && wire != st.wire {")')" \
+	"a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

@@ -253,6 +253,10 @@ fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
         apply_anthropic(usage, u);
     }
     // Anthropic message_delta / non-stream, or OpenAI: top-level "usage".
+    // Defense in depth, currently unobservable: `Value::get` already returns
+    // `None` for a non-object (including `null`) to both `apply_*` below, so
+    // deleting this filter changes no test in `provider`'s module (checked
+    // 2026-09-07). No test can pin it for that reason; keep it anyway.
     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
         if u.get("prompt_tokens").is_some() || u.get("completion_tokens").is_some() {
             apply_openai(usage, u);
@@ -720,6 +724,46 @@ mod tests {
             p.finish().truncated,
             "the first and only chunk already overshot the cap"
         );
+    }
+
+    // -- a null usage chunk is not a zero (docs/26-the-openai-door.md) -----
+
+    /// With `stream_options.include_usage` set, the provider's own reference
+    /// says "All other chunks will also include a `usage` field, but with a
+    /// null value." This pins that a stream shaped exactly that way, `usage:
+    /// null` on every chunk but the last, still settles on the last chunk's
+    /// real numbers.
+    ///
+    /// This does NOT pin `merge_usage`'s `.filter(u.is_object())`: `Value::get`
+    /// already returns `None` for a JSON `null`, so the filter's removal does
+    /// not change this test's result (checked 2026-09-07, see the comment on
+    /// the filter itself). What this test actually exercises is that feeding
+    /// a null-usage chunk before the real one doesn't otherwise disturb
+    /// `UsageParser`'s state, e.g. by tripping some other code path into
+    /// treating the run as already settled at zero.
+    #[test]
+    fn a_stream_with_null_usage_on_every_chunk_but_the_last_still_settles_on_the_last_chunk() {
+        let mut p = UsageParser::default();
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n");
+        p.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let u = p.finish();
+        assert_eq!(u.usage.input_tokens, 10);
+        assert_eq!(u.usage.output_tokens, 5);
+    }
+
+    /// The final usage chunk's `choices` is always an empty array (the
+    /// provider's own reference); that must read as "zero tool calls
+    /// observed", never as "nothing observed at all" (`None`).
+    #[test]
+    fn the_final_usage_chunks_empty_choices_array_counts_no_tool_calls() {
+        let mut p = UsageParser::default();
+        p.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+        );
+        let u = p.finish();
+        assert_eq!(u.usage.tool_calls, Some(0));
     }
 
     #[tokio::test]

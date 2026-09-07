@@ -302,9 +302,11 @@ comparison in #132.
 
 **Counts re-measured 2026-09-07**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1162 passing** (core 308, dpop 16, delegation 41,
-gateway 597, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Python SDK: 11
+`cargo test --all` runs **1210 passing** (core 308, dpop 16, delegation 41,
+gateway 645, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). The gateway
+figure grew from 597 across this plan's own nine tasks (the OpenAI door);
+re-measured once, here, at the end of it rather than per task. Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
 **`tokenfuse-cluster`: 13 integration tests** on live raft clusters (in-process
 + over HTTP sockets, incl. token-auth, HTTPS, **mTLS**, membership, linearizable

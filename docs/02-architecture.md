@@ -37,7 +37,7 @@ Language split: Rust for everything in the request path **and the Cloud control 
 
 ## 4. Core components (a single Rust binary)
 
-1. **Gateway** — `/v1/messages` (Anthropic Messages API). An OpenAI-compatible `/v1/chat/completions` endpoint is planned but NOT yet implemented; the router today serves only `/v1/messages`, `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys` and `/v1/policy-plane` (the last two read-only reports; see docs/22 and docs/19). Attribution headers → estimate → policies → reserve → clamp → forward → SSE passthrough → usage from the final chunk → settle → event. Provider keys: pass-through only, never written to disk/logs (CI test enforces this).
+1. **Gateway**: `/v1/messages` (Anthropic Messages API) and `/v1/chat/completions` (OpenAI-compatible), served by the same handler and the same enforcement pipeline; `TOKENFUSE_WIRE` names which shape a given process speaks, inferred from `TOKENFUSE_UPSTREAM`'s path when unset, one upstream per process (docs/26). The router serves `/v1/messages`, `/v1/chat/completions`, `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys` and `/v1/policy-plane` (the last two read-only reports; see docs/22 and docs/19). Attribution headers → estimate → policies → reserve → clamp → forward → SSE passthrough → usage from the final chunk → settle → event. Provider keys: pass-through only, never written to disk/logs (CI test enforces this).
 2. **Policy engine** — in-process, hot-reload (LISTEN/NOTIFY or 10s polling).
 3. **Budget counters** — a Lua script `check_and_reserve` (Redis mode) / atomic structures (in-proc).
 4. **Anomaly detector + forecast** — inline heuristics + EWMA forecast of "budget blowout at step ~N".
@@ -48,13 +48,14 @@ Language split: Rust for everything in the request path **and the Cloud control 
 ## 5. Request flow
 
 ```
-Agent → POST /v1/messages (X-Fuse-Run-Id: r42)
-  1. token estimate (local)
+Agent → POST /v1/messages or /v1/chat/completions (X-Fuse-Run-Id: r42)
+  1. token estimate (local; OpenAI: n completions multiply the output side)
   2. check_and_reserve(r42, $est)      ← atomic
   3. clamp max_tokens = min(requested, remaining/price_output)
   4. forward → SSE passthrough (zero-copy)
   5. usage from the final chunk (Anthropic: message_start/message_delta;
-     OpenAI: stream_options.include_usage)
+     OpenAI: stream_options.include_usage, added by the gateway itself
+     on a streamed request that did not set it)
   6. settle(r42, $actual)
   7. event → Parquet (async)
 

@@ -217,10 +217,17 @@ impl Router {
     ///
     /// `task_class` is the caller's `x-fuse-task-type` header (empty string
     /// if absent); an unrecognized or absent class falls back to the rules
-    /// table's `default_class`. `body_len`/`max_tokens` are the same request
-    /// shape [`estimate_cost`] uses, so candidates are priced exactly the way
-    /// the real call will be, using this request's own I/O balance rather
-    /// than an arbitrary fixed ratio.
+    /// table's `default_class`. `body_len`/`max_tokens`/`completions` are the
+    /// same request shape [`estimate_cost`] uses, so candidates are priced
+    /// exactly the way the real call will be, using this request's own I/O
+    /// balance rather than an arbitrary fixed ratio.
+    ///
+    /// `completions` matters here for the same reason it matters to the
+    /// reservation estimate: the output side of a call's cost grows with
+    /// `n` and the input side does not, so a model with cheap input and dear
+    /// output can rank cheapest at `n=1` and most expensive at `n=4`. Pricing
+    /// every candidate at `n=1` regardless of the real request would rank
+    /// candidates for a call nobody is making.
     pub fn route(
         &self,
         requested_model: &str,
@@ -228,6 +235,7 @@ impl Router {
         prices: &PriceBook,
         body_len: usize,
         max_tokens: Option<u64>,
+        completions: u64,
     ) -> RouteDecision {
         let Some(rule) = self.resolve_class(task_class) else {
             return RouteDecision::kept(requested_model);
@@ -242,7 +250,7 @@ impl Router {
         }
 
         let cost_of = |model: &str| -> Option<Microusd> {
-            estimate_cost(prices, model, body_len, max_tokens)
+            estimate_cost(prices, model, body_len, max_tokens, completions)
         };
 
         // A rule explicitly requiring a higher tier than the requested model
@@ -398,7 +406,7 @@ mod tests {
         ];
 
         for case in cases {
-            let decision = r.route(case.requested, case.task_class, &p, 4000, Some(1000));
+            let decision = r.route(case.requested, case.task_class, &p, 4000, Some(1000), 1);
             assert_eq!(decision.chosen_model, case.expected, "case: {}", case.name);
         }
     }
@@ -409,7 +417,7 @@ mod tests {
         let p = prices();
         // haiku is the cheapest known model; nothing in the "cheap" class can
         // beat it, so the router must keep it, not just happen to.
-        let decision = r.route("claude-haiku-4-5", "cheap", &p, 4000, Some(1000));
+        let decision = r.route("claude-haiku-4-5", "cheap", &p, 4000, Some(1000), 1);
         assert!(!decision.routed());
         assert_eq!(decision.chosen_model, "claude-haiku-4-5");
     }
@@ -423,7 +431,7 @@ mod tests {
         // table. A naive cost-only comparison would "upgrade" it to sonnet
         // (cheapest eligible candidate costs more); the router must not,
         // since it has no basis to claim this model falls short of the bar.
-        let decision = r.route("mystery-cheap-model", "hard", &p, 4000, Some(1000));
+        let decision = r.route("mystery-cheap-model", "hard", &p, 4000, Some(1000), 1);
         assert!(!decision.routed());
         assert_eq!(decision.chosen_model, "mystery-cheap-model");
     }
@@ -435,7 +443,7 @@ mod tests {
         // haiku is declared Haiku-tier; the "hard" class requires Sonnet or
         // above, so this is the one case where the router pays more than
         // what was requested.
-        let decision = r.route("claude-haiku-4-5", "hard", &p, 4000, Some(1000));
+        let decision = r.route("claude-haiku-4-5", "hard", &p, 4000, Some(1000), 1);
         assert!(decision.routed());
         assert_eq!(decision.chosen_model, "claude-sonnet-4-5");
         assert_eq!(
@@ -452,8 +460,82 @@ mod tests {
         // (tier >= Sonnet), and both are declared cheapest-first already, but
         // the router must still pick the actually-cheaper one (sonnet) by
         // price, not just trust declaration order.
-        let decision = r.route("claude-opus-4-5", "hard", &p, 4000, Some(1000));
+        let decision = r.route("claude-opus-4-5", "hard", &p, 4000, Some(1000), 1);
         assert_eq!(decision.chosen_model, "claude-sonnet-4-5");
+    }
+
+    /// The router runs BEFORE the reservation estimate and used to price every
+    /// candidate at a literal `1` regardless of how many completions the
+    /// request actually asked for (`crates/gateway/src/router.rs`, CLAUDE.md
+    /// task-5 finding 2). The output half of a call's cost grows with `n` and
+    /// the input half does not, so a model with cheap input and dear output
+    /// can rank cheapest at `n=1` and most expensive at `n=4`. `route()`'s own
+    /// doc comment claims candidates are "priced exactly the way the real call
+    /// will be" - true only if `completions` reaches `estimate_cost`.
+    ///
+    /// Two candidates, deliberately built to cross over: at 1000 input tokens
+    /// (`body_len=4000`) and 1000 output tokens per completion
+    /// (`max_tokens=1000`):
+    ///   - "cheap-input-dear-output" ($5/$20 per Mtok): n=1 costs
+    ///     0.001*5 + 0.001*20 = $0.025; n=4 costs 0.001*5 + 0.004*20 = $0.085.
+    ///   - "dear-input-cheap-output" ($30/$1 per Mtok): n=1 costs
+    ///     0.001*30 + 0.001*1 = $0.031; n=4 costs 0.001*30 + 0.004*1 = $0.034.
+    ///
+    /// "cheap-input-dear-output" wins at n=1 ($0.025 < $0.031);
+    /// "dear-input-cheap-output" wins at n=4 ($0.034 < $0.085). "requested"
+    /// ($1000/$1000 per Mtok) is priced far above both at either n so it is
+    /// never the answer, only the reference the router must beat.
+    ///
+    /// If `route` still passed a literal `1` to `estimate_cost` no matter what
+    /// `completions` this call carries, `at_four` would equal `at_one`.
+    #[test]
+    fn threading_completions_through_route_changes_which_candidate_wins() {
+        let mut classes = HashMap::new();
+        classes.insert(
+            "money".to_string(),
+            ClassRule {
+                required_tier: Tier::Haiku,
+                candidates: vec![
+                    Candidate {
+                        model: "cheap-input-dear-output".to_string(),
+                        tier: Tier::Haiku,
+                    },
+                    Candidate {
+                        model: "dear-input-cheap-output".to_string(),
+                        tier: Tier::Haiku,
+                    },
+                ],
+            },
+        );
+        let rules = RouterRules {
+            default_class: "money".to_string(),
+            classes,
+        };
+        let r = Router::new(RouterMode::On, rules);
+        let p = PriceBook::new()
+            .with(
+                "cheap-input-dear-output",
+                ModelPrice::per_mtok_usd(5.0, 20.0, 0.0, 0.0),
+            )
+            .with(
+                "dear-input-cheap-output",
+                ModelPrice::per_mtok_usd(30.0, 1.0, 0.0, 0.0),
+            )
+            .with(
+                "requested",
+                ModelPrice::per_mtok_usd(1000.0, 1000.0, 0.0, 0.0),
+            );
+
+        let at_one = r.route("requested", "money", &p, 4000, Some(1000), 1);
+        let at_four = r.route("requested", "money", &p, 4000, Some(1000), 4);
+
+        assert_eq!(at_one.chosen_model, "cheap-input-dear-output");
+        assert_eq!(at_four.chosen_model, "dear-input-cheap-output");
+        assert_ne!(
+            at_one.chosen_model, at_four.chosen_model,
+            "a candidate priced for n completions must not rank the same as \
+             one priced for 1 when n != 1"
+        );
     }
 
     #[test]
@@ -479,7 +561,7 @@ mod tests {
         // part of the routing algorithm.
         let r = Router::new(RouterMode::Off, default_rules());
         let p = prices();
-        let decision = r.route("claude-opus-4-5", "cheap", &p, 4000, Some(1000));
+        let decision = r.route("claude-opus-4-5", "cheap", &p, 4000, Some(1000), 1);
         assert_eq!(decision.chosen_model, "claude-haiku-4-5");
     }
 
@@ -491,7 +573,7 @@ mod tests {
         };
         let r = Router::new(RouterMode::On, rules);
         let p = prices();
-        let decision = r.route("claude-opus-4-5", "anything", &p, 4000, Some(1000));
+        let decision = r.route("claude-opus-4-5", "anything", &p, 4000, Some(1000), 1);
         assert!(!decision.routed());
     }
 
@@ -511,7 +593,7 @@ mod tests {
         };
         let r = Router::new(RouterMode::On, rules);
         let p = prices();
-        let decision = r.route("claude-opus-4-5", "weird", &p, 4000, Some(1000));
+        let decision = r.route("claude-opus-4-5", "weird", &p, 4000, Some(1000), 1);
         assert!(!decision.routed());
     }
 
