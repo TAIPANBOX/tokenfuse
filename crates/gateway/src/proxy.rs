@@ -482,8 +482,10 @@ pub async fn chat_completions(
 /// that is wire-specific by design, since the two doors keep the system
 /// prompt in different places and `Wire::system_text` matches on `self` to
 /// find it. What IS true is that budget check, firewall, identity, caching
-/// and forwarding are the same code for every door; the body itself is
-/// forwarded as-is once the budget check passes.
+/// and forwarding are the same code for every door; the body is not
+/// forwarded as-is, though - the model rewrite, DLP masking and (on a
+/// streamed OpenAI request) `Wire::prepare_upstream_body` can each still
+/// rewrite it after the budget check passes, before it reaches the provider.
 ///
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`

@@ -253,6 +253,10 @@ fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
         apply_anthropic(usage, u);
     }
     // Anthropic message_delta / non-stream, or OpenAI: top-level "usage".
+    // Defense in depth, currently unobservable: `Value::get` already returns
+    // `None` for a non-object (including `null`) to both `apply_*` below, so
+    // deleting this filter changes no test in `provider`'s module (checked
+    // 2026-09-07). No test can pin it for that reason; keep it anyway.
     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
         if u.get("prompt_tokens").is_some() || u.get("completion_tokens").is_some() {
             apply_openai(usage, u);
@@ -726,12 +730,19 @@ mod tests {
 
     /// With `stream_options.include_usage` set, the provider's own reference
     /// says "All other chunks will also include a `usage` field, but with a
-    /// null value." `merge_usage` filters on `u.is_object()`, so a `usage:
-    /// null` chunk is skipped rather than parsed as an empty usage that would
-    /// overwrite what a later chunk reports. This pins that behaviour by name
-    /// rather than leaving it as an accident of how `filter` reads.
+    /// null value." This pins that a stream shaped exactly that way, `usage:
+    /// null` on every chunk but the last, still settles on the last chunk's
+    /// real numbers.
+    ///
+    /// This does NOT pin `merge_usage`'s `.filter(u.is_object())`: `Value::get`
+    /// already returns `None` for a JSON `null`, so the filter's removal does
+    /// not change this test's result (checked 2026-09-07, see the comment on
+    /// the filter itself). What this test actually exercises is that feeding
+    /// a null-usage chunk before the real one doesn't otherwise disturb
+    /// `UsageParser`'s state, e.g. by tripping some other code path into
+    /// treating the run as already settled at zero.
     #[test]
-    fn a_null_usage_on_every_chunk_but_the_last_does_not_settle_the_run_at_zero() {
+    fn a_stream_with_null_usage_on_every_chunk_but_the_last_still_settles_on_the_last_chunk() {
         let mut p = UsageParser::default();
         p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n");
         p.feed(
