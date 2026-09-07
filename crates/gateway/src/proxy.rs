@@ -18,6 +18,7 @@ use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
 use crate::unitledger::UnitReservation;
 use crate::wardryx::{DecideContext, WardryxDecision, WardryxMode, WardryxOutcome};
+use crate::wire::Wire;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{response::Builder, HeaderMap, HeaderValue, StatusCode};
@@ -455,9 +456,16 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
+/// The Anthropic Messages door. Everything it does lives in [`handle`]; this
+/// exists so the route table names a handler per door and the shape is chosen
+/// in exactly one place.
+pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    handle(Wire::Anthropic, st, headers, body).await
+}
+
 /// Anthropic-style messages endpoint. Provider-agnostic: the body is forwarded
 /// as-is once the budget check passes.
-pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: Bytes) -> Response {
+async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
     // Who is calling, resolved from the credential they presented rather than
     // from anything they can write. Empty when client keys are not configured,
     // which is every deployment that has not opted in.
@@ -477,7 +485,7 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, mut body: 
 
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    let mut parsed = parse_request(&request);
+    let mut parsed = wire.parse_request(&request);
 
     // No run id → unmanaged pass-through (drop-in safe), unless the operator
     // has said that a call which cannot be metered is not a call this gateway
@@ -2592,27 +2600,6 @@ fn upstream_error(e: ProviderError) -> Response {
         .expect("valid response")
 }
 
-struct ParsedRequest {
-    model: String,
-    max_tokens: Option<u64>,
-    stream: bool,
-}
-
-fn parse_request(value: &serde_json::Value) -> ParsedRequest {
-    ParsedRequest {
-        model: value
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        max_tokens: value.get("max_tokens").and_then(|m| m.as_u64()),
-        stream: value
-            .get("stream")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false),
-    }
-}
-
 /// Re-serialize `body` with its top-level `"model"` field set to `model`
 /// (the router's chosen candidate), the same "parse, mutate, re-serialize"
 /// shape the DLP mask path already uses to rewrite the outgoing body.
@@ -3023,6 +3010,24 @@ pub(crate) mod tests {
 
     async fn call(st: AppState, req: Request<Body>) -> Response {
         crate::app(st).oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_door_is_served_through_the_shared_handler() {
+        // The point of this test is not the 200: it is that `messages` reaches
+        // the shared handler with Wire::Anthropic, so a later door cannot
+        // change what this one does without failing here.
+        //
+        // Adapted from the task brief, which assumed a `test_state()` helper
+        // and a bare 200 for `HeaderMap::new()`. This module's helper is
+        // `state(mode, provider)`, and `AppState::new` defaults
+        // `require_run_id: true` (state.rs:534), so an empty header map with
+        // no `x-fuse-run-id` would hit `metering_required()` (400) rather than
+        // 200. `.with_require_run_id(false)` restores the unmanaged
+        // pass-through the brief's plain 200 assumed.
+        let st = state(Mode::Enforce, StubProvider::default()).with_require_run_id(false);
+        let resp = handle(Wire::Anthropic, st, HeaderMap::new(), Bytes::from(body(64))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
