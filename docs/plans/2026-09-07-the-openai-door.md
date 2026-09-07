@@ -30,8 +30,12 @@ provider facts this plan assumes and the reasons for each decision.
 - **No competitor names** in README or any public copy.
 - **`cargo fmt --all`, `cargo build`, `cargo test --all`, `cargo clippy
   --all-targets -- -D warnings`** before every commit. CI has a fmt gate.
-- **One task, one PR, one branch off `main`.** `main` has nine required checks
-  and direct pushes are blocked. Do not merge on red.
+- **One branch for the whole feature, one commit per task, one PR at the end.**
+  `main` has nine required checks and direct pushes are blocked, so nine PRs
+  would mean nine full CI runs for one feature. Each task still ends in its own
+  commit and its own review, so the PR is readable commit by commit. Do not
+  merge on red. (`@claude` 2026-09-07: this supersedes the earlier
+  "one task, one PR" line, which collided with how this plan is executed.)
 - Commit trailer: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 - Nothing metered is enabled anywhere in this work.
 
@@ -248,7 +252,7 @@ impl Wire {
         };
         let completions = match self {
             Wire::Anthropic => 1,
-            OpenAi => value
+            Wire::OpenAi => value
                 .get("n")
                 .and_then(|n| n.as_u64())
                 .filter(|n| *n >= 1)
@@ -263,11 +267,6 @@ impl Wire {
     }
 }
 ```
-
-Note the `OpenAi` arm above is written without its `Wire::` prefix on purpose
-so the compiler catches it: fix it to `Wire::OpenAi` when it errors. (If you
-are reading this after the fact: yes, that is deliberate, and no, do not leave
-a bare identifier pattern in a match on an enum, because it binds everything.)
 
 - [ ] **Step 4: Add the module declaration**
 
@@ -411,8 +410,9 @@ git commit -m "feat(gateway): the estimate multiplies by the completions asked f
 
 **Files:**
 - Modify: `crates/gateway/src/proxy.rs` (`messages`, `parse_request`, `ParsedRequest`)
-- Modify: `crates/gateway/src/state.rs` (`AppState` gains `wire`)
-- Modify: `crates/gateway/src/lib.rs` (unchanged routes, `AppState` construction sites in tests)
+
+`AppState` is NOT touched here. The `wire` field lands in Task 4, which is
+what needs it; this task only moves the shape into the handler's signature.
 
 **Interfaces:**
 - Consumes: `Wire`, `ParsedRequest` from Task 1.
@@ -486,7 +486,7 @@ edit the test. Revert and find what moved.
 
 ```bash
 cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --all
-git add crates/gateway/src/proxy.rs crates/gateway/src/state.rs
+git add crates/gateway/src/proxy.rs
 git commit -m "refactor(gateway): one handler, and the door chooses the shape"
 ```
 
