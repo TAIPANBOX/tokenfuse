@@ -133,4 +133,24 @@ mod tests {
             "a wrapped multiplication would make the most expensive request the cheapest"
         );
     }
+
+    /// `u64::MAX * u64::MAX` wraps to exactly `1` (both operands are
+    /// congruent to `-1` mod 2^64), which is why the test above catches a
+    /// wrapping regression only by coincidence: a wrapped product is not
+    /// generally cheap (`1000 * u64::MAX` wraps to `2^64 - 1000`, still a
+    /// ceiling-priced call). The shape that actually prices a call as free
+    /// is a pair of powers of two whose product is exactly `2^64`, which
+    /// wraps to zero. `4096 == 2^12` and `4_503_599_627_370_496 == 2^52`
+    /// multiply to exactly `2^64`.
+    #[test]
+    fn a_pair_of_powers_of_two_that_would_wrap_to_zero_still_prices_at_the_ceiling() {
+        let prices = crate::pricebook::default_price_book();
+        let would_wrap_to_zero =
+            estimate_cost(&prices, "gpt-4o", 400, Some(4096), 4_503_599_627_370_496).unwrap();
+        let one = estimate_cost(&prices, "gpt-4o", 400, Some(1000), 1).unwrap();
+        assert!(
+            would_wrap_to_zero.0 > one.0,
+            "a product that wraps to exactly zero must not price the call as free"
+        );
+    }
 }
