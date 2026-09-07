@@ -149,3 +149,43 @@ async fn four_completions_are_reserved_for_before_the_call_is_forwarded() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
 }
+
+/// Closes the gap task 9's mutation table names for the "skip the injection"
+/// mutant: `wire::tests::a_streamed_openai_request_is_asked_to_report_its_usage`
+/// proves `Wire::prepare_upstream_body` itself does the rewrite, but calls
+/// the function directly and would keep passing even if `handle` stopped
+/// calling it. This drives a real streamed request through the router with a
+/// provider that records the exact bytes it received, so it fails if the
+/// call site in `proxy.rs` is ever deleted.
+#[tokio::test]
+async fn a_streamed_openai_request_reaching_the_provider_carries_the_usage_request() {
+    let (state, sent) = common::app_with_wire_capturing(Wire::OpenAi);
+    let app = tokenfuse_gateway::app(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-fuse-run-id", "r-inject-1")
+                .body(Body::from(
+                    r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+
+    let captured = sent.lock().unwrap().clone().expect("provider was called");
+    let v: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(
+        v["stream_options"]["include_usage"],
+        serde_json::json!(true),
+        "the body handle actually forwarded must carry the usage request; \
+         it did not, got {v}"
+    );
+}

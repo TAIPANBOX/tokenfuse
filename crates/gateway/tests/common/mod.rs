@@ -95,3 +95,65 @@ pub fn app_with_wire_and_budget(wire: Wire, budget_usd: f64) -> AppState {
     )
     .with_wire(wire)
 }
+
+/// A provider that records the exact bytes `handle` sent it, then answers
+/// like `StubOkProvider`.
+///
+/// `Wire::prepare_upstream_body` (task 7) rewrites the body `handle` is about
+/// to forward; a unit test on that function alone (`wire::tests`) proves the
+/// function does the rewrite, but proves nothing about whether `handle`
+/// still calls it - deleting the call site is a mutant `wire::tests` cannot
+/// see (task 9's mutation table names this explicitly). This closes that
+/// gap by asserting on what actually reached the "provider".
+#[derive(Clone, Default)]
+pub struct CapturingProvider {
+    pub sent: Arc<Mutex<Option<Bytes>>>,
+}
+
+#[async_trait]
+impl Provider for CapturingProvider {
+    async fn send(
+        &self,
+        _headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<ProviderResponse, ProviderError> {
+        *self.sent.lock().unwrap() = Some(body);
+        let usage = tokenfuse_core::Usage {
+            input_tokens: 10,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
+            usage,
+            truncated: false,
+        })));
+        let chunk = Bytes::from_static(b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+        let stream = futures::stream::once(async move { Ok(chunk) });
+        Ok(ProviderResponse {
+            status: 200,
+            content_type: Some("text/event-stream".to_string()),
+            body: Box::pin(stream),
+            usage: slot,
+        })
+    }
+}
+
+/// State for a gateway serving `wire` whose provider records the body it was
+/// sent, for tests that need to see what actually left the gateway rather
+/// than only what came back.
+pub fn app_with_wire_capturing(wire: Wire) -> (AppState, Arc<Mutex<Option<Bytes>>>) {
+    let sent = Arc::new(Mutex::new(None));
+    let provider = CapturingProvider { sent: sent.clone() };
+    let state = AppState::new(
+        Arc::new(Ledger::new()),
+        Arc::new(tokenfuse_gateway::pricebook::default_price_book()),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(provider),
+        "wire-door-test-policy",
+    )
+    .with_wire(wire);
+    (state, sent)
+}

@@ -16,6 +16,17 @@ parser reads both the Anthropic and the OpenAI response shapes
 header allowlist already forwards `openai-organization` and `openai-beta`
 (`provider.rs:309-318`).
 
+**Status now (`@measured 2026-09-07`, end of the plan this doc describes):**
+built, in the shape above. `crates/gateway/src/wire.rs` holds the `Wire`
+enum; `POST /v1/chat/completions` is routed beside `/v1/messages` through the
+same `handle`; the wire-mismatch refusal, the `n`-multiplied estimate, the
+`max_completion_tokens` preference, the `stream_options.include_usage`
+injection, and the OpenAI-shaped refusal body (`breaker_error_response`) are
+all in `main`. `features/the-openai-door.feature` and
+`.superpowers/sdd/2026-09-07-the-openai-door/task-89-report.md` carry the
+evidence. Section 8 below is unchanged: it was written to survive this
+status flipping and still names what remains true.
+
 ## 1. What is being built, and what is deliberately not
 
 **Built.** `POST /v1/chat/completions`, served by the same handler and the same
