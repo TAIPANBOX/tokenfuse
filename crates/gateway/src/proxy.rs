@@ -865,7 +865,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             &verdict,
             &unit,
         );
-        return breaker_error_response(&run_id, &verdict);
+        return breaker_error_response(wire, &run_id, &verdict);
     }
 
     // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
@@ -1138,7 +1138,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
         if let Some(reason) = &loop_reason {
             st.sink.record(CallRecord {
@@ -1175,7 +1175,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
     }
 
@@ -1239,7 +1239,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 &verdict,
                 &unit,
             );
-            return breaker_error_response(&run_id, &verdict);
+            return breaker_error_response(wire, &run_id, &verdict);
         }
     }
 
@@ -1444,7 +1444,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         &verdict,
                         &unit,
                     );
-                    return breaker_error_response(&run_id, &verdict);
+                    return breaker_error_response(wire, &run_id, &verdict);
                 }
             },
             Mode::Shadow | Mode::Warn => st.units.reserve_unchecked(&unit, estimate, now_millis()),
@@ -1507,7 +1507,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                     &verdict,
                     &unit,
                 );
-                return breaker_error_response(&run_id, &verdict);
+                return breaker_error_response(wire, &run_id, &verdict);
             }
             Err(BudgetError::UnknownRun { .. }) => {
                 if let Some(ur) = &unit_reservation {
@@ -1559,7 +1559,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                     &verdict,
                     &unit,
                 );
-                return breaker_error_response(&run_id, &verdict);
+                return breaker_error_response(wire, &run_id, &verdict);
             }
         },
         Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate).await,
@@ -2635,13 +2635,37 @@ async fn collect(
 /// owner of the 402 budget/policy/loop/kill/wasm wire contract. Status, body,
 /// and headers are byte-identical to the pre-refactor `budget_error` builder;
 /// the verdict's `to_error_json` mirrors that JSON shape exactly.
-fn breaker_error_response(run_id: &str, verdict: &BreakerVerdict) -> Response {
+fn breaker_error_response(wire: Wire, run_id: &str, verdict: &BreakerVerdict) -> Response {
     let status = verdict
         .reason
         .map(BreakerReason::http_status)
         .and_then(|code| StatusCode::from_u16(code).ok())
         .unwrap_or(StatusCode::PAYMENT_REQUIRED);
-    let body = verdict.to_error_json(run_id);
+    let mut body = verdict.to_error_json(run_id);
+    // The Anthropic branch builds exactly what it always has (invariant 2:
+    // breaker_error_response_matches_budget_error_byte_for_byte pins those
+    // bytes across refactors). OpenAI clients read `error.message`,
+    // `error.code` and `error.param` by convention (openai-python's
+    // `_exceptions.py`), so those three are added for that door only; our
+    // own fields (`type`, `run_id`, `reason`, `retryable`, ...) stay exactly
+    // as they are, a superset either way.
+    if wire == Wire::OpenAi {
+        if let Some(err) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+            let kind = verdict
+                .reason
+                .map(|r| r.as_wire_str().to_string())
+                .unwrap_or_else(|| "blocked".to_string());
+            err.insert(
+                "message".to_string(),
+                serde_json::Value::String(format!(
+                    "run {run_id} was stopped by the gateway: {}",
+                    verdict.detail.as_deref().unwrap_or("")
+                )),
+            );
+            err.insert("code".to_string(), serde_json::Value::String(kind));
+            err.insert("param".to_string(), serde_json::Value::Null);
+        }
+    }
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -5248,7 +5272,7 @@ pub(crate) mod tests {
 
             let old = golden_budget_error(kind, run_id, budget, spent, policy_id, detail);
             let verdict = budget_verdict(reason, budget, spent, policy_id, detail);
-            let new = breaker_error_response(run_id, &verdict);
+            let new = breaker_error_response(Wire::Anthropic, run_id, &verdict);
 
             // Status.
             assert_eq!(new.status(), old.status(), "status mismatch for {kind}");
@@ -5268,6 +5292,60 @@ pub(crate) mod tests {
             let new_bytes = to_bytes(new.into_body(), usize::MAX).await.unwrap();
             assert_eq!(new_bytes, old_bytes, "body bytes mismatch for {kind}");
         }
+    }
+
+    // --- breaker_error_response(wire, ..): a refusal each door's own clients parse ---
+
+    /// Not an existing helper before this task: no such extractor was found
+    /// in this module (checked by grep before writing this), so it is added
+    /// here rather than assumed. `#[test]` in the brief's Step 1 does not
+    /// compile against this crate: extracting an axum `Response` body is
+    /// async (`axum::body::to_bytes`), matching every other body-reading
+    /// test in this module (see `breaker_error_response_matches_budget_error_byte_for_byte`
+    /// just above), so both new tests are `#[tokio::test]` instead.
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_openai_door_refuses_in_the_envelope_its_clients_parse() {
+        let verdict = budget_verdict(
+            BreakerReason::BudgetExceeded,
+            Microusd::from_usd(5.0),
+            Microusd::from_usd(5.5),
+            "p1",
+            "over budget",
+        );
+        let resp = breaker_error_response(Wire::OpenAi, "r1", &verdict);
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "budget_exceeded");
+        assert_eq!(v["error"]["code"], "budget_exceeded");
+        assert!(v["error"]["param"].is_null());
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("r1"), "the message names the run");
+        // The fields the record already carries are still there.
+        assert_eq!(v["error"]["run_id"], "r1");
+        assert_eq!(v["error"]["retryable"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_door_still_refuses_in_exactly_the_bytes_it_always_did() {
+        let verdict = budget_verdict(
+            BreakerReason::BudgetExceeded,
+            Microusd::from_usd(5.0),
+            Microusd::from_usd(5.5),
+            "p1",
+            "over budget",
+        );
+        let v = body_json(breaker_error_response(Wire::Anthropic, "r1", &verdict)).await;
+        assert!(
+            v["error"].get("message").is_none(),
+            "no message on this door"
+        );
+        assert!(v["error"].get("code").is_none());
+        assert!(v["error"].get("param").is_none());
     }
 
     // --- referenced_domains (Wardryx `domains` extraction) ---
