@@ -10,7 +10,7 @@
 
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
-![release](https://img.shields.io/badge/release-v0.4.3-brightgreen)
+![release](https://img.shields.io/badge/release-v0.4.4-brightgreen)
 ![tests](https://img.shields.io/badge/tests-1151-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -665,7 +665,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Is it free?** Yes, all of it. TokenFuse is open source (Apache-2.0) and free to self-host, with no seat limits and no time limit: the CLI, the local proxy, `tokenfuse mcp-scan` and its GitHub Action, and the **Cloud** control plane and dashboard (fleet spend, alerts, central budgets, the kill-switch). There is no paid TokenFuse tier. A separate commercial product provides the **secured, managed enterprise control room** over the whole stack (authenticated remote access over a tunnel, unified fleet control, hardware-signed actions); TokenFuse itself stays free and open.
 
-**Is it production-ready?** It's a young v0.4.3: functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
+**Is it production-ready?** It's a young v0.4.4: functional and CI-tested, but not yet audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
