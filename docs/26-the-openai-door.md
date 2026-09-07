@@ -102,22 +102,54 @@ green. The codebase already knows the field exists: `ToolCallCounter` handles
 `n > 1` explicitly (`provider.rs:173-176`). `estimate_cost` gains the
 multiplier; the Anthropic path passes 1 and its arithmetic is unchanged.
 
-**The output limit moved.** OpenAI deprecated `max_tokens` for
-`max_completion_tokens`. Reading only the old name on a modern request yields
-`None`, the estimate falls to `DEFAULT_MAX_TOKENS` (1024), and a request that
-asked for 100k output tokens is priced as if it asked for 1k. Read the new name
-first, fall back to the old. When both are present and disagree, take the new
-one and price the larger of the two: `@claude`, this is our decision, not a
-reading of the provider's documented behaviour, and the estimate errs upward
-because under-charging is the failure this tier exists to prevent.
+**The output limit moved, and on some models the old name is refused.**
+Verified against the provider's own reference (`developers.openai.com`,
+`api-reference/chat/create`, read 2026-09-07), which says of `max_tokens`:
+"This value is now deprecated in favor of `max_completion_tokens`, and is not
+compatible with o-series models", and of the new name that it is "An upper
+bound for the number of tokens that can be generated for a completion,
+including visible output tokens and reasoning tokens".
 
-**Usage in a stream has to be asked for.** OpenAI sends no `usage` object in a
-streamed response unless the request carried
-`stream_options: {"include_usage": true}`. Without it, `settle_amount` records
-`CostBasis::EstimateNoUsage` and the run settles on the pre-flight estimate:
-honest, visible in the record, and wrong by whatever the estimate was wrong by,
-on every streamed call an ordinary SDK makes. So the gateway injects the option
-when the request streams and did not set it (`@yurii 2026-09-07`).
+Two consequences, and the second is the one I did not have on the first pass.
+Reading only the old name on a modern request yields `None`, the estimate falls
+to `DEFAULT_MAX_TOKENS` (1024), and a request that asked for 100k output tokens
+is priced as if it asked for 1k. And on an o-series model the old name is not
+merely deprecated but incompatible, so a caller that reaches us with only
+`max_tokens` set is sending something the provider will reject: we price it,
+reserve for it, and the upstream refuses. Read the new name first, fall back to
+the old.
+
+Because `max_completion_tokens` counts reasoning tokens as well as visible
+ones, it is the right bound to price against on a reasoning model: the invisible
+half is billed and the number already includes it.
+
+When both names are present and disagree, take `max_completion_tokens` and
+price the larger of the two. `@claude`: this is our decision, not a reading of
+documented provider behaviour, and the estimate errs upward because
+under-charging is the failure this tier exists to prevent.
+
+**Usage in a stream has to be asked for.** Verified on the same page:
+setting `stream_options.include_usage` means "an additional chunk will be
+streamed before the `data: [DONE]` message. The `usage` field on this chunk
+shows the token usage statistics for the entire request, and the `choices`
+field will always be an empty array. **All other chunks will also include a
+`usage` field, but with a null value.**"
+
+Without it, `settle_amount` records `CostBasis::EstimateNoUsage` and the run
+settles on the pre-flight estimate: honest, visible in the record, and wrong by
+whatever the estimate was wrong by, on every streamed call an ordinary SDK
+makes. So the gateway injects the option when the request streams and did not
+set it (`@yurii 2026-09-07`).
+
+The emphasised sentence is a hazard the first draft of this design missed, and
+it lands on code that already exists. `merge_usage` reads
+`v.get("usage").filter(|u| u.is_object())` (`provider.rs:256`), so a `usage`
+that is `null` is skipped rather than parsed as an empty usage: **today's parser
+already survives this, by construction rather than by intent.** That makes it
+exactly the kind of behaviour that a later refactor removes without noticing, so
+it gets a named test of its own (§6) rather than being left to luck. The final
+chunk's empty `choices` array is likewise harmless to `ToolCallCounter`, which
+iterates whatever is there.
 
 Injecting mutates the caller's request, which the gateway already does in two
 places (DLP masking, model rewrite), so the mechanism and its precedent exist.
@@ -129,18 +161,40 @@ it set it to `false`.
 
 ## 5. The refusal an SDK can read
 
-The Breaker's current body carries `type`, `run_id`, `budget_usd`, `spent_usd`,
-`policy_id`, `reason` and `retryable`. It has **no `message` field**, and an
-OpenAI SDK surfaces `error.message`, so today a refused call would raise an
-error with an empty message.
+**The first draft of this section was wrong, and the correction is worth
+keeping**, because it changes why we do this rather than whether. It said an
+OpenAI SDK surfaces `error.message`, so our body, which has no `message`, would
+raise an error with an empty message. Checked against the client's own source
+(`openai/openai-python`, `main`, read 2026-09-07), that is not what happens:
 
-The OpenAI door therefore renders the same verdict into OpenAI's envelope:
-`message` (a sentence naming the run and what stopped it), `type`, `code`, and
-`param: null`, with our own fields kept alongside. Extra members are ignored by
-the SDKs and keep the body a superset of what the record already contains.
+- `_base_client.py` builds the human-readable text as
+  `f"Error code: {response.status_code} - {body}"`, where `body` is the **whole
+  parsed JSON object**. Our `run_id`, `reason` and figures are therefore already
+  in the message a user sees.
+- `_client.py::_make_status_error` then does
+  `data = body.get("error", body) if is_mapping(body) else body`, so it **does**
+  unwrap our `error` object,
+- and `_exceptions.py` reads `body.get("code")`, `body.get("param")` and
+  `body.get("type")` off it. Our `type` already lands on `exc.type`; `code` and
+  `param` come back `None`.
 
-Status codes and headers do not change: 402 for the budget family, 403 for the
-auth family, `x-fuse: blocked` and `x-fuse-run-id` on both.
+So the real reasons to render OpenAI's envelope are narrower and still good:
+`message` and `code` are what the convention carries and what other clients
+(Node, LangChain, LiteLLM, anything hand-rolled over `curl`) read, and a body
+that satisfies the convention costs us nothing.
+
+The OpenAI door therefore adds `message` (a sentence naming the run and what
+stopped it), `code` (the same wire string as `type`) and `param: null`, and
+keeps our own fields alongside. Extra members are ignored by the SDKs and keep
+the body a superset of what the record already contains.
+
+**Status codes and headers do not change**, and the check above says they are
+already right: 402 for the budget family, 403 for the auth family, `x-fuse:
+blocked` and `x-fuse-run-id` on both. In the client's taxonomy a 403 becomes
+`PermissionDeniedError`, which is what a DLP, taint or identity refusal is; 402
+is not special-cased and falls through to the generic `APIStatusError`, which is
+correct, since no standard exception class means "your budget stopped this" and
+inventing a mapping for it is not ours to do.
 
 **Invariant 2 is untouched and is the proof.** The golden test
 `breaker_error_response_matches_budget_error_byte_for_byte` asserts the
@@ -165,6 +219,13 @@ fields present and disagreeing; `stream_options` present as a string, as null,
 and as an object with a non-boolean `include_usage`; a `messages` array that is
 empty, and one whose entries are not objects.
 
+**Two named tests for behaviour that works today only by construction**, both
+about the injected `include_usage`: one asserting that a streamed response whose
+non-final chunks carry `"usage": null` settles on parsed usage from the final
+chunk and never on an empty `Usage`, and one asserting the final chunk's empty
+`choices` array leaves the tool-call count untouched. Neither is a new feature;
+both pin behaviour a refactor could remove silently.
+
 **Mutation testing of the product code**, which is what T3 adds. Each fault is
 planted deliberately and an existing test must catch it:
 
@@ -175,6 +236,7 @@ planted deliberately and an existing test must catch it:
 | skip the `include_usage` injection | every streamed run settles on an estimate |
 | overwrite an `include_usage` the caller already set | the caller's own choice silently changed |
 | serve the mismatched door instead of refusing | a reservation opened against an upstream that will refuse |
+| treat a `null` `usage` chunk as parsed usage | every streamed run settles at zero |
 
 **A gate with teeth.** `scripts/gates-have-teeth.sh` gains a case for whatever
 gate this adds, and the case plants that gate's own fault and requires the
