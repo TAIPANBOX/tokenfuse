@@ -463,17 +463,27 @@ pub async fn messages(State(st): State<AppState>, headers: HeaderMap, body: Byte
     handle(Wire::Anthropic, st, headers, body).await
 }
 
+/// The OpenAI Chat Completions door. Same handler, same enforcement, a
+/// different body shape. Requires an OpenAI-compatible upstream; see
+/// `docs/26-the-openai-door.md`.
+pub async fn chat_completions(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(Wire::OpenAi, st, headers, body).await
+}
+
 /// The shared enforcement path both doors serve through, parameterised by
 /// which wire the caller spoke. Reads the request only through
 /// `wire.parse_request`, so everything from here on (budget check, firewall,
 /// identity, caching, forwarding) is the same code for every door; the body
 /// itself is forwarded as-is once the budget check passes.
 ///
-/// `pub` rather than crate-private: the OpenAI door's route is not registered
-/// on the router yet (that is the next task), so until it is, this is also
-/// the integration tests' only way to exercise that door's dispatch honestly,
-/// see `tests/wire_door.rs`.
-pub async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
+/// Crate-private: both doors are registered on the router (`lib.rs`), so
+/// tests reach either one through real HTTP on `tokenfuse_gateway::app`
+/// rather than calling this directly - see `tests/wire_door.rs`.
+async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
     // A process forwards to one upstream endpoint, so it serves the door
     // matching that upstream's shape and refuses the other one loudly, before
     // anything is reserved: nothing is opened, no budget is checked, no key is
@@ -772,6 +782,7 @@ pub async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Byte
             &st.prices,
             body.len(),
             parsed.max_tokens,
+            parsed.completions,
         );
         let mut applied = false;
         if st.router.mode == RouterMode::On && decision.routed() {
@@ -805,8 +816,14 @@ pub async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Byte
         // No estimate has been computed yet on this path (it's derived below,
         // once past the kill/DLP gates) — compute it locally so the avoided
         // spend is still captured for the trace.
-        let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens, 1)
-            .unwrap_or(Microusd::ZERO);
+        let estimate = estimate_cost(
+            &st.prices,
+            &parsed.model,
+            body.len(),
+            parsed.max_tokens,
+            parsed.completions,
+        )
+        .unwrap_or(Microusd::ZERO);
         st.sink.record(CallRecord {
             ts_millis: now_millis(),
             run_id: run_id.clone(),
@@ -1030,8 +1047,14 @@ pub async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Byte
         cache_ctx = Some(CacheCtx { partition, core });
     }
 
-    let estimate = estimate_cost(&st.prices, &parsed.model, body.len(), parsed.max_tokens, 1)
-        .unwrap_or(Microusd::ZERO);
+    let estimate = estimate_cost(
+        &st.prices,
+        &parsed.model,
+        body.len(),
+        parsed.max_tokens,
+        parsed.completions,
+    )
+    .unwrap_or(Microusd::ZERO);
 
     // `open_run` above just committed (the in-process ledger applies
     // synchronously; the raft ledger's write returned only after a majority

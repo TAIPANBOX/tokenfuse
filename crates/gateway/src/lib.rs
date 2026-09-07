@@ -83,6 +83,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(proxy::healthz))
         .route("/v1/messages", post(proxy::messages))
+        .route("/v1/chat/completions", post(proxy::chat_completions))
         .merge(admin)
         // docs/07 B.7 level 2: an executor asks BEFORE it runs a tool.
         .route("/v1/fuse/check-tool-call", post(toolcheck::check_tool_call))

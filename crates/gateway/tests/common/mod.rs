@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use std::sync::{Arc, Mutex};
-use tokenfuse_core::{Ledger, Mode, ModelPrice, Policy, PriceBook};
+use tokenfuse_core::{Ledger, Microusd, Mode, ModelPrice, Policy, PriceBook};
 use tokenfuse_gateway::provider::{
     ParsedUsage, Provider, ProviderError, ProviderResponse, UsageSlot,
 };
@@ -65,6 +65,29 @@ pub fn app_with_wire(wire: Wire) -> AppState {
         Arc::new(prices),
         Arc::new(Policy {
             mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(StubOkProvider),
+        "wire-door-test-policy",
+    )
+    .with_wire(wire)
+}
+
+/// State for a gateway that serves `wire`, priced from the real default price
+/// book (so `gpt-4o` and every other shipped model name resolve), with
+/// `policy.budget_per_run` set to `budget_usd`.
+///
+/// Used by tests that need the estimate to actually bind against a budget
+/// rather than merely observe the wire guard - see
+/// `four_completions_are_reserved_for_before_the_call_is_forwarded` in
+/// `wire_door.rs` for how the figure is derived.
+pub fn app_with_wire_and_budget(wire: Wire, budget_usd: f64) -> AppState {
+    AppState::new(
+        Arc::new(Ledger::new()),
+        Arc::new(tokenfuse_gateway::pricebook::default_price_book()),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            budget_per_run: Some(Microusd::from_usd(budget_usd)),
             ..Default::default()
         }),
         Arc::new(StubOkProvider),
