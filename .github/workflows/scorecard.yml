@@ -42,7 +42,7 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # named, not -latest: a rolling label changes the OS under a tested job
     permissions:
       security-events: write
       id-token: write
