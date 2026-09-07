@@ -25,7 +25,11 @@ pub struct ParsedRequest {
     /// How many completions are being asked for and therefore billed. Always
     /// 1 on the Anthropic wire, which has no such parameter; `n` on OpenAI,
     /// where the provider's own reference says "you will be charged based on
-    /// the number of generated tokens across all of the choices".
+    /// the number of generated tokens across all of the choices". This is a
+    /// caller-controlled multiplier on the money path: a consumer that
+    /// multiplies an output-token estimate by it must use saturating
+    /// arithmetic, since a plain `*` wraps silently in a release build and a
+    /// wrapped reservation under-charges.
     pub completions: u64,
 }
 
@@ -42,7 +46,7 @@ impl Wire {
     /// the upstream URL's path implies, else Anthropic, which is what every
     /// deployment that predates this code already is.
     pub fn from_declaration(declared: Option<&str>, upstream: Option<&str>) -> Wire {
-        match declared.map(str::trim).filter(|d| !d.is_empty()) {
+        match declared.map(str::trim) {
             Some(d) if d.eq_ignore_ascii_case("openai") => return Wire::OpenAi,
             Some(d) if d.eq_ignore_ascii_case("anthropic") => return Wire::Anthropic,
             // An unrecognised value is not a third shape. main.rs warns about
@@ -204,5 +208,35 @@ mod tests {
             Wire::from_declaration(Some("gemini"), None),
             Wire::Anthropic
         );
+    }
+
+    #[test]
+    fn a_declaration_is_read_without_regard_to_case() {
+        assert_eq!(Wire::from_declaration(Some("OpenAI"), None), Wire::OpenAi);
+        assert_eq!(Wire::from_declaration(Some("OPENAI"), None), Wire::OpenAi);
+    }
+
+    #[test]
+    fn a_declaration_with_stray_whitespace_is_still_a_declaration() {
+        assert_eq!(
+            Wire::from_declaration(Some("  openai  "), None),
+            Wire::OpenAi
+        );
+        assert_eq!(
+            Wire::from_declaration(
+                Some("\tanthropic\n"),
+                Some("https://api.openai.com/v1/chat/completions")
+            ),
+            Wire::Anthropic
+        );
+    }
+
+    #[test]
+    fn an_explicit_anthropic_declaration_beats_an_upstream_url_that_looks_like_openai() {
+        let w = Wire::from_declaration(
+            Some("anthropic"),
+            Some("https://api.openai.com/v1/chat/completions"),
+        );
+        assert_eq!(w, Wire::Anthropic);
     }
 }
