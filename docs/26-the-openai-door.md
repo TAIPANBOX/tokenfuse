@@ -59,14 +59,23 @@ and owns every operation whose answer depends on the shape:
 | completions requested | always 1 | `n`, default 1 |
 | stream flag | `stream` | `stream` |
 | system text | `system`, string or content-block array | the `system`/`developer` role in `messages` |
-| tools text | `tools` | `tools` |
-| semantic-cache core | existing `semantic_core` | existing `semantic_core` |
 | body prepared for upstream | unchanged | `stream_options.include_usage = true` when streaming and absent |
 | refusal body | today's bytes, unchanged | the OpenAI error envelope |
 
-`messages()` becomes a shared handler taking a `Wire`. The existing helpers
-(`parse_request`, `system_text`, `tools_text`, `semantic_core`) move behind it
-rather than being rewritten. Nothing in the pipeline's ORDER changes: auth,
+`messages()` becomes a shared handler taking a `Wire`. `parse_request` and
+`system_text` move behind it rather than being rewritten.
+
+**Two helpers deliberately do NOT move**, checked rather than assumed:
+`tools_text` reads a top-level `tools` array, which both wires spell the same
+way, and `semantic_core`'s own doc says it already handles the Anthropic and
+the OpenAI content shapes. Moving them would be churn with no behaviour behind
+it. `system_text` is the one that must move, and the reason is a defect rather
+than tidiness: it reads Anthropic's top-level `system` field, OpenAI keeps the
+prompt in a `system` or `developer` message instead, so on the new door it
+returns an empty string and the semantic-cache partition key silently loses the
+system prompt. Two callers with different system prompts and the same question
+would then share a partition. The cache is Off by default, which is the only
+reason this is small. Nothing in the pipeline's ORDER changes: auth,
 parse, run-id, budget resolve, taint pre-note, open_run, agent-id grammar,
 delegation chain, identity map, model router, kill check, DLP, cache, estimate,
 policy evaluate and loop detect, wasm policy, Wardryx, unit budget, run budget,
