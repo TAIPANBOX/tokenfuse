@@ -142,9 +142,21 @@ impl LedgerBackend for RaftLedger {
                 run_id: resp.blocked_run.unwrap_or_else(|| run_id.to_string()),
                 budget: Microusd(resp.budget_micros as i64),
                 spent: Microusd(resp.spent_micros as i64),
+                // `would` is display-only here: the accept/reject decision was
+                // already made by the raft state machine's own saturating u64
+                // arithmetic (crates/cluster/src/types.rs). But this figure is
+                // built independently, with a plain `+` on two `u64`s and then
+                // an `as i64` cast that does not saturate: on overflow it wraps
+                // and can print a negative "would" in a release build (an `as
+                // i64` cast reinterprets bits rather than clamping, unlike a
+                // float-to-int `as` cast). Saturate the u64 sum, clamp it into
+                // i64's range before casting, then saturating_add the estimate.
                 would: Microusd(
-                    (resp.reserved_micros + resp.spent_micros) as i64 + estimate.0.max(0),
-                ),
+                    resp.reserved_micros
+                        .saturating_add(resp.spent_micros)
+                        .min(i64::MAX as u64) as i64,
+                )
+                .saturating_add(Microusd(estimate.0.max(0))),
             }),
             // Fail open: if consensus is unreachable, don't block the agent.
             Err(e) => {
