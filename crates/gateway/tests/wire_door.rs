@@ -33,6 +33,12 @@ fn headers_with_run_id(run_id: &str) -> HeaderMap {
 #[tokio::test]
 async fn a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything() {
     let state = common::app_with_wire(Wire::Anthropic);
+    // A second handle onto the SAME ledger (`AppState` is `Clone`, all fields
+    // are `Arc` - see `state.rs`), kept independently of the one `handle`
+    // consumes below, so this test can ask the ledger itself whether it ever
+    // heard of this run id rather than trusting the response alone.
+    let ledger = state.ledger.clone();
+
     let resp = tokenfuse_gateway::proxy::handle(
         Wire::OpenAi,
         state,
@@ -53,6 +59,19 @@ async fn a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserv
             .unwrap()
             .contains("TOKENFUSE_WIRE"),
         "the refusal must name the variable that fixes it, got {v}"
+    );
+
+    // The claim in this test's name is the guard's POSITION: refused before
+    // anything is reserved. A body assertion alone cannot tell "refused
+    // first" from "refused after opening the run and reserving against it,
+    // then still answering 400" - both produce the same response. Asking the
+    // ledger directly closes that gap: if `open_run` had already run for
+    // this id, `snapshot` would return `Some`.
+    assert!(
+        ledger.snapshot("r-wire-1").await.is_none(),
+        "the ledger must never have heard of this run id - the guard is \
+         supposed to refuse before open_run, not merely before this response \
+         is built"
     );
 }
 
