@@ -45,17 +45,25 @@ impl ModelPrice {
         }
     }
 
-    /// Exact cost of a usage record. Uses i128 intermediates so a large token
-    /// count times a per-Mtok price cannot overflow before the divide.
+    /// Price a usage record. Saturating throughout: an absurd token count
+    /// prices at the ceiling, never at a negative or a wrapped-small figure.
+    ///
+    /// The direction matters and is not symmetric. Over-charging an impossible
+    /// request refuses it, which is the safe answer for a request nobody can
+    /// pay for. Under-charging it serves it, and a negative cost passes every
+    /// budget check there is: measured on 2026-09-07, `output_tokens = 1e18`
+    /// priced at -3446744073709551616 micro-usd and the gateway forwarded a
+    /// call it should have refused. Same reasoning as ADR-8's fallback price.
     pub fn cost(&self, usage: &Usage) -> Microusd {
         let part = |tokens: u64, price: Microusd| -> i64 {
-            ((tokens as i128 * price.0 as i128) / 1_000_000) as i64
+            let micros = (tokens as i128).saturating_mul(price.0 as i128) / 1_000_000;
+            micros.clamp(0, i64::MAX as i128) as i64
         };
         Microusd(
             part(usage.input_tokens, self.input_per_mtok)
-                + part(usage.output_tokens, self.output_per_mtok)
-                + part(usage.cache_read_tokens, self.cache_read_per_mtok)
-                + part(usage.cache_write_tokens, self.cache_write_per_mtok),
+                .saturating_add(part(usage.output_tokens, self.output_per_mtok))
+                .saturating_add(part(usage.cache_read_tokens, self.cache_read_per_mtok))
+                .saturating_add(part(usage.cache_write_tokens, self.cache_write_per_mtok)),
         )
     }
 }
@@ -210,5 +218,96 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(price.cost(&no_tools), price.cost(&many_tools));
+    }
+
+    #[test]
+    fn a_cost_is_never_negative_however_many_tokens_are_claimed() {
+        let p = sonnet();
+        for tokens in [1e17 as u64, 1e18 as u64, u64::MAX / 2, u64::MAX] {
+            let usage = Usage {
+                output_tokens: tokens,
+                ..Default::default()
+            };
+            let c = p.cost(&usage);
+            assert!(
+                c.0 >= 0,
+                "output_tokens={tokens} priced at {} micro-usd: a negative cost \
+                 passes every budget check there is",
+                c.0
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpayable_request_saturates_at_the_top_rather_than_wrapping_to_the_bottom() {
+        let p = sonnet();
+        let huge = Usage {
+            output_tokens: u64::MAX,
+            ..Default::default()
+        };
+        let ordinary = Usage {
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert!(
+            p.cost(&huge).0 > p.cost(&ordinary).0,
+            "the most expensive request must not be the cheapest"
+        );
+        assert_eq!(
+            p.cost(&huge).0,
+            i64::MAX,
+            "saturating, not merely non-negative"
+        );
+    }
+
+    #[test]
+    fn every_token_field_saturates_and_the_sum_of_four_maxima_does_not_wrap() {
+        let p = sonnet();
+        let all = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(p.cost(&all).0, i64::MAX);
+    }
+
+    #[test]
+    fn ordinary_prices_are_exactly_what_they_always_were() {
+        // The fix must not move a single real figure. These are the numbers the
+        // existing tests in this module already assert, restated here so a future
+        // saturating-arithmetic change cannot quietly round them.
+        let p = sonnet();
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(p.cost(&u).0, 3_000_000 + 15_000_000);
+    }
+
+    /// Every field of `ModelPrice` is `pub`, so a misconfigured negative rate
+    /// is constructible on the public surface without going through
+    /// `per_mtok_usd`. Without the `clamp(0, ..)` lower bound in `cost`, that
+    /// negative rate would produce a negative cost by a second route, the same
+    /// failure this fix closes for an overflowing token count.
+    #[test]
+    fn a_negative_rate_never_produces_a_negative_cost() {
+        let p = ModelPrice {
+            input_per_mtok: Microusd(-5_000_000),
+            output_per_mtok: Microusd(0),
+            cache_read_per_mtok: Microusd(0),
+            cache_write_per_mtok: Microusd(0),
+        };
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            p.cost(&usage).0,
+            0,
+            "a negative rate must clamp to zero, not produce a negative cost"
+        );
     }
 }
