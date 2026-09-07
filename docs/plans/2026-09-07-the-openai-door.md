@@ -1533,6 +1533,18 @@ In `scripts/gates-have-teeth.sh`, add a case in the shape the file already
 uses, planting the "serve the mismatched door" fault and requiring the failure.
 Run `./scripts/gates-have-teeth.sh` and confirm the new case reports `ok`.
 
+- [ ] **Step 5a: Update the stated test counts, last, once**
+
+`scripts/stated-numbers.sh` compares the README badge and PROGRESS.md's
+per-crate breakdown against what `cargo test --all` actually runs, and every
+task in this plan adds tests, so the gate is red from Task 0 until this step.
+Do it here rather than in each task: re-measure per crate with
+`cargo test -p tokenfuse-<crate>` (core, dpop, delegation, gateway, cloud, and
+the umbrella), write the six figures and their sum into both files, and run the
+gate until it prints the sum back at you. Do not derive the breakdown by
+arithmetic from the total; the gate checks both and the point is that each
+figure was measured.
+
 - [ ] **Step 5: Correct the copy**
 
 Three README lines currently say the endpoint is planned and not implemented
