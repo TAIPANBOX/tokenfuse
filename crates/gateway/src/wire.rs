@@ -133,6 +133,42 @@ impl Wire {
             completions,
         }
     }
+
+    /// The body to forward, when it differs from the body that arrived.
+    ///
+    /// OpenAI sends no usage in a streamed response unless the request asked
+    /// for it, and a run settled from an estimate rather than from measured
+    /// usage is the failure this gateway exists to avoid. So a streamed
+    /// request that did not answer the question gets `include_usage` added.
+    ///
+    /// Returns `None` when nothing needs changing, including when the body is
+    /// not an object we can safely rewrite: the caller then forwards what it
+    /// received, which is always safe.
+    ///
+    /// A caller who set `include_usage` themselves is never overruled, not
+    /// even when they set it to `false`.
+    pub fn prepare_upstream_body(self, body: &bytes::Bytes, stream: bool) -> Option<bytes::Bytes> {
+        if self != Wire::OpenAi || !stream {
+            return None;
+        }
+        let mut value: Value = serde_json::from_slice(body).ok()?;
+        let obj = value.as_object_mut()?;
+        match obj.get("stream_options") {
+            Some(Value::Object(o)) if o.contains_key("include_usage") => return None,
+            Some(Value::Object(_)) | None => {}
+            // Present and not an object: the caller sent something we do not
+            // understand, and rewriting it would change their request into one
+            // they did not make.
+            Some(_) => return None,
+        }
+        let entry = obj
+            .entry("stream_options")
+            .or_insert_with(|| Value::Object(Default::default()));
+        entry
+            .as_object_mut()?
+            .insert("include_usage".to_string(), Value::Bool(true));
+        serde_json::to_vec(&value).ok().map(bytes::Bytes::from)
+    }
 }
 
 /// Concatenates the `text` field of each text-shaped content block in a
@@ -375,6 +411,56 @@ mod tests {
         let v = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
         assert_eq!(Wire::OpenAi.system_text(&v), "");
         assert_eq!(Wire::Anthropic.system_text(&json!({"model":"x"})), "");
+    }
+
+    // --- prepare_upstream_body (stream_options.include_usage injection) ---
+
+    #[test]
+    fn a_streamed_openai_request_is_asked_to_report_its_usage() {
+        let body = bytes::Bytes::from(r#"{"model":"gpt-4o","stream":true}"#);
+        let out = Wire::OpenAi.prepare_upstream_body(&body, true).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["stream_options"]["include_usage"], json!(true));
+    }
+
+    #[test]
+    fn a_caller_that_already_answered_the_question_is_not_overruled() {
+        for already in [json!(true), json!(false)] {
+            let body = bytes::Bytes::from(
+                serde_json::json!({"model":"gpt-4o","stream":true,
+                    "stream_options":{"include_usage": already}})
+                .to_string(),
+            );
+            assert!(
+                Wire::OpenAi.prepare_upstream_body(&body, true).is_none(),
+                "include_usage={already} was the caller's choice and stays"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_options_that_is_not_an_object_is_left_exactly_as_it_came() {
+        for odd in [json!("yes"), json!(3), json!([]), json!(null)] {
+            let body = bytes::Bytes::from(
+                serde_json::json!({"model":"gpt-4o","stream":true,"stream_options": odd})
+                    .to_string(),
+            );
+            assert!(Wire::OpenAi.prepare_upstream_body(&body, true).is_none());
+        }
+    }
+
+    #[test]
+    fn nothing_is_added_to_a_request_that_does_not_stream_or_to_the_other_door() {
+        let body = bytes::Bytes::from(r#"{"model":"gpt-4o"}"#);
+        assert!(Wire::OpenAi.prepare_upstream_body(&body, false).is_none());
+        let anth = bytes::Bytes::from(r#"{"model":"claude-haiku-4-5","stream":true}"#);
+        assert!(Wire::Anthropic.prepare_upstream_body(&anth, true).is_none());
+    }
+
+    #[test]
+    fn a_body_that_is_not_an_object_is_left_alone_rather_than_replaced() {
+        let body = bytes::Bytes::from("[1,2,3]");
+        assert!(Wire::OpenAi.prepare_upstream_body(&body, true).is_none());
     }
 
     #[test]

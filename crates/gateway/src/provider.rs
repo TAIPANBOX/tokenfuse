@@ -722,6 +722,39 @@ mod tests {
         );
     }
 
+    // -- a null usage chunk is not a zero (docs/26-the-openai-door.md) -----
+
+    /// With `stream_options.include_usage` set, the provider's own reference
+    /// says "All other chunks will also include a `usage` field, but with a
+    /// null value." `merge_usage` filters on `u.is_object()`, so a `usage:
+    /// null` chunk is skipped rather than parsed as an empty usage that would
+    /// overwrite what a later chunk reports. This pins that behaviour by name
+    /// rather than leaving it as an accident of how `filter` reads.
+    #[test]
+    fn a_null_usage_on_every_chunk_but_the_last_does_not_settle_the_run_at_zero() {
+        let mut p = UsageParser::default();
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n");
+        p.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        );
+        let u = p.finish();
+        assert_eq!(u.usage.input_tokens, 10);
+        assert_eq!(u.usage.output_tokens, 5);
+    }
+
+    /// The final usage chunk's `choices` is always an empty array (the
+    /// provider's own reference); that must read as "zero tool calls
+    /// observed", never as "nothing observed at all" (`None`).
+    #[test]
+    fn the_final_usage_chunks_empty_choices_array_counts_no_tool_calls() {
+        let mut p = UsageParser::default();
+        p.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+        );
+        let u = p.finish();
+        assert_eq!(u.usage.tool_calls, Some(0));
+    }
+
     #[tokio::test]
     async fn stub_sse_stream_yields_frames_and_usage() {
         let stub = StubProvider {

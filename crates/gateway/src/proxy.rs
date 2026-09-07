@@ -476,12 +476,14 @@ pub async fn chat_completions(
 
 /// The shared enforcement path both doors serve through, parameterised by
 /// which wire the caller spoke. `wire.parse_request` is not the only reader
-/// of the raw JSON: `taint::tool_uses_in`, `cache_eligible`, `semantic_core`,
-/// `system_text` and `tools_text` all read it too, each already wire-agnostic
-/// (see `docs/26-the-openai-door.md` section 8). What IS true is that budget
-/// check, firewall, identity, caching and forwarding are the same code for
-/// every door; the body itself is forwarded as-is once the budget check
-/// passes.
+/// of the raw JSON: `taint::tool_uses_in`, `cache_eligible`, `semantic_core`
+/// and `tools_text` all read it too, each already wire-agnostic (see
+/// `docs/26-the-openai-door.md` section 8). `system_text` is the one reader
+/// that is wire-specific by design, since the two doors keep the system
+/// prompt in different places and `Wire::system_text` matches on `self` to
+/// find it. What IS true is that budget check, firewall, identity, caching
+/// and forwarding are the same code for every door; the body itself is
+/// forwarded as-is once the budget check passes.
 ///
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`
@@ -1665,6 +1667,12 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     } else {
         Labels::new()
     };
+
+    // Ask for usage on a stream that would otherwise report none. Last, so it
+    // sees the body every earlier stage produced (DLP masking, model rewrite).
+    if let Some(prepared) = wire.prepare_upstream_body(&body, parsed.stream) {
+        body = prepared;
+    }
 
     let resp = match st.provider.send(headers, body).await {
         Ok(r) => r,
