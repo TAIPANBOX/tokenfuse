@@ -300,6 +300,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: System deps
+        # A hard ceiling for a flapping snapshot service; the probe catches
+        # "down", apt's per-fetch bounds do not add up to a bound on the step.
+        timeout-minutes: 6
         run: |
           # The snapshot service is served from archive.ubuntu.com. The runner
           # ships pointing at the azure mirror, which does not serve snapshots
