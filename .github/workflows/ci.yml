@@ -265,6 +265,7 @@ jobs:
               sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' "$f"
             fi
           done
+          ./scripts/apt-snapshot-probe.sh
           sudo apt-get update --snapshot "$APT_SNAPSHOT"
           sudo apt-get install -y --snapshot "$APT_SNAPSHOT" clang llvm libelf-dev
       - name: Install Rust (stable + nightly + rust-src)

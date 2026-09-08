@@ -124,6 +124,7 @@ jobs:
           # 2026-09-02, so apt looked for musl-tools in package lists it had
           # never fetched and answered "Unable to locate package" on every
           # Linux runner of the first tag that ran this job (v0.4.2).
+          ./scripts/apt-snapshot-probe.sh
           sudo apt-get update --snapshot "$APT_SNAPSHOT"
           # --snapshot, like bench.yml and ci.yml: unpinned, this resolves to
           # whatever is newest when the job runs, so the commit that passes
