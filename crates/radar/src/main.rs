@@ -93,6 +93,36 @@ mod tests {
         assert!(!is_local_model_port(5432));
         assert!(!is_local_model_port(0));
     }
+
+    /// A provider's address on a port it does not serve is not LLM traffic.
+    /// A resolver choosing a source address per RFC 6724 connect()s a UDP
+    /// socket to every candidate address of a multi-address name and sends
+    /// nothing: Go on port 53 (net/addrselect.go), glibc on port 0, musl on
+    /// 65535. The tracepoint sees each one, so flagged by address alone a
+    /// process that merely resolved api.openai.com read as one that called
+    /// it. Measured 2026-09-08 on idryx's sensor, which shares this shape
+    /// (TAIPANBOX/idryx#67, graded HIGH there).
+    #[test]
+    fn a_provider_address_is_llm_traffic_only_on_443() {
+        let openai = Ipv4Addr::new(162, 159, 140, 245);
+        let llm: HashSet<Ipv4Addr> = HashSet::from([openai]);
+        assert_eq!(is_llm(openai, 443, &llm), Some("LLM provider"));
+        assert_eq!(
+            is_llm(openai, 53, &llm),
+            None,
+            "a resolver's source-address probe on 53 is not an API call"
+        );
+        assert_eq!(
+            is_llm(openai, 65535, &llm),
+            None,
+            "musl probes on 65535; still not an API call"
+        );
+        assert_eq!(
+            is_llm(openai, 8080, &llm),
+            None,
+            "the providers serve nothing but 443"
+        );
+    }
 }
 
 #[tokio::main]
