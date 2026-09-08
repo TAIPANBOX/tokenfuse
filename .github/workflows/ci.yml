@@ -247,8 +247,55 @@ jobs:
       - name: the gates still fail on the faults they exist to catch
         run: ./scripts/gates-have-teeth.sh
 
+  # Decides whether the radar job below has anything to test. radar is its own
+  # nested workspace with no path dependency on the rest of the repository, so
+  # a change outside crates/radar, this file and the apt probe cannot change
+  # what it builds. Until 2026-09-08 the job ran on every pull request anyway,
+  # and on that day snapshot.ubuntu.com was down for hours: every open pull
+  # request, most of them touching docs, the dashboard or an SDK, wore a red
+  # `radar (eBPF build)` for an outage none of them could cause or fix. The
+  # job stays a required check; when it is skipped here it reports "skipped",
+  # which branch protection counts as satisfied, and the reason is in this
+  # job's summary rather than implied by a green tick.
+  #
+  # Decided against, and why: a `paths:` filter on the workflow (a required
+  # check that never reports blocks the merge instead of skipping), a
+  # third-party paths-filter action (one more pinned dependency for four
+  # lines of git), and any live-archive fallback for the snapshot itself
+  # (@yurii 2026-09-08: that trade is closed; the pin stays).
+  changes:
+    name: what changed
+    runs-on: ubuntu-24.04
+    outputs:
+      radar: ${{ steps.radar.outputs.radar }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: radar-relevant paths in this change
+        id: radar
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Any doubt runs the job: a base we cannot diff against (a first push,
+          # a force-push, a shallow clone) is a reason to run, never to skip.
+          relevant=true; reason="could not diff against base '$BASE'; running to be safe"
+          if [ -n "$BASE" ] && ! printf '%s' "$BASE" | grep -Eq '^0+$' && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            if files=$(git diff --name-only "$BASE" "$GITHUB_SHA"); then
+              if printf '%s\n' "$files" | grep -Eq '^(crates/radar/|\.github/workflows/ci\.yml$|scripts/apt-snapshot-probe\.sh$)'; then
+                relevant=true; reason="radar, this workflow or the apt probe changed"
+              else
+                relevant=false; reason="nothing under crates/radar, this workflow or the apt probe changed ($(printf '%s\n' "$files" | grep -c .) file(s) elsewhere)"
+              fi
+            fi
+          fi
+          echo "radar=$relevant" >>"$GITHUB_OUTPUT"
+          echo "radar (eBPF build): $([ "$relevant" = true ] && echo runs || echo skipped), $reason" | tee -a "$GITHUB_STEP_SUMMARY"
+
   radar:
     name: radar (eBPF build)
+    needs: changes
+    if: needs.changes.outputs.radar == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
