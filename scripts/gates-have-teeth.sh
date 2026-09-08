@@ -517,6 +517,40 @@ edit_all(".github/workflows/bench.yml", " install ", " nstall ")
 edit_all(".github/workflows/release.yml", " install ", " nstall ")')" \
 	"measured nothing"
 
+# --- the snapshot probe: fails in a minute, not an hour -------------------
+# All three run offline. The fault is a base address nothing listens on (port
+# 9, discard, closed everywhere this runs); the non-fault is a one-shot local
+# server that answers the pinned InRelease once and exits on its own, so no
+# process is left behind and nothing here needs kill; and with APT_SNAPSHOT
+# unset the probe must say so rather than probe nothing and pass.
+run_case "apt-snapshot-probe: the service is unreachable" fail_env \
+	"env APT_SNAPSHOT=20260820T000000Z APT_SNAPSHOT_BASE=http://127.0.0.1:9 ./scripts/apt-snapshot-probe.sh" \
+	"pass" \
+	"is not serving snapshot"
+
+run_case "apt-snapshot-probe: the service answers, so it must not fire" pass \
+	"( d=\$(mktemp -d); mkdir -p \"\$d/ubuntu/20260820T000000Z/dists/noble\"; echo Origin: Ubuntu >\"\$d/ubuntu/20260820T000000Z/dists/noble/InRelease\"
+	python3 - \"\$d\" <<'PYSRV' &
+import http.server, os, socketserver, sys
+os.chdir(sys.argv[1])
+class Q(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+srv = socketserver.TCPServer(('127.0.0.1', 0), Q)
+open(os.path.join(sys.argv[1], 'port'), 'w').write(str(srv.server_address[1]))
+srv.timeout = 15
+srv.handle_request()
+srv.server_close()
+PYSRV
+	for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s \"\$d/port\" ] && break; sleep 0.25; done
+	if [ ! -s \"\$d/port\" ]; then echo 'the one-shot server never bound a port, so this case measured nothing'; wait; rm -rf \"\$d\"; exit 1; fi
+	env APT_SNAPSHOT=20260820T000000Z APT_SNAPSHOT_BASE=http://127.0.0.1:\$(cat \"\$d/port\") ./scripts/apt-snapshot-probe.sh; rc=\$?; wait; rm -rf \"\$d\"; exit \$rc )" \
+	"pass"
+
+run_case "apt-snapshot-probe: no pin given, so it measured nothing" fail_env \
+	"env -u APT_SNAPSHOT ./scripts/apt-snapshot-probe.sh" \
+	"pass" \
+	"APT_SNAPSHOT is not set"
+
 run_case "pinned-installs: an apt install loses its snapshot" fail \
 	"./scripts/pinned-installs.sh" \
 	"$(py 'edit(".github/workflows/ci.yml", "sudo apt-get install -y --snapshot \"$APT_SNAPSHOT\" clang", "sudo apt-get install -y clang")')" \
