@@ -1,7 +1,7 @@
 //! TokenFuse Radar (W1): eBPF-based discovery of LLM traffic / shadow agents.
 //!
 //! Attaches to the `sys_enter_connect` tracepoint and reports every outbound
-//! TCP connection (pid, comm, dest ip:port), flagging those that go to known
+//! IPv4 connect(), TCP or UDP (pid, comm, dest ip:port), flagging those that go to known
 //! LLM providers or local model servers — with zero configuration in the apps.
 
 use std::collections::HashSet;
@@ -53,7 +53,12 @@ fn is_local_model_port(port: u16) -> bool {
 }
 
 fn is_llm(ip: Ipv4Addr, port: u16, llm: &HashSet<Ipv4Addr>) -> Option<&'static str> {
-    if llm.contains(&ip) {
+    // A provider address is LLM traffic only on 443, the one port those
+    // providers serve. A resolver choosing a source address per RFC 6724
+    // connect()s a UDP socket to every candidate address and sends nothing:
+    // Go on 53, glibc on 0, musl on 65535. Flagged by address alone, a name
+    // lookup printed as an API call (idryx#67, the same defect, graded HIGH).
+    if port == 443 && llm.contains(&ip) {
         Some("LLM provider")
     } else if port == 11434 {
         Some("local Ollama")
