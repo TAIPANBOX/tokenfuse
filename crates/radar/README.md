@@ -2,7 +2,7 @@
 
 Linux-only. Discovers **LLM traffic and shadow agents** on a host with **zero
 config in the apps**: an eBPF program on the `sys_enter_connect` tracepoint
-reports every outbound TCP connection (pid, comm, dest ip:port) and flags those
+reports every outbound IPv4 connect(), TCP or UDP (pid, comm, dest ip:port), and flags those
 going to known LLM providers or local model servers (Ollama/vLLM).
 
 This crate is its own nested workspace and is **excluded from the default

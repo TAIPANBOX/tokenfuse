@@ -834,10 +834,20 @@ build)`, `cloud apns (feature build)`.
    comparing `comm`, which any process can rename with `prctl`; the port
    compares PID.
 
-   The structural half matters as much: this file holds twenty invariants and
-   none of them is about radar, the crate has no tests at all, and its CI job
-   runs `cargo build` and stops. The most fragile code in the repository had
-   the least holding it.
+   The structural half mattered as much: this file held twenty invariants and
+   none of them was about radar, the crate had no tests at all, and its CI job
+   ran `cargo build` and stopped. The most fragile code in the repository had
+   the least holding it. The tests and the `cargo test -p radar` step landed
+   the same day.
+
+   A fourth defect, 2026-09-08, found by running idryx's port of this sensor
+   (idryx#67): `is_llm` flagged a provider address on ANY port, and a resolver
+   choosing a source address per RFC 6724 connect()s every candidate address
+   and sends nothing (Go on 53, glibc on 0, musl on 65535), so a process that
+   merely resolved api.openai.com printed as one that called it. The flag now
+   requires port 443, the one port those providers serve.
+   *(test: `a_provider_address_is_llm_traffic_only_on_443`, red before the
+   change; bound from `features/radar-provider-flag.feature`)*
 
    **This does not deprecate radar and does not forbid fixing it.** The three
    defects above are worth repairing precisely because it ships and runs. The
