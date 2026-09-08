@@ -108,6 +108,9 @@ jobs:
       # it produces names `cc` rather than musl, which sends people the wrong
       # way.
       - name: musl linker
+        # A hard ceiling for a flapping snapshot service; the probe catches
+        # "down", apt's per-fetch bounds do not add up to a bound on the step.
+        timeout-minutes: 6
         if: endsWith(matrix.target, '-linux-musl')
         run: |
           # The snapshot service is served from archive.ubuntu.com; the runner

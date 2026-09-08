@@ -12,10 +12,15 @@
 #      change in this repository caused or could fix. This turns that into one
 #      `::error` line at the top of the log.
 #
-#   2. Give apt bounded timeouts and retries, and make a failed index fetch an
-#      error rather than a warning (APT::Update::Error-Mode=any), so that if
-#      the service dies between the probe and the install the step still ends
-#      quickly and says why.
+#   2. Give apt bounded timeouts and a single retry, and make a failed index
+#      fetch an error rather than a warning (APT::Update::Error-Mode=any), so
+#      that if the service dies between the probe and the install the step
+#      still ends and says why. These bounds are per fetch, and apt fetches
+#      dozens of index files: on 2026-09-08 a flapping service (InRelease
+#      answered, later indexes 503ed) turned Retries=3 x 20 s x dozens of files
+#      into 27 minutes. The probe catches "down", not "flapping"; the hard
+#      bound for flapping is `timeout-minutes` on the workflow step itself,
+#      which every snapshot-pinned step carries.
 set -euo pipefail
 
 snap="${APT_SNAPSHOT:?APT_SNAPSHOT is not set; the pin lives in the workflow env}"
@@ -36,7 +41,7 @@ fi
 # Only where apt lives. On a developer Mac, where gates-have-teeth.sh also
 # runs this, there is no apt.conf.d and nothing to bound.
 if [ -d /etc/apt/apt.conf.d ]; then
-	conf='Acquire::Retries "3";
+	conf='Acquire::Retries "1";
 Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
 APT::Update::Error-Mode "any";'

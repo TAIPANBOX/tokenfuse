@@ -23,6 +23,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install wrk
+        # A hard ceiling for a flapping snapshot service; the probe catches
+        # "down", apt's per-fetch bounds do not add up to a bound on the step.
+        timeout-minutes: 6
         run: |
           # The snapshot service is served from archive.ubuntu.com. The runner
           # ships pointing at the azure mirror, which does not serve snapshots
