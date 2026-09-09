@@ -29,17 +29,31 @@ struct SockAddrIn {
 const AF_INET: u16 = 2;
 
 // `try_radar` reads the syscall argument at a fixed byte offset into the
-// tracepoint context, which is an x86_64 fact and not a portable one: the
-// layout of `trace_event_raw_sys_enter` is per-architecture, so the same offset
-// on aarch64 reads a different field and hands the userspace side a plausible,
-// wrong pointer. Nothing about that failure is loud. The program loads, the ring
-// buffer fills, and the addresses are rubbish.
+// tracepoint context. The build refuses anywhere but x86_64, and until
+// 2026-09-09 the reason written here was that offset 24 "on aarch64 reads a
+// different field". THAT WAS WRONG, and the correction is left in place of the
+// claim rather than quietly swapped for a better one.
 //
-// So the build refuses rather than the sensor lying. The real fix is CO-RE,
-// reading the argument through BTF instead of counting bytes, and it exists:
-// idryx's `connect.c` does exactly that through `trace_event_raw_sys_enter` out
-// of `vmlinux.h`. Per invariant 21 in CLAUDE.md that is where the sensor grows,
-// so this crate gets the honest refusal and idryx gets the portable read.
+// `struct trace_entry` is 8 bytes (`short unsigned int` + two `unsigned char` +
+// `int`), and `trace_event_raw_sys_enter` is that, then `long id`, then
+// `unsigned long args[6]` from offset 16. So `args[1]` sits at offset 24 on
+// every LP64 architecture, aarch64 included. Read off an aarch64 kernel's own
+// BTF, and then confirmed by running: with this refusal lifted in a throwaway
+// copy, the program built for aarch64, loaded on Linux 7.0.12 aarch64, and
+// reported 127.0.0.1:11434 and 192.0.2.9:8000, both exactly as connected. That
+// was the first live run this program has ever had.
+//
+// 32-bit is a different matter and the refusal covers it correctly: there
+// `long` is 4 bytes and the offset genuinely moves.
+//
+// THE REFUSAL STAYS ANYWAY, and now says why. `@decided 2026-09-09`: keep the
+// architecture gate as it is. It is not a claim that the read breaks elsewhere;
+// it is invariant 21 in CLAUDE.md, which puts every capability this sensor
+// gains in idryx and narrows radar to reporting what it sees. Widening what
+// radar supports is growth in the repository that is supposed to stop growing,
+// and idryx's `connect.c` already reads this argument through BTF rather than
+// counting bytes, which is portable by construction instead of by two
+// measurements.
 //
 // THE CONDITION IS `bpf_target_arch`, NOT `target_arch`, and the difference is
 // the whole thing. This crate compiles for `bpfel-unknown-none`, where
@@ -69,9 +83,9 @@ pub fn radar(ctx: TracePointContext) -> u32 {
 }
 
 fn try_radar(ctx: &TracePointContext) -> Result<(), i64> {
-    // sys_enter_connect: uservaddr pointer at offset 24 on x86_64. The
-    // compile_error above is what keeps that sentence from being a lie
-    // somewhere else.
+    // sys_enter_connect: uservaddr is args[1], at offset 24 on any LP64
+    // architecture. See the header for how that offset is arrived at and what
+    // the compile_error above is actually for, which is not this.
     let addr_ptr: u64 = unsafe { ctx.read_at::<u64>(24)? };
     if addr_ptr == 0 {
         return Ok(());
