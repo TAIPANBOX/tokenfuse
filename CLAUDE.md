@@ -825,9 +825,25 @@ build)`, `cloud apns (feature build)`.
 
    **Three defects found on 2026-08-08 are why the direction is that way and
    not the other** (@claude, read off both trees). `radar-ebpf` reads the
-   syscall argument at a hard-coded `ctx.read_at::<u64>(24)`, commented "offset
-   24 on x86_64", so it is not CO-RE and reads the wrong bytes anywhere else;
-   the port uses the BTF-typed `trace_event_raw_sys_enter` and is portable.
+   syscall argument at a hard-coded `ctx.read_at::<u64>(24)`, so it is not
+   CO-RE: it counts bytes where the port reads a BTF-typed
+   `trace_event_raw_sys_enter`, and a layout that changes is a layout this
+   crate would follow silently.
+
+   **This sentence said "reads the wrong bytes anywhere else" until
+   2026-09-09, and that was wrong.** `struct trace_entry` is 8 bytes, then
+   `long id`, then `unsigned long args[6]` from offset 16, so `args[1]` is at
+   24 on every LP64 architecture, aarch64 included. Read off an aarch64
+   kernel's own BTF and then confirmed by running: with the architecture
+   refusal lifted in a throwaway copy, the program built for aarch64, loaded
+   on Linux 7.0.12 aarch64, and reported both test destinations exactly as
+   connected. 32-bit is genuinely different, and the refusal covers it.
+
+   The correction is left here rather than swapped for a better sentence
+   because this invariant is the argument for where work happens, and an
+   argument resting on a false premise is one somebody re-derives. The
+   remaining reasons stand on their own: the port is CO-RE by construction
+   rather than by two measurements, and radar is not where the sensor grows.
    `main.rs`'s loopback filter admits ports 11434 and 8000 but not 8001, while
    its own `is_llm` lists 8001 as a vLLM port, so that branch is unreachable
    and a local vLLM on 8001 is never reported. And it drops its own traffic by
