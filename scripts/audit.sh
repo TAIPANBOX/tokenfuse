@@ -204,3 +204,16 @@ cargo audit "${args[@]}"
 echo
 echo "auditing crates/cluster"
 (cd crates/cluster && cargo audit "${args[@]}")
+
+# The third nested workspace, and until 2026-09-09 it had no lockfile at all, so
+# nothing here audited it and nothing pinned it. That is the crate whose output
+# is loaded into the kernel: aya, aya-ebpf and their trees were the one part of
+# this repository's dependency graph no advisory had ever been compared against.
+# Clean on the first run, 65 crates.
+#
+# Its lockfile going missing fails this step rather than skipping it: cargo audit
+# has nothing to scan and says so, which is the "measured nothing" answer the
+# other two subjects already give.
+echo
+echo "auditing crates/radar"
+(cd crates/radar && cargo audit "${args[@]}")
