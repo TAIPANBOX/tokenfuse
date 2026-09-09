@@ -5,7 +5,7 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, gen::bpf_probe_read_user},
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 use core::mem;
@@ -17,6 +17,68 @@ pub struct ConnEvent {
     pub _pad: u16,
     pub daddr: u32,
     pub comm: [u8; 16],
+}
+
+/// What this program saw and did NOT put on the ring buffer, per reason.
+///
+/// Without it, an empty table has four indistinguishable meanings: nothing
+/// connected, everything connected over a family this sensor does not observe,
+/// a sockaddr could not be read, or the ring buffer filled and real evidence
+/// went on the floor. The last one is the reason this exists: a full ring
+/// buffer is silent, `reserve` simply returns `None`, and the kernel keeps no
+/// drop counter for a BPF ring buffer the way it does for a perf buffer.
+///
+/// `other_family` is the one an operator will actually see move, and on this
+/// sensor it means more than it does on idryx's: radar observes AF_INET only,
+/// so every IPv6 connection on the box lands in this counter. That does not
+/// make radar see IPv6, and it does stop the blind spot being silent.
+///
+/// The three names are idryx's `skipped_counts` names verbatim, so the two
+/// sensors in this estate answer the same question with the same vocabulary.
+#[repr(C)]
+pub struct SkippedCounts {
+    pub other_family: u64,
+    pub unreadable: u64,
+    pub ringbuf_full: u64,
+}
+
+/// PER-CPU, and the choice is not incidental. A plain `Array<u64>` incremented
+/// with `*p += 1` is a read-modify-write from several CPUs at once and loses
+/// counts under exactly the load that makes these numbers worth having. The
+/// atomic alternative in Rust is `AtomicU64::fetch_add`, whose result must be
+/// dead for LLVM's BPF backend to emit `XADD`; aya-ebpf uses no atomics
+/// anywhere, so radar would be the first thing in this toolchain to lean on
+/// that codegen path, in a program nothing tests.
+///
+/// A per-CPU array with a plain increment has one race left, a nested
+/// preemption on the same CPU, which can lose an increment and can never turn
+/// a nonzero count into a zero. That is all the userspace side needs: it warns
+/// the first time a counter moves and prints totals at the end, so an
+/// undercount is a smaller number and never a silent one.
+#[map]
+static SKIPPED: PerCpuArray<SkippedCounts> = PerCpuArray::with_max_entries(1, 0);
+
+/// Which counter a skipped connection belongs to. An enum rather than three
+/// call sites so the map lookup is written once.
+enum Skipped {
+    OtherFamily,
+    Unreadable,
+    RingbufFull,
+}
+
+#[inline(always)]
+fn bump(which: Skipped) {
+    // A one-element per-CPU array is always present, but the verifier requires
+    // the None arm regardless and it costs nothing.
+    if let Some(counts) = SKIPPED.get_ptr_mut(0) {
+        unsafe {
+            match which {
+                Skipped::OtherFamily => (*counts).other_family += 1,
+                Skipped::Unreadable => (*counts).unreadable += 1,
+                Skipped::RingbufFull => (*counts).ringbuf_full += 1,
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -98,7 +160,15 @@ fn try_radar(ctx: &TracePointContext) -> Result<(), i64> {
             addr_ptr as *const core::ffi::c_void,
         )
     };
-    if ret != 0 || sa.sin_family != AF_INET {
+    // Split from the family check below, which it used to share a condition
+    // with: an unreadable sockaddr and a family this sensor does not observe
+    // are different facts about the host and belong in different counters.
+    if ret != 0 {
+        bump(Skipped::Unreadable);
+        return Ok(());
+    }
+    if sa.sin_family != AF_INET {
+        bump(Skipped::OtherFamily);
         return Ok(());
     }
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
@@ -113,6 +183,12 @@ fn try_radar(ctx: &TracePointContext) -> Result<(), i64> {
             (*p).comm = comm;
         }
         entry.submit(0);
+    } else {
+        // The counter that matters most. The other two are traffic this sensor
+        // was never going to report; this one is a connection it wanted to
+        // report and could not, so the table is incomplete in a way no other
+        // number would show.
+        bump(Skipped::RingbufFull);
     }
     Ok(())
 }

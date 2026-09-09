@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 
-use aya::maps::RingBuf;
+use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 
 #[repr(C)]
@@ -133,6 +133,83 @@ fn is_own_connection(event_pid: u32, self_pid: u32) -> bool {
     event_pid == self_pid
 }
 
+/// Mirror of `SkippedCounts` in radar-ebpf, hand-kept in step because there is
+/// no crate shared between the two halves and nothing compares them. `ConnEvent`
+/// has carried the same risk since this sensor was written; the size assertion
+/// in the tests below is the cheap half of the answer, and a shared
+/// `radar-common` crate is the real one, which is a change of its own.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct SkippedCounts {
+    other_family: u64,
+    unreadable: u64,
+    ringbuf_full: u64,
+}
+
+// Safety: a `#[repr(C)]` struct of three `u64`s has no padding, no pointers and
+// no invalid bit patterns, which is what `Pod` asks for.
+unsafe impl aya::Pod for SkippedCounts {}
+
+impl SkippedCounts {
+    /// The whole machine's counts. The map is per-CPU, so a reader that took
+    /// one entry would report one core's share of the truth.
+    fn total(per_cpu: &[SkippedCounts]) -> SkippedCounts {
+        per_cpu.iter().fold(SkippedCounts::default(), |mut acc, c| {
+            acc.other_family += c.other_family;
+            acc.unreadable += c.unreadable;
+            acc.ringbuf_full += c.ringbuf_full;
+            acc
+        })
+    }
+
+    /// Traffic this sensor was never going to report. Deliberately excludes the
+    /// ring buffer, so the two lines an operator reads say different things
+    /// rather than one repeating a number from the other.
+    fn out_of_scope(&self) -> bool {
+        self.other_family > 0 || self.unreadable > 0
+    }
+
+    /// Evidence in scope that was dropped. A million AF_UNIX connects say
+    /// nothing is wrong; one full ring buffer says the table cannot be trusted
+    /// to be complete.
+    fn lost(&self) -> bool {
+        self.ringbuf_full > 0
+    }
+}
+
+/// Reads the whole machine's counters, or `None` if the map cannot be read.
+///
+/// A failure here returns nothing rather than an error: the connections already
+/// printed are real either way, and losing a capture over an unreadable counter
+/// would trade the thing this sensor is for against the thing that describes it.
+fn read_skipped(map: &PerCpuArray<MapData, SkippedCounts>) -> Option<SkippedCounts> {
+    map.get(&0, 0)
+        .ok()
+        .map(|values| SkippedCounts::total(&values))
+}
+
+/// On stderr, never in the table, and that is what makes it survive invariant
+/// 21: when radar stops printing a table and starts emitting agent-event
+/// NDJSON, a consumer cannot see a terminal and needs these counts more, not
+/// less.
+fn report_skipped(counts: &SkippedCounts) {
+    if counts.out_of_scope() {
+        eprintln!(
+            "tokenfuse-radar: not reported -- {} connect(s) over other address \
+             families (AF_UNIX, netlink, and every IPv6 connection on this box), \
+             {} unreadable sockaddr(s)",
+            counts.other_family, counts.unreadable
+        );
+    }
+    if counts.lost() {
+        eprintln!(
+            "tokenfuse-radar: WARNING: {} connection(s) were dropped because the \
+             ring buffer was full; this table is incomplete",
+            counts.ringbuf_full
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +322,85 @@ mod tests {
         );
     }
 
+    /// The map is per-CPU, so a reader that took one entry would report one
+    /// core's share of the truth and read low on exactly the busy host where
+    /// these numbers matter.
+    #[test]
+    fn the_counts_are_the_whole_machines_and_not_one_cores() {
+        let per_cpu = [
+            SkippedCounts {
+                other_family: 3,
+                unreadable: 0,
+                ringbuf_full: 1,
+            },
+            SkippedCounts {
+                other_family: 4,
+                unreadable: 2,
+                ringbuf_full: 0,
+            },
+            SkippedCounts::default(),
+        ];
+        assert_eq!(
+            SkippedCounts::total(&per_cpu),
+            SkippedCounts {
+                other_family: 7,
+                unreadable: 2,
+                ringbuf_full: 1
+            }
+        );
+    }
+
+    /// Two lines that say different things. Out-of-scope traffic is a fact
+    /// about the host; a full ring buffer is a fact about this table, and
+    /// folding them would let a million AF_UNIX connects read as lost evidence.
+    #[test]
+    fn out_of_scope_traffic_is_not_lost_evidence() {
+        let clean = SkippedCounts::default();
+        assert!(!clean.out_of_scope() && !clean.lost());
+
+        let busy = SkippedCounts {
+            other_family: 4096,
+            unreadable: 3,
+            ringbuf_full: 0,
+        };
+        assert!(
+            busy.out_of_scope(),
+            "a quiet table on a busy host has to be explainable"
+        );
+        assert!(
+            !busy.lost(),
+            "traffic this sensor never wanted is not evidence it dropped"
+        );
+
+        let lost = SkippedCounts {
+            other_family: 0,
+            unreadable: 0,
+            ringbuf_full: 1,
+        };
+        assert!(
+            lost.lost(),
+            "one dropped connection means the table is incomplete"
+        );
+        assert!(
+            !lost.out_of_scope(),
+            "a dropped connection is not out-of-scope traffic, and printing it as both \
+             would repeat one number in two lines"
+        );
+    }
+
+    /// The struct is written twice, here and in radar-ebpf, with nothing
+    /// comparing them: a field added to one and not the other would be read
+    /// off the wrong offsets, silently. This is the cheap half of that
+    /// problem; a shared crate is the real one.
+    #[test]
+    fn the_counter_struct_is_the_size_the_bpf_side_writes() {
+        assert_eq!(
+            std::mem::size_of::<SkippedCounts>(),
+            24,
+            "three u64 counters, no padding; if this moved, radar-ebpf's copy moved too"
+        );
+    }
+
     /// And where that pid cannot be compared, radar refuses rather than
     /// filtering nothing. Inside a PID namespace the event's pid comes from the
     /// initial namespace and `std::process::id()` does not, so the comparison
@@ -311,7 +467,25 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("{:<8} {:<16} {:<21} {}", "PID", "COMM", "DEST", "FLAG");
 
-    let mut ring = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap())?;
+    // take_map, not map_mut, and the difference is what lets the counters exist
+    // at all: the ring buffer borrows `ebpf` mutably for the whole life of the
+    // loop below, so a second `ebpf.map(..)` inside it does not borrow-check.
+    // Taking both maps out first is the fix, and it is the one hidden cost of
+    // this change.
+    let mut ring = RingBuf::try_from(
+        ebpf.take_map("EVENTS")
+            .ok_or_else(|| anyhow::anyhow!("the loaded object has no EVENTS map"))?,
+    )?;
+    let skipped: PerCpuArray<MapData, SkippedCounts> = PerCpuArray::try_from(
+        ebpf.take_map("SKIPPED")
+            .ok_or_else(|| anyhow::anyhow!("the loaded object has no SKIPPED map"))?,
+    )?;
+
+    // Warned once, not once per poll: the same full ring buffer is still full
+    // 200ms later, and a warning per poll would bury the connections it sits
+    // among. The totals at the end say how many in the end.
+    let mut warned_lost = false;
+
     loop {
         while let Some(item) = ring.next() {
             if item.len() < core::mem::size_of::<ConnEvent>() {
@@ -348,6 +522,30 @@ async fn main() -> anyhow::Result<()> {
                 format!("{ip}:{}", ev.dport)
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if !warned_lost {
+            if let Some(counts) = read_skipped(&skipped) {
+                if counts.lost() {
+                    eprintln!(
+                        "tokenfuse-radar: WARNING: the ring buffer filled and \
+                         connections were dropped; this table is incomplete. \
+                         Totals on exit."
+                    );
+                    warned_lost = true;
+                }
+            }
+        }
+
+        // Ctrl-C is where the totals get printed, so a run that is stopped the
+        // way runs are actually stopped still says what it could not observe.
+        // Before this, the only way to learn was to already know.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                if let Some(counts) = read_skipped(&skipped) {
+                    report_skipped(&counts);
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
     }
 }
