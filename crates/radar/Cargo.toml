@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 aya = "0.13"
-aya-log = "0.2"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 
