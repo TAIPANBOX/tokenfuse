@@ -833,11 +833,25 @@ build)`, `cloud apns (feature build)`.
    **This sentence said "reads the wrong bytes anywhere else" until
    2026-09-09, and that was wrong.** `struct trace_entry` is 8 bytes, then
    `long id`, then `unsigned long args[6]` from offset 16, so `args[1]` is at
-   24 on every LP64 architecture, aarch64 included. Read off an aarch64
-   kernel's own BTF and then confirmed by running: with the architecture
-   refusal lifted in a throwaway copy, the program built for aarch64, loaded
-   on Linux 7.0.12 aarch64, and reported both test destinations exactly as
-   connected. 32-bit is genuinely different, and the refusal covers it.
+   24 on every LP64 architecture, aarch64 included. Confirmed by running: with
+   the architecture refusal lifted in a throwaway copy, the program built for
+   aarch64, loaded on Linux 7.0.12 aarch64, and reported both test
+   destinations exactly as connected. 32-bit is genuinely different, and the
+   refusal covers it.
+
+   **That correction carried a false sentence of its own, corrected the same
+   day.** It said the layout was "read off an aarch64 kernel's own BTF". No
+   aarch64 BTF was read. The header that was actually consulted is idryx's
+   committed `vmlinux.h`, and that one is x86_64's: its `struct pt_regs` runs
+   r15, r14, r13, r12, bp, bx down to `orig_ax`, it defines `x86_hw_tss` and
+   `desc_struct`, and it has no `user_pt_regs` at all (@measured `grep` over
+   `internal/ebpfcapture/bpf/vmlinux.h` in TAIPANBOX/idryx, 2026-09-09).
+
+   The conclusion stands, because neither support it actually rests on
+   involves that header: the offset follows from the C types under any LP64
+   ABI, and the program was then run on aarch64 and reported correctly. A
+   conclusion that is right for an invented reason is worse than one that is
+   wrong, because being right stops anybody checking the reason.
 
    The correction is left here rather than swapped for a better sentence
    because this invariant is the argument for where work happens, and an

@@ -99,11 +99,19 @@ const AF_INET: u16 = 2;
 // `struct trace_entry` is 8 bytes (`short unsigned int` + two `unsigned char` +
 // `int`), and `trace_event_raw_sys_enter` is that, then `long id`, then
 // `unsigned long args[6]` from offset 16. So `args[1]` sits at offset 24 on
-// every LP64 architecture, aarch64 included. Read off an aarch64 kernel's own
-// BTF, and then confirmed by running: with this refusal lifted in a throwaway
-// copy, the program built for aarch64, loaded on Linux 7.0.12 aarch64, and
-// reported 127.0.0.1:11434 and 192.0.2.9:8000, both exactly as connected. That
-// was the first live run this program has ever had.
+// every LP64 architecture, aarch64 included. Confirmed by running: with this
+// refusal lifted in a throwaway copy, the program built for aarch64, loaded on
+// Linux 7.0.12 aarch64, and reported 127.0.0.1:11434 and 192.0.2.9:8000, both
+// exactly as connected. That was the first live run this program has ever had.
+//
+// THAT CORRECTION HAD A FALSE SENTENCE OF ITS OWN, corrected the same day. It
+// said the layout was "read off an aarch64 kernel's own BTF". No aarch64 BTF
+// was read: the header actually consulted is idryx's committed vmlinux.h, and
+// it is x86_64's (pt_regs runs r15/r14/r13/r12/bp/bx down to orig_ax, it has
+// x86_hw_tss and desc_struct, and no user_pt_regs at all). The offset above
+// stands on the C types and on the live aarch64 run, neither of which needs
+// that header. A conclusion that is right for an invented reason is worse than
+// one that is wrong, because being right stops anybody checking the reason.
 //
 // 32-bit is a different matter and the refusal covers it correctly: there
 // `long` is 4 bytes and the offset genuinely moves.
