@@ -445,6 +445,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
+      contents: read       # a job-level block replaces the workflow's; kept for the attestation action
       packages: write
       id-token: write      # keyless image signature and the provenance attestation
       attestations: write
