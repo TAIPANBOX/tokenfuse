@@ -40,7 +40,14 @@ ARG FEATURES=""
 # `export`), so passing --build-arg is enough.
 ARG TOKENFUSE_VERSION=""
 ARG TOKENFUSE_GIT_SHA=""
-RUN if [ -n "$FEATURES" ]; then \
+# An ARG left at its empty default is still SET in this shell, and
+# `option_env!` reads a set-but-empty variable as Some(""), so an image built
+# with neither arg printed `tokenfuse  ()` rather than the `-dev` fallback the
+# comment above promises (the released v0.5.0 image did). Unset the empties,
+# and the fallback is the same as the release binaries'.
+RUN [ -n "$TOKENFUSE_VERSION" ] || unset TOKENFUSE_VERSION; \
+    [ -n "$TOKENFUSE_GIT_SHA" ] || unset TOKENFUSE_GIT_SHA; \
+    if [ -n "$FEATURES" ]; then \
         cargo build --release -p tokenfuse-gateway --features "$FEATURES"; \
     else \
         cargo build --release -p tokenfuse-gateway; \

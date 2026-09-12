@@ -374,6 +374,11 @@ jobs:
       # metadata-action lowercases on the way past, which is why the merge job's
       # `images:` line survived while the build job's `outputs:` line did not.
       # Anything talking to buildx directly has to do it itself.
+      # The same seven-character sha the binaries job stamps, so `--version`
+      # prints the same string from an image and from an archive.
+      - name: the short sha for the version stamp
+        id: stamp
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: lowercase the owner
         id: owner
         run: echo "name=${OWNER,,}" >> "$GITHUB_OUTPUT"
@@ -386,7 +391,16 @@ jobs:
         with:
           context: ${{ matrix.image.context }}
           file: ${{ matrix.image.dockerfile }}
-          build-args: ${{ matrix.image.build-args }}
+          # The version stamp, the same two values the binaries job exports.
+          # Until 2026-09-13 only the binaries carried them: the released
+          # v0.5.0 image answered `tokenfuse --version` with an empty version
+          # and an empty sha, found by INS-1 of the 1.0 proving run. On the
+          # pull-request path these carry the pull request's own ref, which
+          # publishes nothing.
+          build-args: |
+            ${{ matrix.image.build-args }}
+            TOKENFUSE_VERSION=${{ github.ref_name }}
+            TOKENFUSE_GIT_SHA=${{ steps.stamp.outputs.sha }}
           outputs: type=image,name=ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.image.repo }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.image.scope }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.scope }}-${{ matrix.arch }}
