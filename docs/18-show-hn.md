@@ -5,7 +5,7 @@
 > the prepared first comment in immediately after submitting.
 >
 > HN "Show HN" rules require something people can try. We qualify:
-> `docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse`
+> `docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v0.5.0`
 > works offline against the built-in fake provider (the flag is required, and
 > says out loud that the numbers it then reports are invented), and the
 > rug-pull demo is one `cargo run`.
@@ -69,8 +69,10 @@ Honest limitations, so you don't have to dig for them: budget enforcement is
 estimate-before / settle-after, a fast pre-flight approximation reconciled
 against real usage — not a hard guarantee that not one extra cent is spent.
 It's fail-open by default (if TokenFuse breaks, your traffic flows — run the
-HA cluster if you want the opposite trade-off). And it's a young v0.3.0:
-functional and CI-tested, but no external security audit yet. Default mode is
+HA cluster if you want the opposite trade-off). And it's a young v0.5.0:
+functional and CI-tested, releases signed keyless with per-target binaries,
+checksums, an SBOM and provenance you can verify, but no external security
+audit yet. Default mode is
 **shadow** — it records what it *would* have blocked and changes nothing, so
 you can evaluate it risk-free and flip to enforce when the numbers convince
 you.
@@ -82,7 +84,10 @@ dashboard. No seat limits, no time limit, no paid tier.
 Try it (offline, no signup, built-in fake provider; the flag is how the
 gateway makes you say you know its numbers are invented):
 
-    docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse
+    docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v0.5.0
+
+The whole stack, not just the proxy, is the second door: stack-single brings
+up every plane on a clean VM in 111 seconds (measured 2026-08-02).
 
 I'd especially value feedback on the loop-detection heuristics (what runaway
 patterns have bitten you that identical-call/ping-pong/context-growth
@@ -99,9 +104,10 @@ answers:
 **"My provider already has spend limits."** Org-level limits cap a month and
 a key. They can't cap one task, can't see that a sub-agent belongs to a
 parent task, can't detect a loop (the provider sees valid, novel-enough
-requests), and can't stop a run mid-flight. Also: one TokenFuse fronts
-Anthropic, OpenAI, Ollama, vLLM — any Anthropic/OpenAI-shaped endpoint — so
-the budget is provider-agnostic.
+requests), and can't stop a run mid-flight. Also: TokenFuse fronts any
+Anthropic-shaped or OpenAI-shaped endpoint (Anthropic, OpenAI, OpenRouter,
+Ollama, vLLM), one wire per process and no translation between them, by
+decision (docs/26), so the budget is provider-agnostic.
 
 **"Why not LiteLLM / a gateway?"** Gateways are routing + per-key caps, and
 they're good at that. Run-scoped hierarchical budgets, loop detection, and a
@@ -117,10 +123,10 @@ own workload first.
 
 **"What's the catch on 'free'?"** There is no catch: the whole thing is free
 and self-hosted, including the Cloud control plane (fleet dashboard, central
-budgets, the kill switch). No seat limits, no time limit, no paid tier. The
-commercial product is separate: a secured, managed enterprise control room
-over the whole agent-governance stack, for companies that want the stack run
-for them. TokenFuse itself stays free and open.
+budgets, the kill switch). No seat limits, no time limit, no paid tier, and no
+paid tier anywhere else in the stack either: every plane is Apache-2.0 and
+self-hosted. If you want it run for you, that is a conversation, not a product
+page.
 
 **"Does it read my prompts?"** No — metadata-only by default. Cost, token
 counts, timing, fingerprints. The DLP/taint features that do look at content

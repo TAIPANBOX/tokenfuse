@@ -96,3 +96,45 @@ def test_check_response_duck_typed():
 
     with pytest.raises(tokenfuse.BudgetExceeded):
         tokenfuse.check_response(FakeResp())
+
+
+def test_the_openai_door_urls():
+    assert tokenfuse.chat_completions_url("http://host:9/") == "http://host:9/v1/chat/completions"
+    assert tokenfuse.openai_base_url("http://host:9") == "http://host:9/v1"
+    # The Anthropic SDK takes the root and appends /v1/messages itself.
+    assert tokenfuse.gateway_url("http://host:9") == "http://host:9"
+
+
+def test_the_openai_shaped_402_maps_to_the_same_exception():
+    # The body the OpenAI door returned on 2026-09-12 against OpenRouter, verbatim
+    # shape: type and code both carry the reason, message is the sentence.
+    body = {
+        "error": {
+            "budget_usd": 0.007,
+            "code": "budget_exceeded",
+            "message": "run r3 was stopped by the gateway: per-run budget exceeded",
+            "param": None,
+            "policy_id": "default",
+            "reason": "per-run budget exceeded",
+            "retryable": False,
+            "run_id": "r3",
+            "spent_usd": 0.00321,
+            "type": "budget_exceeded",
+        }
+    }
+    with pytest.raises(tokenfuse.BudgetExceeded) as excinfo:
+        tokenfuse.raise_for_fuse(402, body)
+    assert excinfo.value.run_id == "r3"
+    assert excinfo.value.budget_usd == 0.007
+    assert excinfo.value.spent_usd == 0.00321
+
+
+def test_an_openai_body_with_code_only_still_maps():
+    body = {"error": {"code": "loop_detected", "message": "loop"}}
+    with pytest.raises(tokenfuse.LoopDetected):
+        tokenfuse.raise_for_fuse(402, body)
+
+
+def test_version_is_the_gateway_line():
+    assert tokenfuse.__version__ == "0.5.0"
+

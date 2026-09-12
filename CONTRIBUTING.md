@@ -32,6 +32,10 @@ for the full gate.
   (see the golden regression tests) - this is a spend kill-switch, and a
   behavior change there needs to be deliberate, not incidental.
 
+## Reporting a problem
+
+A report we can act on carries three things: the version (`tokenfuse --version`, or the image tag), the wire (`TOKENFUSE_WIRE`, Anthropic or OpenAI, and the upstream URL shape), and the exact response body, in particular the `error.type` of a 402 or 403. Metadata only: never paste prompt contents or keys.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for how to report vulnerabilities privately.

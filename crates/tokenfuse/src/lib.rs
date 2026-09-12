@@ -12,8 +12,13 @@
 //! ```text
 //! docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 //!   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-//!   ghcr.io/taipanbox/tokenfuse
+//!   ghcr.io/taipanbox/tokenfuse:v0.5.0
 //! ```
+//!
+//! The image tag is pinned on purpose: there is no `:latest`. Two wire shapes,
+//! one per process: `TOKENFUSE_UPSTREAM` ending in `/v1/messages` serves
+//! Anthropic-shaped clients, one ending in `/v1/chat/completions` serves
+//! OpenAI-shaped clients (`TOKENFUSE_WIRE` overrides the inference).
 //!
 //! Point your provider client at `http://127.0.0.1:4100` and attach a few
 //! `X-Fuse-*` headers; `x-fuse-run-id` is required, since a call the gateway

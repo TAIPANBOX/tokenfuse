@@ -37,6 +37,25 @@ except tokenfuse.LoopDetected as e:
 For raw HTTP clients (`requests` / `httpx`), call `tokenfuse.check_response(resp)`
 after the request, or `tokenfuse.raise_for_fuse(status_code, body)`.
 
+### The OpenAI door
+
+A gateway started with an OpenAI-shaped upstream (`TOKENFUSE_UPSTREAM` ending in
+`/v1/chat/completions`, or `TOKENFUSE_WIRE=openai`) serves OpenAI-shaped clients.
+One process, one wire shape; the same headers and the same exceptions:
+
+```python
+import openai, tokenfuse
+
+client = openai.OpenAI(
+    base_url=tokenfuse.openai_base_url(),                # http://127.0.0.1:4100/v1
+    default_headers=tokenfuse.run_headers("run-42", budget_usd=5.0),
+)
+```
+
+The 402 body the OpenAI door returns carries the same `error.type` as the
+Anthropic one, so `raise_for_fuse` maps both doors to the same exception classes.
+Versions: from 0.5.0 this package versions with the gateway.
+
 ## Exceptions
 
 All inherit `tokenfuse.FuseError` (fields: `run_id`, `budget_usd`, `spent_usd`,
