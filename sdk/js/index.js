@@ -21,6 +21,23 @@ function messagesUrl(gateway = DEFAULT_GATEWAY) {
 }
 
 /**
+ * Full URL of the OpenAI-style chat completions endpoint (the OpenAI door,
+ * `TOKENFUSE_WIRE=openai`). One gateway process serves one wire shape.
+ */
+function chatCompletionsUrl(gateway = DEFAULT_GATEWAY) {
+  return `${gatewayUrl(gateway)}/v1/chat/completions`;
+}
+
+/**
+ * `baseURL` for an OpenAI-compatible client: the OpenAI SDK appends
+ * `/chat/completions` itself, so the gateway root plus `/v1`. The Anthropic SDK
+ * appends `/v1/messages` and takes `gatewayUrl()` unchanged.
+ */
+function openaiBaseUrl(gateway = DEFAULT_GATEWAY) {
+  return `${gatewayUrl(gateway)}/v1`;
+}
+
+/**
  * Build the `X-Fuse-*` attribution headers for a run. Only `runId` is required;
  * without it the gateway treats a call as an unmanaged pass-through.
  *
@@ -46,9 +63,11 @@ function runHeaders(runId, opts = {}) {
 }
 
 module.exports = {
-  VERSION: "0.3.0",
+  VERSION: "0.5.0",
   DEFAULT_GATEWAY,
   gatewayUrl,
   messagesUrl,
+  chatCompletionsUrl,
+  openaiBaseUrl,
   runHeaders,
 };

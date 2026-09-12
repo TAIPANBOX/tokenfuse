@@ -7,6 +7,12 @@ export declare function gatewayUrl(gateway?: string): string;
 /** Full URL of the Anthropic-style messages endpoint. */
 export declare function messagesUrl(gateway?: string): string;
 
+/** Full URL of the OpenAI-style chat completions endpoint (the OpenAI door). */
+export declare function chatCompletionsUrl(gateway?: string): string;
+
+/** `baseURL` for an OpenAI-compatible client: the gateway root plus `/v1`. */
+export declare function openaiBaseUrl(gateway?: string): string;
+
 export interface RunHeaderOptions {
   budgetUsd?: number;
   taskType?: string;

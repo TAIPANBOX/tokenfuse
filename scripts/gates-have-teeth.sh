@@ -514,7 +514,8 @@ run_case "pinned-installs: no install commands left, so it measured nothing" fai
 	"./scripts/pinned-installs.sh" \
 	"$(py 'edit_all(".github/workflows/ci.yml", " install ", " nstall ")
 edit_all(".github/workflows/bench.yml", " install ", " nstall ")
-edit_all(".github/workflows/release.yml", " install ", " nstall ")')" \
+edit_all(".github/workflows/release.yml", " install ", " nstall ")
+edit_all(".github/workflows/sdk-publish.yml", " install ", " nstall ")')" \
 	"measured nothing"
 
 # --- the snapshot probe: fails in a minute, not an hour -------------------

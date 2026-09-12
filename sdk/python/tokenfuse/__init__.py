@@ -30,6 +30,8 @@ __all__ = [
     "DEFAULT_GATEWAY",
     "gateway_url",
     "messages_url",
+    "chat_completions_url",
+    "openai_base_url",
     "run_headers",
     "raise_for_fuse",
     "check_response",
@@ -43,7 +45,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 DEFAULT_GATEWAY = "http://127.0.0.1:4100"
 
@@ -56,6 +58,19 @@ def gateway_url(gateway: str = DEFAULT_GATEWAY) -> str:
 def messages_url(gateway: str = DEFAULT_GATEWAY) -> str:
     """Full URL of the Anthropic-style messages endpoint."""
     return f"{gateway_url(gateway)}/v1/messages"
+
+
+def chat_completions_url(gateway: str = DEFAULT_GATEWAY) -> str:
+    """Full URL of the OpenAI-style chat completions endpoint (the OpenAI door,
+    ``TOKENFUSE_WIRE=openai``). One gateway process serves one wire shape."""
+    return f"{gateway_url(gateway)}/v1/chat/completions"
+
+
+def openai_base_url(gateway: str = DEFAULT_GATEWAY) -> str:
+    """``base_url`` for an OpenAI-compatible client: the OpenAI SDK appends
+    ``/chat/completions`` itself, so the gateway root plus ``/v1``. The Anthropic
+    SDK appends ``/v1/messages`` and takes :func:`gateway_url` unchanged."""
+    return f"{gateway_url(gateway)}/v1"
 
 
 def run_headers(
@@ -169,10 +184,13 @@ def raise_for_fuse(status_code: int, body: Any) -> None:
     err = data.get("error")
     if not isinstance(err, dict):
         return
-    kind = err.get("type", "")
+    # Both wire shapes carry the reason as ``error.type`` (the OpenAI door adds
+    # ``message``, ``code`` and ``param`` around the same fields), so one mapping
+    # serves both doors.
+    kind = err.get("type") or err.get("code") or ""
     cls = _ERROR_TYPES.get(kind, FuseError)
     raise cls(
-        err.get("reason") or kind or "tokenfuse blocked the request",
+        err.get("reason") or err.get("message") or kind or "tokenfuse blocked the request",
         run_id=err.get("run_id"),
         budget_usd=err.get("budget_usd"),
         spent_usd=err.get("spent_usd"),

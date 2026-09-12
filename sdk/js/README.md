@@ -32,10 +32,29 @@ Two additional block types return `403` instead of `402`: `dlp_blocked` (a
 secret was found in the outgoing prompt) and `taint_blocked` (the model asked
 for a capability denied under the run's taint).
 
+### The OpenAI door
+
+A gateway started with an OpenAI-shaped upstream (`TOKENFUSE_UPSTREAM` ending in
+`/v1/chat/completions`, or `TOKENFUSE_WIRE=openai`) serves OpenAI-shaped clients.
+One process, one wire shape; the same headers, the same 402 contract:
+
+```js
+const OpenAI = require("openai");
+
+const client = new OpenAI({
+  baseURL: tf.openaiBaseUrl(),                       // http://127.0.0.1:4100/v1
+  defaultHeaders: tf.runHeaders("run-42", { budgetUsd: 5.0 }),
+});
+```
+
 ## API
 
-- `gatewayUrl(gateway?)`: base URL for the provider client.
+- `gatewayUrl(gateway?)`: base URL for an Anthropic-shaped client.
 - `messagesUrl(gateway?)`: the Anthropic-style messages endpoint.
+- `openaiBaseUrl(gateway?)`: `baseURL` for an OpenAI-shaped client (the gateway root plus `/v1`).
+- `chatCompletionsUrl(gateway?)`: the OpenAI-style chat completions endpoint.
 - `runHeaders(runId, { budgetUsd, taskType, parentRunId, tags })`: the `X-Fuse-*` headers.
+
+Versions: from 0.5.0 this package versions with the gateway.
 
 Ships with TypeScript types. Licensed under Apache-2.0.

@@ -1,6 +1,6 @@
 {
   "name": "tokenfuse",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "JavaScript/TypeScript client helpers for TokenFuse — runtime cost control for AI agents.",
   "keywords": ["llm", "agents", "finops", "budget", "tokenfuse"],
   "license": "Apache-2.0",
