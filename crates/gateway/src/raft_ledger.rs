@@ -190,6 +190,45 @@ impl LedgerBackend for RaftLedger {
         }
     }
 
+    /// The checked reserve's question, answered from the local read: this run
+    /// and every ancestor, the same walk `Ledger::would_exceed` makes, over
+    /// `sm.read_run`, which is the eventually consistent copy `snapshot` reads
+    /// too. So on a lagging follower this can under-report (stale `spent`, or
+    /// no run yet) and, if a budget raise has not replicated, over-report.
+    /// Advisory, like every shadow signal; the checked `reserve` above is
+    /// where the cluster decides. Note also that `reserve_unchecked` above is
+    /// a checked reserve whose refusal is ignored (the state machine refuses
+    /// an over-budget `Reserve`, so the spend lands only at `Settle`); that is
+    /// older than this method and is written down in invariant 42.
+    async fn would_exceed(&self, run_id: &str, estimate: Microusd) -> Option<BudgetError> {
+        let est = estimate.0.max(0) as u64;
+        let mut next = Some(run_id.to_string());
+        let mut hops = 0u32;
+        while let Some(id) = next {
+            // A cycle in the parent links would spin here; the in-process
+            // ledger's `chain` has the same shape and the same cap is cheap.
+            hops += 1;
+            if hops > 64 {
+                return None;
+            }
+            let s = self.node.sm.read_run(&id).await?;
+            let would = s
+                .spent_micros
+                .saturating_add(s.reserved_micros)
+                .saturating_add(est);
+            if would > s.budget_micros {
+                return Some(BudgetError::Exceeded {
+                    run_id: id,
+                    budget: Microusd(s.budget_micros.min(i64::MAX as u64) as i64),
+                    spent: Microusd(s.spent_micros.min(i64::MAX as u64) as i64),
+                    would: Microusd(would.min(i64::MAX as u64) as i64),
+                });
+            }
+            next = s.parent;
+        }
+        None
+    }
+
     async fn snapshot(&self, run_id: &str) -> Option<RunSnapshot> {
         self.node.sm.read_run(run_id).await.map(snap_of)
     }

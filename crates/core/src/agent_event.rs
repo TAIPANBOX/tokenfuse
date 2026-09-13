@@ -95,6 +95,25 @@ pub enum EventType {
     /// budget, policy, loop, kill, or WASM-policy trip. Raised at the
     /// gateway's `breaker_error_response` call sites.
     BreakerTripped,
+    /// The Breaker's finding in shadow or warn mode: this call WOULD have been
+    /// refused (the run's or an ancestor's budget was exceeded by the same
+    /// rule enforce applies) and was forwarded because enforcement is off.
+    /// Raised by the gateway's shadow/warn path, once per such call. The
+    /// firewall's `taint_shadow` is the precedent, and the reasoning is the
+    /// same: until this variant existed (2026-09-13) a shadow week left no
+    /// header and no event for the budget, only `allow` rows in the trace,
+    /// while the README promised that shadow "records what it would block".
+    ///
+    /// `medium`, by `taint_shadow`'s argument: the spend HAPPENED, so it is
+    /// not `low`; and `breaker_tripped` is itself `medium`, the per-call
+    /// record of a refusal that worked. A consumer counting refusals reads
+    /// `breaker_tripped`; one sizing a budget before turning enforce on reads
+    /// this, and never confuses the two because they are two types.
+    ///
+    /// `data` is `breaker_tripped`'s (`reason`, `budget_usd`, `spent_usd`,
+    /// `policy_id`, `detail`, `unit`) plus `mode` (`shadow` or `warn`), so a
+    /// shadow-to-enforce comparison is arithmetic over one shape.
+    BreakerShadow,
     /// New: a DLP (secret-scanning) 403 block. Raised at the gateway's
     /// `dlp_block` call site.
     DlpBlock,
@@ -727,6 +746,7 @@ impl EventType {
             EventType::BudgetThreshold => "budget_threshold",
             EventType::RunKilled => "run_killed",
             EventType::BreakerTripped => "breaker_tripped",
+            EventType::BreakerShadow => "breaker_shadow",
             EventType::DlpBlock => "dlp_block",
             EventType::TaintBlock => "taint_block",
             EventType::McpDrift => "mcp_drift",
@@ -794,9 +814,10 @@ impl EventType {
             // Beside them, the firewall's shadow finding: a dangerous action
             // that was permitted because enforcement is off. Not an incident,
             // and not silence either. See the variant's own note.
-            EventType::BudgetThreshold | EventType::BreakerTripped | EventType::TaintShadow => {
-                Severity::Medium
-            }
+            EventType::BudgetThreshold
+            | EventType::BreakerTripped
+            | EventType::BreakerShadow
+            | EventType::TaintShadow => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             // Taint acquisition sits here for the same reason: a run reading

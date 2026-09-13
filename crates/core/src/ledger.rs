@@ -175,6 +175,31 @@ impl Ledger {
         })
     }
 
+    /// The question `reserve` asks, answered without reserving: would
+    /// `estimate` exceed this run's budget or any ancestor's? `None` for a run
+    /// this ledger does not know (there is nothing to say about it) and for a
+    /// call that fits. Shadow and warn modes ask this before
+    /// `reserve_unchecked`, so what they record is the refusal enforce would
+    /// have made, computed by the same rule rather than by a second one that
+    /// could drift.
+    pub fn would_exceed(&self, run_id: &str, estimate: Microusd) -> Option<BudgetError> {
+        let runs = self.runs.lock().unwrap();
+        runs.contains_key(run_id).then_some(())?;
+        for id in Self::chain(&runs, run_id) {
+            let s = &runs[&id];
+            let would = s.spent + s.reserved + estimate;
+            if would > s.budget {
+                return Some(BudgetError::Exceeded {
+                    run_id: id,
+                    budget: s.budget,
+                    spent: s.spent,
+                    would,
+                });
+            }
+        }
+        None
+    }
+
     /// Reserve without a budget check across the whole chain. Used in
     /// shadow/warn modes, where a breach must be *recorded* (so spend and steps
     /// stay accurate) but must not block. Opens the run at zero budget if absent.
@@ -293,6 +318,51 @@ mod tests {
             }
             other => panic!("expected Exceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn would_exceed_mirrors_reserve_without_reserving() {
+        let ledger = Ledger::new();
+        ledger.open_run("parent", usd(0.02), None);
+        ledger.open_run("child", usd(1.0), Some("parent"));
+        // Fits: nothing to say, and asking reserves nothing.
+        assert!(ledger.would_exceed("child", usd(0.01)).is_none());
+        let before = ledger.snapshot("child").unwrap();
+        assert_eq!(before.reserved, Microusd::ZERO);
+        assert_eq!(before.steps, 0);
+        // The parent's cap, not the child's own generous one, is what the checked
+        // reserve would refuse on; would_exceed names the same run.
+        match ledger.would_exceed("child", usd(0.03)) {
+            Some(BudgetError::Exceeded { run_id, budget, .. }) => {
+                assert_eq!(run_id, "parent");
+                assert_eq!(budget, usd(0.02));
+            }
+            other => panic!("expected the parent's refusal, got {other:?}"),
+        }
+        // Still nothing reserved, on either level: this was a question.
+        assert_eq!(ledger.snapshot("child").unwrap().reserved, Microusd::ZERO);
+        assert_eq!(ledger.snapshot("parent").unwrap().reserved, Microusd::ZERO);
+        // And it agrees with the checked reserve's verdict, both ways.
+        assert!(ledger.reserve("child", usd(0.03)).is_err());
+        assert!(ledger.reserve("child", usd(0.01)).is_ok());
+        // That reservation is outstanding (nothing settled), and it counts: the
+        // parent has 0.01 reserved of its 0.02, so another 0.015 would exceed
+        // it even though nothing has been SPENT yet. A mirror that summed
+        // spent + estimate and forgot reserved would say this fits.
+        assert_eq!(ledger.snapshot("parent").unwrap().spent, Microusd::ZERO);
+        match ledger.would_exceed("child", usd(0.015)) {
+            Some(BudgetError::Exceeded { run_id, .. }) => assert_eq!(run_id, "parent"),
+            other => panic!("an outstanding reservation must count, got {other:?}"),
+        }
+        assert!(ledger.would_exceed("child", usd(0.009)).is_none());
+        // Meeting the budget exactly is not exceeding it: the line is the same
+        // strict one reserve draws.
+        let l2 = Ledger::new();
+        l2.open_run("r", usd(1.0), None);
+        assert!(l2.would_exceed("r", usd(1.0)).is_none());
+        assert!(l2.would_exceed("r", Microusd(1_000_001)).is_some());
+        // An unknown run is nothing to say, not a refusal.
+        assert!(l2.would_exceed("nobody", usd(0.0)).is_none());
     }
 
     #[test]
