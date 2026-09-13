@@ -354,6 +354,11 @@ Then change **one line** in your app, the base URL:
 export ANTHROPIC_BASE_URL=http://localhost:4100   # Anthropic SDK
 ```
 
+The same one line in nine frameworks, each with the place its per-run headers
+go and a script that runs until the 402: [`examples/recipes/`](examples/recipes/README.md)
+(LangChain, OpenAI Agents SDK, PydanticAI, CrewAI, AutoGen, Semantic Kernel,
+LiteLLM, Haystack, Claude Code).
+
 Your agent runs exactly as before, with one thing to know before you point
 production traffic at it: **a call that carries no `x-fuse-run-id` is refused**
 (`400 metering_required`), because a call this gateway cannot account for is one
