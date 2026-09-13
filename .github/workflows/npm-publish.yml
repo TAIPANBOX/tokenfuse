@@ -13,6 +13,14 @@ name: publish npm
 on:
   workflow_dispatch:
 
+# Top level: read only. Every job that publishes carries its own block
+# naming everything it needs (a job-level block REPLACES this one, so
+# `contents: read` must be repeated there for the checkout). Found by
+# SUP-4 of the 1.0 proving run: a top-level write, or no top-level block,
+# scores Token-Permissions 0 on Scorecard, and ten repositories had one.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: build + publish

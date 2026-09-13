@@ -52,7 +52,6 @@ env:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   # The binaries, before the images, because they are what a person downloads.
@@ -311,6 +310,11 @@ jobs:
   # Nothing here carries a tag: a tag on a single-architecture image is what
   # somebody else's arm64 node would then pull and fail on.
   build:
+    # Pushes to the registry by digest, so it needs the package scope the
+    # top level no longer grants; `contents: read` repeated for the checkout.
+    permissions:
+      contents: read
+      packages: write
     name: ${{ matrix.name }} on ${{ matrix.arch }}
     # Never on a pull request: this job pushes by digest, and the merge job
     # below would tag the result by sha, so a pull request would publish.
