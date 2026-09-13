@@ -3,6 +3,12 @@
 //! Not `tests/common.rs`: a file directly under `tests/` compiles as its own
 //! test binary, and this one has no tests of its own to run - only helpers
 //! other test files pull in with `mod common;`.
+//!
+//! Every test binary that pulls this in compiles all of it and uses a subset,
+//! so `dead_code` is allowed here and nowhere else: a helper no binary uses
+//! is found by reading this file, not by a lint that would otherwise fail the
+//! first binary to need only one of them.
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -156,4 +162,61 @@ pub fn app_with_wire_capturing(wire: Wire) -> (AppState, Arc<Mutex<Option<Bytes>
     )
     .with_wire(wire);
     (state, sent)
+}
+
+/// A provider that streams a fixed SSE body through the REAL `UsageParser`,
+/// the way `HttpProvider` does, and publishes whatever the parser found.
+///
+/// `StubOkProvider` and `CapturingProvider` write the usage slot themselves,
+/// which is right for what they test and wrong for anything about how a body
+/// is READ: a stream with no usage block never reaches a slot pre-filled with
+/// ten tokens. This one does what the network path does, so a test can hand it
+/// the exact bytes a provider sends when the caller set
+/// `stream_options.include_usage: false` and see what the gateway settles.
+#[derive(Clone)]
+pub struct ParsingProvider {
+    pub body: &'static [u8],
+}
+
+#[async_trait]
+impl Provider for ParsingProvider {
+    async fn send(
+        &self,
+        _headers: HeaderMap,
+        _body: Bytes,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let slot: UsageSlot = Arc::new(Mutex::new(None));
+        let writer = Arc::clone(&slot);
+        let bytes = Bytes::from_static(self.body);
+        let stream = async_stream::try_stream! {
+            let mut parser = tokenfuse_gateway::provider::UsageParser::new();
+            parser.feed(&bytes);
+            yield bytes;
+            *writer.lock().unwrap() = Some(parser.finish());
+        };
+        Ok(ProviderResponse {
+            status: 200,
+            content_type: Some("text/event-stream".to_string()),
+            body: Box::pin(stream),
+            usage: slot,
+        })
+    }
+}
+
+/// State for a gateway serving `wire` in front of a `ParsingProvider`, with
+/// the ledger handed back so a test can read what a call settled.
+pub fn app_with_wire_parsing(wire: Wire, body: &'static [u8]) -> (AppState, Arc<Ledger>) {
+    let ledger = Arc::new(Ledger::new());
+    let state = AppState::new(
+        ledger.clone(),
+        Arc::new(tokenfuse_gateway::pricebook::default_price_book()),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(ParsingProvider { body }),
+        "wire-door-test-policy",
+    )
+    .with_wire(wire);
+    (state, ledger)
 }

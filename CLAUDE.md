@@ -2527,3 +2527,45 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     and C8 reads SPEC against trailryx's mapping: agent-passport SPEC.md's
     tokenfuse row gains `breaker_shadow` (medium), and
     `trailryx-agentevent` maps it as it maps `taint_shadow`.)*
+
+43. **A settlement is `Parsed` only when a priced token count was parsed.**
+    `settle_amount` used to read "did the body carry usage" as
+    `usage != Usage::default()`. That was the right question until I1
+    (docs/21) added `tool_calls` to `Usage`: a response with no usage block at
+    all still parses as JSON, `ToolCallCounter::finish` answers `Some(0)` for
+    it, and the struct is no longer default while every token count is zero.
+    The cost of zero tokens is zero, so the call settled as `Parsed` for
+    nothing: 0 tokens, 0 microusd, `spent_usd` unmoved, for a completion
+    delivered in full. On the OpenAI door a caller reaches that state with one
+    field, `stream_options: {"include_usage": false}`, which the gateway
+    rightly never overrules; every provider that honours the flag (OpenAI,
+    Ollama, Bedrock's OpenAI door) then sends no usage chunk. RUN-3 of the 1.0
+    proving run measured it on Ollama and Bedrock, 2026-09-13, on the released
+    v0.5.0 image (tokenfuse#283). Vertex and OpenRouter send usage regardless
+    and were never affected; a buffered answer with no `usage` object was,
+    through the same function.
+
+    The fix asks the question the doc always meant: `carries_priced_tokens`,
+    true when any of the four token counts is nonzero (cache reads alone are a
+    measured response). Everything else keeps its shape: the estimate is what a
+    2xx with no usage settles on (`EstimateNoUsage`), a refusal still settles
+    zero (`provider_refused`), a truncated body still settles the estimate and
+    records `Usage::default()`, and `tool_calls: Some(0)` stays on the record
+    as the observation it is. docs/26's mutant table already named "treat a
+    `null` `usage` chunk as parsed usage: every streamed run settles at zero";
+    the side field was the way that mutant shipped.
+    *(tests: `settle::tests::settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage`,
+    `settle_amount_on_an_unknown_model_with_no_tokens_is_still_the_estimate`,
+    `settle_amount_prices_a_cache_read_only_response_as_parsed`, and through
+    the router with the REAL `UsageParser` reading a stream shaped like
+    Ollama's, `tests/no_usage_stream_settles_on_the_estimate.rs`:
+    `a_stream_with_no_usage_block_settles_on_the_estimate_not_zero`,
+    `a_stream_with_a_usage_block_settles_on_the_usage_not_the_estimate`,
+    `a_buffered_answer_with_no_usage_object_settles_on_the_estimate_not_zero`.
+    All red on the unfixed tree first. Mutants, each caught by a named test:
+    the old guard restored (both layers), `carries_priced_tokens` always true
+    (four unit tests), `unmeasured` zero on a 2xx (the router test), cache
+    tokens not counted (the cache-read test), the streaming settle bypassing
+    `settle_amount` (the router test). Scenarios:
+    `features/a-stream-without-usage-settles-on-the-estimate.feature`, four,
+    each bound.)*
