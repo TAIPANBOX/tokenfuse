@@ -74,6 +74,10 @@
       {
         "severity": "high",
         "type": "taint_cleared"
+      },
+      {
+        "severity": "medium",
+        "type": "breaker_shadow"
       }
     ]
   },

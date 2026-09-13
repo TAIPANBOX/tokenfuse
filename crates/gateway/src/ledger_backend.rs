@@ -45,6 +45,12 @@ pub trait LedgerBackend: Send + Sync {
     /// Reserve without a budget check (shadow/warn modes record but never block).
     async fn reserve_unchecked(&self, run_id: &str, estimate: Microusd) -> Reservation;
 
+    /// The refusal `reserve` would make, without reserving. Shadow and warn
+    /// ask this before `reserve_unchecked` so the header and the
+    /// `breaker_shadow` event describe the same refusal enforce would have
+    /// made. `None` when the call fits or the run is unknown.
+    async fn would_exceed(&self, run_id: &str, estimate: Microusd) -> Option<BudgetError>;
+
     /// Current accounting for a run, if known.
     async fn snapshot(&self, run_id: &str) -> Option<RunSnapshot>;
 
@@ -71,6 +77,10 @@ impl LedgerBackend for LocalLedger {
 
     async fn reserve_unchecked(&self, run_id: &str, estimate: Microusd) -> Reservation {
         self.0.reserve_unchecked(run_id, estimate)
+    }
+
+    async fn would_exceed(&self, run_id: &str, estimate: Microusd) -> Option<BudgetError> {
+        self.0.would_exceed(run_id, estimate)
     }
 
     async fn snapshot(&self, run_id: &str) -> Option<RunSnapshot> {

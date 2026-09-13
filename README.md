@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.5.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1210-brightgreen)
+![tests](https://img.shields.io/badge/tests-1217-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -383,7 +383,7 @@ curl http://localhost:4100/v1/messages \
 - **No `x-fuse-run-id`?** The call is refused with `400 metering_required`, and `TOKENFUSE_REQUIRE_RUN_ID=0` brings back the old unmetered pass-through.
 - **Live view:** `docker exec <container> tokenfuse top` shows every run and its $/min.
 
-**Observe first, then enforce.** The BUDGET starts in **shadow** mode: it records what it *would* block but changes nothing, so a cap you are still tuning cannot stop a run. Flip to **enforce** when you trust it:
+**Observe first, then enforce.** The BUDGET starts in **shadow** mode: it records what it *would* block (an `x-fuse-would-block` response header on the call, and, with `TOKENFUSE_EVENTS_PATH` set and an agent id on the request, a `breaker_shadow` event on the bus) but changes nothing, so a cap you are still tuning cannot stop a run. Flip to **enforce** when you trust it:
 
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \

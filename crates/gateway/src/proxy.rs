@@ -406,6 +406,44 @@ fn emit_taint_raised(
     }
 }
 
+/// One `breaker_shadow` event: the Breaker's finding in shadow or warn mode.
+/// The same `data` as `breaker_tripped` plus `mode`, so a consumer compares a
+/// shadow week with an enforce week over one shape, and a different TYPE, so
+/// a consumer counting refusals never counts a call that was forwarded.
+/// `verdict.would_trip_only` is expected to be true; the data says nothing
+/// about tripping because nothing tripped.
+fn emit_breaker_shadow(
+    st: &AppState,
+    run_id: &str,
+    agent_id: &str,
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+    verdict: &BreakerVerdict,
+    unit: &str,
+    mode: &str,
+) {
+    debug_assert!(
+        verdict.would_trip_only,
+        "a shadow event describes a refusal that did not happen"
+    );
+    let outcome = st.events.emit(
+        EventType::BreakerShadow,
+        now_millis(),
+        Some(agent_id),
+        Some(run_id),
+        on_behalf_of,
+        serde_json::json!({
+            "reason": verdict.reason.map(BreakerReason::as_wire_str),
+            "budget_usd": verdict.budget_usd,
+            "spent_usd": verdict.spent_usd,
+            "policy_id": verdict.policy_id,
+            "detail": verdict.detail,
+            "unit": (!unit.is_empty()).then_some(unit),
+            "mode": mode,
+        }),
+    );
+    crate::events::log_outcome(EventType::BreakerShadow, outcome);
+}
+
 fn emit_breaker_event(
     st: &AppState,
     run_id: &str,
@@ -1394,7 +1432,8 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     }
 
     // For shadow/warn, surface whichever signal tripped in the response header.
-    let would_block = eval.violated.clone().or(loop_reason);
+    // `mut`: the run-budget check below adds its own reason in shadow/warn.
+    let mut would_block = eval.violated.clone().or(loop_reason);
 
     // Unit budget gate (docs/20): the resolved unit's monthly cap, checked
     // BEFORE the run-level reserve so a unit-capped call never holds a run
@@ -1562,7 +1601,51 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 return breaker_error_response(wire, &run_id, &verdict);
             }
         },
-        Mode::Shadow | Mode::Warn => st.ledger.reserve_unchecked(&run_id, estimate).await,
+        Mode::Shadow | Mode::Warn => {
+            // The same question the checked reserve asks, answered first and
+            // without reserving, so what shadow records is the refusal enforce
+            // would have made. Until 2026-09-13 this arm recorded the spend and
+            // said nothing: no header, no event, an `allow` row in the trace,
+            // while the README promised that shadow "records what it would
+            // block". RUN-6 of the 1.0 proving run found it on the released
+            // v0.5.0. `taint_shadow` beside `taint_block` is the precedent
+            // (`EventType::BreakerShadow`).
+            if let Some(BudgetError::Exceeded {
+                run_id: hit_run,
+                budget,
+                spent,
+                ..
+            }) = st.ledger.would_exceed(&run_id, estimate).await
+            {
+                let reason = if hit_run == run_id {
+                    "per-run budget exceeded".to_string()
+                } else {
+                    format!("parent run '{hit_run}' budget exceeded")
+                };
+                would_block = Some(match would_block.take() {
+                    Some(prior) => format!("{prior}; budget_exceeded: {reason}"),
+                    None => format!("budget_exceeded: {reason}"),
+                });
+                let mut verdict = budget_verdict(
+                    BreakerReason::BudgetExceeded,
+                    budget,
+                    spent,
+                    &st.policy_id,
+                    &reason,
+                );
+                verdict.would_trip_only = true;
+                emit_breaker_shadow(
+                    &st,
+                    &run_id,
+                    &event_agent_id,
+                    chain_on_record,
+                    &verdict,
+                    &unit,
+                    mode_str(st.policy.mode),
+                );
+            }
+            st.ledger.reserve_unchecked(&run_id, estimate).await
+        }
     };
 
     // Agent firewall: accumulate the run's taint from this request (header +
@@ -3045,6 +3128,10 @@ pub(crate) mod tests {
             self.0.reserve_unchecked(run_id, estimate).await
         }
 
+        async fn would_exceed(&self, run_id: &str, estimate: Microusd) -> Option<BudgetError> {
+            self.0.would_exceed(run_id, estimate).await
+        }
+
         async fn snapshot(&self, _run_id: &str) -> Option<RunSnapshot> {
             None
         }
@@ -3288,6 +3375,244 @@ pub(crate) mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key("x-fuse-would-block"));
+    }
+
+    // ---- shadow mode records the refusal it did not make ------------------
+    //
+    // README: "The BUDGET starts in shadow mode: it records what it WOULD
+    // block but changes nothing." Until 2026-09-13 that was true of
+    // `max_steps` and `budget_per_step` (the `x-fuse-would-block` header) and
+    // false of the run budget itself: `reserve_unchecked` recorded the spend
+    // and said nothing, so a shadow week showed no header, no event and plain
+    // `allow` rows for every call that enforce would have refused. RUN-6 of
+    // the 1.0 proving run found it on the released v0.5.0 image. The stub
+    // meters 1000/500 tokens a call at test-model prices, 0.0105 USD, so a
+    // 0.02 budget is exceeded by the third call: call 3 is the one that must
+    // carry the signal, calls 1 and 2 must not.
+
+    fn shadow_run(mode: Mode, tag: &str) -> (AppState, std::path::PathBuf) {
+        let (events, path) = recording_exporter(tag);
+        (
+            state(mode, StubProvider::default()).with_events(events),
+            path,
+        )
+    }
+
+    // An agent id on every request: the exporter skips an envelope with no
+    // subject (SPEC.md requires one), so a test without it reads an empty file
+    // and proves nothing about what was emitted.
+    fn budgeted(run: &str, budget: &str) -> Request<Body> {
+        Request::post("/v1/messages")
+            .header("x-fuse-run-id", run)
+            .header("x-fuse-agent-id", "agent://test.example/shadow-bot")
+            .header("x-fuse-budget-usd", budget)
+            .body(Body::from(body(100)))
+            .unwrap()
+    }
+
+    fn shadow_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+        events_at(path)
+            .into_iter()
+            .filter(|e| e["type"] == "breaker_shadow")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shadow_over_run_budget_is_forwarded_and_says_so() {
+        let (st, path) = shadow_run(Mode::Shadow, "shadow-run-budget");
+        for i in 1..=2 {
+            let resp = call(st.clone(), budgeted("run-shadow", "0.02")).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "call {i} is inside the budget"
+            );
+            assert!(
+                !resp.headers().contains_key("x-fuse-would-block"),
+                "call {i} is inside the budget and must carry no would-block"
+            );
+        }
+        let resp = call(st.clone(), budgeted("run-shadow", "0.02")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "shadow forwards the call enforce would refuse"
+        );
+        let header = resp
+            .headers()
+            .get("x-fuse-would-block")
+            .expect("shadow must say, in the response, that enforce would have refused this call")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.contains("budget_exceeded"),
+            "the header names the breaker reason, got {header:?}"
+        );
+        assert_eq!(resp.headers()["x-fuse-mode"], "shadow");
+
+        let shadow = shadow_events(&path);
+        assert_eq!(
+            shadow.len(),
+            1,
+            "exactly one breaker_shadow on the bus, for the one call enforce would have refused; got {shadow:?}"
+        );
+        let e = &shadow[0];
+        assert_eq!(
+            e["severity"], "medium",
+            "the same band as breaker_tripped: the money in a shadow finding was spent"
+        );
+        assert_eq!(e["run_id"], "run-shadow");
+        assert_eq!(e["data"]["reason"], "budget_exceeded");
+        assert_eq!(e["data"]["mode"], "shadow");
+        assert_eq!(e["data"]["budget_usd"], 0.02);
+        assert!(
+            e["data"]["spent_usd"].as_f64().unwrap() > 0.02,
+            "spent is over the budget when the third call arrives: {e}"
+        );
+        assert!(
+            events_at(&path)
+                .iter()
+                .all(|e| e["type"] != "breaker_tripped"),
+            "shadow tripped nothing, so it must not claim it did: a consumer counting \
+             breaker_tripped would read a shadow week as a week of refusals"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_over_run_budget_is_forwarded_and_says_so() {
+        let (st, path) = shadow_run(Mode::Warn, "warn-run-budget");
+        for _ in 1..=2 {
+            call(st.clone(), budgeted("run-warn", "0.02")).await;
+        }
+        let resp = call(st.clone(), budgeted("run-warn", "0.02")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("x-fuse-would-block"));
+        let shadow = shadow_events(&path);
+        assert_eq!(shadow.len(), 1, "{shadow:?}");
+        assert_eq!(shadow[0]["data"]["mode"], "warn");
+    }
+
+    #[tokio::test]
+    async fn shadow_at_exactly_the_budget_is_not_flagged() {
+        // The checked reserve refuses when spent + reserved + estimate EXCEEDS
+        // the budget, not when it meets it. Shadow must draw the same line, or
+        // a shadow week over-reports and the operator sizes the budget wrong.
+        // Two stub calls spend exactly 0.021; the third call's estimate on the
+        // 39-byte body (9 input tokens at 3, 100 output tokens at 15, times the
+        // 1.15 margin, ceiled) is 0.001757, so a budget of exactly 0.022757 is
+        // met and not exceeded. `estimate_cost`'s own tests hold that figure.
+        let (st, path) = shadow_run(Mode::Shadow, "shadow-exact");
+        for _ in 1..=2 {
+            call(st.clone(), budgeted("run-exact", "0.022757")).await;
+        }
+        let resp = call(st.clone(), budgeted("run-exact", "0.022757")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !resp.headers().contains_key("x-fuse-would-block"),
+            "meeting the budget exactly is not exceeding it: {:?}",
+            resp.headers().get("x-fuse-would-block")
+        );
+        assert!(shadow_events(&path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shadow_flags_the_parent_budget_a_child_would_exhaust() {
+        // The checked reserve walks the whole chain (a sub-agent's spend rolls
+        // up into its parent's cap). Shadow asks the same question of the same
+        // chain, so a child that would have been refused on its PARENT's
+        // budget is flagged with that parent named.
+        let (st, path) = shadow_run(Mode::Shadow, "shadow-parent");
+        call(st.clone(), budgeted("run-parent", "0.02")).await;
+        let child = |n: &str| {
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", n)
+                .header("x-fuse-agent-id", "agent://test.example/shadow-bot")
+                .header("x-fuse-parent-run-id", "run-parent")
+                .header("x-fuse-budget-usd", "1.0")
+                .body(Body::from(body(100)))
+                .unwrap()
+        };
+        let a = call(st.clone(), child("run-child-a")).await;
+        assert_eq!(a.status(), StatusCode::OK);
+        assert!(
+            !a.headers().contains_key("x-fuse-would-block"),
+            "child a still fits the parent"
+        );
+        let b = call(st.clone(), child("run-child-b")).await;
+        assert_eq!(b.status(), StatusCode::OK, "shadow forwards child b");
+        let header = b.headers()["x-fuse-would-block"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.contains("run-parent"),
+            "the parent that would have refused it is named: {header:?}"
+        );
+        let shadow = shadow_events(&path);
+        assert_eq!(shadow.len(), 1, "{shadow:?}");
+        assert_eq!(shadow[0]["run_id"], "run-child-b");
+        assert!(shadow[0]["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("run-parent"));
+    }
+
+    #[tokio::test]
+    async fn shadow_appends_the_budget_reason_to_an_existing_would_block() {
+        // `max_steps: Some(0)` makes first_violation flag every call, so the
+        // header already carries a reason before the budget check runs. The
+        // budget reason must be APPENDED: a consumer that read "max steps
+        // reached" yesterday must still find it there today.
+        let (events, path) = recording_exporter("shadow-appends");
+        let mut st = state(Mode::Shadow, StubProvider::default()).with_events(events);
+        st.policy = Arc::new(Policy {
+            mode: Mode::Shadow,
+            max_steps: Some(0),
+            ..Default::default()
+        });
+        for _ in 1..=2 {
+            call(st.clone(), budgeted("run-both", "0.02")).await;
+        }
+        let resp = call(st.clone(), budgeted("run-both", "0.02")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = resp.headers()["x-fuse-would-block"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.starts_with("max steps reached"),
+            "the reason that was there first is still first: {header:?}"
+        );
+        assert!(
+            header.contains("budget_exceeded: per-run budget exceeded"),
+            "{header:?}"
+        );
+        assert_eq!(shadow_events(&path).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn enforce_over_run_budget_emits_breaker_tripped_and_no_shadow() {
+        // The two events must never both fire for one call: enforce refused,
+        // so there is nothing that "would" have happened.
+        let (st, path) = shadow_run(Mode::Enforce, "enforce-no-shadow");
+        for _ in 1..=2 {
+            call(st.clone(), budgeted("run-enforce", "0.02")).await;
+        }
+        let resp = call(st.clone(), budgeted("run-enforce", "0.02")).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let all = events_at(&path);
+        assert_eq!(
+            all.iter()
+                .filter(|e| e["type"] == "breaker_tripped")
+                .count(),
+            1,
+            "{all:?}"
+        );
+        assert!(
+            shadow_events(&path).is_empty(),
+            "enforce is not shadow: {all:?}"
+        );
     }
 
     // ---- client credentials (key identity) --------------------------------

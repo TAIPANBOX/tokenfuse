@@ -2459,3 +2459,71 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     script gate: the five routes are a hand-written list at the call site
     (`lib.rs::app`), the same shape invariant 34 already names, and there is
     no mechanical way to notice a sixth admin-shaped route added outside it.)*
+
+42. **Shadow mode records the refusal it did not make.** The README has said
+    since the first release that the budget starts in shadow mode and "records
+    what it would block but changes nothing". Until 2026-09-13 that was true of
+    `max_steps` and `budget_per_step`, which set `x-fuse-would-block`, and
+    false of the run budget itself: the shadow arm called `reserve_unchecked`,
+    recorded the spend and said nothing, so a shadow week left no header, no
+    event and plain `allow` rows for every call enforce would have refused.
+    `BreakerVerdict.would_trip_only` existed and nothing set it. An operator
+    sizing a budget before turning enforce on had the ledger total and nothing
+    per call. RUN-6 of the 1.0 proving run found it on the released v0.5.0
+    image, on the Mac and again under stack-single.
+
+    The fix asks the ledger the checked reserve's own question first,
+    `LedgerBackend::would_exceed`, computed by the same rule over the same
+    chain (`Ledger::would_exceed` mirrors `Ledger::reserve` line for line
+    without reserving), so on the in-process ledger the shadow signal and the
+    enforce refusal come from one rule. Not from one lock: the question and
+    the `reserve_unchecked` that follows are two acquisitions, so two
+    concurrent shadow calls on one run that together exceed the cap can both
+    read "fits", and the NEXT call on that run carries the signal. Advisory,
+    bounded, written down rather than closed. When it says the call would be
+    refused, shadow and warn set
+    `x-fuse-would-block: budget_exceeded: <reason>` (appended after any
+    `max_steps` or loop reason already there) and emit ONE `breaker_shadow`
+    event (medium), the firewall's `taint_shadow` beside `taint_block` being
+    the precedent: `breaker_tripped`'s `data` plus `mode` (`shadow` or `warn`),
+    and a different type, so a consumer counting refusals never counts a call
+    that was forwarded. Then `reserve_unchecked` records the spend exactly as
+    before. Enforce is untouched and emits no shadow event.
+
+    Where it says nothing, named so the next reader does not infer it: the
+    Parquet row of a shadowed call is still `decision: "allow"` (`CallRecord`
+    has no would-block column; `tokenfuse backtest` over the trace is the
+    offline way to ask the same question). The unit monthly cap (docs/20) in
+    shadow and warn still records nothing at all: `units.reserve_unchecked`
+    has no header and no event where enforce refuses `unit_budget_exceeded`
+    and emits `unit_cap_exceeded`; the same mirror over
+    `UnitLedger::try_reserve` is the obvious next step and is not in this
+    change. Without `TOKENFUSE_EVENTS_PATH`, or on a request with no
+    `x-fuse-agent-id` (the exporter skips an envelope with no subject), the
+    header is the only record and the agent sees it, not the operator. On the
+    raft backend the question walks the same chain over the local,
+    eventually consistent read (under-reports on a lagging follower,
+    over-reports if a budget raise has not replicated), and the raft
+    `reserve_unchecked` is older and worse than either: it submits a checked
+    `Reserve` and ignores `accepted`, so the state machine refuses an
+    over-budget shadow call, reserves nothing, does not advance `steps`, and
+    the spend lands only at `Settle`. A `Request::ReserveUnchecked` variant is
+    a raft schema decision (invariant 5, `replicated-shape.sh`); HA is compiled
+    out of every shipped image, so it waits.
+    *(tests: `proxy::tests::shadow_over_run_budget_is_forwarded_and_says_so`,
+    `warn_over_run_budget_is_forwarded_and_says_so`,
+    `shadow_at_exactly_the_budget_is_not_flagged`,
+    `shadow_flags_the_parent_budget_a_child_would_exhaust`,
+    `enforce_over_run_budget_emits_breaker_tripped_and_no_shadow`, and
+    `ledger::tests::would_exceed_mirrors_reserve_without_reserving`; the three
+    behaviours were red on the unfixed tree first. Mutants, each caught by a
+    named test: `>=` for `>` in the check, the chain replaced by the own run,
+    the event dropped, `breaker_tripped` emitted in its place, the header
+    dropped, `reserved` forgotten in the mirror, the header overwritten
+    instead of appended. Scenarios: `features/shadow-records-the-refusal.feature`,
+    seven, each bound. `contracts/tokenfuse-constants.json` regenerated: 19
+    event types. Landed in one motion with two sibling changes, because
+    estate-gates C4 reads this crate's `as_wire_str` arms against SPEC 6.2
+    and C8 reads SPEC against trailryx's mapping: agent-passport SPEC.md's
+    tokenfuse row gains `breaker_shadow` (medium), and
+    `trailryx-agentevent` maps it as it maps `taint_shadow`.)*
