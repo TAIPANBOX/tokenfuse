@@ -5,7 +5,7 @@
 //! other test files pull in with `mod common;`.
 //!
 //! Every test binary that pulls this in compiles all of it and uses a subset,
-//! so `dead_code` is allowed here and nowhere else: a helper no binary uses
+//! so `dead_code` is allowed here and in no other test file: a helper no binary uses
 //! is found by reading this file, not by a lint that would otherwise fail the
 //! first binary to need only one of them.
 #![allow(dead_code)]

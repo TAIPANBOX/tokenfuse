@@ -3,13 +3,19 @@
 //!
 //! The caller may set `stream_options.include_usage: false`, and the gateway
 //! never overrules a caller who set the field (`Wire::prepare_upstream_body`).
-//! A provider that honours it (OpenAI, Ollama, Bedrock's OpenAI door) then
-//! streams content chunks and `[DONE]` with no usage anywhere. Those chunks
-//! still parse as JSON, so the tool-call counter answers `Some(0)`, and the
-//! parsed `Usage` is zero tokens beside `tool_calls: Some(0)`. Measured live on
-//! 2026-09-13 (go-to-market-2026-09/evidence/1.0/r3-providers-2026-09-13):
-//! the gateway settled 0 tokens, 0 microusd, `spent_usd` unmoved, for a
-//! completion delivered in full.
+//! A provider that honours it then streams content chunks and `[DONE]` with no
+//! usage anywhere: OpenAI by its own reference (docs/26 quotes it), Ollama and
+//! Bedrock's OpenAI door as measured. Those chunks still parse as JSON, so the
+//! tool-call counter answers `Some(0)`, and the parsed `Usage` is zero tokens
+//! beside `tool_calls: Some(0)`. Measured live on 2026-09-13 on the released
+//! v0.5.0 image (the trace rows are in tokenfuse#283): the gateway settled 0
+//! tokens, 0 microusd, `spent_usd` unmoved, for a completion delivered in full.
+//!
+//! Two spellings of "no usage" exist on this wire and collapse to one parse:
+//! the key absent from every chunk (what Ollama sends with `include_usage:
+//! false`, `NO_USAGE_STREAM`), and `"usage": null` on every chunk with no
+//! final usage chunk (`NULL_USAGE_STREAM`). `merge_usage` reads a usage only
+//! when it is an object, so both leave the token counts at zero.
 //!
 //! `settle::tests::settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage`
 //! pins the decision function. This file drives the whole path through the
@@ -32,8 +38,17 @@ data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,
 data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
 
+/// `"usage": null` on every chunk and no final usage chunk: the other
+/// spelling of a stream that reports nothing.
+const NULL_USAGE_STREAM: &[u8] = b"data: {\"id\":\"chatcmpl-3\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"1\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+data: {\"id\":\"chatcmpl-3\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
+data: [DONE]\n\n";
+
 /// The same stream with the usage chunk OpenAI-compatible providers append
 /// when `include_usage` is on: the control, which must settle on the usage.
+/// Ollama's live chunk also carried `prompt_tokens_details.cached_tokens: 24`,
+/// which the fallback rate prices and this fixture omits, so the figure here
+/// is 2715 where the live run settled 2751.
 const USAGE_STREAM: &[u8] = b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"1\"},\"finish_reason\":null}],\"usage\":null}\n\n\
 data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
 data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen2.5:3b\",\"choices\":[],\"usage\":{\"prompt_tokens\":46,\"completion_tokens\":27,\"total_tokens\":73}}\n\n\
@@ -139,4 +154,15 @@ async fn a_stream_with_a_usage_block_settles_on_the_usage_not_the_estimate() {
     );
     // 46 x 15 + 27 x 75 USD per Mtok at the fallback rate = 2715 microusd.
     assert_eq!(spent, Microusd(2715));
+}
+
+#[tokio::test]
+async fn a_stream_with_usage_null_on_every_chunk_settles_on_the_estimate_not_zero() {
+    let (status, estimate, spent) = stream_through(NULL_USAGE_STREAM, "r-283-null-usage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(estimate > Microusd::ZERO);
+    assert_eq!(
+        spent, estimate,
+        "`usage: null` on every chunk is the same fact as no usage key: nothing to price, the estimate"
+    );
 }

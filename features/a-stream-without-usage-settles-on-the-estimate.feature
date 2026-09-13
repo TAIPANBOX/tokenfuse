@@ -3,15 +3,18 @@ Feature: A stream without a usage block settles on the estimate, never at zero
   On the OpenAI door the gateway asks the provider for a usage chunk on every
   stream and never overrules a caller who set stream_options.include_usage
   themselves. A caller who sets it to false against a provider that honours it
-  (OpenAI, Ollama, Bedrock's OpenAI door) gets a stream with no usage anywhere.
+  gets a stream with no usage anywhere: OpenAI by its own reference, Ollama and
+  Bedrock's OpenAI door as measured.
   RUN-3 of the 1.0 proving run measured on 2026-09-13, on the released v0.5.0
   image, that such a stream settled at zero: 0 tokens, 0 microusd, the run's
   spent_usd unmoved, for a completion delivered in full (tokenfuse#283).
 
-  @decided 2026-09-13: fixed the same day. "Usage was parsed" means a priced
-  token count came out of the body, not that the parsed struct differs from
-  its default; the tool-call count that rides alongside is an observation and
-  is kept on the record without deciding the amount. Invariant 43.
+  @decided 2026-09-13: fix it now, in its own change, rather than fold it into
+  the TokenFuse 1.0 release work. @claude on the shape of the fix: "usage was
+  parsed" means a priced token count came out of the body, not that the parsed
+  struct differs from its default; the tool-call count that rides alongside is
+  an observation and is kept on the record without deciding the amount.
+  Invariant 43.
 
   # @test:a_stream_with_no_usage_block_settles_on_the_estimate_not_zero
   Scenario: A stream that reports no usage settles on the estimate
@@ -41,3 +44,9 @@ Feature: A stream without a usage block settles on the estimate, never at zero
     When the settlement amount is decided
     Then the basis is the estimate with no usage
     And the tool-call count stays on the record
+
+  # @test:a_stream_with_usage_null_on_every_chunk_settles_on_the_estimate_not_zero
+  Scenario: usage null on every chunk is the same as no usage
+    Given a provider whose every chunk says usage null and sends no final usage chunk
+    When a caller streams a completion
+    Then the run's spent equals the pre-flight estimate

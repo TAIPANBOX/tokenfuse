@@ -60,10 +60,12 @@
 //! story a bank's FinOps team wants to see.
 //!
 //! For an allowed call, `cost_microusd` is normally the real settled cost
-//! (parsed usage × price). One edge case: `SettleGuard`'s `Drop` path (client
-//! cancel / upstream error mid-stream, see `settle.rs`) settles with the
-//! *reserved fallback* when no usage was parsed — recorded with `decision =
-//! "allow"` but `input_tokens = output_tokens = 0`. We detect that shape
+//! (parsed usage × price). One edge case: a settlement with no priced token
+//! count parsed settles on the *reserved fallback* — `SettleGuard`'s `Drop`
+//! path (client cancel / upstream error mid-stream, see `settle.rs`), or any
+//! 2xx whose body carried no usage block, which every `include_usage: false`
+//! stream is (invariant 43) — recorded with `decision = "allow"` but
+//! `input_tokens = output_tokens = 0`. We detect that shape
 //! (zero tokens, non-zero cost) and mark it `x_cost_basis = "estimated"`;
 //! everything else lands on `"settled"`.
 

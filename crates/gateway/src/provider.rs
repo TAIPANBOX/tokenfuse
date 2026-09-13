@@ -481,8 +481,12 @@ impl Provider for StubProvider {
             // Prefer the declared usage; fall back to what the parser saw.
             // Never truncated in practice (the stub's bodies are a few bytes),
             // but carried through honestly rather than hard-coded false.
+            // "The parser saw usage" is asked the way settlement asks it
+            // (`Usage::carries_priced_tokens`, invariant 43): a body with no
+            // usage block still parses and carries `tool_calls: Some(0)`, and
+            // comparing against `Usage::default()` read that as usage.
             let parsed = parser.finish();
-            let usage = if parsed.usage == Usage::default() { usage } else { parsed.usage };
+            let usage = if parsed.usage.carries_priced_tokens() { parsed.usage } else { usage };
             *writer.lock().unwrap() = Some(ParsedUsage { usage, truncated: parsed.truncated });
         };
 

@@ -45,8 +45,16 @@ pub(crate) enum CostBasis {
 
 /// Decides what a settlement charges and why, from the parsed usage (if any)
 /// and the pre-flight estimate to fall back to. "Parsed" means at least one
-/// priced token count came out of the body (`carries_priced_tokens`); a body
-/// that parsed as JSON and carried no usage block is `EstimateNoUsage`. Pure and unit-tested on its
+/// priced token count came out of the body (`Usage::carries_priced_tokens`);
+/// a body that parsed as JSON and carried no usage block is
+/// `EstimateNoUsage`. That question used to be asked as
+/// `usage != Usage::default()`, which `tool_calls: Some(0)` satisfies with
+/// every count zero, so a 2xx stream with no usage block settled as `Parsed`
+/// at zero: tokenfuse#283, measured 2026-09-13 on Ollama and Bedrock's OpenAI
+/// door on the released v0.5.0 image (OpenAI itself omits the chunk by its own
+/// reference when the caller sets `include_usage: false`; not measured here).
+/// Vertex Gemini and OpenRouter, one model each, send usage regardless and
+/// were never affected. Cache reads alone count as a measured response. Pure and unit-tested on its
 /// own below; both settle paths in this crate (`SettleGuard::settle_now` here
 /// and `crate::proxy::buffered_managed`) call this one function so the
 /// three-way decision is made in exactly one place.
@@ -82,7 +90,7 @@ pub(crate) fn settle_amount(
         return (unmeasured, Usage::default(), CostBasis::EstimateTruncated);
     }
     match prices.cost(model, &usage) {
-        Some(cost) if carries_priced_tokens(&usage) => (cost, usage, CostBasis::Parsed),
+        Some(cost) if usage.carries_priced_tokens() => (cost, usage, CostBasis::Parsed),
         // Either the model has no price at all, or no token count was parsed
         // (the body carried no usage block, or the guard was dropped before
         // any was ever written to the slot). `usage` is recorded as it came,
@@ -90,28 +98,6 @@ pub(crate) fn settle_amount(
         // survives on the record even when the amount is the estimate.
         _ => (unmeasured, usage, CostBasis::EstimateNoUsage),
     }
-}
-
-/// Whether a parsed `Usage` holds anything a price book can price. This is
-/// the question `settle_amount` asks before it trusts a parsed amount, and it
-/// used to be asked as `usage != Usage::default()`. That stopped being the
-/// same question when I1 (docs/21) added `tool_calls` to `Usage`: a response
-/// with no usage block at all still parses as JSON, `ToolCallCounter::finish`
-/// answers `Some(0)` for it, and the struct is no longer default while every
-/// token count is zero. The cost of zero tokens is zero, so the call settled
-/// as `Parsed` for nothing. tokenfuse#283: a caller who set
-/// `stream_options.include_usage: false` zero-rated its own streams against
-/// its budget, on every provider that honours the flag. Measured 2026-09-13
-/// on Ollama and Bedrock; Vertex and OpenRouter send usage regardless and
-/// were never affected.
-///
-/// Cache fields count as priced tokens on purpose: a response whose only
-/// nonzero counts are cache reads is still a measured response.
-fn carries_priced_tokens(usage: &Usage) -> bool {
-    usage.input_tokens > 0
-        || usage.output_tokens > 0
-        || usage.cache_read_tokens > 0
-        || usage.cache_write_tokens > 0
 }
 
 pub struct SettleGuard {
@@ -693,7 +679,7 @@ mod tests {
     /// parse usage" as `usage != Usage::default()`, which that side field
     /// satisfies, and the call settled as `Parsed` at zero: a completion
     /// delivered in full for nothing against the budget. Measured live on
-    /// Ollama and Bedrock (go-to-market-2026-09/evidence/1.0/r3-providers-2026-09-13).
+    /// Ollama and Bedrock; the trace rows are in tokenfuse#283.
     #[test]
     fn settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage() {
         let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));

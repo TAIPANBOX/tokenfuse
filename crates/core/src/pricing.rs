@@ -25,6 +25,28 @@ pub struct Usage {
     pub tool_calls: Option<u32>,
 }
 
+impl Usage {
+    /// Whether this usage holds anything a price book prices: any of the four
+    /// token counts nonzero. `tool_calls` is deliberately not read here, for
+    /// the same reason [`ModelPrice::cost`] does not read it: it is an
+    /// observation that rides alongside the counts, not a count itself.
+    ///
+    /// This is the question "did the body carry usage" that settlement asks
+    /// before it trusts a parsed amount. Asking it as `!= Usage::default()`
+    /// stopped being the same question when `tool_calls` was added: a body
+    /// with no usage block still parses as JSON, the tool-call counter answers
+    /// `Some(0)`, and a struct with every count zero is no longer default. The
+    /// gateway settled such a call as parsed, at the cost of zero tokens, which
+    /// is zero (tokenfuse#283). The four fields are enumerated here, next to
+    /// `cost`'s own list, so a fifth priced field is added to both in one file.
+    pub fn carries_priced_tokens(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_write_tokens > 0
+    }
+}
+
 /// Per-model price, in microdollars per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelPrice {
