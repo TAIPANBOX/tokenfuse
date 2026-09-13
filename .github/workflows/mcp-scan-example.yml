@@ -27,10 +27,14 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   scan:
+    # Pushes to the registry by digest, so it needs the package scope the
+    # top level no longer grants; `contents: read` repeated for the checkout.
+    permissions:
+      contents: read
+      pull-requests: write
     name: scan MCP server
     runs-on: ubuntu-24.04
     steps:
