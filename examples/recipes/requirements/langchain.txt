@@ -1,0 +1,2 @@
+langchain-openai==1.6.2
+langchain-anthropic==1.7.2
