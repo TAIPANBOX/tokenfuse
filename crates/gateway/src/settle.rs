@@ -44,7 +44,17 @@ pub(crate) enum CostBasis {
 }
 
 /// Decides what a settlement charges and why, from the parsed usage (if any)
-/// and the pre-flight estimate to fall back to. Pure and unit-tested on its
+/// and the pre-flight estimate to fall back to. "Parsed" means at least one
+/// priced token count came out of the body (`Usage::carries_priced_tokens`);
+/// a body that parsed as JSON and carried no usage block is
+/// `EstimateNoUsage`. That question used to be asked as
+/// `usage != Usage::default()`, which `tool_calls: Some(0)` satisfies with
+/// every count zero, so a 2xx stream with no usage block settled as `Parsed`
+/// at zero: tokenfuse#283, measured 2026-09-13 on Ollama and Bedrock's OpenAI
+/// door on the released v0.5.0 image (OpenAI itself omits the chunk by its own
+/// reference when the caller sets `include_usage: false`; not measured here).
+/// Vertex Gemini and OpenRouter, one model each, send usage regardless and
+/// were never affected. Cache reads alone count as a measured response. Pure and unit-tested on its
 /// own below; both settle paths in this crate (`SettleGuard::settle_now` here
 /// and `crate::proxy::buffered_managed`) call this one function so the
 /// three-way decision is made in exactly one place.
@@ -80,10 +90,12 @@ pub(crate) fn settle_amount(
         return (unmeasured, Usage::default(), CostBasis::EstimateTruncated);
     }
     match prices.cost(model, &usage) {
-        Some(cost) if usage != Usage::default() => (cost, usage, CostBasis::Parsed),
-        // Either the model has no price at all, or nothing was parsed
-        // (`usage` defaulted, whether because the body carried no usage or
-        // the guard was dropped before any was ever written to the slot).
+        Some(cost) if usage.carries_priced_tokens() => (cost, usage, CostBasis::Parsed),
+        // Either the model has no price at all, or no token count was parsed
+        // (the body carried no usage block, or the guard was dropped before
+        // any was ever written to the slot). `usage` is recorded as it came,
+        // so an observation that rides alongside the counts (`tool_calls`)
+        // survives on the record even when the amount is the estimate.
         _ => (unmeasured, usage, CostBasis::EstimateNoUsage),
     }
 }
@@ -657,6 +669,77 @@ mod tests {
              this row as settled in the FOCUS export"
         );
         assert_eq!(basis, CostBasis::EstimateTruncated);
+    }
+
+    /// tokenfuse#283, RED-FIRST. A 2xx stream whose caller set
+    /// `stream_options.include_usage: false` carries JSON chunks and no usage
+    /// block. The parser still sees JSON, so `ToolCallCounter::finish()`
+    /// answers `Some(0)` and the parsed `Usage` is zero tokens beside
+    /// `tool_calls: Some(0)`. Before this fix `settle_amount` read "did we
+    /// parse usage" as `usage != Usage::default()`, which that side field
+    /// satisfies, and the call settled as `Parsed` at zero: a completion
+    /// delivered in full for nothing against the budget. Measured live on
+    /// Ollama and Bedrock; the trace rows are in tokenfuse#283.
+    #[test]
+    fn settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage() {
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
+        let parsed = Some(ParsedUsage {
+            usage: Usage {
+                tool_calls: Some(0),
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        let estimate = Microusd::from_usd(1.0);
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate);
+        assert_eq!(
+            actual, estimate,
+            "no priced token was parsed, so the estimate is what this settles on, not zero"
+        );
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+        assert_eq!(
+            usage.tool_calls,
+            Some(0),
+            "the observation itself stays on the record: I1 counts tool calls, it does not price them"
+        );
+    }
+
+    /// The same shape on the fallback price book: a model the book does not
+    /// know is priced at the fallback rate, and zero tokens at any rate is
+    /// zero, so the guard has to be about tokens, not about cost.
+    #[test]
+    fn settle_amount_on_an_unknown_model_with_no_tokens_is_still_the_estimate() {
+        let prices = crate::pricebook::default_price_book();
+        let parsed = Some(ParsedUsage {
+            usage: Usage {
+                tool_calls: Some(0),
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        let estimate = Microusd::from_usd(0.004);
+        let (actual, _, basis) =
+            settle_amount(&prices, "amazon.nova-2-lite-v1:0", parsed, estimate);
+        assert_eq!(actual, estimate);
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+    }
+
+    /// A response whose only nonzero count is cache reads is still a measured
+    /// response: it is priced as parsed, not thrown back on the estimate.
+    #[test]
+    fn settle_amount_prices_a_cache_read_only_response_as_parsed() {
+        let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.3, 3.75));
+        let parsed = Some(ParsedUsage {
+            usage: Usage {
+                cache_read_tokens: 1_000_000,
+                tool_calls: Some(0),
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        let (actual, _, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        assert_eq!(basis, CostBasis::Parsed);
+        assert_eq!(actual, Microusd::from_usd(0.3));
     }
 
     #[test]

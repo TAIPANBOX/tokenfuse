@@ -302,8 +302,8 @@ comparison in #132.
 
 **Counts re-measured 2026-09-13**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1217 passing** (core 309, dpop 16, delegation 41,
-gateway 651, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1224 passing** (core 309, dpop 16, delegation 41,
+gateway 658, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). The gateway
 figure grew from 597 across this plan's own nine tasks (the OpenAI door);
 re-measured once, here, at the end of it rather than per task. Python SDK: 11

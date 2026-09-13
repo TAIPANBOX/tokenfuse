@@ -257,6 +257,14 @@ planted deliberately and an existing test must catch it:
 | overwrite an `include_usage` the caller already set | the caller's own choice silently changed |
 | serve the mismatched door instead of refusing | a reservation opened against an upstream that will refuse |
 | treat a `null` `usage` chunk as parsed usage | every streamed run settles at zero |
+| read "usage was parsed" off the struct rather than off the token counts | a stream with no usage block settles at zero, because `tool_calls: Some(0)` makes the struct non-default (shipped in v0.5.0 as tokenfuse#283, found by RUN-3 of the 1.0 proving run; invariant 43) |
+
+Two cases that the fix for #283 newly reaches, both in the conservative
+direction and both the pre-I1 behaviour restored: a 2xx whose JSON body is an
+error object (some OpenAI-compatible gateways answer errors with 200) settles
+the estimate, and so does a 2xx whose usage block is explicitly all zero. The
+status line is the contract; a 2xx with nothing to price is charged what was
+reserved. v0.5.0 charged both nothing.
 
 **A gate with teeth.** `scripts/gates-have-teeth.sh` gains a case for whatever
 gate this adds, and the case plants that gate's own fault and requires the

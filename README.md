@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v0.5.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1217-brightgreen)
+![tests](https://img.shields.io/badge/tests-1224-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -366,7 +366,7 @@ it does not make. Add the header (step 3), or set
 `TOKENFUSE_REQUIRE_RUN_ID=0` to restore the unmetered pass-through while you
 wire the header up. See [Safe by default](#-safe-by-default) for both.
 
-> The gateway serves two front doors from the same binary, through the same enforcement pipeline: the **Anthropic Messages API** (`/v1/messages`) and an OpenAI-compatible `/v1/chat/completions` ([docs/02](docs/02-architecture.md)), so OpenAI-style SDKs (and Ollama / vLLM clients) can point at it too. One gateway process forwards to one upstream, and `TOKENFUSE_WIRE` says which shape it speaks; unset, it's inferred from `TOKENFUSE_UPSTREAM`'s path, and a caller at the door this process doesn't serve is refused before anything is reserved. On a streamed `/v1/chat/completions` call, the gateway adds `stream_options: {"include_usage": true}` when the request didn't set it itself, so the caller's stream ends with one extra chunk after the model's own content: `choices` is empty on it and `usage` carries the token totals for the whole request. Setting `stream_options.include_usage` yourself, including to `false`, is left exactly as you wrote it, and this chunk is not added.
+> The gateway serves two front doors from the same binary, through the same enforcement pipeline: the **Anthropic Messages API** (`/v1/messages`) and an OpenAI-compatible `/v1/chat/completions` ([docs/02](docs/02-architecture.md)), so OpenAI-style SDKs (and Ollama / vLLM clients) can point at it too. One gateway process forwards to one upstream, and `TOKENFUSE_WIRE` says which shape it speaks; unset, it's inferred from `TOKENFUSE_UPSTREAM`'s path, and a caller at the door this process doesn't serve is refused before anything is reserved. On a streamed `/v1/chat/completions` call, the gateway adds `stream_options: {"include_usage": true}` when the request didn't set it itself, so the caller's stream ends with one extra chunk after the model's own content: `choices` is empty on it and `usage` carries the token totals for the whole request. Setting `stream_options.include_usage` yourself, including to `false`, is left exactly as you wrote it, and this chunk is not added; a stream that then reports no usage is charged the pre-flight estimate, not measured and not free (invariant 43).
 
 ### Step 3. Give a run a budget
 
