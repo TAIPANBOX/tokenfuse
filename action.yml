@@ -204,7 +204,7 @@ runs:
           }
     - name: Upload scan report
       if: always()
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@v7.0.1
       with:
         name: mcp-scan-report
         path: ${{ inputs.json-out }}
