@@ -63,7 +63,7 @@ function runHeaders(runId, opts = {}) {
 }
 
 module.exports = {
-  VERSION: "0.5.0",
+  VERSION: "0.5.1",
   DEFAULT_GATEWAY,
   gatewayUrl,
   messagesUrl,
