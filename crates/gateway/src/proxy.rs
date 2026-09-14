@@ -269,7 +269,10 @@ fn emit_upstream_refused_via(
         Dependency::Provider,
         DependencyStage::Response,
         DependencyEffect::CallFailed,
-        &format!("provider answered HTTP {} for model {model}", status.as_u16()),
+        &format!(
+            "provider answered HTTP {} for model {model}",
+            status.as_u16()
+        ),
     );
 }
 
@@ -7212,7 +7215,11 @@ pub(crate) mod tests {
         );
 
         let found = only_dependency_failures(&path);
-        assert_eq!(found.len(), 1, "exactly one event for one refusal, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one event for one refusal, got {found:?}"
+        );
         let e = &found[0];
         assert_eq!(e["severity"], "high");
         assert_eq!(e["agent_id"], "agent://test.local/rehearsal");
@@ -7248,7 +7255,9 @@ pub(crate) mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            resp.headers().get("x-fuse-stream").map(|v| v.to_str().unwrap()),
+            resp.headers()
+                .get("x-fuse-stream")
+                .map(|v| v.to_str().unwrap()),
             Some("passthrough"),
             "this must be the streaming path, or the test proves the buffered one twice"
         );
@@ -7288,7 +7297,10 @@ pub(crate) mod tests {
         let resp = call(st, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let snap = ledger.snapshot("run-refused-usage").await.expect("the run");
-        assert!(snap.spent > Microusd::ZERO, "the reported usage is billed as before");
+        assert!(
+            snap.spent > Microusd::ZERO,
+            "the reported usage is billed as before"
+        );
         assert_eq!(only_dependency_failures(&path).len(), 1);
     }
 
