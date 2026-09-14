@@ -284,8 +284,10 @@ pub enum EventType {
 /// Capped because the string comes from whatever the HTTP client had to say
 /// about a failure, and an unbounded field on a per-call event is a line of
 /// NDJSON whose length an operator's upstream chose. What it holds is the
-/// error text and the configured upstream host, never a request body: nothing
-/// on the failure paths that emit this has parsed the body into the error.
+/// error text and the configured upstream host, or, for a refusal (stage
+/// `response`), the provider's status and the model id the call named; never
+/// a request body beyond that one identifier: nothing on the failure paths
+/// that emit this has parsed the body into the error.
 pub const DEPENDENCY_DETAIL_MAX_CHARS: usize = 200;
 
 /// Which of the box's own dependencies failed (`data.dependency`).
@@ -320,6 +322,12 @@ pub enum DependencyStage {
     Stream,
     /// The answer arrived and its body could not be collected.
     ResponseBody,
+    /// The answer arrived and was a refusal: a non-2xx status from a
+    /// reachable provider (a 429, a 400 for a retired model id). The caller
+    /// got that status and nothing was charged beyond what the provider
+    /// reported generating; without this stage a provider refusing every
+    /// call was invisible on the bus (tokenfuse#260).
+    Response,
     /// The policy plane could not be asked for a decision.
     Decide,
 }
@@ -330,6 +338,7 @@ impl DependencyStage {
             DependencyStage::Send => "send",
             DependencyStage::Stream => "stream",
             DependencyStage::ResponseBody => "response_body",
+            DependencyStage::Response => "response",
             DependencyStage::Decide => "decide",
         }
     }

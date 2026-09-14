@@ -15,7 +15,17 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Every cache-creation token, on either TTL: the total the provider
+    /// reports as `cache_creation_input_tokens`, and the figure the trace
+    /// keeps.
     pub cache_write_tokens: u64,
+    /// The subset of `cache_write_tokens` written with the 1-hour TTL
+    /// (`usage.cache_creation.ephemeral_1h_input_tokens`), which Anthropic
+    /// bills at 2x input against 1.25x for the 5-minute default. Zero when
+    /// the provider reports no breakdown. `#[serde(default)]` because a
+    /// gateway older than this field posts usage without it (tokenfuse#282).
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
     /// Number of tool calls the model emitted in this response (I1, an
     /// observed metric only - see docs/21-tool-runs.md). `None` only when the
     /// response body never parsed as JSON at all; a successfully parsed body
@@ -44,6 +54,7 @@ impl Usage {
             || self.output_tokens > 0
             || self.cache_read_tokens > 0
             || self.cache_write_tokens > 0
+            || self.cache_write_1h_tokens > 0
     }
 }
 
@@ -53,7 +64,17 @@ pub struct ModelPrice {
     pub input_per_mtok: Microusd,
     pub output_per_mtok: Microusd,
     pub cache_read_per_mtok: Microusd,
+    /// The 5-minute cache write, the default TTL.
     pub cache_write_per_mtok: Microusd,
+    /// The 1-hour cache write. Anthropic prices it at 2x input where the
+    /// 5-minute write is 1.25x, so [`ModelPrice::per_mtok_usd`] derives it as
+    /// 1.6x the 5-minute rate, exact for every model in the book; a book
+    /// entry names its own with [`ModelPrice::with_cache_write_1h_usd`].
+    /// `#[serde(default)]` so a price posted by an older gateway still reads;
+    /// a zero here prices a 1-hour write at nothing, which is why the
+    /// constructor never leaves it zero (tokenfuse#282).
+    #[serde(default)]
+    pub cache_write_1h_per_mtok: Microusd,
 }
 
 impl ModelPrice {
@@ -64,7 +85,15 @@ impl ModelPrice {
             output_per_mtok: Microusd::from_usd(output),
             cache_read_per_mtok: Microusd::from_usd(cache_read),
             cache_write_per_mtok: Microusd::from_usd(cache_write),
+            cache_write_1h_per_mtok: Microusd::from_usd(cache_write * 1.6),
         }
+    }
+
+    /// Name the 1-hour cache-write rate outright, for a book entry whose
+    /// provider does not follow the 1.6x ratio.
+    pub fn with_cache_write_1h_usd(mut self, cache_write_1h: f64) -> Self {
+        self.cache_write_1h_per_mtok = Microusd::from_usd(cache_write_1h);
+        self
     }
 
     /// Price a usage record. Saturating throughout: an absurd token count
@@ -81,11 +110,22 @@ impl ModelPrice {
             let micros = (tokens as i128).saturating_mul(price.0 as i128) / 1_000_000;
             micros.clamp(0, i64::MAX as i128) as i64
         };
+        // The 1-hour subset is priced at its own rate and taken out of the
+        // total so no written token is counted twice; a subset past the total
+        // (a provider's bug) leaves nothing on the 5-minute side and prices the
+        // subset in full, the over-charging direction.
+        let five_minute = usage
+            .cache_write_tokens
+            .saturating_sub(usage.cache_write_1h_tokens);
         Microusd(
             part(usage.input_tokens, self.input_per_mtok)
                 .saturating_add(part(usage.output_tokens, self.output_per_mtok))
                 .saturating_add(part(usage.cache_read_tokens, self.cache_read_per_mtok))
-                .saturating_add(part(usage.cache_write_tokens, self.cache_write_per_mtok)),
+                .saturating_add(part(five_minute, self.cache_write_per_mtok))
+                .saturating_add(part(
+                    usage.cache_write_1h_tokens,
+                    self.cache_write_1h_per_mtok,
+                )),
         )
     }
 }
@@ -176,6 +216,89 @@ mod tests {
         };
         // 3 + 15 + 0.30 + 3.75 = 22.05 USD
         assert_eq!(price.cost(&usage), Microusd::from_usd(22.05));
+    }
+
+    /// tokenfuse#282, the INT-2 call of the 1.0 proving run: Claude Code
+    /// through the gateway on claude-haiku-4-5, 10 input, 192 output and
+    /// 140,373 cache-creation tokens, every one of them a 1-hour write.
+    /// Anthropic bills a 1-hour cache write at 2x input (2.00 USD/Mtok on
+    /// haiku), a 5-minute one at 1.25x (1.25): Claude Code's own figure for
+    /// the call was 0.281716 USD; the gateway said 0.176436, the whole write
+    /// priced at the 5-minute rate, 37 percent short.
+    #[test]
+    fn a_one_hour_cache_write_is_priced_at_the_one_hour_rate() {
+        let haiku = ModelPrice::per_mtok_usd(1.00, 5.00, 0.10, 1.25);
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 192,
+            cache_write_tokens: 140_373,
+            cache_write_1h_tokens: 140_373,
+            ..Default::default()
+        };
+        // 10 x 1.00 + 192 x 5.00 + 140,373 x 2.00 per Mtok = 0.000010 + 0.000960 + 0.280746
+        assert_eq!(haiku.cost(&usage), Microusd(281_716));
+        let five_minute_only = Usage {
+            cache_write_1h_tokens: 0,
+            ..usage
+        };
+        assert_eq!(five_minute_only.cache_write_tokens, 140_373);
+        assert_eq!(haiku.cost(&five_minute_only), Microusd(176_436));
+    }
+
+    /// The total stays the total: `cache_write_tokens` counts every written
+    /// token and `cache_write_1h_tokens` names the subset of it on the longer
+    /// TTL, so a mixed write prices each part at its own rate and nothing is
+    /// counted twice.
+    #[test]
+    fn a_mixed_cache_write_prices_each_ttl_once() {
+        let haiku = ModelPrice::per_mtok_usd(1.00, 5.00, 0.10, 1.25);
+        let usage = Usage {
+            cache_write_tokens: 1_000_000,
+            cache_write_1h_tokens: 400_000,
+            ..Default::default()
+        };
+        // 600,000 x 1.25 + 400,000 x 2.00 per Mtok = 0.75 + 0.80
+        assert_eq!(haiku.cost(&usage), Microusd::from_usd(1.55));
+    }
+
+    /// A 1-hour subset larger than the total is a provider bug; it prices in
+    /// the over-charging direction (all of it at the 1-hour rate, nothing
+    /// negative), the ADR-8 rule for anything the gateway cannot make sense of.
+    #[test]
+    fn a_one_hour_subset_past_the_total_never_prices_negative() {
+        let haiku = ModelPrice::per_mtok_usd(1.00, 5.00, 0.10, 1.25);
+        let usage = Usage {
+            cache_write_tokens: 100_000,
+            cache_write_1h_tokens: 150_000,
+            ..Default::default()
+        };
+        assert_eq!(haiku.cost(&usage), Microusd::from_usd(0.30));
+    }
+
+    /// The 1-hour rate is 1.6x the 5-minute one by default, which is exactly
+    /// Anthropic's published ratio (1.25x input against 2x input) for every
+    /// model in the book; a book entry may still name its own.
+    #[test]
+    fn the_one_hour_write_rate_defaults_to_anthropics_ratio_and_can_be_named() {
+        let haiku = ModelPrice::per_mtok_usd(1.00, 5.00, 0.10, 1.25);
+        assert_eq!(haiku.cache_write_1h_per_mtok, Microusd::from_usd(2.00));
+        let sonnet = ModelPrice::per_mtok_usd(3.00, 15.00, 0.30, 3.75);
+        assert_eq!(sonnet.cache_write_1h_per_mtok, Microusd::from_usd(6.00));
+        let named = haiku.with_cache_write_1h_usd(9.99);
+        assert_eq!(named.cache_write_1h_per_mtok, Microusd::from_usd(9.99));
+        assert_eq!(named.cache_write_per_mtok, Microusd::from_usd(1.25));
+    }
+
+    /// A usage whose only nonzero count is the 1-hour subset still carries
+    /// priced tokens (a provider that reported the subset and not the total
+    /// would otherwise settle on the estimate as if it had reported nothing).
+    #[test]
+    fn a_one_hour_only_usage_carries_priced_tokens() {
+        let usage = Usage {
+            cache_write_1h_tokens: 5,
+            ..Default::default()
+        };
+        assert!(usage.carries_priced_tokens());
     }
 
     #[test]
@@ -290,6 +413,7 @@ mod tests {
             output_tokens: u64::MAX,
             cache_read_tokens: u64::MAX,
             cache_write_tokens: u64::MAX,
+            cache_write_1h_tokens: u64::MAX,
             ..Default::default()
         };
         assert_eq!(p.cost(&all).0, i64::MAX);
@@ -321,6 +445,7 @@ mod tests {
             output_per_mtok: Microusd(0),
             cache_read_per_mtok: Microusd(0),
             cache_write_per_mtok: Microusd(0),
+            cache_write_1h_per_mtok: Microusd(0),
         };
         let usage = Usage {
             input_tokens: 1_000_000,

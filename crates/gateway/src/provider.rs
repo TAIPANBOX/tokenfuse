@@ -285,19 +285,52 @@ fn apply_anthropic(usage: &mut Usage, u: &serde_json::Value) {
         u,
         "cache_creation_input_tokens",
     );
+    // The TTL breakdown beside the total: the 1-hour subset is billed at a
+    // different rate and is kept apart (tokenfuse#282); the 5-minute figure
+    // is the remainder and is not stored twice.
+    if let Some(breakdown) = u.get("cache_creation").filter(|c| c.is_object()) {
+        set_if_positive(
+            &mut usage.cache_write_1h_tokens,
+            breakdown,
+            "ephemeral_1h_input_tokens",
+        );
+    }
 }
 
+/// OpenAI's usage shape, folded into the Anthropic-shaped [`Usage`].
+///
+/// The two vendors disagree on one thing that costs money. Anthropic's
+/// `input_tokens` and `cache_read_input_tokens` are disjoint; OpenAI's
+/// `prompt_tokens` INCLUDES `prompt_tokens_details.cached_tokens`. `Usage`
+/// keeps the disjoint shape, because that is what [`ModelPrice::cost`]
+/// prices, so the cached subset is netted out of the prompt count here. Until
+/// 2026-09-14 it was not, and every cached token was priced twice: once at
+/// the full input rate inside `prompt_tokens` and again at the cache-read
+/// rate, +14.5 % on a 950/128 call and more with a higher hit ratio, landing
+/// in the run's budget as spend nobody was billed (tokenfuse#267).
+///
+/// `saturating_sub`: a cached count past the prompt count is the provider's
+/// bug, and an input count that wraps is the ADR-8 direction reversed.
 fn apply_openai(usage: &mut Usage, u: &serde_json::Value) {
-    set_if_positive(&mut usage.input_tokens, u, "prompt_tokens");
-    set_if_positive(&mut usage.output_tokens, u, "completion_tokens");
-    if let Some(cached) = u
+    // The cached count already seen on an earlier chunk counts too: a
+    // provider that sends `prompt_tokens_details` on one chunk and a bare
+    // `prompt_tokens` on a later one would otherwise reset the input to the
+    // whole prompt while the cache-read count stayed, which is the double
+    // charge back under a different chunking (the review of #267).
+    let cached = u
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|x| x.as_u64())
-    {
-        if cached > 0 {
-            usage.cache_read_tokens = cached;
+        .unwrap_or(0)
+        .max(usage.cache_read_tokens);
+    if let Some(prompt) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
+        if prompt > 0 {
+            usage.input_tokens = prompt.saturating_sub(cached);
         }
+    }
+    set_if_positive(&mut usage.output_tokens, u, "completion_tokens");
+    if cached > 0 {
+        usage.cache_read_tokens = cached;
     }
 }
 
@@ -502,6 +535,7 @@ impl Provider for StubProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokenfuse_core::{Microusd, ModelPrice};
 
     #[test]
     fn parses_anthropic_sse_usage() {
@@ -517,6 +551,35 @@ mod tests {
         assert_eq!(u.output_tokens, 842);
     }
 
+    /// The Anthropic usage object names the TTL of a cache write under
+    /// `cache_creation` (`ephemeral_5m_input_tokens`, `ephemeral_1h_input_tokens`)
+    /// beside the total `cache_creation_input_tokens`; the parser keeps the
+    /// total and the 1-hour subset (tokenfuse#282). Here the INT-2 shape:
+    /// the whole write on the 1-hour TTL.
+    #[test]
+    fn parses_the_one_hour_cache_write_subset_from_a_message_start() {
+        let mut p = UsageParser::new();
+        p.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":140373,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":140373}}}}\n\n");
+        p.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":192}}\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 192);
+        assert_eq!(u.cache_write_tokens, 140_373);
+        assert_eq!(u.cache_write_1h_tokens, 140_373);
+    }
+
+    /// A usage object without the `cache_creation` breakdown (older API
+    /// versions, and the stub) is a 5-minute write in full: the subset stays
+    /// zero and nothing else moves.
+    #[test]
+    fn a_cache_write_without_a_ttl_breakdown_is_all_five_minute() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"msg_2","usage":{"input_tokens":40,"output_tokens":15,"cache_creation_input_tokens":500}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.cache_write_tokens, 500);
+        assert_eq!(u.cache_write_1h_tokens, 0);
+    }
+
     #[test]
     fn parses_openai_sse_usage() {
         let mut p = UsageParser::new();
@@ -524,9 +587,74 @@ mod tests {
         p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
         p.feed(b"data: [DONE]\n\n");
         let u = p.finish().usage;
-        assert_eq!(u.input_tokens, 950);
+        // OpenAI's `prompt_tokens` INCLUDES the cached subset; Anthropic's
+        // `input_tokens` excludes it. `Usage` keeps Anthropic's disjoint
+        // shape, which is what `ModelPrice::cost` prices, so the cached 128
+        // are netted out of the 950 here rather than priced twice
+        // (tokenfuse#267).
+        assert_eq!(u.input_tokens, 822);
         assert_eq!(u.output_tokens, 120);
         assert_eq!(u.cache_read_tokens, 128);
+    }
+
+    /// tokenfuse#267, the settle-side number. `gpt-4o` at the book's rates
+    /// (2.50 input / 1.25 cached USD per Mtok), a call reporting
+    /// `prompt_tokens 950` with `cached_tokens 128`: the provider bills
+    /// 822 x 2.50 + 128 x 1.25 per Mtok = 2055 + 160 = 2215 micro-USD, not
+    /// 950 x 2.50 + 128 x 1.25 = 2375 + 160 = 2535 (every cached token at the
+    /// full input rate and again at the cache-read rate).
+    #[test]
+    fn an_openai_cached_token_is_priced_once_not_twice() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-1","usage":{"prompt_tokens":950,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":128}}}"#);
+        let u = p.finish().usage;
+        let gpt_4o = ModelPrice::per_mtok_usd(2.50, 10.00, 1.25, 2.50);
+        assert_eq!(
+            gpt_4o.cost(&u),
+            Microusd(2215),
+            "822 x 2.50 + 128 x 1.25 = 2215 micro-USD; 2535 would be the cached subset priced twice"
+        );
+    }
+
+    /// The cached subset on one chunk and a bare `prompt_tokens` on a later
+    /// one (a provider that repeats the prompt count on every chunk and the
+    /// details once): the later chunk must not reset the input to the whole
+    /// prompt while the cache-read count stays, or the double charge is back
+    /// under a different chunking.
+    #[test]
+    fn a_later_chunk_without_the_cached_subset_still_nets_it() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 120);
+    }
+
+    /// A cached count larger than the prompt count is a provider bug, not a
+    /// negative input: it nets to zero rather than wrapping.
+    #[test]
+    fn an_openai_cached_count_past_the_prompt_count_nets_to_zero_not_wraps() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-2","usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":150}}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.cache_read_tokens, 150);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    /// No `prompt_tokens_details` at all (the shape most OpenAI-compatible
+    /// providers send): nothing is netted and nothing changes.
+    #[test]
+    fn an_openai_usage_without_cached_tokens_is_unchanged() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-3","usage":{"prompt_tokens":950,"completion_tokens":120}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 950);
+        assert_eq!(u.cache_read_tokens, 0);
+        assert_eq!(u.output_tokens, 120);
     }
 
     #[test]

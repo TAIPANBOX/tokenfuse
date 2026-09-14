@@ -245,6 +245,51 @@ fn emit_dependency_failed_via(
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
 }
 
+/// Whether a provider's non-2xx is the PROVIDER's failure, worth an operator's
+/// mail, rather than the caller's own mistake, which is not. A 429, a 408 and
+/// every 5xx (529 overloaded included) are the provider's; a 404 and a 400 are
+/// how providers answer a retired or unknown model id (Anthropic 404, Bedrock's
+/// door 400), which is a deployment's configuration and so the operator's; a
+/// 401 or 403 (the caller's own credential, forwarded), a 413, 415 or 422 (the
+/// caller's own payload) are the caller's and page nobody. `@claude` 2026-09-14,
+/// after the review of #260: the alternative, every non-2xx, pages the
+/// operator's notifier at `high` for a tenant with a bad key.
+fn is_the_providers_refusal(status: StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 400 | 404 | 408 | 429)
+}
+
+/// A reachable provider that refused the call: the non-2xx a caller sees
+/// passed through, settled at zero or at what the provider reported, and,
+/// since tokenfuse#260, one `dependency_failed` on the bus at stage
+/// `response` for the statuses `is_the_providers_refusal` names, so an
+/// operator's notifier hears about a provider refusing every call. `detail`
+/// carries the status and the model, the two things a person reads first;
+/// heraldyx's own window keeps a throttling burst to one mail. Emitted where
+/// the status is first known on both managed paths, so a streamed refusal
+/// does not wait for the guard.
+fn emit_upstream_refused_via(
+    events: &crate::events::EventExporter,
+    run_id: &str,
+    agent_id: &str,
+    on_behalf_of: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+    model: &str,
+    status: StatusCode,
+) {
+    emit_dependency_failed_via(
+        events,
+        Some(run_id),
+        agent_id,
+        on_behalf_of,
+        Dependency::Provider,
+        DependencyStage::Response,
+        DependencyEffect::CallFailed,
+        &format!(
+            "provider answered HTTP {} for model {model}",
+            status.as_u16()
+        ),
+    );
+}
+
 /// Record that a run picked up taint it did not have before.
 ///
 /// Emits ONE event per source that contributed something new, so the record
@@ -1919,6 +1964,20 @@ fn stream_managed(
     // there is still exactly one place that decides proven from claimed.
     let ev_chain = record_chain;
     let ev_proof = record_proof;
+    let provider_refused_at_entry = !status.is_success();
+    if is_the_providers_refusal(status) {
+        emit_upstream_refused_via(
+            &ev_events,
+            &ev_run_id,
+            &ev_agent_id,
+            (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
+                Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
+                None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
+            }),
+            model,
+            status,
+        );
+    }
     // Whether the estimate may be charged when the stream reports no usage,
     // the same rule PR #167 established for `buffered_managed` one screen
     // down. A refusal is a refusal whether the client asked to stream it or
@@ -1964,19 +2023,26 @@ fn stream_managed(
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    emit_dependency_failed_via(
-                        &ev_events,
-                        Some(ev_run_id.as_str()),
-                        &ev_agent_id,
-                        (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
-                            Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
-                            None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
-                        }),
-                        Dependency::Provider,
-                        DependencyStage::Stream,
-                        DependencyEffect::CallFailed,
-                        &e.to_string(),
-                    );
+                    // A refused stream whose error body then breaks is one
+                    // refusal, recorded at entry (or the caller's own 4xx,
+                    // recorded nowhere by decision): a second event here would
+                    // say "part of the answer reached the agent", which on a
+                    // refusal is false (the review of #260).
+                    if !provider_refused_at_entry {
+                        emit_dependency_failed_via(
+                            &ev_events,
+                            Some(ev_run_id.as_str()),
+                            &ev_agent_id,
+                            (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
+                                Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
+                                None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
+                            }),
+                            Dependency::Provider,
+                            DependencyStage::Stream,
+                            DependencyEffect::CallFailed,
+                            &e.to_string(),
+                        );
+                    }
                     Err(e)?
                 }
             };
@@ -2146,6 +2212,16 @@ async fn buffered_managed(
     st.ledger.settle(&reservation, actual);
     if let Some(ur) = &unit_reservation {
         st.units.settle(ur, actual, now_millis());
+    }
+    if is_the_providers_refusal(status) {
+        emit_upstream_refused_via(
+            &st.events,
+            &reservation.run_id,
+            event_agent_id,
+            chain_on_record,
+            model,
+            status,
+        );
     }
     let spent = st
         .ledger
@@ -6994,6 +7070,30 @@ pub(crate) mod tests {
     /// The status line is already 200 and already sent by the time this
     /// happens, which is why the failure cannot be reported by a status code
     /// and has to be reported by an event.
+    /// A 429 whose error body then breaks mid-stream: two failures in one
+    /// call, which must be one event.
+    struct TornRefusalProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for TornRefusalProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let first = Ok(Bytes::from_static(b"{\"type\":\"error\","));
+            let then = Err(ProviderError::Upstream(
+                "error reading a body from connection: connection reset by peer".to_string(),
+            ));
+            Ok(ProviderResponse {
+                status: 429,
+                content_type: Some("application/json".to_string()),
+                body: Box::pin(futures::stream::iter(vec![first, then])),
+                usage: Arc::new(Mutex::new(None)),
+            })
+        }
+    }
+
     struct TornStreamProvider;
 
     #[async_trait::async_trait]
@@ -7125,6 +7225,190 @@ pub(crate) mod tests {
             "the operator is told what actually failed, got {:?}",
             e["data"]["detail"]
         );
+    }
+
+    /// tokenfuse#260. A provider that is REACHABLE and refusing (a 429, a 400
+    /// for a retired model id) passed its status through and settled zero,
+    /// correctly, and wrote nothing to the bus: `dependency_failed` fired from
+    /// the transport-error arm only, so a notifier never heard about a provider
+    /// refusing every call. Measured 2026-09-07 on v0.4.3 with a stub answering
+    /// 429/400/200: three drills, each status right, each expected mail missed.
+    /// The refusal is a `dependency_failed` at stage `response` (the answer
+    /// arrived, and it was a refusal), effect `call_failed` (the caller got the
+    /// provider's status, nothing was charged), the status and model in
+    /// `detail` for the person reading the mail.
+    #[tokio::test]
+    async fn a_reachable_provider_that_refuses_is_recorded_on_the_bus() {
+        let (events, path) = recording_exporter("refused-buffered");
+        let st = state_with_provider(Arc::new(RefusingProvider {
+            status: 429,
+            body: RATE_LIMITED,
+            usage: None,
+        }))
+        .with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-refused")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the provider's status still passes through unchanged"
+        );
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one event for one refusal, got {found:?}"
+        );
+        let e = &found[0];
+        assert_eq!(e["severity"], "high");
+        assert_eq!(e["agent_id"], "agent://test.local/rehearsal");
+        assert_eq!(e["run_id"], "run-refused");
+        assert_eq!(e["data"]["dependency"], "provider");
+        assert_eq!(e["data"]["stage"], "response");
+        assert_eq!(e["data"]["effect"], "call_failed");
+        let detail = e["data"]["detail"].as_str().expect("a detail string");
+        assert!(
+            detail.contains("429") && detail.contains("test-model"),
+            "the status and the model are what an operator needs first, got {detail:?}"
+        );
+    }
+
+    /// The same on the streaming path: the status is known when the stream
+    /// opens, so the event does not wait for the guard.
+    #[tokio::test]
+    async fn a_reachable_provider_that_refuses_a_stream_is_recorded_on_the_bus() {
+        let (events, path) = recording_exporter("refused-stream");
+        let st = state_with_provider(Arc::new(RefusingProvider {
+            status: 400,
+            body: r#"{"type":"error","error":{"type":"not_found_error","message":"model: retired-model"}}"#,
+            usage: None,
+        }))
+        .with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-refused-stream")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get("x-fuse-stream")
+                .map(|v| v.to_str().unwrap()),
+            Some("passthrough"),
+            "this must be the streaming path, or the test proves the buffered one twice"
+        );
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+        assert_eq!(found[0]["data"]["stage"], "response");
+        assert_eq!(found[0]["data"]["effect"], "call_failed");
+        assert_eq!(found[0]["run_id"], "run-refused-stream");
+        assert!(found[0]["data"]["detail"].as_str().unwrap().contains("400"));
+    }
+
+    /// A refusal that reports usage (a provider that generated part of an
+    /// answer and then failed over it) is billed for what it generated, as
+    /// before, AND recorded: the record is about the operator's mail, not the
+    /// money, and the money rule stays what #167 made it.
+    #[tokio::test]
+    async fn a_refusal_with_usage_is_still_billed_and_now_recorded() {
+        let (events, path) = recording_exporter("refused-with-usage");
+        let st = state_with_provider(Arc::new(RefusingProvider {
+            status: 500,
+            body: UPSTREAM_BROKEN,
+            usage: Some(tokenfuse_core::Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            }),
+        }))
+        .with_events(events);
+        let ledger = Arc::clone(&st.ledger);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-refused-usage")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let snap = ledger.snapshot("run-refused-usage").await.expect("the run");
+        assert!(
+            snap.spent > Microusd::ZERO,
+            "the reported usage is billed as before"
+        );
+        assert_eq!(only_dependency_failures(&path).len(), 1);
+    }
+
+    /// A refused stream whose error body then breaks: one refusal, one event,
+    /// the one recorded at entry; the stream arm must not add a second that
+    /// would read as "part of the answer reached the agent" (the review of
+    /// #260).
+    #[tokio::test]
+    async fn a_refused_stream_that_then_breaks_is_recorded_once() {
+        let (events, path) = recording_exporter("refused-then-torn");
+        let st = state_with_provider(Arc::new(TornRefusalProvider)).with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-refused-torn")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body_stream(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await;
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "one refusal, one event, got {found:?}");
+        assert_eq!(found[0]["data"]["stage"], "response");
+    }
+
+    /// The caller's own mistakes are not the provider's failure: a 401 (the
+    /// caller's forwarded key), a 413 and a 422 (the caller's payload) page
+    /// nobody, while a 404 (a retired model id) and a 5xx do.
+    #[tokio::test]
+    async fn a_callers_own_4xx_is_not_recorded_as_the_providers_failure() {
+        for (status, expected) in [
+            (401u16, 0usize),
+            (403, 0),
+            (413, 0),
+            (422, 0),
+            (404, 1),
+            (500, 1),
+            (529, 1),
+            (408, 1),
+        ] {
+            let (events, path) = recording_exporter(&format!("status-{status}"));
+            let st = state_with_provider(Arc::new(RefusingProvider {
+                status,
+                body: UPSTREAM_BROKEN,
+                usage: None,
+            }))
+            .with_events(events);
+            let req = Request::post("/v1/messages")
+                .header("x-fuse-run-id", format!("run-status-{status}"))
+                .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(body(500)))
+                .unwrap();
+            let resp = call(st, req).await;
+            assert_eq!(resp.status().as_u16(), status, "the status passes through");
+            assert_eq!(
+                only_dependency_failures(&path).len(),
+                expected,
+                "HTTP {status}: {} event(s) expected",
+                expected
+            );
+        }
     }
 
     // The other half of the same rule, and the one that decides whether this
