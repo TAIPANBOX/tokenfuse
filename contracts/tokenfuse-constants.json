@@ -143,6 +143,7 @@
   "price_book": {
     "fallback": {
       "cache_read_per_mtok_microusd": 1500000,
+      "cache_write_1h_per_mtok_microusd": 30000000,
       "cache_write_per_mtok_microusd": 18750000,
       "input_per_mtok_microusd": 15000000,
       "output_per_mtok_microusd": 75000000
@@ -150,6 +151,7 @@
     "models": [
       {
         "cache_read_per_mtok_microusd": 80000,
+        "cache_write_1h_per_mtok_microusd": 1600000,
         "cache_write_per_mtok_microusd": 1000000,
         "input_per_mtok_microusd": 800000,
         "model": "claude-haiku",
@@ -157,6 +159,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2000000,
         "cache_write_per_mtok_microusd": 1250000,
         "input_per_mtok_microusd": 1000000,
         "model": "claude-haiku-4-5",
@@ -164,6 +167,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2000000,
         "cache_write_per_mtok_microusd": 1250000,
         "input_per_mtok_microusd": 1000000,
         "model": "claude-haiku-4-5-20251001",
@@ -171,6 +175,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
         "cache_write_per_mtok_microusd": 6250000,
         "input_per_mtok_microusd": 5000000,
         "model": "claude-opus-4-5",
@@ -178,6 +183,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
         "cache_write_per_mtok_microusd": 6250000,
         "input_per_mtok_microusd": 5000000,
         "model": "claude-opus-4-5-20251101",
@@ -185,6 +191,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
         "cache_write_per_mtok_microusd": 3750000,
         "input_per_mtok_microusd": 3000000,
         "model": "claude-sonnet",
@@ -192,6 +199,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
         "cache_write_per_mtok_microusd": 3750000,
         "input_per_mtok_microusd": 3000000,
         "model": "claude-sonnet-4-5",
@@ -199,6 +207,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
         "cache_write_per_mtok_microusd": 3750000,
         "input_per_mtok_microusd": 3000000,
         "model": "claude-sonnet-4-5-20250929",
@@ -206,6 +215,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 250000,
+        "cache_write_1h_per_mtok_microusd": 3125000,
         "cache_write_per_mtok_microusd": 3125000,
         "input_per_mtok_microusd": 2500000,
         "model": "gpt",
@@ -213,6 +223,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 1250000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
         "cache_write_per_mtok_microusd": 2500000,
         "input_per_mtok_microusd": 2500000,
         "model": "gpt-4o",
@@ -220,6 +231,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 75000,
+        "cache_write_1h_per_mtok_microusd": 150000,
         "cache_write_per_mtok_microusd": 150000,
         "input_per_mtok_microusd": 150000,
         "model": "gpt-4o-mini",
@@ -227,6 +239,7 @@
       },
       {
         "cache_read_per_mtok_microusd": 7500000,
+        "cache_write_1h_per_mtok_microusd": 15000000,
         "cache_write_per_mtok_microusd": 15000000,
         "input_per_mtok_microusd": 15000000,
         "model": "o1",

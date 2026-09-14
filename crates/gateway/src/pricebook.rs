@@ -24,7 +24,10 @@ pub fn default_price_book() -> PriceBook {
             "claude-haiku",
             ModelPrice::per_mtok_usd(0.80, 4.0, 0.08, 1.0),
         )
-        .with("gpt", ModelPrice::per_mtok_usd(2.5, 10.0, 0.25, 3.125))
+        .with(
+            "gpt",
+            ModelPrice::per_mtok_usd(2.5, 10.0, 0.25, 3.125).with_cache_write_1h_usd(3.125),
+        )
         //
         // --- Anthropic, current lineup. Prices as of 2026-07, verify against
         // https://platform.claude.com/docs/en/about-claude/pricing before
@@ -32,8 +35,10 @@ pub fn default_price_book() -> PriceBook {
         // reconciled on settle from actual usage — see estimate.rs). Cache
         // write/read follow Anthropic's published multiplier off the input
         // rate (5-minute TTL: write = 1.25x input, read = 0.1x input); the
-        // 1-hour-TTL cache tier (2x write) and the >200K-context long-context
-        // tier are not modeled here and would under-price those specific
+        // 1-hour-TTL cache tier (2x write) is the derived `cache_write_1h`
+        // column, 1.6x the 5-minute rate, which is exactly Anthropic's ratio
+        // (tokenfuse#282; the >200K-context long-context tier is still
+        // not modeled here and would under-price those specific
         // calls — acceptable for a pre-call reserve estimate but flagged for
         // honesty (CLAUDE.md invariant 4). ---
         //
@@ -82,14 +87,24 @@ pub fn default_price_book() -> PriceBook {
         // Cached-read discount is a flat 50% off input across these models. ---
         //
         // gpt-4o: $2.50 / $10.00 per Mtok, cached input $1.25.
-        .with("gpt-4o", ModelPrice::per_mtok_usd(2.50, 10.00, 1.25, 2.50))
+        // OpenAI has no 1-hour cache tier either, so the derived 1.6x column
+        // is set back to the single write rate on each of these three: the
+        // published book must not show a rate no provider charges, and no
+        // OpenAI usage object reports a 1-hour subset for it to price.
+        .with(
+            "gpt-4o",
+            ModelPrice::per_mtok_usd(2.50, 10.00, 1.25, 2.50).with_cache_write_1h_usd(2.50),
+        )
         // gpt-4o-mini: $0.15 / $0.60 per Mtok, cached input $0.075.
         .with(
             "gpt-4o-mini",
-            ModelPrice::per_mtok_usd(0.15, 0.60, 0.075, 0.15),
+            ModelPrice::per_mtok_usd(0.15, 0.60, 0.075, 0.15).with_cache_write_1h_usd(0.15),
         )
         // o1: $15.00 / $60.00 per Mtok, cached input $7.50.
-        .with("o1", ModelPrice::per_mtok_usd(15.00, 60.00, 7.50, 15.00))
+        .with(
+            "o1",
+            ModelPrice::per_mtok_usd(15.00, 60.00, 7.50, 15.00).with_cache_write_1h_usd(15.00),
+        )
         //
         // --- Conservative fallback for anything not listed above (ADR-8):
         // priced at (a margin above) the most expensive known model, so an

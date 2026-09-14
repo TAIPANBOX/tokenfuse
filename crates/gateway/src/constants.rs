@@ -241,6 +241,7 @@ fn price_book() -> serde_json::Value {
             "output_per_mtok_microusd": p.output_per_mtok.0,
             "cache_read_per_mtok_microusd": p.cache_read_per_mtok.0,
             "cache_write_per_mtok_microusd": p.cache_write_per_mtok.0,
+            "cache_write_1h_per_mtok_microusd": p.cache_write_1h_per_mtok.0,
         })
     };
     json!({

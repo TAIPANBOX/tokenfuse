@@ -285,6 +285,16 @@ fn apply_anthropic(usage: &mut Usage, u: &serde_json::Value) {
         u,
         "cache_creation_input_tokens",
     );
+    // The TTL breakdown beside the total: the 1-hour subset is billed at a
+    // different rate and is kept apart (tokenfuse#282); the 5-minute figure
+    // is the remainder and is not stored twice.
+    if let Some(breakdown) = u.get("cache_creation").filter(|c| c.is_object()) {
+        set_if_positive(
+            &mut usage.cache_write_1h_tokens,
+            breakdown,
+            "ephemeral_1h_input_tokens",
+        );
+    }
 }
 
 /// OpenAI's usage shape, folded into the Anthropic-shaped [`Usage`].
@@ -533,6 +543,35 @@ mod tests {
         assert_eq!(u.cache_read_tokens, 300);
         // Final cumulative delta wins.
         assert_eq!(u.output_tokens, 842);
+    }
+
+    /// The Anthropic usage object names the TTL of a cache write under
+    /// `cache_creation` (`ephemeral_5m_input_tokens`, `ephemeral_1h_input_tokens`)
+    /// beside the total `cache_creation_input_tokens`; the parser keeps the
+    /// total and the 1-hour subset (tokenfuse#282). Here the INT-2 shape:
+    /// the whole write on the 1-hour TTL.
+    #[test]
+    fn parses_the_one_hour_cache_write_subset_from_a_message_start() {
+        let mut p = UsageParser::new();
+        p.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":140373,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":140373}}}}\n\n");
+        p.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":192}}\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 192);
+        assert_eq!(u.cache_write_tokens, 140_373);
+        assert_eq!(u.cache_write_1h_tokens, 140_373);
+    }
+
+    /// A usage object without the `cache_creation` breakdown (older API
+    /// versions, and the stub) is a 5-minute write in full: the subset stays
+    /// zero and nothing else moves.
+    #[test]
+    fn a_cache_write_without_a_ttl_breakdown_is_all_five_minute() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"msg_2","usage":{"input_tokens":40,"output_tokens":15,"cache_creation_input_tokens":500}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.cache_write_tokens, 500);
+        assert_eq!(u.cache_write_1h_tokens, 0);
     }
 
     #[test]
