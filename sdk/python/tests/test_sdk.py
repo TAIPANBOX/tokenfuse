@@ -136,5 +136,5 @@ def test_an_openai_body_with_code_only_still_maps():
 
 
 def test_version_is_the_gateway_line():
-    assert tokenfuse.__version__ == "0.5.1"
+    assert tokenfuse.__version__ == "1.0.0"
 

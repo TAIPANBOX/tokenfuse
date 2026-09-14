@@ -101,6 +101,14 @@ jobs:
       - name: the numbers this repo states about itself are true
         run: ./scripts/stated-numbers.sh
 
+      # The surface compat/1.0.json says this repository's 1.0 froze, against
+      # the code, and against COMPATIBILITY.md, which is rendered from it rather
+      # than typed by hand. Written in the 1.0.0 release commit and held from
+      # it on; estate-gates C19 checks this step exists, this step checks the
+      # promise still holds.
+      - name: compat surface is frozen
+        run: ./scripts/compat-surface.sh
+
       # An unpinned install is a dependency with no lockfile. `cargo install
       # bpf-linker` took main red on 2026-08-20 without a commit: 0.11.0 was
       # published the day after that job last passed, and the first pull
