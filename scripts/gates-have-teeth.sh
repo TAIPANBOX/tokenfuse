@@ -608,6 +608,91 @@ run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {", "    if false && wire != st.wire {")')" \
 	"a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything ... FAILED"
 
+# --- invariant 44: the 1.0 surface is frozen --------------------------------
+#
+# compat/1.0.json is the promise of this major and compat-surface.sh is what
+# holds it. Seven cases, the same seven the other 1.0 planes carry: three
+# frozen names leaving the code (a route, an env name, a subcommand), the
+# human form edited by hand, an additive name that must NOT fire, and the two
+# ways the subject can be taken away, which must read as measured nothing.
+
+# A route gone from the router. `/v1/policy-plane` is one occurrence in
+# lib.rs, the only file the manifest names for `http.routes`.
+run_case "compat-surface: a frozen route renamed in lib.rs" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'edit("crates/gateway/src/lib.rs", "\"/v1/policy-plane\"", "\"/v1/policy-plane-renamed\"")')" \
+	"'/v1/policy-plane' is promised"
+
+# An environment name the manifest stops declaring. `TOKENFUSE_WIRE` is one
+# occurrence in components.json, the only file named for `env`, so a single
+# replace is the whole of the drift. (manifest.rs would catch the same rename
+# from the other side, against the code; this gate catches it against the
+# promise.)
+run_case "compat-surface: an env name gone from components.json" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'edit("components.json", "\"TOKENFUSE_WIRE\"", "\"TOKENFUSE_WIRE_RENAMED\"")')" \
+	"'TOKENFUSE_WIRE' is promised"
+
+# A subcommand renamed at the dispatch. `focus-export` is one quoted
+# occurrence in main.rs; the cloud's main.rs, the other `where` file, never
+# carried it.
+run_case "compat-surface: a subcommand renamed in main.rs" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "Some(\"focus-export\")", "Some(\"focus-exported\")")')" \
+	"'focus-export' is promised"
+
+# The human form, edited by hand rather than rendered. The same failure
+# invariant 12 names for the README's own numbers: a copy with no gate rots
+# first, and the rendering is the one place the promise is written for a
+# reader rather than for the check.
+run_case "compat-surface: COMPATIBILITY.md edited by hand" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'edit("COMPATIBILITY.md", "# Compatibility", "# Compatibility (hand-edited)")')" \
+	"is not the rendering of"
+
+# An additive name is documentation for a reader and is never checked against
+# the code, by design: a new event type, a new price-book model, a new
+# subcommand are additive rather than frozen, and adding one must not fail the
+# gate the way removing a FROZEN one must. The mutation edits the manifest and
+# regenerates the rendering in the same step, so the case is judged on the
+# property it names rather than on the unrelated fact that a stale rendering
+# would also fail.
+run_case "compat-surface: an additive name added" pass \
+	"./scripts/compat-surface.sh" \
+	"$(cat <<'PY'
+import json
+import subprocess
+
+p = "compat/1.0.json"
+m = json.load(open(p))
+before = len(m["additive"])
+m["additive"].append("a teeth-test additive name, never checked against the code")
+assert len(m["additive"]) == before + 1, "additive list did not grow"
+json.dump(m, open(p, "w"), indent=2, ensure_ascii=False)
+open(p, "a").write("\n")
+r = subprocess.run(["./scripts/compat-surface.sh", "--write"], capture_output=True, text=True)
+assert r.returncode == 0, "regenerating after the additive edit failed:\n" + r.stdout + r.stderr
+PY
+)"
+
+# The manifest itself gone. Every case above assumes compat/1.0.json is there
+# to compare against; this is the check on that assumption, and the answer has
+# to be "measured nothing" rather than a silent pass on an absent promise.
+run_case "compat-surface: the manifest is gone" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'import os; os.remove("compat/1.0.json")')" \
+	"measured nothing"
+
+# A file a `where` entry names, gone. The check cannot tell "this name left the
+# code" from "the file it lived in left the repository", and it must not try:
+# both are measured nothing rather than a pass, because a literal cannot be
+# found in a file that is not there either way. The published constants file
+# is the one taken away here, the same subject the constants case above takes.
+run_case "compat-surface: a file a where entry names is gone" fail \
+	"./scripts/compat-surface.sh" \
+	"$(py 'import os; os.remove("contracts/tokenfuse-constants.json")')" \
+	"measured nothing"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
