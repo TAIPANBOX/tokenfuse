@@ -45,7 +45,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 DEFAULT_GATEWAY = "http://127.0.0.1:4100"
 
