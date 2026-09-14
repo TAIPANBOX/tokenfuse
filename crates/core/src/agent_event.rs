@@ -320,6 +320,12 @@ pub enum DependencyStage {
     Stream,
     /// The answer arrived and its body could not be collected.
     ResponseBody,
+    /// The answer arrived and was a refusal: a non-2xx status from a
+    /// reachable provider (a 429, a 400 for a retired model id). The caller
+    /// got that status and nothing was charged beyond what the provider
+    /// reported generating; without this stage a provider refusing every
+    /// call was invisible on the bus (tokenfuse#260).
+    Response,
     /// The policy plane could not be asked for a decision.
     Decide,
 }
@@ -330,6 +336,7 @@ impl DependencyStage {
             DependencyStage::Send => "send",
             DependencyStage::Stream => "stream",
             DependencyStage::ResponseBody => "response_body",
+            DependencyStage::Response => "response",
             DependencyStage::Decide => "decide",
         }
     }
