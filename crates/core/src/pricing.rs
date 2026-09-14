@@ -413,6 +413,7 @@ mod tests {
             output_tokens: u64::MAX,
             cache_read_tokens: u64::MAX,
             cache_write_tokens: u64::MAX,
+            cache_write_1h_tokens: u64::MAX,
             ..Default::default()
         };
         assert_eq!(p.cost(&all).0, i64::MAX);

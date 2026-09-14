@@ -312,11 +312,17 @@ fn apply_anthropic(usage: &mut Usage, u: &serde_json::Value) {
 /// `saturating_sub`: a cached count past the prompt count is the provider's
 /// bug, and an input count that wraps is the ADR-8 direction reversed.
 fn apply_openai(usage: &mut Usage, u: &serde_json::Value) {
+    // The cached count already seen on an earlier chunk counts too: a
+    // provider that sends `prompt_tokens_details` on one chunk and a bare
+    // `prompt_tokens` on a later one would otherwise reset the input to the
+    // whole prompt while the cache-read count stayed, which is the double
+    // charge back under a different chunking (the review of #267).
     let cached = u
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(usage.cache_read_tokens);
     if let Some(prompt) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
         if prompt > 0 {
             usage.input_tokens = prompt.saturating_sub(cached);
@@ -592,12 +598,11 @@ mod tests {
     }
 
     /// tokenfuse#267, the settle-side number. `gpt-4o` at the book's rates
-    /// (2.50 / 10.00 / cached 1.25 USD per Mtok), a call reporting
-    /// `prompt_tokens 950` with `cached_tokens 128`: OpenAI bills
-    /// (950 - 128) x 2.50 + 128 x 1.25 = 2215 micro-USD per million, i.e.
-    /// 2215 micro-USD for these counts... in absolute terms 2055 + 160 =
-    /// 2215 micro-USD, not 2375 + 160 = 2535 (every cached token priced at
-    /// the full input rate and again at the cache-read rate).
+    /// (2.50 input / 1.25 cached USD per Mtok), a call reporting
+    /// `prompt_tokens 950` with `cached_tokens 128`: the provider bills
+    /// 822 x 2.50 + 128 x 1.25 per Mtok = 2055 + 160 = 2215 micro-USD, not
+    /// 950 x 2.50 + 128 x 1.25 = 2375 + 160 = 2535 (every cached token at the
+    /// full input rate and again at the cache-read rate).
     #[test]
     fn an_openai_cached_token_is_priced_once_not_twice() {
         let mut p = UsageParser::new();
@@ -609,6 +614,23 @@ mod tests {
             Microusd(2215),
             "822 x 2.50 + 128 x 1.25 = 2215 micro-USD; 2535 would be the cached subset priced twice"
         );
+    }
+
+    /// The cached subset on one chunk and a bare `prompt_tokens` on a later
+    /// one (a provider that repeats the prompt count on every chunk and the
+    /// details once): the later chunk must not reset the input to the whole
+    /// prompt while the cache-read count stays, or the double charge is back
+    /// under a different chunking.
+    #[test]
+    fn a_later_chunk_without_the_cached_subset_still_nets_it() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 120);
     }
 
     /// A cached count larger than the prompt count is a provider bug, not a

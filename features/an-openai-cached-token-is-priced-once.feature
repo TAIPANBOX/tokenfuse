@@ -40,3 +40,10 @@ Feature: An OpenAI cached token is priced once, never twice
     Given a usage with prompt_tokens 950 and completion_tokens 120 and no prompt_tokens_details
     When the gateway parses it
     Then input tokens are 950 and cache-read tokens 0
+
+  # @test:a_later_chunk_without_the_cached_subset_still_nets_it
+  Scenario: The cached subset seen on one chunk still nets a later bare prompt count
+    Given a stream whose first usage chunk says prompt_tokens 950 with cached_tokens 128
+    And whose later usage chunk says prompt_tokens 950 and completion_tokens 120 with no details
+    When the gateway parses the stream
+    Then the usage holds 822 input tokens and 128 cache-read tokens, not 950 and 128

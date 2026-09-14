@@ -284,8 +284,10 @@ pub enum EventType {
 /// Capped because the string comes from whatever the HTTP client had to say
 /// about a failure, and an unbounded field on a per-call event is a line of
 /// NDJSON whose length an operator's upstream chose. What it holds is the
-/// error text and the configured upstream host, never a request body: nothing
-/// on the failure paths that emit this has parsed the body into the error.
+/// error text and the configured upstream host, or, for a refusal (stage
+/// `response`), the provider's status and the model id the call named; never
+/// a request body beyond that one identifier: nothing on the failure paths
+/// that emit this has parsed the body into the error.
 pub const DEPENDENCY_DETAIL_MAX_CHARS: usize = 200;
 
 /// Which of the box's own dependencies failed (`data.dependency`).

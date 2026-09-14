@@ -339,6 +339,7 @@
     "the agent-event envelope schema this emitter writes (taipanbox.dev/agent-event/v0.2 today): it moves with agent-passport's SPEC in its own release (SPEC 6.2/6.4), not with this repository's",
     "a Parquet trace column: appended, nullable on read (invariant 6); a column is never removed or retyped within this major",
     "a model in the price book (contracts/tokenfuse-constants.json#price_book): a model may be added or repriced in a minor; the fallback rate and the microusd_per_mtok unit stay",
+    "a new per-model rate column in the price book (contracts/tokenfuse-constants.json#price_book), such as cache_write_1h_per_mtok_microusd added in 1.0.1: a reader that knows the four original columns keeps reading them; a column is never removed or renamed within this major",
     "a new subcommand, a new TOKENFUSE_ environment name behind a new feature, a new Cloud route: a minor",
     "the JS SDK (npm tokenfuse) exports the Python names in camelCase (gatewayUrl, messagesUrl, chatCompletionsUrl, openaiBaseUrl, runHeaders, DEFAULT_GATEWAY, VERSION); sdk/js/test.js calls every one, so they are held by that test rather than by this gate, whose literal rule cannot see an unquoted JS identifier"
   ],

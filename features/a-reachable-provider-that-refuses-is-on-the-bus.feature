@@ -12,7 +12,10 @@ Feature: A reachable provider that refuses the call is on the bus
   `response` (the answer arrived, and it was a refusal), effect call_failed,
   the status and the model in detail; emitted where the status is first
   known on both managed paths, so a streamed refusal does not wait for the
-  settle guard. The money rules stay what they were.
+  settle guard. The money rules stay what they were. Which refusals are the
+  provider's is a decision written in the code (is_the_providers_refusal):
+  5xx, 429, 408, 404 and 400; a caller's own 401, 403, 413, 415 or 422
+  pages nobody.
 
   # @test:a_reachable_provider_that_refuses_is_recorded_on_the_bus
   Scenario: A buffered 429 is on the bus
@@ -41,3 +44,17 @@ Feature: A reachable provider that refuses the call is on the bus
     Given a provider answering 200
     When a run calls the Messages door
     Then no dependency_failed is written
+
+  # @test:a_refused_stream_that_then_breaks_is_recorded_once
+  Scenario: A refused stream whose error body then breaks is one event, not two
+    Given a provider answering 429 whose body stream then resets
+    When a run streams through the Messages door and drains the body
+    Then exactly one dependency_failed is on the bus, at stage response
+    And the stream arm adds no second event that would read as an answer that reached the agent
+
+  # @test:a_callers_own_4xx_is_not_recorded_as_the_providers_failure
+  Scenario: The caller's own mistakes page nobody, the provider's failures do
+    Given providers answering 401, 403, 413 and 422
+    When budgeted runs call the Messages door
+    Then no dependency_failed is written for any of them
+    And providers answering 404, 408, 500 and 529 each write one
