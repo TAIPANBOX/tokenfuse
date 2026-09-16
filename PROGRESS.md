@@ -300,11 +300,22 @@ comparison in #132.
 
 ## Test status
 
-**Counts re-measured 2026-09-13**, each by the command named, because the set
+**Counts re-measured 2026-09-16**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1240 passing** (core 314, dpop 16, delegation 41,
+`cargo test --all` runs **1245 passing** (core 314, dpop 21, delegation 41,
 gateway 669, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). The gateway
+states and `scripts/stated-numbers.sh` gates (invariant 12). dpop grew from
+16 to 21 the same day: one characterization test recording that `ring`
+already bounds an RSA modulus at 8192 bits (invariant 29), three more
+pinning both sides of that exact boundary (a real 2048-bit proof, a real
+8192-bit proof at the ceiling, and an 8200-bit refusal), added while
+correcting that paragraph's own numbers against a release-mode measurement,
+and a fifth pinning the OTHER edge: a real 2040-bit proof, signed offline the
+same way, refused by the same too_small check site, added after a re-review
+found the paragraph describing that site had the floor wrong (it read as a
+fixed 1024 bits, unreachable; it is actually the parameter set's own 2048,
+and reachable from any presenter's JWK).
+The gateway
 figure grew from 597 across this plan's own nine tasks (the OpenAI door);
 re-measured once, here, at the end of it rather than per task. Python SDK: 11
 passing (from the `python sdk` CI job). JS SDK: a smoke check, no count.
