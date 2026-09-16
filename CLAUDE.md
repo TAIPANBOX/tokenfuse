@@ -1492,24 +1492,61 @@ build)`, `cloud apns (feature build)`.
    an all-ones 48 KiB modulus cost that verifier 1.34s against 245us for a
    real 2048-bit key, and the caller needs no matching private key to make a
    verifier pay for it, only bytes shaped like a signature. `jsonwebtoken`
-   9.3.1's RSA path (`crates/rsa.rs::verify_from_components`) goes through
-   `ring` 0.17.14, and `ring::rsa::verification::verify_rsa_` parses the
-   modulus through `PublicModulus::from_be_bytes` BEFORE calling
-   `key.exponentiate`; that parse refuses anything over
-   `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
+   9.3.1's RSA path goes through `ring` 0.17.14's
+   `ring::rsa::verification::verify_rsa_` (`ring-0.17.14/src/rsa/verification.rs:198`),
+   which calls `public_key::Inner::from_modulus_and_exponent`, which calls
+   `PublicModulus::from_be_bytes` (`ring-0.17.14/src/rsa/public_modulus.rs:39`)
+   BEFORE `key.exponentiate`. That function is TWO check sites, not one, run
+   back to back right after the modulus bytes are parsed into a big integer
+   (line 56) and before the Montgomery setup (line 72): `public_modulus.rs:66-68`
+   refuses anything under 1024 bits (`KeyRejected::too_small()`, never reached
+   on this path, since `jsonwebtoken`'s own `RSA_*_2048_8192_*` parameter sets
+   ask for 2048 bits as their own floor) and `public_modulus.rs:69-71` refuses
+   anything over `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
    `ring-0.17.14/src/rsa.rs:31` as `BitLength::from_bits(8192)` and shared by
    every `RSA_PKCS1_*_2048_8192_*`/`RSA_PSS_*_2048_8192_*` parameter set
    `jsonwebtoken` uses. So the same 8192-bit ceiling the Go fix added by hand
    is already enforced here, one dependency down, before any modular
    exponentiation runs, and a modulus over it is `KeyRejected::too_large()`
    at parse time rather than a signature failure after the cost is paid.
-   `@measured` `cargo test -p tokenfuse-dpop an_oversized_rsa_modulus` 2026-09-16:
-   `an_oversized_rsa_modulus_is_refused_before_the_expensive_part_not_after`
-   builds a JWK with an all-ones 48 KiB `n`, `e: AQAB`, inside a real DPoP
-   proof, and times one `verify_proof` call against a matching-length bogus
-   signature: refused as `ProofRefusal::BadSignature` in 2.8ms, three orders
-   of magnitude under the Go number and well under what a real 2048-bit
-   modexp itself costs, which is what shows no exponentiation ran at all.
+
+   **Measured on both sides of the boundary, not only on an extreme, and the
+   first draft of this paragraph over-read its own number.** `@measured`
+   `cargo test -p tokenfuse-dpop --release` 2026-09-16, four tests, each
+   printing one `verify_proof` call's elapsed time: a real, accepted
+   2048-bit signature (`a_2048_bit_rsa_proof_is_accepted_and_verifies`, the
+   fixture key `crates/cloud/tests/oidc.rs` also signs OIDC bearer tokens
+   with) verifies in about 51-59us; a real, accepted 8192-bit signature at
+   ring's own ceiling (`an_8192_bit_rsa_modulus_at_the_ceiling_is_accepted_and_verifies`,
+   signed offline with a freshly generated 8192-bit key via `openssl dgst
+   -sha256 -sign`, since ring's OWN signing side,
+   `RsaKeyPair::from_pkcs8`, caps a private key at 4096 bits,
+   `PRIVATE_KEY_PUBLIC_MODULUS_MAX_BITS` at `ring-0.17.14/src/rsa.rs:35`,
+   half the verify side's ceiling, so this crate cannot sign its own
+   8192-bit fixture) verifies in about 293-307us, real work a caller who
+   stays inside the bound can still force, larger than the 2048-bit case
+   because the modulus is; and a modulus refused eight bits OVER the
+   ceiling, 8200 bits, on a header small enough that the refusal's own cost
+   is visible (`an_8200_bit_rsa_modulus_eight_bits_over_the_ceiling_is_refused_before_the_expensive_part`)
+   is refused in about 12-16us, a fifth to a twentieth of an ACCEPTED
+   verify at the ceiling, which is the number that shows no exponentiation
+   ran.
+
+   The 48 KiB all-ones case
+   (`an_oversized_rsa_modulus_is_refused_before_the_expensive_part_not_after`)
+   was re-measured the same way and answers about 165us in release, not the
+   2.8ms first written here: that 2.8ms is a real number, `cargo test -p
+   tokenfuse-dpop` (the debug profile CI and a plain local run both use)
+   still reports it, but it is mostly debug-build base64/JSON parsing of the
+   proof's own 64 KiB header (the 48 KiB modulus, base64-inflated by about a
+   third, sitting inside the header JSON `verify_proof` decodes before the
+   key ever reaches `ring`), not `ring`'s own check; the 8200-bit case above
+   isolates that check on a header nowhere near 64 KiB and measures far
+   under it in both profiles. And 2.8ms against the Go side's 1.34s is
+   roughly 480x, not the three orders of magnitude (roughly 1000x) first
+   written here: still two-and-a-half orders, still the same conclusion,
+   overstated by about double.
+
    This bound is `ring`'s, not this crate's own code, so a dependency bump
    that changed the backend's parameter constants could move it without this
    file saying so, the same caveat this invariant already makes about the

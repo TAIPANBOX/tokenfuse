@@ -431,6 +431,44 @@ mod tests {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
     }
 
+    /// Fixture RSA-2048 key and matching JWK, borrowed rather than
+    /// duplicated: this is `crates/cloud/tests/oidc.rs`'s `KEY1_PEM` and its
+    /// JWKS entry (kid `test-key-1`), the same key that crate's own `sign()`
+    /// helper uses to sign real OIDC bearer tokens. It is a REAL RSA key
+    /// pair a signature can be checked against, not merely a shape.
+    const KEY1_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDUBL7Q6EMRckuz
+Pxf2CJ3y/Nv7ueHKm0JBJDowC+YlqbaDjK/yA6Ja7OsuFb2egCqoHWOEr6XMvb99
++QFDFo4kopxMkqW6relSNpwUuuuqd9kDf0OXYVPznjuCXTk4FtEPZnFoL5EmQVcl
+tWV4od3evVmzq+/0YSbjZ/evmFrL7QGE9uVGMZdGqdgX0Qw4DTtlqZacAGKHOf0x
+v4yG3yxa3LW9i80/pju8w/p+0eengl/cGtT7mWutMeUyZ8zlwgqnYZ20AYzX+AEk
+MZRTYXcGEE8UVnq8+KrwdtL5xm+1H0kWl5mH8g4Z3FyvfaQfbebG6bTo42yrLAIW
+5HQBY64lAgMBAAECggEADJldl3994M8IdZXlwB6h+DsTfYF9y/Lu/H0BIjLK0ekk
+aevV1s1le/7BOQNcucsG/eeFLvDbKvAJrZw6+XghKUcqf5hlVdMY3uRU4Rx8faxS
+jpUk+J11hjAcfDI7ALzGXqJpUdYly36thZWieokv7JkW+AjbIQwW6gOXIe2tU5nd
+qc+k+Mh/AP9QuKCexFtlJ6jY6t5ZAX3upQLz9A1ay/1z5RXNzjnrgp6saFhlF5zc
+Fb7bl92JrYavkp6gGvqNBCOVLwGVQnYXAAvrtMmNdpGeEvmBuysXJkgmMWG+pJo+
+pcJytUaOHaQnwVnJd/spA6h12ZZ22TAv3hgqfMfmLwKBgQD8vulhV44XrKLayq/r
+6pradndl7wSatASkRK56cK75HJXpQGbFAHQ5a96y5TRcW7sCCikL0TP6z9ViIMjd
+wj47RAlEmgCuEWN+m6pduSIlm+vBtnBNLFK+IVDaIeMpasRJOQvEdiXAxcJYRdRD
+pVx3xT4mAF60OOpehQKn+ftL2wKBgQDWv5c1e9Y5285HnfWeDXoq1PfYrUt1RiXb
+rJNTCACebqxMmfSxNqKYapXfHXUW0Lp4PPZ2p7WAcHt/uqzKBnNHRh62E3ptYdH5
+NOMgEzaXgvwd1+2w47bldJSag2yOzgcKg5VVPE97GWIzHbyEamHThnyfszh5O7pa
+8s3f0XsN/wKBgGblbmwT0iRvQynh5LceHwcbvcZBBdXZvh4GXCY64/FFIv8AGhbP
+9YE/Gj4otCV5ruvIqSdHd2r/2/aENGKb5uwH6eIE9IvpRmFQDI71hSJclSGbHaM9
+jT4coCb+LtY4wkqxL8o+82XE3TdEzoLvunKEWaXs9qFWnov2iLtMOXOLAoGBAJWK
+gzxuSOavhvzeJXzze6A5/4F2Y7Z9q71Gdqz6RJwPC5KoHvoMxrsGdekRtUi2/zLd
+mO9VqBGRwp5Wmx5v0XTPgnFeLQHgfXxhdMwQNRLa1r/dbpqgZ+tu/FCAtmbXV5Xd
+vW7Geb6KFZTs3ysCfa7z1vLKtcfObN4KeIykbmF3AoGASSKePOYmSXRxMjiZOQNX
+7FOZpgoCGtaCxmJNKf1uLRLvVif5Z0pKTCjS83NcyOYSucb10FinC5m27x7YBKCX
+dh3J9Q9K/JiBTKhW0Zwn7CD6I7RqUUONzJX3rPiv08z9VW1e8mPtfcrT3MVS3aCC
+yyuNSwNVs/LTnw7nI9Ius8M=
+-----END PRIVATE KEY-----";
+
+    /// `n`/`e` from the same JWKS entry (kid `test-key-1`), the public half
+    /// of `KEY1_PEM` above.
+    const KEY1_N: &str = "1AS-0OhDEXJLsz8X9gid8vzb-7nhyptCQSQ6MAvmJam2g4yv8gOiWuzrLhW9noAqqB1jhK-lzL2_ffkBQxaOJKKcTJKluq3pUjacFLrrqnfZA39Dl2FT8547gl05OBbRD2ZxaC-RJkFXJbVleKHd3r1Zs6vv9GEm42f3r5hay-0BhPblRjGXRqnYF9EMOA07ZamWnABihzn9Mb-Mht8sWty1vYvNP6Y7vMP6ftHnp4Jf3BrU-5lrrTHlMmfM5cIKp2GdtAGM1_gBJDGUU2F3BhBPFFZ6vPiq8HbS-cZvtR9JFpeZh_IOGdxcr32kH23mxum06ONsqywCFuR0AWOuJQ";
+
     struct Key {
         signing: p256::ecdsa::SigningKey,
     }
@@ -786,17 +824,207 @@ mod tests {
             ProofRefusal::BadSignature,
             "an oversized modulus must be REFUSED, not accepted for being big"
         );
-        // 2048-bit RSA verification measures in the hundreds of microseconds
-        // on ordinary hardware; a verifier that let the 48 KiB modulus reach
-        // `exponentiate` would cost over a second, per the Go measurement.
-        // 50ms is generous headroom above a parse-and-refuse and nowhere near
-        // what an unbounded modexp at this size would cost.
+        // This elapsed time is mostly debug-build base64/JSON parsing of the
+        // proof's own 64 KiB header (the 48 KiB modulus, base64-inflated by
+        // about a third, sitting inside the header JSON `verify_proof`
+        // decodes before the key ever reaches ring), NOT ring's own check:
+        // `an_8200_bit_rsa_modulus...` below isolates that cost on a header
+        // three orders of magnitude smaller and measures far under a
+        // millisecond. 500ms is generous headroom above a parse-and-refuse
+        // of a header this size and nowhere near what an unbounded modexp at
+        // this size would cost (the Go number this exists to compare against
+        // is 1.34s for one call); it is loosened from an earlier 50ms bound
+        // because a debug-build base64/JSON parse of 64 KiB is not always
+        // that fast on a loaded CI runner, and this test's real subject is
+        // "no modexp ran", not "parsing was fast".
         assert!(
-            elapsed.as_millis() < 50,
+            elapsed.as_millis() < 500,
             "a 48 KiB RSA modulus took {elapsed:?} to refuse; ring's 8192-bit \
              cap should reject it during parsing, long before any modular \
              exponentiation. This elapsed time is the number invariant 29 \
              now cites."
         );
+    }
+
+    /// The 48 KiB case above proves an absurdly large modulus is refused
+    /// cheaply. It does not prove the boundary is at 8192 bits specifically,
+    /// only that it is somewhere well below 48 KiB: a verifier with a bug
+    /// that let anything up to, say, 16 KiB through would still pass it.
+    ///
+    /// This test and the two below it pin the boundary itself. Both sides
+    /// are real RSA arithmetic, not shapes: a genuine 2048-bit signature
+    /// verifies (the ordinary case, timed for comparison), a genuine
+    /// 8192-bit signature at ring's own ceiling verifies too (proving the
+    /// bound is inclusive of 8192 and that accepting it is not free, only
+    /// bounded), and a modulus one byte-and-a-bit over that ceiling, 8200
+    /// bits, is refused before any exponentiation, the same way the 48 KiB
+    /// case is, just measured on a header small enough that the refusal's
+    /// own cost is visible rather than drowned out by JSON/base64 parsing of
+    /// a huge header.
+    ///
+    /// `ring::rsa::verification::verify_rsa_` (`ring-0.17.14/src/rsa/verification.rs:198`)
+    /// calls `public_key::Inner::from_modulus_and_exponent`, which calls
+    /// `PublicModulus::from_be_bytes` (`ring-0.17.14/src/rsa/public_modulus.rs:39`).
+    /// THAT function is two check sites, not one, back to back:
+    /// `public_modulus.rs:66-68` refuses anything under 1024 bits
+    /// (`KeyRejected::too_small()`, this crate never reaches it, `jsonwebtoken`'s
+    /// own `RSA_*_2048_8192_*` parameter sets ask for 2048 as their own
+    /// floor) and `public_modulus.rs:69-71` refuses anything over the 8192-bit
+    /// ceiling (`KeyRejected::too_large()`), which is the one invariant 29 is
+    /// about. Both run AFTER the modulus bytes are parsed into a big integer
+    /// (`bigint::OwnedModulusValue::from_be_bytes`, line 56, immediately
+    /// above both checks) and BEFORE the Montgomery setup
+    /// (`bigint::OwnedModulus::from`, line 72) or the exponentiation itself,
+    /// so both are check sites in the sense this invariant means: places
+    /// that turn away a key before the expensive part, not places that
+    /// parse for free.
+    #[test]
+    fn a_2048_bit_rsa_proof_is_accepted_and_verifies() {
+        use std::time::Instant;
+
+        let jwk = serde_json::json!({"kty": "RSA", "n": KEY1_N, "e": "AQAB"});
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.typ = Some("dpop+jwt".into());
+        header.jwk = Some(serde_json::from_value(jwk.clone()).expect("a jwk"));
+        let now = 1_800_000_000;
+        let claims: HashMap<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"htm": "POST", "htu": URL, "iat": now, "jti": "p-2048"}),
+        )
+        .expect("claims");
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(KEY1_PEM.as_bytes())
+            .expect("a real 2048-bit RSA key");
+        let proof =
+            jsonwebtoken::encode(&header, &claims, &key).expect("sign with a real 2048-bit key");
+
+        let start = Instant::now();
+        let result = verify_proof(&proof, "POST", URL, now);
+        let elapsed = start.elapsed();
+        eprintln!("2048-bit RSA, a REAL signature, one verify_proof call: {elapsed:?}");
+
+        let v = result.expect("a genuinely signed 2048-bit RS256 proof must be accepted");
+        assert_eq!(v.jti, "p-2048");
+        let expected_jkt =
+            thumbprint(&serde_json::from_value(jwk).expect("a jwk")).expect("a thumbprint");
+        assert_eq!(v.jkt, expected_jkt);
+    }
+
+    /// A real 8192-bit RSA key, at ring's own ceiling, verifies rather than
+    /// merely parsing. `ring::signature::RsaKeyPair::from_pkcs8` (the SIGNING
+    /// side) caps a private key at 4096 bits
+    /// (`PRIVATE_KEY_PUBLIC_MODULUS_MAX_BITS`, `ring-0.17.14/src/rsa.rs:35`),
+    /// half the 8192-bit ceiling the VERIFY side accepts, so this crate's own
+    /// signing helper (`jsonwebtoken::EncodingKey`, backed by the same ring)
+    /// cannot produce an 8192-bit-key proof to feed itself: the two
+    /// directions are bounded by two different constants inside one
+    /// dependency. Signed instead with a real, freshly generated 8192-bit RSA
+    /// key via `openssl dgst -sha256 -sign`, offline, once, over the exact
+    /// `header_b64.claims_b64` bytes this constant carries (independently
+    /// confirmed with `openssl dgst -sha256 -verify` against the matching
+    /// public key before this was committed). The `htm`/`htu`/`iat`/`jti` are
+    /// therefore FIXED: changing any of them invalidates the signature, and
+    /// this test would need a new offline signature, not an edit.
+    #[test]
+    fn an_8192_bit_rsa_modulus_at_the_ceiling_is_accepted_and_verifies() {
+        use std::time::Instant;
+
+        const PROOF_8192_AT_THE_CEILING: &str = "\
+         eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IlJTMjU2IiwiandrIjp7Imt0eSI6IlJTQSIsIm4iOiIxdEtvWkozRDJmaTlfX0Q4\
+         QXFqSGJZQUctcnhuQWprY1JwcXdJZzAxZUVXMk9YN0wtV21KbE9CeHhnbkdqTjUyYmNZU3BWUnFnUnJUVENGVHNiNUk4eFRI\
+         NlZER0Y5eXpSMl9HTTBFLV9ydW45Z1V3N0o0cnIxS2NZUXRGN3VNR0FUcTVFNUJhMUlrbXRxVmo3RVUyWFhGSVY5YndLM2VT\
+         cXoxeUhMV3gzMkdLR3EzNllOSzY0am9LamJjXzVPWVUxVm53RjhVX3dJbHdPeTEtaGJBcGhMTFMyX1lpcG1aRlEyY09QV19x\
+         VzBkR2VXbHRDT3ZPS3lJejdMNWdzYllHdHViWUw4TnZBa1BvemZZcTVvWUZFM0Fxc3JvSEdwMklGaXlNR0t3NTdKSDNsQWRy\
+         a1IxUm5JNjV2a2FXZ2N4UmNrdk5UakVBV3dYa1BidGkwX18xVzBURnVQaUtxd1pCOEZSLWJyd0F1SERpcXBXdjFXYmZONU5M\
+         S01CN1VOSUxacTh2Vm8yS3hOWDR0emZ2aVMtQm5aNVJOTmNWX3JHZGtpWkVtdVFWa2J5SVNOX1JuRWRwUU1YYUw3Z2xoRjNL\
+         dGhOeEdlRnNNNkZ4TUphemdaTWVZcnhpcVFZY3Y0SWhKSWszT2RjUW93Z0xpUjAxSEhGcGhPcmJDVEJsS0hvOVprVjFYQ0xf\
+         Vk9yZldPaTI4eUpoY0s1UlBBeXF0Z0x4QXl5WlB3eHY5bkstRER4c3pnWGNJZGNkWXE0VEYxUm9BbWJQRGhmVzh0bGtlcHRf\
+         eDBDNFBoR05DWjk5ZTNhWmczV3pRTkpQYVppSmtCV0tLN2lUSUxmWDdFbUVjcGc3YjF2X3NDVnRsNHJtT0xzMERUaTRqT1Rh\
+         d28tVS1uV29waVVseExaWks3blJtQTQ3ejRaSHFFMnBBbXN4d2ZaNnl0T2FKeVdKbW41YXNQU3dBMnJ6YUNUZ1d4bnM4N3Rx\
+         RUE1NHEwaXNKaE5jeHc3a1VVUlZJSHR1LVN6ZjJFVkhCR3JBaU0zTzd0N19JaWxZcnRJX0swa09vc05xMkk4Nl9Ha2gxSFlX\
+         NUNHVGVKSnpRMG9YaG5YaTNhcTI0NTJ1XzVXZFJlQVlIVXpyd2VzRWRnZXozcTZMOE45VTE1R3QtQncwNWd0NWlQM0pZWDha\
+         TGgyN0ZYR2YycjRVR0ZvMi1vd21qMFNSblQyTlFlQnpIMkdfYlRuSXkzYm5yTGw4UExBczEtOGhlUHM5cGhuLVdud0FyRzJ3\
+         ZnJiOGJwYlh1MWFnSnN5U0hEZk1lbVV0eExtZFpUMG1rVmRPcFZqU21GQmhpUm85Q3NTeUJURzRzRHhpSEdkWmJLWkRxTTVp\
+         bmIxempaZDdteW51cnBHcnlRNjl1bFdnNHBwWTdIOS1DcXN5VW1hYTZjUnJCLXJVeHh4bExXUWZ3T3NfZW01OVJvaVVJUkk1\
+         dHVxb2o3MUI3anlPaEljWm5JWllBQVVpWTc4RmZhUkl0RFhzYVFkVzc1ZkREcHlvb3NCWDVKemJhQ1JhMFNTcXZGS0RsdFAt\
+         aE1LWmlRc2FXUHpZa29JQmdJRDBFaThHY0dkbGFybkZaSElVWHg5aXdSWldsV2hselVZdzdiMS1YZVVaSDF0emJUZWw5NGxf\
+         MXJleUkyTUo4UVNsemVnc3FScHVXUERDT09uTVZoQnNqa3FsY0VDNFJDd2w3b3JHcW93Rl9Kbm1EWVFvSW9wZkc4M0VzNGZo\
+         MEJ5OE5kelVjaEJDcXhhWHM2YmJCckF1LXVpSzVubVByTmFTalV3ZXRWWDNoUkhWNGtCbk93IiwiZSI6IkFRQUIifX0.eyJo\
+         dG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9tY3AuYWNtZS5leGFtcGxlL21jcCIsImlhdCI6MTgwMDAwMDAwMCwianRpIjoi\
+         cC04MTkyLWNlaWxpbmcifQ.WZr-HgfhN_pkSkoKsjjBiyD4zQP-PW8K5gKBghHAteDfNyJDjao-LpDsSXBMuvZP7bbytdvnB\
+         tD7N_zULrOCgW0fPXDwqwFoNyIQwnhAEa0-TWfK4MpYFmvS7tsbDx9F3tYqrkeqmA__jC6f6K1PXnCbP-79U2aeNAfuVTT3R\
+         GK3UNqan6wtONKpuSMcw0LTjAUsIYbRvguObP1MxqAaJc9a4RW0jZ2BPYyctlZSpx_WQZWxANPvsJn0tlnHroQUyfwmnnU9C\
+         Jbfs_ewy7umWjDViSkKvBKfZSvXYJR453KuNkajqvyr7SL1pCMZGwQ-7Idyx1gtz4QthfkFNxQW6YPnv2fWqMsu8Mz0W6GuK\
+         IpywBg5DOhc6r-nEniFd8GcdfxI-Hh8nVz3_A5It9jxLRjeATfwU1nhcq3oMJxLnv_227T8Vkv8gmxIEMSzLCUZ7g7dW8GXV\
+         mT3w-T2eHvRSi0GyTG69ackHJdvVjwL3_PsCXKPHL0au2kJ0yua3ceUVYK2yFWf7qUKopl6fGhK7AoruJqxhgEiRDpU8ovfb\
+         mK4-G1A5N5Q9fC9cpICZwxJzdHbUvM4ROETgmdXQRa4bjZnq7Px_lUlVgZ7pHOHfikeOTuatY5hkujOcwMwdyCNEXlIGqBN5\
+         _mcOvCQrIYDTMh6Q-NlVOoWhy0J7qzpcZE3FwuPYXCxTZtENV0sU_cawuAwZOHdNnLlM2itMORZ_abZSd3Uw_ogZWwxfjSgw\
+         shhJNJghVTYj4J8FwW0QaHDqxRkCIiLmxulvm1aMNyvAM4NUw0du9YIfl48xoOA6EsuwGjed6Y9SBpNANZcK4_WLwNgIJKiz\
+         pMHC-Qg2oxwtF_986_7GtxTF7Q6LGwjH_ieI35tJj64eqUkMtGTvAfcau5s1ta4g8Ti3uyBSzhZa1TT_kNkGm1AF5K5SzJoV\
+         K3x6oDwFXVbpSp6aGzh9G7KvqCNIS1HVzjCzZifhlErucwAWxgVLLaUa7NureLvIe3g3qANYVZS1rfwurpkk0sAIoY55u8Ag\
+         K6ZaffaAWp6jeufdEPqSRrZ7Af2k__Wpg4ZFXpjB_ThYHaWI7Ra5fKjjc_xZkX7KKnnkoQkaUVTzZPt5vhMe_omF6KuJ0dlQ\
+         qvyChVa4BSYPf80LgQ8WB3BHHegvpuOjFPKfmXLrtoEpI8TCAMjjg-wgK_pXk-3lZvaX2YHFGIfkLZhWMsXa_r71u11woiDt\
+         o46Dq1nQkYPZfBFOfLGx0h5qxYmYQob93pbOVTS-lCM-MVtmCKkMFrBijMmEcagi7CtwDbEGOtieyTCpw9F4EtqzQnQ9-tPY\
+         qXi-pBQjbSwapouQ1FiYiQlngSKuHgj9kIxwI9rxfCP_w";
+
+        let now = 1_800_000_000;
+        let start = Instant::now();
+        let result = verify_proof(PROOF_8192_AT_THE_CEILING, "POST", URL, now);
+        let elapsed = start.elapsed();
+        eprintln!("8192-bit RSA modulus (ring's own ceiling), a REAL accepted verify: {elapsed:?}");
+
+        let v = result.expect(
+            "a real 8192-bit key at exactly ring's ceiling must verify, not just parse: this \
+             is the accepted side of invariant 29's boundary, and its printed elapsed time is \
+             the accepted-ceiling cost that paragraph now cites",
+        );
+        assert_eq!(v.jti, "p-8192-ceiling");
+    }
+
+    /// One byte-and-a-bit over the ceiling, refused before the expensive
+    /// part, on a header small enough that the refusal's own cost is
+    /// visible. 1025 bytes, all-ones, is exactly 8200 bits (the top bit of
+    /// the first byte is set, so this is 8200 bits and not merely "at most
+    /// 1025 bytes"): eight bits over `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`
+    /// (`ring-0.17.14/src/rsa.rs:31`, `BitLength::from_bits(8192)`), the
+    /// too-large check site named above the two tests before this one.
+    #[test]
+    fn an_8200_bit_rsa_modulus_eight_bits_over_the_ceiling_is_refused_before_the_expensive_part() {
+        use std::time::Instant;
+
+        let now = 1_800_000_000;
+        let n = b64(&vec![0xFFu8; 1025]);
+        let e = b64(&[0x01, 0x00, 0x01]);
+        let jwk = serde_json::json!({"kty": "RSA", "n": n, "e": e});
+        let header = serde_json::json!({"typ": "dpop+jwt", "alg": "RS256", "jwk": jwk});
+        let claims = serde_json::json!({"htm": "POST", "htu": URL, "iat": now, "jti": "p-8200"});
+        let signing_input = format!(
+            "{}.{}",
+            b64(header.to_string().as_bytes()),
+            b64(claims.to_string().as_bytes())
+        );
+        // A bogus signature the same length a real 8200-bit signature would
+        // be; nobody needs the matching private key, the same point the 48
+        // KiB test above makes, just at the exact boundary rather than an
+        // extreme.
+        let bogus_signature = vec![0xABu8; 1025];
+        let proof = format!("{signing_input}.{}", b64(&bogus_signature));
+
+        let start = Instant::now();
+        let result = verify_proof(&proof, "POST", URL, now);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "8200-bit RSA modulus (8 bits over ring's ceiling), one verify attempt: {elapsed:?}"
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            ProofRefusal::BadSignature,
+            "8200 bits is eight over ring's 8192-bit ceiling and must be refused, not accepted \
+             for being merely small"
+        );
+        // No fixed millisecond assertion here on purpose: this test's job is
+        // the boundary (the assert_eq above), not a timing budget the 48 KiB
+        // and 8192-bit tests already carry one of each. The elapsed time
+        // printed above is what invariant 29 cites as the isolated cost of
+        // ring's own check, apart from header-parsing overhead.
     }
 }
