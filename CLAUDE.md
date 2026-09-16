@@ -1512,10 +1512,11 @@ build)`, `cloud apns (feature build)`.
    unauthenticated presenter's JWK (invariant 30 again), the same
    reachability the 8192-bit ceiling below has, just at the other edge. A
    real 1024-bit and a real 2040-bit RS256 proof, each signed offline the
-   same way the 8192-bit fixture below is (ring's own signing side cannot
-   produce a key this small either, `RsaKeyPair::from_pkcs8` has no floor
-   below which it refuses to sign, but `EncodingKey::from_rsa_pem` still
-   goes through it, so both were signed with `openssl dgst -sha256 -sign`,
+   same way the 8192-bit fixture below is (ring's signing side refuses a
+   key this small: `RsaKeyPair::from_pkcs8` takes a modulus of at least
+   2047 bits and at most 4096, so neither a 1024-bit nor an 8192-bit key
+   can be signed with through it, and both were signed with
+   `openssl dgst -sha256 -sign`,
    outside ring entirely), are both refused here rather than accepted or
    refused somewhere else; `a_2040_bit_rsa_proof_signed_offline_is_refused_below_the_2048_bit_floor`
    below pins the 2040-bit case as a permanent test. And `public_modulus.rs:69-71`
@@ -1547,7 +1548,7 @@ build)`, `cloud apns (feature build)`.
    is visible (`an_8200_bit_rsa_modulus_eight_bits_over_the_ceiling_is_refused_before_the_expensive_part`)
    is refused in the tens of microseconds (three isolated `--release` runs
    on this machine, `@measured` 2026-09-16: 44us, 46us, 326us, the last one
-   a cold-run outlier the same way the 8192-bit case below has one), well
+   a cold-run outlier), well
    under a fifth of an ACCEPTED verify at the ceiling, which is the number
    that shows no exponentiation ran. The first draft of this line cited
    12-16us; that did not reproduce at that magnitude on a re-measure and is
