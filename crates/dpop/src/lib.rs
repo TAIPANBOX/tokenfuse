@@ -729,4 +729,74 @@ mod tests {
              about it than that no algorithm rule admits it"
         );
     }
+
+    /// Measures whether an RSA modulus of arbitrary size, chosen entirely by
+    /// whoever presents the proof, costs this verifier an expensive modular
+    /// exponentiation before being refused.
+    ///
+    /// The Go twin of this door (`agent-stack-go/delegation`, agent-stack-go#59,
+    /// found 2026-09-16) had no such bound: an all-ones 48 KiB modulus cost
+    /// 1.34s to verify against 245us for a real 2048-bit key, and the caller
+    /// needs no valid private key to make the verifier pay that cost, only
+    /// bytes shaped like a signature. That is a request-time DoS reachable by
+    /// anybody who can reach a door built on `verify_proof`: RFC 9449 has the
+    /// proof carry its OWN public key in the header, by design, so this JWK
+    /// comes from the presenter, not from an operator's configured JWKS.
+    ///
+    /// This crate's RSA path goes through `jsonwebtoken` 9 to `ring` 0.17,
+    /// and `ring::rsa::verification::verify_rsa_` parses the modulus through
+    /// `PublicModulus::from_be_bytes` BEFORE calling `key.exponentiate(..)`:
+    /// that parse checks `bits > max_bits` and returns `KeyRejected::too_large()`
+    /// for anything over `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
+    /// `ring-0.17.14/src/rsa.rs` as `BitLength::from_bits(8192)` for every
+    /// `RSA_PKCS1_*_2048_8192_*`/`RSA_PSS_*_2048_8192_*` parameter set
+    /// `jsonwebtoken` uses (`crates/rsa.rs::alg_to_rsa_parameters`). So the
+    /// same 8192-bit ceiling the Go fix added by hand is already enforced
+    /// here, one layer down, before any exponentiation runs.
+    #[test]
+    fn an_oversized_rsa_modulus_is_refused_before_the_expensive_part_not_after() {
+        use std::time::Instant;
+
+        let now = 1_800_000_000;
+        // 48 KiB, all-ones: the same shape the Go measurement used.
+        let n = b64(&vec![0xFFu8; 48 * 1024]);
+        let e = b64(&[0x01, 0x00, 0x01]); // 65537, AQAB
+        let jwk = serde_json::json!({"kty": "RSA", "n": n, "e": e});
+        let header = serde_json::json!({"typ": "dpop+jwt", "alg": "RS256", "jwk": jwk});
+        let claims = serde_json::json!({"htm": "POST", "htu": URL, "iat": now, "jti": "p1"});
+        let signing_input = format!(
+            "{}.{}",
+            b64(header.to_string().as_bytes()),
+            b64(claims.to_string().as_bytes())
+        );
+        // A bogus signature the same byte length a real 48 KiB-modulus
+        // signature would be. Nobody needs to hold the matching private key
+        // for this to cost a verifier anything: that is the whole point of
+        // the DoS this test is checking is closed.
+        let bogus_signature = vec![0xABu8; 48 * 1024];
+        let proof = format!("{signing_input}.{}", b64(&bogus_signature));
+
+        let start = Instant::now();
+        let result = verify_proof(&proof, "POST", URL, now);
+        let elapsed = start.elapsed();
+
+        eprintln!("48 KiB RSA modulus, one verify attempt through verify_proof: {elapsed:?}");
+        assert_eq!(
+            result.unwrap_err(),
+            ProofRefusal::BadSignature,
+            "an oversized modulus must be REFUSED, not accepted for being big"
+        );
+        // 2048-bit RSA verification measures in the hundreds of microseconds
+        // on ordinary hardware; a verifier that let the 48 KiB modulus reach
+        // `exponentiate` would cost over a second, per the Go measurement.
+        // 50ms is generous headroom above a parse-and-refuse and nowhere near
+        // what an unbounded modexp at this size would cost.
+        assert!(
+            elapsed.as_millis() < 50,
+            "a 48 KiB RSA modulus took {elapsed:?} to refuse; ring's 8192-bit \
+             cap should reject it during parsing, long before any modular \
+             exponentiation. This elapsed time is the number invariant 29 \
+             now cites."
+        );
+    }
 }

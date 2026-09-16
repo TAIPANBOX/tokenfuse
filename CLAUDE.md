@@ -1482,6 +1482,39 @@ build)`, `cloud apns (feature build)`.
    hold it, and neither can go red for the proof path, which is the honest
    limit.
 
+   **The RSA modulus is bounded too, one layer down from this rule, and that
+   was checked rather than assumed.** `algorithms_for_key` names which
+   algorithms an RSA key may use and says nothing about how big it may be.
+   On the proof path (invariant 30) the key comes from the PRESENTER's own
+   proof header, RFC 9449 requires exactly that, so an unauthenticated caller
+   at the MCP broker's door picks the modulus a verify attempt runs against,
+   the same reachability agent-stack-go#59 (2026-09-16) found on the Go side:
+   an all-ones 48 KiB modulus cost that verifier 1.34s against 245us for a
+   real 2048-bit key, and the caller needs no matching private key to make a
+   verifier pay for it, only bytes shaped like a signature. `jsonwebtoken`
+   9.3.1's RSA path (`crates/rsa.rs::verify_from_components`) goes through
+   `ring` 0.17.14, and `ring::rsa::verification::verify_rsa_` parses the
+   modulus through `PublicModulus::from_be_bytes` BEFORE calling
+   `key.exponentiate`; that parse refuses anything over
+   `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
+   `ring-0.17.14/src/rsa.rs:31` as `BitLength::from_bits(8192)` and shared by
+   every `RSA_PKCS1_*_2048_8192_*`/`RSA_PSS_*_2048_8192_*` parameter set
+   `jsonwebtoken` uses. So the same 8192-bit ceiling the Go fix added by hand
+   is already enforced here, one dependency down, before any modular
+   exponentiation runs, and a modulus over it is `KeyRejected::too_large()`
+   at parse time rather than a signature failure after the cost is paid.
+   `@measured` `cargo test -p tokenfuse-dpop an_oversized_rsa_modulus` 2026-09-16:
+   `an_oversized_rsa_modulus_is_refused_before_the_expensive_part_not_after`
+   builds a JWK with an all-ones 48 KiB `n`, `e: AQAB`, inside a real DPoP
+   proof, and times one `verify_proof` call against a matching-length bogus
+   signature: refused as `ProofRefusal::BadSignature` in 2.8ms, three orders
+   of magnitude under the Go number and well under what a real 2048-bit
+   modexp itself costs, which is what shows no exponentiation ran at all.
+   This bound is `ring`'s, not this crate's own code, so a dependency bump
+   that changed the backend's parameter constants could move it without this
+   file saying so, the same caveat this invariant already makes about the
+   alg-family check two paragraphs up.
+
    **A delegation is verified with what the process already holds.** No client,
    no URL, no timeout: the key set is local, the clock is passed in, and
    revocation is a closure the caller owns. wardryx decides at a 3.2 ms p50 and
