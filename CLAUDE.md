@@ -1498,11 +1498,28 @@ build)`, `cloud apns (feature build)`.
    `PublicModulus::from_be_bytes` (`ring-0.17.14/src/rsa/public_modulus.rs:39`)
    BEFORE `key.exponentiate`. That function is TWO check sites, not one, run
    back to back right after the modulus bytes are parsed into a big integer
-   (line 56) and before the Montgomery setup (line 72): `public_modulus.rs:66-68`
-   refuses anything under 1024 bits (`KeyRejected::too_small()`, never reached
-   on this path, since `jsonwebtoken`'s own `RSA_*_2048_8192_*` parameter sets
-   ask for 2048 bits as their own floor) and `public_modulus.rs:69-71` refuses
-   anything over `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
+   (line 56) and before the Montgomery setup (line 72). `public_modulus.rs:66-68`
+   compares the modulus's byte-rounded bit length against `min_bits`, and
+   `min_bits` is the PARAMETER SET's floor, not a fixed constant: it is
+   passed in by the caller (`verification.rs:216`, `params.min_bits`) and
+   `jsonwebtoken`'s own `RSA_PKCS1_2048_8192_SHA256` (the set RS256 uses)
+   sets it to 2048. The 1024 that also appears near this check, at line 62,
+   is a different thing: `assert!(min_bits >= MIN_BITS)`, an unconditional
+   sanity floor on whatever `min_bits` the caller passes, never the floor a
+   real verify runs against. So `public_modulus.rs:66-68` is exactly the
+   code that enforces the 2048-bit floor, `KeyRejected::too_small()` on
+   anything shorter, and it IS reachable: the modulus comes from an
+   unauthenticated presenter's JWK (invariant 30 again), the same
+   reachability the 8192-bit ceiling below has, just at the other edge. A
+   real 1024-bit and a real 2040-bit RS256 proof, each signed offline the
+   same way the 8192-bit fixture below is (ring's own signing side cannot
+   produce a key this small either, `RsaKeyPair::from_pkcs8` has no floor
+   below which it refuses to sign, but `EncodingKey::from_rsa_pem` still
+   goes through it, so both were signed with `openssl dgst -sha256 -sign`,
+   outside ring entirely), are both refused here rather than accepted or
+   refused somewhere else; `a_2040_bit_rsa_proof_signed_offline_is_refused_below_the_2048_bit_floor`
+   below pins the 2040-bit case as a permanent test. And `public_modulus.rs:69-71`
+   refuses anything over `PUBLIC_KEY_PUBLIC_MODULUS_MAX_LEN`, hard-coded in
    `ring-0.17.14/src/rsa.rs:31` as `BitLength::from_bits(8192)` and shared by
    every `RSA_PKCS1_*_2048_8192_*`/`RSA_PSS_*_2048_8192_*` parameter set
    `jsonwebtoken` uses. So the same 8192-bit ceiling the Go fix added by hand
@@ -1528,9 +1545,14 @@ build)`, `cloud apns (feature build)`.
    because the modulus is; and a modulus refused eight bits OVER the
    ceiling, 8200 bits, on a header small enough that the refusal's own cost
    is visible (`an_8200_bit_rsa_modulus_eight_bits_over_the_ceiling_is_refused_before_the_expensive_part`)
-   is refused in about 12-16us, a fifth to a twentieth of an ACCEPTED
-   verify at the ceiling, which is the number that shows no exponentiation
-   ran.
+   is refused in the tens of microseconds (three isolated `--release` runs
+   on this machine, `@measured` 2026-09-16: 44us, 46us, 326us, the last one
+   a cold-run outlier the same way the 8192-bit case below has one), well
+   under a fifth of an ACCEPTED verify at the ceiling, which is the number
+   that shows no exponentiation ran. The first draft of this line cited
+   12-16us; that did not reproduce at that magnitude on a re-measure and is
+   widened here rather than re-pinned to a number this sensitive to the
+   machine and the run.
 
    The 48 KiB all-ones case
    (`an_oversized_rsa_modulus_is_refused_before_the_expensive_part_not_after`)

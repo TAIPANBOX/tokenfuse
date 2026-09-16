@@ -866,12 +866,22 @@ yyuNSwNVs/LTnw7nI9Ius8M=
     /// calls `public_key::Inner::from_modulus_and_exponent`, which calls
     /// `PublicModulus::from_be_bytes` (`ring-0.17.14/src/rsa/public_modulus.rs:39`).
     /// THAT function is two check sites, not one, back to back:
-    /// `public_modulus.rs:66-68` refuses anything under 1024 bits
-    /// (`KeyRejected::too_small()`, this crate never reaches it, `jsonwebtoken`'s
-    /// own `RSA_*_2048_8192_*` parameter sets ask for 2048 as their own
-    /// floor) and `public_modulus.rs:69-71` refuses anything over the 8192-bit
-    /// ceiling (`KeyRejected::too_large()`), which is the one invariant 29 is
-    /// about. Both run AFTER the modulus bytes are parsed into a big integer
+    /// `public_modulus.rs:66-68` compares the modulus's byte-rounded bit
+    /// length against `min_bits`, and `min_bits` is the PARAMETER SET's
+    /// floor, passed in by the caller (`verification.rs:216`,
+    /// `params.min_bits`), not a fixed constant: `jsonwebtoken`'s own
+    /// `RSA_PKCS1_2048_8192_SHA256` (the set RS256 uses) sets it to 2048.
+    /// The 1024 nearby, at line 62, is a different thing, an unconditional
+    /// `assert!(min_bits >= MIN_BITS)` sanity floor on whatever `min_bits`
+    /// the caller passes, never the floor a real verify runs against. So
+    /// `public_modulus.rs:66-68` IS reached on this path, and it is exactly
+    /// what enforces the 2048-bit floor (`KeyRejected::too_small()`) against
+    /// a modulus an unauthenticated presenter's JWK supplies, the same
+    /// reachability the 8192-bit ceiling has at the other edge; the test
+    /// below this one, `a_2040_bit_rsa_proof_signed_offline_is_refused_below_the_2048_bit_floor`,
+    /// pins that with a real signature. `public_modulus.rs:69-71` refuses
+    /// anything over the 8192-bit ceiling (`KeyRejected::too_large()`),
+    /// which is the one invariant 29 is about. Both run AFTER the modulus bytes are parsed into a big integer
     /// (`bigint::OwnedModulusValue::from_be_bytes`, line 56, immediately
     /// above both checks) and BEFORE the Montgomery setup
     /// (`bigint::OwnedModulus::from`, line 72) or the exponentiation itself,
@@ -1026,5 +1036,62 @@ yyuNSwNVs/LTnw7nI9Ius8M=
         // and 8192-bit tests already carry one of each. The elapsed time
         // printed above is what invariant 29 cites as the isolated cost of
         // ring's own check, apart from header-parsing overhead.
+    }
+
+    /// The OTHER edge of `too_small`, and the reason invariant 29's
+    /// prose above was wrong until a re-review caught it: the check at
+    /// `public_modulus.rs:66-68` does not refuse "anything under 1024
+    /// bits" as a fixed floor that this path never reaches. It compares
+    /// against `min_bits`, the PARAMETER SET's own floor
+    /// (`verification.rs:216`, `params.min_bits`), and `jsonwebtoken`'s
+    /// `RSA_PKCS1_2048_8192_SHA256` sets that to 2048. So the real floor
+    /// on this path is 2048, not 1024, and the check IS reached: a
+    /// presenter's JWK carries whatever modulus it likes.
+    ///
+    /// 2040 bits is eight bits UNDER that real floor, the mirror of the
+    /// 8200-bits-over test above. Signed offline the same way the
+    /// 8192-bit fixture is (ring's signing side, `RsaKeyPair::from_pkcs8`,
+    /// has no floor of its own that would refuse a 2040-bit key to sign
+    /// with, but `EncodingKey::from_rsa_pem` still goes through it, and
+    /// this crate has no way to hand it a raw PKCS#1 v1.5 signature it did
+    /// not itself produce, so the key was generated and the signature made
+    /// with `openssl dgst -sha256 -sign` over the exact
+    /// `header_b64.claims_b64` bytes this constant carries, independently
+    /// confirmed with `openssl dgst -sha256 -verify` against the matching
+    /// public key before this was committed). The `htm`/`htu`/`iat`/`jti`
+    /// are therefore FIXED, the same constraint the 8192-bit test carries.
+    #[test]
+    fn a_2040_bit_rsa_proof_signed_offline_is_refused_below_the_2048_bit_floor() {
+        use std::time::Instant;
+
+        const PROOF_2040_BELOW_THE_FLOOR: &str = "\
+         eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IlJTMjU2IiwiandrIjp7Imt0eSI6IlJTQSIsIm4iOiJvMC1vUHBfUWtuOHJs\
+         NVExV0dMOUtmakk2blhsbjNEVTBRWEJ3UnFuemtnQ3FFOENmbkM3UTMtd0FqZ1J1LWVNcE83dEJXVUNMdUtneFVVeGRK\
+         RW9rejB0bndETFNacE9iX0s0U2pkS1dUeUZwcENaU3YwbDYzandKb2dseE5lY1pyRS0tT3N4VWpRdXFiOWZ6aGx4enZh\
+         WHRqTFhiV1l6RHdZS2YyOEdPcDFFTWhqeHc3eHdRaHF0NUkwRlh3dGtfS3Axc0FIVFAtbHdlYk11aV9wMFVYSVNMVW1i\
+         QmxZU2tlVXVJUWFqVmZKMHMyMXJhUGc5blBrT3BScTR2Z1p1ZGYxWUNTMVlkRzFwMkNKWFdRYTVxV1A5MU9ldXBQR1Fi\
+         Z1JBY0t3anAzSGliRWFwT0k4eHFLc0VheEF0Y204aGg1YzJPNXZZNXNjLWU4RGJUbjVqIiwiZSI6IkFRQUIifX0.eyJo\
+         dG0iOiJQT1NUIiwiaHR1IjoiaHR0cHM6Ly9tY3AuYWNtZS5leGFtcGxlL21jcCIsImlhdCI6MTgwMDAwMDAwMCwianRp\
+         IjoicC0yMDQwIn0.PO1cIVUJlaoxO1oUM8iqG3HsOKJpp3hueo1y5f4Y0gb0QCnGR3mWOHTgK-fzperYLGAWAxX_Qrn5\
+         2xM-MA98-DH17jlKPVZz-AyKBKnsNmYS6SDe8HrfZrKiRtTFCkk6dbRm0vFiRPT1gjwQOvzHMzOGnAEMpOKKhrXLSwNR\
+         EDZ0gRR1BNKPbOo0Jy8xWRVCQV28Zw19sNgo-nUsIdqj8ZTRIgkWSj0ZnyVZ-mTX40aS7lAyeYd9w4vyFFdSiKkkcmKh\
+         BwxK85mXXD7tce5ydV0nUNmjmGWaLH453haak1EkYuKCeHbO70etju1KMuuMHffFi9tCbMCfhs6TNmd0";
+
+        let now = 1_800_000_000;
+        let start = Instant::now();
+        let result = verify_proof(PROOF_2040_BELOW_THE_FLOOR, "POST", URL, now);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "2040-bit RSA modulus (below the real 2048-bit floor), a REAL signature: {elapsed:?}"
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            ProofRefusal::BadSignature,
+            "a real 2040-bit RS256 signature, otherwise valid, must be refused by the same \
+             too_small check site that refuses a 1024-bit one: the floor on this path is the \
+             parameter set's 2048 bits, not a hard-coded 1024, and this site is reached, not \
+             skipped, for any modulus shorter than that"
+        );
     }
 }
