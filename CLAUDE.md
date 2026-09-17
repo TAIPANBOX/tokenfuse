@@ -2862,7 +2862,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `Option::unwrap()` on a `None` value` (that line number true of that one measurement only).
     `a_parent_declared_after_an_unchecked_admission_is_refused` (added after review) and
     `an_empty_parent_header_is_treated_as_absent` (added after review) were each proven red by
-    deleting or reverting one line of the ALREADY-LANDED product code and restoring it: with
+    deleting or reverting one line of the ALREADY-LANDED product code and restoring it
+    (@measured `cargo test -p tokenfuse-core a_parent_declared_after_an_unchecked_admission_is_refused`
+    and `cargo test -p tokenfuse-gateway --lib an_empty_parent_header_is_treated_as_absent`
+    2026-09-17, each once with the line planted and once restored): with
     `reserve_unchecked`'s `s.admitted_ever = true;` deleted, the first panicked `called
     Result::unwrap_err() on an Ok value: Opened { generation: 1, parent: Some("p"),
     parent_disposition: Adopted, reopened: false }`; with the `.filter(|p| !p.is_empty())` removed
@@ -2886,9 +2889,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     coordinator's workers are refused (D1) until the coordinator calls again (re-opening the
     parent in the now-empty in-process ledger) or a Cloud budget names the parent; nothing here
     persists across a restart (see the restart-durability line above). The 400 body's
-    `accepted_parent` names another run's held parent to ANY caller who names that run id in
-    `x-fuse-parent-run-id`, with no authentication of its own, which is the same topological fact
-    `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41); this door does not check
-    who is asking. And N plain gateways behind one address, with no `cluster` feature, each hold
+    `accepted_parent` names another run's held parent to a caller who puts that run id in
+    `x-fuse-run-id` and any other id in `x-fuse-parent-run-id`; the door has no authentication
+    of its own beyond the client keys, when those are on (`resolve_client_key` runs first and
+    answers 401 otherwise), so with client keys off this is the same topological fact
+    `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41). And N plain gateways behind one address, with no `cluster` feature, each hold
     their own ledger, so a worker whose call lands on a different replica than the one its
     coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*
