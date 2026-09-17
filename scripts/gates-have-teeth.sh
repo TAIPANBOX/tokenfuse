@@ -613,10 +613,13 @@ run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
 # Not a scripts/*.sh gate: the rule is enforcement code held by cargo test. The
 # mutant is the exact fault the review found (ledger.rs `None => break`), planted
 # by its text in the one walker every admission path shares, and the probe that
-# found it must go red.
+# found it must go red. The planted text still constructs the variant, so the
+# mutant compiles under CI's `RUSTFLAGS=-D warnings` (a never-constructed variant
+# is a dead_code error there, and a mutant that does not compile is WRONG REASON,
+# not a caught fault).
 run_case "hierarchical-budgets: an unknown parent walked past silently" fail \
 	"cargo test -p tokenfuse-core --test fable_missed -- --exact missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing" \
-	"$(py 'edit("crates/core/src/ledger.rs", "return (links, Some(Stop::UnknownParent(id)));", "break;")')" \
+	"$(py 'edit("crates/core/src/ledger.rs", "return (links, Some(Stop::UnknownParent(id)));", "let _ = Stop::UnknownParent(id); break;")')" \
 	"missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing ... FAILED"
 
 # --- invariant 44: the 1.0 surface is frozen --------------------------------
