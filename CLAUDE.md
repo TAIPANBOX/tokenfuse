@@ -2018,18 +2018,40 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     start reading as fresh, which turns every other rule here off. Equal cursors
     ARE accepted: `as_of` is a Unix second and refusing that would break any
     poller faster than 1 Hz.
-    *(scenarios: `features/revocation.feature`, twenty-one since invariant 48
-    added two, each bound to a named
-    test. Test: eighteen in `delegation::revocations`, every one run against a
-    `check` stubbed to `|_, _, _| false`, which is what the doors do today;
+
+    **A body with no `revocations` array, or a null one, is refused and never
+    read as an empty list.** `revocations` carries no `#[serde(default)]`: a
+    snapshot silent about the member, or one that names it `null`, is a parse
+    error rather than an honest empty list, because those are not the same
+    fact and reading the second as the first is how a wrong upstream, a proxy
+    in the way, or anyone else who can shape that response empties every
+    revocation this process holds. An entry that is not a JSON object is
+    refused the same way (an entry `[]` or `["dead"]` would otherwise decode
+    positionally into a record `vouchryx` never sends), which is the rule Go's
+    `ParseSnapshot` states since agent-stack-go#62. `as_of` keeps its own
+    default, since a missing or zero cursor is refused one layer down by
+    [`Install::NoCursor`] regardless.
+    *(scenarios: `features/revocation.feature`, twenty-two: invariant 48 added
+    two and the 2026-09-17 review's fix added a third, each bound to a named
+    test. Test: twenty in `delegation::revocations`, eighteen of them run
+    against a `check` stubbed to `|_, _, _| false`, which is what the doors
+    do today;
     fourteen went red there, verbatim among them `left: Never right: Stale {
     age_secs: 61 }` and `tok-1 was answered from the list: Answer { revoked:
     false, basis: Never }`. One stayed red past the stub and found a real
     defect: a derived `Deserialize` reads `[]` positionally into an empty
     snapshot, so `Snapshot::from_json` now refuses a body that is not a JSON
-    object. Eight mutants planted in the product code on
-    2026-08-26, all eight caught, each named with the test that caught it in the
-    pull request. The two worth naming here are the ones the design turns on:
+    object. A twentieth,
+    `a_snapshot_with_no_revocations_array_is_an_error_not_an_empty_list`, is
+    the Rust twin of the same review's F4 (its probe
+    `TestCodexInvariant19MalformedSnapshotCannotEraseKnownRevocation` sits in
+    a private evidence archive and is not runnable from here): a
+    body missing the member parsed the same way `[]` once did, `install`
+    accepted it, and a held revocation for a live jti answered not revoked.
+    Eight mutants planted in the product code on 2026-08-26, all eight caught,
+    each named with the test that caught it in the pull request; a ninth,
+    `#[serde(default)]` restored on `revocations`, caught by the new test on
+    2026-09-17. The two worth naming here are the ones the design turns on:
     the age never consulted, so a stale list serves for ever
     (`a_miss_on_a_stale_list_falls_back_to_the_fail_mode`), and the age
     governing a HIT as well as a MISS

@@ -152,7 +152,6 @@ impl Revocation {
 /// every revoked token in the estate is live again.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct Snapshot {
-    #[serde(default)]
     pub revocations: Vec<Revocation>,
     #[serde(default)]
     pub as_of: i64,
@@ -179,12 +178,57 @@ impl Snapshot {
     /// Unknown MEMBERS are still accepted on purpose: entries carry `actor` and
     /// `reason` that this consumer has no use for, and refusing a member
     /// `vouchryx` adds later would make every consumer a release blocker.
+    ///
+    /// # A missing or null `revocations` member is refused, not read as empty
+    ///
+    /// `revocations` carries no `#[serde(default)]`. A body silent about the
+    /// member, or explicit that it is `null`, is a [`serde_json::Error`]
+    /// rather than a [`Snapshot`] with an empty list, because those are not
+    /// the same fact: an empty list is a fetch that succeeded and found
+    /// nothing, while a body that never mentions `revocations` at all answers
+    /// no question this module can trust. Reading the second as the first is
+    /// how a wrong upstream, a proxy in the way, or anyone else who can shape
+    /// this response empties every revocation this process holds; `install`
+    /// would accept it (the cursor still moves forward) and every token that
+    /// list named would answer live again. `as_of` keeps its own
+    /// `#[serde(default)]`, because a missing or zero cursor is refused one
+    /// layer down by [`Install::NoCursor`] regardless, and that member has no
+    /// equivalent to an honest empty list for a missing value to be confused
+    /// with.
+    ///
+    /// Each ELEMENT of `revocations` is held to the same rule, checked here
+    /// rather than left to the derive: a struct is also read from a JSON
+    /// array positionally, so `["dead"]` would parse clean into
+    /// `Revocation { jti: "dead", .. }` and `[]` into
+    /// `Revocation::default()`, neither of which `vouchryx` ever sends. This
+    /// walks `revocations` before `from_value` and refuses any entry that is
+    /// not a JSON object. Go's `ParseSnapshot` refuses the same shape on its
+    /// side since agent-stack-go#62; this crate does not import Go and cannot
+    /// check that directly, so agent-stack-go's own invariant is what holds
+    /// the two in step.
     pub fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(raw)?;
         if !value.is_object() {
             return Err(serde::de::Error::custom(
                 "a revocations body is a JSON object with `revocations` and `as_of`",
             ));
+        }
+        if let Some(serde_json::Value::Array(entries)) = value.get("revocations") {
+            if let Some(bad) = entries.iter().find(|entry| !entry.is_object()) {
+                // Named by kind, not echoed: the gateway logs this on every
+                // poll, and an entry is bounded only by the snapshot cap.
+                let kind = match bad {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a boolean",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::String(_) => "a string",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => unreachable!("filtered above"),
+                };
+                return Err(serde::de::Error::custom(format!(
+                    "a revocation entry is a JSON object, not {kind}"
+                )));
+            }
         }
         serde_json::from_value(value)
     }
@@ -755,9 +799,77 @@ mod tests {
         );
     }
 
+    /// A struct is also read from a JSON ARRAY positionally, field by field,
+    /// so without the `is_object` guard below, `[[], 1800000000]` would parse
+    /// clean into `Snapshot { revocations: [], as_of: 1800000000 }` and
+    /// `[[{"jti":"dead"}], 1800000000]` into one naming "dead". `[]` alone no
+    /// longer proves the guard is doing anything: once `revocations` lost its
+    /// `#[serde(default)]`, serde's own arity check refuses a zero-element
+    /// seq before the guard would even matter (`invalid length 0`), so the
+    /// two FULLY-POPULATED positional arrays below are what actually requires
+    /// the guard; deleting it and running this test is the mutant proof for
+    /// that requirement.
     #[test]
     fn a_body_that_is_not_a_list_at_all_is_an_error_rather_than_an_empty_list() {
-        for raw in ["", "null", "[]", "{\"revocations\": 7}", "not json"] {
+        for raw in [
+            "",
+            "null",
+            "[]",
+            "{\"revocations\": 7}",
+            "not json",
+            r#"[[],1800000000]"#,
+            r#"[[{"jti":"dead"}],1800000000]"#,
+        ] {
+            assert!(
+                Snapshot::from_json(raw).is_err(),
+                "{raw:?} parsed as a revocation list"
+            );
+        }
+    }
+
+    /// The Rust twin of the Go review's F4
+    /// (`TestCodexInvariant19MalformedSnapshotCannotEraseKnownRevocation`,
+    /// 2026-09-17). None of a body silent about `revocations`, one explicit
+    /// that it is `null`, one whose array holds a `null` entry, or one whose
+    /// array holds a non-object entry is an empty list: each is an error, and
+    /// a parse that errors installs nothing. The positional door (a struct
+    /// read from a JSON array rather than an object) is a different shape,
+    /// covered instead by
+    /// `a_body_that_is_not_a_list_at_all_is_an_error_rather_than_an_empty_list`
+    /// above.
+    ///
+    /// The end-to-end loop runs FIRST and is the actual detector: a cache
+    /// already holding a revocation for `tok-1` must still answer revoked
+    /// after each hostile body below is offered to it, because a parse that
+    /// errors is never installed. It has to come before the plain `is_err()`
+    /// loop, or a body that wrongly parses would already have panicked that
+    /// loop first and this one would never run.
+    #[test]
+    fn a_snapshot_with_no_revocations_array_is_an_error_not_an_empty_list() {
+        let hostile = [
+            r#"{"as_of":1800000000}"#,
+            r#"{"as_of":1800000000,"revocations":null}"#,
+            r#"{"as_of":1800000000,"revocations":[null]}"#,
+            r#"{"as_of":1800000000,"revocations":[[]]}"#,
+            r#"{"as_of":1800000000,"revocations":[["dead"]]}"#,
+        ];
+
+        for raw in hostile {
+            let mut r = Revocations::with_defaults();
+            assert_eq!(
+                r.install(snapshot(AS_OF, vec![jti("tok-1", AS_OF + 3600)]), AS_OF),
+                Install::Applied
+            );
+            if let Ok(snap) = Snapshot::from_json(raw) {
+                r.install(snap, AS_OF);
+            }
+            assert!(
+                r.check("tok-1", "s", AS_OF - 10, AS_OF).revoked,
+                "{raw:?} must not erase a known revocation"
+            );
+        }
+
+        for raw in hostile {
             assert!(
                 Snapshot::from_json(raw).is_err(),
                 "{raw:?} parsed as a revocation list"
