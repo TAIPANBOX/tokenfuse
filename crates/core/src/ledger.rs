@@ -546,7 +546,9 @@ impl Ledger {
     }
 
     /// Snapshot every known run (for observability / the `runs` endpoint).
-    /// Closed runs are included.
+    /// Closed runs are included, but `RunSnapshot` carries no `closed` field,
+    /// so a closed run and an open one are indistinguishable in this list
+    /// (and in `GET /v1/runs`); `run_info` is where `closed` can be read.
     pub fn list_runs(&self) -> Vec<(String, RunSnapshot)> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -869,6 +871,29 @@ mod tests {
         assert_eq!(l.snapshot("a").unwrap().spent, Microusd(150_000));
         assert_eq!(l.snapshot("b").unwrap().spent, Microusd(150_000));
         assert_eq!(l.snapshot("p").unwrap().spent, Microusd::ZERO);
+    }
+
+    /// The same admission-gates-adoption rule as above, but the admission is
+    /// an UNCHECKED one (the shape shadow and warn produce): `reserve_unchecked`
+    /// must mark `admitted_ever` too, or a run whose only spend went through
+    /// the unchecked path could adopt a parent afterward while D2 says any
+    /// mode refuses that.
+    #[test]
+    fn a_parent_declared_after_an_unchecked_admission_is_refused() {
+        let l = Ledger::new();
+        l.open_run("c", Microusd(1_000_000), None).expect("opens");
+        l.open_run("p", Microusd(1_000_000), None).expect("opens");
+        l.reserve_unchecked("c", Microusd(1));
+
+        let err = l.open_run("c", Microusd(1_000_000), Some("p")).unwrap_err();
+        assert_eq!(
+            err,
+            OpenError::AdoptedTooLate {
+                run_id: "c".to_string(),
+                declared: "p".to_string()
+            }
+        );
+        assert_eq!(l.run_info("c").unwrap().parent, None);
     }
 
     /// A parent declared before any admission is adopted, and the adopted

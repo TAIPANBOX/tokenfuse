@@ -1,7 +1,4 @@
 // @codex 2026-09-17: review-only probes, written against 80e0d42 without product changes. Moved into the suite by the ledger PR (invariant 49); codex_f02's setup is the one change, see its own comment.
-// The seed literal below is the review's own, kept verbatim; clippy's digit-grouping
-// style lint on it is silenced at the file level rather than by editing the literal.
-#![allow(clippy::unusual_byte_groupings)]
 use std::sync::{Arc, Barrier};
 use tokenfuse_core::{Ledger, Microusd, ModelPrice, Usage};
 
@@ -137,6 +134,9 @@ fn codex_held_children_race_against_one_parent_with_exact_accounting() {
     }
 }
 
+// The seed literal below is the review's own, kept verbatim; clippy's digit-grouping
+// style lint on it is silenced on this one test rather than by editing the literal.
+#[allow(clippy::unusual_byte_groupings)]
 #[test]
 fn codex_held_seeded_integer_arithmetic_matches_i128_oracle() {
     let mut seed = 0x18_09_2026_u64;

@@ -419,3 +419,68 @@ async fn raft_backend_refuses_a_changed_or_late_parent_from_its_local_read() {
     // None of the refusals above touched p2.
     assert_eq!(rl.snapshot("p2").await.unwrap().reserved, Microusd::ZERO);
 }
+
+/// Two reservations on one run, both settled: `reserved` must return exactly
+/// to zero and `spent` must be the sum. `raft_backend_enforces_and_settles`
+/// above only ever settles one reservation, which cannot catch a process-local
+/// id counter that stopped counting (e.g. `next_id` never advancing, or two
+/// reserves handed the same id): the second settle would then remove nothing
+/// new from `outstanding`, silently drop, and leave `reserved` stuck at the
+/// first reservation's amount forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_backend_settles_two_reservations_back_to_zero_reserved() {
+    let addr = "127.0.0.1:5625";
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("http://{addr}"));
+    let rl: Arc<dyn LedgerBackend> =
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
+            .await
+            .unwrap();
+
+    let run = "r-two-settles";
+    let mut ready = false;
+    for _ in 0..100 {
+        let _ = rl.open_run(run, Microusd::from_usd(1.0), None).await;
+        if rl
+            .snapshot(run)
+            .await
+            .is_some_and(|s| s.budget == Microusd::from_usd(1.0))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "single-node cluster never became ready");
+
+    let a = rl
+        .reserve(run, Microusd::from_usd(0.3))
+        .await
+        .expect("first reserve fits");
+    let b = rl
+        .reserve(run, Microusd::from_usd(0.3))
+        .await
+        .expect("second reserve fits");
+    assert_ne!(
+        a.id, b.id,
+        "a reservation-id counter that stopped counting would hand out the same id twice"
+    );
+
+    rl.settle(&a, Microusd::from_usd(0.3));
+    rl.settle(&b, Microusd::from_usd(0.3));
+
+    let mut settled = false;
+    for _ in 0..100 {
+        if let Some(s) = rl.snapshot(run).await {
+            if s.reserved == Microusd::ZERO && s.spent == Microusd::from_usd(0.6) {
+                settled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        settled,
+        "both settles must apply: reserved back to zero, spent the sum of both"
+    );
+}

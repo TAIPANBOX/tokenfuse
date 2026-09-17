@@ -2792,13 +2792,18 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(tests: `crates/core/tests/codex_money_review.rs` and `crates/core/tests/fable_missed.rs`,
     the review's probes moved into the suite, seven red at 80e0d42 by the review's own runs and
     @measured `cargo test -p tokenfuse-core --test codex_money_review --test fable_missed
-    --no-fail-fast` 2026-09-17 at 6fdef03 (before this change, re-run by the implementer): the
-    same seven FAILED (`codex_f01`, `codex_f02`, `codex_f09`, `codex_f10`, `missed1`, `missed2`,
-    `missed6`), `codex_held_children_race_against_one_parent_with_exact_accounting` and
+    --no-fail-fast` 2026-09-17 at 6fdef03 (before this change, re-run by the implementer, on the
+    review's ORIGINAL files exactly as they had already been copied into the worktree: `codex_f02`
+    unmoved, calling `reserve` rather than `reserve_unchecked`, and no `.expect("opens")` anywhere,
+    since 6fdef03's `open_run` returns `()`; the COMMITTED forms below, `.expect("opens")`
+    throughout and `codex_f02` moved to `reserve_unchecked`, do not compile against 6fdef03 at
+    all): the same seven FAILED (`codex_f01`, `codex_f02`, `codex_f09`, `codex_f10`, `missed1`,
+    `missed2`, `missed6`), `codex_held_children_race_against_one_parent_with_exact_accounting` and
     `codex_held_seeded_integer_arithmetic_matches_i128_oracle` stayed `ok`; `ledger::tests`:
     `a_child_of_an_unopened_parent_is_refused_and_reserves_nothing`,
     `a_child_of_an_unopened_parent_is_admitted_once_the_parent_opens`,
     `a_parent_declared_after_a_descendants_admission_is_refused`,
+    `a_parent_declared_after_an_unchecked_admission_is_refused`,
     `a_parent_declared_before_any_admission_is_adopted`,
     `a_changed_parent_is_refused_and_the_held_one_stays`,
     `a_reservation_settles_on_the_chain_it_was_admitted_against`,
@@ -2813,8 +2818,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_cloud_budget_on_the_parent_opens_it_and_admits_the_child`,
     `shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf`,
     `a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent`,
+    `a_changed_or_late_parent_is_a_400_in_shadow_too_and_the_trace_keeps_the_accepted_parent`,
+    `an_empty_parent_header_is_treated_as_absent`,
     `a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root`;
-    `tests/cluster_backend.rs::raft_backend_refuses_a_changed_or_late_parent_from_its_local_read`.
+    `tests/cluster_backend.rs::raft_backend_refuses_a_changed_or_late_parent_from_its_local_read`,
+    `raft_backend_settles_two_reservations_back_to_zero_reserved`.
     Red first: the seven probes above, red by assertion at 6fdef03, verbatim: `codex_f01`
     panicked "ADR-2: reserve must check every ancestor, including the root beyond the walk
     cap"; `codex_f02` panicked "ADR-2: settle may only release what this call reserved on that
@@ -2824,20 +2832,63 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     panicked "a parent that was never opened must not admit the child's spend unchecked";
     `missed2` panicked "a zero-budget parent declared on the second call must refuse the
     child"; `missed6` panicked on `assert_eq!(p.reserved, Microusd(0), ...)` (left:
-    `Microusd(100000)`). Seven more (`a_child_naming_a_parent_this_gateway_has_not_opened_is_refused`,
-    `a_cloud_budget_on_the_parent_opens_it_and_admits_the_child`,
-    `shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf`,
-    `a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent`,
-    `a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root`,
-    `racing_children_with_a_late_parent_are_refused_until_it_opens`,
-    `a_saturated_unit_cap_cannot_grant_past_its_ceiling`) were written to compile against the
-    UNCHANGED tree (a bare `open_run` statement rather than `.expect`) and run by name before
-    the product changed: also red by assertion there (402 read as 200 in three, the
-    would-block header absent in one, 16 grants where the unopened parent should have refused
-    every one, `Ok` where `i64::MAX` already left no headroom). Every other new test names an
-    API this change adds and so is red by compile against 6fdef03, the weaker form invariant
-    46 already accepts. Twelve mutants planted in the product code 2026-09-17, each caught by
-    the test named in the pull request. Scenarios: `features/hierarchical-budgets.feature`,
-    fifteen, each bound (`features-are-bound.sh`: 222 scenarios, 234 bindings, 0 broken). Not a
-    script gate: the rule is enforcement code `cargo test` runs; `gates-have-teeth.sh` plants
-    the unknown-parent mutant and requires `missed1` to go red.)*
+    `Microusd(100000)`). A further seven test names were proven red before the product changed,
+    each in a TEMPORARY form written to compile against 6fdef03 (`open_run`'s result left as a
+    bare statement rather than `.expect`ed, since it returned `()` there), never in their
+    committed form, and the temporary form is not always the same shape as the committed one, so
+    what is quoted below is what that temporary run actually printed, not a restatement of the
+    committed assertion. `a_child_naming_a_parent_this_gateway_has_not_opened_is_refused`,
+    `a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root` and the `parent_run_changed`
+    half of `a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent` each read
+    `left: 200 right: 402` or `right: 400`; `shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf`
+    panicked on the missing would-block header; `a_saturated_unit_cap_cannot_grant_past_its_ceiling`
+    panicked with `got Ok(Some(UnitReservation { .. }))`.
+    `racing_children_with_a_late_parent_are_refused_until_it_opens`'s COMMITTED body matches
+    `Err(BudgetError::UnknownParent { .. })`, a variant 6fdef03's `BudgetError` does not carry at
+    all (@measured by adding that exact committed body to a copy of 6fdef03's `ledger.rs`,
+    2026-09-17: `error[E0599]: no method named `expect` found for unit type `()``, then, with that
+    line removed, `error[E0599]: no variant named `UnknownParent` found for enum
+    `ledger::BudgetError``), so that exact source is compile-red there for two independent
+    reasons, never assertion-red; its temporary stand-in instead counted grants with `.is_ok()`
+    and asserted the count was `0`, which is what went red (`left: 16 right: 0`).
+    `a_cloud_budget_on_the_parent_opens_it_and_admits_the_child` needed no stand-in to compile
+    (6fdef03's `AppState` already carried `set_cloud_budgets`/`cloud_budget`, unrelated to this
+    change) and ran red in its COMMITTED form, but not on a 402-vs-200 comparison: call 1's
+    `resp1.status() == StatusCode::OK` passes under 6fdef03 too (the old code never opens a
+    parent from a Cloud budget, so nothing capped the child there either), and the very next
+    line, `st.ledger.snapshot("parent").await.unwrap()`, is what panics: @measured by running
+    that exact committed test body against a copy of 6fdef03's `proxy.rs`, 2026-09-17,
+    `thread '...' panicked at crates/gateway/src/proxy.rs:5419:58: called
+    `Option::unwrap()` on a `None` value` (that line number true of that one measurement only).
+    `a_parent_declared_after_an_unchecked_admission_is_refused` (added after review) and
+    `an_empty_parent_header_is_treated_as_absent` (added after review) were each proven red by
+    deleting or reverting one line of the ALREADY-LANDED product code and restoring it: with
+    `reserve_unchecked`'s `s.admitted_ever = true;` deleted, the first panicked `called
+    Result::unwrap_err() on an Ok value: Opened { generation: 1, parent: Some("p"),
+    parent_disposition: Adopted, reopened: false }`; with the `.filter(|p| !p.is_empty())` removed
+    from the parent header read, the second read `left: 402 right: 200`. Every other new test
+    names an API this change adds and so is red by compile against 6fdef03, the weaker form
+    invariant 46 already accepts. Fourteen mutants planted in the product code 2026-09-17, each
+    caught by the test named in the pull request (the last two are the `reserve_unchecked`
+    admitted_ever deletion and the empty-header filter removal, both just above, kept in this
+    paragraph rather than renumbered into section 7's twelve since both target a line a
+    second-model review named, not a line this spec's own table
+    named). Scenarios: `features/hierarchical-budgets.feature`, sixteen, each bound
+    (`features-are-bound.sh`: 223 scenarios, 235 bindings, 0 broken). Not a script gate: the rule
+    is enforcement code `cargo test` runs; `gates-have-teeth.sh` plants the unknown-parent mutant
+    and requires `missed1` to go red.
+
+    **Where it says nothing**, four more facts added after a second-model review: a D1/F01
+    refusal's sink row is `decision: "budget_exceeded"` with `cost_microusd = estimate`, the same
+    shape a genuine over-budget refusal writes, so `tokenfuse savings`, `focus-export`'s
+    `x_blocked` and the Cloud's aggregation count it as avoided spend, though nothing was ever
+    priced against a budget that was actually insufficient. After a gateway restart, a
+    coordinator's workers are refused (D1) until the coordinator calls again (re-opening the
+    parent in the now-empty in-process ledger) or a Cloud budget names the parent; nothing here
+    persists across a restart (see the restart-durability line above). The 400 body's
+    `accepted_parent` names another run's held parent to ANY caller who names that run id in
+    `x-fuse-parent-run-id`, with no authentication of its own, which is the same topological fact
+    `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41); this door does not check
+    who is asking. And N plain gateways behind one address, with no `cluster` feature, each hold
+    their own ledger, so a worker whose call lands on a different replica than the one its
+    coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*

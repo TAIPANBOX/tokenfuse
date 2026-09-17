@@ -5520,6 +5520,31 @@ pub(crate) mod tests {
         assert!(shadow_events(&path).is_empty());
     }
 
+    /// The spec's own decision row for an empty header: `TaintStore::note_parent`
+    /// already ignores an empty `x-fuse-parent-run-id`, and the ledger must
+    /// treat it the same way, as no declaration at all, never as a real (and
+    /// therefore always-unopened) parent named `''`.
+    #[tokio::test]
+    async fn an_empty_parent_header_is_treated_as_absent() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "solo")
+            .header("x-fuse-parent-run-id", "")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st.clone(), req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an empty parent header must be treated as absent, not as a real parent name"
+        );
+        assert!(
+            st.ledger.snapshot("").await.is_none(),
+            "no run named '' must ever be opened"
+        );
+    }
+
     #[tokio::test]
     async fn a_cloud_budget_on_the_parent_opens_it_and_admits_the_child() {
         let sink = RecordingSink::default();
@@ -5699,6 +5724,78 @@ pub(crate) mod tests {
             "only calls 1 and 3 are money calls; 2 and 4 are 400s with no row"
         );
         assert!(records.iter().all(|r| r.parent_run_id == "p1"));
+    }
+
+    /// D2's 400s are not an enforce-only posture: a changed parent and a late
+    /// adoption are refused in shadow mode too, since neither is a money
+    /// refusal (invariant 42 only changes what a BUDGET refusal looks like in
+    /// shadow, and these are never that). The shadow-mode twin of the test
+    /// above.
+    #[tokio::test]
+    async fn a_changed_or_late_parent_is_a_400_in_shadow_too_and_the_trace_keeps_the_accepted_parent(
+    ) {
+        let sink = RecordingSink::default();
+        let st = state(Mode::Shadow, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        st.ledger
+            .open_run("p1", Microusd::from_usd(5.0), None)
+            .await
+            .expect("opens");
+        st.ledger
+            .open_run("p2", Microusd::from_usd(5.0), None)
+            .await
+            .expect("opens");
+
+        let mk = |run: &str, parent: Option<&str>| {
+            let mut b = Request::post("/v1/messages")
+                .header("x-fuse-run-id", run)
+                .header("x-fuse-budget-usd", "5.0");
+            if let Some(p) = parent {
+                b = b.header("x-fuse-parent-run-id", p);
+            }
+            b.body(Body::from(body(100))).unwrap()
+        };
+
+        // A changed parent is a 400 in shadow, not a would-block.
+        let resp1 = call(st.clone(), mk("c", Some("p1"))).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let resp2 = call(st.clone(), mk("c", Some("p2"))).await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::BAD_REQUEST,
+            "a changed parent is a 400 in shadow too, not a would-block"
+        );
+        let bytes2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(json2["error"]["code"], "parent_run_changed");
+        assert_eq!(json2["error"]["accepted_parent"], "p1");
+        let resp3 = call(st.clone(), mk("c", None)).await;
+        assert_eq!(resp3.status(), StatusCode::OK);
+
+        // A late adoption (declared after an admission, here the run's own
+        // unchecked one, since this is shadow) is a 400 in shadow too.
+        let warm = call(st.clone(), mk("d", None)).await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        let late = call(st.clone(), mk("d", Some("p2"))).await;
+        assert_eq!(
+            late.status(),
+            StatusCode::BAD_REQUEST,
+            "an adoption after an admission is a 400 in shadow too"
+        );
+        let bytes_late = to_bytes(late.into_body(), usize::MAX).await.unwrap();
+        let json_late: serde_json::Value = serde_json::from_slice(&bytes_late).unwrap();
+        assert_eq!(json_late["error"]["code"], "parent_adopted_too_late");
+
+        let p1 = st.ledger.snapshot("p1").await.unwrap();
+        assert_eq!(
+            p1.spent,
+            Microusd(21_000),
+            "two successful calls through c rolled up into p1"
+        );
+
+        let records = sink.snapshot();
+        let c_rows: Vec<_> = records.iter().filter(|r| r.run_id == "c").collect();
+        assert_eq!(c_rows.len(), 2, "only calls 1 and 3 on c are money calls");
+        assert!(c_rows.iter().all(|r| r.parent_run_id == "p1"));
     }
 
     #[tokio::test]

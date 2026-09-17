@@ -63,6 +63,12 @@ Feature: Hierarchical budgets check every ancestor, and a reservation settles wh
     Then the declaration is refused, because a reservation was admitted against the run
     And the child's later spend still lands on the run and never on the declared parent
 
+  # @test:a_parent_declared_after_an_unchecked_admission_is_refused
+  Scenario: A parent declared after the run's own unchecked admission is refused
+    Given a run with no parent that has been admitted once via the unchecked path
+    When the run declares a parent
+    Then the declaration is refused, because an admission was recorded even though it was never checked
+
   # @test:a_parent_declared_before_any_admission_is_adopted
   # @test:missed2_a_parent_declared_after_the_first_call_is_ignored
   Scenario: A parent declared before any admission is adopted
