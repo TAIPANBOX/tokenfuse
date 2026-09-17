@@ -2732,3 +2732,167 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 48. **A subject revocation names a party, wherever that party stands in the chain.** `verify_delegation` reads the chain first and asks `revoked` once per entry, the subject and then every actor, root first, first hit refuses. Until 2026-09-17 it asked about `sub` alone, the human at the root, so an entry naming a compromised agent in `act` matched nothing and revoked nobody, while every test of the path had planted the agent as the argument directly and stayed green; the Go verifier in agent-stack-go had the same defect and closes it in its own change (agent-stack-go#61). At most `MAX_CHAIN_ENTRIES` calls, none for a token that failed an earlier step and none for a chain that does not parse. The gateway's `revocations::hook` logs a fail-mode fallback once per request rather than once per entry, so a stale list behind a 32-entry chain is one warning, not 32. `@decided 2026-09-17`: a subject revocation names a party, not a `sub` field.
     Where it says nothing: the age rule of invariant 32 is unchanged and applies to every entry the same way, so under `FailClosed` with a stale list the ROOT entry's fallback refuses before any actor is asked, and the one warning carries `Basis::Stale` and no party.
     *(tests: `tests::a_revocation_naming_any_party_in_the_chain_refuses_the_token`, a seeded sweep of 200 chains of every depth to the cap, red first at case 0 (`agent://acme/a0-1`, position 2 of 3, not honoured); `tests::revocation_is_not_consulted_for_a_token_whose_chain_is_malformed` for the order; mutants: the loop collapsed to the root alone, caught by the sweep, and the hook hoisted above the chain read, caught by the second; scenarios in `features/revocation.feature`)*
+
+49. **A reservation is settled on the chain it was admitted against, exactly once, and a chain
+    this ledger cannot check admits nothing.** Until 2026-09-17 `Ledger::settle` walked the run
+    tree again and released the estimate on whatever ancestors existed at that moment, so a
+    parent that appeared between a child's reserve and its settle lost 800000 of somebody
+    else's reservation (F02 of the 2026-09-18 money-path review, @measured `cargo test
+    --offline -p tokenfuse-core --test codex_money_review` 2026-09-17 at 80e0d42: parent
+    `reserved=0, spent=100000` where 800000 was outstanding); a child naming a parent this
+    ledger had never opened was checked against nothing above itself, with no header, no event
+    and no log (`ledger.rs:121` `None => break`, `proxy.rs:651-652` opened the child only); a
+    parent declared after a run's first call was ignored for the run's life while every trace
+    row claimed it (`or_insert` set the parent once); a walk that reached the 64-ancestor cap
+    admitted against the truncated set; `settle` after `close_run` was a silent no-op that
+    left every ancestor's `reserved` inflated for good; and at a budget of `i64::MAX` the
+    saturating sum turned an overflow into an allowed equality (F09).
+
+    A `Reservation` now carries an id, the admitted chain leaf first with each run's
+    generation, and the leaf's generation; `settle` applies to those links and only those, and
+    a second settle of the same id is `Settlement::NotOutstanding`, never a second charge and
+    never a release of a sibling. `close_run` keeps a run's counters (a late settlement lands
+    on the closed leaf and on its ancestors) and `open_run` reopens it under a new generation,
+    which an old settlement cannot touch: the leaf half of that settlement is dropped, its
+    ancestor half still lands, and the trace row is where the leaf's spend then lives.
+
+    `@decided 2026-09-17`, two decisions about the parent header. A child naming a parent this
+    gateway has not opened is refused in enforce (402 `budget_exceeded`, the detail naming the
+    parent, one `breaker_tripped`), unless the parent has a Cloud-managed budget, in which case
+    the parent is opened at that budget as a root on first sight and the child proceeds; the
+    policy default is never used to open a parent; shadow and warn forward the call and record
+    the refusal the way invariant 42 records a would-block. A parent may be adopted only by a
+    run that has no parent yet and against which no reservation has ever been admitted, its
+    own or a descendant's (`admitted_ever`, marked on every run of an admitted chain; `steps ==
+    0` is not the test, since a child reserving through a parent leaves the parent's steps at
+    zero); any other change of parent is a 400 `invalid_request` (`parent_run_changed`,
+    `parent_adopted_too_late`, `parent_is_self`), not a money refusal, and every trace row
+    carries the parent the ledger holds, never the header. A walk that reaches
+    `MAX_CHAIN_DEPTH` with an ancestor still unwalked is refused (402, the detail naming the
+    leaf, the last walked run and the unchecked one); a cycle is not a truncation, every member
+    is on the chain once. The three admission predicates (`Ledger::reserve`,
+    `Ledger::would_exceed`, `UnitLedger::try_reserve`) use `checked_add` and read overflow as
+    exceeded. One walker serves the checked reserve, the shadow question and the unchecked
+    reserve, and one detail table serves the enforce 402 and the shadow would-block, so none
+    of them can drift from another.
+
+    **Where it says nothing.** The raft backend (feature `cluster`, compiled out of every
+    shipped image) keeps the older state machine: an unknown parent is still walked past
+    silently, a chain at 64 is still truncated, `Settle` walks the live tree, there is no
+    generation, exactly-once is per gateway process only, and a late parent is refused
+    whenever the local copy shows the run exists without one and silently ignored on a
+    follower whose copy lacks the run. Closing that is one raft PR under invariant 5, and this
+    change does not move `crates/cluster/src/types.rs`. A restart still loses every open
+    reservation and every counter (issue #293, its own design). The Cloud budget map has no
+    hierarchy, so a parent opened from it is a root. Three D1 refusals on one run raise the
+    Cloud's `budget_exhausted` incident, which pages about a misconfigured coordinator. The
+    unit monthly cap in shadow is still uncovered, as invariant 42 says. Opening a parent from
+    its Cloud budget writes a log line and no agent-event: no existing type describes it and a
+    new one is a cross-repository change (the sibling changes invariant 42 records).
+    *(tests: `crates/core/tests/codex_money_review.rs` and `crates/core/tests/fable_missed.rs`,
+    the review's probes moved into the suite, seven red at 80e0d42 by the review's own runs and
+    @measured `cargo test -p tokenfuse-core --test codex_money_review --test fable_missed
+    --no-fail-fast` 2026-09-17 at 6fdef03 (before this change, re-run by the implementer, on the
+    review's ORIGINAL files exactly as they had already been copied into the worktree: `codex_f02`
+    unmoved, calling `reserve` rather than `reserve_unchecked`, and no `.expect("opens")` anywhere,
+    since 6fdef03's `open_run` returns `()`; the COMMITTED forms below, `.expect("opens")`
+    throughout and `codex_f02` moved to `reserve_unchecked`, do not compile against 6fdef03 at
+    all): the same seven FAILED (`codex_f01`, `codex_f02`, `codex_f09`, `codex_f10`, `missed1`,
+    `missed2`, `missed6`), `codex_held_children_race_against_one_parent_with_exact_accounting` and
+    `codex_held_seeded_integer_arithmetic_matches_i128_oracle` stayed `ok`; `ledger::tests`:
+    `a_child_of_an_unopened_parent_is_refused_and_reserves_nothing`,
+    `a_child_of_an_unopened_parent_is_admitted_once_the_parent_opens`,
+    `a_parent_declared_after_a_descendants_admission_is_refused`,
+    `a_parent_declared_after_an_unchecked_admission_is_refused`,
+    `a_parent_declared_before_any_admission_is_adopted`,
+    `a_changed_parent_is_refused_and_the_held_one_stays`,
+    `a_reservation_settles_on_the_chain_it_was_admitted_against`,
+    `a_closed_run_keeps_the_counters_a_late_settlement_needs`,
+    `an_old_settlement_never_touches_a_reopened_runs_counters`,
+    `a_second_settlement_of_one_reservation_is_an_observable_no_op`,
+    `racing_children_with_a_late_parent_are_refused_until_it_opens`,
+    `a_walk_that_reaches_the_depth_cap_refuses_and_names_the_unchecked_ancestor`;
+    `unitledger::tests::a_saturated_unit_cap_cannot_grant_past_its_ceiling`;
+    `money::tests::checked_add_reports_overflow_instead_of_saturating`; `proxy::tests`:
+    `a_child_naming_a_parent_this_gateway_has_not_opened_is_refused`,
+    `a_cloud_budget_on_the_parent_opens_it_and_admits_the_child`,
+    `shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf`,
+    `a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent`,
+    `a_changed_or_late_parent_is_a_400_in_shadow_too_and_the_trace_keeps_the_accepted_parent`,
+    `an_empty_parent_header_is_treated_as_absent`,
+    `a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root`;
+    `tests/cluster_backend.rs::raft_backend_refuses_a_changed_or_late_parent_from_its_local_read`,
+    `raft_backend_settles_two_reservations_back_to_zero_reserved`.
+    Red first: the seven probes above, red by assertion at 6fdef03, verbatim: `codex_f01`
+    panicked "ADR-2: reserve must check every ancestor, including the root beyond the walk
+    cap"; `codex_f02` panicked "ADR-2: settle may only release what this call reserved on that
+    ancestor" (left: `Microusd(0)`, right: `Microusd(800000)`); `codex_f09` panicked "ADR-2 and
+    money.rs: no headroom remains at i64::MAX; saturation must not turn overflow into an
+    allowed equality"; `codex_f10` panicked on `assert_eq!(after, before, ...)`; `missed1`
+    panicked "a parent that was never opened must not admit the child's spend unchecked";
+    `missed2` panicked "a zero-budget parent declared on the second call must refuse the
+    child"; `missed6` panicked on `assert_eq!(p.reserved, Microusd(0), ...)` (left:
+    `Microusd(100000)`). A further seven test names were proven red before the product changed,
+    each in a TEMPORARY form written to compile against 6fdef03 (`open_run`'s result left as a
+    bare statement rather than `.expect`ed, since it returned `()` there), never in their
+    committed form, and the temporary form is not always the same shape as the committed one, so
+    what is quoted below is what that temporary run actually printed, not a restatement of the
+    committed assertion. `a_child_naming_a_parent_this_gateway_has_not_opened_is_refused`,
+    `a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root` and the `parent_run_changed`
+    half of `a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent` each read
+    `left: 200 right: 402` or `right: 400`; `shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf`
+    panicked on the missing would-block header; `a_saturated_unit_cap_cannot_grant_past_its_ceiling`
+    panicked with `got Ok(Some(UnitReservation { .. }))`.
+    `racing_children_with_a_late_parent_are_refused_until_it_opens`'s COMMITTED body matches
+    `Err(BudgetError::UnknownParent { .. })`, a variant 6fdef03's `BudgetError` does not carry at
+    all (@measured by adding that exact committed body to a copy of 6fdef03's `ledger.rs`,
+    2026-09-17: `error[E0599]: no method named `expect` found for unit type `()``, then, with that
+    line removed, `error[E0599]: no variant named `UnknownParent` found for enum
+    `ledger::BudgetError``), so that exact source is compile-red there for two independent
+    reasons, never assertion-red; its temporary stand-in instead counted grants with `.is_ok()`
+    and asserted the count was `0`, which is what went red (`left: 16 right: 0`).
+    `a_cloud_budget_on_the_parent_opens_it_and_admits_the_child` needed no stand-in to compile
+    (6fdef03's `AppState` already carried `set_cloud_budgets`/`cloud_budget`, unrelated to this
+    change) and ran red in its COMMITTED form, but not on a 402-vs-200 comparison: call 1's
+    `resp1.status() == StatusCode::OK` passes under 6fdef03 too (the old code never opens a
+    parent from a Cloud budget, so nothing capped the child there either), and the very next
+    line, `st.ledger.snapshot("parent").await.unwrap()`, is what panics: @measured by running
+    that exact committed test body against a copy of 6fdef03's `proxy.rs`, 2026-09-17,
+    `thread '...' panicked at crates/gateway/src/proxy.rs:5419:58: called
+    `Option::unwrap()` on a `None` value` (that line number true of that one measurement only).
+    `a_parent_declared_after_an_unchecked_admission_is_refused` (added after review) and
+    `an_empty_parent_header_is_treated_as_absent` (added after review) were each proven red by
+    deleting or reverting one line of the ALREADY-LANDED product code and restoring it
+    (@measured `cargo test -p tokenfuse-core a_parent_declared_after_an_unchecked_admission_is_refused`
+    and `cargo test -p tokenfuse-gateway --lib an_empty_parent_header_is_treated_as_absent`
+    2026-09-17, each once with the line planted and once restored): with
+    `reserve_unchecked`'s `s.admitted_ever = true;` deleted, the first panicked `called
+    Result::unwrap_err() on an Ok value: Opened { generation: 1, parent: Some("p"),
+    parent_disposition: Adopted, reopened: false }`; with the `.filter(|p| !p.is_empty())` removed
+    from the parent header read, the second read `left: 402 right: 200`. Every other new test
+    names an API this change adds and so is red by compile against 6fdef03, the weaker form
+    invariant 46 already accepts. Fourteen mutants planted in the product code 2026-09-17, each
+    caught by the test named in the pull request (the last two are the `reserve_unchecked`
+    admitted_ever deletion and the empty-header filter removal, both just above, kept in this
+    paragraph rather than renumbered into section 7's twelve since both target a line a
+    second-model review named, not a line this spec's own table
+    named). Scenarios: `features/hierarchical-budgets.feature`, sixteen, each bound
+    (`features-are-bound.sh`: 223 scenarios, 235 bindings, 0 broken). Not a script gate: the rule
+    is enforcement code `cargo test` runs; `gates-have-teeth.sh` plants the unknown-parent mutant
+    and requires `missed1` to go red.
+
+    **Where it says nothing**, four more facts added after a second-model review: a D1/F01
+    refusal's sink row is `decision: "budget_exceeded"` with `cost_microusd = estimate`, the same
+    shape a genuine over-budget refusal writes, so `tokenfuse savings`, `focus-export`'s
+    `x_blocked` and the Cloud's aggregation count it as avoided spend, though nothing was ever
+    priced against a budget that was actually insufficient. After a gateway restart, a
+    coordinator's workers are refused (D1) until the coordinator calls again (re-opening the
+    parent in the now-empty in-process ledger) or a Cloud budget names the parent; nothing here
+    persists across a restart (see the restart-durability line above). The 400 body's
+    `accepted_parent` names another run's held parent to a caller who puts that run id in
+    `x-fuse-run-id` and any other id in `x-fuse-parent-run-id`; the door has no authentication
+    of its own beyond the client keys, when those are on (`resolve_client_key` runs first and
+    answers 401 otherwise), so with client keys off this is the same topological fact
+    `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41). And N plain gateways behind one address, with no `cluster` feature, each hold
+    their own ledger, so a worker whose call lands on a different replica than the one its
+    coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*

@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.0.1-brightgreen)
-![tests](https://img.shields.io/badge/tests-1248-brightgreen)
+![tests](https://img.shields.io/badge/tests-1278-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -201,7 +201,7 @@ That's the dashboard's own tagline, and it's literal, not marketing. TokenFuse d
 
 ### 2. Budgets that survive a crash
 
-A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** - a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing - and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and - with durable storage enabled - a budget outlives not just a node crash but a full process restart.
+A budget only means something if two gateways racing each other can't both spend it, and if it doesn't vanish the moment a process dies mid-run. TokenFuse's per-run budgets are **hierarchical** - a sub-agent's spend rolls up and is checked against every ancestor, all-or-nothing, and a sub-agent naming a parent the gateway has not opened is refused rather than checked against nothing in enforce (a would-block in shadow and warn) (the in-process ledger; the raft ledger's older walk is listed in CLAUDE.md invariant 49) - and, in cluster mode, are replicated across nodes through a **raft** state machine that can persist durably to disk (redb). The affordability check is linearized across the whole gateway fleet, so there's no cross-node double-spend, and - with durable storage enabled - a budget outlives not just a node crash but a full process restart.
 
 ### 3. Drop-in, fail-open, and fast
 

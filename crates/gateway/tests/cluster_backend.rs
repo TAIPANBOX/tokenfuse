@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::Request;
-use tokenfuse_core::{BudgetError, Ledger, Microusd, ModelPrice, Policy, PriceBook};
+use tokenfuse_core::{BudgetError, Ledger, Microusd, ModelPrice, OpenError, Policy, PriceBook};
 use tokenfuse_gateway::ledger_backend::LedgerBackend;
 use tokenfuse_gateway::provider::StubProvider;
 use tokenfuse_gateway::raft_ledger::RaftLedger;
@@ -33,7 +33,7 @@ async fn raft_backend_enforces_and_settles() {
     let run = "r";
     let mut ready = false;
     for _ in 0..100 {
-        rl.open_run(run, Microusd::from_usd(1.0), None).await;
+        let _ = rl.open_run(run, Microusd::from_usd(1.0), None).await;
         if let Some(s) = rl.snapshot(run).await {
             if s.budget == Microusd::from_usd(1.0) {
                 ready = true;
@@ -82,7 +82,7 @@ async fn raft_backend_enforces_parent_budget() {
     // Wait for readiness by opening the parent until it replicates.
     let mut ready = false;
     for _ in 0..100 {
-        rl.open_run("parent", Microusd::from_usd(1.0), None).await;
+        let _ = rl.open_run("parent", Microusd::from_usd(1.0), None).await;
         if rl
             .snapshot("parent")
             .await
@@ -95,7 +95,8 @@ async fn raft_backend_enforces_parent_budget() {
     }
     assert!(ready);
     // Child has a huge own budget but rolls up into the $1.00 parent.
-    rl.open_run("child", Microusd::from_usd(100.0), Some("parent"))
+    let _ = rl
+        .open_run("child", Microusd::from_usd(100.0), Some("parent"))
         .await;
 
     let a = rl.reserve("child", Microusd::from_usd(0.6)).await;
@@ -178,7 +179,7 @@ async fn follower_burst_of_fresh_runs_does_not_panic_on_snapshot_lag() {
     // wait for anything to reach node 2; that catch-up window is the bug.
     let mut ready = false;
     for _ in 0..150 {
-        node1
+        let _ = node1
             .open_run("warmup", Microusd::from_usd(1.0), None)
             .await;
         if node1
@@ -276,7 +277,7 @@ async fn raft_backend_refuses_an_absurd_estimate_with_a_non_negative_would_and_n
     let run = "r-absurd";
     let mut ready = false;
     for _ in 0..100 {
-        rl.open_run(run, Microusd(10_000), None).await;
+        let _ = rl.open_run(run, Microusd(10_000), None).await;
         if rl
             .snapshot(run)
             .await
@@ -333,4 +334,153 @@ async fn raft_backend_refuses_an_absurd_estimate_with_a_non_negative_would_and_n
             "a 20000 reservation on a 10000 budget with 52 already spent must be refused, got {other:?}"
         ),
     }
+}
+
+/// The raft backend's D2 refusals, held from its LOCAL read (invariant 49): a
+/// changed parent is refused and the held one stays in effect; a late parent
+/// on an existing parentless run is refused too, WIDER than the in-process
+/// rule (it does not consult admissions, because the state machine's `Open`
+/// never sets a parent on an existing run at all, so it cannot adopt one);
+/// and a self-declared parent is refused before anything is submitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_backend_refuses_a_changed_or_late_parent_from_its_local_read() {
+    let addr = "127.0.0.1:5620";
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("http://{addr}"));
+    let rl: Arc<dyn LedgerBackend> =
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
+            .await
+            .unwrap();
+
+    // Readiness: open p1 until it replicates (the same pattern the other
+    // single-node tests in this file use).
+    let mut ready = false;
+    for _ in 0..100 {
+        let _ = rl.open_run("p1", Microusd::from_usd(1.0), None).await;
+        if rl
+            .snapshot("p1")
+            .await
+            .is_some_and(|s| s.budget == Microusd::from_usd(1.0))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "single-node cluster never became ready");
+
+    let _ = rl.open_run("p2", Microusd::from_usd(1.0), None).await;
+    assert!(
+        rl.open_run("c", Microusd::from_usd(1.0), Some("p1"))
+            .await
+            .is_ok(),
+        "first open of c under p1 must succeed"
+    );
+    assert!(
+        rl.open_run("d", Microusd::from_usd(1.0), None)
+            .await
+            .is_ok(),
+        "first open of d with no parent must succeed"
+    );
+
+    // A changed parent is refused from the local read.
+    match rl.open_run("c", Microusd::from_usd(1.0), Some("p2")).await {
+        Err(OpenError::ParentChanged {
+            run_id,
+            held,
+            declared,
+        }) => {
+            assert_eq!(run_id, "c");
+            assert_eq!(held, "p1");
+            assert_eq!(declared, "p2");
+        }
+        other => panic!("expected ParentChanged, got {other:?}"),
+    }
+    // Omitting the header keeps the held parent.
+    match rl.open_run("c", Microusd::from_usd(1.0), None).await {
+        Ok(opened) => assert_eq!(opened.parent, Some("p1".to_string())),
+        other => panic!("expected Ok with parent p1 kept, got {other:?}"),
+    }
+    // A late parent on an existing parentless run is refused: wider than the
+    // in-process rule, since the raft state machine cannot adopt at all.
+    match rl.open_run("d", Microusd::from_usd(1.0), Some("p1")).await {
+        Err(OpenError::AdoptedTooLate { run_id, declared }) => {
+            assert_eq!(run_id, "d");
+            assert_eq!(declared, "p1");
+        }
+        other => panic!("expected AdoptedTooLate, got {other:?}"),
+    }
+    // A self-declared parent is refused before anything is submitted.
+    match rl.open_run("d", Microusd::from_usd(1.0), Some("d")).await {
+        Err(OpenError::SelfParent { run_id }) => assert_eq!(run_id, "d"),
+        other => panic!("expected SelfParent, got {other:?}"),
+    }
+
+    // None of the refusals above touched p2.
+    assert_eq!(rl.snapshot("p2").await.unwrap().reserved, Microusd::ZERO);
+}
+
+/// Two reservations on one run, both settled: `reserved` must return exactly
+/// to zero and `spent` must be the sum. `raft_backend_enforces_and_settles`
+/// above only ever settles one reservation, which cannot catch a process-local
+/// id counter that stopped counting (e.g. `next_id` never advancing, or two
+/// reserves handed the same id): the second settle would then remove nothing
+/// new from `outstanding`, silently drop, and leave `reserved` stuck at the
+/// first reservation's amount forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_backend_settles_two_reservations_back_to_zero_reserved() {
+    let addr = "127.0.0.1:5625";
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("http://{addr}"));
+    let rl: Arc<dyn LedgerBackend> =
+        RaftLedger::start(1, addr.parse().unwrap(), Arc::new(peers), true, None, None)
+            .await
+            .unwrap();
+
+    let run = "r-two-settles";
+    let mut ready = false;
+    for _ in 0..100 {
+        let _ = rl.open_run(run, Microusd::from_usd(1.0), None).await;
+        if rl
+            .snapshot(run)
+            .await
+            .is_some_and(|s| s.budget == Microusd::from_usd(1.0))
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "single-node cluster never became ready");
+
+    let a = rl
+        .reserve(run, Microusd::from_usd(0.3))
+        .await
+        .expect("first reserve fits");
+    let b = rl
+        .reserve(run, Microusd::from_usd(0.3))
+        .await
+        .expect("second reserve fits");
+    assert_ne!(
+        a.id, b.id,
+        "a reservation-id counter that stopped counting would hand out the same id twice"
+    );
+
+    rl.settle(&a, Microusd::from_usd(0.3));
+    rl.settle(&b, Microusd::from_usd(0.3));
+
+    let mut settled = false;
+    for _ in 0..100 {
+        if let Some(s) = rl.snapshot(run).await {
+            if s.reserved == Microusd::ZERO && s.spent == Microusd::from_usd(0.6) {
+                settled = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        settled,
+        "both settles must apply: reserved back to zero, spent the sum of both"
+    );
 }
