@@ -176,7 +176,8 @@ const MAX_ACTORS_WITH_SUBJECT: usize = MAX_CHAIN_ENTRIES - 1;
 /// token.
 ///
 /// The order is deliberate and each step is cheaper than the next thing it
-/// protects: shape, signature, issuer, audience, expiry, binding, revocation. A
+/// protects: shape, signature, issuer, audience, expiry, binding, chain,
+/// revocation. A
 /// revocation lookup on a forged token is work an attacker chose, which on a
 /// busy enforcement point is a cheap denial of service.
 ///
@@ -535,11 +536,14 @@ mod tests {
             let actors: Vec<String> = (0..depth)
                 .map(|j| format!("agent://acme/a{i}-{j}"))
                 .collect();
+            // Issued seven seconds ago, so a verifier that forwarded `now` in
+            // place of the token's own `iat` is told apart by the fourth case.
+            let issued = now - 7;
             let tok = token(
                 &issuer,
                 &holder,
                 now,
-                serde_json::json!({"act": nest_actors(&actors), "jti": format!("tok-{i}")}),
+                serde_json::json!({"act": nest_actors(&actors), "jti": format!("tok-{i}"), "iat": issued}),
             );
             let mut chain = vec!["user://acme/alice".to_string()];
             chain.extend(actors.iter().cloned());
@@ -571,8 +575,16 @@ mod tests {
             // Naming a member but dated before the token's issue: revoking is
             // not banning (vouchryx's invariant 7), so the token stands.
             assert!(
-                verify(&|_, sub, iat| sub == named && iat < now).is_ok(),
+                verify(&|_, sub, iat| sub == named && iat < issued).is_ok(),
                 "case {i}: a revocation older than the token refused it"
+            );
+            // Naming a member, dated after the issue but before now: refused,
+            // and only a verifier forwarding the token's own `iat` gets this
+            // right.
+            assert_eq!(
+                verify(&|_, sub, iat| sub == named && iat <= now - 3).map(|_| ()),
+                Err(Refusal::Revoked),
+                "case {i}: a revocation between the token's issue and now was not honoured"
             );
         }
     }
