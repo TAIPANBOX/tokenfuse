@@ -608,6 +608,17 @@ run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {", "    if false && wire != st.wire {")')" \
 	"a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything ... FAILED"
 
+# --- invariant 49: a chain the ledger cannot check admits nothing ------------
+#
+# Not a scripts/*.sh gate: the rule is enforcement code held by cargo test. The
+# mutant is the exact fault the review found (ledger.rs `None => break`), planted
+# by its text in the one walker every admission path shares, and the probe that
+# found it must go red.
+run_case "hierarchical-budgets: an unknown parent walked past silently" fail \
+	"cargo test -p tokenfuse-core --test fable_missed -- --exact missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing" \
+	"$(py 'edit("crates/core/src/ledger.rs", "return (links, Some(Stop::UnknownParent(id)));", "break;")')" \
+	"missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing ... FAILED"
+
 # --- invariant 44: the 1.0 surface is frozen --------------------------------
 #
 # compat/1.0.json is the promise of this major and compat-surface.sh is what

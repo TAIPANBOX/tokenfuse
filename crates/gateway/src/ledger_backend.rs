@@ -31,13 +31,20 @@
 //! until both backends implement it, which is loud enough on its own.
 
 use async_trait::async_trait;
-use tokenfuse_core::{BudgetError, Ledger, Microusd, Reservation, RunSnapshot};
+use tokenfuse_core::{BudgetError, Ledger, Microusd, OpenError, Opened, Reservation, RunSnapshot};
 
 /// A budget ledger the gateway can reserve/settle against.
 #[async_trait]
 pub trait LedgerBackend: Send + Sync {
     /// Register a run with its budget (and optional parent for hierarchy).
-    async fn open_run(&self, run_id: &str, budget: Microusd, parent: Option<&str>);
+    /// `Err` is D2: the declaration would move the run or is impossible; the
+    /// backend changed nothing.
+    async fn open_run(
+        &self,
+        run_id: &str,
+        budget: Microusd,
+        parent: Option<&str>,
+    ) -> Result<Opened, OpenError>;
 
     /// Reserve `estimate` if it fits the budget; otherwise return the error.
     async fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError>;
@@ -67,8 +74,13 @@ pub struct LocalLedger(pub std::sync::Arc<Ledger>);
 
 #[async_trait]
 impl LedgerBackend for LocalLedger {
-    async fn open_run(&self, run_id: &str, budget: Microusd, parent: Option<&str>) {
-        self.0.open_run(run_id, budget, parent);
+    async fn open_run(
+        &self,
+        run_id: &str,
+        budget: Microusd,
+        parent: Option<&str>,
+    ) -> Result<Opened, OpenError> {
+        self.0.open_run(run_id, budget, parent)
     }
 
     async fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError> {
@@ -92,6 +104,12 @@ impl LedgerBackend for LocalLedger {
     }
 
     fn settle(&self, reservation: &Reservation, actual: Microusd) {
-        self.0.settle(reservation, actual);
+        if let tokenfuse_core::Settlement::NotOutstanding = self.0.settle(reservation, actual) {
+            tracing::debug!(
+                id = reservation.id,
+                run = %reservation.run_id,
+                "settle ignored: not outstanding"
+            );
+        }
     }
 }

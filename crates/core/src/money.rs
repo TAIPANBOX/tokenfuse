@@ -27,6 +27,12 @@ impl Microusd {
         Microusd(self.0.saturating_add(other.0))
     }
 
+    /// `None` on overflow. The three admission predicates read `None` as
+    /// "exceeded": a sum that cannot be represented cannot fit any budget (F09).
+    pub fn checked_add(self, other: Microusd) -> Option<Microusd> {
+        self.0.checked_add(other.0).map(Microusd)
+    }
+
     /// Subtract, clamping at zero (a settled reservation must never push a
     /// counter negative).
     pub fn saturating_sub(self, other: Microusd) -> Microusd {
@@ -114,5 +120,14 @@ mod tests {
     #[test]
     fn display_shows_six_decimals() {
         assert_eq!(Microusd(1_234_500).to_string(), "$1.234500");
+    }
+
+    /// `checked_add` reports overflow rather than saturating: the three
+    /// admission predicates (`Ledger::reserve`, `Ledger::would_exceed`,
+    /// `UnitLedger::try_reserve`) read `None` as exceeded (F09, invariant 49).
+    #[test]
+    fn checked_add_reports_overflow_instead_of_saturating() {
+        assert_eq!(Microusd(i64::MAX).checked_add(Microusd(1)), None);
+        assert_eq!(Microusd(3).checked_add(Microusd(4)), Some(Microusd(7)));
     }
 }

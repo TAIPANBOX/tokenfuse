@@ -244,7 +244,7 @@ comparison in #132.
 | MCP scanner + lockfile (Ring 3.3 / S6) | ✅ done | `crates/core/mcp.rs`: parse `tools/list`, fingerprint tools, scan descriptions for poisoning (injection phrases, zero-width chars), and diff vs a lockfile → **rug-pull** detection. `tokenfuse mcp-scan <tools.json> [--lock f] [--write-lock]`. Verified live. (Live credential-broker proxy = follow-up, needs MCP transport.) |
 | eBPF Radar (W1) | ✅ done | `crates/radar` (+ nested `radar-ebpf`, aya): eBPF on `sys_enter_connect` reports every outbound TCP connection (pid/comm/ip:port) and flags LLM providers + local Ollama/vLLM — **zero app config**. Linux-only; excluded from default workspace, own CI job. **Built & run live on a Hetzner Ubuntu 24.04 VPS (kernel 7.0)** — flagged real Anthropic/OpenAI + Ollama traffic, ignored non-LLM. |
 | Backtesting (W6) | ✅ done | `crates/core/backtest.rs`: replay a candidate policy (per-run/per-step budget, max-steps) over the Parquet trace → runs/calls blocked + `$ saved`. `tokenfuse backtest --budget … --max-steps …`. Verified live (saved 50% on a demo trace). |
-| Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. |
+| Hierarchical sub-agent budgets | ✅ done | `X-Fuse-Parent-Run-Id` links a run to its parent; `reserve`/`settle` roll a sub-agent's spend up the ancestor chain and check every level (all-or-nothing). A child that fits its own budget is still blocked by a tighter parent → `402 budget_exceeded` naming the parent. Since 2026-09-17 (invariant 49): a reservation carries the chain it was admitted against and settles exactly once; a child naming a parent the gateway has not opened is refused with 402 unless a Cloud budget names the parent; a parent is never changed and is adopted only before any admission (400 otherwise); a walk that reaches the 64-ancestor cap refuses rather than truncates; the raft ledger keeps the older walk (compiled out of every shipped image). |
 | HA cluster / raft (W7) | ✅ done | `crates/cluster` (openraft, storage-v2): the budget ledger replicated across N nodes. `Reserve`/`Settle` are raft log entries, so the affordability check is **linearized** — no cross-node double-spend — and budgets survive a node crash (quorum commit). Reference in-memory storage. `cargo run -p tokenfuse-cluster` demos a 3-node cluster: over-budget reserve denied by consensus, spend read back from a **follower**. Excluded from default workspace; own CI job. |
 | Cluster — HTTP transport | ✅ done | `net_http.rs` (HTTP `RaftNetwork`, JSON-over-HTTP via openraft `serde`) + `server.rs` (axum per-node server: `/raft/*` peer RPCs, `/mgmt/init`, `/mgmt/metrics`, `/api/write`, `/api/read/{run}`) → clusters form **across processes/machines**. `tokenfuse-cluster serve --id N --http … --peers …` runs one node; `demo-http` spins 3 over real sockets. 2 HTTP integration tests (form over `:0`, deny over-budget by consensus, follower read; leader-forward). |
 | Gateway↔cluster integration | ✅ done | Async `LedgerBackend` trait (`ledger_backend.rs`): `LocalLedger` (default, wraps in-process `Ledger` — no behavior change) or `RaftLedger` (`raft_ledger.rs`, feature `cluster`) which co-locates a raft node so budgets are enforced by consensus across gateways. Hot path refactored sync→async (`open`/`reserve`/`snapshot` await; `settle` stays sync fire-and-forget so `SettleGuard::drop` is unchanged). Configured via `TOKENFUSE_CLUSTER_*`; fails open on consensus outage. Gated tests (`tests/cluster_backend.rs`): enforce/deny/settle + parent-budget. Default gateway 35 tests still green. |
@@ -302,9 +302,17 @@ comparison in #132.
 
 **Counts re-measured 2026-09-17**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1248 passing** (core 314, dpop 21, delegation 44,
-gateway 669, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). dpop grew from
+`cargo test --all` runs **1275 passing** (core 335, dpop 21, delegation 44,
+gateway 675, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 314
+to 335 and gateway from 669 to 675 on 2026-09-17 (invariant 49): the ledger
+contract's evidence, twenty-one new in `tokenfuse-core` (eleven in
+`ledger::tests`, one in `money::tests`, and the money-path review's own nine
+probes moved into `crates/core/tests/codex_money_review.rs` and
+`fable_missed.rs`), six new in `tokenfuse-gateway` (five in `proxy::tests`,
+one in `unitledger::tests`); `crates/gateway/tests/cluster_backend.rs` gained
+a seventh (`--features cluster`, not part of the default-feature count above).
+dpop grew from
 16 to 21 the same day: one characterization test recording that `ring`
 already bounds an RSA modulus at 8192 bits (invariant 29), three more
 pinning both sides of that exact boundary (a real 2048-bit proof, a real

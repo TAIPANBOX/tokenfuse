@@ -140,13 +140,23 @@ impl UnitLedger {
         let window = month_key(now_millis);
         let mut state = self.state.lock().unwrap();
         let s = Self::rolled(&mut state, unit, &window);
-        let would = s.spent + s.reserved + estimate;
-        if would > cap {
-            return Err(UnitExceeded {
-                unit: unit.to_string(),
-                budget: cap,
-                spent: s.spent,
-            });
+        // `checked_add` reads overflow as exceeded (F09, invariant 49): a sum
+        // that cannot be represented fits no budget. `reserve_unchecked` and
+        // `settle` below keep their saturating arithmetic; they record, they
+        // do not admit.
+        let fits = s
+            .spent
+            .checked_add(s.reserved)
+            .and_then(|c| c.checked_add(estimate));
+        match fits {
+            Some(would) if would <= cap => {}
+            _ => {
+                return Err(UnitExceeded {
+                    unit: unit.to_string(),
+                    budget: cap,
+                    spent: s.spent,
+                });
+            }
         }
         s.reserved = s.reserved + estimate;
         Ok(Some(UnitReservation {
@@ -354,6 +364,32 @@ mod tests {
         ledger.set_overrides(HashMap::new());
         assert_eq!(ledger.effective_cap("treasury"), Some(usd(10.0)));
         assert_eq!(ledger.effective_cap("lending"), None);
+    }
+
+    /// The same ceiling case as `core::ledger`'s
+    /// `an_absurd_estimate_does_not_leave_a_lasting_credit_for_a_later_ordinary_reservation`,
+    /// at the actual ceiling rather than merely an absurd estimate: a unit
+    /// capped at and fully spent to `i64::MAX` must refuse one more
+    /// micro-USD, because the sum cannot be represented at all (F09,
+    /// invariant 49). `checked_add` reads that overflow as exceeded.
+    #[test]
+    fn a_saturated_unit_cap_cannot_grant_past_its_ceiling() {
+        let ledger = UnitLedger::new(HashMap::from([("treasury".into(), Microusd(i64::MAX))]));
+        let r = ledger
+            .try_reserve("treasury", Microusd(i64::MAX), JULY)
+            .unwrap()
+            .expect("capped unit reserves");
+        ledger.settle(&r, Microusd(i64::MAX), JULY);
+        assert_eq!(ledger.spent("treasury", JULY), Microusd(i64::MAX));
+
+        let next = ledger.try_reserve("treasury", Microusd(1), JULY);
+        match next {
+            Err(UnitExceeded { budget, spent, .. }) => {
+                assert_eq!(budget, Microusd(i64::MAX));
+                assert_eq!(spent, Microusd(i64::MAX));
+            }
+            other => panic!("no headroom remains at i64::MAX, got {other:?}"),
+        }
     }
 
     #[test]

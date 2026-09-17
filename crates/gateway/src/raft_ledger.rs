@@ -12,19 +12,28 @@
 //! TokenFuse's default) so a cluster outage degrades to "no enforcement", never
 //! "all agents blocked".
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokenfuse_cluster::net_http::Peers;
 use tokenfuse_cluster::server::{self, HttpNode};
 use tokenfuse_cluster::types::Request;
-use tokenfuse_core::{BudgetError, Microusd, Reservation, RunSnapshot};
+use tokenfuse_core::{
+    BudgetError, ChainLink, Microusd, OpenError, Opened, ParentDisposition, Reservation,
+    RunSnapshot,
+};
 
 use crate::ledger_backend::LedgerBackend;
 
 pub struct RaftLedger {
     node: Arc<HttpNode>,
+    /// Process-local reservation ids and the outstanding set: exactly-once at THIS gateway.
+    /// Not replicated: a second gateway cannot see them (documented in invariant 49).
+    next_id: AtomicU64,
+    outstanding: Mutex<HashSet<u64>>,
 }
 
 impl RaftLedger {
@@ -99,7 +108,34 @@ impl RaftLedger {
             });
         }
 
-        Ok(Arc::new(Self { node }))
+        Ok(Arc::new(Self {
+            node,
+            next_id: AtomicU64::new(0),
+            outstanding: Mutex::new(HashSet::new()),
+        }))
+    }
+
+    /// A granted reservation, whether from an accepted checked reserve, a
+    /// fail-open one, or an unchecked one: the same process-local id and
+    /// outstanding-set bookkeeping either way, so the three call sites
+    /// cannot drift apart. `generation: 0` and a single-link chain naming
+    /// only `run_id`, because the raft response does not carry the walked
+    /// chain (the state machine settles by walking its own live tree,
+    /// unlike the in-process ledger).
+    fn grant(&self, run_id: &str, estimate: Microusd, step: u32) -> Reservation {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.outstanding.lock().unwrap().insert(id);
+        Reservation {
+            id,
+            run_id: run_id.to_string(),
+            amount: estimate,
+            step,
+            generation: 0,
+            chain: vec![ChainLink {
+                run_id: run_id.to_string(),
+                generation: 0,
+            }],
+        }
     }
 }
 
@@ -114,15 +150,67 @@ fn snap_of(s: tokenfuse_cluster::types::RunState) -> RunSnapshot {
 
 #[async_trait]
 impl LedgerBackend for RaftLedger {
-    async fn open_run(&self, run_id: &str, budget: Microusd, parent: Option<&str>) {
+    /// D2 from the LOCAL read only: `sm.read_run` is the eventually
+    /// consistent copy `snapshot` reads too, so a refusal here can only be
+    /// stale-ABSENT (a lagging follower whose copy has not caught up yet,
+    /// which lets the submit through and keeps the state machine's old
+    /// parent silently, as at `6fdef03`), never stale-WRONG: the state
+    /// machine's `parent` is immutable after the first `Open`. Wider than
+    /// the in-process rule on purpose: `AdoptedTooLate` fires whenever the
+    /// local copy shows the run exists without a parent, admissions or not,
+    /// because the state machine's `Open` never sets a parent on an
+    /// existing run at all, so it cannot adopt one the way the in-process
+    /// ledger does.
+    async fn open_run(
+        &self,
+        run_id: &str,
+        budget: Microusd,
+        parent: Option<&str>,
+    ) -> Result<Opened, OpenError> {
+        if parent == Some(run_id) {
+            return Err(OpenError::SelfParent {
+                run_id: run_id.to_string(),
+            });
+        }
+        let local = self.node.sm.read_run(run_id).await;
+        let declared = parent.map(|p| p.to_string());
+        if let Some(l) = &local {
+            match (l.parent.as_deref(), declared.as_deref()) {
+                (Some(h), Some(d)) if h != d => {
+                    return Err(OpenError::ParentChanged {
+                        run_id: run_id.to_string(),
+                        held: h.to_string(),
+                        declared: d.to_string(),
+                    });
+                }
+                (None, Some(d)) => {
+                    return Err(OpenError::AdoptedTooLate {
+                        run_id: run_id.to_string(),
+                        declared: d.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
         let req = Request::Open {
             run: run_id.to_string(),
             budget_micros: budget.0.max(0) as u64,
-            parent: parent.map(|p| p.to_string()),
+            parent: declared.clone(),
         };
         if let Err(e) = self.node.submit(req).await {
             tracing::warn!(run = run_id, "cluster open_run failed: {e}");
         }
+        let was_absent = local.is_none();
+        Ok(Opened {
+            generation: 0,
+            parent: local.and_then(|l| l.parent).or(declared),
+            parent_disposition: if was_absent && parent.is_some() {
+                ParentDisposition::Set
+            } else {
+                ParentDisposition::Kept
+            },
+            reopened: false,
+        })
     }
 
     async fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError> {
@@ -131,11 +219,7 @@ impl LedgerBackend for RaftLedger {
             micros: estimate.0.max(0) as u64,
         };
         match self.node.submit(req).await {
-            Ok(resp) if resp.accepted => Ok(Reservation {
-                run_id: run_id.to_string(),
-                amount: estimate,
-                step: resp.step,
-            }),
+            Ok(resp) if resp.accepted => Ok(self.grant(run_id, estimate, resp.step)),
             Ok(resp) => Err(BudgetError::Exceeded {
                 // The blocked run may be an ancestor — surface it so the gateway
                 // can say "parent run X exceeded" vs "per-run budget exceeded".
@@ -161,11 +245,7 @@ impl LedgerBackend for RaftLedger {
             // Fail open: if consensus is unreachable, don't block the agent.
             Err(e) => {
                 tracing::warn!(run = run_id, "cluster reserve failed open: {e}");
-                Ok(Reservation {
-                    run_id: run_id.to_string(),
-                    amount: estimate,
-                    step: 0,
-                })
+                Ok(self.grant(run_id, estimate, 0))
             }
         }
     }
@@ -183,11 +263,7 @@ impl LedgerBackend for RaftLedger {
             Ok(resp) => resp.step,
             Err(_) => 0,
         };
-        Reservation {
-            run_id: run_id.to_string(),
-            amount: estimate,
-            step,
-        }
+        self.grant(run_id, estimate, step)
     }
 
     /// The checked reserve's question, answered from the local read: this run
@@ -244,6 +320,14 @@ impl LedgerBackend for RaftLedger {
     }
 
     fn settle(&self, reservation: &Reservation, actual: Microusd) {
+        if !self.outstanding.lock().unwrap().remove(&reservation.id) {
+            tracing::debug!(
+                id = reservation.id,
+                run = %reservation.run_id,
+                "settle ignored: not outstanding"
+            );
+            return;
+        }
         let node = self.node.clone();
         let req = Request::Settle {
             run: reservation.run_id.clone(),

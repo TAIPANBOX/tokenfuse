@@ -36,7 +36,7 @@ use tokenfuse_core::cache::{CacheMode, Lookup};
 use tokenfuse_core::injection::{self, SUSPECTED_INJECTION};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
-    dlp, evaluate, BreakerReason, BreakerVerdict, BudgetError, DlpMode, Microusd, Mode,
+    dlp, evaluate, BreakerReason, BreakerVerdict, BudgetError, DlpMode, Microusd, Mode, OpenError,
     Reservation, RunSnapshot, SemanticCache,
 };
 
@@ -647,12 +647,34 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             .note_blocks(&run_id, &taint::tool_uses_in(&request));
     }
 
-    // A sub-agent's run rolls up into its parent's budget (hierarchical budgets).
-    let parent = header_str(&headers, "x-fuse-parent-run-id");
-    st.ledger.open_run(&run_id, budget, parent.as_deref()).await;
-    // Now also recorded on the trace (agent-passport SPEC.md §3.2) — before
-    // this it lived only in the ledger's in-memory hierarchy above.
-    let parent_run_id = parent.clone().unwrap_or_default();
+    // A sub-agent's run rolls up into its parent's budget (hierarchical budgets, invariant 49).
+    // An empty header is no declaration.
+    let parent = header_str(&headers, "x-fuse-parent-run-id").filter(|p| !p.is_empty());
+    // D1's one exception: a parent this gateway has not opened, for which an operator set a budget
+    // in the Cloud, is opened at that budget on first sight, as a root (the Cloud budget map has no
+    // hierarchy). The policy default is never used to open a parent.
+    if let Some(p) = parent.as_deref().filter(|p| *p != run_id) {
+        if st.ledger.snapshot(p).await.is_none() {
+            if let Some(b) = st.cloud_budget(p) {
+                match st.ledger.open_run(p, b, None).await {
+                    Ok(_) => tracing::info!(parent = %p, child = %run_id, budget_usd = b.as_usd(),
+                        "opened a parent run at its Cloud-managed budget on first sight, declared by a child"),
+                    Err(e) => tracing::warn!(parent = %p, child = %run_id, error = %e,
+                        "could not open the parent at its Cloud-managed budget"),
+                }
+            }
+        }
+    }
+    let opened = match st.ledger.open_run(&run_id, budget, parent.as_deref()).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(run = %run_id, error = %e, "refused: the request would move the run to another parent, or names an impossible one");
+            return parent_run_refused(&run_id, &e);
+        }
+    };
+    // The relationship the LEDGER holds, never the header: a later call that omits the header
+    // still rolls up, and every row this request writes says so (D2).
+    let parent_run_id = opened.parent.clone().unwrap_or_default();
 
     // Attribution only: which logical agent made this call. Request-scoped like
     // `model` — it rides along into every CallRecord and never touches the
@@ -1540,23 +1562,19 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     let reservation = match st.policy.mode {
         Mode::Enforce => match st.ledger.reserve(&run_id, estimate).await {
             Ok(r) => r,
-            Err(BudgetError::Exceeded {
-                run_id: hit_run,
-                budget,
-                spent,
-                ..
-            }) => {
+            Err(err) => {
                 // The unit reservation above was taken optimistically;
                 // release it (settle at zero) so a run-level refusal does
                 // not leak reserved unit headroom.
                 if let Some(ur) = &unit_reservation {
                     st.units.settle(ur, Microusd::ZERO, now_millis());
                 }
-                let reason = if hit_run == run_id {
-                    "per-run budget exceeded".to_string()
-                } else {
-                    format!("parent run '{hit_run}' budget exceeded")
-                };
+                if let BudgetError::UnknownParent { parent, .. } = &err {
+                    tracing::warn!(run = %run_id, parent = %parent,
+                        "refused: the run declares a parent this gateway has not opened; nothing is admitted against a budget that cannot be checked");
+                }
+                let (hit_budget, hit_spent, reason) =
+                    budget_refusal(&err, &run_id, budget, snapshot.spent);
                 st.sink.record(CallRecord {
                     ts_millis: now_millis(),
                     run_id: run_id.clone(),
@@ -1578,62 +1596,10 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
-                    budget,
-                    spent,
+                    hit_budget,
+                    hit_spent,
                     &st.policy_id,
                     &reason,
-                );
-                emit_breaker_event(
-                    &st,
-                    &run_id,
-                    &event_agent_id,
-                    chain_on_record,
-                    &verdict,
-                    &unit,
-                );
-                return breaker_error_response(wire, &run_id, &verdict);
-            }
-            Err(BudgetError::UnknownRun { .. }) => {
-                if let Some(ur) = &unit_reservation {
-                    st.units.settle(ur, Microusd::ZERO, now_millis());
-                }
-                // Unreachable today on both backends: the in-process ledger's
-                // `open_run` (above, before this match) always registers
-                // this exact `run_id` before `reserve` runs, and the raft
-                // backend's `reserve` never returns `UnknownRun` at all (an
-                // unknown/rejected run folds into `BudgetError::Exceeded`
-                // there instead; see `RaftLedger::reserve` in
-                // `raft_ledger.rs`). Kept explicit rather than deleted so a
-                // future backend change can't quietly reopen this as a
-                // budget-check bypass: fail CLOSED (deny) here, not the
-                // `reserve_unchecked` bypass this arm used to call.
-                st.sink.record(CallRecord {
-                    ts_millis: now_millis(),
-                    run_id: run_id.clone(),
-                    model: parsed.model.clone(),
-                    decision: "budget_exceeded".into(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cost_microusd: estimate.0,
-                    step: snapshot.steps + 1,
-                    agent_id: agent_id.clone(),
-                    saved_microusd: 0,
-                    parent_run_id: parent_run_id.clone(),
-                    on_behalf_of: on_behalf_of.clone(),
-                    outcome: outcome_tag.clone(),
-                    key_id: key_id.clone(),
-                    unit: unit.clone(),
-                    // Blocked before the request ever reached the provider (I1).
-                    tool_calls: None,
-                });
-                let verdict = budget_verdict(
-                    BreakerReason::BudgetExceeded,
-                    Microusd::ZERO,
-                    Microusd::ZERO,
-                    &st.policy_id,
-                    &format!(
-                        "run '{run_id}' has no ledger reservation; denying instead of bypassing the budget check"
-                    ),
                 );
                 emit_breaker_event(
                     &st,
@@ -1655,26 +1621,17 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             // block". RUN-6 of the 1.0 proving run found it on the released
             // v0.5.0. `taint_shadow` beside `taint_block` is the precedent
             // (`EventType::BreakerShadow`).
-            if let Some(BudgetError::Exceeded {
-                run_id: hit_run,
-                budget,
-                spent,
-                ..
-            }) = st.ledger.would_exceed(&run_id, estimate).await
-            {
-                let reason = if hit_run == run_id {
-                    "per-run budget exceeded".to_string()
-                } else {
-                    format!("parent run '{hit_run}' budget exceeded")
-                };
+            if let Some(err) = st.ledger.would_exceed(&run_id, estimate).await {
+                let (hit_budget, hit_spent, reason) =
+                    budget_refusal(&err, &run_id, budget, snapshot.spent);
                 would_block = Some(match would_block.take() {
                     Some(prior) => format!("{prior}; budget_exceeded: {reason}"),
                     None => format!("budget_exceeded: {reason}"),
                 });
                 let mut verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
-                    budget,
-                    spent,
+                    hit_budget,
+                    hit_spent,
                     &st.policy_id,
                     &reason,
                 );
@@ -2552,6 +2509,51 @@ fn metering_required() -> Response {
         .expect("valid response")
 }
 
+/// D2: the request would move a run to another parent, or names an impossible one. 400 and
+/// not a money refusal: nothing was priced, the request is malformed relative to what the
+/// ledger holds, and the caller can fix it. No trace row and no event, like every other 400
+/// here; the warn line at the call site is the record.
+fn parent_run_refused(run_id: &str, err: &OpenError) -> Response {
+    let (code, accepted, declared, reason) = match err {
+        OpenError::ParentChanged { held, declared, .. } => (
+            "parent_run_changed",
+            Some(held.as_str()),
+            declared.as_str(),
+            format!("run '{run_id}' already rolls up into '{held}'; a parent is never changed once set (the request declared '{declared}'). Send x-fuse-parent-run-id: {held}, omit the header, or start a new run id"),
+        ),
+        OpenError::AdoptedTooLate { declared, .. } => (
+            "parent_adopted_too_late",
+            None,
+            declared.as_str(),
+            format!("run '{run_id}' has already reserved against its budget chain; a parent cannot be adopted after that (the request declared '{declared}'). Start a new run id under '{declared}'"),
+        ),
+        OpenError::SelfParent { .. } => (
+            "parent_is_self",
+            None,
+            run_id,
+            format!("run '{run_id}' declares itself as its own parent"),
+        ),
+    };
+    let body = serde_json::json!({
+        "error": {
+            "type": "invalid_request",
+            "code": code,
+            "run_id": run_id,
+            "accepted_parent": accepted,
+            "declared_parent": declared,
+            "reason": reason,
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
 /// The door a caller used is not the one this process serves. Refused here,
 /// before a run is opened or a cent reserved, because forwarding an OpenAI
 /// body to an Anthropic endpoint turns a configuration mistake into a provider
@@ -2855,6 +2857,59 @@ fn budget_verdict(
     }
 }
 
+/// The budget-family refusal's numbers and detail string, ONE table for the enforce 402 and the
+/// shadow/warn would-block, so the header, the event and the body cannot drift (invariant 42's
+/// argument). `own_budget`/`own_spent` are the calling run's, used when the refusal names no
+/// ancestor's figures.
+fn budget_refusal(
+    err: &BudgetError,
+    run_id: &str,
+    own_budget: Microusd,
+    own_spent: Microusd,
+) -> (Microusd, Microusd, String) {
+    match err {
+        BudgetError::Exceeded { run_id: hit, budget, spent, .. } if hit == run_id => {
+            (*budget, *spent, "per-run budget exceeded".to_string())
+        }
+        BudgetError::Exceeded { run_id: hit, budget, spent, .. } => {
+            (*budget, *spent, format!("parent run '{hit}' budget exceeded"))
+        }
+        // Unreachable today on both backends: the in-process ledger's `open_run` (called
+        // before `reserve` runs) always registers this exact `run_id` first, and the raft
+        // backend's `reserve` never returns `UnknownRun` at all (an unknown/rejected run
+        // folds into `BudgetError::Exceeded` there instead; see `RaftLedger::reserve` in
+        // `raft_ledger.rs`). Kept explicit rather than deleted so a future backend change
+        // can't quietly reopen this as a budget-check bypass: fail CLOSED (deny) here, not
+        // a `reserve_unchecked` bypass.
+        BudgetError::UnknownRun { .. } => (
+            Microusd::ZERO,
+            Microusd::ZERO,
+            format!(
+                "run '{run_id}' has no ledger reservation; denying instead of bypassing the budget check"
+            ),
+        ),
+        BudgetError::UnknownParent { parent, .. } => (
+            own_budget,
+            own_spent,
+            format!(
+                "parent run '{parent}' is not open on this gateway; open it first (a call on the parent, or a Cloud budget for it)"
+            ),
+        ),
+        BudgetError::ChainTooDeep { at, next, depth, .. } => (
+            own_budget,
+            own_spent,
+            format!(
+                "budget chain from run '{run_id}' is deeper than {depth} ancestors; the walk stopped at '{at}' with '{next}' unchecked"
+            ),
+        ),
+        BudgetError::RunClosed { run_id: closed } => (
+            own_budget,
+            own_spent,
+            format!("run '{closed}' is closed and admits no spend"),
+        ),
+    }
+}
+
 fn upstream_error(e: ProviderError) -> Response {
     let body =
         serde_json::json!({ "error": { "type": "upstream_error", "detail": e.to_string() } });
@@ -3070,6 +3125,7 @@ pub(crate) mod tests {
     use crate::sink::EventSink;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
     use tower::ServiceExt;
@@ -3188,8 +3244,13 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl LedgerBackend for SnapshotLaggingLedger {
-        async fn open_run(&self, run_id: &str, budget: Microusd, parent: Option<&str>) {
-            self.0.open_run(run_id, budget, parent).await;
+        async fn open_run(
+            &self,
+            run_id: &str,
+            budget: Microusd,
+            parent: Option<&str>,
+        ) -> Result<tokenfuse_core::Opened, tokenfuse_core::OpenError> {
+            self.0.open_run(run_id, budget, parent).await
         }
 
         async fn reserve(
@@ -5376,7 +5437,8 @@ pub(crate) mod tests {
         // Parent budget is tiny — smaller than a single child call's estimate.
         st.ledger
             .open_run("parent", Microusd::from_usd(0.001), None)
-            .await;
+            .await
+            .expect("opens");
 
         let child = Request::post("/v1/messages")
             .header("x-fuse-run-id", "child")
@@ -5392,6 +5454,292 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "budget_exceeded");
         assert!(json["error"]["reason"].as_str().unwrap().contains("parent"));
+    }
+
+    // ---- invariant 49: hierarchical budgets, D1/D2/F01 -------------------
+    //
+    // A child naming a parent this gateway has not opened is checked against
+    // nothing above itself (unless a Cloud budget opens the parent on first
+    // sight); a parent, once set, is never silently changed; a chain that
+    // reaches the depth cap refuses rather than truncates. See CLAUDE.md
+    // invariant 49.
+
+    #[tokio::test]
+    async fn a_child_naming_a_parent_this_gateway_has_not_opened_is_refused() {
+        let sink = RecordingSink::default();
+        let (events, path) = recording_exporter("d1-unopened-parent");
+        let st = state(Mode::Enforce, StubProvider::default())
+            .with_sink(Arc::new(sink.clone()))
+            .with_events(events);
+        let prices = Arc::clone(&st.prices);
+
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "child")
+            .header("x-fuse-parent-run-id", "parent")
+            .header("x-fuse-agent-id", "agent://test.example/shadow-bot")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+
+        let resp = call(st.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "budget_exceeded");
+        assert_eq!(
+            json["error"]["reason"],
+            "parent run 'parent' is not open on this gateway; open it first (a call on the parent, or a Cloud budget for it)"
+        );
+        assert_eq!(json["error"]["budget_usd"], 5.0);
+        assert_eq!(json["error"]["spent_usd"], 0.0);
+
+        let child = st.ledger.snapshot("child").await.unwrap();
+        assert_eq!(child.reserved, Microusd::ZERO);
+        assert_eq!(child.spent, Microusd::ZERO);
+        assert_eq!(child.steps, 0);
+        assert!(st.ledger.snapshot("parent").await.is_none());
+
+        let expected = estimate_cost(&prices, "test-model", body(100).len(), Some(100), 1)
+            .unwrap_or(Microusd::ZERO);
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "budget_exceeded");
+        assert_eq!(records[0].parent_run_id, "parent");
+        assert_eq!(records[0].cost_microusd, expected.0);
+
+        let all = events_at(&path);
+        let tripped: Vec<_> = all
+            .iter()
+            .filter(|e| e["type"] == "breaker_tripped")
+            .collect();
+        assert_eq!(tripped.len(), 1);
+        assert_eq!(
+            tripped[0]["data"]["detail"],
+            "parent run 'parent' is not open on this gateway; open it first (a call on the parent, or a Cloud budget for it)"
+        );
+        assert!(shadow_events(&path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cloud_budget_on_the_parent_opens_it_and_admits_the_child() {
+        let sink = RecordingSink::default();
+        let (events, path) = recording_exporter("d1-cloud-budget");
+        let st = state(Mode::Enforce, StubProvider::default())
+            .with_sink(Arc::new(sink.clone()))
+            .with_events(events);
+        st.set_cloud_budgets(HashMap::from([("parent".to_string(), Microusd(11_500))]));
+
+        let mk = || {
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", "child")
+                .header("x-fuse-parent-run-id", "parent")
+                .header("x-fuse-agent-id", "agent://test.example/shadow-bot")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(body(100)))
+                .unwrap()
+        };
+
+        let resp1 = call(st.clone(), mk()).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let parent1 = st.ledger.snapshot("parent").await.unwrap();
+        assert_eq!(parent1.budget, Microusd(11_500));
+        assert_eq!(parent1.reserved, Microusd::ZERO);
+        assert_eq!(parent1.spent, Microusd(10_500));
+        assert_eq!(parent1.steps, 0);
+        let child1 = st.ledger.snapshot("child").await.unwrap();
+        assert_eq!(child1.spent, Microusd(10_500));
+        assert_eq!(child1.steps, 1);
+        assert_eq!(sink.snapshot()[0].parent_run_id, "parent");
+
+        let resp2 = call(st.clone(), mk()).await;
+        assert_eq!(resp2.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["error"]["reason"],
+            "parent run 'parent' budget exceeded"
+        );
+
+        let parent2 = st.ledger.snapshot("parent").await.unwrap();
+        assert_eq!(parent2, parent1, "the refusal must change nothing");
+
+        let list = Request::get("/v1/runs").body(Body::empty()).unwrap();
+        let resp = call(st.clone(), list).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let runs: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let parent_row = runs
+            .as_array()
+            .expect("an array of runs")
+            .iter()
+            .find(|r| r["run_id"] == "parent")
+            .expect("the Cloud-opened parent is listed");
+        assert_eq!(parent_row["budget_usd"], 0.0115);
+
+        let tripped = events_at(&path)
+            .into_iter()
+            .filter(|e| e["type"] == "breaker_tripped")
+            .count();
+        assert_eq!(tripped, 1, "exactly one breaker_tripped overall, on call 2");
+    }
+
+    #[tokio::test]
+    async fn shadow_records_an_unopened_parent_as_a_would_block_and_accounts_the_leaf() {
+        for mode in [Mode::Shadow, Mode::Warn] {
+            let tag = format!("d1-ghost-{}", mode_str(mode));
+            let sink = RecordingSink::default();
+            let (st, path) = shadow_run(mode, &tag);
+            let st = st.with_sink(Arc::new(sink.clone()));
+
+            let req = Request::post("/v1/messages")
+                .header("x-fuse-run-id", "child")
+                .header("x-fuse-parent-run-id", "ghost")
+                .header("x-fuse-agent-id", "agent://test.example/shadow-bot")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(body(100)))
+                .unwrap();
+
+            let resp = call(st.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let header = resp
+                .headers()
+                .get("x-fuse-would-block")
+                .expect("must carry the would-block header")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                header,
+                "budget_exceeded: parent run 'ghost' is not open on this gateway; open it first (a call on the parent, or a Cloud budget for it)"
+            );
+
+            let child = st.ledger.snapshot("child").await.unwrap();
+            assert_eq!(child.spent, Microusd(10_500));
+            assert_eq!(child.steps, 1);
+            assert_eq!(child.reserved, Microusd::ZERO);
+            assert!(st.ledger.snapshot("ghost").await.is_none());
+
+            let shadow = shadow_events(&path);
+            assert_eq!(shadow.len(), 1, "mode {mode:?}: {shadow:?}");
+            assert_eq!(shadow[0]["data"]["mode"], mode_str(mode));
+            assert_eq!(
+                shadow[0]["data"]["detail"],
+                "parent run 'ghost' is not open on this gateway; open it first (a call on the parent, or a Cloud budget for it)"
+            );
+            assert!(
+                events_at(&path)
+                    .iter()
+                    .all(|e| e["type"] != "breaker_tripped"),
+                "mode {mode:?}: shadow/warn must never trip"
+            );
+
+            let records = sink.snapshot();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].decision, "allow");
+            assert_eq!(records[0].parent_run_id, "ghost");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_parent_is_a_400_and_the_trace_keeps_the_accepted_parent() {
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default()).with_sink(Arc::new(sink.clone()));
+        st.ledger
+            .open_run("p1", Microusd::from_usd(5.0), None)
+            .await
+            .expect("opens");
+        st.ledger
+            .open_run("p2", Microusd::from_usd(5.0), None)
+            .await
+            .expect("opens");
+
+        let mk = |parent: Option<&str>| {
+            let mut b = Request::post("/v1/messages")
+                .header("x-fuse-run-id", "c")
+                .header("x-fuse-budget-usd", "5.0");
+            if let Some(p) = parent {
+                b = b.header("x-fuse-parent-run-id", p);
+            }
+            b.body(Body::from(body(100))).unwrap()
+        };
+
+        let resp1 = call(st.clone(), mk(Some("p1"))).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let resp2 = call(st.clone(), mk(Some("p2"))).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp2.headers()["x-fuse"], "blocked");
+        assert_eq!(resp2.headers()["x-fuse-run-id"], "c");
+        let bytes2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(json2["error"]["type"], "invalid_request");
+        assert_eq!(json2["error"]["code"], "parent_run_changed");
+        assert_eq!(json2["error"]["accepted_parent"], "p1");
+        assert_eq!(json2["error"]["declared_parent"], "p2");
+
+        let resp3 = call(st.clone(), mk(None)).await;
+        assert_eq!(resp3.status(), StatusCode::OK);
+
+        let resp4 = call(st.clone(), mk(Some("c"))).await;
+        assert_eq!(resp4.status(), StatusCode::BAD_REQUEST);
+        let bytes4 = to_bytes(resp4.into_body(), usize::MAX).await.unwrap();
+        let json4: serde_json::Value = serde_json::from_slice(&bytes4).unwrap();
+        assert_eq!(json4["error"]["code"], "parent_is_self");
+
+        let p1 = st.ledger.snapshot("p1").await.unwrap();
+        assert_eq!(p1.spent, Microusd(21_000));
+        let p2 = st.ledger.snapshot("p2").await.unwrap();
+        assert_eq!(p2.spent, Microusd::ZERO);
+        assert_eq!(p2.reserved, Microusd::ZERO);
+
+        let records = sink.snapshot();
+        assert_eq!(
+            records.len(),
+            2,
+            "only calls 1 and 3 are money calls; 2 and 4 are 400s with no row"
+        );
+        assert!(records.iter().all(|r| r.parent_run_id == "p1"));
+    }
+
+    #[tokio::test]
+    async fn a_65_deep_chain_is_refused_at_the_door_naming_the_unchecked_root() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        st.ledger
+            .open_run("r0", Microusd::from_usd(1.0), None)
+            .await
+            .expect("opens");
+        for i in 1..=63 {
+            st.ledger
+                .open_run(
+                    &format!("r{i}"),
+                    Microusd::from_usd(1.0),
+                    Some(&format!("r{}", i - 1)),
+                )
+                .await
+                .expect("opens");
+        }
+
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "r64")
+            .header("x-fuse-parent-run-id", "r63")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["error"]["reason"],
+            "budget chain from run 'r64' is deeper than 64 ancestors; the walk stopped at 'r1' with 'r0' unchecked"
+        );
+        assert_eq!(json["error"]["budget_usd"], 5.0);
+
+        for i in 0..=64 {
+            let snap = st.ledger.snapshot(&format!("r{i}")).await.unwrap();
+            assert_eq!(snap.reserved, Microusd::ZERO);
+            assert_eq!(snap.spent, Microusd::ZERO);
+        }
     }
 
     #[tokio::test]
@@ -5514,7 +5862,8 @@ pub(crate) mod tests {
         );
         st.ledger
             .open_run("run-cancel", Microusd::from_usd(5.0), None)
-            .await;
+            .await
+            .expect("opens");
         let reservation = st
             .ledger
             .reserve("run-cancel", Microusd::from_usd(0.5))
