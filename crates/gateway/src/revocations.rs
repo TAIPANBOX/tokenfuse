@@ -266,6 +266,11 @@ pub fn spawn_poller(
 /// module existed, and the difference is that it is now reachable only when an
 /// operator asked for nothing.
 pub fn hook(feed: &Feed, now: i64) -> impl Fn(&str, &str, i64) -> bool + '_ {
+    // The verifier asks once per chain entry since 2026-09-17, up to
+    // `MAX_CHAIN_ENTRIES` times for one token, and a stale list answers every
+    // entry with the same fallback. One line per request is the signal; one per
+    // entry is the same signal 32 times.
+    let warned = std::cell::Cell::new(false);
     move |jti, subject, issued_at| {
         let Some(cache) = feed else {
             return false;
@@ -274,7 +279,7 @@ pub fn hook(feed: &Feed, now: i64) -> impl Fn(&str, &str, i64) -> bool + '_ {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .check(jti, subject, issued_at, now);
-        if answer.basis.is_fallback() {
+        if answer.basis.is_fallback() && !warned.replace(true) {
             // A fallback is the fail mode answering, not the list. An operator
             // who never sees these cannot tell a working poller from a dead one
             // that happens to be refusing nothing.

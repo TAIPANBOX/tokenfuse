@@ -176,14 +176,16 @@ const MAX_ACTORS_WITH_SUBJECT: usize = MAX_CHAIN_ENTRIES - 1;
 /// token.
 ///
 /// The order is deliberate and each step is cheaper than the next thing it
-/// protects: shape, signature, issuer, audience, expiry, binding, revocation. A
+/// protects: shape, signature, issuer, audience, expiry, binding, chain,
+/// revocation. A
 /// revocation lookup on a forged token is work an attacker chose, which on a
 /// busy enforcement point is a cheap denial of service.
 ///
 /// `proof`, `method` and `url` are the RFC 9449 header and what THIS server
 /// received. `now` is a Unix second, injected so an expiry is testable without
-/// sleeping. `revoked` is consulted last and may be a closure that always
-/// answers false, which is a caller deciding that a valid signature is enough.
+/// sleeping. `revoked` is consulted last, once per chain entry (the subject,
+/// then every actor, root first), and may be a closure that always answers
+/// false, which is a caller deciding that a valid signature is enough.
 /// [`revocations::Revocations::hook`] is the closure for a caller that has not
 /// decided that.
 pub fn verify_delegation(
@@ -251,12 +253,24 @@ pub fn verify_delegation(
         return Err(Refusal::WrongKey);
     }
 
-    if revoked(&claims.jti, &claims.sub, claims.iat) {
-        return Err(Refusal::Revoked);
+    // The chain is read BEFORE the list is asked, because the list is asked
+    // about every entry of it: a subject revocation names a PARTY, and the
+    // party an operator revokes when an agent is compromised usually sits in
+    // `act`, with a human at the root in `sub`. Root first, first hit refuses.
+    // Until 2026-09-17 the list was asked about `sub` alone, so an entry
+    // naming an agent in `act` matched nothing and revoked nobody, and every
+    // test of this path had planted the agent as the argument directly. At
+    // most `MAX_CHAIN_ENTRIES` calls, none for a token that failed an earlier
+    // step and none for a chain that does not parse.
+    let chain = chain_of(&claims.sub, claims.act.as_ref())?;
+    for party in &chain {
+        if revoked(&claims.jti, party, claims.iat) {
+            return Err(Refusal::Revoked);
+        }
     }
 
     Ok(VerifiedDelegation {
-        chain: chain_of(&claims.sub, claims.act.as_ref())?,
+        chain,
         subject: claims.sub,
         jkt,
         jti: claims.jti,
@@ -487,6 +501,126 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Refusal::Revoked);
+    }
+
+    /// The nested `act` for a root-first list of actors: the outermost `act`
+    /// is the current actor (RFC 8693 4.1), so the list is wrapped from the
+    /// first actor outwards.
+    fn nest_actors(actors: &[String]) -> serde_json::Value {
+        let mut act = serde_json::json!({"sub": actors[0]});
+        for a in &actors[1..] {
+            act = serde_json::json!({"sub": a, "act": act});
+        }
+        act
+    }
+
+    /// A subject revocation names a PARTY. A compromised agent sits in `act`,
+    /// never in `sub`, so a list matched against `sub` alone revokes the human
+    /// at the root and spares the very agent the entry was written for. Every
+    /// earlier test of this path planted the agent as the `subject` argument
+    /// directly, which is why the gap lived this long. Seeded sweep: 200
+    /// chains of every depth up to the cap, one random member named each.
+    #[test]
+    fn a_revocation_naming_any_party_in_the_chain_refuses_the_token() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000_i64);
+        let mut seed: u64 = 20260917;
+        let mut next = move || {
+            // xorshift64: deterministic, dependency-free.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..200 {
+            let depth = 1 + (next() % MAX_ACTORS_WITH_SUBJECT as u64) as usize;
+            let actors: Vec<String> = (0..depth)
+                .map(|j| format!("agent://acme/a{i}-{j}"))
+                .collect();
+            // Issued seven seconds ago, so a verifier that forwarded `now` in
+            // place of the token's own `iat` is told apart by the fourth case.
+            let issued = now - 7;
+            let tok = token(
+                &issuer,
+                &holder,
+                now,
+                serde_json::json!({"act": nest_actors(&actors), "jti": format!("tok-{i}"), "iat": issued}),
+            );
+            let mut chain = vec!["user://acme/alice".to_string()];
+            chain.extend(actors.iter().cloned());
+            let named = chain[(next() % chain.len() as u64) as usize].clone();
+            let position = chain.iter().position(|p| *p == named).unwrap();
+            let verify = |revoked: &dyn Fn(&str, &str, i64) -> bool| {
+                verify_delegation(
+                    &cfg(&issuer),
+                    &tok,
+                    Some(&proof(&holder, now)),
+                    "POST",
+                    URL,
+                    now,
+                    revoked,
+                )
+            };
+            // Naming any member, dated at or after the token's issue: refused.
+            assert_eq!(
+                verify(&|_, sub, iat| sub == named && iat <= now).map(|_| ()),
+                Err(Refusal::Revoked),
+                "seed 20260917 case {i}: a revocation naming {named:?} (position {position} of {}) was not honoured",
+                chain.len()
+            );
+            // Naming nobody in the chain: honoured.
+            assert!(
+                verify(&|_, sub, _| sub == "agent://acme/stranger").is_ok(),
+                "case {i}: a revocation naming a stranger refused the token"
+            );
+            // Naming a member but dated before the token's issue: revoking is
+            // not banning (vouchryx's invariant 7), so the token stands.
+            assert!(
+                verify(&|_, sub, iat| sub == named && iat < issued).is_ok(),
+                "case {i}: a revocation older than the token refused it"
+            );
+            // Naming a member, dated after the issue but before now: refused,
+            // and only a verifier forwarding the token's own `iat` gets this
+            // right.
+            assert_eq!(
+                verify(&|_, sub, iat| sub == named && iat <= now - 3).map(|_| ()),
+                Err(Refusal::Revoked),
+                "case {i}: a revocation between the token's issue and now was not honoured"
+            );
+        }
+    }
+
+    /// The list is asked about every chain entry, so the chain has to be read
+    /// before the list is asked about anything: a cyclic `act` is refused as
+    /// malformed with zero calls, rather than costing a lookup per entry
+    /// first. Pins the order, which nothing else did.
+    #[test]
+    fn revocation_is_not_consulted_for_a_token_whose_chain_is_malformed() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000_i64);
+        let cyclic = serde_json::json!({"sub": "agent://acme/triage", "act": {"sub": "agent://acme/triage"}});
+        let calls = std::cell::Cell::new(0usize);
+        let err = verify_delegation(
+            &cfg(&issuer),
+            &token(&issuer, &holder, now, serde_json::json!({"act": cyclic})),
+            Some(&proof(&holder, now)),
+            "POST",
+            URL,
+            now,
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            Refusal::Malformed,
+            "a cyclic chain was not refused as malformed"
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "the revocation list was consulted for a token whose chain never parsed"
+        );
     }
 
     #[test]

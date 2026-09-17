@@ -102,8 +102,10 @@ pub struct Revocation {
     /// Revokes exactly one token. Empty when this is a subject entry.
     #[serde(default)]
     pub jti: String,
-    /// Revokes every token issued for this subject at or before
-    /// [`Revocation::issued_before`].
+    /// Names a PARTY, and revokes every token issued at or before
+    /// [`Revocation::issued_before`] that carries it anywhere in its chain: as
+    /// the human at the root (`sub`) or as any actor in `act`. The verifier
+    /// asks once per chain entry, so this list needs no chain logic of its own.
     #[serde(default)]
     pub subject: String,
     /// A Unix second. Only meaningful with [`Revocation::subject`].
@@ -409,7 +411,10 @@ impl Revocations {
     /// `observe` is not optional and takes the whole [`Answer`], so the site
     /// that wires this up has to decide what it does with a fallback rather
     /// than never being shown one. Pass `|_| {}` to decide on nothing, which is
-    /// then visible in the diff as a decision.
+    /// then visible in the diff as a decision. Since 2026-09-17 the verifier
+    /// asks once per chain entry, root first, so `observe` fires up to
+    /// `MAX_CHAIN_ENTRIES` times per verification and, on a stale or
+    /// never-fetched list, sees the same fallback answer for every entry.
     pub fn hook<'a>(
         &'a self,
         now: i64,

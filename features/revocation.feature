@@ -164,3 +164,24 @@ Feature: A revocation list something actually consults
     When any token is checked
     Then it is refused, because the default an operator falls into is the one
       that breaks loudly rather than the one that breaks silently
+
+  # @test:a_revocation_naming_any_party_in_the_chain_refuses_the_token
+  Scenario: A revocation names a party wherever that party stands in the chain
+    Given two hundred seeded delegation chains of every depth up to the cap
+    And a revocation naming one member of each chain, root or actor, at random
+    When each token is verified
+    Then every one is refused
+    And a revocation naming nobody in the chain is not honoured
+    And one dated before the token was issued is not honoured either, because
+      revoking is not banning
+    # @decided 2026-09-17: a subject revocation names a party, not a `sub`
+    # field. Until then the door asked the list about `sub` alone, so an entry
+    # naming an agent in `act` matched nothing and revoked nobody; every earlier
+    # test had planted the agent as the argument directly.
+
+  # @test:revocation_is_not_consulted_for_a_token_whose_chain_is_malformed
+  Scenario: A chain that does not parse is refused before the list is asked
+    Given a token whose nested act names the same agent twice
+    When it is verified with a revocation list attached
+    Then it is refused as malformed
+    And the list is never consulted
