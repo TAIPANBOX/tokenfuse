@@ -102,8 +102,10 @@ pub struct Revocation {
     /// Revokes exactly one token. Empty when this is a subject entry.
     #[serde(default)]
     pub jti: String,
-    /// Revokes every token issued for this subject at or before
-    /// [`Revocation::issued_before`].
+    /// Names a PARTY, and revokes every token issued at or before
+    /// [`Revocation::issued_before`] that carries it anywhere in its chain: as
+    /// the human at the root (`sub`) or as any actor in `act`. The verifier
+    /// asks once per chain entry, so this list needs no chain logic of its own.
     #[serde(default)]
     pub subject: String,
     /// A Unix second. Only meaningful with [`Revocation::subject`].
