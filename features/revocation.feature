@@ -185,3 +185,15 @@ Feature: A revocation list something actually consults
     When it is verified with a revocation list attached
     Then it is refused as malformed
     And the list is never consulted
+
+  # @test:a_snapshot_with_no_revocations_array_is_an_error_not_an_empty_list
+  # @measured TestCodexInvariant19MalformedSnapshotCannotEraseKnownRevocation 2026-09-17
+  # @decided 2026-09-17: the review's F4 (MEDIUM there) is closed as measured;
+  # the Go twin is held by agent-stack-go's own invariant
+  Scenario: A malformed snapshot never erases a revocation this process already knows
+    Given an enforcement point holding a revocation list naming a token as revoked
+    And a fetch returns a body that is silent about `revocations`, names it
+      `null`, holds a `null` entry, or holds an entry that is not a JSON object
+    When that body is offered to the cache
+    Then it is refused rather than read as an empty list
+    And the token the cache already held as revoked is still refused

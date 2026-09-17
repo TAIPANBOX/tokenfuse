@@ -302,7 +302,7 @@ comparison in #132.
 
 **Counts re-measured 2026-09-17**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1247 passing** (core 314, dpop 21, delegation 43,
+`cargo test --all` runs **1248 passing** (core 314, dpop 21, delegation 44,
 gateway 669, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). dpop grew from
 16 to 21 the same day: one characterization test recording that `ring`
