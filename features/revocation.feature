@@ -187,9 +187,9 @@ Feature: A revocation list something actually consults
     And the list is never consulted
 
   # @test:a_snapshot_with_no_revocations_array_is_an_error_not_an_empty_list
-  # @measured TestCodexInvariant19MalformedSnapshotCannotEraseKnownRevocation 2026-09-17
-  # @decided 2026-09-17: the review's F4 (MEDIUM there) is closed as measured;
-  # the Go twin is held by agent-stack-go's own invariant
+  # Rust twin of the 2026-09-17 delegation review's F4 (MEDIUM there); the probe
+  # that showed it lives in the review's private evidence archive and is not
+  # runnable here. The Go side is agent-stack-go#62, merged as 7d0cb44.
   Scenario: A malformed snapshot never erases a revocation this process already knows
     Given an enforcement point holding a revocation list naming a token as revoked
     And a fetch returns a body that is silent about `revocations`, names it

@@ -203,8 +203,9 @@ impl Snapshot {
     /// `Revocation::default()`, neither of which `vouchryx` ever sends. This
     /// walks `revocations` before `from_value` and refuses any entry that is
     /// not a JSON object. Go's `ParseSnapshot` refuses the same shape on its
-    /// side; this crate does not import Go and cannot check that directly,
-    /// so agent-stack-go's own invariant is what holds the two in step.
+    /// side since agent-stack-go#62; this crate does not import Go and cannot
+    /// check that directly, so agent-stack-go's own invariant is what holds
+    /// the two in step.
     pub fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(raw)?;
         if !value.is_object() {
@@ -214,8 +215,18 @@ impl Snapshot {
         }
         if let Some(serde_json::Value::Array(entries)) = value.get("revocations") {
             if let Some(bad) = entries.iter().find(|entry| !entry.is_object()) {
+                // Named by kind, not echoed: the gateway logs this on every
+                // poll, and an entry is bounded only by the snapshot cap.
+                let kind = match bad {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a boolean",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::String(_) => "a string",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => unreachable!("filtered above"),
+                };
                 return Err(serde::de::Error::custom(format!(
-                    "a revocation entry is a JSON object, not {bad}"
+                    "a revocation entry is a JSON object, not {kind}"
                 )));
             }
         }
