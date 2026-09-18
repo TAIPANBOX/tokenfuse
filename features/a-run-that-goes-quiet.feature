@@ -76,13 +76,15 @@ Feature: A run that goes quiet is an incident
     Then nothing is raised
     And a refused run whose retry was then allowed is watched again
 
-  # @test:a_stalled_run_reaches_the_console_and_the_stream_and_not_yet_the_wire
+  # @test:a_stalled_run_is_exported_as_an_agent_event
+  # @test:a_stalled_run_without_an_attributed_agent_is_skipped_never_invented
   # @test:a_stalled_run_is_listed_on_the_incidents_endpoint_for_a_viewer
   # @test:a_stalled_run_reaches_the_sse_stream
   Scenario: Exported like the other incidents, so the notifier can say an agent went quiet
     When a run_stalled incident is raised
     Then it is on the incidents endpoint and on the live stream
-    And until the type is on the wire it is not exported, and the log says so
+    And it is on the shared event bus as run_stalled at severity medium, skipped and counted
+      for a run with no agent
 
   # @test:a_restart_does_not_raise_a_stall_for_a_run_it_never_watched
   # @test:an_out_of_order_record_counts_the_call_and_moves_nothing_else

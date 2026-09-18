@@ -1156,8 +1156,9 @@ pub struct Store {
     /// default; see `crate::main`'s wiring of `TOKENFUSE_EVENTS_PATH` and
     /// [`Store::with_event_exporter`]. Emits the four P2 incident kinds
     /// (`budget_exhausted`/`sustained_loop`/`spend_spike`/`fanout_explosion`)
-    /// from the SAME `fired` loop that already broadcasts `StreamEvent::Incident`
-    /// (see `ingest_at`) — this is the one place all four converge.
+    /// and `budget_threshold` from the SAME `fired` loop that already
+    /// broadcasts `StreamEvent::Incident` (see `ingest_at`), and `run_stalled`
+    /// from the sweep's own copy of that loop (`sweep_stalled_at`).
     event_exporter: Arc<EventExporter>,
 }
 
@@ -1166,7 +1167,9 @@ pub struct Store {
 /// `budget_threshold` early warning (agent-passport SPEC.md §6.2). `None` for
 /// anything else (defensive: a future incident kind added here without
 /// updating this map is silently NOT exported, rather than panicking or
-/// guessing, see the `unknown_kind` test).
+/// guessing, see the `unknown_kind` test). `run_stalled` since 2026-09-18
+/// (invariant 60), raised by the sweep, whose export loop says at warn when a
+/// kind is missing here.
 fn agent_event_type_for_incident_kind(kind: &str) -> Option<EventType> {
     match kind {
         "budget_exhausted" => Some(EventType::BudgetExhausted),
@@ -1174,6 +1177,7 @@ fn agent_event_type_for_incident_kind(kind: &str) -> Option<EventType> {
         "spend_spike" => Some(EventType::SpendSpike),
         "fanout_explosion" => Some(EventType::FanoutExplosion),
         "budget_threshold" => Some(EventType::BudgetThreshold),
+        "run_stalled" => Some(EventType::RunStalled),
         _ => None,
     }
 }
@@ -7034,10 +7038,11 @@ mod tests {
             .starts_with("run r1 went quiet: no call for 300 s"));
     }
 
-    /// Commit 1 only: reaches the console and the stream; not yet the wire,
-    /// and not a skip either, since nothing was attempted.
+    /// Commit 2: the type is on the wire, so a stalled run is exported like
+    /// any other agent-event, and a repeat sweep writes no second line (the
+    /// once-per-run guard holds on the wire too).
     #[test]
-    fn a_stalled_run_reaches_the_console_and_the_stream_and_not_yet_the_wire() {
+    fn a_stalled_run_is_exported_as_an_agent_event() {
         let dir =
             std::env::temp_dir().join(format!("tf-cloud-stall-events-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7047,31 +7052,65 @@ mod tests {
         s.ingest_at("acme", &[call_at("r1", PLANNER, 6, T0)], T0);
         s.ingest_at("acme", &[call_at("r1", PLANNER, 7, T0 + 1_000)], T0 + 1_000);
 
-        let mut rx = s.subscribe();
         let fired = s.sweep_stalled_at(T0 + 1_000 + STALL_MS);
         assert_eq!(fired.len(), 1);
-        assert_eq!(stalled(&s).len(), 1);
 
-        let mut saw_it = false;
-        loop {
-            match rx.try_recv() {
-                Ok(StreamEvent::Incident(inc)) if inc.id == "run_stalled:r1" => saw_it = true,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        assert!(saw_it, "the stall must reach the stream");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one run_stalled event");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["schema"], "taipanbox.dev/agent-event/v0.2");
+        assert_eq!(v["source"], "tokenfuse");
+        assert_eq!(v["type"], "run_stalled");
+        assert_eq!(v["severity"], "medium");
+        assert_eq!(v["agent_id"], PLANNER);
+        assert_eq!(v["run_id"], "r1");
+        assert_eq!(v["data"]["org"], "acme");
+        assert_eq!(v["data"]["occurrences"], 1);
+        assert_eq!(v["data"]["last_call_millis"], T0 + 1_000);
+        assert_eq!(v["data"]["silence_ms"], 300_000);
+        assert_eq!(v["data"]["stall_after_ms"], 300_000);
+        assert_eq!(v["data"]["longest_gap_ms"], 1_000);
+        assert_eq!(v["data"]["calls"], 2);
+        assert_eq!(v["data"]["steps"], 7);
+
+        // A second sweep a minute later writes no second line: the incident
+        // is the once-per-run guard.
+        s.sweep_stalled_at(T0 + 1_000 + STALL_MS + 60_000);
+        let contents_after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents_after.lines().count(),
+            1,
+            "no second line on a repeat sweep"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unattributed stalled run is a counted skip at export, never an
+    /// invented `agent_id` (invariant 6, SPEC 6.1).
+    #[test]
+    fn a_stalled_run_without_an_attributed_agent_is_skipped_never_invented() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-cloud-stall-events-unattributed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+        let s = Store::new().with_event_exporter(exporter.clone());
+        s.ingest_at("acme", &[call_at("r1", "", 6, T0)], T0);
+        s.ingest_at("acme", &[call_at("r1", "", 7, T0 + 1_000)], T0 + 1_000);
+
+        let fired = s.sweep_stalled_at(T0 + 1_000 + STALL_MS);
+        assert_eq!(fired.len(), 1, "raised on the console");
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap_or_default(),
             "",
-            "not on the wire until the type exists"
+            "no agent_id, so nothing is written"
         );
-        assert_eq!(
-            exporter.skipped_count(),
-            0,
-            "not a skip either: nothing was attempted"
-        );
+        assert_eq!(exporter.skipped_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

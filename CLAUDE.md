@@ -3254,13 +3254,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     summary shows the stamp. An out-of-order record counts the call and moves nothing else. An
     incident evicted by `MAX_INCIDENTS_PER_ORG` re-arms the guard for that run, the same bounded
     over-count `budget_breaks` accepts. An orchestrator waiting on a child is quiet by design and
-    is reported once. A run evicted from the run map is not reported at all. And the type is NOT
-    YET ON THE WIRE: this commit raises the incident on `/v1/incidents`, the SSE stream and the
-    push pipeline, and its export is skipped with a `warn` line saying the kind has no agent-event
-    type yet; the wire commit adds `EventType::RunStalled` (medium) after agent-passport SPEC 6.2
-    and trailryx carry the type, invariant 42's order (estate-gates C4 and C8). heraldyx renders the
-    kind with its fallback phrasing until it gains a row; trailryx refuses it as `UnknownType`
-    until it is named.
+    is reported once. A run evicted from the run map is not reported at all.
+    The type reached the wire in the second commit of this change: `EventType::RunStalled`
+    (medium), `contracts/tokenfuse-constants.json` regenerated to 20 event types, the sweep's
+    export loop mapping the kind; landed after agent-passport SPEC 6.2's tokenfuse row gained
+    `run_stalled` (medium) and `trailryx-agentevent` named it, invariant 42's order (estate-gates
+    C4 and C8 green at every step).
     *(tests: `store::tests::a_run_silent_past_the_threshold_is_stalled_once_and_not_again`,
     `a_run_that_moved_again_is_not_stalled`,
     `a_stall_is_not_re_raised_when_the_run_moves_and_goes_quiet_again`,
@@ -3271,7 +3270,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_run_that_pauses_by_habit_is_not_stalled_at_the_floor`, `a_killed_run_is_not_stalled`,
     `the_stall_incident_names_the_run_the_agent_the_last_call_and_the_silence`,
     `an_unattributed_stalled_run_is_on_the_console_with_no_agent_invented`,
-    `a_stalled_run_reaches_the_console_and_the_stream_and_not_yet_the_wire`,
+    `a_stalled_run_is_exported_as_an_agent_event`,
+    `a_stalled_run_without_an_attributed_agent_is_skipped_never_invented`,
     `a_restart_does_not_raise_a_stall_for_a_run_it_never_watched`,
     `an_out_of_order_record_counts_the_call_and_moves_nothing_else`,
     `the_stall_map_is_bounded_by_recency_not_by_panic`,
@@ -3281,7 +3281,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_sweep_task_is_spawned_only_when_the_detector_is_on`;
     `push::tests::a_stalled_run_pushes_went_quiet_not_running_hot`;
     `tests/run_stalled.rs::a_stalled_run_is_listed_on_the_incidents_endpoint_for_a_viewer`,
-    `a_stalled_run_reaches_the_sse_stream`. Red first, @measured `cargo test -p tokenfuse-cloud`
+    `a_stalled_run_reaches_the_sse_stream`; `agent_event::tests::run_stalled_is_on_the_wire_at_medium`.
+    Red first, @measured `cargo test -p tokenfuse-cloud`
     2026-09-18 against the tree with the sweep and the fold stubbed to no-ops:
     `one incident at the floor: left: 0 right: 1`; `not again while the silence holds:
     left: 0 right: 1`; `a retry that was allowed re-opens the run: left: 0 right: 1`; the
@@ -3298,5 +3299,6 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     comparison removed, the two-call requirement weakened, the kill gate removed, the dirty
     flag not set, the cap removed, the future-stamp cap removed, `load` seeding the map, a
     late record walking the newest stamp back, the off gate removed, the silence measured from
-    the first call. Scenarios: `features/a-run-that-goes-quiet.feature`, eight, each bound.
+    the first call, the `run_stalled` export arm removed, and the wire type's severity moved to
+    high. Scenarios: `features/a-run-that-goes-quiet.feature`, eight, each bound.
     Not a script gate: the rule is a predicate, held by `cargo test`.)*

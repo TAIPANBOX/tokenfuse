@@ -277,6 +277,34 @@ pub enum EventType {
     /// ancestor keeps supplying them, so a half-done job says so instead of
     /// looking like a broken feature.
     TaintCleared,
+
+    /// A run the control plane had seen calling stopped calling: no call for
+    /// `TOKENFUSE_CLOUD_STALL_MINUTES` and longer than its own longest gap
+    /// between calls, raised once per run by `crates/cloud/src/store.rs::
+    /// sweep_stalled_at` (invariant 60, tokenfuse#296).
+    ///
+    /// Added 2026-09-18, and it is the first type here raised on ABSENCE:
+    /// every other detector fires when a record arrives, and a node killed
+    /// mid-run produces no record. Measured 2026-09-17 on the appliance
+    /// proving run: a node killed at step 7 of a 60-call run left the run on
+    /// the console at step 7 with a stale last-seen time, no event at 5 s or
+    /// 60 s, no incident.
+    ///
+    /// `medium`, fixed, and the band is the whole judgement. The Cloud never
+    /// learns that a run finished (no reservation state reaches it), so it
+    /// cannot tell a dead node from a long generation or from a run that
+    /// ended without tagging an outcome, and the last of those is reported
+    /// once, after the floor plus the run's own longest gap. `high` would
+    /// page on every run that finishes quietly; `low` would bury the dead
+    /// node this exists for. The sentence a notifier writes is "agent X went
+    /// quiet on run Y, last call at T, silent for S", which asks a person to
+    /// look, not to act.
+    ///
+    /// `data`: `{org, occurrences, last_call_millis, silence_ms,
+    /// stall_after_ms, longest_gap_ms, calls, steps}`. Envelope `agent_id`
+    /// is the run's attributed agent; an unattributed run is skipped and
+    /// counted, never invented (invariant 6).
+    RunStalled,
 }
 
 /// How much of a transport error's text travels in `data.detail`.
@@ -767,6 +795,7 @@ impl EventType {
             EventType::TaintShadow => "taint_shadow",
             EventType::TaintRaised => "taint_raised",
             EventType::TaintCleared => "taint_cleared",
+            EventType::RunStalled => "run_stalled",
         }
     }
 
@@ -776,7 +805,7 @@ impl EventType {
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
-    /// `budget_threshold` / `breaker_tripped` / `taint_shadow` = `medium`;
+    /// `budget_threshold` / `breaker_tripped` / `taint_shadow` / `run_stalled` = `medium`;
     /// `taint_cleared` = `high`;
     /// `tool_call` / `taint_raised` = `low`.
     ///
@@ -826,7 +855,11 @@ impl EventType {
             EventType::BudgetThreshold
             | EventType::BreakerTripped
             | EventType::BreakerShadow
-            | EventType::TaintShadow => Severity::Medium,
+            | EventType::TaintShadow
+            // Beside them, a run that went quiet: the Cloud cannot tell a
+            // dead node from a run that ended without saying so, so it asks
+            // a person to look.
+            | EventType::RunStalled => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             // Taint acquisition sits here for the same reason: a run reading
@@ -1504,6 +1537,7 @@ mod tests {
             (EventType::ToolCall, "tool_call"),
             (EventType::BudgetThreshold, "budget_threshold"),
             (EventType::RunKilled, "run_killed"),
+            (EventType::RunStalled, "run_stalled"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
@@ -1516,6 +1550,12 @@ mod tests {
         // carry a high/critical severity that would page like an incident.
         assert_eq!(EventType::ToolCall.severity(), Severity::Low);
         assert_eq!(EventType::ToolCall.as_wire_str(), "tool_call");
+    }
+
+    #[test]
+    fn run_stalled_is_on_the_wire_at_medium() {
+        assert_eq!(EventType::RunStalled.as_wire_str(), "run_stalled");
+        assert_eq!(EventType::RunStalled.severity(), Severity::Medium);
     }
 
     // -- build() / envelope shape -------------------------------------------

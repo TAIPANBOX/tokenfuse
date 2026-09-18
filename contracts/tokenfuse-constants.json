@@ -78,6 +78,10 @@
       {
         "severity": "medium",
         "type": "breaker_shadow"
+      },
+      {
+        "severity": "medium",
+        "type": "run_stalled"
       }
     ]
   },
