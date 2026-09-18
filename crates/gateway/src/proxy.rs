@@ -11,9 +11,9 @@
 use crate::estimate::estimate_cost;
 use crate::identitymap::StrictMode;
 use crate::keystats::KeyStats;
-use crate::provider::{ProviderError, ProviderResponse, UsageParser};
+use crate::provider::{ProviderError, ProviderResponse};
 use crate::router::RouterMode;
-use crate::settle::{settle_amount, CostBasis, SettleGuard};
+use crate::settle::{CallAttribution, SettleGuard, Terminal};
 use crate::sink::{now_millis, CallRecord};
 use crate::state::AppState;
 use crate::unitledger::UnitReservation;
@@ -37,7 +37,7 @@ use tokenfuse_core::injection::{self, SUSPECTED_INJECTION};
 use tokenfuse_core::taint::{self, FirewallMode, Labels};
 use tokenfuse_core::{
     dlp, evaluate, BreakerReason, BreakerVerdict, BudgetError, DlpMode, Microusd, Mode, OpenError,
-    Reservation, RunSnapshot, SemanticCache,
+    RunSnapshot, SemanticCache,
 };
 
 /// Where a non-streaming response should be cached after it settles.
@@ -1570,18 +1570,45 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         }
     };
 
+    // Invariant 50: one guard owns this call's reservations from here (the
+    // unit half is held, or would have been) to its terminal transition, and
+    // decides on `Drop` what each outcome is charged, rather than whoever
+    // happened to remember to call settle. `router_route` moves in by value:
+    // the guard is the only place that writes the `allow` row from now on.
+    // On a streamed request it is `None`, so that row's `saved_microusd`
+    // stays the zero the streaming guard hard-coded before this change: a
+    // routed stream's avoided spend is not counted, exactly as before, and
+    // counting it is a separate decision, not this change's.
+    let mut guard = SettleGuard::new(
+        st.ledger.clone(),
+        st.units.clone(),
+        st.prices.clone(),
+        st.sink.clone(),
+        st.keystats.clone(),
+        st.retained.clone(),
+        run_id.clone(),
+        estimate,
+        CallAttribution {
+            model: parsed.model.clone(),
+            agent_id: agent_id.clone(),
+            parent_run_id: parent_run_id.clone(),
+            on_behalf_of: on_behalf_of.clone(),
+            outcome: outcome_tag.clone(),
+            key_id: key_id.clone(),
+            unit: unit.clone(),
+            router_route: if parsed.stream { None } else { router_route },
+        },
+        unit_reservation,
+    );
+
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
     let reservation = match st.policy.mode {
         Mode::Enforce => match st.ledger.reserve(&run_id, estimate).await {
             Ok(r) => r,
             Err(err) => {
-                // The unit reservation above was taken optimistically;
-                // release it (settle at zero) so a run-level refusal does
-                // not leak reserved unit headroom.
-                if let Some(ur) = &unit_reservation {
-                    st.units.settle(ur, Microusd::ZERO, now_millis());
-                }
+                // `guard` holds the unit half and drops on this return:
+                // NotDispatched releases it.
                 if let BudgetError::UnknownParent { parent, .. } = &err {
                     tracing::warn!(run = %run_id, parent = %parent,
                         "refused: the run declares a parent this gateway has not opened; nothing is admitted against a budget that cannot be checked");
@@ -1662,6 +1689,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             st.ledger.reserve_unchecked(&run_id, estimate).await
         }
     };
+    guard.hold_run(reservation);
 
     // Agent firewall: accumulate the run's taint from this request (header +
     // tool history) so the response's tool calls can be judged against it.
@@ -1774,14 +1802,23 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         body = prepared;
     }
 
+    // From here the outcome is unknown until `not_sent` or `answered` says
+    // otherwise (invariant 50): nothing between the guard's creation and
+    // this line awaits except the run reserve itself, whose `Reservation`
+    // is not in the guard's hands until `hold_run` above returns.
+    guard.dispatching();
     let resp = match st.provider.send(headers, body).await {
-        Ok(r) => r,
+        Ok(r) => {
+            guard.answered(r.status, r.usage.clone());
+            r
+        }
         Err(e) => {
-            // Failed call cost us nothing - release the reservation(s).
-            st.ledger.settle(&reservation, Microusd::ZERO);
-            if let Some(ur) = &unit_reservation {
-                st.units.settle(ur, Microusd::ZERO, now_millis());
-            }
+            // The request did not reach the provider (S4): released, not
+            // retained. `not_sent` then an explicit `settle_now` rather than
+            // waiting for `Drop`, so the release happens before the 502
+            // response is built, matching every other early return here.
+            guard.not_sent();
+            let _ = guard.settle_now();
             // No CallRecord is written on this path, deliberately (there was
             // no call to price), which is why the event is the only thing
             // that will ever say this happened: without it a provider outage
@@ -1804,23 +1841,16 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     if parsed.stream {
         stream_managed(
             resp,
-            reservation,
+            guard,
             would_block,
             dlp_note,
             &parsed.model,
             &st,
-            agent_id,
             event_agent_id,
-            parent_run_id,
-            on_behalf_of,
             chain_on_record
                 .map(|c| c.chain.to_vec())
                 .unwrap_or_default(),
             chain_on_record.and_then(|c| c.proof.cloned()),
-            outcome_tag,
-            key_id,
-            unit,
-            unit_reservation,
             identity_header,
             router_header,
             wardryx_header,
@@ -1828,7 +1858,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     } else {
         buffered_managed(
             resp,
-            reservation,
+            guard,
             would_block,
             dlp_note,
             &parsed.model,
@@ -1845,10 +1875,8 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             &outcome_tag,
             &key_id,
             &unit,
-            unit_reservation,
             identity_header,
             router_header,
-            router_route,
             wardryx_header,
         )
         .await
@@ -1891,41 +1919,37 @@ fn set_header_checked(builder: Builder, name: &'static str, value: &str) -> Buil
 #[allow(clippy::too_many_arguments)]
 fn stream_managed(
     resp: ProviderResponse,
-    reservation: Reservation,
+    guard: SettleGuard,
     would_block: Option<String>,
     dlp_note: Option<String>,
     model: &str,
     st: &AppState,
-    // For the TRACE and the ledger: the header, unchanged.
-    agent_id: String,
     // For the RECORD: the header, or the agent a proven chain named.
     event_agent_id: String,
-    parent_run_id: String,
-    on_behalf_of: String,
-    // The chain as a list, beside the joined `on_behalf_of` above. The joined
-    // form is a trace column and the list is what the event envelope takes
-    // (SPEC.md §5), and this function now emits, so it needs both.
+    // The chain as a list, beside the joined `on_behalf_of` the guard's
+    // attribution already carries. The joined form is a trace column and the
+    // list is what the event envelope takes (SPEC.md §5), and this function
+    // emits, so it needs both.
     // The RESOLVED chain and its proof, owned because the stream outlives this
     // call. No raw chain beside it: the trace's `on_behalf_of` column is the
-    // flat header string one line up, and this list only ever fed events.
+    // flat header string the guard already holds, and this list only ever
+    // fed events.
     record_chain: Vec<String>,
     record_proof: Option<tokenfuse_core::agent_event::DelegationProof>,
-    outcome: String,
-    key_id: String,
-    unit: String,
-    unit_reservation: Option<UnitReservation>,
     identity_header: Option<String>,
     router_header: Option<String>,
     wardryx_header: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let inner = resp.body;
-    // Capture the header values before `reservation` is moved into the guard.
-    let run_id = reservation.run_id.clone();
-    let step = reservation.step;
+    // The guard arrives already answered (invariant 50: `guard.answered` ran
+    // in `handle`, on the line the status became known), so its run id and
+    // step are all this function needs from it before it moves into the
+    // stream below.
+    let run_id = guard.run_id().to_string();
+    let step = guard.step();
     // And what an event needs, for the same reason and one line further: the
-    // guard takes `agent_id` by value, and the stream that may fail outlives
-    // this function entirely.
+    // stream that may fail outlives this function entirely.
     let ev_events = std::sync::Arc::clone(&st.events);
     let ev_agent_id = event_agent_id;
     let ev_run_id = run_id.clone();
@@ -1948,33 +1972,6 @@ fn stream_managed(
             status,
         );
     }
-    // Whether the estimate may be charged when the stream reports no usage,
-    // the same rule PR #167 established for `buffered_managed` one screen
-    // down. A refusal is a refusal whether the client asked to stream it or
-    // not: the provider generated nothing, so there is nothing to fall back
-    // to measuring, and settling the estimate would exhaust a run's budget on
-    // calls nobody was billed for. `SettleGuard` holds the decision because
-    // it owns both the end-of-stream settle and the cancel/error `Drop`.
-    let provider_refused = !status.is_success();
-    let guard = SettleGuard::new(
-        st.ledger.clone(),
-        st.prices.clone(),
-        st.sink.clone(),
-        model.to_string(),
-        resp.usage.clone(),
-        reservation.amount,
-        provider_refused,
-        reservation,
-        agent_id,
-        parent_run_id,
-        on_behalf_of,
-        outcome,
-        key_id,
-        unit,
-        st.units.clone(),
-        unit_reservation,
-        st.keystats.clone(),
-    );
 
     // The guard settles at end-of-stream via `complete()`; if this future is
     // dropped first (client cancel) or an upstream error propagates via `?`, the
@@ -2061,7 +2058,7 @@ fn stream_managed(
 #[allow(clippy::too_many_arguments)]
 async fn buffered_managed(
     resp: ProviderResponse,
-    reservation: Reservation,
+    mut guard: SettleGuard,
     would_block: Option<String>,
     dlp_note: Option<String>,
     model: &str,
@@ -2089,10 +2086,8 @@ async fn buffered_managed(
     outcome_tag: &str,
     key_id: &str,
     unit: &str,
-    unit_reservation: Option<UnitReservation>,
     identity_header: Option<String>,
     router_header: Option<String>,
-    router_route: Option<(String, String)>,
     wardryx_header: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
@@ -2104,10 +2099,10 @@ async fn buffered_managed(
     let bytes = match collect(resp.body).await {
         Ok(b) => b,
         Err(e) => {
-            st.ledger.settle(&reservation, Microusd::ZERO);
-            if let Some(ur) = &unit_reservation {
-                st.units.settle(ur, Microusd::ZERO, now_millis());
-            }
+            // A 2xx that broke charges the estimate, or the usage the
+            // provider reported before breaking; a refusal whose body broke
+            // charges zero. The guard decides from the status it was given.
+            let _ = guard.settle_now();
             // A different stage from the send failure above and worth telling
             // apart: the provider answered, so whatever is wrong is between
             // the status line and the last byte rather than in reaching the
@@ -2115,7 +2110,7 @@ async fn buffered_managed(
             // shown the other.
             emit_dependency_failed(
                 st,
-                Some(&reservation.run_id),
+                Some(guard.run_id()),
                 event_agent_id,
                 chain_on_record,
                 Dependency::Provider,
@@ -2127,66 +2122,29 @@ async fn buffered_managed(
         }
     };
 
-    let parsed = resp.usage.lock().unwrap().take();
-
-    // What to settle when the response reports no usage we can price, and
-    // which of three bases the charge rests on - see `settle_amount` and
-    // `CostBasis` for the full picture. This mirrors
-    // `SettleGuard::settle_now`'s copy of the same decision; both call the
-    // one function so a body that overruns `UsageParser::CAP` is handled
-    // identically whether the client asked to stream the response or not.
-    //
-    // On a 2xx the estimate is the conservative fallback it has always been:
-    // a completion did happen, we simply could not measure it, so charging
-    // what was reserved beats charging nothing and letting an unmeasurable
-    // model spend a run's budget for free.
-    //
-    // On a non-2xx it is wrong, and wrongly expensive. The provider refused:
-    // there is no completion to measure, so the pre-flight estimate is not a
-    // fallback measurement of anything, it is a number this gateway invented
-    // and then wrote into the run's budget, the trace, the FOCUS export and
-    // the Cloud aggregates as money somebody was billed. The transport-error
-    // paths beside this one settle `ZERO` for exactly this reason ("failed
-    // call cost us nothing"): a 4xx/5xx is the same fact arriving with a
-    // status line instead of a broken socket, and a provider that 429s a run
-    // repeatedly would otherwise exhaust that run's budget on calls that cost
-    // nothing.
-    //
-    // Reported usage is still settled as itself either way, including on a
-    // refusal: a provider that generated part of a response and then failed
-    // over it bills for what it generated, and that is real money rather than
-    // an estimate. A TRUNCATED body is the one exception, refused or not: see
-    // `settle_amount`, partial usage surviving a cut-off buffer is never
-    // trusted.
-    let unmeasured = if status.is_success() {
-        reservation.amount
-    } else {
-        Microusd::ZERO
+    // One settle site for both paths (invariant 38, invariant 50): the guard
+    // prices the slot through `settle_amount` with the estimate as the
+    // fallback on a 2xx and zero on a refusal, settles the run and the
+    // unit, and writes the `allow` row (S5, including the router-savings
+    // arithmetic).
+    let actual = match guard.settle_now() {
+        Some(Terminal::Settled { actual, .. }) => actual,
+        other => {
+            // Unreachable: `answered` ran before this function was called.
+            // A value rather than a panic, and loud, because a silent zero
+            // is the class of fault this PR closes.
+            tracing::error!(
+                run = %guard.run_id(),
+                ?other,
+                "the settle guard was not in an answered state after the body was read"
+            );
+            Microusd::ZERO
+        }
     };
-    let (actual, parsed_usage, basis) = settle_amount(&st.prices, model, parsed, unmeasured);
-    if basis == CostBasis::EstimateTruncated {
-        // `settled_microusd` is named, not assumed nonzero: a refused call
-        // whose error body also overran the cap settles zero here, same as
-        // any other refusal, and the log line must not read as though an
-        // estimate was charged when nothing was.
-        tracing::warn!(
-            model = %model,
-            buffered_bytes = UsageParser::CAP,
-            settled_microusd = actual.0,
-            "usage-parser cap hit before the response's usage block arrived; \
-             the parsed usage cannot be trusted, so this settled on the \
-             fallback amount above instead"
-        );
-        st.keystats.record_truncated_settlement();
-    }
-    st.ledger.settle(&reservation, actual);
-    if let Some(ur) = &unit_reservation {
-        st.units.settle(ur, actual, now_millis());
-    }
     if is_the_providers_refusal(status) {
         emit_upstream_refused_via(
             &st.events,
-            &reservation.run_id,
+            guard.run_id(),
             event_agent_id,
             chain_on_record,
             model,
@@ -2195,57 +2153,10 @@ async fn buffered_managed(
     }
     let spent = st
         .ledger
-        .snapshot(&reservation.run_id)
+        .snapshot(guard.run_id())
         .await
         .map(|s| s.spent)
         .unwrap_or(actual);
-
-    // Router savings (FinOps): when this call was actually routed to a
-    // cheaper model (see the router step in `messages`), the difference
-    // between what the originally requested model would have cost for this
-    // exact usage and what the chosen model actually cost is real avoided
-    // spend. Fold it into `saved_microusd` on this row so it rolls up
-    // through the same accounting path cache hits use, distinguishable by
-    // `decision == "allow"` (a cache hit records its own `cache_hit` row and
-    // returns before reaching here, so an "allow" row with nonzero
-    // `saved_microusd` can only come from the router). `saturating_sub`
-    // keeps this at zero rather than negative on the one case the router
-    // routes up (an explicit higher-tier requirement) -- there is no
-    // "savings" to report when the call ended up pricier than requested.
-    let router_saved = match &router_route {
-        Some((original_model, chosen_model)) => {
-            match (
-                st.prices.cost(original_model, &parsed_usage),
-                st.prices.cost(chosen_model, &parsed_usage),
-            ) {
-                (Some(would_have_cost), Some(did_cost)) => would_have_cost.saturating_sub(did_cost),
-                _ => Microusd::ZERO,
-            }
-        }
-        None => Microusd::ZERO,
-    };
-
-    st.sink.record(CallRecord {
-        ts_millis: now_millis(),
-        run_id: reservation.run_id.clone(),
-        model: model.to_string(),
-        decision: "allow".into(),
-        input_tokens: parsed_usage.input_tokens,
-        output_tokens: parsed_usage.output_tokens,
-        cost_microusd: actual.0,
-        step: reservation.step,
-        agent_id: agent_id.to_string(),
-        saved_microusd: router_saved.0,
-        parent_run_id: parent_run_id.to_string(),
-        on_behalf_of: on_behalf_of.to_string(),
-        outcome: outcome_tag.to_string(),
-        key_id: key_id.to_string(),
-        unit: unit.to_string(),
-        // The model-emitted tool-call count parsed out of this response's
-        // body, same source as `input_tokens`/`output_tokens` above (I1,
-        // docs/21-tool-runs.md).
-        tool_calls: parsed_usage.tool_calls,
-    });
 
     // Agent firewall: judge the model's requested tool calls against the run's
     // accumulated taint. Enforce → 403; shadow/warn → header note.
@@ -2264,13 +2175,13 @@ async fn buffered_managed(
                 // carries no additional cost (avoids double-counting spend).
                 st.sink.record(CallRecord {
                     ts_millis: now_millis(),
-                    run_id: reservation.run_id.clone(),
+                    run_id: guard.run_id().to_string(),
                     model: model.to_string(),
                     decision: "taint_blocked".into(),
                     input_tokens: 0,
                     output_tokens: 0,
                     cost_microusd: 0,
-                    step: reservation.step,
+                    step: guard.step(),
                     agent_id: agent_id.to_string(),
                     saved_microusd: 0,
                     parent_run_id: parent_run_id.to_string(),
@@ -2287,7 +2198,7 @@ async fn buffered_managed(
                     EventType::TaintBlock,
                     now_millis(),
                     Some(event_agent_id),
-                    Some(&reservation.run_id),
+                    Some(guard.run_id()),
                     chain_on_record,
                     taint_verdict_data(
                         TaintStage::ModelToolCall,
@@ -2299,7 +2210,7 @@ async fn buffered_managed(
                     ),
                 );
                 crate::events::log_outcome(EventType::TaintBlock, outcome);
-                return firewall_block(&reservation.run_id, &reason);
+                return firewall_block(guard.run_id(), &reason);
             }
             // Shadow: the action is PERMITTED and this response carries it to
             // a client that will execute it. Before 2026-08-26 that fact left
@@ -2309,7 +2220,7 @@ async fn buffered_managed(
                 EventType::TaintShadow,
                 now_millis(),
                 Some(event_agent_id),
-                Some(&reservation.run_id),
+                Some(guard.run_id()),
                 chain_on_record,
                 taint_verdict_data(
                     TaintStage::ModelToolCall,
@@ -2325,7 +2236,7 @@ async fn buffered_managed(
         }
         // Executing these tools will taint future turns — record their labels now.
         st.accumulate_taint(
-            &reservation.run_id,
+            guard.run_id(),
             taint::labels_for_tools(&resp_tools, &st.firewall.sources),
         );
     }
@@ -2348,8 +2259,8 @@ async fn buffered_managed(
         .status(status)
         .header("content-type", content_type)
         .header("x-fuse", "managed")
-        .header("x-fuse-run-id", reservation.run_id.clone())
-        .header("x-fuse-step", reservation.step.to_string())
+        .header("x-fuse-run-id", guard.run_id().to_string())
+        .header("x-fuse-step", guard.step().to_string())
         .header("x-fuse-mode", mode_str(st.policy.mode))
         .header("x-fuse-cost-usd", format!("{:.6}", actual.as_usd()))
         .header("x-fuse-spent-usd", format!("{:.6}", spent.as_usd()))
@@ -3192,7 +3103,7 @@ pub(crate) mod tests {
     use axum::http::Request;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook};
+    use tokenfuse_core::{Ledger, ModelPrice, Policy, PriceBook, Reservation};
     use tower::ServiceExt;
 
     /// Test-only serialization lock for the shared `OUTCOME_OVERCAP` process
@@ -3453,14 +3364,28 @@ pub(crate) mod tests {
             .body(Body::from(body(500)))
             .unwrap();
 
-        let resp = call(st, req).await;
+        let resp = call(st.clone(), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
         assert!(resp.headers().contains_key("x-fuse-cost-usd"));
+        // The step the reservation was admitted at, not a constant: the guard
+        // copies it in `hold_run` (invariant 50), and a second call on the
+        // same run must read 2.
+        assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "1");
 
         let snap = ledger.snapshot("run-1").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.steps, 1);
+
+        let again = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-1")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, again).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "2");
+        assert_eq!(ledger.snapshot("run-1").await.unwrap().steps, 2);
     }
 
     #[tokio::test]
@@ -6012,7 +5937,9 @@ pub(crate) mod tests {
     async fn client_cancel_midstream_still_settles() {
         use futures::StreamExt;
         // A managed streaming reservation whose body is only partially consumed
-        // (client disconnects) must still be settled — reservation released.
+        // (client disconnects) must still be settled - reservation released,
+        // charged the estimate (invariant 50: `Started`, not `Unknown` - the
+        // provider already answered 2xx by the time the guard is built here).
         let st = state(
             Mode::Enforce,
             StubProvider {
@@ -6031,28 +5958,39 @@ pub(crate) mod tests {
             .reserve("run-cancel", Microusd::from_usd(0.5))
             .await
             .unwrap();
+        let mut guard = SettleGuard::new(
+            st.ledger.clone(),
+            st.units.clone(),
+            st.prices.clone(),
+            st.sink.clone(),
+            st.keystats.clone(),
+            st.retained.clone(),
+            "run-cancel".into(),
+            Microusd::from_usd(0.5),
+            CallAttribution {
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            None,
+        );
+        guard.hold_run(reservation);
+        guard.dispatching();
         let resp = st
             .provider
             .send(HeaderMap::new(), Bytes::new())
             .await
             .unwrap();
+        guard.answered(resp.status, resp.usage.clone());
 
         let response = stream_managed(
             resp,
-            reservation,
+            guard,
             None,
             None,
             "test-model",
             &st,
             String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
             Vec::new(),
-            None,
-            String::new(),
-            String::new(),
-            String::new(),
             None,
             None,
             None,
@@ -6065,8 +6003,14 @@ pub(crate) mod tests {
         }
 
         let snap = st.ledger.snapshot("run-cancel").await.unwrap();
-        assert_eq!(snap.reserved, Microusd::ZERO); // released, not leaked
-        assert!(snap.spent > Microusd::ZERO); // conservative fallback charge
+        assert_eq!(snap.reserved, Microusd::ZERO, "released, not leaked");
+        assert_eq!(
+            snap.spent,
+            Microusd::from_usd(0.5),
+            "the estimate, exactly: the slot was never written because the stream was \
+             dropped after one chunk, and `spent > 0` would also pass a mutant charging \
+             one micro-USD"
+        );
     }
 
     #[tokio::test]
@@ -7193,10 +7137,263 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "budget_exceeded");
         assert_eq!(units.spent("treasury", now_millis()), Microusd::ZERO);
+        // The exact figure, not just "close enough to reserve 0.99 more":
+        // mutant M8 (the guard built after the run reserve, so the unit half
+        // is bare on this exact refusal) leaks 1_757 of a 1_000_000 cap,
+        // which the loose `try_reserve(0.99)` check below cannot tell apart
+        // from a clean release (990_000 + 1_757 still fits under 1_000_000).
+        assert_eq!(units.reserved("treasury", now_millis()), Microusd::ZERO);
         // Nearly the whole cap must still be reservable: nothing leaked.
         assert!(units
             .try_reserve("treasury", Microusd::from_usd(0.99), now_millis())
             .is_ok());
+    }
+
+    // -- one guard owns a call's reservations from the first one taken ------
+    //
+    // spec-guard-pr2.md section 6, E8 to E12, E20 to E22. A provider double
+    // that never returns from `send` (or answers 200 and hangs mid-body),
+    // used to exercise a cancel while the request is still on the wire and a
+    // cancel while a 2xx body is still being read.
+
+    struct PendingProvider {
+        body_pending: bool,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PendingProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            if !self.body_pending {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
+            let entered = self.entered.clone();
+            let body = async_stream::try_stream! {
+                entered.notify_one();
+                std::future::pending::<()>().await;
+                yield Bytes::from_static(b"{}");
+            };
+            Ok(ProviderResponse {
+                status: 200,
+                content_type: None,
+                body: Box::pin(body),
+                usage: Arc::new(Mutex::new(None)),
+            })
+        }
+    }
+
+    /// E8 (spec-guard-pr2.md section 6). A cancel while the provider still
+    /// holds the request (never answered) retains both halves, on the leaf
+    /// AND its ancestor: the outcome is unknown, not a release, and the
+    /// registry lists the handle an eventual reconciliation needs (D7/D8).
+    ///
+    /// Compile-red at e25835c: `AppState.retained` does not exist there.
+    #[tokio::test]
+    // Emits a `retained:` warn into the process-wide captured log that
+    // `settle::tests` E13/E14 read, so it holds their lock. Single-threaded
+    // `block_on` runtime, never contended by another task: safe across the
+    // awaits below despite the lint (same as
+    // `outcome_header_over_cap_is_dropped_not_recorded`).
+    #[allow(clippy::await_holding_lock)]
+    async fn a_cancel_while_the_provider_holds_the_request_retains_both_ledgers() {
+        let _serial = crate::testlog::log_lock();
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let units = Arc::clone(&st.units);
+        let ledger = Arc::clone(&st.ledger);
+        let retained = Arc::clone(&st.retained);
+        // The parent exists first, with the ordinary StubProvider still in place.
+        let parent_req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "coordinator")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st.clone(), parent_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        st.provider = Arc::new(PendingProvider {
+            body_pending: false,
+            entered: entered.clone(),
+        });
+        let child_req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "worker")
+            .header("x-fuse-parent-run-id", "coordinator")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let task = tokio::spawn(crate::app(st.clone()).oneshot(child_req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let worker = ledger.snapshot("worker").await.unwrap();
+        assert_eq!(worker.reserved, Microusd(8_657));
+        assert_eq!(worker.spent, Microusd::ZERO);
+        assert_eq!(worker.steps, 1);
+        let coordinator = ledger.snapshot("coordinator").await.unwrap();
+        assert_eq!(coordinator.reserved, Microusd(8_657));
+        assert_eq!(coordinator.spent, Microusd(10_500));
+        assert_eq!(units.reserved("treasury", now_millis()), Microusd(8_657));
+        assert_eq!(units.spent("treasury", now_millis()), Microusd(10_500));
+
+        let held = retained.for_run("worker");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].run.amount, Microusd(8_657));
+        assert_eq!(held[0].run.chain[0].run_id, "worker");
+        assert_eq!(held[0].run.chain[1].run_id, "coordinator");
+        assert_eq!(
+            held[0].unit.as_ref().map(|u| (u.unit.clone(), u.amount)),
+            Some(("treasury".to_string(), Microusd(8_657)))
+        );
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "the coordinator's own ordinary call only");
+    }
+
+    /// E9. The buffered twin of E8 (spec section 6): the provider answered
+    /// 2xx and the caller left while the body was still being collected. The
+    /// outcome is `Started`, not unknown, so both ledgers settle at the
+    /// estimate rather than staying retained.
+    ///
+    /// RED-FIRST at e25835c: `buffered_managed` has no guard wrapping the
+    /// whole call, so dropping the future while `collect()` awaits leaks the
+    /// reservation outright (nothing ever settles it) instead of charging the
+    /// estimate. `units.reserved(..)` is added by this PR (section 5.3) and
+    /// is asserted once that method exists.
+    #[tokio::test]
+    async fn a_cancel_while_the_body_is_being_collected_settles_the_estimate_on_both_ledgers() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let units = Arc::clone(&st.units);
+        let ledger = Arc::clone(&st.ledger);
+        // The parent exists first, with the ordinary StubProvider still in place.
+        let parent_req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "coordinator")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st.clone(), parent_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        st.provider = Arc::new(PendingProvider {
+            body_pending: true,
+            entered: entered.clone(),
+        });
+        let child_req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "worker")
+            .header("x-fuse-parent-run-id", "coordinator")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let task = tokio::spawn(crate::app(st.clone()).oneshot(child_req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let worker = ledger.snapshot("worker").await.unwrap();
+        assert_eq!(worker.reserved, Microusd::ZERO, "released, not leaked");
+        assert_eq!(
+            worker.spent,
+            Microusd(8_657),
+            "settled at the estimate: a 2xx arrived"
+        );
+        let coordinator = ledger.snapshot("coordinator").await.unwrap();
+        assert_eq!(coordinator.reserved, Microusd::ZERO);
+        assert_eq!(coordinator.spent, Microusd(19_157));
+        assert_eq!(units.reserved("treasury", now_millis()), Microusd::ZERO);
+        assert_eq!(units.spent("treasury", now_millis()), Microusd(19_157));
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 2, "one row for coordinator, one for worker");
+        let row = &records[1];
+        assert_eq!(row.decision, "allow");
+        assert_eq!(row.run_id, "worker");
+        assert_eq!(row.cost_microusd, 8_657);
+        assert_eq!(row.input_tokens, 0);
+        assert_eq!(row.output_tokens, 0);
+        assert_eq!(row.step, 1);
+        assert_eq!(row.unit, "treasury");
+        assert_eq!(row.parent_run_id, "coordinator");
+        assert_eq!(row.tool_calls, None);
+    }
+
+    /// E20. `GET /v1/runs` lists a retained reservation on its run, additive
+    /// fields `retained`/`retained_usd` (spec section 4.1). RED-FIRST at
+    /// e25835c: the JSON has no `retained` member at all, so indexing it
+    /// reads `Value::Null`, never `1`.
+    #[tokio::test]
+    // Same `retained:` warn, same lock, same reason as E8 above.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retained_reservation_is_listed_on_the_runs_endpoint() {
+        let _serial = crate::testlog::log_lock();
+        let st = state(Mode::Enforce, StubProvider::default());
+        let plain_req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "plain")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st.clone(), plain_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut st = st;
+        st.provider = Arc::new(PendingProvider {
+            body_pending: false,
+            entered: entered.clone(),
+        });
+        let held_req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "held")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let task = tokio::spawn(crate::app(st.clone()).oneshot(held_req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let list = Request::get("/v1/runs").body(Body::empty()).unwrap();
+        let resp = call(st.clone(), list).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let runs: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let runs = runs.as_array().expect("an array of runs");
+        let held_row = runs
+            .iter()
+            .find(|r| r["run_id"] == "held")
+            .expect("the held run is listed");
+        assert_eq!(held_row["retained"], 1);
+        assert!((held_row["retained_usd"].as_f64().unwrap() - 0.008657).abs() < 1e-9);
+        assert!((held_row["reserved_usd"].as_f64().unwrap() - 0.008657).abs() < 1e-9);
+        assert_eq!(held_row["spent_usd"], 0.0);
+        let plain_row = runs
+            .iter()
+            .find(|r| r["run_id"] == "plain")
+            .expect("the plain run is listed");
+        assert_eq!(plain_row["retained"], 0);
+        assert_eq!(plain_row["retained_usd"], 0.0);
+        assert_eq!(plain_row["reserved_usd"], 0.0);
     }
 
     // -- a call the provider refused is not spend ---------------------------
@@ -7994,6 +8191,166 @@ pub(crate) mod tests {
         assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
         assert_eq!(found[0]["data"]["stage"], "response_body");
         assert_eq!(found[0]["data"]["effect"], "call_failed");
+    }
+
+    // -- one guard owns a call's reservations, continued (F04 on the
+    // -- buffered path: a 2xx whose body then breaks) ----------------------
+
+    /// E10 (spec-guard-pr2.md section 6). A 2xx whose buffered body breaks
+    /// before any usage arrived settles at the pre-flight estimate on both
+    /// ledgers and writes the `allow` row the send-error arm never gets.
+    ///
+    /// RED-FIRST at e25835c: `buffered_managed`'s `Err(e)` arm settles both
+    /// reservations at `Microusd::ZERO` and writes no row at all.
+    #[tokio::test]
+    async fn a_2xx_whose_body_breaks_settles_the_estimate_on_both_ledgers_and_writes_the_row() {
+        let (events, path) = recording_exporter("torn-2xx-guard");
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_events(events)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(TornStreamProvider);
+        let units = Arc::clone(&st.units);
+        let ledger = Arc::clone(&st.ledger);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "torn")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let snap = ledger.snapshot("torn").await.unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(snap.spent, Microusd(8_657));
+        assert_eq!(units.spent("treasury", now_millis()), Microusd(8_657));
+        assert_eq!(units.reserved("treasury", now_millis()), Microusd::ZERO);
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1, "one allow row, where e25835c writes none");
+        assert_eq!(records[0].decision, "allow");
+        assert_eq!(records[0].cost_microusd, 8_657);
+        assert_eq!(records[0].input_tokens, 0);
+        assert_eq!(records[0].output_tokens, 0);
+
+        let found = only_dependency_failures(&path);
+        assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+        assert_eq!(found[0]["data"]["stage"], "response_body");
+    }
+
+    /// A provider that answers 200, starts a body, and THEN breaks the
+    /// connection, after it has already published usage to the slot: a
+    /// provider that reports what it generated before the read that would
+    /// deliver it fails. E11's double.
+    struct AnsweredThenTornProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for AnsweredThenTornProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let first = Ok(Bytes::from_static(b"{\"partial\":"));
+            let then = Err(ProviderError::Upstream(
+                "connection reset by peer".to_string(),
+            ));
+            Ok(ProviderResponse {
+                status: 200,
+                content_type: Some("application/json".to_string()),
+                body: Box::pin(futures::stream::iter(vec![first, then])),
+                usage: Arc::new(Mutex::new(Some(ParsedUsage {
+                    usage: tokenfuse_core::Usage {
+                        input_tokens: 1_000,
+                        output_tokens: 500,
+                        ..Default::default()
+                    },
+                    truncated: false,
+                }))),
+            })
+        }
+    }
+
+    /// E11. A 2xx whose buffered body breaks AFTER the provider already
+    /// reported usage: settled at that usage, not the estimate and not zero.
+    ///
+    /// RED-FIRST at e25835c: `buffered_managed`'s `Err(e)` arm never reads
+    /// the usage slot; it settles zero regardless of what was published.
+    #[tokio::test]
+    async fn a_2xx_whose_body_breaks_after_reporting_usage_settles_that_usage() {
+        let sink = RecordingSink::default();
+        let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        st.provider = Arc::new(AnsweredThenTornProvider);
+        let units = Arc::clone(&st.units);
+        let ledger = Arc::clone(&st.ledger);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "torn-usage")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let snap = ledger.snapshot("torn-usage").await.unwrap();
+        assert_eq!(
+            snap.spent,
+            Microusd(10_500),
+            "the reported usage, not the estimate and not zero"
+        );
+        assert_eq!(units.spent("treasury", now_millis()), Microusd(10_500));
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_microusd, 10_500);
+        assert_eq!(records[0].input_tokens, 1_000);
+        assert_eq!(records[0].output_tokens, 500);
+    }
+
+    /// E12. Shadow and warn charge the estimate on a broken 2xx too
+    /// (invariant 42's purpose: a shadow week must not under-count), and
+    /// this is not a budget refusal: no `breaker_shadow`, no
+    /// `breaker_tripped`.
+    ///
+    /// RED-FIRST at e25835c: settles zero on both modes, same defect as E10.
+    #[tokio::test]
+    async fn the_shadow_twin_of_a_broken_2xx_records_the_estimate_and_no_shadow_event() {
+        for mode in [Mode::Shadow, Mode::Warn] {
+            let tag = format!("shadow-torn-{}", mode_str(mode));
+            let (st, path) = shadow_run(mode, &tag);
+            let sink = RecordingSink::default();
+            let mut st = st.with_sink(Arc::new(sink.clone()));
+            st.provider = Arc::new(TornStreamProvider);
+            let ledger = Arc::clone(&st.ledger);
+
+            let resp = call(st, budgeted("run-shadow-torn", "5.0")).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+            let snap = ledger.snapshot("run-shadow-torn").await.unwrap();
+            assert_eq!(snap.spent, Microusd(1_757));
+            assert_eq!(snap.reserved, Microusd::ZERO);
+
+            let records = sink.snapshot();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].cost_microusd, 1_757);
+
+            assert!(
+                shadow_events(&path).is_empty(),
+                "no breaker_shadow for a broken 2xx"
+            );
+            let tripped = events_at(&path)
+                .into_iter()
+                .filter(|e| e["type"] == "breaker_tripped")
+                .count();
+            assert_eq!(tripped, 0, "not a budget refusal, {mode:?}");
+            let found = only_dependency_failures(&path);
+            assert_eq!(found.len(), 1, "{mode:?}: {found:?}");
+            assert_eq!(found[0]["data"]["stage"], "response_body");
+        }
     }
 
     // SPEC.md §6.1 requires `agent_id` and §6.2 says a missing one is skipped

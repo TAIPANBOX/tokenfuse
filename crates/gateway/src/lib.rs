@@ -43,6 +43,8 @@ pub mod settle;
 pub mod sink;
 pub mod sqlq;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testlog;
 pub mod toolcheck;
 pub mod tui;
 pub mod unitledger;

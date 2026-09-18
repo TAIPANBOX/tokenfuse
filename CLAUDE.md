@@ -2379,8 +2379,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     `feed` now sets `truncated` the moment a byte is dropped, and `finish()`
     returns it beside the `Usage` in a `ParsedUsage`. The settle side is one
-    function, `settle::settle_amount`, called by both `SettleGuard::settle_now`
-    (streaming) and `proxy::buffered_managed` (buffered) - the same
+    function, `settle::settle_amount`, called by `SettleGuard::settle_now`, which since
+    invariant 50 (2026-09-18) is the one settle site for both paths (until then
+    `proxy::buffered_managed` was a second caller of the same function) - the same
     one-copy-not-two-agreeing-verbatim-copies shape invariant 29 already holds
     for algorithm rules, applied here so a body that overruns the cap is
     handled identically regardless of which path the client's request took.
@@ -2941,6 +2942,208 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41). And N plain gateways behind one address, with no `cluster` feature, each hold
     their own ledger, so a worker whose call lands on a different replica than the one its
     coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*
+
+50. **One owner holds a call's reservations from the first one taken to the terminal
+    transition, and an unknown outcome keeps its exposure.** Until 2026-09-18 the settle guard
+    existed only on the streaming path and only after the provider had answered
+    (`proxy.rs:1946` at `e25835c`), so a client that gave up while `Provider::send` was pending
+    dropped a bare `Reservation` and a bare `UnitReservation`: both stayed outstanding for the
+    life of the run and the month, with no line anywhere saying so (F03 and 3.4 of the
+    2026-09-18 money-path review, @measured by the review at 80e0d42:
+    `codex_f03_cancel_during_provider_send_releases_reservation` and
+    `..._during_buffered_body_...` red with `reserved` still up after the abort). A 2xx whose
+    body then broke was settled at zero on both ledgers by a manual arm (`proxy.rs:2094-2097`),
+    so a completion the provider generated and billed cost the run nothing and the streaming path
+    charged the estimate for the same event (F04 and 3.5, invariant 38 broken on one event).
+
+    `SettleGuard` (`crates/gateway/src/settle.rs`) is now created in `handle` the moment the
+    unit reservation block ends, holds the unit half and the run half as `Option`s across every
+    await that follows, and decides on `Drop` from one `CallOutcome` state through one pure
+    table (`disposition`): reserved and not dispatched, or `send` returned `Err`, releases both
+    at zero; a status line arrived and it was a refusal charges what the provider reported, else
+    zero (invariant 47); a 2xx arrived charges what the body reported, else the estimate, whether
+    the body completed, broke or was abandoned (invariant 43, and now the same answer on both
+    paths); and a call handed to the provider that ended before any status line came back is
+    RETAINED: neither settled nor released, listed in `AppState.retained`, shown on
+    `GET /v1/runs` as `retained` and `retained_usd`, and warned about with the run, the
+    reservation id, the amount and the unit. The `allow` trace row is written by the guard in one
+    site for both paths; a call that ends before the provider answers writes no row. On the
+    streaming path that row's `saved_microusd` stays the zero it carried before the move:
+    `handle` passes no `router_route` for a streamed request, so a routed stream's avoided spend
+    is not counted, as before, and counting it is a separate decision.
+
+    `@decided 2026-09-17`: a call cancelled before the provider answered leaves no trace row,
+    like the send-error arm. `@decided 2026-09-18`: a call whose outcome is unknown after dispatch
+    keeps its reservation until it is reconciled and is never settled at zero; completing it at
+    the estimate is not chosen. A call that was definitely not sent, and a refusal that reports no
+    priced usage, release as before; a 2xx that then breaks settles at the estimate; parsed usage
+    settles as parsed.
+
+    Reconciling a retained reservation is not built. What exists: the caller's next call on the
+    run may widen `x-fuse-budget-usd` (`open_run` updates an open run's budget), a Cloud budget
+    or a unit cap override widens the room the same way, the unit half expires with the UTC
+    month, and a restart forgets everything (issue #293). The shape of a real path (an
+    admin-keyed `POST /v1/runs/{id}/reconcile` settling or releasing by reservation id, or a
+    bounded retention) is an open decision, D8.
+
+    **Where it says nothing.** A cancel during `Provider::send` is read as unknown from the
+    line before the await, because `HttpProvider::send` is one `reqwest` future with no point
+    the caller can observe between "connecting" and "the head is written"; nothing measured
+    whether hyper drops the upstream request when that future is dropped, so the provider may
+    still run and bill the retained call, and the estimate is not proven to bound that bill.
+    `send` returning `Err` is read as "not sent" and released, and `ProviderError::Upstream`
+    cannot say otherwise: a connection reset while awaiting the response head arrives through the
+    same arm and releases a reservation for a call the provider may have executed (D9, an open
+    decision; the split is `reqwest::Error::is_connect`, in PR 3's file). Whether axum drops the
+    handler future on a client disconnect in every phase is not measured here (the live test is
+    named in the PR's NOT proven list and was not run). No agent-event type describes a retained
+    call; a new type is a cross-repository change (D10). The registry is process-local and
+    capped at 8192 entries; past the cap the ledger still holds the reservation and only the
+    handle is not kept (`listed=false` on the warn, `Retained::unlisted`). On the raft backend a
+    reservation committed while the future is dropped between commit and return is not held by
+    anything, as before. The unit half of a retained reservation cannot be settled after the
+    month rolls (`UnitLedger::settle` drops a stale window), which any D8 must say.
+
+    *(tests: `crates/gateway/tests/codex_money_review.rs`, the review's F03 and F04 probes and
+    three held controls moved into the suite, the send-cancel probe renamed to
+    `codex_f03_cancel_during_provider_send_is_retained_not_released` with its assertion moved to
+    retention; `settle::tests`: `a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns`,
+    `a_guard_dropped_before_dispatch_releases_both_ledgers_and_writes_no_row`,
+    `a_guard_holding_only_the_unit_half_releases_it_on_drop`,
+    `a_guard_told_the_send_failed_releases_both_and_writes_no_row`,
+    `a_second_settle_of_one_guard_changes_nothing`,
+    `the_run_and_unit_ledgers_agree_in_every_terminal_state`,
+    `every_state_has_the_disposition_the_rule_names`; `proxy::tests`:
+    `a_cancel_while_the_provider_holds_the_request_retains_both_ledgers`,
+    `a_cancel_while_the_body_is_being_collected_settles_the_estimate_on_both_ledgers`,
+    `a_2xx_whose_body_breaks_settles_the_estimate_on_both_ledgers_and_writes_the_row`,
+    `a_2xx_whose_body_breaks_after_reporting_usage_settles_that_usage`,
+    `the_shadow_twin_of_a_broken_2xx_records_the_estimate_and_no_shadow_event`,
+    `a_retained_reservation_is_listed_on_the_runs_endpoint`, and
+    `client_cancel_midstream_still_settles` now pinned to the exact estimate;
+    `unitledger::tests::reserved_reports_the_outstanding_amount_in_the_current_window`.
+
+    Red first, @measured `cargo test -p tokenfuse-gateway --test codex_money_review` (a trimmed,
+    pre-product form keeping E1-E7 exactly as the review wrote them) and a temporary
+    `proxy::tests` addition for E9, E10, E11, E12, E20, both at `e25835c` 2026-09-18:
+    `codex_f03_..._releases_reservation` (E1's original name and form) and
+    `codex_f03_cancel_during_buffered_body_releases_reservation` (E2) both panicked "ADR-2 and
+    settle.rs cancellation promise: dropping the request future must release its reservation"
+    (left: `Microusd(11535)`, right: `Microusd(0)`); `codex_f04_buffered_body_error_preserves_reported_usage`
+    (E3) panicked "invariant 47 money rule: reported generated usage must be settled even if
+    delivery fails" (left: `Microusd(0)`, right: `Microusd(7500)`);
+    `codex_f04_real_http_2xx_body_error_must_not_silently_settle_zero` (E4) panicked "invariant 43
+    and review fallback requirement: upstream answered 200 but its body broke; usage is
+    unavailable, so reserve estimate must not become a zero settlement" (left: `Microusd(0)`,
+    right: `Microusd(11535)`); the three held controls (E5, E6, E7) were already green, unaffected
+    by this change. The temporary `proxy::tests` (no `st.retained`, no `UnitLedger::reserved`, both
+    added later in the same commit) read: `a_cancel_while_the_body_is_being_collected_...`
+    panicked "released, not leaked" on `worker.reserved`, left `Microusd(8657)` right
+    `Microusd(0)`: at e25835c a cancel during `collect` LEAKED the reservation (reserved 8657,
+    spent 0, F03's shape) where the fix charges the estimate (@measured
+    `cargo test -p tokenfuse-gateway --lib a_cancel_while_the_body_is_being_collected` on a
+    `git archive e25835c` copy with the test appended minus its two `units.reserved` lines,
+    2026-09-18); `a_2xx_whose_body_breaks_settles_the_estimate_...` left `Microusd(0)` right
+    `Microusd(8657)` (settled at zero where the fix charges the estimate); the shadow twin left
+    `Microusd(0)` right `Microusd(1757)`; the runs-endpoint listing left `Null` right `1` (no
+    `retained` member in the JSON at e25835c). Every other new test (`E8`, `E13` to `E19`, `E21`,
+    `E22`) names an API this change adds and so is red by compile against `e25835c`, the weaker
+    form invariant 46 already accepts.
+
+    Twelve mutants planted in the product code 2026-09-18, each reverted after; one equivalent.
+    M1 (`Unknown => Retain` mutated to `Release`) and M2 (to `Charge{false}`): both caught by
+    `a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns`,
+    `every_state_has_the_disposition_the_rule_names`,
+    `a_cancel_while_the_provider_holds_the_request_retains_both_ledgers` and
+    `codex_f03_cancel_during_provider_send_is_retained_not_released`. M3 (`Started` charging zero
+    again): caught by `client_cancel_midstream_still_settles`,
+    `a_2xx_whose_body_breaks_settles_the_estimate_on_both_ledgers_and_writes_the_row`,
+    `the_shadow_twin_of_a_broken_2xx_records_the_estimate_and_no_shadow_event`,
+    `every_state_has_the_disposition_the_rule_names`,
+    `codex_f04_real_http_2xx_body_error_must_not_silently_settle_zero`,
+    `settle::tests::drop_without_complete_settles_with_fallback`, and three of the four
+    `no_usage_stream_settles_on_the_estimate.rs` tests (the fourth settles on a parsed usage
+    block and cannot move under this mutant). M4 (the unit half's settle deleted from
+    `charge`): caught by `a_cancel_while_the_body_is_being_collected_settles_the_estimate_...`,
+    `a_2xx_whose_body_breaks_settles_the_estimate_...`,
+    `a_2xx_whose_body_breaks_after_reporting_usage_settles_that_usage`,
+    `the_run_and_unit_ledgers_agree_in_every_terminal_state` and
+    `a_unit_reservation_settles_alongside_the_run_reservation`. M5a (the guard's construction
+    moved to after `send` resolves, so nothing owns the reservation during the cancellable
+    await): caught by `a_cancel_while_the_provider_holds_the_request_retains_both_ledgers`,
+    `a_retained_reservation_is_listed_on_the_runs_endpoint` and
+    `codex_f03_cancel_during_provider_send_is_retained_not_released`, reading the LEAK (`reserved`
+    still up at the estimate, registry empty) rather than the retention (registry one entry) -
+    the two look the same on `reserved` alone, which is invariant 50's own point. M5b
+    (`guard.dispatching()` deleted): caught by the same three. The two `proxy` tests fail first
+    on the `debug_assert_eq!` inside `answered` during their prior ordinary call (state stayed
+    `NotDispatched`, not `Unknown`), a debug-build catch; the probe never reaches `answered`
+    and catches it by its money and registry assertions (a `NotDispatched` drop releases, so
+    `reserved` reads 0 and the registry is empty), which holds in a release build too. M6 (the
+    warn line deleted from `retain`): caught by
+    `a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns` (no `retained:` line
+    in the captured log). M7 (`settle_now`'s two `take()` calls replaced by `clone()`, so a
+    second call settles again): caught by `a_second_settle_of_one_guard_changes_nothing` (unit
+    `spent` read `6_000_000`, two rows, not one); `codex_held_stream_drop_before_first_poll_settles_once`
+    stayed GREEN under this mutant, which is the point rather than a miss: the run half is
+    shielded a second time by invariant 49's own ledger-level exactly-once
+    (`Settlement::NotOutstanding`), and the unit ledger has no such guard of its own, which is
+    exactly the asymmetry E17 was written to read. M8 (the guard's construction moved to after
+    the run-budget match, so the unit half is bare on a refusal): NOT caught by
+    `a_run_budget_refusal_releases_the_unit_reservation` as it read before this PR - a
+    1_757-microUSD leak against a 1_000_000-microUSD cap does not move a
+    `try_reserve(Microusd::from_usd(0.99))` probe that has 10_000 microUSD of slack to spare, so
+    the mutant and the clean release were indistinguishable to it. That test now also asserts
+    `units.reserved("treasury", ..) == Microusd::ZERO` directly, which reads the exact figure and
+    is what actually caught it once added; the loose `try_reserve` check stays alongside it. M9
+    (`self.retained.push` deleted, the warn line left in place claiming `listed=true`): caught by
+    the same three `proxy`/`settle` tests as M1/M2/M5a plus
+    `a_retained_reservation_is_listed_on_the_runs_endpoint`. M10 (`answered` reading every status
+    as a success): caught by `a_429_from_the_provider_settles_nothing_as_spend`,
+    `a_refused_stream_dropped_without_complete_settles_zero_not_the_estimate` and
+    `the_run_and_unit_ledgers_agree_in_every_terminal_state`. M11 (`record_row` deleted from
+    `charge`): caught by `a_429_from_the_provider_settles_nothing_as_spend` (one row expected,
+    zero written), `a_cancel_while_the_body_is_being_collected_settles_the_estimate_...`,
+    `a_2xx_whose_body_breaks_settles_the_estimate_...` and
+    `a_second_settle_of_one_guard_changes_nothing`. M12 (`buffered_managed`'s explicit
+    `guard.settle_now()` deleted from its `Err` arm): EQUIVALENT by construction, @measured
+    `cargo test -p tokenfuse-gateway --lib` and `--tests` 2026-09-18 with the line removed: all
+    536 lib tests and every integration test (including the seven moved probes) stayed green,
+    because `guard`'s `Drop` settles identically one line later at the `return`. M13
+    (`self.step = reservation.step` deleted from `hold_run`, so `x-fuse-step` on every managed
+    response and `step` on every `taint_blocked` row read 0 while the `allow` row, which reads
+    `run.step`, stays right): SURVIVED the suite as first written, no test asserted the
+    header's value; caught since by `managed_request_within_budget_settles_cost` (`x-fuse-step`
+    left `"0"` right `"1"`, and `"2"` on a second call of the same run) and
+    `tests/router.rs::streaming_request_carries_the_router_header_too` (the streaming site,
+    same left/right), @measured `cargo test -p tokenfuse-gateway` with the line removed
+    2026-09-18.
+
+    Coverage, @measured `cargo llvm-cov -p tokenfuse-gateway --lib --summary-only` 2026-09-18,
+    "before" read from a `git archive e25835c` snapshot built in isolation (this repository's
+    shared stash and worktree registry were both off limits to this session) and "after" in the
+    worktree: `settle.rs` moved from 1 missed of 546 lines (99.82%) to 26 missed of 990
+    (97.37%; the file grew by the registry, the five-state table and the tests that prove them);
+    `proxy.rs` from 359 missed of 5907 (93.92%) to 353 missed of 6163 (94.27%); the whole crate
+    from 2776 missed of 16864 (83.54%) to 2793 missed of 17591 (84.12%) on the run this figure is
+    quoted from, 2795/17591 (84.11%) on an immediate repeat with nothing else changed, which is
+    named rather than hidden: a two-line swing across two runs of one async, cancellation-timing
+    suite is more likely one of the cancel tests occasionally resolving its race a different way
+    than a measurement error, and it does not move either file's own figure. Uncovered that
+    matters, all by design: `settle.rs:419-420`, the `retain` arm reached with no run half
+    (unreachable by construction - `dispatching` asserts one is held before the state can become
+    `Unknown`); `proxy.rs:2113-2125`, the `charge`-result fallback in `buffered_managed`
+    (unreachable - `answered` runs before this function is ever called); `settle.rs:229-230`,
+    `Retained::push` past its 8192-entry cap (never reached by a test; section 12's own
+    NOT-proven list says so). `settle.rs:495-500`'s router-savings arithmetic inside
+    `record_row` reads uncovered by this `--lib`-only command but is exercised by
+    `tests/router.rs::on_mode_rewrites_the_forwarded_body_and_prices_the_chosen_model`, which runs
+    in a separate binary `cargo llvm-cov -p tokenfuse-gateway --lib` does not link.
+
+    Scenarios: `features/settlement-owns-the-call.feature`, twelve, each bound
+    (`features-are-bound.sh`: 245 scenarios, 275 bindings, 0 broken, after #303 landed its own). Not a script gate: the rule
+    is the guard's disposition table, held by `cargo test`; `gates-have-teeth.sh` plants the
+    retain-to-release mutant and requires the guard-level test to go red.)*
 
 51. **A declared chain longer than the record holds is refused at the door, whether or not
     anybody verifies chains, and the two chain caps bound different things.** (Numbered 51

@@ -622,6 +622,21 @@ run_case "hierarchical-budgets: an unknown parent walked past silently" fail \
 	"$(py 'edit("crates/core/src/ledger.rs", "return (links, Some(Stop::UnknownParent(id)));", "let _ = Stop::UnknownParent(id); break;")')" \
 	"missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing ... FAILED"
 
+# --- invariant 50: an unknown outcome keeps its exposure ---------------------
+#
+# Not a scripts/*.sh gate: the rule is the settle guard's disposition table,
+# held by cargo test. The mutant is the one D7 forbids, a retained reservation
+# quietly released, planted by its text in the one function that decides, and
+# the guard-level test that reads the ledger, the registry and the log must go
+# red. The planted text still constructs the variant, so the mutant compiles
+# under CI's `RUSTFLAGS=-D warnings` (a never-constructed variant is a
+# dead_code error there, and a mutant that does not compile is WRONG REASON,
+# not a caught fault).
+run_case "settlement-owns-the-call: a retained reservation released instead" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact settle::tests::a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns" \
+	"$(py 'edit("crates/gateway/src/settle.rs", "CallOutcome::Unknown => Disposition::Retain,", "CallOutcome::Unknown => { let _ = Disposition::Retain; Disposition::Release }")')" \
+	"a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns ... FAILED"
+
 # --- invariant 44: the 1.0 surface is frozen --------------------------------
 #
 # compat/1.0.json is the promise of this major and compat-surface.sh is what
