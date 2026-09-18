@@ -156,8 +156,12 @@ counters roll over on the first call of a new month.
 
 ### Honest limitations (stated, not buried)
 
-- Unit counters are in-process and per-gateway: they reset on restart and are
-  NOT fleet-consistent across multiple gateways. Run budgets can already be
+- Unit counters are in-process and per-gateway: they reset on restart (since
+  #293 a gateway with `TOKENFUSE_CLOUD_URL` set seeds the current UTC month's
+  tally from the control plane's `/v1/units` before it listens, startup only,
+  then counts its own spend on top; without a reachable control plane the
+  month starts at zero and one warning says so) and are NOT fleet-consistent
+  across multiple gateways. Run budgets can already be
   raft-replicated; unit budgets deliberately do NOT touch the replicated
   ledger in this slice (a new dimension in raft state is a schema-identity
   decision, per this repo's invariants). Fleet-consistent unit caps are a

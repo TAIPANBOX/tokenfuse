@@ -158,6 +158,19 @@ pub struct CallRecord {
     /// always a non-issue in either direction).
     #[serde(default)]
     pub tool_calls: Option<u32>,
+    /// The human accountable for the unit this call was billed to, as the
+    /// gateway's identity map names it (`units[].owner`, docs/20 section 2),
+    /// resolved server-side at push time (#295). `""` when the identity map
+    /// is off, the call resolved to no unit, or the unit names no owner.
+    /// Matches the `owner` key `crates/gateway/src/cloudsink.rs::WireRecord`
+    /// adds beside every `CallRecord` field on the wire; it is NOT a Parquet
+    /// column (`sink.rs::CallRecord` keeps its sixteen, invariant 38's 116
+    /// construction sites untouched). Additive: `#[serde(default)]` so a
+    /// gateway older than this field still ingests, and an older control
+    /// plane ignores the key (no `deny_unknown_fields`). Precedence over the
+    /// delegation chain: see the owner fold in [`Store::ingest_at`].
+    #[serde(default)]
+    pub owner: String,
 }
 
 /// The aggregated state of one run within an organization.
@@ -180,9 +193,11 @@ pub struct RunAgg {
     /// pre-identity-map snapshots still load.
     #[serde(default)]
     pub unit: String,
-    /// The human this run is answerable to: the root `user://` principal of
-    /// the delegation chain the gateway forwarded (P3, agent-passport SPEC
-    /// §5). `""` when the chain named no human, which is the ordinary case
+    /// The human this run is answerable to: the unit's configured owner when
+    /// the gateway's identity map names one (`CallRecord::owner`, #295), else
+    /// the root `user://` principal of the delegation chain the gateway
+    /// forwarded (P3, agent-passport SPEC §5). `""` when the chain named no
+    /// human, which is the ordinary case
     /// for a run nobody delegated - folded into the literal `"unassigned"`
     /// bucket by [`Store::owners`], never dropped, for the same reason
     /// `unit` is (docs/20 section 3: unattributed spend stays VISIBLE).
@@ -1455,9 +1470,19 @@ impl Store {
                     }
                     // Same treatment for the owner, and the same "last
                     // non-empty wins" rule: a later call on the same run that
-                    // forwarded no chain must not erase the person an earlier
-                    // one named.
-                    if let Some(owner) = owner_of_chain(&r.on_behalf_of) {
+                    // named nobody must not erase the person an earlier one
+                    // named. Two sources since #295, in this order: the row's
+                    // own `owner`, which is the unit's owner from the gateway's
+                    // identity map, operator configuration resolved
+                    // server-side; then the root human of the delegation chain,
+                    // which the caller wrote (invariant 15's reason: a header a
+                    // caller can choose must not pick whose spend this is).
+                    // The chain fills the gap when the unit named nobody, which
+                    // is every row from a gateway older than this field, so
+                    // such a deployment aggregates exactly as before.
+                    if !r.owner.is_empty() {
+                        agg.owner = r.owner.clone();
+                    } else if let Some(owner) = owner_of_chain(&r.on_behalf_of) {
                         agg.owner = owner;
                     }
                     if r.step > agg.steps {
@@ -4125,6 +4150,105 @@ mod tests {
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].owner, "user://acme/alice");
         assert_eq!(owners[0].spent_microusd, 1500);
+    }
+
+    // -- #295: the owner rides the wire ------------------------------------
+    //
+    // Records are built from JSON with `serde_json::from_str` rather than a
+    // struct literal, so these compile at the base whether or not the DTO
+    // carries `owner` yet, and go red on their assertion instead of on a
+    // missing field.
+
+    /// tokenfuse#295's own shape: a unit whose owner the gateway's identity
+    /// map names must land the run's spend under that owner, not
+    /// "unassigned".
+    #[test]
+    fn a_row_carrying_a_unit_owner_lands_under_it_in_owners() {
+        let s = Store::new();
+        let r1: CallRecord = serde_json::from_str(
+            r#"{"run_id":"r1","unit":"aws","owner":"user://customer.example/platform-lead","decision":"allow","cost_microusd":1000}"#,
+        )
+        .unwrap();
+        let r2: CallRecord = serde_json::from_str(
+            r#"{"run_id":"r2","unit":"aws","owner":"user://customer.example/platform-lead","decision":"allow","cost_microusd":2000}"#,
+        )
+        .unwrap();
+        s.ingest("acme", &[r1, r2]);
+
+        let owners = s.owners("acme");
+        assert_eq!(
+            owners.len(),
+            1,
+            "one owner, and no unassigned bucket: {owners:?}"
+        );
+        assert_eq!(owners[0].owner, "user://customer.example/platform-lead");
+        assert_eq!(owners[0].spent_microusd, 3000);
+        assert_eq!(owners[0].runs, 2);
+    }
+
+    /// The control: a row with no unit owner still falls back to the chain's
+    /// root human exactly as before, and one with neither stays unassigned.
+    /// Green on both sides of this change - it is what holds the gap rule.
+    #[test]
+    fn a_row_without_a_unit_owner_falls_back_to_the_chains_root_human() {
+        let s = Store::new();
+        let with_chain: CallRecord = serde_json::from_str(
+            r#"{"run_id":"r1","on_behalf_of":"user://acme/alice,agent://acme/planner","decision":"allow","cost_microusd":1000}"#,
+        )
+        .unwrap();
+        let with_neither: CallRecord =
+            serde_json::from_str(r#"{"run_id":"r2","decision":"allow","cost_microusd":500}"#)
+                .unwrap();
+        s.ingest("acme", &[with_chain, with_neither]);
+
+        let owners = s.owners("acme");
+        let alice = owners
+            .iter()
+            .find(|o| o.owner == "user://acme/alice")
+            .expect("the chain's root human is still the owner with no unit owner");
+        assert_eq!(alice.spent_microusd, 1000);
+        let unassigned = owners
+            .iter()
+            .find(|o| o.owner == "unassigned")
+            .expect("a row naming neither stays unassigned");
+        assert_eq!(unassigned.spent_microusd, 500);
+    }
+
+    /// #295's precedence decision, pinned: the row's own `owner` (server-
+    /// resolved from the identity map) outranks a caller-declared chain,
+    /// because the chain is a header the caller writes and the Cloud cannot
+    /// tell a proven chain from a claimed one on the wire.
+    #[test]
+    fn the_units_owner_outranks_the_callers_chain() {
+        let s = Store::new();
+        let r: CallRecord = serde_json::from_str(
+            r#"{"run_id":"r1","owner":"user://customer.example/finops-lead","on_behalf_of":"user://acme/alice,agent://acme/planner","decision":"allow","cost_microusd":1000}"#,
+        )
+        .unwrap();
+        s.ingest("acme", &[r]);
+
+        let owners = s.owners("acme");
+        assert_eq!(owners.len(), 1, "{owners:?}");
+        assert_eq!(owners[0].owner, "user://customer.example/finops-lead");
+        assert!(
+            !owners.iter().any(|o| o.owner == "user://acme/alice"),
+            "the chain's human must not appear once the row names an owner: {owners:?}"
+        );
+    }
+
+    /// An older gateway's batch omits `owner` entirely; additive means it
+    /// still ingests and defaults to `""`, and a gateway that DOES send it
+    /// must have it survive deserialization intact.
+    #[test]
+    fn deserializes_owner_and_defaults_it_for_an_older_gateway() {
+        let rec: CallRecord = serde_json::from_str(
+            r#"{"run_id":"r1","owner":"user://customer.example/platform-lead"}"#,
+        )
+        .unwrap();
+        assert_eq!(rec.owner, "user://customer.example/platform-lead");
+
+        let old: CallRecord = serde_json::from_str(r#"{"run_id":"r1"}"#).unwrap();
+        assert_eq!(old.owner, "");
     }
 
     #[test]

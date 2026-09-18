@@ -1172,6 +1172,20 @@ async fn serve() {
             // when the identity map is on: an unconfigured gateway has no
             // units to apply them to, so it does not poll the endpoint.
             if state.identity.enabled() {
+                // #293 (invariant 52): start each unit's month where the
+                // control plane left it, synchronously and before the
+                // listener binds, so the first admitted call already sees
+                // the month. Bounded by SEED_TIMEOUT; never refuses to
+                // start; one line either way. Gated like the poller below:
+                // a gateway with no identity map resolves no unit and has
+                // nothing to seed.
+                let _ = tokenfuse_gateway::cloudsink::seed_unit_ledger(
+                    &base,
+                    &key,
+                    &units,
+                    tokenfuse_gateway::sink::now_millis(),
+                )
+                .await;
                 let stu = units.clone();
                 tokenfuse_gateway::cloudsink::spawn_unit_budget_poller(
                     base.clone(),
@@ -1185,7 +1199,10 @@ async fn serve() {
                     },
                 );
             }
-            let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(base, key));
+            let cloud = Arc::new(
+                tokenfuse_gateway::cloudsink::CloudSink::new(base, key)
+                    .with_unit_owners(state.identity.unit_owners()),
+            );
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();
             tokio::spawn(async move {

@@ -197,6 +197,9 @@ pub struct IdentityMap {
     units: HashMap<String, Option<Microusd>>,
     keys: HashMap<String, KeyBinding>,
     prefixes: Vec<PrefixBinding>,
+    /// `units[].owner` per unit id, only for units that name one (#295).
+    /// Read at push time by the cloud sink, never on the request path.
+    unit_owners: HashMap<String, String>,
 }
 
 /// A `keys[]` entry, resolved: which unit a key_id is bound to, and which
@@ -343,10 +346,12 @@ impl std::error::Error for LoadError {
 
 /// The wire shape of the JSON file (`docs/20-identity-map.md` section 2).
 /// Unknown fields are tolerated everywhere: plain serde default behavior, no
-/// `deny_unknown_fields`, matching the stack-wide additive convention. Fields
-/// this module has no use for (`units[].name`/`units[].owner`) are simply
-/// omitted here rather than kept unread: that omission is itself "unknown
-/// field", tolerated the same way a genuinely future field would be.
+/// `deny_unknown_fields`, matching the stack-wide additive convention. The
+/// one field this module has no use for (`units[].name`) is simply omitted
+/// here rather than kept unread: that omission is itself "unknown field",
+/// tolerated the same way a genuinely future field would be. `units[].owner`
+/// was omitted the same way until #295, when the control plane's owner view
+/// turned out to need it.
 #[derive(Debug, Deserialize)]
 struct WireMap {
     #[serde(default)]
@@ -362,6 +367,15 @@ struct WireUnit {
     id: String,
     #[serde(default)]
     budget_usd_month: Option<f64>,
+    /// The human accountable for the unit (`docs/20-identity-map.md` section
+    /// 2, a `user://` principal by convention; not validated). Read since
+    /// #295 so it can ride the telemetry the gateway pushes and reach the
+    /// control plane's `/v1/owners`. `#[serde(default)]` so a map written
+    /// before this field was read still parses; a blank/whitespace-only value
+    /// normalises to absent, a present value is kept verbatim, exactly the
+    /// `created` rule below.
+    #[serde(default)]
+    owner: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -431,6 +445,7 @@ impl IdentityMap {
     /// degrades a bad entry and continues loading.
     fn build(wire: WireMap) -> Result<Self, LoadError> {
         let mut units: HashMap<String, Option<Microusd>> = HashMap::new();
+        let mut unit_owners: HashMap<String, String> = HashMap::new();
         for u in wire.units {
             if u.id.trim().is_empty() {
                 return Err(LoadError::Invalid(format!(
@@ -456,6 +471,13 @@ impl IdentityMap {
                     )))
                 }
             };
+            // Blank reads as absent, a present value stays verbatim: the same
+            // normalisation `created` gets below (docs/22), applied here so a
+            // unit whose owner is "   " does not reach the control plane as a
+            // person called "   ".
+            if let Some(owner) = u.owner.as_deref().filter(|s| !s.trim().is_empty()) {
+                unit_owners.insert(u.id.clone(), owner.to_string());
+            }
             units.insert(u.id, budget);
         }
 
@@ -522,6 +544,7 @@ impl IdentityMap {
             units,
             keys,
             prefixes,
+            unit_owners,
         })
     }
 
@@ -660,6 +683,22 @@ impl IdentityMap {
             .iter()
             .filter_map(|(id, budget)| budget.map(|b| (id.clone(), b)))
             .collect()
+    }
+
+    /// The owner `units[].owner` names for `unit`, verbatim, or `None` when
+    /// the unit is unknown or names none (#295).
+    #[must_use]
+    pub fn unit_owner(&self, unit: &str) -> Option<&str> {
+        self.unit_owners.get(unit).map(String::as_str)
+    }
+
+    /// Every unit that names an owner, as an owned map for the cloud sink,
+    /// which reads it at push time for the life of the process. The map is
+    /// loaded once at startup and never reloaded, so this equals the
+    /// call-time answer for every record the sink will ever see.
+    #[must_use]
+    pub fn unit_owners(&self) -> HashMap<String, String> {
+        self.unit_owners.clone()
     }
 
     /// Every configured `keys[].key_id`, for a startup cross-check against
@@ -936,6 +975,7 @@ mod tests {
                 units: vec![WireUnit {
                     id: "u".to_string(),
                     budget_usd_month: Some(bad),
+                    owner: None,
                 }],
                 keys: vec![],
                 prefixes: vec![],
@@ -1364,6 +1404,67 @@ mod tests {
         assert_eq!(budgets.get("treasury"), Some(&Microusd::from_usd(2000.0)));
         assert_eq!(budgets.get("ops"), Some(&Microusd::from_usd(50.0)));
         assert_eq!(budgets.get("lending"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // units[].owner (#295)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_units_owner_is_kept_verbatim() {
+        let raw = r#"{"units": [{"id": "treasury", "owner": " user://bank.example/olena "}]}"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(
+            map.unit_owner("treasury"),
+            Some(" user://bank.example/olena ")
+        );
+        assert_eq!(
+            map.unit_owners(),
+            HashMap::from([(
+                "treasury".to_string(),
+                " user://bank.example/olena ".to_string()
+            )])
+        );
+
+        // The design doc's own example (`owner` present, unpadded).
+        let doc_map = IdentityMap::parse(DESIGN_DOC_EXAMPLE).unwrap();
+        assert_eq!(
+            doc_map.unit_owner("treasury"),
+            Some("user://bank.example/olena")
+        );
+    }
+
+    #[test]
+    fn a_blank_owner_normalizes_to_absent() {
+        for owner in ["", "   ", "\n", "\t "] {
+            let raw = format!(r#"{{"units": [{{"id": "u", "owner": {owner:?}}}]}}"#);
+            let map = IdentityMap::parse(&raw).unwrap();
+            assert_eq!(
+                map.unit_owner("u"),
+                None,
+                "owner {owner:?} must normalize to absent"
+            );
+            assert!(
+                map.unit_owners().is_empty(),
+                "owner {owner:?} must not appear in unit_owners()"
+            );
+            assert!(
+                map.enabled(),
+                "a unit with a blank owner is still a configured unit"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_absent_on_an_old_map_is_none_and_unit_owners_is_empty() {
+        // A map written before this field existed.
+        let raw = r#"{"units": [{"id": "u", "budget_usd_month": 1.0}]}"#;
+        let map = IdentityMap::parse(raw).unwrap();
+        assert_eq!(map.unit_owner("u"), None);
+        assert!(map.unit_owners().is_empty());
+        assert_eq!(map.unit_budget("u"), Some(Microusd::from_usd(1.0)));
+
+        assert!(IdentityMap::default().unit_owners().is_empty());
     }
 
     // -----------------------------------------------------------------

@@ -842,15 +842,17 @@ async fn units(State(st): State<AppState>, headers: HeaderMap) -> Response {
 /// The caller org's spend rolled up by the human each run answers to, highest
 /// spend first.
 ///
-/// The owner is the root `user://` principal of the delegation chain the
-/// gateway forwards; a run whose chain named nobody rolls up under the literal
-/// `"unassigned"` rather than being dropped. Unlike `/v1/units` there are no
-/// `month_*` columns, and that absence is deliberate: nothing budgets a person,
-/// so a monthly figure here would mirror no enforcement (see `OwnerAgg`).
+/// The owner is the unit's configured owner when the gateway's identity map
+/// names one (the record's `owner`, #295), else the root `user://` principal
+/// of the delegation chain the gateway forwards; a run with neither rolls up
+/// under the literal `"unassigned"` rather than being dropped. Unlike
+/// `/v1/units` there are no `month_*` columns, and that absence is
+/// deliberate: nothing budgets a person, so a monthly figure here would
+/// mirror no enforcement (see `OwnerAgg`).
 #[utoipa::path(
     get, path = "/v1/owners",
     responses(
-        (status = 200, description = "aggregated owners, highest spend first; runs whose delegation chain named no human roll up under \"unassigned\"", body = Vec<OwnerAgg>),
+        (status = 200, description = "aggregated owners, highest spend first; runs with no unit owner and no human in their delegation chain roll up under \"unassigned\"", body = Vec<OwnerAgg>),
         (status = 401, description = "unauthorized", body = ErrorResponse),
     ),
     security(("bearer" = [])),

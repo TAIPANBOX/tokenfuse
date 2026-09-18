@@ -7149,6 +7149,60 @@ pub(crate) mod tests {
             .is_ok());
     }
 
+    /// tokenfuse#293, the appliance's numbers: the control plane showed the unit at 2145
+    /// micro-USD for the month, a central override of 0.001 USD arrived, and the gateway
+    /// refused nothing for 79 s because its own tally had restarted at zero. With the seed
+    /// the very next call is refused, and once the override is gone the seed is spend
+    /// under the file cap, not a cap of its own.
+    #[tokio::test]
+    async fn a_restarted_gateway_enforces_a_central_cap_against_the_months_seeded_tally() {
+        let sink = RecordingSink::default();
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(sink.clone()));
+        let units = Arc::clone(&st.units);
+        let now = now_millis();
+        assert_eq!(
+            units.seed_month(
+                "treasury",
+                Microusd(2_145),
+                &crate::unitledger::month_key(now),
+                now
+            ),
+            crate::unitledger::SeedOutcome::Applied
+        );
+        units.set_overrides(HashMap::from([("treasury".to_string(), Microusd(1_000))]));
+        let req = |run: &str| {
+            Request::post("/v1/messages")
+                .header("x-fuse-key", "sk-t")
+                .header("x-fuse-run-id", run)
+                .header("x-fuse-budget-usd", "5.0")
+                .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+                .body(Body::from(body(10)))
+                .unwrap()
+        };
+        let resp = call(st.clone(), req("seeded-cap-1")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "2145 seeded plus a 204 estimate is past a 1000 cap"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "unit_budget_exceeded");
+        assert!((json["error"]["budget_usd"].as_f64().unwrap() - 0.001).abs() < 1e-9);
+        assert!((json["error"]["spent_usd"].as_f64().unwrap() - 0.002145).abs() < 1e-9);
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, "unit_budget_exceeded");
+        assert_eq!(records[0].unit, "treasury");
+        // The seed is spend, not a cap: under the file cap (1 USD) there is room, and the
+        // call's settled cost lands on top of the seed.
+        units.set_overrides(HashMap::new());
+        let resp = call(st, req("seeded-cap-2")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(units.spent("treasury", now), Microusd(2_145 + 10_500));
+    }
+
     // -- one guard owns a call's reservations from the first one taken ------
     //
     // spec-guard-pr2.md section 6, E8 to E12, E20 to E22. A provider double

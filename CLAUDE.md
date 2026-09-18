@@ -613,6 +613,11 @@ build)`, `cloud apns (feature build)`.
 
    Adopted `@yurii 2026-08-05` ("merge it and add the invariant"); the wording
    and the general form above are `@claude`.
+
+   Since invariant 53 (2026-09-18) an unreachable control plane is also said
+   once per outage, at its start and at its end, by the retry queue; the
+   attempts themselves stay at debug, so this boundary is unchanged: a status
+   answer is a refusal and is never queued.
    *(test: `a_refused_push_is_visible_to_the_operator`,
    `a_control_plane_that_refuses_every_batch_is_reported_once`,
    `a_second_distinct_status_is_reported_again`,
@@ -3204,6 +3209,234 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     gate: nothing stops a third door reading the header through its own splitter, the shape
     invariant 34 names; the two doors that exist are held by their tests)*
 
+52. **A unit's month starts where the control plane left it, and a gateway that cannot ask says
+    so once.** The unit ledger is in-process and per-gateway by design (docs/20 section 3,
+    invariant 5's reason), so a restart began every unit's month at zero while the control plane
+    kept `month_spent_microusd` for the org. Measured 2026-09-17 on the appliance proving run
+    (tokenfuse#293): after `docker compose down` and `up` and two reboots the control plane showed
+    unit `aws` at 2145 micro-USD for the month; a central override of 0.001 USD, polled every 3 s,
+    refused nothing for 79 s because the gateway's own tally for the month was about 700
+    micro-USD, and an override of 0.0005 USD, below that tally, refused at once. The cap held from
+    the last restart; the control plane knew the month.
+
+    `cloudsink::seed_unit_ledger` now runs once in `serve`, inside the cloud block and only when
+    the identity map is on (the same gate as the unit-budget poller), synchronously before the
+    listener binds: one `GET {base}/v1/units` with the org key (any org key passes that route;
+    the admin key ingest needs passes it too), the whole exchange bounded by `SEED_TIMEOUT` (5 s)
+    and the body by `SEED_MAX_BODY_BYTES` (4 MiB, above what 4 096 units can answer with). For
+    every row whose `month` is this gateway's current UTC month (`unitledger::month_key`, the
+    same function on both sides), `UnitLedger::seed_month` sets the unit's committed spend to the
+    row's `month_spent_microusd`, capped or not: `set_overrides` can cap a unit the file left
+    uncapped, and a seed that existed only for capped units would be found by nothing when that
+    override arrives, which is the measured case. A row of another month, a row with no month (a
+    control plane older than the month columns), the literal `unassigned` bucket, a blank unit
+    and a negative figure are skipped and counted. `reserved` is never seeded: the reservations
+    in flight in the process that died went with it and the control plane never saw them. A
+    window already counting is never overwritten (a guard, not a path: nothing has counted
+    before the listener binds). The seed is spend, so it rolls over with the month like any other
+    spend and a later `try_reserve` admits iff seed plus own spend plus reservations plus the
+    estimate fit the cap in effect.
+
+    One INFO line names the month, the units and their figures, and every skip count. Every
+    failure (unreachable, timed out, a non-2xx, a body over the cap, a body that is not a JSON
+    array) is one WARN naming the reason, and the gateway starts with the month at zero, which is
+    what every gateway did before this. `@decided 2026-09-18`: the gateway never refuses to start
+    because the control plane cannot be reached. `@claude 2026-09-18` on the level, argued against
+    invariant 13's boundary: a failed push stays at debug because it is transient, clears without
+    anybody editing configuration and would repeat several times a second; the seed's failure is
+    none of those, nothing retries it, its consequence lasts until the next restart and no other
+    part of the estate reports it, and it is one line per process by construction. That is
+    invariant 13's own test for a warning, met.
+
+    **Where it says nothing.** Startup only: no refresh, no retry; a control plane down at startup
+    leaves the month at zero until the next restart, as before. The figure is the org's, so two
+    gateways each start from the org total and then count their own spend, which makes each more
+    conservative than before and no more consistent with the other (docs/20's non-fleet-consistency
+    stands). Clock skew: the row's `month` is the control plane's, compared with this gateway's;
+    around a month boundary the two can disagree and the row is skipped, so the new month starts
+    at zero, which is the honest figure for a month seconds old. The seed holds this gateway's
+    own pre-restart spend only insofar as it reached the control plane; records dropped or still
+    queued (invariant 53) at the restart are in neither the queue nor the seed. A control plane
+    reporting an absurd figure refuses a unit for the month, which adds no power the admin key
+    does not already have through `/v1/unit-budgets`; a negative figure is refused as hostile. The
+    run ledger still restarts at zero (D8's territory), and `unassigned` is not a unit.
+    *(tests: `unitledger::tests`: `a_seed_for_the_current_month_is_the_units_committed_spend`,
+    `a_seed_for_another_month_is_skipped`, `a_later_reservation_is_refused_at_the_seeded_tally`,
+    `a_seed_never_overwrites_a_window_already_counting`,
+    `a_seed_on_an_uncapped_unit_is_found_by_a_later_override`,
+    `a_seeded_month_rolls_over_like_any_other_spend`,
+    `seeded_tallies_refuse_exactly_at_the_cap_across_a_sweep` (200 seeds); `cloudsink::tests`:
+    `the_unit_month_is_seeded_from_the_control_plane`,
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`,
+    `a_control_plane_that_does_not_answer_in_time_leaves_the_month_at_zero`,
+    `a_control_plane_that_refuses_the_seed_is_one_warning_naming_the_status`,
+    `a_units_body_that_is_not_json_seeds_nothing`, `a_row_without_a_month_is_skipped_and_counted`,
+    `the_unassigned_bucket_is_never_seeded`, `a_negative_month_figure_is_refused_as_hostile`,
+    `an_oversized_units_body_is_refused_before_it_is_parsed`,
+    `hostile_units_bodies_never_panic_and_never_seed` (200 seeds); `proxy::tests`:
+    `a_restarted_gateway_enforces_a_central_cap_against_the_months_seeded_tally` (the issue's
+    numbers: 2145 seeded, a 1000 override, 402 with 0.001 and 0.002145, then 200 under the file
+    cap with the cost on top of the seed). Red first, @measured `cargo test -p tokenfuse-gateway
+    --lib unitledger::` and `--lib cloudsink::` and `--lib proxy::tests::a_restarted_gateway_...`
+    2026-09-18: every test names an API this change adds and is red by compile at `da0fa34`; the
+    proxy scenario with the `seed_month` call deleted reads `left: 200 right: 402` (`2145 seeded
+    plus a 204 estimate is past a 1000 cap`), the appliance's 79 seconds in one line. Mutants,
+    @measured 2026-09-18: M52-1 (`apply_unit_months` reads `spent_microusd`, the all-time figure,
+    instead of `month_spent_microusd`) caught by `the_unit_month_is_seeded_from_the_control_plane`
+    (`aws` reads 999999 instead of 2145); M52-2 (the month check removed) caught by
+    `a_seed_for_another_month_is_skipped` when planted inside `seed_month` itself (`Applied` where
+    `OtherMonth` was expected); the redundant check in `apply_unit_months` duplicates it and is
+    not independently observable through `a_row_without_a_month_is_skipped_and_counted`, since
+    `seed_month`'s own check still catches an unmatched row; M52-3 (`seed_month` writes
+    `s.reserved` instead of `s.spent`) caught by
+    `a_seed_for_the_current_month_is_the_units_committed_spend` (`spent` reads 0) and
+    `a_later_reservation_is_refused_at_the_seeded_tally` (`Err.spent` reads 0); M52-4 (the
+    unreachable arm panics instead of warning) caught by
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`
+    (the test itself panics, which is cargo reporting the test binary dying, loudly either way);
+    M52-5 (the INFO line deleted) caught by `the_unit_month_is_seeded_from_the_control_plane`
+    (`left: 0 right: 1` on the `SEEDED` line count); M52-6 (the WARN line deleted) caught by
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`
+    (`left: 0 right: 1` on the `NOT_SEEDED` line count); M52-7 (`main.rs` seeds only capped units,
+    or not at all) is not reachable by a unit test, held by reading the diff, the live check is
+    the appliance run and it is not re-run here.
+    Scenarios: `features/the-unit-month-survives-a-restart.feature`, six, each bound. Not a
+    script gate: the wiring in `main.rs` is held by reading and by the appliance run, not by a
+    test)*
+
+53. **Telemetry that cannot reach the control plane is queued and replayed in order, and the
+    outage is said once at each end.** `CloudSink::ship` dropped a batch whose `send()` returned
+    `Err` after one debug line, so an outage of the control plane cost the org exactly the spend
+    made during it, silently. Measured 2026-09-17 on the appliance proving run (tokenfuse#294):
+    `tokenfuse-cloud` stopped for about 40 s, three calls served (`200`, allowed by the policy
+    plane), and after it came back `/v1/units` for the unit stayed at 72 calls while forty later
+    calls raised it to 112; the log said nothing in that window.
+
+    A push is now one of three things. Accepted: nothing said, as before. Refused (any status the
+    control plane answers with, 5xx included): dropped and reported once per status, invariant 13
+    byte for byte, never queued. Unreachable (`send()` returned `Err`: refused connection, reset,
+    closed before the answer, DNS, or `PUSH_TIMEOUT`, 10 s, elapsed): the batch goes into an
+    in-memory `VecDeque` of `QUEUE_CAP` (10 000) records, oldest dropped first past the cap. While
+    the queue holds anything, every new batch is appended behind it so replay stays in order; a
+    batch that failed on the fast path goes to the FRONT, because it was taken while the queue
+    was empty and so before everything appended since. One drainer at a time
+    (`compare_exchange` on a flag) pops `BATCH`-sized chunks from the front, POSTs each, and on
+    the first transport failure puts the chunk back at the front and stops; a refusal during
+    replay drops that chunk and goes on, because the plane is answering. The drain is attempted
+    on every `ship` and every `flush`, so the 2 s flush tick in `main.rs` is the retry cadence.
+    `record()` and `flush()` stay sync: two std mutexes, a spawn, and the queue's lock is never
+    held across an await, so the request path never waits for the network (invariant 13's tests
+    hold that the refusal path is unchanged; the timing guard below holds the rest).
+
+    Sizing, read off the code rather than chosen: a `CallRecord` is 272 bytes of struct plus its
+    strings, about 0.5 KiB, 4.5 KiB with a 4 KiB chain, so the cap is about 5 MB and at most
+    about 45 MB; in time, 26 s at BENCHMARKS.md's 384 req/s ceiling on a 2 vCPU box, 100 s at 100
+    calls/s, 17 minutes at 10 calls/s, days at the appliance's rate; the measured 40 s outage
+    fits at up to 250 calls/s. Three lines, once per outage: WARN when records start being
+    queued (naming the cap and the error), WARN at the first drop (naming the count), INFO when
+    the queue is empty again (replayed and dropped counts); every further attempt and drop of the
+    same outage logs at debug, the shape invariant 13 set. `@decided 2026-09-18`: a status answer
+    is a refusal, warned once per status, never queued; no agent-event type for the sink (SPEC
+    6.1, it has no agent subject).
+
+    **Where it says nothing.** `/v1/ingest` has no idempotency key, so a batch whose POST reached
+    the plane and whose answer was lost (the timeout case) is counted twice on replay; a restart
+    loses the queue, and the Parquet trace is the durable record; batches already in flight when
+    an outage begins may replay in either order relative to each other, which is the order the
+    fast path never promised; the drain is single file, so a slow plane bounds replay at `BATCH`
+    per round trip; a chunk refused during replay is counted in neither figure, invariant 13's
+    line is its report; the cap and both timeouts are constants, and making any of them a
+    variable is a `components.json`, `tests/manifest.rs` and `compat/1.0.json` decision not
+    taken here.
+    *(tests: `cloudsink::tests`: `records_pushed_during_an_outage_arrive_in_order_after_recovery`,
+    `one_transition_line_per_outage`, `the_cap_drops_the_oldest_and_says_so_once` (10 025 records
+    against the real cap), `a_refusal_is_never_queued`,
+    `a_push_that_never_gets_an_answer_is_bounded_and_queued`,
+    `a_drain_that_fails_midway_keeps_the_rest_in_order`,
+    `record_and_flush_return_without_waiting_for_the_control_plane` (2 s bound against a 10 s
+    stall), and the five invariant-13 tests unchanged; the control plane in these is a raw TCP
+    stub that can close a connection before answering, which no handler can. Red first,
+    @measured `cargo test -p tokenfuse-gateway --lib cloudsink::tests::trimmed` 2026-09-18: a
+    trimmed form of the order test (`queued()` replaced by a fixed 200 ms sleep, since `queued()`
+    is an API this change adds) panicked `timed out waiting for every record to arrive` against
+    the commit-1 tree, zero bodies received: the batches were silently dropped, as invariant 13
+    always did for an unreachable push; the seven real tests each name `queued()` or
+    `with_options` and are red by compile at that same tree. Mutants, @measured 2026-09-18:
+    M53-1 (`drain()` body replaced by `return`, never drained) caught by
+    `records_pushed_during_an_outage_arrive_in_order_after_recovery` (times out, 0 received);
+    M53-2 (LIFO: `pop_front_chunk` drains from the back) caught by the same test's in-order
+    assertion and by `a_drain_that_fails_midway_keeps_the_rest_in_order`; M53-3 (the cap never
+    trips, `truncate_front` returns 0) caught by `the_cap_drops_the_oldest_and_says_so_once`
+    (times out waiting for the queue to settle at the cap); M53-4 (drops not reported,
+    `note_dropped` a no-op) caught by the same test (times out waiting for the debug-level drop
+    line); M53-5 (a refusal queued, either `Refused` arm calling `push_front_capped`) caught by
+    `a_control_plane_that_refuses_every_batch_is_reported_once`, which never completes (the
+    refused chunk is popped, refused, and requeued forever); M53-6 (the transition line per
+    attempt, the `outage.swap` guard removed) caught by `one_transition_line_per_outage` (3 WARN
+    lines, not 1); M53-7 (`flush()` loses its `self.drain()`) caught by the same test (times out
+    waiting for the drained line); the order test does not reliably catch M53-7 on its own in
+    this implementation, because the preceding push already leaves a drain task in flight that
+    happens to pick up the reconnect, which is read from the run rather than assumed. Scenarios:
+    `features/telemetry-survives-a-control-plane-outage.feature`, six, each bound. Not
+    a script gate)*
+
+54. **The unit's owner rides the telemetry the gateway already pushes, and the control plane's
+    owner view reads it before the chain.** `RunAgg.owner` was filled from one source, the root
+    `user://` of the caller-declared `x-fuse-on-behalf-of` chain, and the identity map's
+    `units[].owner` was parsed and dropped (`WireUnit` omitted it on purpose). Measured 2026-09-17
+    on the appliance proving run (tokenfuse#295): both maps named an owner per unit; after 272
+    calls across four agents `GET /v1/owners` returned one row, `unassigned`, and the console's
+    Money view the same, while `/v1/units` attributed every call.
+
+    `IdentityMap` now keeps `units[].owner` (blank normalised to absent, a present value verbatim,
+    the `created` rule) and hands `unit_owners()` to the sink once at startup. The sink pushes
+    each record as `WireRecord`, the `CallRecord` flattened plus `owner`, so the JSON gains one
+    additive key beside the sixteen and the trace's shape is untouched (`@decided 2026-09-18`:
+    no Parquet column, `compat/1.0.json` unchanged, invariant 38's 116 construction sites
+    untouched). The control plane's ingest DTO gains `owner` with `#[serde(default)]`, and the
+    fold reads it first: `@claude 2026-09-18`, the row's owner is operator configuration resolved
+    server-side, the chain is a header the caller writes and the plane cannot tell a proven chain
+    from a claimed one on the wire (invariant 15's reason), so the chain fills the gap and never
+    overrides. A deployment naming no unit owner pushes `owner: ""` on every record and
+    aggregates exactly as before: the three owner tests that predate this are that proof.
+
+    **Where it says nothing.** Across the calls of one run the last non-empty row wins, as for
+    `unit` and `agent_id`, so a run whose calls resolve to two units with different owners lands
+    under the later one; a run whose calls carried no unit owner still answers to the chain's
+    root human, as before. The field is not a Parquet column, so `tokenfuse sql` and
+    `focus-export` do not see it (the identity map is the source there). The map is loaded once,
+    so an owner changed in the file reaches the wire at the next restart, like every other map
+    change. `http.rs`'s `/v1/owners` description names both sources; nothing generated from the
+    spec lives in this repository (CI validates and uploads it, the dashboard has no generated
+    client), and an external client sees an optional string.
+    *(tests: `identitymap::tests`: `a_units_owner_is_kept_verbatim`,
+    `a_blank_owner_normalizes_to_absent`,
+    `owner_absent_on_an_old_map_is_none_and_unit_owners_is_empty`; `cloudsink::tests`:
+    `the_wire_record_carries_the_units_owner_beside_every_existing_field` (seventeen keys, the
+    sixteen equal to the record's own serialisation),
+    `a_unit_without_an_owner_and_a_record_without_a_unit_carry_an_empty_owner`; `cloud::store`:
+    `deserializes_owner_and_defaults_it_for_an_older_gateway`,
+    `a_row_carrying_a_unit_owner_lands_under_it_in_owners`,
+    `a_row_without_a_unit_owner_falls_back_to_the_chains_root_human`,
+    `the_units_owner_outranks_the_callers_chain`, and the three existing owner tests green. Red
+    first, @measured `cargo test -p tokenfuse-cloud --lib` and `cargo test -p tokenfuse-gateway
+    --lib` 2026-09-18: `a_row_carrying_a_unit_owner_lands_under_it_in_owners` at `da0fa34` reads
+    `left: "unassigned" right: "user://customer.example/platform-lead"`;
+    `the_units_owner_outranks_the_callers_chain` reads `left: "user://acme/alice" right:
+    "user://customer.example/finops-lead"`; the rest are red by compile (`no method named
+    unit_owner`/`unit_owners` found for `IdentityMap`; `use of undeclared type HashMap` and `wire
+    not found in this scope` in `cloudsink.rs`; `no field owner on type store::CallRecord`).
+    Mutants, @measured 2026-09-18: M54-1 (`wire` ignores the map, `owner: ""` always) caught by
+    `the_wire_record_carries_the_units_owner_beside_every_existing_field`; M54-2 (the fold reads
+    the chain first) caught by `the_units_owner_outranks_the_callers_chain`; M54-3
+    (`#[serde(flatten)]` removed, the record nests under `rec`) caught by the same test's 17-key
+    count (`left: 2 right: 17`); M54-4 (`#[serde(default)]` removed from the DTO field) caught by
+    `deserializes_owner_and_defaults_it_for_an_older_gateway` and the existing
+    `deserializes_without_agent_passport_fields_for_backward_compat` (both refuse to parse
+    `{"run_id": "r1"}`, `missing field owner`); M54-5 (`main.rs` drops `.with_unit_owners(..)`) is
+    not reachable by a unit test, held by reading the diff, not re-run here. Scenarios:
+    `features/the-unit-owner-reaches-the-control-plane.feature`, four, each bound. Not a script
+    gate: `main.rs` handing the map to the sink is held by reading, not by a test)*
 55. **Usage is read from SSE events, not from lines.** (Numbered 55 because two sibling changes in flight from the same base on 2026-09-18 take 52 to 54 and 60; the number is the only thing the three share.) An SSE event's data is its `data` fields' values joined with LF, and no rule says any one line is a JSON document on its own; `UsageParser::finish` parsed each `data:` line as one, so an event carrying its usage object across two lines lost the object while the lines that did parse kept their figures, and the settlement was `Parsed` rather than the estimate (F06 of the 2026-09-18 money-path review, @measured by the review at 80e0d42 and again here at `da0fa34`: the Anthropic door on `claude-sonnet` consuming a `message_delta` split across two `data:` lines settled 30 micro-USD against 15030, the whole output cost gone with nothing to say so). Since 2026-09-18 `finish` reads the buffered body as an event stream first, by the WHATWG event-stream grammar (`split_sse_events`, `provider.rs`): a line ends at CRLF, LF or CR; a line starting with `:` is a comment; the field is the text before the first colon and the value the text after it with exactly one leading space removed; a `data` field appends its value and an LF to the data buffer; `event`, `id`, `retry` and every other field leave the buffer alone; a blank line dispatches the buffer less its trailing LF, and a buffer that is then empty dispatches nothing. Each dispatched event is one JSON document, handed once to `merge_usage` and once to `ToolCallCounter::observe_streaming`; an event whose whole data is `[DONE]` is OpenAI's sentinel and is skipped; an event that does not parse is skipped, its siblings are not. A body in which no `data` field appears is one JSON document, as before. Two departures from the browser algorithm, `@fable` 2026-09-18, both in the direction of not losing an event: a final event the body ends without a blank line for IS dispatched, because at end of body nothing can follow it, a provider that omits the last blank line is a shape the line parser accepted, and on the Anthropic wire that last event is the `message_delta` carrying the cumulative `output_tokens`, exactly the figure F06 loses; and a `data:` line whose JSON does not parse is skipped rather than failing the body, because the events that did parse are real money and settlement already has its own rule for a body that reported nothing (invariant 43). A body cut by the cap is `truncated` and nothing parsed from it is priced or recorded, whatever the splitter made of the cut event (invariant 38: `settle_amount`'s first branch runs before it looks at the usage). The MCP live-scan client's own frame reader (`mcpclient::parse_sse_frames`) calls the same splitter rather than keeping its copy of the rules. The OpenAI netting state the same review found broken in one order (F05) is invariant 45's text, amended the same day.
 
     **Where it says nothing.** No real Anthropic or OpenAI stream has been observed carrying a multi-line `data` event; both emit one compact line per event as far as anyone here has measured, so this closes a contract, not a reproduced loss. An event whose JSON fails to parse is skipped silently, with no counter and no log line; a stream whose usage event an intermediary broke into non-JSON pieces settles on whatever else parsed, or on the estimate. The parser is still buffered (`CAP`, invariant 38); an incremental SSE parser is out of scope. `event:` names are read by nobody, so a provider that put usage under an event type with an empty `data` is one nothing here can price. Leading whitespace before a field name is stripped before the name is compared, as the line parser always did (no provider is known to indent, and a test pins the tolerance); a whitespace-only line is a field line with an empty name, not a blank line, so it never dispatches or splits an event.
