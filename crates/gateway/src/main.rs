@@ -1185,7 +1185,10 @@ async fn serve() {
                     },
                 );
             }
-            let cloud = Arc::new(tokenfuse_gateway::cloudsink::CloudSink::new(base, key));
+            let cloud = Arc::new(
+                tokenfuse_gateway::cloudsink::CloudSink::new(base, key)
+                    .with_unit_owners(state.identity.unit_owners()),
+            );
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();
             tokio::spawn(async move {

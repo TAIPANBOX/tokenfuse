@@ -3204,6 +3204,63 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     gate: nothing stops a third door reading the header through its own splitter, the shape
     invariant 34 names; the two doors that exist are held by their tests)*
 
+54. **The unit's owner rides the telemetry the gateway already pushes, and the control plane's
+    owner view reads it before the chain.** `RunAgg.owner` was filled from one source, the root
+    `user://` of the caller-declared `x-fuse-on-behalf-of` chain, and the identity map's
+    `units[].owner` was parsed and dropped (`WireUnit` omitted it on purpose). Measured 2026-09-17
+    on the appliance proving run (tokenfuse#295): both maps named an owner per unit; after 272
+    calls across four agents `GET /v1/owners` returned one row, `unassigned`, and the console's
+    Money view the same, while `/v1/units` attributed every call.
+
+    `IdentityMap` now keeps `units[].owner` (blank normalised to absent, a present value verbatim,
+    the `created` rule) and hands `unit_owners()` to the sink once at startup. The sink pushes
+    each record as `WireRecord`, the `CallRecord` flattened plus `owner`, so the JSON gains one
+    additive key beside the sixteen and the trace's shape is untouched (`@decided 2026-09-18`:
+    no Parquet column, `compat/1.0.json` unchanged, invariant 38's 116 construction sites
+    untouched). The control plane's ingest DTO gains `owner` with `#[serde(default)]`, and the
+    fold reads it first: `@claude 2026-09-18`, the row's owner is operator configuration resolved
+    server-side, the chain is a header the caller writes and the plane cannot tell a proven chain
+    from a claimed one on the wire (invariant 15's reason), so the chain fills the gap and never
+    overrides. A deployment naming no unit owner pushes `owner: ""` on every record and
+    aggregates exactly as before: the three owner tests that predate this are that proof.
+
+    **Where it says nothing.** Across the calls of one run the last non-empty row wins, as for
+    `unit` and `agent_id`, so a run whose calls resolve to two units with different owners lands
+    under the later one; a run whose calls carried no unit owner still answers to the chain's
+    root human, as before. The field is not a Parquet column, so `tokenfuse sql` and
+    `focus-export` do not see it (the identity map is the source there). The map is loaded once,
+    so an owner changed in the file reaches the wire at the next restart, like every other map
+    change. `http.rs`'s `/v1/owners` description names both sources; nothing generated from the
+    spec lives in this repository (CI validates and uploads it, the dashboard has no generated
+    client), and an external client sees an optional string.
+    *(tests: `identitymap::tests`: `a_units_owner_is_kept_verbatim`,
+    `a_blank_owner_normalizes_to_absent`,
+    `owner_absent_on_an_old_map_is_none_and_unit_owners_is_empty`; `cloudsink::tests`:
+    `the_wire_record_carries_the_units_owner_beside_every_existing_field` (seventeen keys, the
+    sixteen equal to the record's own serialisation),
+    `a_unit_without_an_owner_and_a_record_without_a_unit_carry_an_empty_owner`; `cloud::store`:
+    `deserializes_owner_and_defaults_it_for_an_older_gateway`,
+    `a_row_carrying_a_unit_owner_lands_under_it_in_owners`,
+    `a_row_without_a_unit_owner_falls_back_to_the_chains_root_human`,
+    `the_units_owner_outranks_the_callers_chain`, and the three existing owner tests green. Red
+    first, @measured `cargo test -p tokenfuse-cloud --lib` and `cargo test -p tokenfuse-gateway
+    --lib` 2026-09-18: `a_row_carrying_a_unit_owner_lands_under_it_in_owners` at `da0fa34` reads
+    `left: "unassigned" right: "user://customer.example/platform-lead"`;
+    `the_units_owner_outranks_the_callers_chain` reads `left: "user://acme/alice" right:
+    "user://customer.example/finops-lead"`; the rest are red by compile (`no method named
+    unit_owner`/`unit_owners` found for `IdentityMap`; `use of undeclared type HashMap` and `wire
+    not found in this scope` in `cloudsink.rs`; `no field owner on type store::CallRecord`).
+    Mutants, @measured 2026-09-18: M54-1 (`wire` ignores the map, `owner: ""` always) caught by
+    `the_wire_record_carries_the_units_owner_beside_every_existing_field`; M54-2 (the fold reads
+    the chain first) caught by `the_units_owner_outranks_the_callers_chain`; M54-3
+    (`#[serde(flatten)]` removed, the record nests under `rec`) caught by the same test's 17-key
+    count (`left: 2 right: 17`); M54-4 (`#[serde(default)]` removed from the DTO field) caught by
+    `deserializes_owner_and_defaults_it_for_an_older_gateway` and the existing
+    `deserializes_without_agent_passport_fields_for_backward_compat` (both refuse to parse
+    `{"run_id": "r1"}`, `missing field owner`); M54-5 (`main.rs` drops `.with_unit_owners(..)`) is
+    not reachable by a unit test, held by reading the diff, not re-run here. Scenarios:
+    `features/the-unit-owner-reaches-the-control-plane.feature`, four, each bound. Not a script
+    gate: `main.rs` handing the map to the sink is held by reading, not by a test)*
 55. **Usage is read from SSE events, not from lines.** (Numbered 55 because two sibling changes in flight from the same base on 2026-09-18 take 52 to 54 and 60; the number is the only thing the three share.) An SSE event's data is its `data` fields' values joined with LF, and no rule says any one line is a JSON document on its own; `UsageParser::finish` parsed each `data:` line as one, so an event carrying its usage object across two lines lost the object while the lines that did parse kept their figures, and the settlement was `Parsed` rather than the estimate (F06 of the 2026-09-18 money-path review, @measured by the review at 80e0d42 and again here at `da0fa34`: the Anthropic door on `claude-sonnet` consuming a `message_delta` split across two `data:` lines settled 30 micro-USD against 15030, the whole output cost gone with nothing to say so). Since 2026-09-18 `finish` reads the buffered body as an event stream first, by the WHATWG event-stream grammar (`split_sse_events`, `provider.rs`): a line ends at CRLF, LF or CR; a line starting with `:` is a comment; the field is the text before the first colon and the value the text after it with exactly one leading space removed; a `data` field appends its value and an LF to the data buffer; `event`, `id`, `retry` and every other field leave the buffer alone; a blank line dispatches the buffer less its trailing LF, and a buffer that is then empty dispatches nothing. Each dispatched event is one JSON document, handed once to `merge_usage` and once to `ToolCallCounter::observe_streaming`; an event whose whole data is `[DONE]` is OpenAI's sentinel and is skipped; an event that does not parse is skipped, its siblings are not. A body in which no `data` field appears is one JSON document, as before. Two departures from the browser algorithm, `@fable` 2026-09-18, both in the direction of not losing an event: a final event the body ends without a blank line for IS dispatched, because at end of body nothing can follow it, a provider that omits the last blank line is a shape the line parser accepted, and on the Anthropic wire that last event is the `message_delta` carrying the cumulative `output_tokens`, exactly the figure F06 loses; and a `data:` line whose JSON does not parse is skipped rather than failing the body, because the events that did parse are real money and settlement already has its own rule for a body that reported nothing (invariant 43). A body cut by the cap is `truncated` and nothing parsed from it is priced or recorded, whatever the splitter made of the cut event (invariant 38: `settle_amount`'s first branch runs before it looks at the usage). The MCP live-scan client's own frame reader (`mcpclient::parse_sse_frames`) calls the same splitter rather than keeping its copy of the rules. The OpenAI netting state the same review found broken in one order (F05) is invariant 45's text, amended the same day.
 
     **Where it says nothing.** No real Anthropic or OpenAI stream has been observed carrying a multi-line `data` event; both emit one compact line per event as far as anyone here has measured, so this closes a contract, not a reproduced loss. An event whose JSON fails to parse is skipped silently, with no counter and no log line; a stream whose usage event an intermediary broke into non-JSON pieces settles on whatever else parsed, or on the estimate. The parser is still buffered (`CAP`, invariant 38); an incremental SSE parser is out of scope. `event:` names are read by nobody, so a provider that put usage under an event type with an empty `data` is one nothing here can price. Leading whitespace before a field name is stripped before the name is compared, as the line parser always did (no provider is known to indent, and a test pins the tolerance); a whitespace-only line is a field line with an empty name, not a blank line, so it never dispatches or splits an event.

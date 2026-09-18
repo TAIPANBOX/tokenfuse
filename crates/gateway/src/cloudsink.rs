@@ -7,7 +7,7 @@
 //! `TOKENFUSE_CLOUD_URL` + `TOKENFUSE_CLOUD_KEY`; composes with other sinks via
 //! `TeeSink`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -26,11 +26,40 @@ pub struct CloudSink {
     /// plane that refuses every batch costs one warning per distinct status
     /// rather than one per batch. See [`report_refusal`].
     reported: Arc<Mutex<HashSet<u16>>>,
+    /// `unit -> owner`, taken from the identity map once at startup (#295).
+    /// Empty on a sink built without [`CloudSink::with_unit_owners`], which
+    /// pushes `owner: ""` on every record.
+    unit_owners: Arc<HashMap<String, String>>,
+}
+
+/// One record on the wire: every `CallRecord` field as it is (the trace's
+/// shape, invariant 6, frozen in `compat/1.0.json`) plus the unit's owner
+/// beside them (#295). `flatten` is what keeps the sixteen where they are and
+/// keeps `owner` off the Parquet row: the trace never sees this struct.
+#[derive(Serialize)]
+struct WireRecord<'a> {
+    #[serde(flatten)]
+    rec: &'a CallRecord,
+    /// `units[].owner` for `rec.unit` from the identity map, `""` when the
+    /// map is off, the call resolved to no unit, or the unit names nobody.
+    owner: &'a str,
 }
 
 #[derive(Serialize)]
 struct Batch<'a> {
-    records: &'a [CallRecord],
+    records: Vec<WireRecord<'a>>,
+}
+
+/// Every unit that names an owner, `unit -> owner`, taken from the identity
+/// map once at startup (`IdentityMap::unit_owners`).
+fn wire<'a>(records: &'a [CallRecord], owners: &'a HashMap<String, String>) -> Vec<WireRecord<'a>> {
+    records
+        .iter()
+        .map(|rec| WireRecord {
+            rec,
+            owner: owners.get(&rec.unit).map(String::as_str).unwrap_or(""),
+        })
+        .collect()
 }
 
 impl CloudSink {
@@ -45,7 +74,17 @@ impl CloudSink {
             client: reqwest::Client::new(),
             buf: Mutex::new(Vec::new()),
             reported: Arc::new(Mutex::new(HashSet::new())),
+            unit_owners: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Hand the sink the identity map's `unit -> owner` pairs (#295). Chainable,
+    /// called once in `main.rs` before the sink is shared; a sink built without
+    /// it pushes `owner: ""` on every record, which is what a gateway older
+    /// than this field's reader is taken to mean.
+    pub fn with_unit_owners(mut self, owners: HashMap<String, String>) -> Self {
+        self.unit_owners = Arc::new(owners);
+        self
     }
 
     /// POST a batch in the background. Best-effort: nothing is retried, and a
@@ -57,8 +96,11 @@ impl CloudSink {
         }
         let (client, url, key) = (self.client.clone(), self.url.clone(), self.key.clone());
         let reported = Arc::clone(&self.reported);
+        let owners = Arc::clone(&self.unit_owners);
         tokio::spawn(async move {
-            let payload = match serde_json::to_vec(&Batch { records: &records }) {
+            let payload = match serde_json::to_vec(&Batch {
+                records: wire(&records, &owners),
+            }) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!("cloud telemetry encode failed: {e}");
@@ -418,6 +460,64 @@ mod tests {
             received.load(Ordering::SeqCst) >= n
         })
         .await;
+    }
+
+    // --- the owner rides the wire (#295) ------------------------------------
+
+    #[test]
+    fn the_wire_record_carries_the_units_owner_beside_every_existing_field() {
+        let mut r = one_record();
+        r.unit = "treasury".into();
+        let owners = HashMap::from([(
+            "treasury".to_string(),
+            "user://bank.example/olena".to_string(),
+        )]);
+        let v = serde_json::to_value(Batch {
+            records: wire(&[r.clone()], &owners),
+        })
+        .unwrap();
+        let rec = v["records"][0].as_object().unwrap();
+        assert_eq!(rec.len(), 17, "sixteen record fields plus owner: {rec:?}");
+        assert_eq!(rec["owner"], "user://bank.example/olena");
+
+        // Every field the plain record serialises to must survive the
+        // flatten unchanged, `tool_calls: null` included.
+        let plain = serde_json::to_value(&r).unwrap();
+        let plain = plain.as_object().unwrap();
+        assert_eq!(plain.len(), 16);
+        for (k, val) in plain {
+            assert_eq!(&rec[k], val, "field {k} must survive the flatten unchanged");
+        }
+    }
+
+    #[test]
+    fn a_unit_without_an_owner_and_a_record_without_a_unit_carry_an_empty_owner() {
+        let owners = HashMap::from([(
+            "treasury".to_string(),
+            "user://bank.example/olena".to_string(),
+        )]);
+
+        // A unit the owners map names nobody for.
+        let mut lending = one_record();
+        lending.unit = "lending".into();
+        let v = serde_json::to_value(Batch {
+            records: wire(&[lending], &owners),
+        })
+        .unwrap();
+        let rec = v["records"][0].as_object().unwrap();
+        assert_eq!(rec.len(), 17);
+        assert_eq!(rec["owner"], "");
+
+        // A record that resolved to no unit at all.
+        let mut no_unit = one_record();
+        no_unit.unit = String::new();
+        let v = serde_json::to_value(Batch {
+            records: wire(&[no_unit], &owners),
+        })
+        .unwrap();
+        let rec = v["records"][0].as_object().unwrap();
+        assert_eq!(rec.len(), 17);
+        assert_eq!(rec["owner"], "");
     }
 
     // --- the tests ---------------------------------------------------------
