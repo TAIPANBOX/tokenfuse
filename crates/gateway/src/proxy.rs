@@ -1575,6 +1575,10 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     // decides on `Drop` what each outcome is charged, rather than whoever
     // happened to remember to call settle. `router_route` moves in by value:
     // the guard is the only place that writes the `allow` row from now on.
+    // On a streamed request it is `None`, so that row's `saved_microusd`
+    // stays the zero the streaming guard hard-coded before this change: a
+    // routed stream's avoided spend is not counted, exactly as before, and
+    // counting it is a separate decision, not this change's.
     let mut guard = SettleGuard::new(
         st.ledger.clone(),
         st.units.clone(),
@@ -1592,7 +1596,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             outcome: outcome_tag.clone(),
             key_id: key_id.clone(),
             unit: unit.clone(),
-            router_route,
+            router_route: if parsed.stream { None } else { router_route },
         },
         unit_reservation,
     );
@@ -3360,14 +3364,28 @@ pub(crate) mod tests {
             .body(Body::from(body(500)))
             .unwrap();
 
-        let resp = call(st, req).await;
+        let resp = call(st.clone(), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse").unwrap(), "managed");
         assert!(resp.headers().contains_key("x-fuse-cost-usd"));
+        // The step the reservation was admitted at, not a constant: the guard
+        // copies it in `hold_run` (invariant 50), and a second call on the
+        // same run must read 2.
+        assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "1");
 
         let snap = ledger.snapshot("run-1").await.unwrap();
         assert!(snap.spent > Microusd::ZERO);
         assert_eq!(snap.steps, 1);
+
+        let again = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-1")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, again).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "2");
+        assert_eq!(ledger.snapshot("run-1").await.unwrap().steps, 2);
     }
 
     #[tokio::test]
@@ -5919,7 +5937,7 @@ pub(crate) mod tests {
     async fn client_cancel_midstream_still_settles() {
         use futures::StreamExt;
         // A managed streaming reservation whose body is only partially consumed
-        // (client disconnects) must still be settled — reservation released,
+        // (client disconnects) must still be settled - reservation released,
         // charged the estimate (invariant 50: `Started`, not `Unknown` - the
         // provider already answered 2xx by the time the guard is built here).
         let st = state(
@@ -7176,7 +7194,14 @@ pub(crate) mod tests {
     ///
     /// Compile-red at e25835c: `AppState.retained` does not exist there.
     #[tokio::test]
+    // Emits a `retained:` warn into the process-wide captured log that
+    // `settle::tests` E13/E14 read, so it holds their lock. Single-threaded
+    // `block_on` runtime, never contended by another task: safe across the
+    // awaits below despite the lint (same as
+    // `outcome_header_over_cap_is_dropped_not_recorded`).
+    #[allow(clippy::await_holding_lock)]
     async fn a_cancel_while_the_provider_holds_the_request_retains_both_ledgers() {
+        let _serial = crate::testlog::log_lock();
         let sink = RecordingSink::default();
         let mut st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
             .with_sink(Arc::new(sink.clone()));
@@ -7318,7 +7343,10 @@ pub(crate) mod tests {
     /// e25835c: the JSON has no `retained` member at all, so indexing it
     /// reads `Value::Null`, never `1`.
     #[tokio::test]
+    // Same `retained:` warn, same lock, same reason as E8 above.
+    #[allow(clippy::await_holding_lock)]
     async fn a_retained_reservation_is_listed_on_the_runs_endpoint() {
+        let _serial = crate::testlog::log_lock();
         let st = state(Mode::Enforce, StubProvider::default());
         let plain_req = Request::post("/v1/messages")
             .header("x-fuse-run-id", "plain")

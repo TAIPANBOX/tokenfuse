@@ -186,7 +186,9 @@ pub struct CallAttribution {
     pub unit: String,
     /// `Some((original, chosen))` when the FinOps router rewrote the model: the row's
     /// `saved_microusd` is what the original would have cost minus what the chosen one did,
-    /// for the settled usage. `None` on the streaming path and when nothing was routed.
+    /// for the settled usage. `None` when nothing was routed, and `None` on the streaming
+    /// path by `handle`'s choice: a routed stream keeps the zero its row carried before the
+    /// row moved in here, and counting its avoided spend is a separate decision.
     pub router_route: Option<(String, String)>,
 }
 
@@ -342,7 +344,12 @@ impl SettleGuard {
     }
 
     /// A status line arrived, with the slot the provider will fill at the end of the body.
-    /// A status `StatusCode` cannot parse is not a success.
+    /// A status `StatusCode` cannot parse (outside 100..=999) is not a success here, so the
+    /// ledger treats it as a refusal and charges nothing unpriced, while `stream_managed` and
+    /// `buffered_managed` answer the client with `200` for the same value
+    /// (`from_u16(..).unwrap_or(StatusCode::OK)`). The two
+    /// readings cannot meet through `HttpProvider`: its statuses come from reqwest and are
+    /// always valid, so only a test double can produce one.
     pub fn answered(&mut self, status: u16, usage: UsageSlot) {
         debug_assert_eq!(self.state, CallOutcome::Unknown);
         let ok = StatusCode::from_u16(status)
@@ -488,7 +495,8 @@ impl SettleGuard {
 
     /// The `allow` row, ONE site for both paths (S5). `saved_microusd` is the router's
     /// avoided spend, verbatim the arithmetic that sat in `buffered_managed` at e25835c
-    /// (`proxy.rs:2202-2213`), zero on the streaming path where `router_route` is `None`.
+    /// (`proxy.rs:2202-2213`), zero on the streaming path where `handle` passes `router_route`
+    /// as `None` whatever the router did (the zero that path hard-coded before).
     fn record_row(&self, run: &Reservation, actual: Microusd, usage: &Usage) {
         let a = &self.attribution;
         let saved = match &a.router_route {
@@ -1366,6 +1374,10 @@ mod tests {
     /// outstanding.
     #[test]
     fn the_run_and_unit_ledgers_agree_in_every_terminal_state() {
+        // The `Unknown` row writes a `retained:` warn into the process-wide
+        // captured log; serialised so E13/E14's reads of that buffer never
+        // count this test's line.
+        let _serial = crate::testlog::log_lock();
         struct Row {
             name: &'static str,
             status: Option<u16>,

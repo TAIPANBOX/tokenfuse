@@ -2967,7 +2967,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     RETAINED: neither settled nor released, listed in `AppState.retained`, shown on
     `GET /v1/runs` as `retained` and `retained_usd`, and warned about with the run, the
     reservation id, the amount and the unit. The `allow` trace row is written by the guard in one
-    site for both paths; a call that ends before the provider answers writes no row.
+    site for both paths; a call that ends before the provider answers writes no row. On the
+    streaming path that row's `saved_microusd` stays the zero it carried before the move:
+    `handle` passes no `router_route` for a streamed request, so a routed stream's avoided spend
+    is not counted, as before, and counting it is a separate decision.
 
     `@decided 2026-09-17`: a call cancelled before the provider answered leaves no trace row,
     like the send-error arm. `@decided 2026-09-18`: a call whose outcome is unknown after dispatch
@@ -3034,9 +3037,14 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     unavailable, so reserve estimate must not become a zero settlement" (left: `Microusd(0)`,
     right: `Microusd(11535)`); the three held controls (E5, E6, E7) were already green, unaffected
     by this change. The temporary `proxy::tests` (no `st.retained`, no `UnitLedger::reserved`, both
-    added later in the same commit) read: `a_cancel_while_the_body_is_being_collected_...` left
-    `Microusd(0)` right `Microusd(8657)` (released where the fix charges the estimate);
-    `a_2xx_whose_body_breaks_settles_the_estimate_...` the same left/right; the shadow twin left
+    added later in the same commit) read: `a_cancel_while_the_body_is_being_collected_...`
+    panicked "released, not leaked" on `worker.reserved`, left `Microusd(8657)` right
+    `Microusd(0)`: at e25835c a cancel during `collect` LEAKED the reservation (reserved 8657,
+    spent 0, F03's shape) where the fix charges the estimate (@measured
+    `cargo test -p tokenfuse-gateway --lib a_cancel_while_the_body_is_being_collected` on a
+    `git archive e25835c` copy with the test appended minus its two `units.reserved` lines,
+    2026-09-18); `a_2xx_whose_body_breaks_settles_the_estimate_...` left `Microusd(0)` right
+    `Microusd(8657)` (settled at zero where the fix charges the estimate); the shadow twin left
     `Microusd(0)` right `Microusd(1757)`; the runs-endpoint listing left `Null` right `1` (no
     `retained` member in the JSON at e25835c). Every other new test (`E8`, `E13` to `E19`, `E21`,
     `E22`) names an API this change adds and so is red by compile against `e25835c`, the weaker
@@ -3053,8 +3061,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_shadow_twin_of_a_broken_2xx_records_the_estimate_and_no_shadow_event`,
     `every_state_has_the_disposition_the_rule_names`,
     `codex_f04_real_http_2xx_body_error_must_not_silently_settle_zero`,
-    `settle::tests::drop_without_complete_settles_with_fallback`, and all three
-    `no_usage_stream_settles_on_the_estimate.rs` tests. M4 (the unit half's settle deleted from
+    `settle::tests::drop_without_complete_settles_with_fallback`, and three of the four
+    `no_usage_stream_settles_on_the_estimate.rs` tests (the fourth settles on a parsed usage
+    block and cannot move under this mutant). M4 (the unit half's settle deleted from
     `charge`): caught by `a_cancel_while_the_body_is_being_collected_settles_the_estimate_...`,
     `a_2xx_whose_body_breaks_settles_the_estimate_...`,
     `a_2xx_whose_body_breaks_after_reporting_usage_settles_that_usage`,
@@ -3066,8 +3075,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `codex_f03_cancel_during_provider_send_is_retained_not_released`, reading the LEAK (`reserved`
     still up at the estimate, registry empty) rather than the retention (registry one entry) -
     the two look the same on `reserved` alone, which is invariant 50's own point. M5b
-    (`guard.dispatching()` deleted): caught by the same three, this time through the
-    `debug_assert_eq!` inside `answered` (state stayed `NotDispatched`, not `Unknown`). M6 (the
+    (`guard.dispatching()` deleted): caught by the same three. The two `proxy` tests fail first
+    on the `debug_assert_eq!` inside `answered` during their prior ordinary call (state stayed
+    `NotDispatched`, not `Unknown`), a debug-build catch; the probe never reaches `answered`
+    and catches it by its money and registry assertions (a `NotDispatched` drop releases, so
+    `reserved` reads 0 and the registry is empty), which holds in a release build too. M6 (the
     warn line deleted from `retain`): caught by
     `a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns` (no `retained:` line
     in the captured log). M7 (`settle_now`'s two `take()` calls replaced by `clone()`, so a
@@ -3097,7 +3109,15 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `guard.settle_now()` deleted from its `Err` arm): EQUIVALENT by construction, @measured
     `cargo test -p tokenfuse-gateway --lib` and `--tests` 2026-09-18 with the line removed: all
     536 lib tests and every integration test (including the seven moved probes) stayed green,
-    because `guard`'s `Drop` settles identically one line later at the `return`.
+    because `guard`'s `Drop` settles identically one line later at the `return`. M13
+    (`self.step = reservation.step` deleted from `hold_run`, so `x-fuse-step` on every managed
+    response and `step` on every `taint_blocked` row read 0 while the `allow` row, which reads
+    `run.step`, stays right): SURVIVED the suite as first written, no test asserted the
+    header's value; caught since by `managed_request_within_budget_settles_cost` (`x-fuse-step`
+    left `"0"` right `"1"`, and `"2"` on a second call of the same run) and
+    `tests/router.rs::streaming_request_carries_the_router_header_too` (the streaming site,
+    same left/right), @measured `cargo test -p tokenfuse-gateway` with the line removed
+    2026-09-18.
 
     Coverage, @measured `cargo llvm-cov -p tokenfuse-gateway --lib --summary-only` 2026-09-18,
     "before" read from a `git archive e25835c` snapshot built in isolation (this repository's

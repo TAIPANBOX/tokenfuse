@@ -417,8 +417,20 @@ async fn streaming_request_carries_the_router_header_too() {
     // Draining the body is what triggers the streaming settle path; the
     // CapturingProvider used here always responds non-streaming (a single
     // chunk), which is enough to prove the header reached the client.
+    assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "1");
     let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(captured_model(&captured).await, "claude-haiku-4-5");
+
+    // The row a routed STREAM writes keeps the zero its `saved_microusd`
+    // carried before the row moved into the settle guard (invariant 50):
+    // `handle` passes no route on the streaming path. Counting a routed
+    // stream's avoided spend is a separate decision; this pins that the move
+    // did not take it by accident.
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].decision, "allow");
+    assert_eq!(records[0].model, "claude-haiku-4-5");
+    assert_eq!(records[0].saved_microusd, 0);
 }
 
 #[tokio::test]
