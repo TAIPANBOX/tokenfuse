@@ -91,6 +91,13 @@ beside its trace fields (invariant 54). A periodic flush ships telemetry
 promptly even below the batch size, and is what retries the queue. It composes
 with the other sinks via `TeeSink`.
 
+At startup, a gateway with an identity map asks the same control plane for
+`GET /v1/units` once, within five seconds, and seeds each unit's month-to-date
+into its unit ledger before it listens, so a central monthly cap is enforced
+against the month rather than against the tally since the last restart
+(invariant 52). A control plane it cannot reach costs one warning and a month
+that starts at zero.
+
 Enable it on any gateway:
 
 ```bash

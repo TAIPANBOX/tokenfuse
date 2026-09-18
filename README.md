@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.0.2-brightgreen)
-![tests](https://img.shields.io/badge/tests-1377-brightgreen)
+![tests](https://img.shields.io/badge/tests-1395-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -728,7 +728,7 @@ These five routes list every run's budget and spend, list key ids, enumerate age
 
 This closes the loop the client-credential slice opened: a credential (`key_id`) listed in `keys` is bound to the agent ids it may present, and under `TOKENFUSE_IDENTITY_STRICT` one that is **not** listed there cannot make up the difference by choosing an agent id (it used to reach the prefix fallback, where an id matching nothing skipped the monthly cap and an id matching another unit's prefix charged that unit). **`enforce` is the default since 2026-08-27**, and `off` restores the old behaviour in one variable. A deployment that configured neither client keys nor a delegation issuer is unaffected either way: a mismatch needs something to mismatch with, and both sources are opt-in.. Agents roll up into a business unit, and the unit gets the first budget **above** the run - a UTC-calendar-month cap enforced with the same reserve-then-settle discipline as run budgets (`402`, `"type": "unit_budget_exceeded"`, with the unit's numbers). Every trace row now carries a server-resolved `unit` column (nullable-evolution, old files keep reading), `focus-export` grows an `x_unit` column so per-unit chargeback is a spreadsheet filter, and the Cloud aggregates per-unit spend (`GET /v1/units`, all-time plus a month-to-date rollup over the same UTC-month window the caps enforce - the figure the dashboard's Business units card compares against the monthly caps) with central per-unit cap overrides (`POST /v1/units/{id}/budget`, polled by every gateway of the org). Unmapped spend stays visible as the `unassigned` bucket, never silently dropped.
 
-Limits, stated plainly: unit counters are in-process and per-gateway - they reset on restart and are not fleet-consistent across gateways (the replicated raft ledger deliberately does not grow this dimension in this change; the durable cross-fleet view of unit spend is the Cloud aggregation). Budgets remain estimate-then-settle. With client keys off, `strict` has nothing authenticated to check: binding checks stay idle and only prefix attribution applies.
+Limits, stated plainly: unit counters are in-process and per-gateway - they reset on restart, and a gateway with a control plane configured seeds the current month's tally from `GET /v1/units` before it listens (one log line says what was seeded, or that it could not be), then counts its own spend on top; they are not fleet-consistent across gateways (the replicated raft ledger deliberately does not grow this dimension in this change; the durable cross-fleet view of unit spend is the Cloud aggregation). Budgets remain estimate-then-settle. With client keys off, `strict` has nothing authenticated to check: binding checks stay idle and only prefix attribution applies.
 
 ---
 

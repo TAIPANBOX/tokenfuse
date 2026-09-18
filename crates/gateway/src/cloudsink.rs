@@ -18,9 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::sink::{CallRecord, EventSink};
+use crate::unitledger::{month_key, SeedOutcome, UnitLedger};
+use tokenfuse_core::Microusd;
 
 /// How many records to buffer before an automatic flush.
 const BATCH: usize = 20;
@@ -46,8 +48,81 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The literal the control plane files unattributed spend under
 /// (`crates/cloud/src/store.rs`, `units_at`/`owners`); never a unit here.
-#[allow(dead_code)]
 const UNASSIGNED: &str = "unassigned";
+
+/// #293: how long the startup seed may take in all, connect to last byte.
+/// Bounded because it runs before the listener binds: a control plane that
+/// is down must cost a gateway five seconds of startup, not a hang.
+const SEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// #293: the most `GET /v1/units` may answer with. `UnitAgg` is nine fields,
+/// under 200 bytes a row with an ordinary unit id, and the control plane caps
+/// distinct units at 4 096 plus `unassigned` (`MAX_UNIT_MONTH_KEYS`), so a
+/// full answer is under 1 MiB; four is room for long ids, not a tight fit.
+/// Past it the body is refused before it is parsed: the answer is untrusted
+/// input arriving at startup, and it must not decide how much this process
+/// allocates.
+const SEED_MAX_BODY_BYTES: usize = 4 << 20;
+
+/// One `/v1/units` row, the three fields the seed reads. Every field
+/// defaulted: a control plane older than the month columns answers rows
+/// without `month`, and they must parse and then be skipped, not refuse the
+/// whole answer.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct UnitMonthRow {
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default)]
+    pub month: String,
+    #[serde(default)]
+    pub month_spent_microusd: i64,
+}
+
+/// What the seed did, for the one log line and for tests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedReport {
+    /// The gateway's current UTC month, the only window seeded.
+    pub month: String,
+    /// `(unit, month_spent_microusd)` applied, sorted by unit.
+    pub seeded: Vec<(String, i64)>,
+    /// Rows whose `month` is not `month` (another month, or empty from an old plane).
+    pub skipped_other_month: usize,
+    /// Rows for the literal `unassigned` bucket, which is not a unit.
+    pub skipped_unassigned: usize,
+    /// Rows with a blank unit or a negative figure.
+    pub skipped_invalid: usize,
+    /// Rows the ledger refused because the unit was already counting (zero at startup).
+    pub skipped_counting: usize,
+}
+
+/// Why the seed did not happen. One warning names it; the gateway starts anyway.
+#[derive(Debug)]
+pub enum SeedError {
+    /// `send()` or a body chunk returned `Err`: refused, reset, DNS, cut short.
+    Transport(String),
+    /// Nothing complete within `SEED_TIMEOUT`.
+    TimedOut(Duration),
+    /// The control plane answered with a non-2xx status.
+    Status(u16),
+    /// The body passed `SEED_MAX_BODY_BYTES`.
+    BodyTooLarge(usize),
+    /// The body is not a JSON array of `/v1/units` rows.
+    Malformed(String),
+}
+
+impl std::fmt::Display for SeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SeedError::Transport(e) => {
+                write!(f, "could not be reached or the answer was cut short: {e}")
+            }
+            SeedError::TimedOut(d) => write!(f, "no answer within {d:?}"),
+            SeedError::Status(s) => write!(f, "status {s}"),
+            SeedError::BodyTooLarge(cap) => write!(f, "body over {cap} bytes"),
+            SeedError::Malformed(e) => write!(f, "malformed body: {e}"),
+        }
+    }
+}
 
 pub struct CloudSink {
     push: Arc<Pusher>,
@@ -458,6 +533,147 @@ fn report_refusal(reported: &Mutex<HashSet<u16>>, status: reqwest::StatusCode, u
     }
 }
 
+/// One `GET {base}/v1/units` with the org key, the body read chunk by chunk
+/// under `SEED_MAX_BODY_BYTES`. The key the gateway needs for `/v1/ingest`
+/// (an admin org key) passes `/v1/units`, which accepts any org key.
+async fn fetch_unit_months(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+) -> Result<Vec<u8>, SeedError> {
+    let url = format!("{}/v1/units", base.trim_end_matches('/'));
+    let mut resp = client
+        .get(&url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| SeedError::Transport(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(SeedError::Status(resp.status().as_u16()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| SeedError::Transport(e.to_string()))?
+    {
+        if body.len() + chunk.len() > SEED_MAX_BODY_BYTES {
+            return Err(SeedError::BodyTooLarge(SEED_MAX_BODY_BYTES));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Pure: bytes to rows, or why not.
+pub fn parse_unit_months(body: &[u8]) -> Result<Vec<UnitMonthRow>, SeedError> {
+    serde_json::from_slice::<Vec<UnitMonthRow>>(body)
+        .map_err(|e| SeedError::Malformed(e.to_string()))
+}
+
+/// Pure: apply this month's rows to the ledger and say what happened.
+pub fn apply_unit_months(
+    rows: Vec<UnitMonthRow>,
+    units: &UnitLedger,
+    now_millis: i64,
+) -> SeedReport {
+    let month = month_key(now_millis);
+    let mut report = SeedReport {
+        month: month.clone(),
+        ..Default::default()
+    };
+    for row in rows {
+        if row.unit.trim().is_empty() || row.month_spent_microusd < 0 {
+            report.skipped_invalid += 1;
+            continue;
+        }
+        if row.unit == UNASSIGNED {
+            report.skipped_unassigned += 1;
+            continue;
+        }
+        if row.month != month {
+            tracing::debug!(unit = %row.unit, month = %row.month, "unit month row skipped: not this month");
+            report.skipped_other_month += 1;
+            continue;
+        }
+        match units.seed_month(
+            &row.unit,
+            Microusd(row.month_spent_microusd),
+            &row.month,
+            now_millis,
+        ) {
+            SeedOutcome::Applied => report.seeded.push((row.unit, row.month_spent_microusd)),
+            SeedOutcome::OtherMonth => report.skipped_other_month += 1,
+            SeedOutcome::AlreadyCounting => report.skipped_counting += 1,
+            SeedOutcome::Negative => report.skipped_invalid += 1,
+        }
+    }
+    report.seeded.sort();
+    report
+}
+
+/// The startup seed (#293, invariant 52): fetch, parse, apply, one line.
+/// Never refuses to start: every `Err` is one WARN and a month that starts at
+/// zero, which is what every gateway did before this existed.
+pub async fn seed_unit_ledger(
+    base: &str,
+    key: &str,
+    units: &UnitLedger,
+    now_millis: i64,
+) -> Result<SeedReport, SeedError> {
+    seed_unit_ledger_within(base, key, units, now_millis, SEED_TIMEOUT).await
+}
+
+async fn seed_unit_ledger_within(
+    base: &str,
+    key: &str,
+    units: &UnitLedger,
+    now_millis: i64,
+    within: Duration,
+) -> Result<SeedReport, SeedError> {
+    let url = format!("{}/v1/units", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let fetched = match tokio::time::timeout(within, fetch_unit_months(&client, base, key)).await {
+        Ok(r) => r,
+        Err(_) => Err(SeedError::TimedOut(within)),
+    };
+    let result = fetched
+        .and_then(|body| parse_unit_months(&body))
+        .map(|rows| apply_unit_months(rows, units, now_millis));
+    match &result {
+        Ok(report) => {
+            let mut listed: Vec<String> = report
+                .seeded
+                .iter()
+                .take(32)
+                .map(|(u, s)| format!("{u}={s}"))
+                .collect();
+            if report.seeded.len() > 32 {
+                listed.push("...".to_string());
+            }
+            tracing::info!(
+                url = %url,
+                month = %report.month,
+                units = report.seeded.len(),
+                seeded = %listed.join(" "),
+                skipped_other_month = report.skipped_other_month,
+                skipped_unassigned = report.skipped_unassigned,
+                skipped_invalid = report.skipped_invalid,
+                "seeded the unit month from the control plane: a central cap is enforced against \
+                 the org's month-to-date plus this gateway's own spend from here on"
+            );
+        }
+        Err(e) => tracing::warn!(
+            url = %url,
+            reason = %e,
+            "the unit month could not be seeded from the control plane: every unit starts this \
+             month at zero and a central cap is enforced against this gateway's own tally until \
+             the next restart"
+        ),
+    }
+    result
+}
+
 /// Poll the control plane's per-run budget overrides and hand them to `apply`
 /// (run id → µUSD), so an operator can set/tighten budgets centrally and every
 /// gateway of the org enforces them. Best-effort; runs until the process exits.
@@ -622,6 +838,7 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+    use crate::sink::now_millis;
     use crate::testlog::{captured_log, log_lock};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -634,6 +851,9 @@ mod tests {
     const QUEUED: &str = "cloud telemetry cannot reach the control plane";
     const DROPPING: &str = "cloud telemetry queue is full";
     const DRAINED: &str = "cloud telemetry queue drained";
+    /// #293: the startup seed's own two lines.
+    const SEEDED: &str = "seeded the unit month from the control plane";
+    const NOT_SEEDED: &str = "the unit month could not be seeded from the control plane";
 
     // --- reading what an operator would actually see ----------------------
     //
@@ -1304,6 +1524,316 @@ mod tests {
             0,
             "the stalled pushes are in flight in the background, not failed yet"
         );
+    }
+
+    // --- the startup seed (#293): a stub /v1/units --------------------------
+
+    /// Answers `GET /v1/units` with `status` and `body` verbatim.
+    async fn stub_units(status: u16, body: String) -> String {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/v1/units",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A `/v1/units` that never answers, for the seed's own timeout.
+    async fn stall_units() -> String {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/v1/units",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                axum::http::StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn row(unit: &str, month: &str, month_spent_microusd: i64) -> UnitMonthRow {
+        UnitMonthRow {
+            unit: unit.to_string(),
+            month: month.to_string(),
+            month_spent_microusd,
+        }
+    }
+
+    // --- the startup seed (#293): the tests ----------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_unit_month_is_seeded_from_the_control_plane() {
+        let _g = log_lock();
+        clear_log();
+        let now = now_millis();
+        let m = month_key(now);
+        let body = format!(
+            r#"[{{"unit":"aws","spent_microusd":999999,"calls":7,"month":"{m}","month_spent_microusd":2145,"month_calls":3}},{{"unit":"gcp","month":"{m}","month_spent_microusd":980}},{{"unit":"unassigned","month":"{m}","month_spent_microusd":5}},{{"unit":"old","month":"2001-01","month_spent_microusd":77}}]"#
+        );
+        let base = stub_units(200, body).await;
+        let ledger = UnitLedger::new(HashMap::new());
+        let report = seed_unit_ledger(&base, "k", &ledger, now).await.unwrap();
+        assert_eq!(
+            report.seeded,
+            vec![("aws".to_string(), 2145), ("gcp".to_string(), 980)]
+        );
+        assert_eq!(report.skipped_other_month, 1);
+        assert_eq!(report.skipped_unassigned, 1);
+        assert_eq!(report.skipped_invalid, 0);
+        assert_eq!(ledger.spent("aws", now), Microusd(2_145));
+        assert_eq!(ledger.spent("gcp", now), Microusd(980));
+        assert_eq!(ledger.spent("old", now), Microusd::ZERO);
+        assert_eq!(ledger.spent("unassigned", now), Microusd::ZERO);
+
+        let log = log_text();
+        let seeded_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("INFO") && l.contains(SEEDED))
+            .collect();
+        assert_eq!(seeded_lines.len(), 1, "{log}");
+        let line = seeded_lines[0];
+        assert!(line.contains(&format!("month={m}")), "{line}");
+        assert!(line.contains("units=2"), "{line}");
+        assert!(line.contains("aws=2145"), "{line}");
+        assert!(line.contains("gcp=980"), "{line}");
+        assert!(line.contains("skipped_other_month=1"), "{line}");
+        assert!(line.contains("skipped_unassigned=1"), "{line}");
+        assert!(!log.contains(NOT_SEEDED), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once(
+    ) {
+        let _g = log_lock();
+        clear_log();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let now = now_millis();
+        let ledger = UnitLedger::new(HashMap::new());
+        let result = seed_unit_ledger(&format!("http://{addr}"), "k", &ledger, now).await;
+        assert!(matches!(result, Err(SeedError::Transport(_))), "{result:?}");
+        assert_eq!(ledger.spent("aws", now), Microusd::ZERO);
+        let log = log_text();
+        let warns: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains(NOT_SEEDED))
+            .collect();
+        assert_eq!(warns.len(), 1, "{log}");
+        assert!(warns[0].contains("could not be reached"), "{}", warns[0]);
+        assert!(!log.contains(SEEDED), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_control_plane_that_does_not_answer_in_time_leaves_the_month_at_zero() {
+        let _g = log_lock();
+        clear_log();
+        let base = stall_units().await;
+        let now = now_millis();
+        let ledger = UnitLedger::new(HashMap::new());
+        let result =
+            seed_unit_ledger_within(&base, "k", &ledger, now, Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(SeedError::TimedOut(_))), "{result:?}");
+        let log = log_text();
+        assert!(log.contains("no answer within"), "{log}");
+        assert_eq!(ledger.spent("aws", now), Microusd::ZERO);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_control_plane_that_refuses_the_seed_is_one_warning_naming_the_status() {
+        let now = now_millis();
+        for status in [403u16, 404] {
+            let _g = log_lock();
+            clear_log();
+            let base = stub_units(status, "{}".to_string()).await;
+            let ledger = UnitLedger::new(HashMap::new());
+            let result = seed_unit_ledger(&base, "k", &ledger, now).await;
+            assert!(
+                matches!(result, Err(SeedError::Status(s)) if s == status),
+                "{result:?}"
+            );
+            let log = log_text();
+            assert!(log.contains(&format!("status {status}")), "{log}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_units_body_that_is_not_json_seeds_nothing() {
+        let now = now_millis();
+        for body in ["not json", r#"{"units":[]}"#] {
+            let _g = log_lock();
+            clear_log();
+            let base = stub_units(200, body.to_string()).await;
+            let ledger = UnitLedger::new(HashMap::new());
+            let result = seed_unit_ledger(&base, "k", &ledger, now).await;
+            assert!(
+                matches!(result, Err(SeedError::Malformed(_))),
+                "{body}: {result:?}"
+            );
+            let log = log_text();
+            assert!(log.contains("malformed body"), "{log}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_without_a_month_is_skipped_and_counted() {
+        let _g = log_lock();
+        clear_log();
+        let now = now_millis();
+        let body = r#"[{"unit":"aws","spent_microusd":2145,"calls":7},{"unit":"gcp","spent_microusd":980,"calls":2}]"#;
+        let base = stub_units(200, body.to_string()).await;
+        let ledger = UnitLedger::new(HashMap::new());
+        let report = seed_unit_ledger(&base, "k", &ledger, now).await.unwrap();
+        assert!(report.seeded.is_empty(), "{report:?}");
+        assert_eq!(report.skipped_other_month, 2);
+        assert_eq!(ledger.spent("aws", now), Microusd::ZERO);
+        let log = log_text();
+        assert!(log.contains("units=0"), "{log}");
+        assert!(log.contains("skipped_other_month=2"), "{log}");
+    }
+
+    #[test]
+    fn the_unassigned_bucket_is_never_seeded() {
+        let now = now_millis();
+        let m = month_key(now);
+        let ledger = UnitLedger::new(HashMap::new());
+        let report = apply_unit_months(vec![row("unassigned", &m, 5_000_000)], &ledger, now);
+        assert_eq!(report.skipped_unassigned, 1);
+        assert!(report.seeded.is_empty());
+        assert_eq!(ledger.spent("unassigned", now), Microusd::ZERO);
+    }
+
+    #[test]
+    fn a_negative_month_figure_is_refused_as_hostile() {
+        let now = now_millis();
+        let m = month_key(now);
+        let ledger = UnitLedger::new(HashMap::new());
+        let report = apply_unit_months(
+            vec![row("aws", &m, -5), row("", &m, 1), row("  ", &m, 1)],
+            &ledger,
+            now,
+        );
+        assert_eq!(report.skipped_invalid, 3);
+        assert!(report.seeded.is_empty());
+        assert_eq!(ledger.spent("aws", now), Microusd::ZERO);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_units_body_is_refused_before_it_is_parsed() {
+        let _g = log_lock();
+        clear_log();
+        let now = now_millis();
+        let body = " ".repeat(SEED_MAX_BODY_BYTES + 1);
+        let base = stub_units(200, body).await;
+        let ledger = UnitLedger::new(HashMap::new());
+        let result = seed_unit_ledger(&base, "k", &ledger, now).await;
+        assert!(
+            matches!(result, Err(SeedError::BodyTooLarge(n)) if n == SEED_MAX_BODY_BYTES),
+            "{result:?}"
+        );
+        let log = log_text();
+        assert!(
+            log.contains(&format!("body over {SEED_MAX_BODY_BYTES} bytes")),
+            "{log}"
+        );
+    }
+
+    /// A body the control plane never wrote: raw garbage, and a JSON array
+    /// whose fields take a random shape (absent, string, integer, float,
+    /// negative integer, object, array). The seed must never panic and must
+    /// never seed a blank unit, the literal `unassigned`, or a negative
+    /// figure, whatever it accepts.
+    #[test]
+    fn hostile_units_bodies_never_panic_and_never_seed() {
+        let now = now_millis();
+        let month = month_key(now);
+        for i in 0..200u64 {
+            let mut x = i;
+            let mut next = || {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                x
+            };
+
+            // (a) random bytes of random length 0..512.
+            let len_a = (next() % 512) as usize;
+            let bytes_a: Vec<u8> = (0..len_a).map(|_| (next() % 256) as u8).collect();
+            let ledger_a = UnitLedger::new(HashMap::new());
+            if let Ok(rows) = parse_unit_months(&bytes_a) {
+                let report = apply_unit_months(rows, &ledger_a, now);
+                for (u, s) in &report.seeded {
+                    assert!(!u.trim().is_empty(), "seed {i}a: blank unit seeded");
+                    assert_ne!(u, "unassigned", "seed {i}a: unassigned seeded");
+                    assert!(*s >= 0, "seed {i}a: negative seeded");
+                    assert_eq!(ledger_a.spent(u, now), Microusd(*s), "seed {i}a");
+                }
+            }
+
+            // (b) a JSON array of 1..8 objects with hostile field shapes.
+            let n_objs = 1 + (next() % 7);
+            let mut objs = Vec::new();
+            for _ in 0..n_objs {
+                let shape = |v: u64, current_month: &str| -> (bool, String) {
+                    match v % 7 {
+                        0 => (false, String::new()),
+                        1 => (true, format!("{current_month:?}")),
+                        2 => (true, "5".to_string()),
+                        3 => (true, "5.5".to_string()),
+                        4 => (true, "-5".to_string()),
+                        5 => (true, "{}".to_string()),
+                        _ => (true, "[]".to_string()),
+                    }
+                };
+                let (has_unit, unit_json) = shape(next(), "aws");
+                let (has_month, month_json) = shape(next(), &month);
+                let (has_spend, spend_json) = shape(next(), "5");
+                let mut fields = Vec::new();
+                if has_unit {
+                    fields.push(format!("\"unit\":{unit_json}"));
+                }
+                if has_month {
+                    fields.push(format!("\"month\":{month_json}"));
+                }
+                if has_spend {
+                    fields.push(format!("\"month_spent_microusd\":{spend_json}"));
+                }
+                objs.push(format!("{{{}}}", fields.join(",")));
+            }
+            let body_b = format!("[{}]", objs.join(","));
+            let ledger_b = UnitLedger::new(HashMap::new());
+            if let Ok(rows) = parse_unit_months(body_b.as_bytes()) {
+                let report = apply_unit_months(rows, &ledger_b, now);
+                for (u, s) in &report.seeded {
+                    assert!(
+                        !u.trim().is_empty(),
+                        "seed {i}b: blank unit seeded: {body_b}"
+                    );
+                    assert_ne!(u, "unassigned", "seed {i}b: unassigned seeded: {body_b}");
+                    assert!(*s >= 0, "seed {i}b: negative seeded: {body_b}");
+                    assert_eq!(ledger_b.spent(u, now), Microusd(*s), "seed {i}b: {body_b}");
+                }
+            }
+        }
     }
 
     // --- the tests ---------------------------------------------------------

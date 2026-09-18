@@ -62,6 +62,20 @@ pub struct UnitExceeded {
     pub spent: Microusd,
 }
 
+/// What [`UnitLedger::seed_month`] did with one figure from the control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// `spent` is now the unit's committed spend for the current window.
+    Applied,
+    /// `window` is not the current month by `now_millis`: skipped, nothing touched.
+    OtherMonth,
+    /// The unit already has spend or a reservation in the current window:
+    /// skipped, nothing touched. Cannot happen at startup; a guard, not a path.
+    AlreadyCounting,
+    /// A negative figure names no spend and is refused (hostile input).
+    Negative,
+}
+
 #[derive(Debug)]
 struct UnitState {
     window: String,
@@ -94,6 +108,37 @@ impl UnitLedger {
     /// from the overrides restores the map file's cap.
     pub fn set_overrides(&self, overrides: HashMap<String, Microusd>) {
         *self.overrides.lock().unwrap() = overrides;
+    }
+
+    /// Start a unit's month where the control plane left it (#293). `spent`
+    /// is the org's month-to-date for `unit` as `GET /v1/units` reported it;
+    /// applied only when `window` is the current UTC month here and the unit
+    /// has neither spend nor a reservation in that window yet. `reserved` is
+    /// never seeded: the reservations that were in flight in the process that
+    /// died went with it, and the control plane never saw them. From here on
+    /// this gateway counts its own spend on top, and the seed rolls over with
+    /// the month like any other spend (`rolled`).
+    pub fn seed_month(
+        &self,
+        unit: &str,
+        spent: Microusd,
+        window: &str,
+        now_millis: i64,
+    ) -> SeedOutcome {
+        if spent < Microusd::ZERO {
+            return SeedOutcome::Negative;
+        }
+        let now_window = month_key(now_millis);
+        if window != now_window {
+            return SeedOutcome::OtherMonth;
+        }
+        let mut state = self.state.lock().unwrap();
+        let s = Self::rolled(&mut state, unit, &now_window);
+        if s.spent != Microusd::ZERO || s.reserved != Microusd::ZERO {
+            return SeedOutcome::AlreadyCounting;
+        }
+        s.spent = spent;
+        SeedOutcome::Applied
     }
 
     /// The cap in effect for a unit: central override first, file cap second.
@@ -417,6 +462,143 @@ mod tests {
         ledger.settle(&res, usd(3.5), JULY);
         assert_eq!(ledger.reserved("treasury", JULY), Microusd::ZERO);
         assert_eq!(ledger.reserved("treasury", AUGUST), Microusd::ZERO);
+    }
+
+    // -- #293: seeding a unit's month from the control plane -----------------
+
+    #[test]
+    fn a_seed_for_the_current_month_is_the_units_committed_spend() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), Microusd(1_000_000))]));
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        assert_eq!(ledger.spent("aws", JULY), Microusd(2_145));
+        assert_eq!(ledger.reserved("aws", JULY), Microusd::ZERO);
+    }
+
+    #[test]
+    fn a_seed_for_another_month_is_skipped() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), Microusd(1_000_000))]));
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-06", JULY),
+            SeedOutcome::OtherMonth
+        );
+        assert_eq!(ledger.spent("aws", JULY), Microusd::ZERO);
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-08", JULY),
+            SeedOutcome::OtherMonth
+        );
+        assert_eq!(ledger.spent("aws", JULY), Microusd::ZERO);
+    }
+
+    #[test]
+    fn a_later_reservation_is_refused_at_the_seeded_tally() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), Microusd(1_000))]));
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        let err = ledger.try_reserve("aws", Microusd(1), JULY).unwrap_err();
+        assert_eq!(
+            err,
+            UnitExceeded {
+                unit: "aws".to_string(),
+                budget: Microusd(1_000),
+                spent: Microusd(2_145),
+            }
+        );
+        ledger.set_overrides(HashMap::from([("aws".to_string(), Microusd(1_000_000))]));
+        assert!(ledger
+            .try_reserve("aws", Microusd(1), JULY)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_seed_never_overwrites_a_window_already_counting() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), usd(10.0))]));
+        let held = ledger
+            .try_reserve("aws", usd(4.0), JULY)
+            .unwrap()
+            .expect("capped unit reserves");
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::AlreadyCounting
+        );
+        assert_eq!(ledger.reserved("aws", JULY), usd(4.0));
+        assert_eq!(ledger.spent("aws", JULY), Microusd::ZERO);
+        ledger.settle(&held, usd(3.5), JULY);
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::AlreadyCounting
+        );
+        assert_eq!(ledger.spent("aws", JULY), usd(3.5));
+    }
+
+    #[test]
+    fn a_seed_on_an_uncapped_unit_is_found_by_a_later_override() {
+        let ledger = UnitLedger::new(HashMap::new());
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        assert_eq!(ledger.try_reserve("aws", Microusd(1), JULY), Ok(None));
+        ledger.set_overrides(HashMap::from([("aws".to_string(), Microusd(1_000))]));
+        let err = ledger.try_reserve("aws", Microusd(1), JULY).unwrap_err();
+        assert_eq!(err.spent, Microusd(2_145));
+    }
+
+    #[test]
+    fn a_seeded_month_rolls_over_like_any_other_spend() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), Microusd(1_000_000))]));
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        assert_eq!(ledger.spent("aws", AUGUST), Microusd::ZERO);
+        ledger.set_overrides(HashMap::from([("aws".to_string(), Microusd(1_000))]));
+        assert!(ledger
+            .try_reserve("aws", Microusd(500), AUGUST)
+            .unwrap()
+            .is_some());
+        assert_eq!(ledger.spent("aws", JULY), Microusd::ZERO);
+    }
+
+    /// A seed is spend, so it must refuse exactly at the cap like any other
+    /// spend: swept rather than picked, seed `i` for `i in 0..200` via a
+    /// 64-bit LCG (the same recipe `cloudsink::tests` uses for its own
+    /// hostile-input sweep).
+    #[test]
+    fn seeded_tallies_refuse_exactly_at_the_cap_across_a_sweep() {
+        for i in 0..200u64 {
+            let x = i
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let c = 1 + x % 1_000_000;
+            let s = (x >> 40) % (2 * c);
+            let e = (x >> 20) % c;
+
+            let ledger = UnitLedger::new(HashMap::new());
+            ledger.set_overrides(HashMap::from([("aws".to_string(), Microusd(c as i64))]));
+            assert_eq!(
+                ledger.seed_month("aws", Microusd(s as i64), "2026-07", JULY),
+                SeedOutcome::Applied,
+                "seed {i}"
+            );
+            let result = ledger.try_reserve("aws", Microusd(e as i64), JULY);
+            if s + e <= c {
+                assert!(
+                    matches!(result, Ok(Some(_))),
+                    "seed {i}: s={s} e={e} c={c} should admit, got {result:?}"
+                );
+            } else {
+                match result {
+                    Err(err) => assert_eq!(err.spent, Microusd(s as i64), "seed {i}"),
+                    other => panic!("seed {i}: s={s} e={e} c={c} should refuse, got {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

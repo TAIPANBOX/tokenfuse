@@ -3209,6 +3209,101 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     gate: nothing stops a third door reading the header through its own splitter, the shape
     invariant 34 names; the two doors that exist are held by their tests)*
 
+52. **A unit's month starts where the control plane left it, and a gateway that cannot ask says
+    so once.** The unit ledger is in-process and per-gateway by design (docs/20 section 3,
+    invariant 5's reason), so a restart began every unit's month at zero while the control plane
+    kept `month_spent_microusd` for the org. Measured 2026-09-17 on the appliance proving run
+    (tokenfuse#293): after `docker compose down` and `up` and two reboots the control plane showed
+    unit `aws` at 2145 micro-USD for the month; a central override of 0.001 USD, polled every 3 s,
+    refused nothing for 79 s because the gateway's own tally for the month was about 700
+    micro-USD, and an override of 0.0005 USD, below that tally, refused at once. The cap held from
+    the last restart; the control plane knew the month.
+
+    `cloudsink::seed_unit_ledger` now runs once in `serve`, inside the cloud block and only when
+    the identity map is on (the same gate as the unit-budget poller), synchronously before the
+    listener binds: one `GET {base}/v1/units` with the org key (any org key passes that route;
+    the admin key ingest needs passes it too), the whole exchange bounded by `SEED_TIMEOUT` (5 s)
+    and the body by `SEED_MAX_BODY_BYTES` (4 MiB, above what 4 096 units can answer with). For
+    every row whose `month` is this gateway's current UTC month (`unitledger::month_key`, the
+    same function on both sides), `UnitLedger::seed_month` sets the unit's committed spend to the
+    row's `month_spent_microusd`, capped or not: `set_overrides` can cap a unit the file left
+    uncapped, and a seed that existed only for capped units would be found by nothing when that
+    override arrives, which is the measured case. A row of another month, a row with no month (a
+    control plane older than the month columns), the literal `unassigned` bucket, a blank unit
+    and a negative figure are skipped and counted. `reserved` is never seeded: the reservations
+    in flight in the process that died went with it and the control plane never saw them. A
+    window already counting is never overwritten (a guard, not a path: nothing has counted
+    before the listener binds). The seed is spend, so it rolls over with the month like any other
+    spend and a later `try_reserve` admits iff seed plus own spend plus reservations plus the
+    estimate fit the cap in effect.
+
+    One INFO line names the month, the units and their figures, and every skip count. Every
+    failure (unreachable, timed out, a non-2xx, a body over the cap, a body that is not a JSON
+    array) is one WARN naming the reason, and the gateway starts with the month at zero, which is
+    what every gateway did before this. `@decided 2026-09-18`: the gateway never refuses to start
+    because the control plane cannot be reached. `@claude 2026-09-18` on the level, argued against
+    invariant 13's boundary: a failed push stays at debug because it is transient, clears without
+    anybody editing configuration and would repeat several times a second; the seed's failure is
+    none of those, nothing retries it, its consequence lasts until the next restart and no other
+    part of the estate reports it, and it is one line per process by construction. That is
+    invariant 13's own test for a warning, met.
+
+    **Where it says nothing.** Startup only: no refresh, no retry; a control plane down at startup
+    leaves the month at zero until the next restart, as before. The figure is the org's, so two
+    gateways each start from the org total and then count their own spend, which makes each more
+    conservative than before and no more consistent with the other (docs/20's non-fleet-consistency
+    stands). Clock skew: the row's `month` is the control plane's, compared with this gateway's;
+    around a month boundary the two can disagree and the row is skipped, so the new month starts
+    at zero, which is the honest figure for a month seconds old. The seed holds this gateway's
+    own pre-restart spend only insofar as it reached the control plane; records dropped or still
+    queued (invariant 53) at the restart are in neither the queue nor the seed. A control plane
+    reporting an absurd figure refuses a unit for the month, which adds no power the admin key
+    does not already have through `/v1/unit-budgets`; a negative figure is refused as hostile. The
+    run ledger still restarts at zero (D8's territory), and `unassigned` is not a unit.
+    *(tests: `unitledger::tests`: `a_seed_for_the_current_month_is_the_units_committed_spend`,
+    `a_seed_for_another_month_is_skipped`, `a_later_reservation_is_refused_at_the_seeded_tally`,
+    `a_seed_never_overwrites_a_window_already_counting`,
+    `a_seed_on_an_uncapped_unit_is_found_by_a_later_override`,
+    `a_seeded_month_rolls_over_like_any_other_spend`,
+    `seeded_tallies_refuse_exactly_at_the_cap_across_a_sweep` (200 seeds); `cloudsink::tests`:
+    `the_unit_month_is_seeded_from_the_control_plane`,
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`,
+    `a_control_plane_that_does_not_answer_in_time_leaves_the_month_at_zero`,
+    `a_control_plane_that_refuses_the_seed_is_one_warning_naming_the_status`,
+    `a_units_body_that_is_not_json_seeds_nothing`, `a_row_without_a_month_is_skipped_and_counted`,
+    `the_unassigned_bucket_is_never_seeded`, `a_negative_month_figure_is_refused_as_hostile`,
+    `an_oversized_units_body_is_refused_before_it_is_parsed`,
+    `hostile_units_bodies_never_panic_and_never_seed` (200 seeds); `proxy::tests`:
+    `a_restarted_gateway_enforces_a_central_cap_against_the_months_seeded_tally` (the issue's
+    numbers: 2145 seeded, a 1000 override, 402 with 0.001 and 0.002145, then 200 under the file
+    cap with the cost on top of the seed). Red first, @measured `cargo test -p tokenfuse-gateway
+    --lib unitledger::` and `--lib cloudsink::` and `--lib proxy::tests::a_restarted_gateway_...`
+    2026-09-18: every test names an API this change adds and is red by compile at `da0fa34`; the
+    proxy scenario with the `seed_month` call deleted reads `left: 200 right: 402` (`2145 seeded
+    plus a 204 estimate is past a 1000 cap`), the appliance's 79 seconds in one line. Mutants,
+    @measured 2026-09-18: M52-1 (`apply_unit_months` reads `spent_microusd`, the all-time figure,
+    instead of `month_spent_microusd`) caught by `the_unit_month_is_seeded_from_the_control_plane`
+    (`aws` reads 999999 instead of 2145); M52-2 (the month check removed) caught by
+    `a_seed_for_another_month_is_skipped` when planted inside `seed_month` itself (`Applied` where
+    `OtherMonth` was expected); the redundant check in `apply_unit_months` duplicates it and is
+    not independently observable through `a_row_without_a_month_is_skipped_and_counted`, since
+    `seed_month`'s own check still catches an unmatched row; M52-3 (`seed_month` writes
+    `s.reserved` instead of `s.spent`) caught by
+    `a_seed_for_the_current_month_is_the_units_committed_spend` (`spent` reads 0) and
+    `a_later_reservation_is_refused_at_the_seeded_tally` (`Err.spent` reads 0); M52-4 (the
+    unreachable arm panics instead of warning) caught by
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`
+    (the test itself panics, which is cargo reporting the test binary dying, loudly either way);
+    M52-5 (the INFO line deleted) caught by `the_unit_month_is_seeded_from_the_control_plane`
+    (`left: 0 right: 1` on the `SEEDED` line count); M52-6 (the WARN line deleted) caught by
+    `a_control_plane_that_cannot_be_reached_at_startup_leaves_the_month_at_zero_and_warns_once`
+    (`left: 0 right: 1` on the `NOT_SEEDED` line count); M52-7 (`main.rs` seeds only capped units,
+    or not at all) is not reachable by a unit test, held by reading the diff, the live check is
+    the appliance run and it is not re-run here.
+    Scenarios: `features/the-unit-month-survives-a-restart.feature`, six, each bound. Not a
+    script gate: the wiring in `main.rs` is held by reading and by the appliance run, not by a
+    test)*
+
 53. **Telemetry that cannot reach the control plane is queued and replayed in order, and the
     outage is said once at each end.** `CloudSink::ship` dropped a batch whose `send()` returned
     `Err` after one debug line, so an outage of the control plane cost the org exactly the spend
