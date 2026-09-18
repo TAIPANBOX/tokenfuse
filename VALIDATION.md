@@ -202,6 +202,82 @@ because unset meant `off`, and unset now means `block`. And a missing `x-fuse-ag
 PDP as an empty identity, whose rejection the gateway reported as `wardryx unreachable`, sending
 an operator to debug a healthy machine - now a local `identity_required` naming the header.
 
+## One gateway behind a home router, two clouds at once, and sixteen ways to break it (2026-09-17)
+
+2026-09-17: gateway `tokenfuse:v1.0.1` and control plane `tokenfuse-control-plane:v1.0.1`, as
+pinned by stack-single v1.1.3, ran on a Debian 13 mini PC behind a home router on carrier-grade
+NAT. The gateway was published on the box's tailnet address only, never on the LAN.
+`TOKENFUSE_CLIENT_KEYS` carried one key per cloud; the identity map bound the AWS key to
+`agent://customer.example/aws/*` and the GCP key to `agent://customer.example/gcp/*` (units
+`aws` and `gcp`). The launcher set `TOKENFUSE_WARDRYX_MODE=enforce` and
+`TOKENFUSE_WARDRYX_FAILMODE=closed`; the binary's own default is `mode=off, failmode=open`.
+Full detail: the run's evidence and
+[estate-gates/PROVEN.md](https://github.com/TAIPANBOX/estate-gates/blob/main/PROVEN.md), the
+rows dated 2026-09-17.
+
+**Two customer agents called through the box at once, on two clouds, against the real
+provider.** Direct WireGuard paths measured 23 ms and 29 ms. From 11:46:22Z to 11:47:15Z both
+loops ran 17 x `200` at `0.000033` USD each with `x-fuse-wardryx: allow`, then `402
+budget_exceeded` from call 18, the wire body identical on both. Six `breaker_tripped` lines
+landed on one bus, interleaved by timestamp and chained by `prev_hash`. `GET /v1/runs` showed
+`pct_used: 93.5` on both runs afterward.
+
+**The box told the two clouds apart by key and by id.** No key: `401`. The AWS key presenting
+the GCP agent id: `403 identity_mismatch`, one `high` event on the bus. A wrong key: `401`.
+
+**The box froze one cloud's agents while the other kept working.** `PUT
+/v1/policies/freeze-gcp` (`deny_above_usd 0.000001`) made every GCP call `403 wardryx=deny`
+starting at call 1, while AWS ran its 17 calls in the same minute, unaffected. Three
+`policy_deny` events reached the bus; `DELETE` on the policy, and GCP calls answered `200`
+again.
+
+**A FinOps crew ran on the box through its own gateway door, and a monthly cap stopped it.** A
+second gateway in the same compose project served unit `finops`, matched by prefix, with a
+central cap set through the control plane's `POST /v1/units/finops/budget`. One real
+`claude-sonnet-5` call settled at `0.05811` USD, then the next answered `402 unit 'finops'
+monthly budget exceeded`; `unit_cap_exceeded` (high) and `breaker_tripped` landed on the crew
+door's own events file. The published price book carries no `claude-sonnet-5` row, so that call
+priced at the fallback rate (15/75 USD per Mtok, `x-fuse-price: fallback`), about five times the
+model's list price (tokenfuse#305, open).
+
+**The FinOps reporting surface ran end to end.** `x-fuse-outcome` tags priced by `tokenfuse
+outcomes`; `tokenfuse focus-export` wrote 272 rows for the customer door and 5 for the crew
+door; `tokenfuse savings` totalled `0.002498` USD across 17 budget breaks; `tokenfuse sql` read
+`calls` by unit and decision; `tokenfuse compliance --markdown` ran. On the control plane,
+`/v1/spend`, `/v1/owners`, `/v1/summary`, `/v1/savings`, `/v1/series`, `/v1/units`,
+`/v1/incidents` and `/v1/audit/verify` all answered, the last `ok`. Units read aws 1122, gcp
+627, finops 58110 microUSD; four `budget_exhausted` incidents were open; a central override on
+a unit refused the next call with `402 unit_budget_exceeded`.
+
+**The failure matrix covered sixteen cases; these are the gateway's and the control plane's
+own.** The policy plane stopped: every call answered `403 wardryx unreachable,
+failmode=closed` in 0.3 s, one `dependency_failed` (`dependency=policy_plane`) per call, and
+recovery was instant. Provider egress rejected: `502` in 53 ms plus `dependency_failed` at
+stage `send`. A retired model id: `404` plus `dependency_failed` at stage `response`. A revoked
+key: `401` passed through with no event, by design (invariant 47). Three identical `tool_use`
+blocks among the last ten: `402 loop_detected` before the provider ever saw the call; forty
+identical plain calls are not a loop by that definition, and were stopped by the budget alone.
+`docker compose down`/`up` and two reboots: the run ledger went from 26 runs to 0 and the unit
+ledger's month reset, while the control plane still held `0.002145` USD, so a central cap was
+enforced afterward against a tally that had forgotten the month. Control plane stopped: three
+calls' telemetry was lost outright, not queued. A customer node killed mid-run, and a path cut
+for 40 s: no plane said anything at 5 s or at 60 s. The control plane could not create its own
+events file (uid 10001 with gid 999 against a `2775 root:10001` directory) and said nothing,
+so no control-plane incident reached the bus until the file was pre-created. Owner attribution
+read `unassigned` for every run. A 40-entry `x-fuse-on-behalf-of` chain was accepted with no
+event while delegation verification was off.
+
+**What followed, as of this writing.** tokenfuse#292 and #297 are fixed by #303 (`f6c2ca2`);
+#293, #294 and #295 by #310 (`3787ccd`, invariants 52 to 54); #296 by #307 (`169a83e`, the
+`run_stalled` detector, invariant 60); #305 above is still open. None of it is in a tagged
+release: the launchers pin v1.0.2, whose gateway carries none of these fixes.
+
+**What this run did not prove.** Managed agent runtimes (Bedrock Agents, Vertex Agent Engine)
+were not exercised, nor were managed clusters, arm64, or more than one node or agent per
+cloud. Volume stayed low: about half a call per second across two agents. The raft build was
+not part of this run. Only the tailnet-bound gateway was rebooted; its reboot survival on the
+default loopback bind is untested here.
+
 ## Method
 
 Disposable Hetzner VPS boxes (deleted after each run) and short-lived cloud instances; code delivered as
