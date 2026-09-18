@@ -313,8 +313,9 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+    use crate::testlog::{captured_log, log_lock};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, MutexGuard, OnceLock};
+    use std::sync::Arc;
 
     /// The substring both halves of a refusal report carry: the first-of-its-
     /// kind warning and the quiet repeats after it. These tests match on it, so
@@ -328,59 +329,6 @@ mod tests {
     // These tests therefore capture the log rather than assert on a counter
     // added for their benefit: what is under test is exactly what an operator
     // reads, including the level it is written at.
-
-    /// A `MakeWriter` that appends formatted tracing output to a shared buffer.
-    #[derive(Clone)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// The one buffer, behind the process-wide default subscriber. It has to be
-    /// global rather than per-test: `ship` does its work in a spawned task, so
-    /// a thread-local subscriber set by the test's own thread would never see
-    /// the line it is waiting for.
-    fn captured_log() -> &'static Arc<Mutex<Vec<u8>>> {
-        static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-        BUF.get_or_init(|| {
-            let buf = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(Captured(Arc::clone(&buf)))
-                .with_ansi(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).expect(
-                "these assertions read the subscriber installed here, so nothing \
-                 else in this test binary may install one first",
-            );
-            buf
-        })
-    }
-
-    /// Serialises the tests that read the shared buffer. Cargo runs a binary's
-    /// tests on parallel threads, and without this they would count each
-    /// other's lines. Same reason, and the same shape, as the exporter tests in
-    /// `crate::events`.
-    fn log_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn clear_log() {
         captured_log().lock().unwrap().clear();

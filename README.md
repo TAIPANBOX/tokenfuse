@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.0.2-brightgreen)
-![tests](https://img.shields.io/badge/tests-1290-brightgreen)
+![tests](https://img.shields.io/badge/tests-1311-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -252,6 +252,8 @@ Three properties make this safe in production:
 3. **Metadata-only.** It measures cost and behavior; it does **not** store prompt contents by default.
 
 Because cost is *estimated* before the call and *settled* after it, TokenFuse's numbers are a fast pre-flight approximation reconciled against real usage, not a hard real-time guarantee - see the [FAQ](#-faq) for what that means in practice.
+
+One case is neither settled nor released: a call the gateway has already handed to the provider when the client disconnects, before any answer has come back. The provider may or may not have run it, so its reservation stays outstanding on the run and on the unit's monthly cap rather than being written off as free; `GET /v1/runs` lists it as `retained` / `retained_usd`, the log carries a warning naming the run and the amount, and the run's next call can widen its budget to absorb it. Nothing reconciles it automatically yet (CLAUDE.md invariant 50).
 
 **Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~0.8 ms p50 / ~2 ms p99** over a direct provider call, negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
 

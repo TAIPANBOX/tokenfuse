@@ -1,24 +1,32 @@
-//! A guard that guarantees a streaming reservation is always settled — even if
-//! the client disconnects mid-stream and the response future is dropped before
-//! the normal end-of-stream settle runs.
+//! The owner of a managed call's reservations, from the first one taken to the terminal
+//! transition, and the one place that decides what each outcome is charged.
 //!
-//! On normal completion the caller invokes [`SettleGuard::complete`], which
-//! settles with the usage parsed from the stream. If the guard is dropped first
-//! (client cancel, or an upstream error propagated via `?`), its `Drop` settles
-//! with whatever usage was parsed so far, falling back to the reserved estimate
-//! so the budget is never left over-reserved (a leaked reservation would wrongly
-//! block later calls in the same run).
+//! A managed call takes up to two reservations before it is forwarded: one on the run's budget
+//! chain (`Reservation`) and one on the unit's monthly cap (`UnitReservation`). This guard is
+//! created in `proxy::handle` the moment the unit half exists (or would have: it is created
+//! even when the unit has no cap), holds both halves across every await that follows (the run
+//! reserve, `Provider::send`, the buffered body read, the stream), and on `Drop` decides from
+//! [`CallOutcome`] rather than from whether anybody remembered to call settle. Until
+//! 2026-09-18 it existed only on the streaming path and only after the provider had answered,
+//! so a client that gave up while the provider still held the request leaked both halves
+//! (F03/3.4 of the 2026-09-18 money-path review) and a 2xx whose body broke was settled at
+//! zero on both (F04/3.5). Invariant 50.
 //!
-//! The fallback is only honest when a completion actually happened, which is
-//! what [`SettleGuard::provider_refused`] decides. Either way the reservation is
-//! released, so neither answer can leak one.
+//! The states are what happened on the wire. How much is charged for an answered call is
+//! [`settle_amount`]'s basis, unchanged: parsed usage as parsed, else the estimate on a 2xx and
+//! zero on a refusal (invariants 43 and 47). A call the provider held when the caller left is
+//! neither settled nor released: it is RETAINED, listed in [`Retained`], and stays outstanding
+//! until somebody reconciles it (D7, `@decided 2026-09-18`).
 
 use crate::keystats::KeyStats;
 use crate::ledger_backend::LedgerBackend;
 use crate::provider::{ParsedUsage, UsageSlot};
 use crate::sink::{now_millis, CallRecord, EventSink};
 use crate::unitledger::{UnitLedger, UnitReservation};
-use std::sync::Arc;
+use axum::http::StatusCode;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Microusd, PriceBook, Reservation, Usage};
 
 /// The basis a settlement's charged amount rests on. Not a Parquet column
@@ -27,7 +35,7 @@ use tokenfuse_core::{Microusd, PriceBook, Reservation, Usage};
 /// reconstructed after the fact from which `Microusd` happened to come out,
 /// which two different bases can produce by coincidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CostBasis {
+pub enum CostBasis {
     /// Real usage, parsed from a body the cap never touched.
     Parsed,
     /// Not truncated, but the body carried nothing to price - settled on the
@@ -55,9 +63,10 @@ pub(crate) enum CostBasis {
 /// reference when the caller sets `include_usage: false`; not measured here).
 /// Vertex Gemini and OpenRouter, one model each, send usage regardless and
 /// were never affected. Cache reads alone count as a measured response. Pure and unit-tested on its
-/// own below; both settle paths in this crate (`SettleGuard::settle_now` here
-/// and `crate::proxy::buffered_managed`) call this one function so the
-/// three-way decision is made in exactly one place.
+/// own below; `SettleGuard::charge` is the one caller, so the three-way
+/// decision is made in exactly one place (invariant 50, 2026-09-18: until
+/// then `SettleGuard::settle_now` and `proxy::buffered_managed` were two
+/// separate callers of the same function).
 ///
 /// Returns the amount to charge, the usage to record on the `CallRecord`
 /// (defaulted when nothing was parsed, same as before this function existed),
@@ -75,7 +84,7 @@ pub(crate) enum CostBasis {
 /// cost of also losing whatever partial counts a truncated body happened to
 /// carry - a real loss, but the alternative is a wrong label on a downstream
 /// billing export, which is worse.
-pub(crate) fn settle_amount(
+pub fn settle_amount(
     prices: &PriceBook,
     model: &str,
     parsed: Option<ParsedUsage>,
@@ -100,133 +109,359 @@ pub(crate) fn settle_amount(
     }
 }
 
+/// Where a managed call stands between its first reservation and its terminal transition.
+/// Set only by `proxy::handle` at the sites section 1.3 names; read only by `disposition`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    /// Reserved (the unit half, the run half, or both) and `Provider::send` not yet called.
+    /// A guard that ends here releases both at zero.
+    NotDispatched,
+    /// `Provider::send` has been called and has not returned. The request may be on the wire
+    /// or executing at the provider; nothing this process holds says which. A guard that ends
+    /// here RETAINS both halves (D7).
+    Unknown,
+    /// `Provider::send` returned `Err`. Read as "the request did not reach the provider";
+    /// invariant 50 records the honest limit of that reading. Releases both at zero.
+    NotSent,
+    /// A non-2xx status line arrived. Charges what the provider reported, else zero
+    /// (invariant 47).
+    Refused,
+    /// A 2xx status line arrived. Charges what the body reported, else the estimate
+    /// (invariant 43), whether the body completed, broke, or was abandoned by the caller.
+    Started,
+}
+
+/// What a terminal transition does with the two reservations: a pure function of the state,
+/// so the table can be read in one place and a planted fault is one token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Settle both at zero: nothing was generated.
+    Release,
+    /// Settle neither; hand both to [`Retained`] and warn (D7).
+    Retain,
+    /// Price the usage slot through `settle_amount`; `unmeasured` is the estimate on a 2xx and
+    /// zero on a refusal.
+    Charge { unmeasured_is_estimate: bool },
+}
+
+fn disposition(state: CallOutcome) -> Disposition {
+    match state {
+        CallOutcome::NotDispatched => Disposition::Release,
+        CallOutcome::NotSent => Disposition::Release,
+        CallOutcome::Unknown => Disposition::Retain,
+        CallOutcome::Refused => Disposition::Charge {
+            unmeasured_is_estimate: false,
+        },
+        CallOutcome::Started => Disposition::Charge {
+            unmeasured_is_estimate: true,
+        },
+    }
+}
+
+/// What [`SettleGuard::settle_now`] did. `None` from the method means it had already happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Terminal {
+    Released,
+    Retained {
+        amount: Microusd,
+        listed: bool,
+    },
+    Settled {
+        actual: Microusd,
+        usage: Usage,
+        basis: CostBasis,
+    },
+}
+
+/// The request-scoped fields the `allow` row carries, cloned once into the guard so the row is
+/// written from one place whichever path the call took.
+#[derive(Debug, Clone, Default)]
+pub struct CallAttribution {
+    pub model: String,
+    pub agent_id: String,
+    pub parent_run_id: String,
+    pub on_behalf_of: String,
+    pub outcome: String,
+    pub key_id: String,
+    pub unit: String,
+    /// `Some((original, chosen))` when the FinOps router rewrote the model: the row's
+    /// `saved_microusd` is what the original would have cost minus what the chosen one did,
+    /// for the settled usage. `None` on the streaming path and when nothing was routed.
+    pub router_route: Option<(String, String)>,
+}
+
+/// A reservation kept outstanding on purpose (D7): the request was handed to the provider and
+/// the call ended before any status line came back. Neither settled nor released; listed so an
+/// operator can see it and a reconciliation (D8, not built) can settle or release it with the
+/// handle it needs. Process-local, like the ledger it describes.
+#[derive(Debug, Clone)]
+pub struct RetainedReservation {
+    pub run: Reservation,
+    pub unit: Option<UnitReservation>,
+    pub model: String,
+    pub retained_at_millis: i64,
+}
+
+/// How many retained reservations are listed. Past this the ledger still holds the
+/// reservation outstanding (nothing money-wise changes) and only the handle is not kept; the
+/// retain warn line says `listed=false` and [`Retained::unlisted`] counts it. Bounded because
+/// a caller who can cancel calls can grow this set.
+pub const MAX_RETAINED: usize = 8192;
+
+#[derive(Debug, Default)]
+struct RetainedInner {
+    by_run: HashMap<String, Vec<RetainedReservation>>,
+    total: usize,
+}
+
+/// The process-local registry of retained reservations, one per `AppState`.
+#[derive(Debug, Default)]
+pub struct Retained {
+    inner: Mutex<RetainedInner>,
+    unlisted: AtomicU64,
+}
+
+impl Retained {
+    /// `false` when the cap refused the entry (counted).
+    pub fn push(&self, entry: RetainedReservation) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.total >= MAX_RETAINED {
+            self.unlisted.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        inner.total += 1;
+        inner
+            .by_run
+            .entry(entry.run.run_id.clone())
+            .or_default()
+            .push(entry);
+        true
+    }
+    pub fn for_run(&self, run_id: &str) -> Vec<RetainedReservation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .by_run
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn all(&self) -> Vec<RetainedReservation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .by_run
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().total
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn unlisted(&self) -> u64 {
+        self.unlisted.load(Ordering::Relaxed)
+    }
+}
+
 pub struct SettleGuard {
     ledger: Arc<dyn LedgerBackend>,
+    units: Arc<UnitLedger>,
     prices: Arc<PriceBook>,
     sink: Arc<dyn EventSink>,
-    model: String,
-    usage: UsageSlot,
-    fallback: Microusd,
-    /// Whether the upstream answered with a non-2xx, which decides whether
-    /// `fallback` may be charged at all.
-    ///
-    /// On a success the fallback is the conservative estimate it was written
-    /// to be: a completion did happen and we could not measure it, so charging
-    /// what was reserved beats letting an unmeasurable model spend a run's
-    /// budget for free. On a refusal there is no completion to measure, so the
-    /// estimate is not a fallback measurement of anything: it is a number this
-    /// gateway invented and then wrote into the run's budget, the unit's
-    /// monthly cap, the trace, the FOCUS export and the Cloud aggregates as
-    /// money somebody was billed. A provider that 429s a run repeatedly would
-    /// otherwise exhaust that run's budget on calls that cost nothing.
-    ///
-    /// This is a required constructor argument rather than a value folded into
-    /// `fallback` by the caller on purpose. `stream_managed` inherited the
-    /// buffered path's unconditional estimate and kept it through the fix for
-    /// that path (PR #167), because nothing made it answer the question. Now
-    /// nothing can construct this guard without answering it.
-    ///
-    /// Reported usage is settled as itself either way, including on a refusal:
-    /// a provider that generated part of a response and then failed over it
-    /// bills for what it generated, and that is real money rather than an
-    /// estimate. Only the "no usage to price" fallback is affected.
-    provider_refused: bool,
-    reservation: Option<Reservation>,
-    /// Request-scoped attribution carried into the settled `CallRecord`.
-    agent_id: String,
-    /// Request-scoped `X-Fuse-Parent-Run-Id`, carried into the settled
-    /// `CallRecord` (agent-passport SPEC.md §3.2). `""` when unset.
-    parent_run_id: String,
-    /// Request-scoped raw `X-Fuse-On-Behalf-Of` value, carried into the
-    /// settled `CallRecord` (agent-passport SPEC.md §5). `""` when unset.
-    on_behalf_of: String,
-    /// Request-scoped `X-Fuse-Outcome` value, carried into the settled
-    /// `CallRecord` (P4, unit economics). `""` when unset.
-    outcome: String,
-    /// The server-resolved client credential identity, carried into the
-    /// settled `CallRecord`. `""` when client keys are not configured. Unlike
-    /// every other field here it does not come from a request header the
-    /// caller wrote — see `CallRecord::key_id`.
-    key_id: String,
-    /// The server-resolved business unit (docs/20), carried into the settled
-    /// `CallRecord`. `""` when the identity map is off or nothing matched.
-    unit: String,
-    /// The per-unit monthly ledger and this call's unit reservation, settled
-    /// alongside the run reservation with the same actual cost. `None` when
-    /// the unit has no cap in effect (nothing was reserved).
-    units: Arc<UnitLedger>,
-    unit_reservation: Option<UnitReservation>,
-    /// Where a truncated settlement's counter goes
-    /// (`crate::keystats::KeyStats::record_truncated_settlement`). Added
-    /// alongside the truncation fix rather than threaded through every other
-    /// field above: nothing before this needed a place to report an
-    /// in-process signal that isn't part of the settled `CallRecord`.
     keystats: Arc<KeyStats>,
+    retained: Arc<Retained>,
+    run_id: String,
+    /// The pre-flight estimate both reservations were taken at; equal to `run.amount` once the
+    /// run half is held (asserted in debug builds).
+    estimate: Microusd,
+    attribution: CallAttribution,
+    state: CallOutcome,
+    /// The leaf's step from the run reservation; 0 until `hold_run`.
+    step: u32,
+    run: Option<Reservation>,
+    unit_reservation: Option<UnitReservation>,
+    /// The provider's usage slot, attached by `answered`. `None` until then.
+    usage: Option<UsageSlot>,
 }
 
 impl SettleGuard {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ledger: Arc<dyn LedgerBackend>,
+        units: Arc<UnitLedger>,
         prices: Arc<PriceBook>,
         sink: Arc<dyn EventSink>,
-        model: String,
-        usage: UsageSlot,
-        fallback: Microusd,
-        provider_refused: bool,
-        reservation: Reservation,
-        agent_id: String,
-        parent_run_id: String,
-        on_behalf_of: String,
-        outcome: String,
-        key_id: String,
-        unit: String,
-        units: Arc<UnitLedger>,
-        unit_reservation: Option<UnitReservation>,
         keystats: Arc<KeyStats>,
+        retained: Arc<Retained>,
+        run_id: String,
+        estimate: Microusd,
+        attribution: CallAttribution,
+        unit_reservation: Option<UnitReservation>,
     ) -> Self {
         SettleGuard {
             ledger,
+            units,
             prices,
             sink,
-            model,
-            usage,
-            fallback,
-            provider_refused,
-            reservation: Some(reservation),
-            agent_id,
-            parent_run_id,
-            on_behalf_of,
-            outcome,
-            key_id,
-            unit,
-            units,
-            unit_reservation,
             keystats,
+            retained,
+            run_id,
+            estimate,
+            attribution,
+            state: CallOutcome::NotDispatched,
+            step: 0,
+            run: None,
+            unit_reservation,
+            usage: None,
         }
     }
 
-    fn settle_now(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
-            return;
-        };
-        let parsed = self.usage.lock().unwrap().take();
-        // What to settle when the stream reported no usage we can price. See
-        // `provider_refused`'s doc for why a refusal may not be charged the
-        // estimate; this mirrors `buffered_managed`'s `unmeasured` binding.
-        let unmeasured = if self.provider_refused {
-            Microusd::ZERO
+    /// The run half, from `reserve` or `reserve_unchecked`. Once per guard, before dispatch.
+    pub fn hold_run(&mut self, reservation: Reservation) {
+        debug_assert!(self.run.is_none() && self.state == CallOutcome::NotDispatched);
+        debug_assert_eq!(reservation.amount, self.estimate);
+        self.step = reservation.step;
+        self.run = Some(reservation);
+    }
+
+    /// Called on the line before `Provider::send(..).await`, never after: from here the
+    /// outcome is unknown until `not_sent` or `answered` says otherwise.
+    pub fn dispatching(&mut self) {
+        debug_assert!(self.state == CallOutcome::NotDispatched && self.run.is_some());
+        self.state = CallOutcome::Unknown;
+    }
+
+    /// `Provider::send` returned `Err`.
+    pub fn not_sent(&mut self) {
+        debug_assert_eq!(self.state, CallOutcome::Unknown);
+        self.state = CallOutcome::NotSent;
+    }
+
+    /// A status line arrived, with the slot the provider will fill at the end of the body.
+    /// A status `StatusCode` cannot parse is not a success.
+    pub fn answered(&mut self, status: u16, usage: UsageSlot) {
+        debug_assert_eq!(self.state, CallOutcome::Unknown);
+        let ok = StatusCode::from_u16(status)
+            .map(|s| s.is_success())
+            .unwrap_or(false);
+        self.state = if ok {
+            CallOutcome::Started
         } else {
-            self.fallback
+            CallOutcome::Refused
         };
-        let (actual, usage, basis) = settle_amount(&self.prices, &self.model, parsed, unmeasured);
+        self.usage = Some(usage);
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+    pub fn step(&self) -> u32 {
+        self.step
+    }
+    pub fn state(&self) -> CallOutcome {
+        self.state
+    }
+
+    /// The terminal transition, exactly once: the second call answers `None` and touches
+    /// nothing. Both halves are taken here, which is what makes `Drop` after `complete` a
+    /// no-op and a double settle impossible from this type (the ledger's own exactly-once,
+    /// invariant 49, is the second line of defence for the run half; the unit ledger has none,
+    /// which is why E17 reads the unit).
+    pub fn settle_now(&mut self) -> Option<Terminal> {
+        let run = self.run.take();
+        let unit = self.unit_reservation.take();
+        if run.is_none() && unit.is_none() {
+            return None;
+        }
+        let now = now_millis();
+        Some(match disposition(self.state) {
+            Disposition::Release => self.release(run.as_ref(), unit.as_ref(), now),
+            Disposition::Retain => self.retain(run, unit, now),
+            Disposition::Charge {
+                unmeasured_is_estimate,
+            } => self.charge(run.as_ref(), unit.as_ref(), unmeasured_is_estimate, now),
+        })
+    }
+
+    /// Normal end of stream. Consumes the guard so its `Drop` is a no-op.
+    pub fn complete(mut self) {
+        self.settle_now();
+    }
+
+    fn release(
+        &self,
+        run: Option<&Reservation>,
+        unit: Option<&UnitReservation>,
+        now: i64,
+    ) -> Terminal {
+        if let Some(r) = run {
+            self.ledger.settle(r, Microusd::ZERO);
+        }
+        if let Some(u) = unit {
+            self.units.settle(u, Microusd::ZERO, now);
+        }
+        Terminal::Released
+    }
+
+    fn retain(
+        &self,
+        run: Option<Reservation>,
+        unit: Option<UnitReservation>,
+        now: i64,
+    ) -> Terminal {
+        let Some(run) = run else {
+            // Unreachable by construction (`dispatching` asserts a held run half); written as
+            // a value rather than a panic. Nothing was dispatched against the unit alone.
+            tracing::error!(run = %self.run_id, "settle guard reached the unknown state with no run reservation; releasing the unit half");
+            return self.release(None, unit.as_ref(), now);
+        };
+        let (id, step, amount) = (run.id, run.step, run.amount);
+        let unit_name = unit.as_ref().map(|u| u.unit.clone()).unwrap_or_default();
+        let listed = self.retained.push(RetainedReservation {
+            run,
+            unit,
+            model: self.attribution.model.clone(),
+            retained_at_millis: now,
+        });
+        tracing::warn!(
+            run = %self.run_id,
+            reservation = id,
+            step,
+            amount_microusd = amount.0,
+            unit = %unit_name,
+            model = %self.attribution.model,
+            listed,
+            "retained: the request was handed to the provider and the call ended before any answer came back, so its outcome is unknown; the reservation stays outstanding on the run and on the unit until it is reconciled (invariant 50), never settled at zero"
+        );
+        Terminal::Retained { amount, listed }
+    }
+
+    fn charge(
+        &self,
+        run: Option<&Reservation>,
+        unit: Option<&UnitReservation>,
+        unmeasured_is_estimate: bool,
+        now: i64,
+    ) -> Terminal {
+        let parsed = self
+            .usage
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap().take());
+        let unmeasured = if unmeasured_is_estimate {
+            self.estimate
+        } else {
+            Microusd::ZERO
+        };
+        let (actual, usage, basis) =
+            settle_amount(&self.prices, &self.attribution.model, parsed, unmeasured);
         if basis == CostBasis::EstimateTruncated {
-            // `settled_microusd` is named, not assumed nonzero: a refused
-            // call whose error body also overran the cap settles zero here,
-            // same as any other refusal, and the log line must not read as
-            // though an estimate was charged when nothing was.
+            // Verbatim the existing warn (settle.rs:228-235 at e25835c) and counter.
             tracing::warn!(
-                model = %self.model,
+                model = %self.attribution.model,
                 buffered_bytes = crate::provider::UsageParser::CAP,
                 settled_microusd = actual.0,
                 "usage-parser cap hit before the response's usage block arrived; \
@@ -235,46 +470,62 @@ impl SettleGuard {
             );
             self.keystats.record_truncated_settlement();
         }
-        self.ledger.settle(&reservation, actual);
-        if let Some(ur) = self.unit_reservation.take() {
-            self.units.settle(&ur, actual, now_millis());
+        if let Some(r) = run {
+            self.ledger.settle(r, actual);
         }
+        if let Some(u) = unit {
+            self.units.settle(u, actual, now);
+        }
+        if let Some(r) = run {
+            self.record_row(r, actual, &usage);
+        }
+        Terminal::Settled {
+            actual,
+            usage,
+            basis,
+        }
+    }
 
+    /// The `allow` row, ONE site for both paths (S5). `saved_microusd` is the router's
+    /// avoided spend, verbatim the arithmetic that sat in `buffered_managed` at e25835c
+    /// (`proxy.rs:2202-2213`), zero on the streaming path where `router_route` is `None`.
+    fn record_row(&self, run: &Reservation, actual: Microusd, usage: &Usage) {
+        let a = &self.attribution;
+        let saved = match &a.router_route {
+            Some((original, chosen)) => match (
+                self.prices.cost(original, usage),
+                self.prices.cost(chosen, usage),
+            ) {
+                (Some(would_have_cost), Some(did_cost)) => would_have_cost.saturating_sub(did_cost),
+                _ => Microusd::ZERO,
+            },
+            None => Microusd::ZERO,
+        };
         self.sink.record(CallRecord {
             ts_millis: now_millis(),
-            run_id: reservation.run_id.clone(),
-            model: self.model.clone(),
+            run_id: run.run_id.clone(),
+            model: a.model.clone(),
             decision: "allow".into(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cost_microusd: actual.0,
-            step: reservation.step,
-            agent_id: self.agent_id.clone(),
-            // Streaming allows never serve from cache — no savings to record.
-            saved_microusd: 0,
-            parent_run_id: self.parent_run_id.clone(),
-            on_behalf_of: self.on_behalf_of.clone(),
-            outcome: self.outcome.clone(),
-            key_id: self.key_id.clone(),
-            unit: self.unit.clone(),
-            // The model-emitted tool-call count parsed out of the streamed
-            // response, same source as `input_tokens`/`output_tokens` above
-            // (I1, docs/21-tool-runs.md). `None` on the drop-without-complete
-            // path (cancel/error before any usage was parsed).
+            step: run.step,
+            agent_id: a.agent_id.clone(),
+            saved_microusd: saved.0,
+            parent_run_id: a.parent_run_id.clone(),
+            on_behalf_of: a.on_behalf_of.clone(),
+            outcome: a.outcome.clone(),
+            key_id: a.key_id.clone(),
+            unit: a.unit.clone(),
             tool_calls: usage.tool_calls,
         });
-    }
-
-    /// Settle now with the parsed usage (normal end-of-stream). Consumes the
-    /// guard so its `Drop` becomes a no-op.
-    pub fn complete(mut self) {
-        self.settle_now();
     }
 }
 
 impl Drop for SettleGuard {
     fn drop(&mut self) {
-        // Only fires if `complete()` was not called (cancel / error path).
+        // Every path that did not settle explicitly ends here: a cancelled future, an error
+        // propagated by `?`, an early return. The state decides; nothing else does.
         self.settle_now();
     }
 }
@@ -286,6 +537,17 @@ mod tests {
     use crate::provider::{ParsedUsage, UsageSlot};
     use std::sync::Mutex;
     use tokenfuse_core::{Ledger, ModelPrice, PriceBook, Usage};
+
+    /// Builds a guard with both halves held and dispatched. `slot` starts empty; call
+    /// `*slot.lock().unwrap() = Some(..)` before `answered`/`settle_now` to simulate a
+    /// provider that published usage.
+    struct Rig {
+        ledger: Arc<Ledger>,
+        units: Arc<UnitLedger>,
+        retained: Arc<Retained>,
+        sink: Arc<CapturingSink>,
+        slot: UsageSlot,
+    }
 
     fn setup() -> (Arc<Ledger>, Arc<PriceBook>, UsageSlot, Reservation) {
         let ledger = Arc::new(Ledger::new());
@@ -299,6 +561,53 @@ mod tests {
         (ledger, prices, usage, reservation)
     }
 
+    /// A minimal `EventSink` test double that captures every settled `CallRecord`
+    /// (`all`), plus `last` for the tests that only care about the most recent one.
+    #[derive(Default)]
+    struct CapturingSink {
+        last: Mutex<Option<CallRecord>>,
+        all: Mutex<Vec<CallRecord>>,
+    }
+
+    impl crate::sink::EventSink for CapturingSink {
+        fn record(&self, rec: CallRecord) {
+            self.all.lock().unwrap().push(rec.clone());
+            *self.last.lock().unwrap() = Some(rec);
+        }
+        fn flush(&self) {}
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn guard(
+        ledger: &Arc<Ledger>,
+        prices: Arc<PriceBook>,
+        sink: Arc<dyn EventSink>,
+        model: &str,
+        estimate: Microusd,
+        unit: &str,
+        units: Arc<UnitLedger>,
+        unit_reservation: Option<UnitReservation>,
+        retained: Arc<Retained>,
+        keystats: Arc<KeyStats>,
+    ) -> SettleGuard {
+        SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            units,
+            prices,
+            sink,
+            keystats,
+            retained,
+            "r".into(),
+            estimate,
+            CallAttribution {
+                model: model.into(),
+                unit: unit.into(),
+                ..Default::default()
+            },
+            unit_reservation,
+        )
+    }
+
     #[test]
     fn complete_settles_with_parsed_usage() {
         let (ledger, prices, usage, reservation) = setup();
@@ -310,26 +619,22 @@ mod tests {
             },
             truncated: false,
         });
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             Arc::new(crate::sink::NullSink),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false, // a 200 stream: the estimate is a legitimate fallback
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             Arc::new(KeyStats::default()),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
 
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(snap.reserved, Microusd::ZERO); // released
@@ -339,28 +644,23 @@ mod tests {
     #[test]
     fn drop_without_complete_settles_with_fallback() {
         let (ledger, prices, usage, reservation) = setup();
-        // No usage parsed (cancel before any usage event).
         let fallback = Microusd::from_usd(1.0);
         {
-            let _guard = SettleGuard::new(
-                Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            let mut g = guard(
+                &ledger,
                 prices,
                 Arc::new(crate::sink::NullSink),
-                "m".into(),
-                usage,
+                "m",
                 fallback,
-                false, // a 200 stream: the estimate is a legitimate fallback
-                reservation,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
+                "",
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(Retained::default()),
                 Arc::new(KeyStats::default()),
             );
+            g.hold_run(reservation);
+            g.dispatching();
+            g.answered(200, usage);
             // dropped here without complete()
         }
         let snap = ledger.snapshot("r").unwrap();
@@ -369,36 +669,26 @@ mod tests {
     }
 
     /// The same cancel path, on a stream the provider had already refused.
-    ///
-    /// This is the case no HTTP test can reach: the two in `proxy.rs` drain the
-    /// body, so they exercise `complete()`. A client that gives up on a 429
-    /// before draining it goes through `Drop` instead, and the estimate is
-    /// exactly as invented there. The reservation must still be released, which
-    /// is the guard's whole reason for existing.
     #[test]
     fn a_refused_stream_dropped_without_complete_settles_zero_not_the_estimate() {
         let (ledger, prices, usage, reservation) = setup();
         {
-            let _guard = SettleGuard::new(
-                Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+            let mut g = guard(
+                &ledger,
                 prices,
                 Arc::new(crate::sink::NullSink),
-                "m".into(),
-                usage,
+                "m",
                 Microusd::from_usd(1.0),
-                true, // the provider refused: nothing was generated
-                reservation,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
+                "",
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(Retained::default()),
                 Arc::new(KeyStats::default()),
             );
-            // dropped here without complete()
+            g.hold_run(reservation);
+            g.dispatching();
+            g.answered(429, usage); // the provider refused: nothing was generated
+                                    // dropped here without complete()
         }
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(
@@ -414,9 +704,7 @@ mod tests {
         );
     }
 
-    /// A refusal that DOES report usage is still settled as that usage, on the
-    /// guard as well as through HTTP. Pins the fix as "do not charge an
-    /// estimate for nothing", not "a non-2xx is free".
+    /// A refusal that DOES report usage is still settled as that usage.
     #[test]
     fn a_refused_stream_that_reported_usage_still_settles_it() {
         let (ledger, prices, usage, reservation) = setup();
@@ -428,26 +716,22 @@ mod tests {
             },
             truncated: false,
         });
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             Arc::new(crate::sink::NullSink),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            true, // refused, but it billed for what it generated
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             Arc::new(KeyStats::default()),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(429, usage); // refused, but it billed for what it generated
+        g.complete();
 
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(snap.reserved, Microusd::ZERO);
@@ -478,50 +762,29 @@ mod tests {
             .try_reserve("treasury", Microusd::from_usd(1.0), now)
             .unwrap()
             .expect("capped unit reserves");
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             Arc::new(crate::sink::NullSink),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false, // a 200 stream: the estimate is a legitimate fallback
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            "treasury".into(),
+            "treasury",
             units.clone(),
             Some(ur),
+            Arc::new(Retained::default()),
             Arc::new(KeyStats::default()),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
         // The unit ledger absorbed the same actual cost as the run ledger.
         assert_eq!(units.spent("treasury", now), Microusd::from_usd(3.0));
     }
 
-    /// A minimal `EventSink` test double that just captures the last
-    /// settled `CallRecord`, so a test can inspect a field `NullSink`
-    /// (used everywhere above) throws away.
-    #[derive(Default)]
-    struct CapturingSink {
-        last: Mutex<Option<CallRecord>>,
-    }
-
-    impl crate::sink::EventSink for CapturingSink {
-        fn record(&self, rec: CallRecord) {
-            *self.last.lock().unwrap() = Some(rec);
-        }
-        fn flush(&self) {}
-    }
-
-    /// I1 (docs/21-tool-runs.md): the streaming settle path carries
-    /// `Usage::tool_calls` through into the settled `CallRecord`, exactly
-    /// like `input_tokens`/`output_tokens` - proven here for the streaming
-    /// path specifically, since `buffered_managed`'s non-streaming path is
-    /// covered separately in `proxy.rs`.
+    /// I1 (docs/21-tool-runs.md): the guard carries `Usage::tool_calls`
+    /// through into the settled `CallRecord`, exactly like
+    /// `input_tokens`/`output_tokens`.
     #[test]
     fn complete_settles_with_parsed_tool_calls() {
         let (ledger, prices, usage, reservation) = setup();
@@ -535,26 +798,22 @@ mod tests {
             truncated: false,
         });
         let sink = Arc::new(CapturingSink::default());
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger)),
+        let mut g = guard(
+            &ledger,
             prices,
             sink.clone(),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false, // a 200 stream: the estimate is a legitimate fallback
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             Arc::new(KeyStats::default()),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
 
         let rec = sink
             .last
@@ -572,25 +831,21 @@ mod tests {
         let (ledger, prices, usage, reservation) = setup();
         let sink = Arc::new(CapturingSink::default());
         {
-            let _guard = SettleGuard::new(
-                Arc::new(crate::ledger_backend::LocalLedger(ledger)),
+            let mut g = guard(
+                &ledger,
                 prices,
                 sink.clone(),
-                "m".into(),
-                usage,
+                "m",
                 Microusd::from_usd(1.0),
-                false, // a 200 stream: the estimate is a legitimate fallback
-                reservation,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
+                "",
                 Arc::new(UnitLedger::default()),
                 None,
+                Arc::new(Retained::default()),
                 Arc::new(KeyStats::default()),
             );
+            g.hold_run(reservation);
+            g.dispatching();
+            g.answered(200, usage);
             // dropped here without complete()
         }
         let rec = sink
@@ -603,12 +858,6 @@ mod tests {
     }
 
     // -- settle_amount: the three-way basis, isolated from the guard -------
-    //
-    // These four cover `CostBasis` directly, by name. The `SettleGuard`-level
-    // tests below cover the same three settle-time cases end-to-end (the
-    // ledger charge and the truncation counter), since `basis` itself is
-    // in-process only and not part of the settled `CallRecord` (see the PR
-    // body for why no Parquet column was added).
 
     #[test]
     fn settle_amount_prices_real_usage_as_parsed() {
@@ -679,9 +928,7 @@ mod tests {
     /// answers `Some(0)` and the parsed `Usage` is zero tokens beside
     /// `tool_calls: Some(0)`. Before this fix `settle_amount` read "did we
     /// parse usage" as `usage != Usage::default()`, which that side field
-    /// satisfies, and the call settled as `Parsed` at zero: a completion
-    /// delivered in full for nothing against the budget. Measured live on
-    /// Ollama and Bedrock; the trace rows are in tokenfuse#283.
+    /// satisfies, and the call settled as `Parsed` at zero.
     #[test]
     fn settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage() {
         let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
@@ -756,11 +1003,6 @@ mod tests {
 
     // -- SettleGuard end-to-end: the truncation fallback and its counter ---
 
-    /// RED-FIRST at the guard level (see `provider.rs` for the parser-level
-    /// red-first): before this fix, `SettleGuard` had no way to be told a
-    /// result was truncated at all, so a partial 500k-input-token parse would
-    /// have settled at $1.50 - real money computed from data the cap had
-    /// already cut off.
     #[test]
     fn a_truncated_result_settles_on_the_estimate_and_counts_it() {
         let (ledger, prices, usage, reservation) = setup();
@@ -773,26 +1015,22 @@ mod tests {
         });
         let keystats = Arc::new(KeyStats::default());
         let sink = Arc::new(CapturingSink::default());
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             sink.clone(),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false, // a 200 stream: the estimate is a legitimate fallback
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             keystats.clone(),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
 
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(
@@ -802,12 +1040,6 @@ mod tests {
         );
         assert_eq!(keystats.snapshot().truncated_settlements.settlements, 1);
 
-        // The CallRecord side of the same fix: focusexport::to_row reads
-        // "zero tokens + nonzero cost" as x_cost_basis "estimated" and
-        // anything else as "settled" (see its module doc). The 500k partial
-        // input tokens parsed above must NOT reach the record, or a
-        // downstream FOCUS reader (CostCrew) would call this settled money
-        // rather than the estimate it actually is.
         let rec = sink
             .last
             .lock()
@@ -833,26 +1065,22 @@ mod tests {
             truncated: false,
         });
         let keystats = Arc::new(KeyStats::default());
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             Arc::new(crate::sink::NullSink),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false,
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             keystats.clone(),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
 
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(
@@ -871,26 +1099,22 @@ mod tests {
             truncated: false,
         });
         let keystats = Arc::new(KeyStats::default());
-        let guard = SettleGuard::new(
-            Arc::new(crate::ledger_backend::LocalLedger(ledger.clone())),
+        let mut g = guard(
+            &ledger,
             prices,
             Arc::new(crate::sink::NullSink),
-            "m".into(),
-            usage,
+            "m",
             Microusd::from_usd(1.0),
-            false,
-            reservation,
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
+            "",
             Arc::new(UnitLedger::default()),
             None,
+            Arc::new(Retained::default()),
             keystats.clone(),
         );
-        guard.complete();
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
 
         let snap = ledger.snapshot("r").unwrap();
         assert_eq!(
@@ -902,6 +1126,398 @@ mod tests {
             keystats.snapshot().truncated_settlements.settlements,
             0,
             "not the cap's doing, so it must not count as a truncated settlement"
+        );
+    }
+
+    // -- invariant 50: one owner, five states, an unknown outcome is retained
+
+    fn rig() -> Rig {
+        let ledger = Arc::new(Ledger::new());
+        ledger
+            .open_run("r", Microusd::from_usd(5.0), None)
+            .expect("opens");
+        let units = Arc::new(UnitLedger::new(std::collections::HashMap::from([(
+            "treasury".to_string(),
+            Microusd::from_usd(10.0),
+        )])));
+        Rig {
+            ledger,
+            units,
+            retained: Arc::new(Retained::default()),
+            sink: Arc::new(CapturingSink::default()),
+            slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn rig_guard(rig: &Rig) -> SettleGuard {
+        let prices =
+            Arc::new(PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0)));
+        let now = now_millis();
+        let ur = rig
+            .units
+            .try_reserve("treasury", Microusd::from_usd(1.0), now)
+            .unwrap()
+            .expect("capped unit reserves");
+        let reservation = rig.ledger.reserve("r", Microusd::from_usd(1.0)).unwrap();
+        let mut g = SettleGuard::new(
+            Arc::new(crate::ledger_backend::LocalLedger(rig.ledger.clone())),
+            rig.units.clone(),
+            prices,
+            rig.sink.clone(),
+            Arc::new(KeyStats::default()),
+            rig.retained.clone(),
+            "r".into(),
+            Microusd::from_usd(1.0),
+            CallAttribution {
+                model: "m".into(),
+                unit: "treasury".into(),
+                ..Default::default()
+            },
+            Some(ur),
+        );
+        g.hold_run(reservation);
+        g
+    }
+
+    /// E13. A guard dropped while the provider holds the request (never
+    /// answered) neither settles nor releases: both ledgers stay reserved at
+    /// the estimate, the registry gets exactly one entry, and one `warn`
+    /// names the run, the reservation, the amount and the unit (D7).
+    ///
+    /// Compile-red at e25835c: `Retained`, `RetainedReservation` and
+    /// `AppState.retained` do not exist there.
+    #[test]
+    fn a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns() {
+        let _serial = crate::testlog::log_lock();
+        let buf = crate::testlog::captured_log();
+        let start = buf.lock().unwrap().len();
+
+        let r = rig();
+        {
+            let mut g = rig_guard(&r);
+            g.dispatching();
+            // dropped here, still `Unknown`
+        }
+
+        let snap = r.ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::from_usd(1.0));
+        assert_eq!(snap.spent, Microusd::ZERO);
+        assert_eq!(
+            r.units.reserved("treasury", now_millis()),
+            Microusd::from_usd(1.0)
+        );
+        assert_eq!(r.units.spent("treasury", now_millis()), Microusd::ZERO);
+        assert_eq!(r.retained.len(), 1);
+        let entry = &r.retained.for_run("r")[0];
+        assert_eq!(entry.run.amount, Microusd::from_usd(1.0));
+        assert_eq!(entry.unit.as_ref().unwrap().unit, "treasury");
+        assert!(r.sink.all.lock().unwrap().is_empty(), "no row: D6");
+
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()[start..]).into_owned();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("retained: the request was handed to the provider"),
+            "{text}"
+        );
+        assert!(text.contains("run=r reservation="), "{text}");
+        assert!(text.contains("amount_microusd=1000000"), "{text}");
+        assert!(text.contains("unit=treasury"), "{text}");
+        assert!(text.contains("listed=true"), "{text}");
+    }
+
+    /// E14. A guard dropped before dispatch releases both halves at zero and
+    /// writes no row. Compile-red at e25835c: the new `SettleGuard::new`
+    /// signature does not exist there.
+    #[test]
+    fn a_guard_dropped_before_dispatch_releases_both_ledgers_and_writes_no_row() {
+        let _serial = crate::testlog::log_lock();
+        let buf = crate::testlog::captured_log();
+        let start = buf.lock().unwrap().len();
+
+        let r = rig();
+        {
+            let _g = rig_guard(&r);
+            // dropped here without `dispatching()`: still NotDispatched
+        }
+
+        let snap = r.ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(snap.spent, Microusd::ZERO);
+        assert_eq!(r.units.reserved("treasury", now_millis()), Microusd::ZERO);
+        assert_eq!(r.units.spent("treasury", now_millis()), Microusd::ZERO);
+        assert!(r.retained.is_empty());
+        assert!(r.sink.all.lock().unwrap().is_empty());
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()[start..]).into_owned();
+        assert!(!text.contains("retained:"), "{text}");
+    }
+
+    /// E15. A guard holding only the unit half (no run reservation ever
+    /// taken) releases the unit half on drop and leaves the run ledger
+    /// untouched.
+    #[test]
+    fn a_guard_holding_only_the_unit_half_releases_it_on_drop() {
+        let r = rig();
+        let prices =
+            Arc::new(PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0)));
+        let now = now_millis();
+        let ur = r
+            .units
+            .try_reserve("treasury", Microusd::from_usd(1.0), now)
+            .unwrap()
+            .expect("capped unit reserves");
+        {
+            let _g = SettleGuard::new(
+                Arc::new(crate::ledger_backend::LocalLedger(r.ledger.clone())),
+                r.units.clone(),
+                prices,
+                r.sink.clone(),
+                Arc::new(KeyStats::default()),
+                r.retained.clone(),
+                "r".into(),
+                Microusd::from_usd(1.0),
+                CallAttribution {
+                    model: "m".into(),
+                    unit: "treasury".into(),
+                    ..Default::default()
+                },
+                Some(ur),
+            );
+            // no hold_run: the run half was never taken. Dropped here.
+        }
+        assert_eq!(r.units.reserved("treasury", now_millis()), Microusd::ZERO);
+        assert_eq!(r.units.spent("treasury", now_millis()), Microusd::ZERO);
+        let snap = r.ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(snap.steps, 0);
+        assert!(r.retained.is_empty());
+        assert!(r.sink.all.lock().unwrap().is_empty());
+    }
+
+    /// E16. `not_sent` releases both halves at zero and writes no row, and
+    /// `settle_now` answers `Some(Terminal::Released)` at the point of the
+    /// explicit call, not only on drop.
+    #[test]
+    fn a_guard_told_the_send_failed_releases_both_and_writes_no_row() {
+        let r = rig();
+        let mut g = rig_guard(&r);
+        g.dispatching();
+        g.not_sent();
+        assert_eq!(g.settle_now(), Some(Terminal::Released));
+        drop(g);
+
+        let snap = r.ledger.snapshot("r").unwrap();
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(snap.spent, Microusd::ZERO);
+        assert_eq!(r.units.reserved("treasury", now_millis()), Microusd::ZERO);
+        assert_eq!(r.units.spent("treasury", now_millis()), Microusd::ZERO);
+        assert!(r.retained.is_empty());
+        assert!(r.sink.all.lock().unwrap().is_empty());
+    }
+
+    /// E17. A second `settle_now` after the first, and a `Drop` after that,
+    /// change nothing: the guard settles exactly once. The RUN ledger is
+    /// shielded a second time by invariant 49's own exactly-once; the UNIT
+    /// ledger has no such guard of its own, which is why this reads the unit
+    /// (not 6_000_000) as the assertion that can actually go red.
+    #[test]
+    fn a_second_settle_of_one_guard_changes_nothing() {
+        let r = rig();
+        let mut g = rig_guard(&r);
+        *r.slot.lock().unwrap() = Some(ParsedUsage {
+            usage: Usage {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            },
+            truncated: false,
+        });
+        g.dispatching();
+        g.answered(200, r.slot.clone());
+
+        let first = g.settle_now();
+        let second = g.settle_now();
+        drop(g);
+
+        assert_eq!(
+            first,
+            Some(Terminal::Settled {
+                actual: Microusd(3_000_000),
+                usage: Usage {
+                    input_tokens: 1_000_000,
+                    ..Default::default()
+                },
+                basis: CostBasis::Parsed,
+            })
+        );
+        assert_eq!(second, None);
+        let snap = r.ledger.snapshot("r").unwrap();
+        assert_eq!(snap.spent, Microusd(3_000_000));
+        assert_eq!(snap.reserved, Microusd::ZERO);
+        assert_eq!(
+            r.units.spent("treasury", now_millis()),
+            Microusd(3_000_000),
+            "not 6_000_000: a second settle must not charge the unit twice"
+        );
+        assert_eq!(r.sink.all.lock().unwrap().len(), 1);
+    }
+
+    /// E18. The run and the unit ledgers agree in every terminal state:
+    /// `reserved == 0` on one side exactly when it is on the other, and the
+    /// two `spent` figures always match. Only `Unknown` leaves both
+    /// outstanding.
+    #[test]
+    fn the_run_and_unit_ledgers_agree_in_every_terminal_state() {
+        struct Row {
+            name: &'static str,
+            status: Option<u16>,
+            slot: Option<ParsedUsage>,
+            not_sent: bool,
+        }
+        let rows = [
+            Row {
+                name: "NotDispatched",
+                status: None,
+                slot: None,
+                not_sent: false,
+            },
+            Row {
+                name: "NotSent",
+                status: None,
+                slot: None,
+                not_sent: true,
+            },
+            Row {
+                name: "Refused, no usage",
+                status: Some(429),
+                slot: None,
+                not_sent: false,
+            },
+            Row {
+                name: "Refused, priced usage",
+                status: Some(429),
+                slot: Some(ParsedUsage {
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        ..Default::default()
+                    },
+                    truncated: false,
+                }),
+                not_sent: false,
+            },
+            Row {
+                name: "Started, no usage",
+                status: Some(200),
+                slot: None,
+                not_sent: false,
+            },
+            Row {
+                name: "Started, priced usage",
+                status: Some(200),
+                slot: Some(ParsedUsage {
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        ..Default::default()
+                    },
+                    truncated: false,
+                }),
+                not_sent: false,
+            },
+            Row {
+                name: "Started, truncated",
+                status: Some(200),
+                slot: Some(ParsedUsage {
+                    usage: Usage {
+                        input_tokens: 500_000,
+                        ..Default::default()
+                    },
+                    truncated: true,
+                }),
+                not_sent: false,
+            },
+            Row {
+                name: "Unknown",
+                status: None,
+                slot: None,
+                not_sent: false,
+            },
+        ];
+        let expected_spent = [
+            Microusd::ZERO,
+            Microusd::ZERO,
+            Microusd::ZERO,
+            Microusd(3_000_000),
+            Microusd::from_usd(1.0),
+            Microusd(3_000_000),
+            Microusd::from_usd(1.0),
+            Microusd::ZERO,
+        ];
+        for (row, &expect) in rows.iter().zip(expected_spent.iter()) {
+            let r = rig();
+            let mut g = rig_guard(&r);
+            match row.status {
+                None if !row.not_sent => {
+                    // NotDispatched or Unknown: leave the state as constructed.
+                    if row.name == "Unknown" {
+                        g.dispatching();
+                    }
+                }
+                None => {
+                    g.dispatching();
+                    g.not_sent();
+                }
+                Some(status) => {
+                    let slot: UsageSlot = Arc::new(Mutex::new(row.slot));
+                    g.dispatching();
+                    g.answered(status, slot);
+                }
+            }
+            g.settle_now();
+            let run_snap = r.ledger.snapshot("r").unwrap();
+            let unit_reserved_zero = r.units.reserved("treasury", now_millis()) == Microusd::ZERO;
+            assert_eq!(
+                run_snap.reserved == Microusd::ZERO,
+                unit_reserved_zero,
+                "{}: run.reserved={:?} unit.reserved_zero={}",
+                row.name,
+                run_snap.reserved,
+                unit_reserved_zero
+            );
+            assert_eq!(
+                run_snap.spent,
+                r.units.spent("treasury", now_millis()),
+                "{}",
+                row.name
+            );
+            assert_eq!(run_snap.spent, expect, "{}", row.name);
+            if row.name == "Unknown" {
+                assert_eq!(run_snap.reserved, Microusd::from_usd(1.0), "{}", row.name);
+                assert_eq!(r.retained.len(), 1, "{}", row.name);
+            } else {
+                assert_eq!(run_snap.reserved, Microusd::ZERO, "{}", row.name);
+            }
+        }
+    }
+
+    /// E19. `disposition` names exactly the rule the spec's table gives: the
+    /// pure function is one match, so a planted fault there is one token.
+    #[test]
+    fn every_state_has_the_disposition_the_rule_names() {
+        assert_eq!(
+            disposition(CallOutcome::NotDispatched),
+            Disposition::Release
+        );
+        assert_eq!(disposition(CallOutcome::NotSent), Disposition::Release);
+        assert_eq!(disposition(CallOutcome::Unknown), Disposition::Retain);
+        assert_eq!(
+            disposition(CallOutcome::Refused),
+            Disposition::Charge {
+                unmeasured_is_estimate: false
+            }
+        );
+        assert_eq!(
+            disposition(CallOutcome::Started),
+            Disposition::Charge {
+                unmeasured_is_estimate: true
+            }
         );
     }
 }

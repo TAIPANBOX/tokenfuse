@@ -110,6 +110,10 @@ pub struct AppState {
     /// Per-unit monthly budget counters (docs/20). Uncapped units are not
     /// accounted; disabled entirely when the identity map is off.
     pub units: Arc<UnitLedger>,
+    /// Reservations kept outstanding on purpose because the provider held
+    /// the request when the caller left (invariant 50). Process-local;
+    /// `GET /v1/runs` shows them per run.
+    pub retained: Arc<crate::settle::Retained>,
     /// Since-startup, in-process counters for client-key activity
     /// (docs/22-key-lifecycle.md): per-key calls/mismatches and an
     /// aggregate unauthorized-attempt count. Always present - it is a plain
@@ -550,6 +554,7 @@ impl AppState {
             identity: Arc::new(IdentityMap::default()),
             identity_strict: StrictMode::Off,
             units: Arc::new(UnitLedger::default()),
+            retained: Arc::new(crate::settle::Retained::default()),
             keystats: Arc::new(KeyStats::default()),
             admin_gate: AdminGate::default(),
             // Every deployment that predates this field is Anthropic-only, so

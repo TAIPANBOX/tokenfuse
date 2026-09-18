@@ -217,6 +217,17 @@ impl UnitLedger {
             _ => Microusd::ZERO,
         }
     }
+
+    /// Outstanding reservations for a unit in the current window, for tests and operators.
+    /// Zero when the unit has no state yet or its window is not the current one.
+    pub fn reserved(&self, unit: &str, now_millis: i64) -> Microusd {
+        let window = month_key(now_millis);
+        let state = self.state.lock().unwrap();
+        match state.get(unit) {
+            Some(s) if s.window == window => s.reserved,
+            _ => Microusd::ZERO,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +401,22 @@ mod tests {
             }
             other => panic!("no headroom remains at i64::MAX, got {other:?}"),
         }
+    }
+
+    /// E22 (spec-guard-pr2.md section 5.3). `reserved` mirrors `spent`: the
+    /// outstanding amount in the current window, zero once settled, zero in
+    /// a window this unit has no state in yet.
+    #[test]
+    fn reserved_reports_the_outstanding_amount_in_the_current_window() {
+        let ledger = UnitLedger::new(HashMap::from([("treasury".into(), usd(10.0))]));
+        let res = ledger
+            .try_reserve("treasury", usd(4.0), JULY)
+            .unwrap()
+            .expect("capped unit reserves");
+        assert_eq!(ledger.reserved("treasury", JULY), usd(4.0));
+        ledger.settle(&res, usd(3.5), JULY);
+        assert_eq!(ledger.reserved("treasury", JULY), Microusd::ZERO);
+        assert_eq!(ledger.reserved("treasury", AUGUST), Microusd::ZERO);
     }
 
     #[test]

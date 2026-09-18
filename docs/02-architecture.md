@@ -28,7 +28,7 @@ Language split: Rust for everything in the request path **and the Cloud control 
 ## 3. Key architecture decisions (ADRs)
 
 - **ADR-1. Proxy, not SDK** (drop-in: just change `base_url`); the SDK is a convenience layer (headers + `BudgetExceededError`).
-- **ADR-2. Reserve → settle ledger.** Before the call we atomically reserve the estimated cost; afterward we reconcile against the actual `usage`. The only correct approach under concurrency (sub-agent fan-out). Money is stored as integer microdollars, never floats. Since 2026-09-17 a reservation carries the chain it was admitted against and settles on it exactly once (CLAUDE.md invariant 49).
+- **ADR-2. Reserve → settle ledger.** Before the call we atomically reserve the estimated cost; afterward we reconcile against the actual `usage`. The only correct approach under concurrency (sub-agent fan-out). Money is stored as integer microdollars, never floats. Since 2026-09-17 a reservation carries the chain it was admitted against and settles on it exactly once (CLAUDE.md invariant 49). Since 2026-09-18 one guard owns a call's reservations from the first one taken; a call the provider held when the caller left keeps its reservation until reconciled (CLAUDE.md invariant 50).
 - **ADR-3. Fail-open by default**, fail-closed optional per-policy. A control plane outage must not break inference (cached policies, local event buffer).
 - **ADR-4. We never tear a stream apart mid-flight** — enforcement happens at step boundaries: clamp `max_tokens` before the call + block the next call. Mid-stream kill is only via the manual kill-switch.
 - **ADR-5. OSS core (Apache-2.0) + Cloud.**

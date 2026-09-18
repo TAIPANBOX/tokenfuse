@@ -7,6 +7,7 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::Serialize;
+use tokenfuse_core::Microusd;
 
 /// A run as shown in the dashboard / TUI. Money is rendered in USD at the edge.
 #[derive(Serialize)]
@@ -19,6 +20,16 @@ pub struct RunView {
     pub steps: u32,
     pub pct_used: f64,
     pub killed: bool,
+    /// Reservations on this run kept outstanding on purpose (invariant 50):
+    /// the provider held the request when the caller left, so the outcome
+    /// is unknown rather than settled or released. Additive under
+    /// `compat/1.0.json` (spec-guard-pr2.md section 4.1); `reserved_usd`
+    /// already counted this amount, unchanged. Entries past
+    /// `crate::settle::MAX_RETAINED` are not listed here (`listed=false` on
+    /// the retain warn line) but still hold their reservation.
+    pub retained: u32,
+    /// The sum of `retained`'s reservations, in USD.
+    pub retained_usd: f64,
 }
 
 /// `GET /v1/runs` — all known runs, most-spent first.
@@ -31,9 +42,13 @@ pub async fn list_runs(State(st): State<AppState>) -> Json<Vec<RunView>> {
         .map(|(run_id, s)| {
             let budget = s.budget.as_usd();
             let spent = s.spent.as_usd();
+            let held = st.retained.for_run(&run_id);
+            let retained_usd = held
+                .iter()
+                .fold(Microusd::ZERO, |a, r| a.saturating_add(r.run.amount))
+                .as_usd();
             RunView {
                 killed: st.is_killed(&run_id),
-                run_id,
                 budget_usd: budget,
                 spent_usd: spent,
                 reserved_usd: s.reserved.as_usd(),
@@ -44,6 +59,9 @@ pub async fn list_runs(State(st): State<AppState>) -> Json<Vec<RunView>> {
                 } else {
                     0.0
                 },
+                retained: held.len() as u32,
+                retained_usd,
+                run_id,
             }
         })
         .collect();

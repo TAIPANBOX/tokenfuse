@@ -227,7 +227,7 @@ comparison in #132.
 | `crates/gateway` — HTTP skeleton | ✅ done | axum server, `/healthz` + `/v1/messages`, estimate → enforce → forward → settle, 402 budget contract, shadow/warn/enforce, `x-fuse-*` response headers. The unmanaged pass-through (no `x-fuse-run-id`) is opt-in since 2026-08-06: unset, a call the gateway cannot account for is refused with `400 metering_required`, and `TOKENFUSE_REQUIRE_RUN_ID=0` restores it |
 | Gateway — real forwarding + SSE passthrough | ✅ done | `HttpProvider` (reqwest/rustls) streams chunks through; `UsageParser` extracts usage from Anthropic + OpenAI SSE and non-stream JSON; settle at end-of-stream. `TOKENFUSE_UPSTREAM` selects the real provider; the stub needs `TOKENFUSE_ALLOW_STUB=1` and the process refuses to start with neither (#141). Verified live. |
 | Latency benchmark (p99 < 3 ms) | ✅ done | `examples/bench.rs`; decision path **p99 0.38 µs**, full in-process request **p99 4.67 µs** — ~3 orders under target. See BENCHMARKS.md |
-| Client-cancel settle guard | ✅ done | `SettleGuard` settles on Drop — client cancel or upstream error mid-stream never leaks a reservation |
+| Client-cancel settle guard | ✅ done | `SettleGuard` owns a call's run and unit reservations from the moment the first is taken and decides on Drop by the call's outcome state (invariant 50, 2026-09-18): a cancel or upstream error after a 2xx settles the estimate (or the usage reported before the break), a refusal settles what the provider reported or zero, a call never handed to the provider is released, and a call the provider held when the client left keeps its reservation outstanding as retained exposure, listed on `GET /v1/runs`, never written off at zero. Until 2026-09-18 the guard existed only on the streaming path after the provider had answered: a cancel during `send` or during the buffered body read leaked both reservations (F03 of the 2026-09-18 money-path review), and a 2xx whose body broke settled zero on both (F04). |
 | Loop detection | ✅ done | `crates/core/loops.rs`: identical-tool-call + ping-pong (from the request's own message history) + context-growth (per-run tracker). Wired in: enforce → `402 loop_detected`, shadow/warn → `x-fuse-would-block` header. Verified live. |
 | Observability API | ✅ done | `GET /v1/runs` (list runs, spend, %, killed) + `POST /v1/runs/{id}/kill` (hard stop, any mode). Backs the TUI and any caller of the kill endpoint |
 | `tokenfuse top` TUI | ✅ done | ratatui / crossterm live view: runs table, spend/budget bars, %, steps, select + kill (`k`), refresh, quit. `tokenfuse top` subcommand; polls `/v1/runs` |
@@ -302,10 +302,16 @@ comparison in #132.
 
 **Counts re-measured 2026-09-18**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1290 passing** (core 339, dpop 21, delegation 44,
-gateway 684, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 336
-to 339, gateway from 677 to 684 and cloud from 199 to 201 on 2026-09-18
+`cargo test --all` runs **1311 passing** (core 339, dpop 21, delegation 44,
+gateway 705, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew from 684 to 705 on 2026-09-18 (invariant 50, after #292 and
+#297 landed the same day): the settle guard now owns a call's reservations
+from the first one taken, fourteen new in `tokenfuse-gateway` (six in
+`proxy::tests`, seven in `settle::tests`, one in `unitledger::tests`) plus
+the money-path review's own seven F03/F04 probes moved into
+`crates/gateway/tests/codex_money_review.rs` as an integration file;
+`cluster_backend.rs` is unaffected and stays at six. Before that, core
+grew from 336 to 339, gateway from 677 to 684 and cloud from 199 to 201 on 2026-09-18
 (tokenfuse#292 and #297): three in `core::agent_event` for what `from_env`
 now hands back beside the exporter, one in `gateway::events` reading the warn
 line, two in `gateway::chainproof` for the shared chain parser and its cap,
