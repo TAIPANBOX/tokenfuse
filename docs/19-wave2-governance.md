@@ -45,7 +45,7 @@ Read-only, no prompt content, no run ids, and on the same unauthenticated admin 
 
 **Contract.**
 - `TOKENFUSE_CLOUD_REPLAY_EVENTS` points the control plane at an agent-event NDJSON file it reads (never writes) to reconstruct a run for `/v1/replay/{run}`. Unset, missing, or a corrupt line is tolerated: replay reports `configured:false` or counts malformed lines, and never panics.
-- Incident detectors are thresholded by env (`TOKENFUSE_CLOUD_INCIDENT_*`, see the README table) and derive `budget_exhausted` / `sustained_loop` / `spend_spike` / `fanout_explosion` from ingested call records.
+- Incident detectors are thresholded by env (`TOKENFUSE_CLOUD_INCIDENT_*`, see the README table) and derive `budget_exhausted` / `sustained_loop` / `spend_spike` / `fanout_explosion` from ingested call records; `run_stalled` (2026-09-18, tokenfuse#296, `TOKENFUSE_CLOUD_STALL_MINUTES`) is the one detector that fires on absence, from a periodic sweep over the cadence the control plane remembered rather than from a record arriving.
 - `/v1/replay`, `/v1/compliance`, and `/v1/compliance/evidence` are readable by any authenticated role (the former paid-plan gate is gone: since v0.4.0 there is no paid TokenFuse tier); they never expose `tokenfuse-core` types directly, only cloud-local `*Schema` DTOs (invariant #3).
 
 ## 4. Telemetry hardening: per-instance trace segments (`crates/gateway/src/sink.rs`)

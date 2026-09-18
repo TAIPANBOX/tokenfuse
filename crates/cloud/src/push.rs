@@ -174,11 +174,25 @@ impl PushPipeline {
         let run = inc.run_id.clone().unwrap_or_default();
         // Prefer the run id in the copy, else the incident id (org-scoped).
         let label = inc.run_id.clone().unwrap_or_else(|| inc.id.clone());
-        let title = "Agent running hot".to_string();
-        let body = format!(
-            "Agent/run {label} running hot — {}. Tap to review and kill.",
-            inc.kind
-        );
+        let (title, body) = if inc.kind == "run_stalled" {
+            (
+                "Agent went quiet".to_string(),
+                format!(
+                    "{}. Tap to review.",
+                    inc.summary
+                        .clone()
+                        .unwrap_or_else(|| format!("Agent/run {label} went quiet"))
+                ),
+            )
+        } else {
+            (
+                "Agent running hot".to_string(),
+                format!(
+                    "Agent/run {label} running hot — {}. Tap to review and kill.",
+                    inc.kind
+                ),
+            )
+        };
         for device in self.store.devices_for_org(&inc.org) {
             if let Some(token) = device.apns_token {
                 self.sender.send(Push {
@@ -386,5 +400,60 @@ mod tests {
             spent_microusd: spent,
             ..Default::default()
         }
+    }
+
+    /// A stalled run pushes "went quiet", never the "running hot" sentence
+    /// every other incident renders (invariant 60).
+    #[test]
+    fn a_stalled_run_pushes_went_quiet_not_running_hot() {
+        let store = Arc::new(Store::new());
+        store.insert_device_for_test("t", device("d1", "acme", "admin", Some("apns-1")));
+        let t0 = 1_704_067_200_000_i64;
+        store.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                agent_id: "agent://acme.example/planner".into(),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                step: 6,
+                ts_millis: t0,
+                ..Default::default()
+            }],
+            t0,
+        );
+        store.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                agent_id: "agent://acme.example/planner".into(),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                step: 7,
+                ts_millis: t0 + 1_000,
+                ..Default::default()
+            }],
+            t0 + 1_000,
+        );
+        let inc = store
+            .sweep_stalled_at(t0 + 1_000 + 300_000)
+            .pop()
+            .expect("stalled incident seeded");
+
+        let (pipe, rec) = pipeline_with(store);
+        pipe.handle(StreamEvent::Incident(inc));
+
+        let pushes = rec.pushes.lock().unwrap();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].title, "Agent went quiet");
+        assert_eq!(
+            pushes[0].body,
+            "agent agent://acme.example/planner on run r1 went quiet: no call for 300 s, \
+             last call at 2024-01-01T00:00:01Z (step 7, 2 calls). Tap to review."
+        );
+        assert!(!pushes[0].body.contains("running hot"));
+        assert_eq!(pushes[0].kind.as_deref(), Some("run_stalled"));
+        assert_eq!(pushes[0].reason, "incident");
+        assert_eq!(pushes[0].incident_id.as_deref(), Some("run_stalled:r1"));
     }
 }

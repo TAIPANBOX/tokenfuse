@@ -581,7 +581,9 @@ pub struct Incident {
     /// The agent attributed at trip time, when the gateway tagged the run.
     pub agent_id: Option<String>,
     /// Detector kind: `budget_exhausted` | `sustained_loop` | `spend_spike` |
-    /// `fanout_explosion`.
+    /// `fanout_explosion` | `budget_threshold` | `run_stalled` (invariant 60,
+    /// raised by the sweep rather than by ingest); an external finding
+    /// carries its detector's own name (see `record_external_finding`).
     pub kind: String,
     /// Reused from `tokenfuse_core` — rendered as a lowercase string in JSON.
     #[schema(value_type = String, example = "high")]
@@ -656,6 +658,16 @@ pub struct IncidentConfig {
     pub fanout_multiple: u64,
     /// Window for the `fanout_explosion` distinct-run count.
     pub fanout_window_ms: i64,
+    /// `run_stalled` (invariant 60) trips when a run this plane has seen
+    /// calling at least twice has made no call for this long AND for longer
+    /// than its own longest gap between calls. Minutes on the wire
+    /// (`TOKENFUSE_CLOUD_STALL_MINUTES`, default 5), milliseconds here. `0`
+    /// turns the detector off: nothing is remembered at ingest and the sweep
+    /// raises nothing. Read at the composition root by
+    /// [`IncidentConfig::stall_after_ms_from_minutes`], not by `env_u64`,
+    /// whose "zero is unset" rule is exactly wrong for a knob whose zero means
+    /// off.
+    pub stall_after_ms: i64,
 }
 
 impl Default for IncidentConfig {
@@ -670,7 +682,29 @@ impl Default for IncidentConfig {
             fanout_runs: 20,
             fanout_multiple: 4,
             fanout_window_ms: 600_000,
+            stall_after_ms: 300_000,
         }
+    }
+}
+
+impl IncidentConfig {
+    /// `TOKENFUSE_CLOUD_STALL_MINUTES` as `stall_after_ms`. `None`, empty or
+    /// blank is the default; `"0"` is OFF; anything that is not a whole
+    /// number of minutes is `Err(raw)` so the caller can say so and fall
+    /// back. Saturates rather than wraps: a value past `i64::MAX / 60_000`
+    /// minutes becomes `i64::MAX` milliseconds, a threshold no run reaches.
+    pub fn stall_after_ms_from_minutes(raw: Option<&str>) -> Result<i64, String> {
+        let Some(raw) = raw else {
+            return Ok(Self::default().stall_after_ms);
+        };
+        let s = raw.trim();
+        if s.is_empty() {
+            return Ok(Self::default().stall_after_ms);
+        }
+        let minutes: u64 = s.parse().map_err(|_| raw.to_string())?;
+        Ok(i64::try_from(minutes)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(60_000))
     }
 }
 
@@ -692,6 +726,34 @@ const INCIDENT_TRACKER_CAP: usize = 256;
 /// forever, which is the exact fault this baseline exists to fix. A count per
 /// bucket is two numbers, whatever the agent's volume.
 const FANOUT_HISTORY_BUCKETS: usize = 8;
+
+/// Per-run cadence memory for `run_stalled` (invariant 60), the one detector
+/// that fires on ABSENCE and so needs something a sweep can read when no
+/// record arrives. Ephemeral and NOT in the snapshot: a persisted copy would
+/// make the first sweep after a restart compare every retained run's last
+/// call against the clock, and every run that finished normally while the
+/// plane was down would be reported stalled at once (up to `MAX_TRACKER_KEYS`
+/// of them). Ephemeral means "a cadence is something THIS process saw",
+/// which is the restart guard; the once-per-run guard lives in `incidents`,
+/// which is persisted.
+#[derive(Debug, Clone, Copy, Default)]
+struct StallState {
+    /// The newest call's effective stamp this process has seen for the run
+    /// (the record's own stamp, or the plane's clock when it had none, and
+    /// never later than the plane's clock at arrival).
+    last_ts: i64,
+    /// The longest gap between two consecutive calls, in stamp order, so an
+    /// out-of-order arrival never produces a negative gap. 0 until a second
+    /// call arrives.
+    longest_gap_ms: i64,
+    /// Calls this process has ingested for the run, out-of-order ones
+    /// included: a cadence needs two points.
+    calls_seen: u64,
+    /// Whether the NEWEST call said the run is over: a known refusal
+    /// (`is_known_decision` and `is_blocked`) or a non-empty `outcome` tag.
+    /// Latest wins, so a later call re-opens the run.
+    ended: bool,
+}
 
 /// Hard cap on the number of distinct run_ids retained per org in
 /// [`Inner::orgs`]. `/v1/ingest` is admin-gated, but the plane cannot tell
@@ -747,6 +809,12 @@ const MAX_UNIT_MONTH_KEYS: usize = 4_096;
 /// threshold (not just the HTTP layer's) so `MAX_RUNS_PER_ORG` eviction can
 /// tell an "alerting" run apart from an idle one — see C5 in `ingest_at`.
 const DEFAULT_ALERT_PCT: f64 = 0.8;
+
+/// How often the control plane asks whether a run has gone quiet
+/// (invariant 60). The tick bounds how late past `stall_after_ms` an
+/// incident is raised: at most this long, and the silence the incident
+/// reports is what was measured at the sweep, never the threshold.
+pub const STALL_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A live change broadcast to `/v1/stream` subscribers. `org` routes the event
 /// to the right subscriber and is not sent in the payload.
@@ -952,6 +1020,12 @@ struct Inner {
     /// the windowed distinct-run count the detector thresholds against
     /// (ephemeral — the `Incident` is the durable record).
     fanout_tracker: HashMap<(String, String), VecDeque<(String, i64)>>,
+    /// (org, run) → cadence memory for `run_stalled` (invariant 60), read by
+    /// [`Store::sweep_stalled_at`]. Ephemeral (see [`StallState`]); bounded
+    /// to [`MAX_TRACKER_KEYS`] by `stall_recency`. Entries are never removed
+    /// by the sweep: a fired or ended run is skipped by the predicate and the
+    /// key ages out by recency, so map and index stay in lock-step.
+    stall: HashMap<(String, String), StallState>,
     /// org → running totals, unaffected by `orgs` eviction (persisted) — see
     /// [`OrgTotals`].
     org_totals: HashMap<String, OrgTotals>,
@@ -966,6 +1040,9 @@ struct Inner {
     /// Recency index over `fanout_tracker`'s keys, bounding it to
     /// [`MAX_TRACKER_KEYS`]. Ephemeral, like the tracker itself.
     fanout_recency: RecencyIndex<(String, String)>,
+    /// Recency index over `stall`'s keys, bounding it to
+    /// [`MAX_TRACKER_KEYS`]. Ephemeral, like the map itself.
+    stall_recency: RecencyIndex<(String, String)>,
     /// org → LRU recency index over that org's `savings.breaks` set, bounding
     /// it to [`MAX_BREAK_KEYS`] (see [`SavingsAcc::breaks`]). Ephemeral and NOT
     /// seeded on load (the persisted `breaks` set carries no per-entry
@@ -1202,6 +1279,13 @@ impl Store {
     pub fn with_event_exporter(mut self, event_exporter: Arc<EventExporter>) -> Self {
         self.event_exporter = event_exporter;
         self
+    }
+
+    /// The interval the composition root drives [`Store::sweep_stalled`] on,
+    /// or `None` when the detector is off: nothing to sweep, no task spawned.
+    /// The one place that decides, so the decision has a test.
+    pub fn stall_sweep_tick(stall_after_ms: i64) -> Option<std::time::Duration> {
+        (stall_after_ms > 0).then_some(STALL_SWEEP_TICK)
     }
 
     /// Subscribe to live change events (per-org filtering is the caller's job).
@@ -1538,6 +1622,26 @@ impl Store {
                 // the gateway didn't set one (keeps loop windows sane in tests).
                 let ts = if r.ts_millis > 0 { r.ts_millis } else { now_ms };
                 let agent = (!r.agent_id.is_empty()).then(|| r.agent_id.clone());
+
+                // run_stalled (invariant 60): remember the cadence a sweep
+                // will read, since this is the one detector that fires on
+                // absence. The stamp is capped at the plane's own clock so a
+                // forged future stamp cannot hold the detector off. A known
+                // refusal or an outcome tag on this call says the run ended;
+                // an unrecognised decision says neither and the run stays
+                // watched.
+                if cfg.stall_after_ms > 0 {
+                    let ended = (is_known_decision(&r.decision) && is_blocked(&r.decision))
+                        || !r.outcome.is_empty();
+                    note_call_for_stall(
+                        &mut inner.stall,
+                        &mut inner.stall_recency,
+                        org,
+                        &r.run_id,
+                        ts.min(now_ms),
+                        ended,
+                    );
+                }
 
                 // budget_exhausted (High): ≥ N BUDGET blocks per run.
                 //
@@ -1947,6 +2051,143 @@ impl Store {
             }
             let _ = self.events.send(StreamEvent::Incident(inc));
         }
+    }
+
+    /// `run_stalled` (invariant 60): the one detector that fires on ABSENCE,
+    /// so no ingest can raise it. Driven on the wall clock by the interval
+    /// task `main` spawns (see [`Store::stall_sweep_tick`]); see
+    /// [`Store::sweep_stalled_at`] for the testable inner form.
+    pub fn sweep_stalled(&self) -> Vec<Incident> {
+        self.sweep_stalled_at(now_millis())
+    }
+
+    /// [`Store::sweep_stalled`] with an explicit `now_ms`. Returns the
+    /// incidents THIS sweep raised, after they were broadcast and, once the
+    /// type is on the wire, exported, so a caller can count them. Two passes
+    /// under one write lock: decide over the stall map immutably, then raise;
+    /// export and broadcast happen outside the lock, the `fired` shape
+    /// `ingest_at` uses, because the exporter is file I/O and fail-open.
+    pub fn sweep_stalled_at(&self, now_ms: i64) -> Vec<Incident> {
+        let cfg = &self.incident_cfg;
+        if cfg.stall_after_ms <= 0 {
+            return Vec::new();
+        }
+        let mut fired: Vec<(Incident, serde_json::Value)> = Vec::new();
+        {
+            let mut guard = self.inner.write().unwrap();
+            let inner = &mut *guard;
+            let mut hits: Vec<(String, String, StallState)> = Vec::new();
+            for ((org, run), st) in inner.stall.iter() {
+                let silence_ms = now_ms.saturating_sub(st.last_ts);
+                let killed = inner
+                    .killed
+                    .get(org)
+                    .and_then(|m| m.get(run))
+                    .copied()
+                    .unwrap_or(false);
+                let retained = inner
+                    .orgs
+                    .get(org)
+                    .is_some_and(|runs| runs.contains_key(run));
+                let already = inner
+                    .incidents
+                    .get(org)
+                    .is_some_and(|m| m.contains_key(&incident_id("run_stalled", run)));
+                let stalled = st.calls_seen >= 2
+                    && !st.ended
+                    && !killed
+                    && retained
+                    && !already
+                    && silence_ms >= cfg.stall_after_ms
+                    && silence_ms > st.longest_gap_ms;
+                if stalled {
+                    hits.push((org.clone(), run.clone(), *st));
+                }
+            }
+            for (org, run, st) in hits {
+                // `retained` held above, so the aggregate is there; the
+                // default is only the type checker's demand.
+                let (steps, calls) = inner
+                    .orgs
+                    .get(&org)
+                    .and_then(|runs| runs.get(&run))
+                    .map(|a| (a.steps, a.calls))
+                    .unwrap_or((0, 0));
+                let agent = agent_for_run(inner, &org, &run);
+                let silence_ms = now_ms.saturating_sub(st.last_ts);
+                let summary =
+                    stall_summary(&run, agent.as_deref(), st.last_ts, silence_ms, steps, calls);
+                let mut inc = upsert_incident(
+                    &mut inner.incidents,
+                    &org,
+                    "run_stalled",
+                    // Fixed, not `severity_from_magnitude`: at the transition
+                    // the silence is always within one tick of the line the
+                    // run had to cross, so a ladder would measure the tick,
+                    // and invariant 7 means there is never a later trip to
+                    // measure. The same reason `budget_threshold` is fixed.
+                    tokenfuse_core::Severity::Medium,
+                    &run,
+                    Some(run.clone()),
+                    agent,
+                    now_ms,
+                );
+                if let Some(stored) = inner
+                    .incidents
+                    .get_mut(&org)
+                    .and_then(|m| m.get_mut(&inc.id))
+                {
+                    stored.summary = Some(summary);
+                    inc = stored.clone();
+                }
+                let data = serde_json::json!({
+                    "org": inc.org,
+                    "occurrences": inc.occurrences,
+                    "last_call_millis": st.last_ts,
+                    "silence_ms": silence_ms,
+                    "stall_after_ms": cfg.stall_after_ms,
+                    "longest_gap_ms": st.longest_gap_ms,
+                    "calls": calls,
+                    "steps": steps,
+                });
+                fired.push((inc, data));
+            }
+            if !fired.is_empty() {
+                // The incident IS the once-per-run guard, and it only guards
+                // across a restart if the autosave writes it.
+                inner.dirty = true;
+            }
+        }
+        let mut out = Vec::with_capacity(fired.len());
+        for (inc, data) in fired {
+            match agent_event_type_for_incident_kind(&inc.kind) {
+                Some(event_type) => {
+                    let outcome = self.event_exporter.emit(
+                        event_type,
+                        inc.last_seen_millis,
+                        inc.agent_id.as_deref(),
+                        inc.run_id.as_deref(),
+                        None, // on_behalf_of: not tracked by the incident aggregator
+                        data,
+                    );
+                    log_event_outcome(event_type, outcome);
+                }
+                None => {
+                    // Said rather than silent, once per incident (a stall is
+                    // raised once per run): a consumer of the bus will not
+                    // hear about this run, and the operator should learn
+                    // that from us.
+                    tracing::warn!(
+                        incident = %inc.id,
+                        kind = %inc.kind,
+                        "incident raised on the console and not exported: its kind has no agent-event type on the wire yet"
+                    );
+                }
+            }
+            let _ = self.events.send(StreamEvent::Incident(inc.clone()));
+            out.push(inc);
+        }
+        out
     }
 
     /// Burn-rate buckets for a scope (whole org, or one `run`) over `window_ms`,
@@ -3126,6 +3367,29 @@ fn agent_for_run(inner: &Inner, org: &str, run: &str) -> Option<String> {
         .filter(|agent| !agent.is_empty())
 }
 
+/// The sentence a `run_stalled` incident carries (invariant 60): who went
+/// quiet, when it last called (RFC 3339, second precision, the operator's
+/// precision), and for how long. The agent is named when the run has one;
+/// nothing is invented when it has not.
+fn stall_summary(
+    run: &str,
+    agent: Option<&str>,
+    last_ts: i64,
+    silence_ms: i64,
+    steps: u32,
+    calls: u64,
+) -> String {
+    let subject = match agent {
+        Some(agent) => format!("agent {agent} on run {run}"),
+        None => format!("run {run}"),
+    };
+    format!(
+        "{subject} went quiet: no call for {} s, last call at {} (step {steps}, {calls} calls)",
+        silence_ms / 1000,
+        tokenfuse_core::timefmt::ts_millis_to_rfc3339(last_ts),
+    )
+}
+
 /// Drop a run's `budget_threshold` incident so the next crossing fires again.
 ///
 /// Called when a budget is (re)set. The incident's existence is the edge
@@ -3175,6 +3439,48 @@ fn bump_tracker(
         }
     }
     dq.len() as u64
+}
+
+/// Fold one ingested call into the run's cadence memory for `run_stalled`
+/// (invariant 60). `ts` is the effective stamp already capped at the plane's
+/// clock. Bounds the number of DISTINCT `(org, run)` entries to
+/// [`MAX_TRACKER_KEYS`] exactly as [`bump_tracker`] does, evicting the
+/// least-recently-touched entry when a genuinely NEW key would exceed the
+/// cap.
+///
+/// A record older than the newest already seen counts the call and moves
+/// nothing else: the gap it belongs to is unknowable, and a late final record
+/// must not end a run whose newer call was ordinary.
+fn note_call_for_stall(
+    stall: &mut HashMap<(String, String), StallState>,
+    recency: &mut RecencyIndex<(String, String)>,
+    org: &str,
+    run: &str,
+    ts: i64,
+    ended: bool,
+) {
+    let key = (org.to_string(), run.to_string());
+    if !stall.contains_key(&key) && stall.len() >= MAX_TRACKER_KEYS {
+        if let Some(evict_key) = recency.evict_oldest() {
+            stall.remove(&evict_key);
+        }
+    }
+    recency.touch(key.clone());
+    let st = stall.entry(key).or_default();
+    st.calls_seen = st.calls_seen.saturating_add(1);
+    if st.calls_seen == 1 {
+        st.last_ts = ts;
+        st.ended = ended;
+        return;
+    }
+    if ts >= st.last_ts {
+        let gap = ts.saturating_sub(st.last_ts);
+        if gap > st.longest_gap_ms {
+            st.longest_gap_ms = gap;
+        }
+        st.last_ts = ts;
+        st.ended = ended;
+    }
 }
 
 /// Record `(run_id, ts)` on the per-(org,agent) fanout tracker and return the
@@ -6451,5 +6757,642 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- run_stalled (invariant 60) ---------------------------------------
+
+    /// The floor every stall test uses: five minutes, the default.
+    const STALL_MS: i64 = 300_000;
+    /// 2024-01-01T00:00:00Z, so the RFC 3339 assertion is exact.
+    const T0: i64 = 1_704_067_200_000;
+    const PLANNER: &str = "agent://acme.example/planner";
+
+    /// One call of `run` by `agent` at `ts`, allowed, at `step`.
+    fn call_at(run: &str, agent: &str, step: u32, ts: i64) -> CallRecord {
+        CallRecord {
+            run_id: run.into(),
+            agent_id: agent.into(),
+            decision: "allow".into(),
+            cost_microusd: 1,
+            step,
+            ts_millis: ts,
+            ..Default::default()
+        }
+    }
+
+    /// A store with the default five-minute floor and `r1` called twice by
+    /// the planner, at `T0` (step 6) and `T0 + 1_000` (step 7): a cadence of
+    /// one second. Returns the store and the stamp of the last call.
+    fn a_run_that_called_twice() -> (Store, i64) {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 6, T0)], T0);
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 7, T0 + 1_000)], T0 + 1_000);
+        (s, T0 + 1_000)
+    }
+
+    fn stalled(s: &Store) -> Vec<Incident> {
+        s.incidents("acme")
+            .into_iter()
+            .filter(|i| i.kind == "run_stalled")
+            .collect()
+    }
+
+    /// A node killed mid-run becomes an incident once the floor passes, and
+    /// never a second time while the silence holds.
+    #[test]
+    fn a_run_silent_past_the_threshold_is_stalled_once_and_not_again() {
+        let (s, last) = a_run_that_called_twice();
+        s.take_dirty(); // clear ingest's own dirty flag first
+        assert_eq!(
+            s.sweep_stalled_at(last + STALL_MS - 1).len(),
+            0,
+            "before the floor nothing"
+        );
+        let fired = s.sweep_stalled_at(last + STALL_MS);
+        assert_eq!(fired.len(), 1, "one incident at the floor");
+        assert_eq!(fired[0].kind, "run_stalled");
+        assert_eq!(fired[0].severity, tokenfuse_core::Severity::Medium);
+        assert_eq!(fired[0].run_id, Some("r1".to_string()));
+        assert_eq!(fired[0].agent_id, Some(PLANNER.to_string()));
+        assert_eq!(fired[0].occurrences, 1);
+        assert_eq!(fired[0].id, "run_stalled:r1");
+        assert!(
+            s.take_dirty(),
+            "the guard is saved by the autosave only if the sweep marks the store dirty"
+        );
+        assert_eq!(
+            s.sweep_stalled_at(last + STALL_MS + 60_000).len(),
+            0,
+            "not again while the silence holds"
+        );
+        assert_eq!(stalled(&s).len(), 1);
+        assert_eq!(stalled(&s)[0].occurrences, 1);
+    }
+
+    /// A run that called ten seconds ago is not quiet, whatever the floor.
+    #[test]
+    fn a_run_that_moved_again_is_not_stalled() {
+        let (s, last) = a_run_that_called_twice();
+        let ts = last + STALL_MS - 10_000;
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 8, ts)], ts);
+        assert_eq!(
+            s.sweep_stalled_at(last + STALL_MS).len(),
+            0,
+            "a run that called ten seconds ago is not quiet"
+        );
+    }
+
+    /// The incident on the console is the record: a run that goes quiet,
+    /// moves, and goes quiet again is not reported twice.
+    #[test]
+    fn a_stall_is_not_re_raised_when_the_run_moves_and_goes_quiet_again() {
+        let (s, last) = a_run_that_called_twice();
+        assert_eq!(s.sweep_stalled_at(last + STALL_MS).len(), 1);
+        // This call makes the run's longest gap 305_000 ms, the stall
+        // itself, so the later silence below must exceed that to matter.
+        s.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 8, last + STALL_MS + 5_000)],
+            last + STALL_MS + 5_000,
+        );
+        s.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 9, last + STALL_MS + 6_000)],
+            last + STALL_MS + 6_000,
+        );
+        let fired = s.sweep_stalled_at(last + STALL_MS + 6_000 + 2 * STALL_MS);
+        assert_eq!(fired.len(), 0, "the incident on the console is the record");
+        assert_eq!(stalled(&s)[0].occurrences, 1, "never re-armed on movement");
+    }
+
+    /// `TOKENFUSE_CLOUD_STALL_MINUTES=0` turns the whole detector off: no
+    /// cadence remembered, no sweep task, nothing raised.
+    #[test]
+    fn a_stall_threshold_of_zero_turns_the_detector_off() {
+        let s = Store::with_incident_config(IncidentConfig {
+            stall_after_ms: 0,
+            ..Default::default()
+        });
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 6, T0)], T0);
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 7, T0 + 1_000)], T0 + 1_000);
+        assert_eq!(s.sweep_stalled_at(T0 + 3_600_000).len(), 0);
+        assert!(
+            s.inner.read().unwrap().stall.is_empty(),
+            "off means nothing is remembered either"
+        );
+        assert_eq!(Store::stall_sweep_tick(0), None);
+    }
+
+    /// A cadence needs two points; a run called once has none.
+    #[test]
+    fn a_run_with_one_call_has_no_cadence_and_is_not_stalled() {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 1, T0)], T0);
+        assert_eq!(s.sweep_stalled_at(T0 + 3_600_000).len(), 0);
+    }
+
+    /// A refused run was stopped by the gateway, not stalled; an allowed
+    /// retry re-opens it.
+    #[test]
+    fn a_run_whose_last_call_was_refused_is_stopped_not_stalled() {
+        let (s, last) = a_run_that_called_twice();
+        s.ingest_at(
+            "acme",
+            &[block_at("r1", "budget_exceeded", 0, last + 500)],
+            last + 500,
+        );
+        assert_eq!(
+            s.sweep_stalled_at(last + 500 + 3_600_000).len(),
+            0,
+            "a refused run was stopped by the gateway"
+        );
+        s.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 8, last + 1_500)],
+            last + 1_500,
+        );
+        assert_eq!(
+            s.sweep_stalled_at(last + 1_500 + STALL_MS).len(),
+            1,
+            "a retry that was allowed re-opens the run"
+        );
+    }
+
+    /// A run that tagged its final call with an outcome declared its own
+    /// end; an unrecognised decision declares neither and stays watched.
+    #[test]
+    fn a_run_that_tagged_its_outcome_ended_and_is_not_stalled() {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 1, T0)], T0);
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                agent_id: PLANNER.into(),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                step: 2,
+                ts_millis: T0 + 1_000,
+                outcome: "case_resolved".into(),
+                ..Default::default()
+            }],
+            T0 + 1_000,
+        );
+        assert_eq!(s.sweep_stalled_at(T0 + 3_600_000).len(), 0);
+
+        s.ingest_at("acme", &[call_at("r2", PLANNER, 1, T0)], T0);
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r2".into(),
+                agent_id: PLANNER.into(),
+                decision: "pwned".into(),
+                cost_microusd: 1,
+                step: 2,
+                ts_millis: T0 + 2_000,
+                ..Default::default()
+            }],
+            T0 + 2_000,
+        );
+        assert_eq!(s.sweep_stalled_at(T0 + 2_000 + STALL_MS).len(), 1);
+    }
+
+    /// Floor plus own baseline (invariant 10's shape): a run whose calls are
+    /// ten minutes apart is not called stalled at five.
+    #[test]
+    fn a_run_that_pauses_by_habit_is_not_stalled_at_the_floor() {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 1, T0)], T0);
+        s.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 2, T0 + 600_000)],
+            T0 + 600_000,
+        );
+        s.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 3, T0 + 1_200_000)],
+            T0 + 1_200_000,
+        );
+        assert_eq!(
+            s.sweep_stalled_at(T0 + 1_200_000 + 360_000).len(),
+            0,
+            "six minutes is inside a ten-minute habit"
+        );
+        assert_eq!(
+            s.sweep_stalled_at(T0 + 1_200_000 + 600_000).len(),
+            0,
+            "a silence equal to its longest gap is one it has produced before"
+        );
+        assert_eq!(
+            s.sweep_stalled_at(T0 + 1_200_000 + 600_001).len(),
+            1,
+            "longer than its own longest gap"
+        );
+    }
+
+    /// An operator stopped it on purpose; that is not a stall.
+    #[test]
+    fn a_killed_run_is_not_stalled() {
+        let (s, last) = a_run_that_called_twice();
+        s.kill("acme", "r1");
+        assert_eq!(s.sweep_stalled_at(last + 3_600_000).len(), 0);
+    }
+
+    /// The incident names the run, the agent, the last call time (RFC 3339)
+    /// and the silence, in the operator's own words.
+    #[test]
+    fn the_stall_incident_names_the_run_the_agent_the_last_call_and_the_silence() {
+        let (s, last) = a_run_that_called_twice();
+        let inc = s
+            .sweep_stalled_at(last + STALL_MS)
+            .pop()
+            .expect("the stall itself");
+        assert_eq!(
+            inc.summary.as_deref(),
+            Some(
+                "agent agent://acme.example/planner on run r1 went quiet: no call for 300 s, last call at 2024-01-01T00:00:01Z (step 7, 2 calls)"
+            )
+        );
+        assert_eq!(inc.id, "run_stalled:r1");
+        assert_eq!(inc.source, None);
+        assert_eq!(inc.first_seen_millis, last + STALL_MS);
+    }
+
+    /// An unattributed run is on the console with no agent invented.
+    #[test]
+    fn an_unattributed_stalled_run_is_on_the_console_with_no_agent_invented() {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", "", 6, T0)], T0);
+        s.ingest_at("acme", &[call_at("r1", "", 7, T0 + 1_000)], T0 + 1_000);
+        let fired = s.sweep_stalled_at(T0 + 1_000 + STALL_MS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].agent_id, None);
+        assert!(fired[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .starts_with("run r1 went quiet: no call for 300 s"));
+    }
+
+    /// Commit 1 only: reaches the console and the stream; not yet the wire,
+    /// and not a skip either, since nothing was attempted.
+    #[test]
+    fn a_stalled_run_reaches_the_console_and_the_stream_and_not_yet_the_wire() {
+        let dir =
+            std::env::temp_dir().join(format!("tf-cloud-stall-events-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+        let s = Store::new().with_event_exporter(exporter.clone());
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 6, T0)], T0);
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 7, T0 + 1_000)], T0 + 1_000);
+
+        let mut rx = s.subscribe();
+        let fired = s.sweep_stalled_at(T0 + 1_000 + STALL_MS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(stalled(&s).len(), 1);
+
+        let mut saw_it = false;
+        loop {
+            match rx.try_recv() {
+                Ok(StreamEvent::Incident(inc)) if inc.id == "run_stalled:r1" => saw_it = true,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_it, "the stall must reach the stream");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "",
+            "not on the wire until the type exists"
+        );
+        assert_eq!(
+            exporter.skipped_count(),
+            0,
+            "not a skip either: nothing was attempted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cadence is something THIS process saw: a snapshot loaded at startup
+    /// carries no memory of the calls that built it.
+    #[test]
+    fn a_restart_does_not_raise_a_stall_for_a_run_it_never_watched() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "tf-cloud-{}-stall-restart.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let (a, last) = a_run_that_called_twice();
+        a.save(&path).expect("save");
+
+        let b = Store::new();
+        b.load(&path).expect("load");
+        assert_eq!(
+            b.sweep_stalled_at(last + 3_600_000).len(),
+            0,
+            "a cadence is something this process saw"
+        );
+
+        b.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 8, last + 3_600_000 + 1_000)],
+            last + 3_600_000 + 1_000,
+        );
+        b.ingest_at(
+            "acme",
+            &[call_at("r1", PLANNER, 9, last + 3_600_000 + 2_000)],
+            last + 3_600_000 + 2_000,
+        );
+        assert_eq!(
+            b.sweep_stalled_at(last + 3_600_000 + 2_000 + STALL_MS)
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record older than the newest already seen counts the call and
+    /// moves nothing else; the in-order twin shows the contrast.
+    #[test]
+    fn an_out_of_order_record_counts_the_call_and_moves_nothing_else() {
+        let s = Store::new();
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 1, T0 + 5_000)], T0 + 5_000);
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 2, T0)], T0);
+        let key1 = ("acme".to_string(), "r1".to_string());
+        {
+            let inner = s.inner.read().unwrap();
+            let st = inner.stall.get(&key1).copied().unwrap_or_default();
+            assert_eq!(st.last_ts, T0 + 5_000);
+            assert_eq!(st.longest_gap_ms, 0);
+            assert_eq!(st.calls_seen, 2);
+        }
+        // A late record, older than the newest already seen, carrying an
+        // outcome tag: it counts the call and must not end a run whose
+        // newer call was ordinary.
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r1".into(),
+                agent_id: PLANNER.into(),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                step: 3,
+                ts_millis: T0,
+                outcome: "done".into(),
+                ..Default::default()
+            }],
+            T0,
+        );
+        {
+            let inner = s.inner.read().unwrap();
+            let st = inner.stall.get(&key1).copied().unwrap_or_default();
+            assert!(
+                !st.ended,
+                "a late record must not end a run whose newer call was ordinary"
+            );
+        }
+
+        // The in-order twin: the outcome tag arrives on the NEWEST call and
+        // does end the run.
+        s.ingest_at("acme", &[call_at("r2", PLANNER, 1, T0)], T0);
+        s.ingest_at(
+            "acme",
+            &[CallRecord {
+                run_id: "r2".into(),
+                agent_id: PLANNER.into(),
+                decision: "allow".into(),
+                cost_microusd: 1,
+                step: 2,
+                ts_millis: T0 + 5_000,
+                outcome: "done".into(),
+                ..Default::default()
+            }],
+            T0 + 5_000,
+        );
+        let key2 = ("acme".to_string(), "r2".to_string());
+        {
+            let inner = s.inner.read().unwrap();
+            let st = inner.stall.get(&key2).copied().unwrap_or_default();
+            assert!(st.ended);
+        }
+
+        let fired = s.sweep_stalled_at(T0 + 5_000 + STALL_MS);
+        assert_eq!(fired.len(), 1, "only r1: r2 ended and is not stalled");
+        assert_eq!(fired[0].run_id, Some("r1".to_string()));
+    }
+
+    /// The stall map is bounded by recency, not by panic: it must never
+    /// grow past `MAX_TRACKER_KEYS`, and the newest run stays watched.
+    #[test]
+    fn the_stall_map_is_bounded_by_recency_not_by_panic() {
+        let s = Store::new();
+        let n = MAX_TRACKER_KEYS + 25;
+        for i in 0..n {
+            let run = format!("run-{i}");
+            let ts = T0 + i as i64;
+            s.ingest_at(
+                "acme",
+                &[
+                    call_at(&run, PLANNER, 1, ts),
+                    call_at(&run, PLANNER, 2, ts + 1),
+                ],
+                ts + 1,
+            );
+        }
+        let inner = s.inner.read().unwrap();
+        assert!(
+            inner.stall.len() <= MAX_TRACKER_KEYS,
+            "stall map must stay bounded, got {}",
+            inner.stall.len()
+        );
+        for i in 0..25 {
+            let key = ("acme".to_string(), format!("run-{i}"));
+            assert!(
+                !inner.stall.contains_key(&key),
+                "run-{i} should have been evicted"
+            );
+        }
+        let newest_key = ("acme".to_string(), format!("run-{}", n - 1));
+        assert!(
+            inner.stall.contains_key(&newest_key),
+            "the newest run is still watched"
+        );
+    }
+
+    /// A stamp cannot be later than the plane's own clock at arrival, so a
+    /// forged future stamp cannot hold the detector off.
+    #[test]
+    fn a_forged_future_stamp_does_not_hold_the_detector_off() {
+        let s = Store::new();
+        let now_ms = T0 - 3_600_000;
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 1, T0)], now_ms);
+        s.ingest_at("acme", &[call_at("r1", PLANNER, 2, T0 + 1_000)], now_ms);
+        assert_eq!(
+            s.sweep_stalled_at(now_ms + STALL_MS).len(),
+            1,
+            "a stamp cannot be later than the plane's clock"
+        );
+    }
+
+    /// Seeded hostile sweep (xorshift64, dependency-free) over 200 rounds of
+    /// adversarial records, plus a deterministic tail so the once-per-run
+    /// guard is caught regardless of the seed. Must never panic and must
+    /// never report a stall more than once.
+    #[test]
+    fn a_hostile_record_stream_never_panics_and_never_double_reports() {
+        let s = Store::new();
+        let mut seed: u64 = 20260918;
+        let mut next = move || {
+            // xorshift64: deterministic, dependency-free.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let decisions = [
+            "allow",
+            "cache_hit",
+            "budget_exceeded",
+            "killed",
+            "pwned",
+            "",
+        ];
+        let outcomes = ["", "done"];
+        let agents = ["", PLANNER];
+        let now_choices = [T0, T0 + 4_000_000_000];
+
+        for i in 0..200u64 {
+            let run = format!("r{}", next() % 8);
+            let ts_millis: i64 = match next() % 7 {
+                0 => i64::MIN,
+                1 => -1,
+                2 => 0,
+                3 => 1,
+                4 => i64::MAX,
+                5 => T0 + (next() % 600_000) as i64,
+                _ => T0 - (next() % 600_000) as i64,
+            };
+            let decision = decisions[(next() % decisions.len() as u64) as usize];
+            let outcome = outcomes[(next() % outcomes.len() as u64) as usize];
+            let agent_id = agents[(next() % agents.len() as u64) as usize];
+            let now_ms = now_choices[(next() % now_choices.len() as u64) as usize];
+
+            let rec = CallRecord {
+                run_id: run,
+                agent_id: agent_id.to_string(),
+                decision: decision.to_string(),
+                cost_microusd: 1,
+                step: (i % 50) as u32,
+                ts_millis,
+                outcome: outcome.to_string(),
+                ..Default::default()
+            };
+            s.ingest_at("acme", &[rec], now_ms);
+            let _ = s.sweep_stalled_at(now_ms);
+
+            {
+                let inner = s.inner.read().unwrap();
+                for st in inner.stall.values() {
+                    assert!(st.longest_gap_ms >= 0);
+                    assert!(st.calls_seen >= 1);
+                }
+            }
+            for inc in s.incidents("acme") {
+                if inc.kind == "run_stalled" {
+                    assert_eq!(
+                        inc.occurrences, 1,
+                        "{}: reported {} times",
+                        inc.id, inc.occurrences
+                    );
+                }
+            }
+        }
+
+        // The 200 rounds above can leave a fuzzed run (r0..r7) silent and
+        // eligible but never yet swept out (its own round's sweep shared
+        // that round's `now_ms`, which is rarely far enough past its own
+        // gap). Flush any such leftover before the deterministic tail below,
+        // so `r9`'s own counts are not shared with one of them: every
+        // non-extreme timestamp this fuzz can produce is capped within
+        // `T0` plus or minus a few hundred thousand milliseconds, so a
+        // sweep an hour past the latest `now_choices` value resolves
+        // whatever is resolvable (a run whose own longest gap is even
+        // bigger never fires here, or anywhere, on purpose: that is the
+        // same "own habit" floor invariant 10 already gives ordinary runs).
+        s.sweep_stalled_at(T0 + 4_000_000_000 + 3_600_000);
+
+        // A deterministic tail so the once-per-run guard is caught
+        // regardless of the seed.
+        s.ingest_at(
+            "acme",
+            &[call_at("r9", PLANNER, 1, T0 + 5_000_000_000)],
+            T0 + 5_000_000_000,
+        );
+        s.ingest_at(
+            "acme",
+            &[call_at("r9", PLANNER, 2, T0 + 5_000_000_000 + 1_000)],
+            T0 + 5_000_000_000 + 1_000,
+        );
+        let fired = s.sweep_stalled_at(T0 + 5_000_000_000 + 1_000 + STALL_MS);
+        assert_eq!(fired.len(), 1);
+        let again = s.sweep_stalled_at(T0 + 5_000_000_000 + 1_000 + 2 * STALL_MS);
+        assert_eq!(again.len(), 0);
+        let inc = s
+            .incidents("acme")
+            .into_iter()
+            .find(|i| i.id == "run_stalled:r9")
+            .expect("r9 stalled");
+        assert_eq!(inc.occurrences, 1);
+    }
+
+    /// `TOKENFUSE_CLOUD_STALL_MINUTES`'s parser: zero is off, blank is the
+    /// default, and anything not a whole number of minutes is refused.
+    #[test]
+    fn stall_minutes_env_zero_is_off_blank_is_default_and_junk_is_refused() {
+        let cases: Vec<(Option<&str>, Result<i64, String>)> = vec![
+            (None, Ok(300_000)),
+            (Some(""), Ok(300_000)),
+            (Some("   "), Ok(300_000)),
+            (Some("0"), Ok(0)),
+            (Some(" 0 "), Ok(0)),
+            (Some("5"), Ok(300_000)),
+            (Some("1"), Ok(60_000)),
+            (Some("+7"), Ok(420_000)),
+            (Some("18446744073709551615"), Ok(i64::MAX)),
+            (
+                Some("99999999999999999999"),
+                Err("99999999999999999999".to_string()),
+            ),
+            (Some("abc"), Err("abc".to_string())),
+            (Some("-1"), Err("-1".to_string())),
+            (Some("5.5"), Err("5.5".to_string())),
+            (Some("1e3"), Err("1e3".to_string())),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                IncidentConfig::stall_after_ms_from_minutes(input),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The sweep task's spawn in `main.rs` reads this one function; this is
+    /// the testable seam for "spawned only when the detector is on".
+    #[test]
+    fn the_sweep_task_is_spawned_only_when_the_detector_is_on() {
+        assert_eq!(Store::stall_sweep_tick(0), None);
+        assert_eq!(Store::stall_sweep_tick(-5), None);
+        assert_eq!(
+            Store::stall_sweep_tick(1),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(Store::stall_sweep_tick(300_000), Some(STALL_SWEEP_TICK));
     }
 }
