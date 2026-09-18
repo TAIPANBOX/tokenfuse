@@ -637,6 +637,18 @@ run_case "settlement-owns-the-call: a retained reservation released instead" fai
 	"$(py 'edit("crates/gateway/src/settle.rs", "CallOutcome::Unknown => Disposition::Retain,", "CallOutcome::Unknown => { let _ = Disposition::Retain; Disposition::Release }")')" \
 	"a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns ... FAILED"
 
+# --- invariant 55: usage is read from SSE events, not from lines ---------------
+#
+# Not a scripts/*.sh gate: the rule is the parser's event assembly, held by
+# cargo test. The mutant is the fault the review found, one data line parsed on
+# its own: a `data` field REPLACES the buffer instead of appending to it, so a
+# usage object split across two lines never parses and the review's own probe
+# must go red with the output cost gone (30 for 15030).
+run_case "usage-is-read-from-events: a data field replaces the buffer instead of appending" fail \
+	"cargo test -p tokenfuse-gateway --test codex_money_review -- --exact codex_f06_multiline_sse_usage_is_not_silently_partial" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "data.push_str(value);", "data.clear(); data.push_str(value);")')" \
+	"codex_f06_multiline_sse_usage_is_not_silently_partial ... FAILED"
+
 # --- invariant 44: the 1.0 surface is frozen --------------------------------
 #
 # compat/1.0.json is the promise of this major and compat-surface.sh is what

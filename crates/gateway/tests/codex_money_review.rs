@@ -1,7 +1,8 @@
 // @codex 2026-09-17: review-only probes, written against 80e0d42 without product changes
 // (F03, F04 and their held controls). Moved into the suite by the settle-guard PR
 // (invariant 50); codex_f03's send-cancel probe is renamed and its assertion moved to
-// retention under D7, see its own comment; every other test is verbatim.
+// retention under D7, see its own comment; every other test is verbatim. PR 3 (invariant 55)
+// moves the F05 and F06 probes in the same way, verbatim, plus the `parse` helper they share.
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -10,9 +11,68 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokenfuse_core::{Ledger, Microusd, Mode, Policy};
 use tokenfuse_gateway::estimate::estimate_cost;
-use tokenfuse_gateway::provider::{Provider, ProviderError, ProviderResponse, UsageParser};
+use tokenfuse_gateway::provider::{
+    ParsedUsage, Provider, ProviderError, ProviderResponse, UsageParser,
+};
 use tokenfuse_gateway::{pricebook::default_price_book, state::AppState, wire::Wire};
 use tower::ServiceExt;
+
+fn parse(bytes: &[u8]) -> ParsedUsage {
+    let mut p = UsageParser::new();
+    p.feed(bytes);
+    p.finish()
+}
+
+#[test]
+fn codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once() {
+    let bytes=b"data: {\"usage\":{\"prompt_tokens\":950}}\n\ndata: {\"usage\":{\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\ndata: [DONE]\n\n";
+    let u = parse(bytes).usage;
+    let cost = default_price_book().cost("gpt-4o", &u).unwrap();
+    println!("usage={u:?}; actual={cost:?}; expected=2215");
+    assert_eq!(cost,Microusd(2215),"invariant 45: a cached subset arriving after prompt_tokens still removes that subset from input");
+}
+
+#[test]
+fn codex_f05_inv45_details_only_chunk_is_not_discarded() {
+    let bytes=b"data: {\"usage\":{\"prompt_tokens\":950}}\n\ndata: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\ndata: [DONE]\n\n";
+    let u = parse(bytes).usage;
+    let cost = default_price_book().cost("gpt-4o", &u).unwrap();
+    println!("usage={u:?}; actual={cost:?}; expected=2215");
+    assert_eq!(
+        cost,
+        Microusd(2215),
+        "invariant 45: usage details on a separate chunk must not disappear at shape detection"
+    );
+}
+
+#[tokio::test]
+async fn codex_f06_multiline_sse_usage_is_not_silently_partial() {
+    // One valid SSE event can contain several data fields joined with LF.
+    let bytes=b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec();
+    let (st, l) = state(
+        Arc::new(BytesProvider {
+            bytes,
+            status: 200,
+            fail: false,
+            publish_before_error: false,
+        }),
+        Wire::Anthropic,
+    );
+    let request = Request::post("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-fuse-run-id", "multiline")
+        .header("x-fuse-budget-usd", "10")
+        .body(Body::from(
+            r#"{"model":"claude-sonnet","max_tokens":1000,"stream":true}"#,
+        ))
+        .unwrap();
+    let r = tokenfuse_gateway::app(st).oneshot(request).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let got = l.snapshot("multiline").unwrap();
+    println!("settled={got:?}; expected cost=15030");
+    assert_eq!(got.spent,Microusd(15030),"UsageParser SSE contract and review priced-once invariant: final multiline usage must not vanish while initial usage is priced");
+}
 
 struct BytesProvider {
     bytes: Vec<u8>,

@@ -47,3 +47,40 @@ Feature: An OpenAI cached token is priced once, never twice
     And whose later usage chunk says prompt_tokens 950 and completion_tokens 120 with no details
     When the gateway parses the stream
     Then the usage holds 822 input tokens and 128 cache-read tokens, not 950 and 128
+
+  @fable 2026-09-18, F05 of the money-path review: the netting ran only when
+  the current chunk carried prompt_tokens, and a chunk carrying only the cache
+  details was read as Anthropic's shape and ignored, so the double charge came
+  back in the other order. The prompt count and the cached subset are now kept
+  apart across events and the input is always the one less the other.
+
+  # @test:codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once
+  # @test:a_cached_subset_arriving_after_the_prompt_count_is_netted
+  Scenario: A cached subset arriving after the prompt count is netted once
+    Given a stream whose first usage chunk says prompt_tokens 950
+    And whose later chunk says completion_tokens 0 with cached_tokens 128
+    When the gateway prices the usage on gpt-4o
+    Then it settles 2215 micro-USD, not 2535
+
+  # @test:codex_f05_inv45_details_only_chunk_is_not_discarded
+  # @test:a_details_only_object_is_openai_shaped_not_anthropic
+  Scenario: A chunk carrying only the cache details is not discarded at shape detection
+    Given a stream whose first usage chunk says prompt_tokens 950
+    And whose later chunk carries only prompt_tokens_details with cached_tokens 128
+    When the gateway prices the usage on gpt-4o
+    Then it settles 2215 micro-USD, not 2375
+
+  # @test:the_netting_holds_across_three_events_whatever_the_final_event_carries
+  # @test:a_details_only_event_before_any_prompt_count_waits_for_the_prompt
+  # @test:a_later_zero_completion_count_keeps_the_earlier_positive_one
+  Scenario: The netting holds in every order the two figures can arrive in
+    Given the prompt count and the cached subset on separate chunks, in either order, with or without a final complete usage object
+    And a later chunk whose completion count is zero
+    When the gateway parses the stream
+    Then the usage holds 822 input tokens and 128 cache-read tokens, and an earlier positive output count is kept
+
+  # @test:a_body_mixing_both_vendors_shapes_is_read_per_object
+  Scenario: A body mixing both vendors' shapes is read object by object
+    Given a body carrying Anthropic's message_start, OpenAI's prompt count and cache details on separate chunks, an Anthropic output delta and a total_tokens object
+    When the gateway parses it
+    Then each object is read by its own fields, the netting holds, and total_tokens prices nothing
