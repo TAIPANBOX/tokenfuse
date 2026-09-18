@@ -46,6 +46,54 @@ use std::sync::Arc;
 
 use tokenfuse_delegation::{verify_delegation, DelegationConfig, Refusal};
 
+/// The most entries a declared chain may carry: agent-passport SPEC 5.1's
+/// "Maximum chain depth is 32 entries", read from the delegation crate rather
+/// than retyped, so the header cap and the token cap are one number.
+///
+/// SPEC 5.1 states the bound on the chain ITSELF; proving a chain (5.2) is
+/// optional and additive. The v0.2 envelope pins `maxItems: 32` on
+/// `on_behalf_of` and `agent-conform` runs the record's validator on every
+/// line, so a chain longer than this is one no consumer will hold, whether or
+/// not anybody verified it. Measured 2026-09-17 with no issuer configured
+/// (tokenfuse#297): forty entries were forwarded, answered 200, and every
+/// event of that request would have carried a chain the record refuses.
+pub const MAX_CHAIN_ENTRIES: usize = tokenfuse_delegation::MAX_CHAIN_ENTRIES;
+
+/// A declared chain longer than [`MAX_CHAIN_ENTRIES`]: refused on parse, at
+/// both doors, before anything is resolved, reserved or forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainOverCap {
+    /// How many entries the header carried.
+    pub entries: usize,
+}
+
+/// Split the raw `x-fuse-on-behalf-of` value into the ordered, root-first
+/// chain (agent-passport SPEC 5: comma-separated, entries trimmed, empty
+/// entries dropped), and refuse one longer than the cap.
+///
+/// Entries are still opaque strings here: the acyclic rule and the
+/// `agent://`/`user://` scheme rule are applied to a TOKEN's chain by the
+/// delegation crate and are not applied to a declared chain by this
+/// function. That is a stated limit, not an oversight: the cap is what the
+/// 2026-09-17 run measured as missing, and widening the parse is a separate
+/// decision. An absent header is an empty chain, SPEC 5's "acts
+/// autonomously".
+pub fn declared_chain(raw: Option<&str>) -> Result<Vec<String>, ChainOverCap> {
+    let chain: Vec<String> = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if chain.len() > MAX_CHAIN_ENTRIES {
+        return Err(ChainOverCap {
+            entries: chain.len(),
+        });
+    }
+    Ok(chain)
+}
+
 /// The verifier plus what the operator configured, or nothing at all.
 ///
 /// Absent is the default and the common case. `Option<Arc<..>>` rather than a
@@ -306,6 +354,61 @@ pub fn from_env() -> ChainProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The number is written out here independently of the constant it
+    /// checks (invariant 14's lesson: an expectation taken from the thing
+    /// under test cannot fail), and it is the delegation crate's number, so a
+    /// token's chain and a declared chain are bounded by one rule.
+    #[test]
+    fn the_header_cap_is_the_delegation_crates_cap_and_not_a_second_number() {
+        assert_eq!(MAX_CHAIN_ENTRIES, 32, "agent-passport SPEC 5.1's number");
+        assert_eq!(MAX_CHAIN_ENTRIES, tokenfuse_delegation::MAX_CHAIN_ENTRIES);
+
+        let entries = |n: usize| {
+            (0..n)
+                .map(|i| format!("agent://acme.example/hop{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let at_cap =
+            declared_chain(Some(&entries(32))).expect("32 entries is the cap, not over it");
+        assert_eq!(at_cap.len(), 32);
+        assert_eq!(
+            at_cap[0], "agent://acme.example/hop0",
+            "root first, unchanged"
+        );
+        assert_eq!(
+            declared_chain(Some(&entries(33))),
+            Err(ChainOverCap { entries: 33 }),
+            "one past the cap is refused and says how many were sent"
+        );
+        assert_eq!(
+            declared_chain(Some(&entries(40))),
+            Err(ChainOverCap { entries: 40 }),
+            "the measured case"
+        );
+    }
+
+    /// The parse itself: trimmed, empties dropped, an absent header an empty
+    /// chain. Pinned because both doors now read through this one function
+    /// and each used to have its own splitter.
+    #[test]
+    fn a_declared_chain_is_split_trimmed_and_absent_is_empty() {
+        assert_eq!(declared_chain(None), Ok(Vec::new()));
+        assert_eq!(declared_chain(Some("")), Ok(Vec::new()));
+        assert_eq!(declared_chain(Some(" , ,")), Ok(Vec::new()));
+        assert_eq!(
+            declared_chain(Some(" user://acme/alice , agent://acme/triage,, ")),
+            Ok(vec![
+                "user://acme/alice".to_string(),
+                "agent://acme/triage".to_string()
+            ])
+        );
+        // Empty entries do not count towards the cap: the cap is on entries
+        // the chain carries, and a stray comma carries none.
+        let padded = format!("{},", ",".repeat(40));
+        assert_eq!(declared_chain(Some(&padded)), Ok(Vec::new()));
+    }
 
     #[test]
     fn a_dpop_credential_is_read_and_a_bearer_one_is_not() {

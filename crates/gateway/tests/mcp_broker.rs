@@ -1704,6 +1704,95 @@ async fn a_chain_nobody_proved_is_asked_about_as_unproven() {
     );
 }
 
+/// The MCP door applies the same entry cap as the LLM door (tokenfuse#297).
+///
+/// agent-passport SPEC 5.1 bounds the chain at 32 entries whether or not a
+/// token proves it. Measured 2026-09-17 on the LLM door: forty entries with no
+/// issuer configured were forwarded with nothing on the bus. This door read
+/// the same header through its own splitter and counted nothing either. Red
+/// first on the unfixed tree: `left: 200 right: 400`, and the upstream saw
+/// the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_over_the_cap_is_refused_at_the_mcp_door_too() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let dir = std::env::temp_dir().join(format!("tf-mcp-chain-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let events_path = dir.join("events.ndjson");
+    let mut st = broker_state(
+        upstream,
+        ScanMode::Warn,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::disabled(),
+    );
+    Arc::get_mut(&mut st).unwrap().events = Arc::new(
+        tokenfuse_gateway::events::EventExporter::open(events_path.to_str().expect("utf-8"))
+            .expect("an exporter on a fresh file"),
+    );
+    let broker_url = spawn_server(app(st)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let chain = (0..33)
+        .map(|i| format!("agent://acme.example/hop{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let resp = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("x-fuse-run-id", "run-mcp-chain-33")
+        .header("x-fuse-on-behalf-of", chain)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "the MCP door accepted a 33-entry chain the record cannot hold"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request", "{body}");
+    assert_eq!(body["error"]["code"], "on_behalf_of_over_cap", "{body}");
+    assert_eq!(body["error"]["entries"], 33, "{body}");
+    assert_eq!(body["error"]["max_entries"], 32, "{body}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the upstream saw a call that should have been refused at the door"
+    );
+
+    let text = std::fs::read_to_string(&events_path).unwrap_or_default();
+    let events: Vec<Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "one identity_mismatch for the refusal and nothing else: {events:?}"
+    );
+    assert_eq!(events[0]["type"], "identity_mismatch", "{}", events[0]);
+    assert_eq!(
+        events[0]["data"]["reason"], "on_behalf_of_over_cap",
+        "{}",
+        events[0]
+    );
+    assert_eq!(events[0]["data"]["entries"], 33, "{}", events[0]);
+    assert_eq!(events[0]["data"]["max_entries"], 32, "{}", events[0]);
+    assert_eq!(events[0]["run_id"], "run-mcp-chain-33", "{}", events[0]);
+    assert!(
+        events[0].get("on_behalf_of").is_none(),
+        "the event carries the chain the record refuses: {}",
+        events[0]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A broker with a delegation issuer configured, plus the key a caller holds.
 fn broker_proving_recording(
     upstream: String,

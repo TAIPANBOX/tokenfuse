@@ -110,10 +110,21 @@ async fn main() {
     // read once here at startup (the control plane is its own process,
     // separate from any gateway that might also have it set) — absent/empty
     // keeps the exporter disabled (zero cost on the ingest hot path).
-    let event_exporter = Arc::new(tokenfuse_core::agent_event::Exporter::from_env());
-    if event_exporter.is_enabled() {
-        tracing::info!("agent-event NDJSON export enabled");
+    //
+    // What the read found is logged in the words `tokenfuse_core` chose, at
+    // the level it chose, the same three lines the gateway's `events::from_env`
+    // has. Until tokenfuse#292 this process logged only the enabled case: a
+    // path it could not open (the launchers' `root:10001 2775` directory,
+    // reached as gid 999) produced the disabled exporter and no line, so
+    // four `budget_exhausted` incidents never reached the bus and nothing
+    // said why.
+    let (event_exporter, startup) = tokenfuse_core::agent_event::Exporter::from_env();
+    match startup.line() {
+        None => {}
+        Some(tokenfuse_core::agent_event::StartupLine::Info(line)) => tracing::info!("{line}"),
+        Some(tokenfuse_core::agent_event::StartupLine::Warn(line)) => tracing::warn!("{line}"),
     }
+    let event_exporter = Arc::new(event_exporter);
 
     // `alert_pct` is passed to the store too (not just `AppState`/
     // `PushPipeline`): C5's `MAX_RUNS_PER_ORG` eviction policy needs the SAME

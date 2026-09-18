@@ -159,7 +159,13 @@ struct Act {
 ///
 /// "Maximum chain depth is 32 entries", and SPEC section 5 calls the members of
 /// `on_behalf_of` entries. The root, usually a human, is the first of them.
-const MAX_CHAIN_ENTRIES: usize = 32;
+///
+/// Public because it is the cap on the CHAIN, not on the token: the gateway
+/// applies the same number to a chain a caller merely declares in
+/// `x-fuse-on-behalf-of`, with or without an issuer configured
+/// (`tokenfuse_gateway::chainproof::declared_chain`, tokenfuse#297), and reads
+/// it from here so the two doors cannot hold two numbers.
+pub const MAX_CHAIN_ENTRIES: usize = 32;
 
 /// The same cap counted in RFC 8693 actors, and the thing that stops a
 /// self-referential `act` being walked for ever.

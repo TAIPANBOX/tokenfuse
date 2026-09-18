@@ -89,17 +89,6 @@ fn on_behalf_of_header(headers: &HeaderMap) -> Option<String> {
     Some(raw)
 }
 
-/// Split a captured `on_behalf_of` raw header value into the ordered,
-/// root-first chain the agent-event envelope's `on_behalf_of` array wants
-/// (agent-passport SPEC.md §6.1). Pure string splitting — entries are still
-/// opaque strings, not validated URIs (no enforcement semantics this phase).
-fn split_on_behalf_of(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 /// Sanity cap on the raw `X-Fuse-Outcome` header (P4, unit economics): an
 /// opaque tag this long is almost certainly misuse, not a real outcome label
 /// like `case_resolved`/`escalated`/`abandoned`. Mirrors the
@@ -711,10 +700,34 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     // trace, and split into an ordered list for agent-event envelopes.
     let on_behalf_of_captured = on_behalf_of_header(&headers);
     let on_behalf_of = on_behalf_of_captured.clone().unwrap_or_default();
-    let declared_chain: Vec<String> = on_behalf_of_captured
-        .as_deref()
-        .map(split_on_behalf_of)
-        .unwrap_or_default();
+    // SPEC 5.1's entry cap holds here, with or without an issuer configured
+    // (tokenfuse#297): a chain the record cannot hold is refused before it is
+    // resolved, reserved, forwarded or written into any event. The MCP door
+    // reads the same header through the same function. One event, of the
+    // identity family, carrying the LENGTH and not the chain, so the event
+    // itself is one the record will hold. No trace row, like every other 400
+    // here. Whatever the mode: a malformed header is not a money decision.
+    let declared_chain = match crate::chainproof::declared_chain(on_behalf_of_captured.as_deref()) {
+        Ok(chain) => chain,
+        Err(over) => {
+            tracing::warn!(
+                run = %run_id,
+                entries = over.entries,
+                cap = crate::chainproof::MAX_CHAIN_ENTRIES,
+                "refused: x-fuse-on-behalf-of carries more entries than the Agent Passport chain holds"
+            );
+            let outcome = st.events.emit(
+                EventType::IdentityMismatch,
+                now_millis(),
+                Some(&agent_id),
+                Some(&run_id),
+                None,
+                on_behalf_of_over_cap_data(&key_id, &agent_id, over.entries),
+            );
+            crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+            return on_behalf_of_over_cap(over.entries);
+        }
+    };
 
     // And whether anybody PROVED it. Until 2026-08-26 this comment said "no
     // enforcement semantics this phase, capture only", which was true and had
@@ -2509,10 +2522,62 @@ fn metering_required() -> Response {
         .expect("valid response")
 }
 
+/// tokenfuse#297: `x-fuse-on-behalf-of` carries more entries than agent-passport SPEC 5.1's
+/// chain holds. 400 and not a money refusal, for `parent_run_refused`'s reason: nothing was
+/// priced, the header is malformed relative to a cap the caller can read, and the caller can
+/// fix it. Names the cap and the count sent, because a refusal a caller cannot act on is one
+/// they work around. The one 400 here that also writes an event (see
+/// [`on_behalf_of_over_cap_data`]), because a chain deeper than the record holds is the
+/// identity plane's business, not only the caller's.
+///
+/// Shared with the MCP broker (`crate::mcpbroker`), which reads the same header and answers
+/// the same bytes from the same function, so the two doors cannot drift.
+pub(crate) fn on_behalf_of_over_cap(entries: usize) -> Response {
+    let cap = crate::chainproof::MAX_CHAIN_ENTRIES;
+    let body = serde_json::json!({
+        "error": {
+            "type": "invalid_request",
+            "code": "on_behalf_of_over_cap",
+            "entries": entries,
+            "max_entries": cap,
+            "reason": format!(
+                "x-fuse-on-behalf-of carries {entries} entries; the Agent Passport chain holds \
+                 at most {cap} (SPEC 5.1), whether or not a delegation issuer is configured. \
+                 Shorten the chain: it is never truncated here"
+            ),
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// The `data` of the one `identity_mismatch` an over-cap chain writes: the length and the
+/// cap, never the chain, because the chain is exactly what the record refuses to hold and an
+/// event carrying it would be quarantined with the request it reports. Shared with the MCP
+/// door for the reason [`on_behalf_of_over_cap`] is.
+pub(crate) fn on_behalf_of_over_cap_data(
+    key_id: &str,
+    agent_id: &str,
+    entries: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": (!key_id.is_empty()).then_some(key_id),
+        "agent_id": (!agent_id.is_empty()).then_some(agent_id),
+        "reason": "on_behalf_of_over_cap",
+        "entries": entries,
+        "max_entries": crate::chainproof::MAX_CHAIN_ENTRIES,
+    })
+}
+
 /// D2: the request would move a run to another parent, or names an impossible one. 400 and
 /// not a money refusal: nothing was priced, the request is malformed relative to what the
 /// ledger holds, and the caller can fix it. No trace row and no event, like every other 400
-/// here; the warn line at the call site is the record.
+/// here except the over-cap chain above; the warn line at the call site is the record.
 fn parent_run_refused(run_id: &str, err: &OpenError) -> Response {
     let (code, accepted, declared, reason) = match err {
         OpenError::ParentChanged { held, declared, .. } => (
@@ -8035,6 +8100,149 @@ pub(crate) mod tests {
             firewall_events(&path).is_empty(),
             "a chain nobody proved filed a record, which is the header's own \
              weakness with extra steps"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+    }
+
+    // -- tokenfuse#297: the chain cap holds whether or not anybody verifies --
+    //
+    // agent-passport SPEC 5.1 bounds `on_behalf_of` at 32 entries as a
+    // property of the chain itself; proving it (5.2) is optional. Measured
+    // 2026-09-17 with no issuer configured: forty entries were forwarded,
+    // answered 200, and nothing reached the bus, while the record's schema
+    // pins `maxItems: 32`, so every event of that request carrying the chain
+    // would have been quarantined by any validating consumer.
+
+    /// `n` distinct `agent://` entries, comma-joined, root first.
+    fn a_chain_of(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("agent://acme.example/hop{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn chain_request(run: &str, entries: usize) -> Request<Body> {
+        Request::post("/v1/messages")
+            .header("x-fuse-run-id", run)
+            .header("x-fuse-agent-id", "agent://acme.example/bot")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-on-behalf-of", a_chain_of(entries))
+            .body(Body::from(body(100)))
+            .unwrap()
+    }
+
+    /// The MEASURED defect, driven through the router. Red first on the
+    /// unfixed tree: `left: 200 right: 400`, with the forty-entry chain
+    /// forwarded and the bus empty.
+    #[tokio::test]
+    async fn a_chain_of_forty_entries_is_refused_before_anything_is_forwarded() {
+        let (events, path) = recording_exporter("chain-forty");
+        let provider = CapturingProvider::default();
+        let sink = RecordingSink::default();
+        let st = state_with_provider(Arc::new(provider.clone()))
+            .with_events(events)
+            .with_sink(Arc::new(sink.clone()));
+
+        let resp = call(st.clone(), chain_request("run-chain-40", 40)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a forty-entry chain was accepted; the shared cap is 32 entries and the \
+             record refuses anything longer"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "invalid_request", "{json}");
+        assert_eq!(json["error"]["code"], "on_behalf_of_over_cap", "{json}");
+        assert_eq!(json["error"]["entries"], 40, "{json}");
+        assert_eq!(json["error"]["max_entries"], 32, "{json}");
+        let reason = json["error"]["reason"].as_str().expect("a reason sentence");
+        assert!(
+            reason.contains("32") && reason.contains("40"),
+            "the reason names neither the cap nor the count sent: {reason}"
+        );
+
+        assert!(
+            provider.sent.lock().unwrap().is_none(),
+            "the call reached the provider; the cap is applied before any forward"
+        );
+        if let Some(snap) = st.ledger.snapshot("run-chain-40").await {
+            assert_eq!(snap.reserved, Microusd(0), "a refused call reserved money");
+            assert_eq!(snap.steps, 0, "a refused call counted as a step");
+        }
+        assert!(
+            sink.snapshot().is_empty(),
+            "a 400 writes no trace row, like every other 400 here: {:?}",
+            sink.snapshot()
+        );
+
+        let recorded = events_at(&path);
+        let mismatches: Vec<_> = recorded
+            .iter()
+            .filter(|e| e["type"] == "identity_mismatch")
+            .collect();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "exactly one identity_mismatch on the bus, got: {recorded:?}"
+        );
+        let e = mismatches[0];
+        assert_eq!(e["data"]["reason"], "on_behalf_of_over_cap", "{e}");
+        assert_eq!(e["data"]["entries"], 40, "{e}");
+        assert_eq!(e["data"]["max_entries"], 32, "{e}");
+        assert_eq!(e["run_id"], "run-chain-40", "{e}");
+        assert_eq!(e["agent_id"], "agent://acme.example/bot", "{e}");
+        assert!(
+            e.get("on_behalf_of").is_none(),
+            "the event carries the very chain the record cannot hold, so the event \
+             itself would be quarantined: {e}"
+        );
+        assert_eq!(recorded.len(), 1, "one event for one refusal: {recorded:?}");
+
+        // Whatever the mode: a malformed header is not a money decision, so
+        // shadow refuses it exactly as enforce does.
+        let shadow = state(Mode::Shadow, StubProvider::default());
+        let resp = call(shadow, chain_request("run-chain-40-shadow", 40)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "shadow forwarded a chain the record cannot hold"
+        );
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+    }
+
+    /// The boundary, and the guard: 32 is the cap, not over it, so a chain of
+    /// exactly 32 rides through unchanged and nothing is recorded as a
+    /// mismatch. Without this the refusal above could be a door that refuses
+    /// every chain.
+    #[tokio::test]
+    async fn a_chain_at_exactly_the_cap_is_forwarded_and_recorded_unchanged() {
+        let (events, path) = recording_exporter("chain-thirty-two");
+        let sink = RecordingSink::default();
+        let st = state(Mode::Enforce, StubProvider::default())
+            .with_events(events)
+            .with_sink(Arc::new(sink.clone()));
+
+        let resp = call(st, chain_request("run-chain-32", 32)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a chain at the cap was refused"
+        );
+
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].on_behalf_of,
+            a_chain_of(32),
+            "the chain at the cap must ride into the trace verbatim"
+        );
+        assert!(
+            !events_at(&path)
+                .iter()
+                .any(|e| e["type"] == "identity_mismatch"),
+            "a chain at the cap was recorded as a mismatch: {:?}",
+            events_at(&path)
         );
         std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
     }

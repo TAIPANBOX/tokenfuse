@@ -60,7 +60,14 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 10001 tokenfuse
+    && groupadd -g 10001 tokenfuse \
+    && useradd -r -u 10001 -g 10001 tokenfuse
+# The group is created first and by number: `useradd -r` alone hands a system
+# user a private group from the SYSTEM gid range (999 on Debian), so the
+# process ran as 10001:999 and could not create a file in the launchers'
+# shared events directory, which is `root:10001` with mode 2775. Measured on
+# the 2026-09-17 appliance run (tokenfuse#292). `id` in the image now reads
+# uid=10001 gid=10001, the gid that directory expects.
 COPY --from=build /src/target/release/tokenfuse /usr/local/bin/tokenfuse
 # A writable data dir owned by the non-root user. When you mount a fresh named
 # volume at /data, Docker copies this ownership onto it, so durable raft storage

@@ -1114,6 +1114,71 @@ pub enum EmitOutcome {
     WriteError { errors_total: u64, message: String },
 }
 
+/// What reading [`EVENTS_PATH_ENV`] at process startup found, handed back by
+/// [`Exporter::from_env`] beside the exporter it built.
+///
+/// Data rather than a log line, because this crate has no logging dependency
+/// (invariant 1): the gateway and the Cloud each log it, through
+/// [`Startup::line`] so both say the same words. A chosen silence and a
+/// forgotten log line look identical from outside, which is why there is no
+/// longer a constructor that swallows the failed case (tokenfuse#292).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// The variable is unset or empty: the zero-cost exporter, nothing to say.
+    Off,
+    /// The file opened. `resumed_from` is the chain hash the file's tail
+    /// carried (SPEC.md §6.5), or `None` for a fresh chain.
+    On {
+        path: String,
+        resumed_from: Option<String>,
+    },
+    /// The variable named a path this process could not open. The exporter
+    /// handed back beside this is the disabled one; the process keeps
+    /// running; this is the one line the operator gets, at warn.
+    OpenFailed { path: String, error: String },
+}
+
+/// The one startup line a process logs about the export, and at what level.
+/// The level is decided here, beside the words, so the two processes cannot
+/// log one fact at two levels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupLine {
+    Info(String),
+    Warn(String),
+}
+
+impl Startup {
+    /// The line to log, or `None` when the export is simply off.
+    ///
+    /// The failed case names the variable, the path and the operating
+    /// system's error, and says the export is off: an operator reading
+    /// "could not open" alone is left to infer that the bus will stay empty,
+    /// and the 2026-09-17 proving run showed that inference is not made.
+    pub fn line(&self) -> Option<StartupLine> {
+        match self {
+            Startup::Off => None,
+            Startup::On {
+                path,
+                resumed_from: Some(h),
+            } => Some(StartupLine::Info(format!(
+                "agent-event NDJSON export enabled (prev_hash chain resumed from {}) path='{path}'",
+                &h[..h.len().min(19)]
+            ))),
+            Startup::On {
+                path,
+                resumed_from: None,
+            } => Some(StartupLine::Info(format!(
+                "agent-event NDJSON export enabled (fresh prev_hash chain) path='{path}'"
+            ))),
+            Startup::OpenFailed { path, error } => Some(StartupLine::Warn(format!(
+                "agent-event NDJSON export is off: could not open {EVENTS_PATH_ENV} \
+                 '{path}': {error}. The process keeps running and nothing reaches the \
+                 bus until the path can be opened and the process is restarted"
+            ))),
+        }
+    }
+}
+
 impl Exporter {
     /// The always-off exporter: no file, `emit` is a single branch away from
     /// a no-op, so a disabled exporter costs nothing on the hot path.
@@ -1139,12 +1204,18 @@ impl Exporter {
     /// startup concern, not a per-request one, so this is the one place
     /// allowed to return a hard error.
     pub fn open(path: &str) -> Result<Self, String> {
+        Self::open_file(path).map_err(|e| format!("could not open '{path}': {e}"))
+    }
+
+    /// [`Exporter::open`] with the operating system's own error, for
+    /// [`Exporter::from_env`] to report beside the path rather than inside a
+    /// sentence that already names it.
+    fn open_file(path: &str) -> Result<Self, std::io::Error> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(path)
-            .map_err(|e| format!("could not open '{path}': {e}"))?;
+            .open(path)?;
         let resumed = tail_chain_hash(&mut file);
         Ok(Exporter {
             sink: Some(std::sync::Mutex::new(ChainSink {
@@ -1169,16 +1240,38 @@ impl Exporter {
             .and_then(|s| s.resumed_from.clone())
     }
 
-    /// Read [`EVENTS_PATH_ENV`] ONCE and open it, or return the disabled
-    /// exporter when absent/empty. On an open error, ALSO returns the
-    /// disabled exporter (fail-open at startup too) — the caller should log
-    /// the `Err` case's message via the `Result`-returning [`Exporter::open`]
-    /// directly if it wants a startup warning; `from_env` is the convenience
-    /// path for callers that just want "on or off, never a crash".
-    pub fn from_env() -> Self {
+    /// Read [`EVENTS_PATH_ENV`] ONCE and open it, handing back the exporter
+    /// beside what happened ([`Startup`]), for the caller to log.
+    ///
+    /// Absent or empty is the disabled exporter and [`Startup::Off`]: nothing
+    /// to log, zero cost per request. A path that opens is [`Startup::On`].
+    /// A path that does NOT open is still the disabled exporter (fail-open at
+    /// startup too: an optional audit export must never stop the process),
+    /// and [`Startup::OpenFailed`] names the path and the error.
+    ///
+    /// Until tokenfuse#292 this returned the exporter alone and swallowed the
+    /// open error, which is how the Cloud ran for a whole proving run with
+    /// `TOKENFUSE_EVENTS_PATH` set, a directory it could not write to, four
+    /// `budget_exhausted` incidents, and not one line in its log saying why
+    /// nothing reached the bus. This crate has no logging of its own
+    /// (invariant 1), so the report is data the caller cannot leave unread:
+    /// a `match` on [`Startup`] has to say what it does about `OpenFailed`.
+    pub fn from_env() -> (Self, Startup) {
         match std::env::var(EVENTS_PATH_ENV) {
-            Ok(path) if !path.is_empty() => Self::open(&path).unwrap_or_else(|_| Self::disabled()),
-            _ => Self::disabled(),
+            Ok(path) if !path.is_empty() => match Self::open_file(&path) {
+                Ok(exp) => {
+                    let resumed_from = exp.resumed_from();
+                    (exp, Startup::On { path, resumed_from })
+                }
+                Err(e) => (
+                    Self::disabled(),
+                    Startup::OpenFailed {
+                        path,
+                        error: e.to_string(),
+                    },
+                ),
+            },
+            _ => (Self::disabled(), Startup::Off),
         }
     }
 
@@ -1596,11 +1689,153 @@ mod tests {
         assert_eq!(exp.skipped_count(), 0);
     }
 
+    /// Every test here that touches the one process-wide variable holds this,
+    /// for the reason the gateway's `events` tests hold theirs: cargo runs a
+    /// binary's tests on parallel threads, and two of them racing on one
+    /// environment variable pass or fail on luck.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn from_env_is_disabled_when_var_unset() {
+        let _g = env_lock();
         std::env::remove_var(EVENTS_PATH_ENV);
-        let exp = Exporter::from_env();
+        let (exp, _) = Exporter::from_env();
         assert!(!exp.is_enabled());
+    }
+
+    // -- tokenfuse#292: what from_env hands back beside the exporter ---------
+
+    /// Unset is `Off` and has no line: the common case stays silent and free.
+    #[test]
+    fn from_env_reports_an_unset_variable_as_off_with_nothing_to_log() {
+        let _g = env_lock();
+        std::env::remove_var(EVENTS_PATH_ENV);
+        let (exp, startup) = Exporter::from_env();
+        assert!(!exp.is_enabled());
+        assert_eq!(startup, Startup::Off);
+        assert_eq!(startup.line(), None, "an unset variable has nothing to log");
+
+        std::env::set_var(EVENTS_PATH_ENV, "");
+        let (exp, startup) = Exporter::from_env();
+        std::env::remove_var(EVENTS_PATH_ENV);
+        assert!(!exp.is_enabled(), "an empty value is not a path");
+        assert_eq!(startup, Startup::Off);
+    }
+
+    /// A path that opens is `On`, names the path, and says whether the chain
+    /// resumed: a fresh file starts fresh, and a file whose tail carries an
+    /// event resumes from that event's hash.
+    #[test]
+    fn from_env_reports_an_opened_file_with_its_path_and_where_the_chain_resumed() {
+        let _g = env_lock();
+        let dir =
+            std::env::temp_dir().join(format!("tf-agent-event-{}-startup-on", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let path_str = path.to_str().unwrap().to_string();
+
+        std::env::set_var(EVENTS_PATH_ENV, &path_str);
+        let (exp, startup) = Exporter::from_env();
+        assert!(exp.is_enabled());
+        assert_eq!(
+            startup,
+            Startup::On {
+                path: path_str.clone(),
+                resumed_from: None
+            }
+        );
+        let Some(StartupLine::Info(line)) = startup.line() else {
+            panic!(
+                "an opened file must report at info, got {:?}",
+                startup.line()
+            );
+        };
+        assert!(line.contains("export enabled"), "{line}");
+        assert!(line.contains("fresh"), "{line}");
+        assert!(line.contains(&path_str), "{line}");
+
+        // One event on disk, then a second start resumes from its hash.
+        let outcome = exp.emit(
+            EventType::BreakerTripped,
+            0,
+            Some("agent://acme.example/bot"),
+            Some("run-1"),
+            None,
+            serde_json::Value::Null,
+        );
+        assert_eq!(outcome, EmitOutcome::Written);
+        drop(exp);
+        let (exp, startup) = Exporter::from_env();
+        std::env::remove_var(EVENTS_PATH_ENV);
+        assert!(exp.is_enabled());
+        let Startup::On { resumed_from, .. } = &startup else {
+            panic!("a second start on the same file must be On, got {startup:?}");
+        };
+        let h = resumed_from
+            .as_deref()
+            .expect("the chain resumes from the event already on disk");
+        assert!(h.starts_with("sha256:"), "{h}");
+        let Some(StartupLine::Info(line)) = startup.line() else {
+            panic!("got {:?}", startup.line());
+        };
+        assert!(line.contains("resumed"), "{line}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The failed case: the disabled exporter, and a warn line naming the
+    /// variable, the path and the error and saying the export is off. A
+    /// nonexistent directory rather than a mode bit here, so this half runs
+    /// the same for root; the mode-bit fixture lives at the process level.
+    #[test]
+    fn from_env_reports_an_unopenable_path_at_warn_and_the_export_is_off() {
+        let _g = env_lock();
+        let path = "/nonexistent-directory-for-tokenfuse-core-tests/deep/events.ndjson";
+        std::env::set_var(EVENTS_PATH_ENV, path);
+        let (exp, startup) = Exporter::from_env();
+        std::env::remove_var(EVENTS_PATH_ENV);
+        assert!(!exp.is_enabled(), "an unopenable path degrades to disabled");
+        assert_eq!(
+            exp.emit(
+                EventType::BreakerTripped,
+                0,
+                Some("agent://acme.example/bot"),
+                None,
+                None,
+                serde_json::Value::Null,
+            ),
+            EmitOutcome::Disabled,
+            "and costs nothing per request"
+        );
+        let Startup::OpenFailed {
+            path: reported,
+            error,
+        } = &startup
+        else {
+            panic!("expected OpenFailed, got {startup:?}");
+        };
+        assert_eq!(reported, path);
+        assert!(
+            !error.is_empty(),
+            "the operating system's error is the diagnosis"
+        );
+        let Some(StartupLine::Warn(line)) = startup.line() else {
+            panic!(
+                "a failed open must report at warn, got {:?}",
+                startup.line()
+            );
+        };
+        assert!(line.contains(EVENTS_PATH_ENV), "{line}");
+        assert!(line.contains(path), "{line}");
+        assert!(line.contains(error.as_str()), "{line}");
+        assert!(
+            line.to_ascii_lowercase().contains("export is off"),
+            "{line}"
+        );
     }
 
     #[test]

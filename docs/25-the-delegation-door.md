@@ -26,6 +26,20 @@ against the chain the header declared, and hands the PDP one of three answers:
 what changed is that it now says so rather than looking identical to a verified
 one.
 
+A declared chain is bounded before any of that runs (2026-09-18, tokenfuse#297).
+`chainproof::declared_chain` is the one parser both doors read the header
+through, and a chain of more than `MAX_CHAIN_ENTRIES` (32, read from the
+delegation crate, agent-passport SPEC 5.1's number) is refused with
+`400 invalid_request` / `on_behalf_of_over_cap` and one `identity_mismatch`
+carrying the length and the cap, whether or not an issuer is configured: the
+record refuses a longer chain, so forwarding one would write events the bus
+cannot hold. Measured 2026-09-17 with no issuer, forty entries were forwarded
+and answered 200 with nothing on the bus. Two other caps are not this one: the
+4 KiB sanity cap on the raw header, older, which ignores the header as absent
+rather than refusing; and the ledger's 64-ancestor cap over
+`x-fuse-parent-run-id` (invariant 49), which bounds which runs a call rolls up
+into across requests, not whom one request acts for.
+
 ## 2. It runs in both processes, which is now checked
 
 The proxy (`serve`) and the MCP broker (`mcp_broker`) are separate process
