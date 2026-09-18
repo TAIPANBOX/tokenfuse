@@ -62,14 +62,105 @@ pub trait Provider: Send + Sync {
 // Usage parsing (provider-format-aware, but unified)
 // ---------------------------------------------------------------------------
 
+/// One SSE body, split into events by the WHATWG event-stream grammar (invariant 55): the
+/// `data` payload of every dispatched event, in order, and whether any `data` field appeared
+/// at all, which is what "this body is SSE" has always meant here (a body with `data:` lines
+/// that dispatch nothing is still not a JSON document).
+///
+/// Two departures from the browser algorithm, both on purpose, both in the direction of not
+/// losing an event: a final event the body ends without a blank line for IS dispatched (at
+/// end of body nothing can follow it; a provider that omits the last blank line is a shape the
+/// old line parser accepted; and on the Anthropic wire that last event is the `message_delta`
+/// carrying the cumulative `output_tokens`, the figure F06 lost); and an event whose data is
+/// empty after the trailing LF is removed is not dispatched (the browser dispatches an empty
+/// message; here it could only fail to parse, and `saw_data_field` already records that the
+/// line was there).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SseEvents {
+    pub(crate) events: Vec<String>,
+    pub(crate) saw_data_field: bool,
+}
+
+pub(crate) fn split_sse_events(text: &str) -> SseEvents {
+    let mut out = SseEvents::default();
+    // The data buffer. Every appended value is followed by one LF; `dispatch` removes the
+    // last one, which is why a buffer holding exactly "\n" dispatches nothing.
+    let mut data = String::new();
+    let mut rest = text;
+    loop {
+        // One line: up to the first CR or LF, with CRLF read as one terminator. Text after
+        // the last terminator is a line only when it is non-empty: the grammar sees no line
+        // there, and treating it as a blank line would dispatch on a phantom.
+        let (line, next) = match rest.find(['\r', '\n']) {
+            Some(i) => {
+                let bytes = rest.as_bytes();
+                let after = if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    &rest[i + 2..]
+                } else {
+                    &rest[i + 1..]
+                };
+                (&rest[..i], Some(after))
+            }
+            None => (rest, None),
+        };
+        if next.is_none() && line.is_empty() {
+            break;
+        }
+        if line.is_empty() {
+            dispatch(&mut data, &mut out.events);
+        } else if line.starts_with(':') {
+            // A comment. With `split_once` below this arm is defence in depth (a line
+            // starting with a colon has an empty field name, which nothing reads); it is
+            // kept because the grammar names it.
+        } else {
+            let (field, value) = match line.split_once(':') {
+                Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+                None => (line, ""),
+            };
+            // Leading whitespace before the field name is stripped before the comparison,
+            // exactly as the line parser's `trim_start` always did (no provider is known to
+            // indent a field, and a test pins the tolerance). A whitespace-only line is then
+            // a field line with an empty name, not a blank line, so it dispatches nothing and
+            // never splits an event.
+            if field.trim_start() == "data" {
+                out.saw_data_field = true;
+                data.push_str(value);
+                data.push('\n');
+            }
+            // `event`, `id`, `retry` and any other field: no effect on the data buffer.
+        }
+        match next {
+            Some(n) => rest = n,
+            None => break,
+        }
+    }
+    // The first departure: an unterminated final event is dispatched, not discarded.
+    dispatch(&mut data, &mut out.events);
+    out
+}
+
+/// Dispatch: remove the trailing LF the last `data` line appended; an empty buffer, before or
+/// after that, dispatches nothing. The buffer is empty afterwards either way.
+fn dispatch(data: &mut String, events: &mut Vec<String>) {
+    if data.is_empty() {
+        return;
+    }
+    data.pop();
+    if data.is_empty() {
+        return;
+    }
+    events.push(std::mem::take(data));
+}
+
 /// Extracts token usage from a response body, whether SSE (streaming) or a
 /// single JSON object (non-streaming). It recognizes both Anthropic
 /// (`message_start` / `message_delta`) and OpenAI (`usage` with
 /// `prompt_tokens`) shapes.
 ///
-/// Current implementation buffers the body up to a cap and parses at the end.
-/// TODO: make SSE parsing fully incremental to avoid holding a copy of large
-/// streamed responses (tracked in PROGRESS.md).
+/// Buffered: the body is kept up to [`CAP`](Self::CAP) and parsed once at [`finish`](Self::finish)
+/// (invariant 38), as SSE events by the event-stream grammar when any `data` field appears,
+/// else as one JSON document (invariant 55). An incremental SSE parser is out of scope and is
+/// tracked nowhere yet.
 #[derive(Default)]
 pub struct UsageParser {
     buf: Vec<u8>,
@@ -113,29 +204,27 @@ impl UsageParser {
     pub fn finish(&self) -> ParsedUsage {
         let text = String::from_utf8_lossy(&self.buf);
         let mut usage = Usage::default();
-        let mut saw_sse = false;
+        let mut netting = OpenAiNetting::default();
         let mut tool_calls = ToolCallCounter::default();
 
-        for line in text.lines() {
-            if let Some(rest) = line.trim_start().strip_prefix("data:") {
-                saw_sse = true;
-                let rest = rest.trim();
-                if rest.is_empty() || rest == "[DONE]" {
+        let sse = split_sse_events(&text);
+        if sse.saw_data_field {
+            // Each dispatched event is one JSON document, handed once to `merge_usage` and
+            // once to the tool-call counter (invariant 55). `[DONE]` is OpenAI's end
+            // sentinel; an event that does not parse is skipped and its siblings are not.
+            for event in &sse.events {
+                if event.trim() == "[DONE]" {
                     continue;
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
-                    merge_usage(&mut usage, &v);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(event) {
+                    merge_usage(&mut usage, &mut netting, &v);
                     tool_calls.observe_streaming(&v);
                 }
             }
-        }
-
-        // Non-streaming response: the whole body is one JSON object.
-        if !saw_sse {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                merge_usage(&mut usage, &v);
-                tool_calls.observe_non_streaming(&v);
-            }
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+            // Non-streaming response: the whole body is one JSON object.
+            merge_usage(&mut usage, &mut netting, &v);
+            tool_calls.observe_non_streaming(&v);
         }
 
         usage.tool_calls = tool_calls.finish();
@@ -247,7 +336,35 @@ impl ToolCallCounter {
     }
 }
 
-fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
+/// The two OpenAI prompt figures seen so far in ONE parse, kept apart until each object is
+/// applied so that `Usage.input_tokens` is always `gross_prompt.saturating_sub(cached)`
+/// whichever order they arrive in (invariant 45; F05 of the 2026-09-18 money-path review).
+/// Both follow `set_if_positive`'s rule: the last non-zero value wins, because streamed
+/// events arrive oldest first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OpenAiNetting {
+    /// The provider's `prompt_tokens`, which INCLUDES the cached subset.
+    gross_prompt: u64,
+    /// `prompt_tokens_details.cached_tokens`.
+    cached: u64,
+}
+
+/// OpenAI's usage object, by its own fields: any one of these makes it OpenAI's shape,
+/// including `prompt_tokens_details` on its own, which until 2026-09-18 was read as
+/// Anthropic's and ignored (F05). `total_tokens` marks the shape and is never priced.
+fn is_openai_shape(u: &serde_json::Value) -> bool {
+    [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+    ]
+    .iter()
+    .any(|k| u.get(*k).is_some())
+}
+
+fn merge_usage(usage: &mut Usage, net: &mut OpenAiNetting, v: &serde_json::Value) {
     // Anthropic message_start: { "message": { "usage": { ... } } }
     if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
         apply_anthropic(usage, u);
@@ -258,8 +375,8 @@ fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
     // deleting this filter changes no test in `provider`'s module (checked
     // 2026-09-07). No test can pin it for that reason; keep it anyway.
     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-        if u.get("prompt_tokens").is_some() || u.get("completion_tokens").is_some() {
-            apply_openai(usage, u);
+        if is_openai_shape(u) {
+            apply_openai(usage, net, u);
         } else {
             apply_anthropic(usage, u);
         }
@@ -309,28 +426,37 @@ fn apply_anthropic(usage: &mut Usage, u: &serde_json::Value) {
 /// rate, +14.5 % on a 950/128 call and more with a higher hit ratio, landing
 /// in the run's budget as spend nobody was billed (tokenfuse#267).
 ///
-/// `saturating_sub`: a cached count past the prompt count is the provider's
-/// bug, and an input count that wraps is the ADR-8 direction reversed.
-fn apply_openai(usage: &mut Usage, u: &serde_json::Value) {
-    // The cached count already seen on an earlier chunk counts too: a
-    // provider that sends `prompt_tokens_details` on one chunk and a bare
-    // `prompt_tokens` on a later one would otherwise reset the input to the
-    // whole prompt while the cache-read count stayed, which is the double
-    // charge back under a different chunking (the review of #267).
-    let cached = u
+/// The gross prompt count and the cached subset are kept apart in [`OpenAiNetting`] across
+/// every event of one parse, and `input_tokens` is always written from that state rather than
+/// from whichever object is current, so an object carrying only `prompt_tokens_details` still
+/// nets a `prompt_tokens` that arrived earlier OR later (F05 of the 2026-09-18 money-path
+/// review: until then the netting ran only when the CURRENT object carried `prompt_tokens`, so
+/// a details-only object was read as Anthropic's shape and ignored, and the second order priced
+/// the cached subset twice again).
+fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Value) {
+    if let Some(p) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
+        if p > 0 {
+            net.gross_prompt = p;
+        }
+    }
+    if let Some(c) = u
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|x| x.as_u64())
-        .unwrap_or(0)
-        .max(usage.cache_read_tokens);
-    if let Some(prompt) = u.get("prompt_tokens").and_then(|x| x.as_u64()) {
-        if prompt > 0 {
-            usage.input_tokens = prompt.saturating_sub(cached);
+    {
+        if c > 0 {
+            net.cached = c;
         }
     }
     set_if_positive(&mut usage.output_tokens, u, "completion_tokens");
-    if cached > 0 {
-        usage.cache_read_tokens = cached;
+    // Written from the state, not from this object, so the order the two figures arrived in
+    // cannot matter. `saturating_sub`: a cached count past the prompt count is the provider's
+    // bug, and an input count that wraps is the ADR-8 direction reversed.
+    if net.gross_prompt > 0 {
+        usage.input_tokens = net.gross_prompt.saturating_sub(net.cached);
+    }
+    if net.cached > 0 {
+        usage.cache_read_tokens = net.cached;
     }
 }
 
@@ -535,6 +661,7 @@ impl Provider for StubProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricebook::default_price_book;
     use tokenfuse_core::{Microusd, ModelPrice};
 
     #[test]
@@ -995,5 +1122,438 @@ mod tests {
         // No Authorization header was sent in this request, and none should
         // be fabricated.
         assert_eq!(received["authorization"], "");
+    }
+
+    // -- invariant 55: usage is read from SSE events, not from lines (F06) -
+
+    #[test]
+    fn a_multi_line_data_event_is_one_document() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 1000);
+        assert_eq!(
+            default_price_book().cost("claude-sonnet", &u),
+            Some(Microusd(15030))
+        );
+    }
+
+    #[test]
+    fn a_multi_line_openai_usage_event_is_one_document() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[],\ndata: \"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120,\ndata: \"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\ndata: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 120);
+        assert_eq!(u.tool_calls, Some(0));
+        let gpt_4o = ModelPrice::per_mtok_usd(2.50, 10.00, 1.25, 2.50);
+        assert_eq!(gpt_4o.cost(&u), Microusd(3415));
+    }
+
+    #[test]
+    fn crlf_endings_frame_events_like_lf() {
+        let lf = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let crlf = lf.replace('\n', "\r\n");
+        let mut p = UsageParser::new();
+        p.feed(crlf.as_bytes());
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 1000);
+    }
+
+    #[test]
+    fn a_cr_only_body_frames_events() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":10}}\r\rdata: {\"usage\":{\"completion_tokens\":5}}\r\rdata: [DONE]\r\r");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[test]
+    fn a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data() {
+        // (i) a comment line inside a two-line event does not split it.
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"type\":\"message_delta\",\n: keep-alive\ndata: \"usage\":{\"output_tokens\":1000}}\n\n");
+        assert_eq!(p.finish().usage.output_tokens, 1000);
+
+        // (ii) a comment line between events that happens to look like a usage object prices
+        // nothing: a guard, green on both sides of this change.
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":10}}\n\n:data: {\"usage\":{\"prompt_tokens\":999}}\n\n: {\"usage\":{\"prompt_tokens\":998}}\n\n");
+        assert_eq!(p.finish().usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn data_with_no_space_after_the_colon_is_data() {
+        let mut p = UsageParser::new();
+        p.feed(b"data:{\"usage\":{\"prompt_tokens\":10,\ndata:\"completion_tokens\":5}}\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[test]
+    fn data_with_two_spaces_keeps_the_second_space() {
+        let text = "data:  {\"usage\":{\"prompt_tokens\":10}}\n\n";
+        assert_eq!(
+            split_sse_events(text).events,
+            vec![" {\"usage\":{\"prompt_tokens\":10}}".to_string()]
+        );
+        // Held control: the old `.trim()` swallowed any number of leading spaces too, so this
+        // half is already green at da0fa34.
+        let mut p = UsageParser::new();
+        p.feed(text.as_bytes());
+        assert_eq!(p.finish().usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn event_id_and_retry_lines_do_not_touch_the_data() {
+        let text = "event: message_delta\nid: 7\nretry: 3000\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\n";
+        let mut p = UsageParser::new();
+        p.feed(text.as_bytes());
+        assert_eq!(p.finish().usage.output_tokens, 1000);
+        assert_eq!(
+            split_sse_events(text).events,
+            vec!["{\"type\":\"message_delta\",\n\"usage\":{\"output_tokens\":1000}}".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_data_event_is_not_dispatched_but_marks_the_body_sse() {
+        let got = split_sse_events("data:\n\ndata: \n\n");
+        assert_eq!(
+            got,
+            SseEvents {
+                events: vec![],
+                saw_data_field: true,
+            }
+        );
+        let mut p = UsageParser::new();
+        p.feed(b"data:\n\n");
+        let parsed = p.finish();
+        assert_eq!(parsed.usage, Usage::default());
+        assert_eq!(parsed.usage.tool_calls, None);
+    }
+
+    #[test]
+    fn a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event() {
+        // (i)
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 1000);
+
+        // (ii) guard, green both sides.
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":10}}");
+        assert_eq!(p.finish().usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":10}}\n\ndata: {\"usage\":{\"completion_tokens\":\ndata: not json}\n\ndata: {\"usage\":\ndata: {\"completion_tokens\":5}}\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+        assert_eq!(u.tool_calls, Some(0));
+    }
+
+    #[test]
+    fn done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else() {
+        for done in ["data: [DONE]\n\n", "data: [DONE] \n\n"] {
+            let text = format!("data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\ndata: {{\"type\":\"message_delta\",\ndata: \"usage\":{{\"output_tokens\":1000}}}}\n\n{done}");
+            let mut p = UsageParser::new();
+            p.feed(text.as_bytes());
+            let u = p.finish().usage;
+            assert_eq!(u.input_tokens, 10, "{done:?}");
+            assert_eq!(u.output_tokens, 1000, "{done:?}");
+            let events = split_sse_events(&text).events;
+            assert_eq!(events.len(), 3, "{done:?}");
+            assert_eq!(events[2].trim(), "[DONE]", "{done:?}");
+        }
+    }
+
+    #[test]
+    fn an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced() {
+        let head = b"data: {\"type\":\"message_start\",\ndata: \"message\":{\"usage\":{\"input_tokens\":10}}}\n\n".to_vec();
+        let tail =
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1000}}\n\n".to_vec();
+        let comment_len = UsageParser::CAP - head.len() - 2 - 20;
+        let mut comment = Vec::with_capacity(comment_len + 2);
+        comment.push(b':');
+        comment.extend(std::iter::repeat_n(b'x', comment_len));
+        comment.push(b'\n');
+
+        let mut p = UsageParser::new();
+        p.feed(&head);
+        p.feed(&comment);
+        p.feed(&tail);
+        let parsed = p.finish();
+        assert!(parsed.truncated);
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.output_tokens, 0);
+        assert_eq!(
+            crate::settle::settle_amount(
+                &default_price_book(),
+                "claude-sonnet",
+                Some(parsed),
+                Microusd(777)
+            ),
+            (
+                Microusd(777),
+                Usage::default(),
+                crate::settle::CostBasis::EstimateTruncated
+            )
+        );
+    }
+
+    #[test]
+    fn a_body_split_at_random_offsets_with_any_line_ending_parses_identically() {
+        let lf = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":300}}}\n\n: ping\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\ndata: [DONE]\n\n";
+        let expected = ParsedUsage {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 1000,
+                cache_read_tokens: 300,
+                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                tool_calls: Some(1),
+            },
+            truncated: false,
+        };
+        let mut seed: u64 = 0x2026_0918;
+        for _ in 0..200 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ending = ["\n", "\r\n", "\r"][(seed % 3) as usize];
+            let body = lf.replace('\n', ending);
+
+            let mut one_shot = UsageParser::new();
+            one_shot.feed(body.as_bytes());
+            let one_shot = one_shot.finish();
+
+            let mut chunked = UsageParser::new();
+            let bytes = body.as_bytes();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let size = 1 + ((seed >> 8) % 37) as usize;
+                let end = (offset + size).min(bytes.len());
+                chunked.feed(&bytes[offset..end]);
+                offset = end;
+            }
+            let chunked = chunked.finish();
+            assert_eq!(chunked, expected, "seed={seed} ending={ending:?}");
+            assert_eq!(chunked, one_shot, "seed={seed} ending={ending:?}");
+        }
+    }
+
+    #[test]
+    fn hostile_sse_bodies_never_panic() {
+        let literals: [&[u8]; 15] = [
+            b"data:",
+            b"data: ",
+            b"data:  ",
+            b"data",
+            b":",
+            b"event:",
+            b"id:",
+            b"retry:",
+            b"{\"usage\":{\"prompt_tokens\":",
+            b"{\"message\":{\"usage\":{\"input_tokens\":",
+            b"[DONE]",
+            b"\n",
+            b"\r",
+            b"\r\n",
+            b"\n\n",
+        ];
+        let mut seed: u64 = 0x0918_2026;
+        for case in 0..200u32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut body: Vec<u8> = Vec::new();
+            let pieces = 1 + (seed % 40);
+            for _ in 0..pieces {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let kind = seed % (literals.len() as u64 + 2);
+                if kind == literals.len() as u64 {
+                    // 0 to 300 random bytes.
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let n = (seed % 301) as usize;
+                    for _ in 0..n {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        body.push((seed >> 16) as u8);
+                    }
+                } else if kind == literals.len() as u64 + 1 {
+                    // A random decimal.
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    body.extend_from_slice((seed % 1_000_000).to_string().as_bytes());
+                } else {
+                    body.extend_from_slice(literals[kind as usize]);
+                }
+            }
+            if case == 0 {
+                body.push(b':');
+                body.extend(std::iter::repeat_n(b'x', 1 << 20));
+            }
+            if case == 1 {
+                body.extend_from_slice(b"data: ");
+                body.extend(std::iter::repeat_n(b'{', 1 << 20));
+            }
+
+            let text = String::from_utf8_lossy(&body).into_owned();
+            let events = split_sse_events(&text);
+            for event in &events.events {
+                assert!(!event.is_empty(), "case={case}");
+                assert!(!event.contains('\r'), "case={case}");
+            }
+
+            let mut whole = UsageParser::new();
+            whole.feed(&body);
+            let whole = whole.finish();
+
+            let mut piecewise = UsageParser::new();
+            for byte in &body {
+                piecewise.feed(std::slice::from_ref(byte));
+            }
+            let piecewise = piecewise.finish();
+
+            assert_eq!(whole, piecewise, "case={case}");
+        }
+    }
+
+    /// A1 (2026-09-18): leading whitespace before the field name stays tolerated, exactly as
+    /// the old line parser's `trim_start` always did.
+    #[test]
+    fn an_indented_data_line_is_still_a_data_field() {
+        let text = "  data: {\"usage\":{\"prompt_tokens\":10}}\n\n";
+        let mut p = UsageParser::new();
+        p.feed(text.as_bytes());
+        assert_eq!(p.finish().usage.input_tokens, 10);
+        assert!(split_sse_events(text).saw_data_field);
+    }
+
+    /// A1: a whitespace-only line is a field line with an empty name after the trim, not a
+    /// blank line, so it dispatches nothing and never splits an event.
+    #[test]
+    fn a_whitespace_only_line_is_a_field_line_not_a_blank_line() {
+        let text = "data: {\"usage\":{\"prompt_tokens\":\n   \ndata: 10}}\n\n";
+        let mut p = UsageParser::new();
+        p.feed(text.as_bytes());
+        assert_eq!(p.finish().usage.input_tokens, 10);
+        assert_eq!(
+            split_sse_events(text).events,
+            vec!["{\"usage\":{\"prompt_tokens\":\n10}}".to_string()]
+        );
+    }
+
+    // -- invariant 45, amended: the OpenAI netting state holds in both orders (F05) ----
+
+    #[test]
+    fn a_cached_subset_arriving_after_the_prompt_count_is_netted() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":950}}\n\n");
+        p.feed(b"data: {\"usage\":{\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 0);
+        let gpt_4o = ModelPrice::per_mtok_usd(2.50, 10.00, 1.25, 2.50);
+        assert_eq!(gpt_4o.cost(&u), Microusd(2215));
+    }
+
+    #[test]
+    fn a_details_only_object_is_openai_shaped_not_anthropic() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":950}}\n\n");
+        p.feed(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 0);
+    }
+
+    #[test]
+    fn the_netting_holds_across_three_events_whatever_the_final_event_carries() {
+        let cases: [[&str; 3]; 2] = [
+            [
+                "{\"usage\":{\"prompt_tokens\":950}}",
+                "{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}",
+                "{\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":128}}}",
+            ],
+            [
+                "{\"usage\":{\"prompt_tokens\":950}}",
+                "{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}",
+                "{\"usage\":{\"completion_tokens\":120}}",
+            ],
+        ];
+        for (i, events) in cases.iter().enumerate() {
+            let mut p = UsageParser::new();
+            for event in events {
+                p.feed(format!("data: {event}\n\n").as_bytes());
+            }
+            p.feed(b"data: [DONE]\n\n");
+            let u = p.finish().usage;
+            assert_eq!(u.input_tokens, 822, "order {i}");
+            assert_eq!(u.cache_read_tokens, 128, "order {i}");
+            assert_eq!(u.output_tokens, 120, "order {i}");
+        }
+    }
+
+    #[test]
+    fn a_details_only_event_before_any_prompt_count_waits_for_the_prompt() {
+        // (i)
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 120);
+
+        // (ii) no prompt count ever.
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 0);
+        assert!(u.carries_priced_tokens());
+    }
+
+    #[test]
+    fn a_later_zero_completion_count_keeps_the_earlier_positive_one() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":120}}\n\n");
+        p.feed(b"data: {\"usage\":{\"completion_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 120);
+    }
+
+    #[test]
+    fn a_body_mixing_both_vendors_shapes_is_read_per_object() {
+        let mut p = UsageParser::new();
+        p.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        );
+        p.feed(b"data: {\"usage\":{\"prompt_tokens\":950}}\n\n");
+        p.feed(b"data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n");
+        p.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1000}}\n\n");
+        p.feed(b"data: {\"usage\":{\"total_tokens\":73}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 822);
+        assert_eq!(u.cache_read_tokens, 128);
+        assert_eq!(u.output_tokens, 1000);
     }
 }

@@ -302,9 +302,14 @@ comparison in #132.
 
 **Counts re-measured 2026-09-18**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1311 passing** (core 339, dpop 21, delegation 44,
-gateway 705, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew from 684 to 705 on 2026-09-18 (invariant 50, after #292 and
+`cargo test --all` runs **1337 passing** (core 339, dpop 21, delegation 44,
+gateway 731, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew from 705 to 731 on 2026-09-18 (invariant 55 and the amended 45, PR 3 of the
+money-path repair): the usage parser reads SSE events, not lines, and its OpenAI netting holds
+in both orders; twenty-three new in `provider::tests`, the review's two F05 probes and its F06
+probe copied into `crates/gateway/tests/codex_money_review.rs`.
+
+Before that, gateway grew from 684 to 705 on 2026-09-18 (invariant 50, after #292 and
 #297 landed the same day): the settle guard now owns a call's reservations
 from the first one taken, fourteen new in `tokenfuse-gateway` (six in
 `proxy::tests`, seven in `settle::tests`, one in `unitledger::tests`) plus

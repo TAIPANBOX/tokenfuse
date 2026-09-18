@@ -371,50 +371,18 @@ fn initialized_notification() -> Value {
     })
 }
 
-/// Parse an SSE body into the JSON-RPC frames carried in its `data:` fields.
+/// Parse an SSE body into the JSON-RPC frames carried in its `data` fields.
 ///
-/// Mirrors the `data:`-line handling in `provider::UsageParser::finish`, but
-/// honors the SSE spec's multi-line `data:` continuation: consecutive `data:`
-/// lines within one event are joined with `\n` before parsing, and a blank
-/// line ends the event. Non-`data:` fields (`event:`, `id:`, `retry:`,
-/// comments) are ignored — this client only needs the JSON-RPC payload.
+/// The same splitter the usage parser uses (`provider::split_sse_events`, invariant 55), so
+/// the two readers of SSE in this crate cannot disagree on a line end, a comment, the
+/// one-space rule or where an event ends. Frames whose data is not JSON (a keep-alive, a
+/// sentinel) are dropped rather than failing the stream, as before.
 fn parse_sse_frames(text: &str) -> Vec<Value> {
-    let mut frames = Vec::new();
-    let mut data_lines: Vec<&str> = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            flush_sse_event(&mut data_lines, &mut frames);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            // Per the SSE spec, a single leading space after the colon is
-            // stripped; the rest of the line is taken verbatim.
-            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-        // Other fields (event:, id:, retry:, ": comment") don't carry the
-        // JSON-RPC payload and are ignored.
-    }
-    // The body may end without a trailing blank line; flush whatever's left.
-    flush_sse_event(&mut data_lines, &mut frames);
-
-    frames
-}
-
-/// Join the buffered `data:` lines of one SSE event, parse them as a single
-/// JSON value, and push the result. Malformed events (bytes that aren't
-/// valid JSON — e.g. a keep-alive comment) are dropped rather than failing
-/// the whole stream.
-fn flush_sse_event(data_lines: &mut Vec<&str>, frames: &mut Vec<Value>) {
-    if data_lines.is_empty() {
-        return;
-    }
-    let data = data_lines.join("\n");
-    data_lines.clear();
-    if let Ok(v) = serde_json::from_str::<Value>(&data) {
-        frames.push(v);
-    }
+    crate::provider::split_sse_events(text)
+        .events
+        .iter()
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect()
 }
 
 /// Send a JSON-RPC notification (no `id`); the server may reply with an empty
