@@ -613,6 +613,11 @@ build)`, `cloud apns (feature build)`.
 
    Adopted `@yurii 2026-08-05` ("merge it and add the invariant"); the wording
    and the general form above are `@claude`.
+
+   Since invariant 53 (2026-09-18) an unreachable control plane is also said
+   once per outage, at its start and at its end, by the retry queue; the
+   attempts themselves stay at debug, so this boundary is unchanged: a status
+   answer is a refusal and is never queued.
    *(test: `a_refused_push_is_visible_to_the_operator`,
    `a_control_plane_that_refuses_every_batch_is_reported_once`,
    `a_second_distinct_status_is_reported_again`,
@@ -3203,6 +3208,82 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `features/a-chain-longer-than-the-record-holds.feature`, four, each bound. Not a script
     gate: nothing stops a third door reading the header through its own splitter, the shape
     invariant 34 names; the two doors that exist are held by their tests)*
+
+53. **Telemetry that cannot reach the control plane is queued and replayed in order, and the
+    outage is said once at each end.** `CloudSink::ship` dropped a batch whose `send()` returned
+    `Err` after one debug line, so an outage of the control plane cost the org exactly the spend
+    made during it, silently. Measured 2026-09-17 on the appliance proving run (tokenfuse#294):
+    `tokenfuse-cloud` stopped for about 40 s, three calls served (`200`, allowed by the policy
+    plane), and after it came back `/v1/units` for the unit stayed at 72 calls while forty later
+    calls raised it to 112; the log said nothing in that window.
+
+    A push is now one of three things. Accepted: nothing said, as before. Refused (any status the
+    control plane answers with, 5xx included): dropped and reported once per status, invariant 13
+    byte for byte, never queued. Unreachable (`send()` returned `Err`: refused connection, reset,
+    closed before the answer, DNS, or `PUSH_TIMEOUT`, 10 s, elapsed): the batch goes into an
+    in-memory `VecDeque` of `QUEUE_CAP` (10 000) records, oldest dropped first past the cap. While
+    the queue holds anything, every new batch is appended behind it so replay stays in order; a
+    batch that failed on the fast path goes to the FRONT, because it was taken while the queue
+    was empty and so before everything appended since. One drainer at a time
+    (`compare_exchange` on a flag) pops `BATCH`-sized chunks from the front, POSTs each, and on
+    the first transport failure puts the chunk back at the front and stops; a refusal during
+    replay drops that chunk and goes on, because the plane is answering. The drain is attempted
+    on every `ship` and every `flush`, so the 2 s flush tick in `main.rs` is the retry cadence.
+    `record()` and `flush()` stay sync: two std mutexes, a spawn, and the queue's lock is never
+    held across an await, so the request path never waits for the network (invariant 13's tests
+    hold that the refusal path is unchanged; the timing guard below holds the rest).
+
+    Sizing, read off the code rather than chosen: a `CallRecord` is 272 bytes of struct plus its
+    strings, about 0.5 KiB, 4.5 KiB with a 4 KiB chain, so the cap is about 5 MB and at most
+    about 45 MB; in time, 26 s at BENCHMARKS.md's 384 req/s ceiling on a 2 vCPU box, 100 s at 100
+    calls/s, 17 minutes at 10 calls/s, days at the appliance's rate; the measured 40 s outage
+    fits at up to 250 calls/s. Three lines, once per outage: WARN when records start being
+    queued (naming the cap and the error), WARN at the first drop (naming the count), INFO when
+    the queue is empty again (replayed and dropped counts); every further attempt and drop of the
+    same outage logs at debug, the shape invariant 13 set. `@decided 2026-09-18`: a status answer
+    is a refusal, warned once per status, never queued; no agent-event type for the sink (SPEC
+    6.1, it has no agent subject).
+
+    **Where it says nothing.** `/v1/ingest` has no idempotency key, so a batch whose POST reached
+    the plane and whose answer was lost (the timeout case) is counted twice on replay; a restart
+    loses the queue, and the Parquet trace is the durable record; batches already in flight when
+    an outage begins may replay in either order relative to each other, which is the order the
+    fast path never promised; the drain is single file, so a slow plane bounds replay at `BATCH`
+    per round trip; a chunk refused during replay is counted in neither figure, invariant 13's
+    line is its report; the cap and both timeouts are constants, and making any of them a
+    variable is a `components.json`, `tests/manifest.rs` and `compat/1.0.json` decision not
+    taken here.
+    *(tests: `cloudsink::tests`: `records_pushed_during_an_outage_arrive_in_order_after_recovery`,
+    `one_transition_line_per_outage`, `the_cap_drops_the_oldest_and_says_so_once` (10 025 records
+    against the real cap), `a_refusal_is_never_queued`,
+    `a_push_that_never_gets_an_answer_is_bounded_and_queued`,
+    `a_drain_that_fails_midway_keeps_the_rest_in_order`,
+    `record_and_flush_return_without_waiting_for_the_control_plane` (2 s bound against a 10 s
+    stall), and the five invariant-13 tests unchanged; the control plane in these is a raw TCP
+    stub that can close a connection before answering, which no handler can. Red first,
+    @measured `cargo test -p tokenfuse-gateway --lib cloudsink::tests::trimmed` 2026-09-18: a
+    trimmed form of the order test (`queued()` replaced by a fixed 200 ms sleep, since `queued()`
+    is an API this change adds) panicked `timed out waiting for every record to arrive` against
+    the commit-1 tree, zero bodies received: the batches were silently dropped, as invariant 13
+    always did for an unreachable push; the seven real tests each name `queued()` or
+    `with_options` and are red by compile at that same tree. Mutants, @measured 2026-09-18:
+    M53-1 (`drain()` body replaced by `return`, never drained) caught by
+    `records_pushed_during_an_outage_arrive_in_order_after_recovery` (times out, 0 received);
+    M53-2 (LIFO: `pop_front_chunk` drains from the back) caught by the same test's in-order
+    assertion and by `a_drain_that_fails_midway_keeps_the_rest_in_order`; M53-3 (the cap never
+    trips, `truncate_front` returns 0) caught by `the_cap_drops_the_oldest_and_says_so_once`
+    (times out waiting for the queue to settle at the cap); M53-4 (drops not reported,
+    `note_dropped` a no-op) caught by the same test (times out waiting for the debug-level drop
+    line); M53-5 (a refusal queued, either `Refused` arm calling `push_front_capped`) caught by
+    `a_control_plane_that_refuses_every_batch_is_reported_once`, which never completes (the
+    refused chunk is popped, refused, and requeued forever); M53-6 (the transition line per
+    attempt, the `outage.swap` guard removed) caught by `one_transition_line_per_outage` (3 WARN
+    lines, not 1); M53-7 (`flush()` loses its `self.drain()`) caught by the same test (times out
+    waiting for the drained line); the order test does not reliably catch M53-7 on its own in
+    this implementation, because the preceding push already leaves a drain task in flight that
+    happens to pick up the reconnect, which is read from the run rather than assumed. Scenarios:
+    `features/telemetry-survives-a-control-plane-outage.feature`, six, each bound. Not
+    a script gate)*
 
 54. **The unit's owner rides the telemetry the gateway already pushes, and the control plane's
     owner view reads it before the chain.** `RunAgg.owner` was filled from one source, the root
