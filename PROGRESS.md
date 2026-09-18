@@ -302,13 +302,15 @@ comparison in #132.
 
 **Counts re-measured 2026-09-18**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1285 passing** (core 339, dpop 21, delegation 44,
-gateway 679, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1290 passing** (core 339, dpop 21, delegation 44,
+gateway 684, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 336
-to 339, gateway from 677 to 679 and cloud from 199 to 201 on 2026-09-18
-(tokenfuse#292): three in `core::agent_event` for what `from_env`
+to 339, gateway from 677 to 684 and cloud from 199 to 201 on 2026-09-18
+(tokenfuse#292 and #297): three in `core::agent_event` for what `from_env`
 now hands back beside the exporter, one in `gateway::events` reading the warn
-line, one
+line, two in `gateway::chainproof` for the shared chain parser and its cap,
+two in `proxy::tests` for a forty-entry chain refused and a 32-entry one
+forwarded, one in `tests/mcp_broker.rs` for the same cap at the MCP door, one
 in `tests/image_user_group.rs` walking every Dockerfile for gid 10001, and
 two in `crates/cloud/tests/events_export_startup.rs` running the real
 control-plane binary against a directory it may not write to. Before that,

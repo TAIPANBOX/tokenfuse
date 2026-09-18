@@ -2942,3 +2942,61 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     their own ledger, so a worker whose call lands on a different replica than the one its
     coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*
 
+51. **A declared chain longer than the record holds is refused at the door, whether or not
+    anybody verifies chains, and the two chain caps bound different things.** (Numbered 51
+    because a sibling change in flight from the same base on 2026-09-18, the settle guard's,
+    takes 50; the number is the only thing the two share.) agent-passport
+    SPEC 5.1 bounds `on_behalf_of` at 32 entries and requires it acyclic as a property of the
+    chain ITSELF; proving a chain (5.2) is optional and additive. The v0.2 envelope pins
+    `maxItems: 32` and `agent-conform` runs the record's validator on every line, so a chain
+    longer than that is one no consumer will hold, proven or not. Until 2026-09-18 the entry
+    cap lived in the delegation crate alone (invariant 35), where it bounded a TOKEN's chain,
+    while a chain a caller merely declared in `x-fuse-on-behalf-of` was split, counted by
+    nobody, forwarded, sent to the PDP as unproven and written into every event of the request.
+    Measured 2026-09-17 on the appliance proving run with no issuer configured, the launchers'
+    default (tokenfuse#297): forty entries, about 1.5 KiB and so inside the 4 KiB byte cap,
+    answered 200 with nothing on the bus; every event that request could have written would
+    have been quarantined at the record, the shape invariant 35 already refuses for a proven
+    chain.
+
+    `@claude` 2026-09-18, the reading this change takes and the pull request states, open to
+    being overruled: the cap holds regardless of verification. `chainproof::declared_chain` is
+    the one parser both doors call (the LLM proxy and the MCP broker each had a splitter of
+    their own), and it refuses more than `MAX_CHAIN_ENTRIES`, read from
+    `tokenfuse_delegation` rather than retyped, so a token's chain and a declared chain are
+    bounded by one number. The refusal is `400 invalid_request` with code
+    `on_behalf_of_over_cap`, the count sent and the cap in the body, before anything is
+    resolved, reserved, forwarded or brokered, in every mode (a malformed header is not a
+    money decision, so shadow refuses it too), and one `identity_mismatch` on the bus whose
+    `data` carries `entries` and `max_entries` and whose envelope carries NO `on_behalf_of`:
+    the chain is exactly what the record refuses, so an event carrying it would be quarantined
+    with the request it reports. No trace row, like every other 400 here. The 4 KiB byte cap
+    on the raw header is unchanged: over it the header is ignored as absent, warned and
+    counted, which predates this and is a separate decision.
+
+    **Two caps, two questions, and the README's header contract names both.** `MAX_CHAIN_ENTRIES`
+    (32) bounds how many principals ONE request claims to act for, in one header, and is the
+    shared spec's number. `MAX_CHAIN_DEPTH` (64, `crates/core/src/ledger.rs`, invariant 49)
+    bounds how many runs a call rolls up INTO through `x-fuse-parent-run-id`, across requests,
+    and a walk that reaches it is refused rather than truncated. Neither is derived from the
+    other and neither moved here.
+
+    **Where it says nothing.** The acyclic rule and the `agent://`/`user://` scheme rule are
+    still applied to a TOKEN's chain only; a declared chain's entries stay opaque strings, as
+    they were, and widening the parse is a separate decision written down rather than implied.
+    The over-cap `identity_mismatch` needs an `x-fuse-agent-id` to be filed under, as every
+    event does (SPEC 6.1); without one the exporter skips and counts it. And the byte cap's
+    ignore posture means a header both over 4 KiB and over 32 entries is ignored, not refused,
+    which is the older rule winning.
+    *(tests: `proxy::tests::a_chain_of_forty_entries_is_refused_before_anything_is_forwarded`,
+    red on the unfixed tree verbatim `left: 200 right: 400` with the chain forwarded and the
+    bus empty; `a_chain_at_exactly_the_cap_is_forwarded_and_recorded_unchanged`, the guard,
+    green on both sides; `tests/mcp_broker.rs::a_chain_over_the_cap_is_refused_at_the_mcp_door_too`,
+    red the same way with the upstream having seen the call;
+    `chainproof::tests::the_header_cap_is_the_delegation_crates_cap_and_not_a_second_number`
+    (the 32 written out independently, invariant 14's lesson) and
+    `a_declared_chain_is_split_trimmed_and_absent_is_empty`, both compile-red before
+    `declared_chain` existed. Scenarios:
+    `features/a-chain-longer-than-the-record-holds.feature`, four, each bound. Not a script
+    gate: nothing stops a third door reading the header through its own splitter, the shape
+    invariant 34 names; the two doors that exist are held by their tests)*

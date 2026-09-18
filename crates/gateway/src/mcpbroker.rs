@@ -746,15 +746,36 @@ async fn handle(
         }
         crate::mcpdoor::Admission::Bearer(_) | crate::mcpdoor::Admission::Open => {}
     }
-    let declared: Vec<String> = header("x-fuse-on-behalf-of")
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    // The same parse and the same cap as the LLM door (tokenfuse#297): a
+    // chain longer than SPEC 5.1 allows is refused here, before the chain is
+    // resolved, the policy asked or the upstream reached, with the LLM path's
+    // own 400 and one identity_mismatch carrying the length, not the chain.
+    let declared: Vec<String> =
+        match crate::chainproof::declared_chain(header("x-fuse-on-behalf-of").as_deref()) {
+            Ok(chain) => chain,
+            Err(over) => {
+                tracing::warn!(
+                    entries = over.entries,
+                    cap = crate::chainproof::MAX_CHAIN_ENTRIES,
+                    "mcp broker: refused a call whose x-fuse-on-behalf-of carries more entries \
+                     than the Agent Passport chain holds"
+                );
+                let agent = header("x-fuse-agent-id")
+                    .map(|h| h.trim().to_string())
+                    .unwrap_or_default();
+                let run = header("x-fuse-run-id");
+                let outcome = st.events.emit(
+                    EventType::IdentityMismatch,
+                    crate::sink::now_millis(),
+                    Some(&agent),
+                    run.as_deref(),
+                    None,
+                    crate::proxy::on_behalf_of_over_cap_data("", &agent, over.entries),
+                );
+                crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+                return crate::proxy::on_behalf_of_over_cap(over.entries);
+            }
+        };
 
     // Who this caller acts FOR, and whether anybody proved it. The rule is in
     // `chainproof` because the LLM proxy applies the same one, and a rule
