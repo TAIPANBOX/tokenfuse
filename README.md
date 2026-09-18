@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.0.2-brightgreen)
-![tests](https://img.shields.io/badge/tests-1337-brightgreen)
+![tests](https://img.shields.io/badge/tests-1361-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -679,6 +679,7 @@ A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with 
 | `TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS` | `3` | ≥ this many `loop_detected` decisions for one run (`sustained_loop`). |
 | `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD` | `5.0` | An org's last-minute burn reaches this rate (`spend_spike`). |
 | `TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS` | `20` | One `agent_id` drives ≥ this many distinct runs in the window (`fanout_explosion`). |
+| `TOKENFUSE_CLOUD_STALL_MINUTES` | `5` (`0` off) | A run this control plane has seen calling at least twice has made no call for this many minutes, and for longer than its own longest gap between calls (`run_stalled`, raised once per run by a sweep every 10 s; a kill, a refused last call or an outcome tag on the last call count as the run ending). |
 
 Shipped in the same change as replay: the Cloud **regulator evidence pack** (`/v1/compliance/evidence`: EU AI Act / SR 11-7 / SOC 2 sections, each control graded from this org's live decision + incident data, not the replay file itself). Full picture, including the hash-chained audit trail and the free CLI: [What's inside](#-whats-inside).
 

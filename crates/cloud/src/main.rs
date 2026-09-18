@@ -69,6 +69,24 @@ async fn main() {
     // Incident-detector thresholds, mirroring the `TOKENFUSE_CLOUD_ALERT_PCT`
     // precedent: each env var overrides a documented default.
     let defaults = IncidentConfig::default();
+    // One threshold on a different clock: `run_stalled` fires on ABSENCE, its
+    // knob is minutes, and `0` is a real value (off), which `env_u64` would
+    // read as unset. Parsed by the store's own rule; a value that is not a
+    // whole number of minutes is said and the default used.
+    let stall_after_ms = match IncidentConfig::stall_after_ms_from_minutes(
+        std::env::var("TOKENFUSE_CLOUD_STALL_MINUTES")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(ms) => ms,
+        Err(raw) => {
+            tracing::warn!(
+                "TOKENFUSE_CLOUD_STALL_MINUTES={raw:?} is not a whole number of minutes; using the default {} min",
+                defaults.stall_after_ms / 60_000
+            );
+            defaults.stall_after_ms
+        }
+    };
     let incident_cfg = IncidentConfig {
         budget_blocks: env_u64(
             "TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS",
@@ -104,6 +122,7 @@ async fn main() {
         )
         .max(2),
         fanout_window_ms: defaults.fanout_window_ms,
+        stall_after_ms,
     };
 
     // Agent-event NDJSON export (agent-passport SPEC.md §6): TOKENFUSE_EVENTS_PATH,
@@ -153,6 +172,29 @@ async fn main() {
             });
             tracing::info!("persisting state to {path}");
         }
+    }
+
+    // `run_stalled` (invariant 60) fires on absence, so no ingest can raise
+    // it: a sweep on the wall clock asks the question every tick. Spawned only
+    // when the detector is on, and `Store::stall_sweep_tick` is the one place
+    // that decides that.
+    match Store::stall_sweep_tick(stall_after_ms) {
+        Some(tick) => {
+            let s = Arc::clone(&store);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(tick);
+                loop {
+                    ticker.tick().await;
+                    s.sweep_stalled();
+                }
+            });
+            tracing::info!(
+                "run_stalled detector on: a run silent for {} min, and longer than its own longest gap between calls, is an incident; swept every {} s",
+                stall_after_ms / 60_000,
+                tick.as_secs()
+            );
+        }
+        None => tracing::info!("run_stalled detector off (TOKENFUSE_CLOUD_STALL_MINUTES=0)"),
     }
 
     // Push pipeline: turn store change events into APNs pushes + Live Activity

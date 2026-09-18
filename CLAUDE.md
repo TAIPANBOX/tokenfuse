@@ -3208,3 +3208,97 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     **Where it says nothing.** No real Anthropic or OpenAI stream has been observed carrying a multi-line `data` event; both emit one compact line per event as far as anyone here has measured, so this closes a contract, not a reproduced loss. An event whose JSON fails to parse is skipped silently, with no counter and no log line; a stream whose usage event an intermediary broke into non-JSON pieces settles on whatever else parsed, or on the estimate. The parser is still buffered (`CAP`, invariant 38); an incremental SSE parser is out of scope. `event:` names are read by nobody, so a provider that put usage under an event type with an empty `data` is one nothing here can price. Leading whitespace before a field name is stripped before the name is compared, as the line parser always did (no provider is known to indent, and a test pins the tolerance); a whitespace-only line is a field line with an empty name, not a blank line, so it never dispatches or splits an event.
     *(tests: `crates/gateway/tests/codex_money_review.rs::codex_f06_multiline_sse_usage_is_not_silently_partial`, the review's probe verbatim, and its two F05 siblings beside it; `provider::tests`: `a_multi_line_data_event_is_one_document`, `a_multi_line_openai_usage_event_is_one_document`, `crlf_endings_frame_events_like_lf`, `a_cr_only_body_frames_events`, `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data`, `data_with_no_space_after_the_colon_is_data`, `data_with_two_spaces_keeps_the_second_space`, `event_id_and_retry_lines_do_not_touch_the_data`, `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse`, `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event`, `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not`, `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced`, `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` (200 seeds, three line endings, random chunking), `hostile_sse_bodies_never_panic` (200 seeds, a 1 MiB comment line and a 1 MiB unterminated data line among them), `an_indented_data_line_is_still_a_data_field`, `a_whitespace_only_line_is_a_field_line_not_a_blank_line`. Red first, @measured `cargo test -p tokenfuse-gateway --test codex_money_review codex_f0` and a temporary integration test file exercising the public `UsageParser` API against `da0fa34` (the splitter is `pub(crate)`, so the struct-level assertions below are compile-red there and are named as such), 2026-09-18 at `da0fa34`: `codex_f06_multiline_sse_usage_is_not_silently_partial` panicked `left: Microusd(30) right: Microusd(15030)`; `a_multi_line_data_event_is_one_document` `left: 0 right: 1000`; `a_multi_line_openai_usage_event_is_one_document` `left: 0 right: 822`; `crlf_endings_frame_events_like_lf` `left: 0 right: 1000`; `a_cr_only_body_frames_events` `left: 0 right: 10`; `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` `left: 0 right: 1000` (its guard half green both sides); `data_with_no_space_after_the_colon_is_data` `left: 0 right: 10`; `data_with_two_spaces_keeps_the_second_space`'s `UsageParser` half is a held control (green already: the old `.trim()` swallowed any number of leading spaces), its `split_sse_events` half compile-red; `event_id_and_retry_lines_do_not_touch_the_data` `left: 0 right: 1000`; `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` `left: 0 right: 1000`; `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not` `left: 0 right: 5`; `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else` `left: 0 right: 1000` on the first `[DONE]` form; `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced` `left: 0 right: 10` (the multi-line head); `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` failed at its first seed, `ParsedUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, .. }, .. }` against the expected 10/1000/300, seed=1265663257694863673 ending="\r"; `an_indented_data_line_is_still_a_data_field`'s `UsageParser` half is a held control (green already), its `saw_data_field` half compile-red; `a_whitespace_only_line_is_a_field_line_not_a_blank_line` `left: 0 right: 10`; `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` and `hostile_sse_bodies_never_panic` name `split_sse_events`/`SseEvents`, absent at `da0fa34`, and are red by compile, the weaker form invariant 46 already accepts. Mutants, @measured 2026-09-18, each planted after the fix and reverted: M1 the LF join replaced by a buffer reset, caught by `codex_f06_multiline_sse_usage_is_not_silently_partial` (`left: Microusd(30) right: Microusd(15030)`, also the teeth case below); M2 `prompt_tokens_details`/`completion_tokens_details` dropped from the shape test, caught by `codex_f05_inv45_details_only_chunk_is_not_discarded` (`left: Microusd(2375) right: Microusd(2215)`); M3 the gross prompt written from the current object instead of the state, caught by `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once` (`left: Microusd(2535) right: Microusd(2215)`); M4 a comment line dispatches, caught by `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` (`left: 0 right: 1000`; the plain deletion of that arm is EQUIVALENT under `split_once`, an empty field name being read by nothing, and is recorded as such rather than claimed caught); M5 `\r` no longer a line end, caught by `a_cr_only_body_frames_events` (`left: 0 right: 10`); M6 the one-space rule widened to `trim_start`, caught by `data_with_two_spaces_keeps_the_second_space` (`left: ["...prompt_tokens...10}}"] right: [" ...10}}"]`); M7 `[DONE]` made a parse failure that drops every event before it, caught by `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `parses_anthropic_sse_usage`, `parses_openai_sse_usage` and one of the four router tests in `tests/no_usage_stream_settles_on_the_estimate.rs`; M8 the unterminated-final-event dispatch deleted, caught by `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` (`left: 0 right: 1000`); M9 `saturating_sub` replaced by `wrapping_sub`, caught by the existing `an_openai_cached_count_past_the_prompt_count_nets_to_zero_not_wraps` (`left: 18446744073709551566 right: 0`); M10 the empty-after-pop guard dropped from `dispatch`, caught by `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` (`left: SseEvents { events: ["", ""], .. } right: SseEvents { events: [], .. }`); M16 (A1) the field-name trim removed, caught by `an_indented_data_line_is_still_a_data_field` (`left: 0 right: 10`); M17 (A1) the whole line trimmed before the blank-line check, caught by `a_whitespace_only_line_is_a_field_line_not_a_blank_line` (`left: 0 right: 10`). Scenarios: `features/usage-is-read-from-events-not-lines.feature`, 9, each bound (`features-are-bound.sh`: 258 scenarios / 301 bindings, 0 broken). Not a script gate: the rule is the splitter under `cargo test`; one case in `scripts/gates-have-teeth.sh` plants a `data` field that replaces the buffer instead of appending to it and requires the review's probe to go red.)*
+60. **A run that goes quiet is an incident, once, and the floor is the run's own cadence.**
+    (Numbered 60 because two sibling changes in flight from the same base on 2026-09-18 take 52 to
+    59; the number is the only thing they share.) Every detector in `crates/cloud/src/store.rs`
+    fired on a record ARRIVING: a block, a loop repeat, a burst, a crossing. A node killed mid-run
+    sends no record. Measured 2026-09-17 on the appliance proving run (tokenfuse#296): a customer
+    agent's node was killed at step 7 of a 60-call run, `/v1/runs` kept the run at step 7 with a
+    stale `last_seen`, nothing reached the bus at 5 s or at 60 s, and no incident was raised; the
+    same when the node dropped packets for 40 s. The plane whose job is to say what a run did said
+    nothing when a run stopped doing anything.
+
+    `run_stalled` is the one detector that fires on ABSENCE, so it cannot live in `ingest_at`: the
+    ingest remembers a cadence (`StallState`: the newest stamp, the longest gap between calls, the
+    call count, whether the newest call said the run was over), and a sweep on the wall clock every
+    10 s (`Store::sweep_stalled`, spawned by `main` only when the detector is on) asks the
+    question. The predicate, in the words an operator reads: a run this process has seen calling at
+    least twice, not killed, whose newest call was neither a known refusal nor tagged with an
+    outcome, and with no `run_stalled` incident already, is stalled when it has made no call for
+    `TOKENFUSE_CLOUD_STALL_MINUTES` (default 5, `0` off) and for longer than the longest gap between
+    any two of its own calls. Floor plus own baseline is invariant 10's shape: a run that pauses
+    ten minutes by habit is not called stalled at five. Two calls because a cadence needs two
+    points. Once per run, the incident's own existence being the edge marker exactly as
+    `budget_threshold`'s is (invariant 7), persisted in the snapshot, never re-armed when the run
+    moves again: a slow run would otherwise raise one stall per pause, which is invariant 18's
+    failure by another road. `medium`, fixed rather than `severity_from_magnitude`: at the
+    transition the silence is always within one tick of the line, so a ladder would measure the
+    tick, and there is never a later trip to measure.
+
+    **The Cloud never learns that a run finished.** No reservation state reaches it
+    (`Ledger::close_run` is called only by tests); only `CallRecord` batches do. So a run that ends
+    WITHOUT an outcome tag and without a refusal is indistinguishable from a stall and IS reported,
+    exactly once, after the floor plus its own longest gap. That is the accepted false positive of
+    this detector, and what bounds it: the floor, the run's own habit, the once-per-run guard, and
+    the `medium` band, which asks a person to look and not to act. A run that tags its final call
+    (`x-fuse-outcome`, docs/outcomes) or whose last call the gateway refused is not reported, and
+    the newest record decides: a refused call followed by an allowed retry is a run that continues.
+
+    **Where it says nothing.** The stall map is in memory and not in the snapshot, on purpose: a
+    persisted copy would make the first sweep after a restart report every retained run that
+    finished normally while the plane was down, thousands at once. The price is that a run
+    mid-flight at a restart is unwatched until this process sees two of its calls. The incident
+    fires up to one tick (10 s) after the floor, and the silence it reports is what was measured.
+    A record's stamp is capped at the plane's clock at arrival, so a forged future stamp cannot
+    hold the detector off; a forged OLD stamp raises a stall at the next sweep, once, and the
+    summary shows the stamp. An out-of-order record counts the call and moves nothing else. An
+    incident evicted by `MAX_INCIDENTS_PER_ORG` re-arms the guard for that run, the same bounded
+    over-count `budget_breaks` accepts. An orchestrator waiting on a child is quiet by design and
+    is reported once. A run evicted from the run map is not reported at all.
+    The type reached the wire in the second commit of this change: `EventType::RunStalled`
+    (medium), `contracts/tokenfuse-constants.json` regenerated to 20 event types, the sweep's
+    export loop mapping the kind; landed after agent-passport SPEC 6.2's tokenfuse row gained
+    `run_stalled` (medium) and `trailryx-agentevent` named it, invariant 42's order (estate-gates
+    C4 and C8 green at every step).
+    *(tests: `store::tests::a_run_silent_past_the_threshold_is_stalled_once_and_not_again`,
+    `a_run_that_moved_again_is_not_stalled`,
+    `a_stall_is_not_re_raised_when_the_run_moves_and_goes_quiet_again`,
+    `a_stall_threshold_of_zero_turns_the_detector_off`,
+    `a_run_with_one_call_has_no_cadence_and_is_not_stalled`,
+    `a_run_whose_last_call_was_refused_is_stopped_not_stalled`,
+    `a_run_that_tagged_its_outcome_ended_and_is_not_stalled`,
+    `a_run_that_pauses_by_habit_is_not_stalled_at_the_floor`, `a_killed_run_is_not_stalled`,
+    `the_stall_incident_names_the_run_the_agent_the_last_call_and_the_silence`,
+    `an_unattributed_stalled_run_is_on_the_console_with_no_agent_invented`,
+    `a_stalled_run_is_exported_as_an_agent_event`,
+    `a_stalled_run_without_an_attributed_agent_is_skipped_never_invented`,
+    `a_restart_does_not_raise_a_stall_for_a_run_it_never_watched`,
+    `an_out_of_order_record_counts_the_call_and_moves_nothing_else`,
+    `the_stall_map_is_bounded_by_recency_not_by_panic`,
+    `a_forged_future_stamp_does_not_hold_the_detector_off`,
+    `a_hostile_record_stream_never_panics_and_never_double_reports` (200 seeded rounds),
+    `stall_minutes_env_zero_is_off_blank_is_default_and_junk_is_refused`,
+    `the_sweep_task_is_spawned_only_when_the_detector_is_on`;
+    `push::tests::a_stalled_run_pushes_went_quiet_not_running_hot`;
+    `tests/run_stalled.rs::a_stalled_run_is_listed_on_the_incidents_endpoint_for_a_viewer`,
+    `a_stalled_run_reaches_the_sse_stream`; `agent_event::tests::run_stalled_is_on_the_wire_at_medium`.
+    Red first, @measured `cargo test -p tokenfuse-cloud`
+    2026-09-18 against the tree with the sweep and the fold stubbed to no-ops:
+    `one incident at the floor: left: 0 right: 1`; `not again while the silence holds:
+    left: 0 right: 1`; `a retry that was allowed re-opens the run: left: 0 right: 1`; the
+    outcome/unknown-decision pair `left: 0 right: 1`; `longer than its own longest gap:
+    left: 0 right: 1`; `the stall itself` (an `.expect` panic, nothing to pop); the
+    unattributed run and the console-and-stream test each `left: 0 right: 1`; the restart
+    test `left: 0 right: 1`; the out-of-order test `left: 0 right: 1704067205000`; the
+    recency-bound test `the newest run is still watched`; the forged-stamp test
+    `left: 0 right: 1`; the hostile sweep's deterministic tail `left: 0 right: 1`; the five
+    guards that assert nothing fires (a run that moved, the zero floor, a one-call run, a
+    killed run, the hostile stream's no-panic half) are green on both sides by construction and
+    are each proven by a named mutant. Mutants, each caught by name: the floor comparison
+    inverted, the once-per-run guard removed, the `ended` gate removed, the longest-gap
+    comparison removed, the two-call requirement weakened, the kill gate removed, the dirty
+    flag not set, the cap removed, the future-stamp cap removed, `load` seeding the map, a
+    late record walking the newest stamp back, the off gate removed, the silence measured from
+    the first call, the `run_stalled` export arm removed, and the wire type's severity moved to
+    high. Scenarios: `features/a-run-that-goes-quiet.feature`, eight, each bound.
+    Not a script gate: the rule is a predicate, held by `cargo test`.)*

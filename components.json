@@ -362,6 +362,9 @@
           "TOKENFUSE_CLOUD_REPLAY_EVENTS": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_STALL_MINUTES": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_URL": {
             "required": false
           }
