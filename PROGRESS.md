@@ -300,11 +300,19 @@ comparison in #132.
 
 ## Test status
 
-**Counts re-measured 2026-09-17**, each by the command named, because the set
+**Counts re-measured 2026-09-18**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1278 passing** (core 336, dpop 21, delegation 44,
-gateway 677, cloud 199, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 314
+`cargo test --all` runs **1285 passing** (core 339, dpop 21, delegation 44,
+gateway 679, cloud 201, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 336
+to 339, gateway from 677 to 679 and cloud from 199 to 201 on 2026-09-18
+(tokenfuse#292): three in `core::agent_event` for what `from_env`
+now hands back beside the exporter, one in `gateway::events` reading the warn
+line, one
+in `tests/image_user_group.rs` walking every Dockerfile for gid 10001, and
+two in `crates/cloud/tests/events_export_startup.rs` running the real
+control-plane binary against a directory it may not write to. Before that,
+core grew from 314
 to 336 and gateway from 669 to 677 on 2026-09-17 (invariant 49): the ledger
 contract's evidence, twenty-two new in `tokenfuse-core` (twelve in
 `ledger::tests`, one in `money::tests`, and the money-path review's own nine

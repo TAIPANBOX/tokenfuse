@@ -336,13 +336,57 @@ build)`, `cloud apns (feature build)`.
    against the header-only rule with verbatim "the injection was detected and
    nothing reached the record", and `a_claimed_chain_does_not_file_the_record`)*
 
+   **Fail-open at startup is not the same as silent at startup, and for the
+   control plane it was.** Measured 2026-09-17 on the appliance proving run
+   (tokenfuse#292): `TOKENFUSE_EVENTS_PATH` set on `tokenfuse-cloud`, pointed
+   into the launchers' shared events directory (`root:10001`, mode 2775),
+   reached by a process the image had created as uid 10001 with gid 999.
+   `tokenfuse_core::agent_event::Exporter::from_env` opened the path, got
+   `Permission denied`, handed back the disabled exporter and said nothing;
+   the gateway's own wrapper warned on the same failure and the Cloud's
+   `main.rs` called the convenience form that did not. Four `budget_exhausted`
+   incidents existed and none reached the bus, and the log offered nothing to
+   read. So `from_env` now hands back what happened beside the exporter
+   (`Startup::Off` / `On` / `OpenFailed { path, error }`) and offers no form
+   that swallows the failed case; `Startup::line` carries the one line and its
+   level, so the gateway and the Cloud log the same words: the variable, the
+   path, the operating system's error, and that the export is OFF. The unset
+   case still costs nothing and logs nothing. The images create group 10001
+   before the user and put the user in it, so `id` reads `uid=10001 gid=10001`
+   (@measured on `debian:bookworm-slim` 2026-09-18: `useradd -r -u 10001`
+   alone gives `gid=999` and `touch` in a `root:10001 2775` directory fails
+   with `Permission denied`; with `groupadd -g 10001` first the file is
+   created as `10001:10001`). The launchers pre-creating the file is their own
+   change.
    *(partly gated: the mixed-schema test in `crates/gateway/src/sqlq.rs` covers
-   the Parquet read path; the exporter's two promises are now held by
+   the Parquet read path; the exporter's two promises are held by
    `a_disabled_exporter_does_no_work_at_all`,
    `an_unopenable_path_falls_back_to_disabled_rather_than_failing`,
    `a_directory_as_the_events_path_is_also_fail_open`,
    `an_empty_path_is_treated_as_unset` and
-   `a_missing_agent_id_is_skipped_and_counted_never_invented`)*
+   `a_missing_agent_id_is_skipped_and_counted_never_invented`; the startup
+   report by `crates/cloud/tests/events_export_startup.rs`, which runs the
+   real `tokenfuse-cloud` binary against a 0500 directory and reads its log
+   (`a_control_plane_whose_events_file_cannot_be_created_says_so_at_warn_and_keeps_running`,
+   red on the unfixed binary with the whole startup log quoted: the keys
+   error, `listening on`, and not one line naming the path; its guard
+   `a_control_plane_with_a_writable_events_path_says_the_export_is_enabled`
+   green on both sides), by
+   `an_unwritable_directory_is_named_at_warn_and_the_export_is_off` in
+   `gateway::events` (red on the wording: the old line named the path twice
+   and never said the export was off) and by three in `core::agent_event`
+   (`from_env_reports_an_unset_variable_as_off_with_nothing_to_log`,
+   `from_env_reports_an_opened_file_with_its_path_and_where_the_chain_resumed`,
+   `from_env_reports_an_unopenable_path_at_warn_and_the_export_is_off`);
+   the images by
+   `every_image_that_creates_uid_10001_creates_group_10001_first_and_puts_the_user_in_it`
+   in `crates/gateway/tests/image_user_group.rs`, which walks the repository
+   for every `Dockerfile*` rather than naming two, panics as having measured
+   nothing if it finds none creating uid 10001, and was red naming both files.
+   Scenarios: `features/the-events-file-that-cannot-be-created.feature`, six,
+   each bound. Not a script gate: nothing stops a third process calling
+   `from_env` and matching `OpenFailed` with `{}`, which the compiler cannot
+   see; the binary-level test is what holds the Cloud)*
 7. **A level-triggered detector is edge-converted at the source.** Four of the
    cloud's detectors fire on discrete trips (a block, a loop repeat, a burst),
    so one trip is one event. `budget_threshold` is not like them: once
@@ -1787,7 +1831,8 @@ held, and invariant 2 is held by one golden test that must never be deleted.
   comment went in beside the gate rather than instead of it. Twice now, a debt
   note has underestimated what was checkable; both times the cost of finding out
   was half an hour of reading the code the note described.
-- **Invariant 6**'s exporter half is now five tests. Both promises stop being
+- **Invariant 6**'s exporter half is now five tests, plus the startup report
+  added on 2026-09-18 (tokenfuse#292). Both promises stop being
   true quietly, which is why they needed tests rather than comments: nothing
   crashes when a disabled exporter starts doing work, it just gets slower, in
   production, per request; and nothing warns when a broken path stops being
@@ -2896,3 +2941,4 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `GET /v1/runs` keeps behind `TOKENFUSE_ADMIN_KEYS` (invariant 41). And N plain gateways behind one address, with no `cluster` feature, each hold
     their own ledger, so a worker whose call lands on a different replica than the one its
     coordinator's `open_run` landed on is refused by D1 even though the coordinator did call.)*
+

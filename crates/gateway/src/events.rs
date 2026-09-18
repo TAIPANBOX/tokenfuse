@@ -27,37 +27,35 @@
 //! write error is logged and dropped by the call site (see `crate::proxy`),
 //! never surfaced as a request failure.
 
-pub use tokenfuse_core::agent_event::{EmitOutcome, EventType, Exporter as EventExporter};
+pub use tokenfuse_core::agent_event::{
+    EmitOutcome, EventType, Exporter as EventExporter, Startup, StartupLine,
+};
 
 /// Read [`tokenfuse_core::agent_event::EVENTS_PATH_ENV`] once and build the
 /// exporter, logging the outcome. Call this exactly once, at gateway startup
 /// (`crate::main`) — never per-request.
+///
+/// The read, the open and the words are `tokenfuse_core`'s
+/// (`Exporter::from_env`, `Startup::line`); this function only picks the
+/// `tracing` level the line asks for. The Cloud's `main.rs` does the same
+/// three lines, so both processes say one thing about one fault
+/// (tokenfuse#292: the Cloud used to say nothing at all).
 pub fn from_env() -> EventExporter {
-    match std::env::var(tokenfuse_core::agent_event::EVENTS_PATH_ENV) {
-        Ok(path) if !path.is_empty() => match EventExporter::open(&path) {
-            Ok(exp) => {
-                // Chain continuity is worth one honest startup line (SPEC
-                // §6.5): resumed = one unbroken chain across the restart;
-                // fresh = a new head (empty file, or an unusable tail).
-                match exp.resumed_from() {
-                    Some(h) => tracing::info!(
-                        %path,
-                        resumed_from = %&h[..h.len().min(19)],
-                        "agent-event NDJSON export enabled (prev_hash chain resumed)"
-                    ),
-                    None => tracing::info!(
-                        %path,
-                        "agent-event NDJSON export enabled (fresh prev_hash chain)"
-                    ),
-                }
-                exp
-            }
-            Err(e) => {
-                tracing::warn!(%path, "could not open TOKENFUSE_EVENTS_PATH: {e}");
-                EventExporter::disabled()
-            }
-        },
-        _ => EventExporter::disabled(),
+    let (exp, startup) = EventExporter::from_env();
+    log_startup(&startup);
+    exp
+}
+
+/// Log what [`EventExporter::from_env`] found: nothing for an unset
+/// variable, one info line for an opened file (SPEC §6.5 chain continuity is
+/// worth saying: resumed, or a fresh head), one warn line for a path that
+/// could not be opened, naming the path and the error and saying the export
+/// is off.
+pub fn log_startup(startup: &Startup) {
+    match startup.line() {
+        None => {}
+        Some(StartupLine::Info(line)) => tracing::info!("{line}"),
+        Some(StartupLine::Warn(line)) => tracing::warn!("{line}"),
     }
 }
 
@@ -338,5 +336,119 @@ mod tests {
             EmitOutcome::Written
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // tokenfuse#292: the words in the warning are the contract, because the
+    // log line is the only signal an operator gets that the bus will stay
+    // empty. The Cloud had no line at all; this gateway had one that named
+    // the path and did not say what it meant for the export.
+
+    /// A `MakeWriter` that appends formatted tracing output to a shared
+    /// buffer, the shape `crate::cloudsink`'s tests use. Scoped to this
+    /// thread with `with_default` rather than installed globally: `from_env`
+    /// does its work on the calling thread, so a thread-local subscriber sees
+    /// every line it writes.
+    #[derive(Clone)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a subscriber that captures everything at DEBUG and up,
+    /// and hand back the text an operator would have read.
+    fn captured_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Captured(std::sync::Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// RED-FIRST on the wording: the line this gateway wrote named the path
+    /// and the error and did not say the export was off, so the last
+    /// assertion failed against it. The fixture is the launchers' directory
+    /// as seen by a process in the wrong group: readable, searchable, not
+    /// writable. Unix only, because the fault is a mode bit and so is the
+    /// fixture; a root user is not bound by it, and the test says so rather
+    /// than passing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_directory_is_named_at_warn_and_the_export_is_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = env_lock();
+        let dir = temp_dir("unwritable");
+        let path = dir.join("events.ndjson");
+        let path_str = path.to_str().unwrap().to_string();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::env::set_var(tokenfuse_core::agent_event::EVENTS_PATH_ENV, &path_str);
+
+        let (exp, log) = captured_log(from_env);
+
+        std::env::remove_var(tokenfuse_core::agent_event::EVENTS_PATH_ENV);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        let created = path.exists();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            !created,
+            "the file was created inside a 0500 directory, so this ran as a user the \
+             mode bits do not bind (root) and measured nothing"
+        );
+        assert!(
+            !exp.is_enabled(),
+            "an unopenable events path must degrade to disabled, never stop the gateway"
+        );
+        assert!(matches!(
+            emit_once(&exp, Some("agent://x.example/a")),
+            EmitOutcome::Disabled
+        ));
+        let warnings: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains(&path_str))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one line at WARN names the path. Log:\n{log}"
+        );
+        let line = warnings[0];
+        assert!(
+            line.contains("TOKENFUSE_EVENTS_PATH"),
+            "the warning does not name the variable the operator has to fix: {line}"
+        );
+        assert!(
+            line.to_ascii_lowercase().contains("permission denied") || line.contains("os error"),
+            "the warning does not carry the operating system's error, which is what \
+             distinguishes a mode from an owner from a typo: {line}"
+        );
+        assert!(
+            line.to_ascii_lowercase().contains("export is off"),
+            "the warning names the path and does not say what it means: that the \
+             export is off and the bus will stay empty. An operator reading \
+             'could not open' alone has to infer the consequence: {line}"
+        );
+        assert!(
+            !log.contains("export enabled"),
+            "the log also claims the export is enabled. Log:\n{log}"
+        );
     }
 }
