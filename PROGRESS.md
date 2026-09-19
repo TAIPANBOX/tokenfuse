@@ -302,8 +302,8 @@ comparison in #132.
 
 **Counts re-measured 2026-09-18**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1395 passing** (core 340, dpop 21, delegation 44,
-gateway 761, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1399 passing** (core 340, dpop 21, delegation 44,
+gateway 765, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew from 743 to 761 on 2026-09-18 (invariant 52, tokenfuse#293): seven in `unitledger::tests` and ten in `cloudsink::tests` for the seeded month and one in `proxy::tests` with the appliance's numbers. Before that, gateway grew from 736 to 743 on 2026-09-18 (invariant 53, tokenfuse#294): seven in `cloudsink::tests` for the retry queue that now holds a push the control plane cannot be reached for and replays it in order. Before that, gateway grew from 731 to 736 and cloud from 224 to 228 on 2026-09-18 (invariant 54, tokenfuse#295): three in `identitymap::tests` and two in `cloudsink::tests` for the owner on the wire, four in `cloud::store` for the owner fold. Cloud grew from 201 to 223 on
 2026-09-18 (invariant 60, tokenfuse#296): the run_stalled detector, nineteen in `cloud::store`,
 one in `cloud::push`, two in `crates/cloud/tests/run_stalled.rs`. Then core grew from 339 to

@@ -43,6 +43,10 @@ pub struct ProviderResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    /// The request was rejected before any transport dispatch.
+    #[error("upstream request was not sent: {0}")]
+    NotSent(String),
+    /// Dispatch may have occurred, including before a redirect failed.
     #[error("upstream request failed: {0}")]
     Upstream(String),
 }
@@ -522,8 +526,14 @@ impl Provider for HttpProvider {
             }
         }
 
-        let resp = req
-            .send()
+        // Building is the only proof available here that no bytes were dispatched.
+        // A connect error may belong to a redirect after the original POST ran.
+        let request = req
+            .build()
+            .map_err(|e| ProviderError::NotSent(e.to_string()))?;
+        let resp = self
+            .client
+            .execute(request)
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();

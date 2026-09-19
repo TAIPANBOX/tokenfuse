@@ -2964,7 +2964,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `SettleGuard` (`crates/gateway/src/settle.rs`) is now created in `handle` the moment the
     unit reservation block ends, holds the unit half and the run half as `Option`s across every
     await that follows, and decides on `Drop` from one `CallOutcome` state through one pure
-    table (`disposition`): reserved and not dispatched, or `send` returned `Err`, releases both
+    table (`disposition`): reserved and not dispatched, or `send` returned `NotSent`, releases both
     at zero; a status line arrived and it was a refusal charges what the provider reported, else
     zero (invariant 47); a 2xx arrived charges what the body reported, else the estimate, whether
     the body completed, broke or was abandoned (invariant 43, and now the same answer on both
@@ -2996,10 +2996,17 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the caller can observe between "connecting" and "the head is written"; nothing measured
     whether hyper drops the upstream request when that future is dropped, so the provider may
     still run and bill the retained call, and the estimate is not proven to bound that bill.
-    `send` returning `Err` is read as "not sent" and released, and `ProviderError::Upstream`
-    cannot say otherwise: a connection reset while awaiting the response head arrives through the
-    same arm and releases a reservation for a call the provider may have executed (D9, an open
-    decision; the split is `reqwest::Error::is_connect`, in PR 3's file). Whether axum drops the
+    @codex 2026-09-19: D9 releases only `ProviderError::NotSent`, which the HTTP adapter
+    creates when `RequestBuilder::build` fails before `Client::execute`. Every transport
+    error retains both reservations, including `is_connect`: a 307 may follow an accepted
+    POST and its redirected connection may fail. Direct refused connections conservatively
+    retain too, because this adapter has no transport dispatch evidence. A real TCP test
+    consumed the complete POST before EOF and before redirecting to a refused port; both
+    released incorrectly before this fix. No new CallRecord is invented without an answer;
+    `dependency_failed` still reports `stage=send`, `effect=call_failed`.
+    (gate: `scripts/d9-send-retention.sh`; tests: `send_failure_retention.rs`, both paths,
+    child, parent and unit; malformed URL is the definite-unsent control.)
+    Whether axum drops the
     handler future on a client disconnect in every phase is not measured here (the live test is
     named in the PR's NOT proven list and was not run). No agent-event type describes a retained
     call; a new type is a cross-repository change (D10). The registry is process-local and
