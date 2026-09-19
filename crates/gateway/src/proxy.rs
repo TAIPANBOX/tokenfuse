@@ -1813,17 +1813,15 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             r
         }
         Err(e) => {
-            // The request did not reach the provider (S4): released, not
-            // retained. `not_sent` then an explicit `settle_now` rather than
-            // waiting for `Drop`, so the release happens before the 502
-            // response is built, matching every other early return here.
-            guard.not_sent();
+            // Only an explicit pre-dispatch failure proves the request was not sent.
+            // Transport errors, including a connect failure after a redirect, retain
+            // the reservation because the original provider may already have billed.
+            if matches!(&e, ProviderError::NotSent(_)) {
+                guard.not_sent();
+            }
             let _ = guard.settle_now();
-            // No CallRecord is written on this path, deliberately (there was
-            // no call to price), which is why the event is the only thing
-            // that will ever say this happened: without it a provider outage
-            // leaves the ledger, the trace, the Parquet export and the event
-            // bus all exactly as they were on a quiet afternoon.
+            // No answer exists to price or record; the dependency event still
+            // reports the failed call while the retained registry holds exposure.
             emit_dependency_failed(
                 &st,
                 Some(&run_id),

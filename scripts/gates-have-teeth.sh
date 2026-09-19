@@ -734,6 +734,22 @@ run_case "compat-surface: a file a where entry names is gone" fail \
 	"$(py 'import os; os.remove("contracts/tokenfuse-constants.json")')" \
 	"measured nothing"
 
+# D9: product mutations, the definite-unsent control, and empty-subject refusal.
+run_case "D9: all send errors release" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/proxy.rs", "if matches!(&e, ProviderError::NotSent(_))", "if true")')" \
+    "an ambiguous send must keep its exposure"
+run_case "D9: redirect connect error called unsent" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/provider.rs", ".map_err(|e| ProviderError::Upstream(e.to_string()))?", ".map_err(|e| if e.is_connect() { ProviderError::NotSent(e.to_string()) } else { ProviderError::Upstream(e.to_string()) })?")')" \
+    "a_post_redirected_to_a_refused_connection_is_not_unsent ... FAILED"
+run_case "D9: request-build failure retained" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/provider.rs", "ProviderError::NotSent(e.to_string())", "ProviderError::Upstream(e.to_string())")')" \
+    "a_request_that_cannot_be_built_releases_both_ledgers ... FAILED"
+run_case "D9: harmless source comment" pass "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/provider.rs", "pub enum ProviderError {", "pub enum ProviderError { // harmless comment")')"
+run_case "D9: suite removed" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'import os; os.remove("crates/gateway/tests/send_failure_retention.rs")')" \
+    "measured nothing"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
