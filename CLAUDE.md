@@ -2996,16 +2996,38 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the caller can observe between "connecting" and "the head is written"; nothing measured
     whether hyper drops the upstream request when that future is dropped, so the provider may
     still run and bill the retained call, and the estimate is not proven to bound that bill.
-    @codex 2026-09-19: D9 releases only `ProviderError::NotSent`, which the HTTP adapter
-    creates when `RequestBuilder::build` fails before `Client::execute`. Every transport
-    error retains both reservations, including `is_connect`: a 307 may follow an accepted
-    POST and its redirected connection may fail. Direct refused connections conservatively
-    retain too, because this adapter has no transport dispatch evidence. A real TCP test
-    consumed the complete POST before EOF and before redirecting to a refused port; both
-    released incorrectly before this fix. No new CallRecord is invented without an answer;
-    `dependency_failed` still reports `stage=send`, `effect=call_failed`.
-    (gate: `scripts/d9-send-retention.sh`; tests: `send_failure_retention.rs`, both paths,
-    child, parent and unit; malformed URL is the definite-unsent control.)
+    @codex 2026-09-19: a real TCP test showed a complete POST followed by EOF
+    released before, now retained.
+
+    The provider client follows no redirect (`HttpProvider::new`). Two
+    reasons: the caller's `x-api-key` and the whole prompt are not safe on a
+    second host, since a cross-host redirect strips only five headers
+    (`Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization`,
+    `WWW-Authenticate`) and a 307 or 308 keeps the method and the body; and
+    with no redirect there is exactly one hop, which is what makes a connect
+    error proof that nothing was sent. The same posture `mcpclient.rs`
+    already took for the MCP scanner client. A request that cannot be built,
+    or a connect error on that one hop, is `NotSent` and releases both
+    reservations at zero with one `dependency_failed` at stage `send`. Every
+    other `send` error is `Upstream` and is RETAINED like a cancel (D7): the
+    connection existed and the provider may already have billed. A 3xx from
+    the provider is a status line like any other, passed to the caller as a
+    refusal with no usage and charged zero. No new CallRecord is invented
+    without an answer.
+    (gate: `scripts/d9-send-retention.sh`, six teeth cases; tests:
+    `send_failure_retention.rs`'s four,
+    `a_post_received_before_eof_retains_both_ledgers_on_both_paths`,
+    `a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home`,
+    `a_refused_connection_on_the_only_hop_releases_both_ledgers`,
+    `a_request_that_cannot_be_built_releases_both_ledgers`, plus
+    `a_provider_that_cannot_be_reached_is_recorded` and
+    `codex_held_not_sent_error_releases_without_spend_on_both_paths`. Red
+    first, @measured `cargo test -p tokenfuse-gateway --test
+    send_failure_retention` 2026-09-23: the redirect test read `left: 1
+    right: 0` (the redirect reached the second host) against both this
+    branch's own unfixed tree and `origin/main` at `0bc5617`; the
+    refused-connection test read `left: Microusd(1774) right: Microusd(0)`
+    (retained instead of released) against this branch's own unfixed tree.)
     Whether axum drops the
     handler future on a client disconnect in every phase is not measured here (the live test is
     named in the PR's NOT proven list and was not run). No agent-event type describes a retained

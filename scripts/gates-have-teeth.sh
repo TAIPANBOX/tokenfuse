@@ -738,9 +738,12 @@ run_case "compat-surface: a file a where entry names is gone" fail \
 run_case "D9: all send errors release" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/proxy.rs", "if matches!(&e, ProviderError::NotSent(_))", "if true")')" \
     "an ambiguous send must keep its exposure"
-run_case "D9: redirect connect error called unsent" fail "./scripts/d9-send-retention.sh" \
-    "$(py 'edit("crates/gateway/src/provider.rs", ".map_err(|e| ProviderError::Upstream(e.to_string()))?", ".map_err(|e| if e.is_connect() { ProviderError::NotSent(e.to_string()) } else { ProviderError::Upstream(e.to_string()) })?")')" \
-    "a_post_redirected_to_a_refused_connection_is_not_unsent ... FAILED"
+run_case "D9: a followed redirect" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/provider.rs", ".redirect(reqwest::redirect::Policy::none())", "")')" \
+    "a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home ... FAILED"
+run_case "D9: a refused connection retained" fail "./scripts/d9-send-retention.sh" \
+    "$(py 'edit("crates/gateway/src/provider.rs", "if e.is_connect() {", "if false {")')" \
+    "a_refused_connection_on_the_only_hop_releases_both_ledgers ... FAILED"
 run_case "D9: request-build failure retained" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "ProviderError::NotSent(e.to_string())", "ProviderError::Upstream(e.to_string())")')" \
     "a_request_that_cannot_be_built_releases_both_ledgers ... FAILED"

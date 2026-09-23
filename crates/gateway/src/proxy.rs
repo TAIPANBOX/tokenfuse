@@ -1813,9 +1813,11 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             r
         }
         Err(e) => {
-            // Only an explicit pre-dispatch failure proves the request was not sent.
-            // Transport errors, including a connect failure after a redirect, retain
-            // the reservation because the original provider may already have billed.
+            // NotSent now has two sources: the request could not be built, or
+            // the connection to the provider was never established (redirects
+            // are not followed, so a connect error is the only hop failing).
+            // Every other transport error retains the reservation, because
+            // the connection existed and the provider may already have billed.
             if matches!(&e, ProviderError::NotSent(_)) {
                 guard.not_sent();
             }
@@ -7801,9 +7803,10 @@ pub(crate) mod tests {
 
     /// An upstream that cannot be reached at all: `send` returns `Err`, the
     /// shape a refused connection, a DNS failure, a TLS failure or a connect
-    /// timeout takes by the time it reaches this crate (see
-    /// `provider::HttpProvider::send`, which maps every one of them to
-    /// `ProviderError::Upstream`).
+    /// timeout takes by the time it reaches this crate. Since D9,
+    /// `provider::HttpProvider::send` maps a connect error to
+    /// `ProviderError::NotSent`: redirects are not followed, so this is the
+    /// request's only hop and a connect error is proof nothing was sent.
     ///
     /// Distinct from `RefusingProvider` above, and the distinction is the one
     /// mockryx's game-day drill spends a paragraph on: a provider that answers
@@ -7818,7 +7821,7 @@ pub(crate) mod tests {
             _headers: HeaderMap,
             _body: Bytes,
         ) -> Result<ProviderResponse, ProviderError> {
-            Err(ProviderError::Upstream(
+            Err(ProviderError::NotSent(
                 "error sending request for url (http://127.0.0.1:1/v1/messages): \
                  tcp connect error: Connection refused (os error 61)"
                     .to_string(),

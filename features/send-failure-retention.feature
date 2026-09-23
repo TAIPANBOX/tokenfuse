@@ -1,7 +1,8 @@
 Feature: An ambiguous send failure keeps its exposure
 
-  @measured cargo test -p tokenfuse-gateway --test send_failure_retention 2026-09-19:
-  a complete POST followed by EOF or a failing redirect released its reservation.
+  @measured cargo test -p tokenfuse-gateway --test send_failure_retention 2026-09-23:
+  a redirect from the provider reached a second host, and a refused connection
+  on the request's only hop was conservatively retained rather than released.
 
   # @test:a_post_received_before_eof_retains_both_ledgers_on_both_paths
   Scenario: The provider accepted the POST but never answered
@@ -9,17 +10,17 @@ Feature: An ambiguous send failure keeps its exposure
     When the connection closes before a response head on either path
     Then child, parent and unit keep the same reserve with zero spend and one retained handle
 
-  # @test:a_post_redirected_to_a_refused_connection_is_not_unsent
-  Scenario: A redirect fails after the original POST arrived
-    Given the original upstream consumed the POST and redirected it
-    When the redirected connection is refused
-    Then the original call remains retained on both paths
+  # @test:a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home
+  Scenario: A redirect from the provider is not followed
+    Given the provider answers the POST with a redirect to another host
+    When the gateway forwards it on either path
+    Then the redirect is not followed, the key and the body never reach the other host, and the refusal releases both reservations at zero
 
-  # @test:a_connect_error_without_dispatch_evidence_conservatively_retains
-  Scenario: A transport error has no proof of non-dispatch
-    Given a refused connection without dispatch evidence
-    When the HTTP adapter reports its error
-    Then it conservatively retains both reservations on both paths
+  # @test:a_refused_connection_on_the_only_hop_releases_both_ledgers
+  Scenario: A connection the provider never accepted is not a call
+    Given nothing listens at the provider's address
+    When the call is forwarded on either path
+    Then the caller gets a 502, child, parent and unit are released at zero and nothing is retained
 
   # @test:a_request_that_cannot_be_built_releases_both_ledgers
   Scenario: Request construction fails before dispatch

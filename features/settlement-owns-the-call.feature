@@ -37,10 +37,12 @@ Feature: One owner for a call's reservations, and what each outcome is charged
 
   # @test:codex_held_not_sent_error_releases_without_spend_on_both_paths
   # @test:a_guard_told_the_send_failed_releases_both_and_writes_no_row
+  # @test:a_provider_that_cannot_be_reached_is_recorded
   Scenario: The request did not reach the provider
-    Given a request rejected during construction before transport dispatch
+    Given a provider that cannot be reached, or a request that cannot be built
     When the call is forwarded on either path
     Then the caller gets a 502, both reservations are released at zero, and no trace row is written
+    And one dependency_failed at stage send is on the bus
 
   # @test:codex_f03_cancel_during_provider_send_is_retained_not_released
   # @test:a_cancel_while_the_provider_holds_the_request_retains_both_ledgers
