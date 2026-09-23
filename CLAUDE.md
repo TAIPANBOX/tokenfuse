@@ -93,6 +93,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/compat-surface.sh     # invariant 44; --write renders COMPATIBILITY.md
 ./scripts/audit.sh              # invariant 11; needs cargo-audit
 ./scripts/constants.sh          # builds, unlike the text gates; see invariant 14
+./scripts/d9-send-retention.sh  # invariant 50 (D9); its suite also runs in cargo test --all
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
