@@ -136,18 +136,20 @@ struct PendingProvider {
     entered: Arc<tokio::sync::Notify>,
 }
 
-struct UnreachableProvider;
+struct NotSentProvider;
 #[async_trait]
-impl Provider for UnreachableProvider {
+impl Provider for NotSentProvider {
     async fn send(&self, _: HeaderMap, _: Bytes) -> Result<ProviderResponse, ProviderError> {
-        Err(ProviderError::Upstream("review: connection refused".into()))
+        Err(ProviderError::NotSent(
+            "review: request building failed".into(),
+        ))
     }
 }
 
 #[tokio::test]
-async fn codex_held_send_error_releases_without_spend_on_both_paths() {
+async fn codex_held_not_sent_error_releases_without_spend_on_both_paths() {
     for stream in [false, true] {
-        let (st, ledger) = state(Arc::new(UnreachableProvider), Wire::OpenAi);
+        let (st, ledger) = state(Arc::new(NotSentProvider), Wire::OpenAi);
         let response = tokenfuse_gateway::app(st)
             .oneshot(req(stream, "unreachable"))
             .await

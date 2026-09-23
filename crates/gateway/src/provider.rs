@@ -43,6 +43,13 @@ pub struct ProviderResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    /// The request never left this process: it could not be built, or the
+    /// connection to the provider was never established (redirects are not
+    /// followed, so there is one hop).
+    #[error("upstream request was not sent: {0}")]
+    NotSent(String),
+    /// The connection existed; the provider may have received and executed
+    /// the request.
     #[error("upstream request failed: {0}")]
     Upstream(String),
 }
@@ -497,10 +504,23 @@ impl HttpProvider {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
+        // No redirect is followed, for two reasons. The caller's x-api-key
+        // (in FORWARD_HEADERS) and the whole prompt are not safe to send to a
+        // second host: on a cross-host redirect reqwest strips only five
+        // headers (Authorization, Cookie, cookie2, Proxy-Authorization,
+        // WWW-Authenticate), and a 307 or 308 keeps the method and the body,
+        // so the key and the prompt would follow it. And one hop is what
+        // makes a connect error proof that no byte of the request left this
+        // process (see HttpProvider::send): a followed redirect would leave a
+        // connect error ambiguous between the first hop and the second. Same
+        // posture as mcpclient.rs's scanner client.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(connect_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect(
+                "the provider HTTP client builds; reqwest::Client::new() panics on the same failure",
+            );
         HttpProvider {
             client,
             endpoint: endpoint.into(),
@@ -522,10 +542,21 @@ impl Provider for HttpProvider {
             }
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        // Building is proof that no bytes were dispatched.
+        let request = req
+            .build()
+            .map_err(|e| ProviderError::NotSent(e.to_string()))?;
+        // Redirects are not followed, so a connect error here is the only
+        // hop's handshake failing and the request never left. Anything after
+        // the connection existed (a reset or EOF after the POST was written,
+        // a timeout awaiting the head) may have reached the provider.
+        let resp = self.client.execute(request).await.map_err(|e| {
+            if e.is_connect() {
+                ProviderError::NotSent(e.to_string())
+            } else {
+                ProviderError::Upstream(e.to_string())
+            }
+        })?;
         let status = resp.status().as_u16();
         let content_type = resp
             .headers()
