@@ -144,6 +144,9 @@ mod tests {
                     key_id: String::new(),
                     unit: String::new(),
                     tool_calls: None,
+                    tools_offered: None,
+                    tools_would_prune: None,
+                    pruned_schema_tokens_est: None,
                 });
             }
         }
@@ -254,6 +257,9 @@ mod tests {
                 key_id: String::new(),
                 unit: String::new(),
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
         }
 
@@ -395,6 +401,9 @@ mod tests {
                 key_id: String::new(),
                 unit: String::new(),
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
         }
 
@@ -511,6 +520,9 @@ mod tests {
                 key_id: String::new(),
                 unit: String::new(),
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
         }
 
@@ -628,6 +640,9 @@ mod tests {
                 key_id: String::new(),
                 unit: "treasury".into(),
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
         }
 
@@ -748,6 +763,9 @@ mod tests {
                 key_id: String::new(),
                 unit: String::new(),
                 tool_calls: Some(4),
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
         }
 

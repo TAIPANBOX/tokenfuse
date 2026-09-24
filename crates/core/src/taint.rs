@@ -166,6 +166,35 @@ pub fn declared_tool_names_in(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// [`declared_tool_names_in`] plus, for each declared tool, the byte length of
+/// that whole tool element as `serde_json::to_string` renders it: shadow tool
+/// pruning (W2a) prices the schema of a tool the policy would deny, and this
+/// is the one traversal both callers need instead of two copies drifting
+/// apart. Same wire shapes, same names, same order as
+/// [`declared_tool_names_in`], so a caller that already trusts that
+/// traversal's shape can trust this one too.
+pub fn declared_tool_defs_in(v: &serde_json::Value) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        for t in tools {
+            let len = serde_json::to_string(t).map(|s| s.len()).unwrap_or(0);
+            // Anthropic: tools[].name
+            if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                out.push((name.to_string(), len));
+            }
+            // OpenAI: tools[].function.name
+            if let Some(name) = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                out.push((name.to_string(), len));
+            }
+        }
+    }
+    out
+}
+
 fn push_tool_use_from_content(content: Option<&serde_json::Value>, out: &mut Vec<ToolUse>) {
     if let Some(blocks) = content.and_then(|c| c.as_array()) {
         for b in blocks {
@@ -416,6 +445,98 @@ mod tests {
         });
         assert!(tool_names_in(&req).is_empty());
         assert_eq!(declared_tool_names_in(&req), vec!["wire_transfer"]);
+    }
+
+    #[test]
+    fn declared_tool_defs_in_reads_both_wire_shapes() {
+        let req = json!({"tools":[
+            {"name":"wire_transfer","description":"move money","input_schema":{}},
+            {"name":"lookup","description":"read","input_schema":{}}
+        ]});
+        let defs = declared_tool_defs_in(&req);
+        let names: Vec<String> = defs.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, declared_tool_names_in(&req));
+        let tools = req["tools"].as_array().unwrap();
+        for (i, (_, len)) in defs.iter().enumerate() {
+            assert_eq!(*len, serde_json::to_string(&tools[i]).unwrap().len());
+        }
+
+        let openai_req =
+            json!({"tools":[{"type":"function","function":{"name":"shell_exec","parameters":{}}}]});
+        let openai_defs = declared_tool_defs_in(&openai_req);
+        let openai_names: Vec<String> = openai_defs.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(openai_names, declared_tool_names_in(&openai_req));
+        assert_eq!(
+            openai_defs[0].1,
+            serde_json::to_string(&openai_req["tools"][0])
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn declared_tool_defs_in_survives_hostile_shapes() {
+        // tools absent
+        assert!(declared_tool_defs_in(&json!({})).is_empty());
+        // tools not an array
+        assert!(declared_tool_defs_in(&json!({"tools": "not-an-array"})).is_empty());
+        assert!(declared_tool_defs_in(&json!({"tools": 42})).is_empty());
+        assert!(declared_tool_defs_in(&json!({"tools": null})).is_empty());
+        // elements not objects
+        assert!(declared_tool_defs_in(&json!({"tools": [1, "x", null, true]})).is_empty());
+        // name missing or not a string
+        assert!(declared_tool_defs_in(&json!({"tools": [{"description": "no name"}]})).is_empty());
+        assert!(declared_tool_defs_in(&json!({"tools": [{"name": 5}]})).is_empty());
+        // function present but name missing / not a string
+        assert!(declared_tool_defs_in(&json!({"tools": [{"function": {}}]})).is_empty());
+        assert!(declared_tool_defs_in(&json!({"tools": [{"function": {"name": 5}}]})).is_empty());
+        // deeply nested values
+        let deep = json!({"tools": [{"name": "n", "input_schema": {"a": {"b": {"c": [1,2,3, {"d": "e"}]}}}}]});
+        let defs = declared_tool_defs_in(&deep);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].0, "n");
+        assert_eq!(
+            defs[0].1,
+            serde_json::to_string(&deep["tools"][0]).unwrap().len()
+        );
+
+        // 200-seed sweep over generated shapes: never panics, and every
+        // returned name is one declared_tool_names_in also returns.
+        let mut seed: u64 = 0x7a11_0925;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let n_tools = (next() % 5) as usize;
+            let mut tools = Vec::new();
+            for _ in 0..n_tools {
+                let shape = next() % 7;
+                let el = match shape {
+                    0 => json!({"name": format!("t{}", next() % 100)}),
+                    1 => json!({"function": {"name": format!("t{}", next() % 100)}}),
+                    2 => json!({"name": next() % 100}), // name not a string
+                    3 => json!(null),
+                    4 => json!(next() % 100), // not an object
+                    5 => {
+                        json!({"name": format!("t{}", next() % 100), "extra": {"nested": [1,2,3]}})
+                    }
+                    _ => json!({}), // no name at all
+                };
+                tools.push(el);
+            }
+            let v = json!({"tools": tools});
+            let defs = declared_tool_defs_in(&v);
+            let names = declared_tool_names_in(&v);
+            for (name, _) in &defs {
+                assert!(
+                    names.contains(name),
+                    "declared_tool_defs_in returned a name declared_tool_names_in does not: {name}"
+                );
+            }
+        }
     }
 
     #[test]
