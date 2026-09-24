@@ -3847,6 +3847,18 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     at+jwt` check, because vouchryx does not set one on the token it issues
     (`internal/api/xaa.go`, read at the design stage; a follow-up once it
     does). The event record never carries a proof for this door, by design,
-    not as a gap (see above). And the LLM proxy does not accept XAA: only the
+    not as a gap (see above), and one consequence is worth saying plainly: on
+    the record, an XAA-admitted call and a call whose chain was only claimed
+    in `x-fuse-on-behalf-of` look the same (the chain present, no
+    `delegation_proof`); what differs is the PDP's decision, because only the
+    PDP was told `chain_proven`. @measured end to end 2026-09-24 (vouchryx
+    b4497d8, wardryx 6080bad with `deny_if_chain_unproven` on the agent, this
+    broker, a mock MCP upstream): the same agent and tool through the static
+    key door with a claimed chain was denied, through an XAA token allowed,
+    and the two `tool_call` lines differ only in `decision` and `ts`, both
+    `agent-conform -chain` PASS. Recording the access token's `jti`, `iss` and
+    `client_id` beside the chain is an additive change to the event and a
+    cross-repository decision (agent-passport SPEC 5.2 or 6.2), not made
+    here. And the LLM proxy does not accept XAA: only the
     MCP broker publishes RFC 9728 metadata and only `mcpbroker::handle` reads
     `Authorization: Bearer` this way.
