@@ -4039,7 +4039,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     like before this round. Stale records accumulate (one per refresh),
     so `maybe_compact_order` rebuilds `order` from the live entries,
     sorted by `created_millis`, once it has grown past `2 * entries.len()
-    + 16` — amortised O(1), since compaction only fires after O(n) stale
+    + 16`, amortised O(1), since compaction only fires after O(n) stale
     records have built up.
 
     Embeddings are stored L2-normalized and the query is normalized once
