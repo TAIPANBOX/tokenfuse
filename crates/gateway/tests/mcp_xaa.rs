@@ -159,9 +159,7 @@ async fn a_401_points_at_the_resource_metadata() {
         .to_string();
     assert_eq!(
         www,
-        format!(
-            "Bearer resource_metadata=\"https://mcp.acme.example/.well-known/oauth-protected-resource/mcp\""
-        )
+        "Bearer resource_metadata=\"https://mcp.acme.example/.well-known/oauth-protected-resource/mcp\""
     );
 }
 
