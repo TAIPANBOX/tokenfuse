@@ -3963,4 +3963,28 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     unchanged): `left: Shadow right: Off`; `every_named_cache_mode_is_honoured`
     pins `off`/`shadow`/`on`; `an_unrecognised_cache_value_is_off_not_a_guess`
     pins the typo case. Scenarios: `features/the-cache-defaults-off.feature`,
-    three, each bound.)*
+    three, each bound.
+
+    **The unit tests above prove `cache_mode_from` is correct; they cannot
+    prove `main.rs` actually CALLS it.** Reverting `serve()` to the old
+    inline match (`_ => CacheMode::Shadow` for the unset case) would leave
+    every one of them green, since they test the pure function directly.
+    `crates/gateway/tests/cache_default_startup.rs` closes that seam by
+    running the real built binary (same technique as
+    `tests/stub_wire_mismatch.rs`) and reading the one piece of evidence
+    `main.rs` exposes for this decision, the startup line
+    `tracing::info!(?cache_mode, "semantic cache")`:
+    `unset_cache_resolves_to_off_in_the_real_binary` (TOKENFUSE_CACHE
+    unset), `a_typo_cache_value_resolves_to_off_and_warns_in_the_real_binary`
+    (also asserts the warn line names both the variable and the value,
+    since this binary's tracing setup has no separate stderr routing by
+    level, so the warn appears in the SAME captured stdout stream as the
+    startup line), and `cache_on_is_honoured_in_the_real_binary` as the
+    negative control. Verified red first against `main.rs` reverted to the
+    old inline match, 2026-09-24:
+    `unset_cache_resolves_to_off_in_the_real_binary` panicked "TOKENFUSE_CACHE
+    unset must resolve to Off in the real binary; got: ... semantic cache
+    cache_mode=Shadow" and
+    `a_typo_cache_value_resolves_to_off_and_warns_in_the_real_binary`
+    panicked the same way; the negative control stayed green on both
+    sides, as a guard should.)*
