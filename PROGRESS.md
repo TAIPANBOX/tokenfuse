@@ -302,9 +302,18 @@ comparison in #132.
 
 **Counts re-measured 2026-09-24**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1503 passing** (core 359, dpop 21, delegation 60,
-gateway 834, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by
+`cargo test --all` runs **1509 passing** (core 359, dpop 21, delegation 60,
+gateway 840, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
+six more (invariant 63): three unit tests,
+`defaults::tests::cache_is_off_when_nothing_is_configured`,
+`every_named_cache_mode_is_honoured` and `an_unrecognised_cache_value_is_off_not_a_guess`,
+pinning `TOKENFUSE_CACHE`'s new default; and, added in review, three in
+`tests/cache_default_startup.rs` proving `main.rs` actually calls
+`cache_mode_from` rather than keeping its own inline match (the unit tests
+above cannot see that seam): `unset_cache_resolves_to_off_in_the_real_binary`,
+`a_typo_cache_value_resolves_to_off_and_warns_in_the_real_binary` and the
+negative control `cache_on_is_honoured_in_the_real_binary`. Core grew by
 seventeen more (invariant 64): `crates/core/src/cache.rs`'s
 `SemanticCache::get`/`put` were rewritten around an exact-match index, an
 `RwLock`, a dense `Vec`-backed partition and amortised O(1) eviction/TTL
