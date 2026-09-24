@@ -3701,3 +3701,164 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     (`left: 2 right: 1`); P10 and P11, the cache key dropping the agent or the tool set,
     each caught by `the_cache_never_answers_for_another_agent_or_another_tool_set`
     (`left: 2 right: 3`).)*
+62. **A bearer credential is a door too, and it does not get to answer "is
+    anyone else on the door" by itself.** (Numbered 62 because 56-59 are the
+    unassigned gap invariant 44 already records and 61 is shadow tool
+    pruning, merged the same day by a sibling branch, PR #321.) The MCP
+    broker's two existing doors
+    (`TOKENFUSE_MCP_KEYS`, `TOKENFUSE_MCP_CLIENT_IDS`) are both a caller
+    PROVING something: a shared secret, or possession of a key. A
+    vouchryx-issued Cross App Access (XAA, draft-ietf-oauth-identity-assertion-authz-grant-04)
+    access token proves something too, by a signature this broker verifies
+    offline (`tokenfuse_delegation::verify_access_token`, sharing
+    `verify_delegation`'s decode path and `chain_of`), so it is a third door
+    rather than a special case of either existing one, judged alone and
+    before them (`Authorization: Bearer` presented with `x-fuse-key` or a
+    `dpop` header is refused, two credentials).
+
+    `@claude 2026-09-24`, a decision taken under delegated authority, open to
+    reversal: a third door rather than folding XAA into one of the other two,
+    for the reason above.
+
+    Until this, `something_on_the_door` answered only for the first two, so
+    a broker configuring XAA and nothing else answered `Admission::Open` to a
+    caller presenting nothing at all, exactly the gap invariant 20 closed for
+    the bearer-key door alone. `something_on_the_door` now counts XAA, and
+    `Admission::Open` reached with XAA configured is itself a refusal at the
+    one call site that judges it (`mcpbroker::handle`).
+
+    **A delegation token is a chain proof, not a door credential, and does
+    not open this door either.** `Authorization: DPoP <token>` plus a `dpop`
+    proof (`chainproof::resolve`'s own mechanism, invariant 31) says WHOM a
+    call acts for; it says nothing about WHETHER the call may be served at
+    all. With XAA on and neither of the other two doors configured, a caller
+    presenting only a delegation token still reaches the `Admission::Open`
+    refusal above: `chainproof::resolve` is read only after `mcpdoor::admit`
+    has already judged the request, never as a substitute for a door
+    credential.
+
+    **The record and the chain the PDP is told stay invariant 31's rule
+    applied here, not a new one.** `chain_proven` comes from the signature,
+    never from `x-fuse-on-behalf-of`; a declared chain that disagrees, by
+    order or by set, is refused (`chainproof::same_chain`, made `pub(crate)`
+    for this door to reuse rather than keep a second copy). Invariant 51's
+    over-cap refusal (400 `on_behalf_of_over_cap`, one `identity_mismatch`
+    event) holds on this door too, checked after the door judges the token
+    and before the disagreement check, via `mcpbroker::declared_chain_or_refuse`,
+    the one helper both branches of `handle` call.
+
+    What is new is that `delegation_proof` MUST stay `None` for this door
+    even though `chain_proven` is `true`: SPEC 5.2's proof is holder-bound
+    (`jkt`, `minLength: 1` in both event schemas), a bearer token has no
+    holder, and a record claiming one would be quarantined by agent-conform
+    (invariant 35). Before this door existed, `chain_proven` and
+    `delegation_proof.is_some()` were the same fact everywhere in
+    `mcpbroker.rs` (`mcpbroker.rs`'s own non-XAA branch still derives
+    `chain_proven` that way, correctly: a token verified through
+    `chainproof::resolve` always carries a proof when proven). `proxy.rs`
+    carries the identical derivation for the LLM path, untouched by this
+    door: the LLM proxy is not an OAuth protected resource at this level, and
+    `mcpdoor::admit` has exactly one call site, confirming it. For the XAA
+    door, the two facts are now set independently, in one place
+    (`mcpbroker::handle`'s XAA branch), rather than one derived from the
+    other.
+
+    Every 401 this broker gives while XAA is on carries `WWW-Authenticate:
+    Bearer resource_metadata="..."` (added by `mcpbroker::unauthorized`, which
+    wraps the shared `proxy::unauthorized_response` rather than changing it,
+    so the LLM proxy's own two call sites are unaffected), naming
+    `GET /.well-known/oauth-protected-resource` (RFC 9728) and its
+    resource-path-suffixed twin, both served only while XAA is on; off, both
+    404 exactly as before this door existed, because they are never
+    registered.
+
+    `TOKENFUSE_MCP_ACCEPT_XAA` (`off` the default, or `on`; anything else
+    refuses to start) and `TOKENFUSE_MCP_RESOURCE` (required when XAA is on,
+    an absolute https URL with no query or fragment; set while XAA is off
+    refuses to start, the same set-but-unusable rule `TOKENFUSE_MCP_KEYS`
+    already holds). XAA on requires `TOKENFUSE_DELEGATION_ISSUER` and
+    `TOKENFUSE_DELEGATION_JWKS` already configured (the same issuer and key
+    set the delegation door verifies against; `chainproof.rs`'s
+    `base_config_from_values`, a pure function, is the one place issuer+JWKS
+    are read and parsed, shared by `chainproof::from_env` and
+    `xaadoor::from_env` rather than kept as two copies). This door itself
+    never checks a proof and needs no origin, but the PROCESS does:
+    configuring the issuer and JWKS also turns on the delegation door in the
+    same broker, and that door refuses to start without
+    `TOKENFUSE_DELEGATION_URL` (invariant 31's `htu` rule). @measured
+    `tokenfuse mcp-broker` with `TOKENFUSE_MCP_ACCEPT_XAA=on`, the resource,
+    issuer and JWKS set and `TOKENFUSE_DELEGATION_URL` unset, 2026-09-24: exit
+    2 naming `TOKENFUSE_DELEGATION_URL`. So an operator turning XAA on sets
+    that too, to the broker's own public origin. XAA on together with
+    `TOKENFUSE_MCP_REQUIRE_PROOF` refuses to start, naming both: an operator
+    who closed the bearer-key door on one axis cannot reopen a different
+    bearer door on another. Both names are `experimental` in
+    `compat/1.0.json`: the grant is an IETF draft, not a published RFC.
+    *(test: `crates/delegation/src/lib.rs`'s `verify_access_token` suite
+    (`an_access_token_verifies_and_names_its_agent` and eighteen refusal/shape
+    tests, including a 200-case revocation sweep and a 200-case hostile-bearer-string
+    sweep); `crates/gateway/tests/mcp_xaa.rs` (22 tests over the live HTTP
+    door, including `the_resource_metadata_names_vouchryx`,
+    `a_401_points_at_the_resource_metadata`,
+    `a_vouchryx_token_is_attributed_to_its_agent`,
+    `with_only_xaa_configured_a_call_with_no_credential_is_refused`,
+    `with_xaa_on_a_delegation_token_alone_does_not_open_the_door`,
+    `a_chain_over_the_cap_is_refused_at_the_xaa_door_too`,
+    `the_bearer_scheme_is_case_insensitive`); `crates/gateway/src/xaadoor.rs`'s
+    own suite (fourteen, every startup refusal as a pure-function test);
+    `crates/gateway/src/chainproof.rs`'s `base_config_from_values` tests
+    (seven); `mcpbroker.rs`'s own `something_on_the_door_counts_the_xaa_door`;
+    `crates/gateway/tests/xaa_startup.rs` (two, the real binary, proving
+    `main.rs` is actually wired to the checks above, the one thing none of
+    the unit tests can see). Scenarios: `features/xaa-bearer-door.feature`,
+    bound by `scripts/features-are-bound.sh`. Mutants, nine, each planted in
+    the product code and reverted after: `aud` not checked
+    (`a_token_from_another_issuer_or_for_another_audience_is_refused`,
+    `an_empty_configured_resource_refuses_every_access_token`); `aud`
+    compared by prefix (`an_audience_that_is_only_a_prefix_match_is_refused`);
+    `cnf` bound token accepted (`a_bound_access_token_with_no_proof_is_refused`),
+    widened in review to ANY `cnf` claim, not only `cnf.jkt`: a certificate-bound
+    (`x5t#S256`, RFC 8705) or empty `cnf` is refused as `NoProof` too
+    (`a_token_bound_by_any_confirmation_method_is_refused`, red first against
+    ec7b3ed, where a certificate-bound token was accepted as bearer);
+    `client_id` requirement dropped (`an_access_token_with_no_client_id_is_refused`,
+    `an_exchange_token_is_refused_as_an_access_token`); revocation asked about
+    the root only (`a_revocation_naming_the_agent_in_an_access_tokens_chain_refuses_it`,
+    caught at its first seed); a failed XAA bearer falls through to `admit`
+    (`a_failed_xaa_bearer_never_falls_through_to_a_valid_bearer_key`, isolated
+    from the redundant two-credentials guard for the probe); `Admission::Open`
+    reachable with only XAA on (`with_only_xaa_configured_a_call_with_no_credential_is_refused`);
+    the `WWW-Authenticate` header dropped (`a_401_points_at_the_resource_metadata`);
+    the default of `TOKENFUSE_MCP_ACCEPT_XAA` read as on
+    (`xaadoor::tests::nothing_configured_is_off`,
+    `a_resource_set_while_xaa_is_off_refuses_to_start`; the HTTP-level
+    `xaa_off_leaves_an_authorization_bearer_request_exactly_as_before` does
+    NOT catch this ninth one, because it builds `BrokerState` directly rather
+    than through `from_env`/`from_values`, which is recorded here rather than
+    quietly fixed by relabelling the mutant table).)*
+
+    **Where it says nothing.** A revoked-and-reissued token replays for the
+    rest of its own TTL (at most 300s, vouchryx's own cap): there is no
+    replay cache on this path, the same asymmetry invariant 29 already
+    records for the delegation door. The JWKS is static: a vouchryx key
+    rotation needs a broker restart, same as `TOKENFUSE_DELEGATION_JWKS`
+    always has. `scope` is carried into `VerifiedAccess` and read by nobody:
+    no policy in this repository narrows by it yet. There is no `typ:
+    at+jwt` check, because vouchryx does not set one on the token it issues
+    (`internal/api/xaa.go`, read at the design stage; a follow-up once it
+    does). The event record never carries a proof for this door, by design,
+    not as a gap (see above), and one consequence is worth saying plainly: on
+    the record, an XAA-admitted call and a call whose chain was only claimed
+    in `x-fuse-on-behalf-of` look the same (the chain present, no
+    `delegation_proof`); what differs is the PDP's decision, because only the
+    PDP was told `chain_proven`. @measured end to end 2026-09-24 (vouchryx
+    b4497d8, wardryx 6080bad with `deny_if_chain_unproven` on the agent, this
+    broker, a mock MCP upstream): the same agent and tool through the static
+    key door with a claimed chain was denied, through an XAA token allowed,
+    and the two `tool_call` lines differ only in `decision` and `ts`, both
+    `agent-conform -chain` PASS. Recording the access token's `jti`, `iss` and
+    `client_id` beside the chain is an additive change to the event and a
+    cross-repository decision (agent-passport SPEC 5.2 or 6.2), not made
+    here. And the LLM proxy does not accept XAA: only the
+    MCP broker publishes RFC 9728 metadata and only `mcpbroker::handle` reads
+    `Authorization: Bearer` this way.

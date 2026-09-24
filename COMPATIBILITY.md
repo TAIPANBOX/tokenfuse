@@ -328,6 +328,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - the FinOps model router (TOKENFUSE_ROUTER, TOKENFUSE_ROUTER_RULES) and the semantic cache (TOKENFUSE_CACHE, TOKENFUSE_CACHE_EMBEDDER): the variable names are frozen, their rule syntax and the x-fuse-router / x-fuse-cache header values are not
 - TOKENFUSE_KEYS and TOKENFUSE_EVENTS appear in components.json and are read by nothing (a test fixture in clientkeys.rs and a hint string in firewallcli.rs); TOKENFUSE_VERSION and TOKENFUSE_GIT_SHA are build-time stamps, not configuration: none of the four is promised
 - the max_tokens clamp against the remaining budget that docs/02 ADR-4 describes does not exist (docs/26 section 8); the pre-flight estimate reads the field and never rewrites it
+- Cross App Access (TOKENFUSE_MCP_ACCEPT_XAA, TOKENFUSE_MCP_RESOURCE): the MCP broker's bearer door for a vouchryx-issued XAA access token and the RFC 9728 metadata it publishes while on; the grant is draft-ietf-oauth-identity-assertion-authz-grant-04, not a published RFC, and the shape may still move
 
 ## Support
 

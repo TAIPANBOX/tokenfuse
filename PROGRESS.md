@@ -302,17 +302,18 @@ comparison in #132.
 
 **Counts re-measured 2026-09-24**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1414 passing** (core 342, dpop 21, delegation 44,
-gateway 778, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew from 340 to
-342 and gateway from 765 to 778 on 2026-09-24 (invariant 61, W2a): two in
+`cargo test --all` runs **1476 passing** (core 342, dpop 21, delegation 60,
+gateway 824, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Two sibling branches off the same base landed the same day and are both counted here. Delegation grew from 44 to 60 (the sixtieth added in review: any `cnf` claim refuses an access token) and gateway grew by 46 (invariant 62, W3-tokenfuse): the MCP broker's XAA bearer door, `tokenfuse_delegation::verify_access_token`'s own fifteen tests in the delegation crate, and forty-six in the gateway crate (`xaadoor.rs`'s fourteen startup-refusal tests, `chainproof.rs`'s seven `base_config_from_values` tests, one in `mcpbroker.rs` for `something_on_the_door`, `tests/mcp_xaa.rs`'s twenty-two over the live HTTP door, `tests/xaa_startup.rs`'s two against the real binary). Core grew from 340 to
+342 and gateway grew by 13 more (invariant 61, W2a): two in
 `core::taint` for `declared_tool_defs_in` (both wire shapes, a 200-seed hostile
 sweep); three in `gateway::defaults` for `TOKENFUSE_TOOLS_PRUNE`'s parsing; ten
 in `crates/gateway/tests/shadow_tool_pruning.rs` for the shadow measurement
 wired into `proxy::messages` (one guard, `off_makes_no_filter_call`; five run
 red against the unfixed wiring first; two added in review, the round-once
 estimate and the unnamed agent, run red against the first commit; two for the
-filter cache, held by mutants).
+filter cache, held by mutants). Gateway's two deltas both count from the same
+765 baseline (46 + 13 = 59, landing at 824), not from one another.
 
 Gateway grew from 743 to 761 on 2026-09-18 (invariant 52, tokenfuse#293): seven in `unitledger::tests` and ten in `cloudsink::tests` for the seeded month and one in `proxy::tests` with the appliance's numbers. Before that, gateway grew from 736 to 743 on 2026-09-18 (invariant 53, tokenfuse#294): seven in `cloudsink::tests` for the retry queue that now holds a push the control plane cannot be reached for and replays it in order. Before that, gateway grew from 731 to 736 and cloud from 224 to 228 on 2026-09-18 (invariant 54, tokenfuse#295): three in `identitymap::tests` and two in `cloudsink::tests` for the owner on the wire, four in `cloud::store` for the owner fold. Cloud grew from 201 to 223 on
 2026-09-18 (invariant 60, tokenfuse#296): the run_stalled detector, nineteen in `cloud::store`,

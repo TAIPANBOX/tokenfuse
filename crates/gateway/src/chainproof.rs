@@ -261,7 +261,11 @@ pub fn proven_actor(chain: &Chain) -> Option<&str> {
 /// Order AND membership. Compared both ways on purpose: an equal-length
 /// reordering has the same set, and an extra name has the same prefix, so
 /// either comparison alone lets one of the two through.
-fn same_chain(a: &[String], b: &[String]) -> bool {
+///
+/// `pub(crate)` (not private): `mcpbroker`'s XAA door (W3-tokenfuse) reuses
+/// this exact rule for the same reason invariant 31 already states it once
+/// for the declared-vs-token chain, rather than keeping a second copy.
+pub(crate) fn same_chain(a: &[String], b: &[String]) -> bool {
     if a.len() != b.len() || a != b {
         return false;
     }
@@ -296,42 +300,76 @@ fn same_chain(a: &[String], b: &[String]) -> bool {
 /// verification and would silently get none, which is the failure that looks
 /// exactly like it is working. Same choice, and the same exit code, as
 /// `firewall::from_env` on a bad policy file.
-pub fn from_env() -> ChainProof {
+/// The pure decision, given the two values `from_env` would read and a way
+/// to read the file `jwks_path` names. Injected rather than read directly so
+/// every refusal message is a unit test rather than a startup-only path: a
+/// process-exiting function can only be proven by running the real binary
+/// (`tests/xaa_startup.rs` does that once, for the wiring), and every OTHER
+/// case belongs here instead.
+///
+/// `Ok(None)`: neither `issuer` nor `jwks_path` is set. `Ok(Some(cfg))`: both
+/// were usable; `cfg.audience` is left empty, the caller's to set. `Err`: set
+/// but unusable, and the caller's job is to print the message and exit(2).
+///
+/// Shared by `base_config_from_env` below (used by `from_env`, which
+/// additionally requires `TOKENFUSE_DELEGATION_URL`, needed only for a
+/// proof's `htu`) and by `xaadoor::from_values` (the MCP broker's XAA bearer
+/// door, W3-tokenfuse, which never checks a proof and so never needs an
+/// origin): without this split, turning XAA on would force an operator to
+/// also configure a variable XAA never reads.
+pub(crate) fn base_config_from_values(
+    issuer: &str,
+    jwks_path: &str,
+    read: impl FnOnce(&str) -> std::io::Result<String>,
+) -> Result<Option<DelegationConfig>, String> {
+    let issuer = issuer.trim();
+    let jwks_path = jwks_path.trim();
+    if issuer.is_empty() && jwks_path.is_empty() {
+        return Ok(None);
+    }
+    if issuer.is_empty() || jwks_path.is_empty() {
+        return Err(
+            "TOKENFUSE_DELEGATION_ISSUER and TOKENFUSE_DELEGATION_JWKS must be set together. \
+             One without the other cannot verify anything, and starting anyway would mean \
+             every delegation token is refused while the log says the door is on."
+                .to_string(),
+        );
+    }
+    let raw =
+        read(jwks_path).map_err(|e| format!("TOKENFUSE_DELEGATION_JWKS ({jwks_path}): {e}"))?;
+    let jwks = tokenfuse_delegation::parse_jwks(&raw)
+        .map_err(|e| format!("TOKENFUSE_DELEGATION_JWKS ({jwks_path}) is not a JWKS: {e}"))?;
+    if jwks.keys.is_empty() {
+        return Err(format!(
+            "TOKENFUSE_DELEGATION_JWKS ({jwks_path}) holds no keys, so every token would be \
+             refused by a door reporting itself as on."
+        ));
+    }
+    Ok(Some(DelegationConfig {
+        jwks,
+        issuer: issuer.to_string(),
+        audience: String::new(),
+    }))
+}
+
+/// The env+fs wrapper around [`base_config_from_values`]. Still non-exiting:
+/// both `from_env` and `xaadoor::from_env` call this and decide for
+/// themselves how to report an `Err` and under which variable's name.
+pub(crate) fn base_config_from_env() -> Result<Option<DelegationConfig>, String> {
     let issuer = std::env::var("TOKENFUSE_DELEGATION_ISSUER").unwrap_or_default();
     let jwks_path = std::env::var("TOKENFUSE_DELEGATION_JWKS").unwrap_or_default();
-    if issuer.trim().is_empty() && jwks_path.trim().is_empty() {
-        return None;
-    }
-    if issuer.trim().is_empty() || jwks_path.trim().is_empty() {
-        eprintln!(
-            "tokenfuse: TOKENFUSE_DELEGATION_ISSUER and TOKENFUSE_DELEGATION_JWKS must be \
-             set together. One without the other cannot verify anything, and starting \
-             anyway would mean every delegation token is refused while the log says the \
-             door is on."
-        );
-        std::process::exit(2);
-    }
-    let raw = match std::fs::read_to_string(&jwks_path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("tokenfuse: TOKENFUSE_DELEGATION_JWKS ({jwks_path}): {e}");
+    base_config_from_values(&issuer, &jwks_path, |p: &str| std::fs::read_to_string(p))
+}
+
+pub fn from_env() -> ChainProof {
+    let base = match base_config_from_env() {
+        Ok(None) => return None,
+        Ok(Some(cfg)) => cfg,
+        Err(msg) => {
+            eprintln!("tokenfuse: {msg}");
             std::process::exit(2);
         }
     };
-    let jwks = match tokenfuse_delegation::parse_jwks(&raw) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("tokenfuse: TOKENFUSE_DELEGATION_JWKS ({jwks_path}) is not a JWKS: {e}");
-            std::process::exit(2);
-        }
-    };
-    if jwks.keys.is_empty() {
-        eprintln!(
-            "tokenfuse: TOKENFUSE_DELEGATION_JWKS ({jwks_path}) holds no keys, so every \
-             token would be refused by a door reporting itself as on."
-        );
-        std::process::exit(2);
-    }
     let origin = std::env::var("TOKENFUSE_DELEGATION_URL").unwrap_or_default();
     if origin.trim().is_empty() {
         eprintln!(
@@ -343,9 +381,8 @@ pub fn from_env() -> ChainProof {
     }
     Some(Arc::new(Proving {
         cfg: DelegationConfig {
-            jwks,
-            issuer,
             audience: std::env::var("TOKENFUSE_DELEGATION_AUDIENCE").unwrap_or_default(),
+            ..base
         },
         origin,
     }))
@@ -631,5 +668,97 @@ mod tests {
                 "{leaf:?} was taken as an agent"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // base_config_from_values (W3-tokenfuse's correction 2: a pure function
+    // so every startup refusal is a unit test, not only a binary-level one)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn no_variables_set_is_ok_none() {
+        let result = base_config_from_values("", "", |_| unreachable!("must not read when unset"));
+        assert!(
+            matches!(result, Ok(None)),
+            "DelegationConfig derives neither PartialEq nor Debug, so this is a pattern match \
+             rather than assert_eq!"
+        );
+    }
+
+    #[test]
+    fn issuer_without_jwks_is_refused() {
+        let err = base_config_from_values("https://vouchryx.acme.example", "", |_| {
+            unreachable!("must not read a path that was never given")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("TOKENFUSE_DELEGATION_ISSUER")
+                && err.contains("TOKENFUSE_DELEGATION_JWKS"),
+            "message did not name both variables: {err}"
+        );
+    }
+
+    #[test]
+    fn jwks_without_issuer_is_refused() {
+        let err = base_config_from_values("", "/tmp/keys.json", |_| {
+            unreachable!("must not read when the issuer is missing")
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("TOKENFUSE_DELEGATION_ISSUER")
+                && err.contains("TOKENFUSE_DELEGATION_JWKS"),
+            "message did not name both variables: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_jwks_is_refused() {
+        let err =
+            base_config_from_values("https://vouchryx.acme.example", "/tmp/keys.json", |_| {
+                Ok("not json".to_string())
+            })
+            .unwrap_err();
+        assert!(err.contains("is not a JWKS"), "message was: {err}");
+    }
+
+    #[test]
+    fn a_jwks_file_that_cannot_be_read_is_refused() {
+        let err =
+            base_config_from_values("https://vouchryx.acme.example", "/tmp/keys.json", |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                ))
+            })
+            .unwrap_err();
+        assert!(err.contains("/tmp/keys.json"), "message was: {err}");
+    }
+
+    #[test]
+    fn a_jwks_with_no_keys_is_refused() {
+        let err =
+            base_config_from_values("https://vouchryx.acme.example", "/tmp/keys.json", |_| {
+                Ok(r#"{"keys": []}"#.to_string())
+            })
+            .unwrap_err();
+        assert!(err.contains("holds no keys"), "message was: {err}");
+    }
+
+    #[test]
+    fn both_set_and_usable_builds_a_config_with_an_empty_audience() {
+        let key = tokenfuse_delegation::testing::Key::new();
+        let raw = serde_json::json!({"keys": [key.jwk_value(Some("v-1"))]}).to_string();
+        let cfg =
+            base_config_from_values("https://vouchryx.acme.example", "/tmp/keys.json", |_| {
+                Ok(raw.clone())
+            })
+            .expect("both set and usable")
+            .expect("Some, not None");
+        assert_eq!(cfg.issuer, "https://vouchryx.acme.example");
+        assert_eq!(
+            cfg.audience, "",
+            "the caller sets the audience, not this function"
+        );
+        assert_eq!(cfg.jwks.keys.len(), 1);
     }
 }

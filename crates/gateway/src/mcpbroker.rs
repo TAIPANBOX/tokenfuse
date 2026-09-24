@@ -53,6 +53,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -178,6 +180,11 @@ pub struct BrokerState {
     /// the LLM path's own `failmode=open` and its `dependency_failed` with
     /// `effect: allowed_ungoverned`. `true` refuses instead.
     pub taint_failclosed: bool,
+    /// The third door (W3-tokenfuse, see [`crate::xaadoor`]): a vouchryx XAA
+    /// bearer access token. `None` (the default) leaves every
+    /// `Authorization: Bearer` request exactly as it was before this
+    /// existed.
+    pub xaa: crate::xaadoor::Xaa,
 }
 
 /// Per-request context the HTTP transport reads off headers and the stdio
@@ -237,10 +244,26 @@ pub fn app(state: Arc<BrokerState>) -> Router {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
-    Router::new()
+    let mut router = Router::new()
         .route("/", post(handle))
         .route("/mcp", post(handle))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(|| async { "ok" }));
+    // RFC 9728, only while XAA is on: off, these paths answer axum's own 404
+    // exactly as today, because they are never registered at all.
+    if let Some(xaa) = &state.xaa {
+        let body = crate::xaadoor::resource_metadata_body(xaa);
+        router = router.route(
+            "/.well-known/oauth-protected-resource",
+            get({
+                let body = body.clone();
+                move || async move { Json(body) }
+            }),
+        );
+        if let Some(suffixed) = crate::xaadoor::resource_metadata_path(&xaa.resource) {
+            router = router.route(&suffixed, get(move || async move { Json(body) }));
+        }
+    }
+    router
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
@@ -303,14 +326,24 @@ pub fn bind_exposure_warning(addr: &str, auth_configured: bool) -> Option<String
 ///
 /// One named answer, used for both [`bind_exposure_warning`] and
 /// [`refuse_open_bind`], because "is there anything on the door" is now a
-/// question about TWO variables and a call site that remembered only the older
-/// one would refuse to start a deployment whose door carries the STRONGER
-/// credential. That is not hypothetical: `auth_configured` meant
+/// question about THREE variables and a call site that remembered only the
+/// older ones would refuse to start a deployment whose door carries the
+/// STRONGEST credential, or would leave a bind open when XAA is the only
+/// thing configured. That is not hypothetical: `auth_configured` meant
 /// `TOKENFUSE_MCP_KEYS` alone until the proof door existed, and every reader of
 /// those two functions had that in their head.
+///
+/// `xaa_on` (W3-tokenfuse) is a plain `bool` rather than `&crate::xaadoor::Xaa`,
+/// because the only fact this function needs is presence, and a caller
+/// testing the loopback/open-bind cases without building a real `XaaDoor`
+/// should not have to.
 #[must_use]
-pub fn something_on_the_door(keys: &ClientKeys, clients: &crate::mcpdoor::ClientRegistry) -> bool {
-    keys.enabled() || clients.enabled()
+pub fn something_on_the_door(
+    keys: &ClientKeys,
+    clients: &crate::mcpdoor::ClientRegistry,
+    xaa_on: bool,
+) -> bool {
+    keys.enabled() || clients.enabled() || xaa_on
 }
 
 /// Whether `addr` ("host:port") names a loopback interface, for the startup
@@ -694,12 +727,131 @@ const IDENTITY_CONTRADICTION_RPC_MESSAGE: &str =
 /// DID present an identity, just not one (or a tool) the rule admits.
 const SECRET_SCOPE_RPC_CODE: i64 = -32008;
 
+/// The shared `401`, with `WWW-Authenticate` added when XAA is on
+/// (invariant 30's composition rule applied to the header: the shared
+/// function itself, `proxy::unauthorized_response`, is not touched, so the
+/// LLM proxy's own two call sites are unaffected).
+fn unauthorized(st: &BrokerState) -> Response {
+    let mut resp = crate::proxy::unauthorized_response();
+    if let Some(xaa) = &st.xaa {
+        if let Ok(v) = HeaderValue::from_str(&crate::xaadoor::www_authenticate_value(xaa)) {
+            resp.headers_mut().insert(WWW_AUTHENTICATE, v);
+        }
+    }
+    resp
+}
+
+/// `Authorization: Bearer <credential>`, trimmed, `None` if blank or if the
+/// scheme is not `bearer`. The scheme is matched case-insensitively (RFC
+/// 7235 section 2.1: `auth-scheme` is a token, and tokens are compared
+/// case-insensitively), unlike [`crate::chainproof::dpop_credential`]'s
+/// two-case check for `DPoP`/`dpop`, because that function only ever needs
+/// to agree with clients this codebase already controls the wording for,
+/// while a Bearer credential here comes from an arbitrary MCP client
+/// following the RFC. A scheme that is not bearer (`DPoP`, `Basic`, ...) is
+/// simply not matched here and falls through to the existing path unchanged.
+fn bearer_credential(authorization: Option<&str>) -> Option<String> {
+    let v = authorization?;
+    let space = v.find(' ')?;
+    let (scheme, rest) = v.split_at(space);
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let rest = rest.trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Invariant 51's refusal (`x-fuse-on-behalf-of` over `MAX_CHAIN_ENTRIES`),
+/// factored out so both the classic doors and the XAA door give the exact
+/// same 400 `on_behalf_of_over_cap` plus one `identity_mismatch` event,
+/// rather than one door's copy drifting from the other's.
+///
+/// `Ok(declared)` to proceed; `Err(response)` to return it immediately.
+///
+/// `Response` (axum's `http::Response<Body>`) is over clippy's 128-byte
+/// default, and boxing it would only move the cost to every caller that
+/// wants the body back out: this helper is called at most twice per
+/// request, from `handle` alone, never in a hot loop, so the size is not
+/// worth the indirection.
+#[allow(clippy::result_large_err)]
+fn declared_chain_or_refuse(
+    st: &BrokerState,
+    header: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, Response> {
+    match crate::chainproof::declared_chain(header("x-fuse-on-behalf-of").as_deref()) {
+        Ok(chain) => Ok(chain),
+        Err(over) => {
+            tracing::warn!(
+                entries = over.entries,
+                cap = crate::chainproof::MAX_CHAIN_ENTRIES,
+                "mcp broker: refused a call whose x-fuse-on-behalf-of carries more entries \
+                 than the Agent Passport chain holds"
+            );
+            let agent = header("x-fuse-agent-id")
+                .map(|h| h.trim().to_string())
+                .unwrap_or_default();
+            let run = header("x-fuse-run-id");
+            let outcome = st.events.emit(
+                EventType::IdentityMismatch,
+                crate::sink::now_millis(),
+                Some(&agent),
+                run.as_deref(),
+                None,
+                crate::proxy::on_behalf_of_over_cap_data("", &agent, over.entries),
+            );
+            crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+            Err(crate::proxy::on_behalf_of_over_cap(over.entries))
+        }
+    }
+}
+
+/// The identity checks and the forward, shared by every door that reaches
+/// this far: `handle`'s classic-door tail and its XAA branch both build a
+/// [`CallContext`] their own way and then call this once.
+async fn finish(st: &BrokerState, req: Value, ctx: CallContext) -> Response {
+    // Refused here rather than inside `process` so the answer is the LLM
+    // path's own 400, produced by the LLM path's own function. `process`
+    // refuses too (it is `pub` and stdio calls it directly); this only
+    // upgrades the refusal to the shape a caller of the HTTP transport
+    // already knows.
+    if needs_identity(st, &req, &ctx) {
+        tracing::warn!(
+            "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy gate \
+             cannot judge a call it cannot attribute"
+        );
+        return crate::proxy::identity_required();
+    }
+    // The HTTP shape of the contradiction, so a caller of this transport gets a
+    // 403 with both names rather than a JSON-RPC envelope. `process` still
+    // makes the record and answers stdio, and its check runs whichever way the
+    // call arrives: this only upgrades the refusal, the same way
+    // `needs_identity` above upgrades the no-identity one.
+    if identity_contradicted(&ctx) && st.identity_strict == crate::identitymap::StrictMode::Enforce
+    {
+        record_identity_contradiction(st, &ctx);
+        return crate::proxy::identity_contradicted(
+            attributed_agent(&ctx).unwrap_or_default(),
+            ctx.proven_actor.as_deref().unwrap_or_default(),
+        );
+    }
+    Json(process(st, req, &ctx).await).into_response()
+}
+
 /// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
 /// (agent-passport SPEC.md §3.2) so an event raised for this request can carry
 /// the required `agent_id` (without it, events are skipped, not fabricated),
 /// `X-Fuse-Mcp-Upstream` to pick a named upstream, and the delegation /
 /// attestation / approval headers the Wardryx gate forwards to the PDP.
+///
+/// # The XAA door (W3-tokenfuse), before and instead of the classic two
+///
+/// When [`BrokerState::xaa`] is on and the request carries a usable
+/// `Authorization: Bearer` credential, that credential alone judges this
+/// request: [`crate::mcpdoor::admit`] is never called and
+/// [`crate::chainproof::resolve`] is never consulted. See `crate::xaadoor`'s
+/// module doc for why this is a third door rather than a case of either
+/// existing one.
 async fn handle(
     State(st): State<Arc<BrokerState>>,
     uri: axum::http::Uri,
@@ -712,6 +864,84 @@ async fn handle(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
+    let now = crate::sink::now_millis() / 1000;
+
+    if let Some(xaa) = &st.xaa {
+        if let Some(credential) = bearer_credential(header("authorization").as_deref()) {
+            // Judged by this door ALONE: a second credential alongside it is
+            // not a fall-back opportunity, it is confusion or a probe, and
+            // `mcpdoor`'s own composition rule (invariant 30) already treats
+            // "presented a proof, judged by it" the same way one door over.
+            if header(CLIENT_KEY_HEADER).is_some() || header(crate::mcpdoor::PROOF_HEADER).is_some()
+            {
+                tracing::warn!(
+                    "mcp broker: refused a call presenting an XAA bearer token alongside \
+                     another credential"
+                );
+                return unauthorized(&st);
+            }
+            let verified = match tokenfuse_delegation::verify_access_token(
+                &xaa.cfg,
+                &credential,
+                now,
+                crate::revocations::hook(&st.revocations, now),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(reason = ?e, "mcp broker: refused an XAA bearer token");
+                    return unauthorized(&st);
+                }
+            };
+            // Order: the door judges first (above), then the same over-cap
+            // refusal every door gives (invariant 51), then the disagreement
+            // refusal (invariant 31) - never the other way, so a caller
+            // cannot use a garbage header to learn anything about a token
+            // this door has not yet verified.
+            let declared = match declared_chain_or_refuse(&st, &header) {
+                Ok(d) => d,
+                Err(resp) => return resp,
+            };
+            if !declared.is_empty() && !crate::chainproof::same_chain(&declared, &verified.chain) {
+                tracing::warn!("mcp broker: refused an XAA token whose declared chain disagreed");
+                return unauthorized(&st);
+            }
+            tracing::debug!(
+                agent = %verified.agent,
+                client_id = %verified.client_id,
+                "mcp broker: admitted by XAA bearer token"
+            );
+            // Identity from the credential (invariant 15's rule): the header
+            // when the caller sent a non-blank one, otherwise the token's own
+            // agent. Unlike the classic branch below, `agent_id` itself (not
+            // only `event_agent_id`) gets this fallback, because here the
+            // credential IS the strongest identity signal this request
+            // carries; a header naming a DIFFERENT agent still goes through
+            // the existing contradiction path in `finish`, unchanged.
+            let header_agent = header("x-fuse-agent-id")
+                .map(|h| h.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let ctx = CallContext {
+                agent_id: header_agent
+                    .clone()
+                    .or_else(|| Some(verified.agent.clone())),
+                proven_actor: Some(verified.agent.clone()),
+                event_agent_id: header_agent.or_else(|| Some(verified.agent.clone())),
+                upstream: header("x-fuse-mcp-upstream"),
+                run_id: header("x-fuse-run-id"),
+                on_behalf_of: verified.chain,
+                chain_proven: true,
+                // Never `Some`, even though `chain_proven` is true: SPEC 5.2's
+                // proof is holder-bound and a bearer token has no holder. See
+                // `crate::xaadoor`'s module doc and the invariant this change
+                // adds.
+                delegation_proof: None,
+                attestation_method: header("x-fuse-attestation-method"),
+                approval_token: header("x-fuse-approval-token"),
+            };
+            return finish(&st, req, ctx).await;
+        }
+    }
+
     // The broker's own door, before anything else looks at this request. An
     // unauthenticated caller must reach no vault, no upstream and no scanner.
     //
@@ -730,7 +960,7 @@ async fn handle(
         header(CLIENT_KEY_HEADER).as_deref(),
         header(crate::mcpdoor::PROOF_HEADER).as_deref(),
         uri.path(),
-        crate::sink::now_millis() / 1000,
+        now,
     ) {
         crate::mcpdoor::Admission::Refused(why) => {
             // Never echo what was presented, not even truncated, and never let
@@ -739,7 +969,17 @@ async fn handle(
             // it matters there because "your proof was replayed" and "no client
             // published that key" send somebody to different places.
             tracing::warn!(reason = ?why, "mcp broker: refused a call at the door");
-            return crate::proxy::unauthorized_response();
+            return unauthorized(&st);
+        }
+        // W3-tokenfuse: with XAA configured, a caller presenting none of the
+        // three door credentials must not be treated as "neither door is
+        // configured". A delegation token (`Authorization: DPoP` plus a
+        // `dpop` proof) is a CHAIN PROOF, not a door credential, so it does
+        // not open this door either: `chainproof::resolve` below still reads
+        // it, but only after this arm has already refused the request.
+        crate::mcpdoor::Admission::Open if st.xaa.is_some() => {
+            tracing::warn!("mcp broker: refused a call with no credential while XAA is configured");
+            return unauthorized(&st);
         }
         crate::mcpdoor::Admission::Proof(client_id) => {
             tracing::debug!(%client_id, "mcp broker: admitted by proof of possession");
@@ -750,37 +990,14 @@ async fn handle(
     // chain longer than SPEC 5.1 allows is refused here, before the chain is
     // resolved, the policy asked or the upstream reached, with the LLM path's
     // own 400 and one identity_mismatch carrying the length, not the chain.
-    let declared: Vec<String> =
-        match crate::chainproof::declared_chain(header("x-fuse-on-behalf-of").as_deref()) {
-            Ok(chain) => chain,
-            Err(over) => {
-                tracing::warn!(
-                    entries = over.entries,
-                    cap = crate::chainproof::MAX_CHAIN_ENTRIES,
-                    "mcp broker: refused a call whose x-fuse-on-behalf-of carries more entries \
-                     than the Agent Passport chain holds"
-                );
-                let agent = header("x-fuse-agent-id")
-                    .map(|h| h.trim().to_string())
-                    .unwrap_or_default();
-                let run = header("x-fuse-run-id");
-                let outcome = st.events.emit(
-                    EventType::IdentityMismatch,
-                    crate::sink::now_millis(),
-                    Some(&agent),
-                    run.as_deref(),
-                    None,
-                    crate::proxy::on_behalf_of_over_cap_data("", &agent, over.entries),
-                );
-                crate::events::log_outcome(EventType::IdentityMismatch, outcome);
-                return crate::proxy::on_behalf_of_over_cap(over.entries);
-            }
-        };
+    let declared = match declared_chain_or_refuse(&st, &header) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
 
     // Who this caller acts FOR, and whether anybody proved it. The rule is in
     // `chainproof` because the LLM proxy applies the same one, and a rule
     // written twice becomes two rules.
-    let now = crate::sink::now_millis() / 1000;
     let resolved = crate::chainproof::resolve(
         &st.chain_proof,
         crate::chainproof::dpop_credential(header("authorization").as_deref()),
@@ -797,7 +1014,7 @@ async fn handle(
             // The same 401 the door gives, for the same reason: which refusal
             // it was is an oracle, and the operator's log is where it belongs.
             tracing::warn!(reason = ?why, "mcp broker: refused a delegation token");
-            return crate::proxy::unauthorized_response();
+            return unauthorized(&st);
         }
         crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
         crate::chainproof::Chain::Claimed(chain) => (chain, None),
@@ -827,33 +1044,7 @@ async fn handle(
         attestation_method: header("x-fuse-attestation-method"),
         approval_token: header("x-fuse-approval-token"),
     };
-    // Refused here rather than inside `process` so the answer is the LLM
-    // path's own 400, produced by the LLM path's own function. `process`
-    // refuses too (it is `pub` and stdio calls it directly); this only
-    // upgrades the refusal to the shape a caller of the HTTP transport
-    // already knows.
-    if needs_identity(&st, &req, &ctx) {
-        tracing::warn!(
-            "mcp broker: refusing a tools/call with no x-fuse-agent-id, the policy gate \
-             cannot judge a call it cannot attribute"
-        );
-        return crate::proxy::identity_required();
-    }
-
-    // The HTTP shape of the contradiction, so a caller of this transport gets a
-    // 403 with both names rather than a JSON-RPC envelope. `process` still
-    // makes the record and answers stdio, and its check runs whichever way the
-    // call arrives: this only upgrades the refusal, the same way
-    // `needs_identity` above upgrades the no-identity one.
-    if identity_contradicted(&ctx) && st.identity_strict == crate::identitymap::StrictMode::Enforce
-    {
-        record_identity_contradiction(&st, &ctx);
-        return crate::proxy::identity_contradicted(
-            attributed_agent(&ctx).unwrap_or_default(),
-            ctx.proven_actor.as_deref().unwrap_or_default(),
-        );
-    }
-    Json(process(&st, req, &ctx).await).into_response()
+    finish(&st, req, ctx).await
 }
 
 /// Resolve which upstream URL this request forwards to. A named upstream
@@ -1830,16 +2021,16 @@ mod tests {
             "https://mcp.acme.example",
         )
         .expect("a usable client spec");
-        assert!(!something_on_the_door(&no_keys, &no_clients));
-        assert!(something_on_the_door(&keys, &no_clients));
+        assert!(!something_on_the_door(&no_keys, &no_clients, false));
+        assert!(something_on_the_door(&keys, &no_clients, false));
         assert!(
-            something_on_the_door(&no_keys, &clients),
+            something_on_the_door(&no_keys, &clients, false),
             "a proof door with no shared secret beside it is still a door"
         );
         assert_eq!(
             refuse_open_bind(
                 "0.0.0.0:4200",
-                something_on_the_door(&no_keys, &clients),
+                something_on_the_door(&no_keys, &clients, false),
                 false
             ),
             None,
@@ -1849,17 +2040,41 @@ mod tests {
         // And the refusal follows from it, which is the only reason it matters.
         assert!(refuse_open_bind(
             "0.0.0.0:4200",
-            something_on_the_door(&no_keys, &no_clients),
+            something_on_the_door(&no_keys, &no_clients, false),
             false
         )
         .is_some());
         assert_eq!(
             refuse_open_bind(
                 "0.0.0.0:4200",
-                something_on_the_door(&keys, &no_clients),
+                something_on_the_door(&keys, &no_clients, false),
                 false
             ),
             None
+        );
+    }
+
+    /// W3-tokenfuse: XAA is a third way to put something on the door, counted
+    /// even when neither of the other two is configured, which is what makes
+    /// `refuse_open_bind` stop refusing a non-loopback bind whose only door
+    /// is XAA.
+    #[test]
+    fn something_on_the_door_counts_the_xaa_door() {
+        let no_keys = ClientKeys::default();
+        let no_clients = crate::mcpdoor::ClientRegistry::default();
+        assert!(!something_on_the_door(&no_keys, &no_clients, false));
+        assert!(
+            something_on_the_door(&no_keys, &no_clients, true),
+            "XAA alone must count as something on the door"
+        );
+        assert_eq!(
+            refuse_open_bind(
+                "0.0.0.0:4200",
+                something_on_the_door(&no_keys, &no_clients, true),
+                false
+            ),
+            None,
+            "a non-loopback bind whose only door is XAA must not be refused"
         );
     }
 

@@ -99,6 +99,38 @@ pub fn token(issuer: &Key, holder: &Key, now: i64, over: serde_json::Value) -> S
     )
 }
 
+/// A client_id shaped like CIMD names one: an https URL. vouchryx's own
+/// XAA clients are `client_id|agent://...|sha256:...` lines
+/// (`internal/api/xaa.go`); the value itself is opaque to tokenfuse, so any
+/// non-empty string would do, and this shape is chosen for a reader who sees
+/// it in a test failure.
+pub const XAA_CLIENT_ID: &str = "https://client.acme.example/agent";
+
+/// Mint a token shaped like vouchryx's XAA access-token response
+/// (`internal/api/xaa.go`'s `tokenJWTBearer`): `sub` a user, `act` one agent
+/// actor, `client_id` set, no `cnf` unless `over` adds one.
+pub fn access_token(issuer: &Key, now: i64, over: serde_json::Value) -> String {
+    let mut claims = serde_json::json!({
+        "iss": ISS, "sub": "user://acme/alice", "aud": AUD,
+        "iat": now, "exp": now + 300, "jti": "at-1",
+        "client_id": XAA_CLIENT_ID,
+        "act": {"sub": "agent://acme/triage"},
+    });
+    if let serde_json::Value::Object(o) = over {
+        for (k, v) in o {
+            if v.is_null() {
+                claims.as_object_mut().unwrap().remove(&k);
+            } else {
+                claims[k] = v;
+            }
+        }
+    }
+    issuer.sign(
+        serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": "v-1"}),
+        claims,
+    )
+}
+
 pub fn proof(holder: &Key, now: i64) -> String {
     proof_at(holder, now, "POST", URL, "p1")
 }
