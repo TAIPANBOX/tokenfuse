@@ -545,10 +545,27 @@ async fn mcp_broker() {
             "mcp broker proof door: ON"
         );
     }
-    // "Is there anything on the door" is a question about both variables now.
-    // Asked once, here, so the two bind conditions below cannot answer it
-    // differently: see `mcpbroker::something_on_the_door`.
-    let door_configured = tokenfuse_gateway::mcpbroker::something_on_the_door(&keys, &clients);
+    // The third door (W3-tokenfuse): a vouchryx XAA bearer access token.
+    // process-local: the LLM proxy is not an OAuth protected resource at
+    // this level (only the MCP broker publishes RFC 9728 metadata), so this
+    // door is read here and nowhere else.
+    let xaa = tokenfuse_gateway::xaadoor::from_env();
+    if let Some(refusal) =
+        tokenfuse_gateway::xaadoor::refuse_xaa_with_require_proof(xaa.is_some(), require_proof)
+    {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
+    if xaa.is_some() {
+        tracing::info!(
+            "mcp broker XAA door: ON, TOKENFUSE_MCP_RESOURCE names this broker's resource"
+        );
+    }
+    // "Is there anything on the door" is a question about three variables
+    // now. Asked once, here, so the two bind conditions below cannot answer
+    // it differently: see `mcpbroker::something_on_the_door`.
+    let door_configured =
+        tokenfuse_gateway::mcpbroker::something_on_the_door(&keys, &clients, xaa.is_some());
     // Agent-event NDJSON export (agent-passport SPEC.md §6): the mcp-broker is
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
@@ -599,6 +616,7 @@ async fn mcp_broker() {
             .ok()
             .filter(|v| !v.trim().is_empty()),
         taint_failclosed: std::env::var("TOKENFUSE_MCP_TAINT_FAILMODE").as_deref() == Ok("closed"),
+        xaa,
     });
     if stdio {
         tracing::info!(%upstream, "mcp credential-broker on stdio");

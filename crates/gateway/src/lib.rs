@@ -51,6 +51,7 @@ pub mod unitledger;
 pub mod wardryx;
 pub mod wasmpolicy;
 pub mod wire;
+pub mod xaadoor;
 
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;

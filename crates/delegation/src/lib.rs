@@ -51,6 +51,7 @@
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 /// Re-exported so this module's public surface is unchanged by the move. The
@@ -113,6 +114,7 @@ pub struct VerifiedDelegation {
 }
 
 /// Everything the process already holds. No client, no URL, no timeout.
+#[derive(Debug)]
 pub struct DelegationConfig {
     pub jwks: JwkSet,
     /// The exact `iss` required. Not a prefix: a prefix is how a service ends
@@ -194,15 +196,29 @@ const MAX_ACTORS_WITH_SUBJECT: usize = MAX_CHAIN_ENTRIES - 1;
 /// false, which is a caller deciding that a valid signature is enough.
 /// [`revocations::Revocations::hook`] is the closure for a caller that has not
 /// decided that.
-pub fn verify_delegation(
+/// The decode path every verifier in this file shares: header, `kid`, key,
+/// algorithm, signature, `iss`, `aud`, deserialize. Factored out of
+/// `verify_delegation`'s original body (invariant 29's own rule applied one
+/// level down: verbatim is two things that agree today, a shared function is
+/// two things that cannot disagree tomorrow).
+///
+/// `require_audience` is the one axis the two callers disagree on.
+/// `verify_delegation` accepts an empty `cfg.audience` as "any audience", a
+/// real choice for a single-tenant deployment. `verify_access_token` must
+/// not: an operator who has not configured `TOKENFUSE_MCP_RESOURCE` must not
+/// have every resource accepted, so an empty audience there is refused
+/// outright rather than read as permissive.
+///
+/// `T` carries no `iss`/`aud` field, on purpose: `Validation` checks both
+/// against the raw claims independent of what the target struct names, which
+/// is provable rather than assumed, since `DelegationClaims` has never
+/// carried either and `a_token_from_another_issuer_or_for_another_audience_is_refused`
+/// has passed since this file was written.
+fn decode_claims<T: DeserializeOwned>(
     cfg: &DelegationConfig,
     token: &str,
-    proof: Option<&str>,
-    method: &str,
-    url: &str,
-    now: i64,
-    revoked: impl Fn(&str, &str, i64) -> bool,
-) -> Result<VerifiedDelegation, Refusal> {
+    require_audience: bool,
+) -> Result<T, Refusal> {
     let header = decode_header(token).map_err(|_| Refusal::Malformed)?;
     let kid = header.kid.ok_or(Refusal::Malformed)?;
     let jwk = cfg.jwks.find(&kid).ok_or(Refusal::BadSignature)?;
@@ -213,23 +229,39 @@ pub fn verify_delegation(
 
     let mut validation = Validation::new(algorithms[0]);
     validation.algorithms = algorithms;
-    validation.validate_exp = false; // checked below against the injected clock
+    validation.validate_exp = false; // checked by the caller against the injected clock
     validation.set_required_spec_claims(&["exp", "iss"]);
     validation.set_issuer(&[&cfg.issuer]);
     if cfg.audience.is_empty() {
+        if require_audience {
+            return Err(Refusal::Audience);
+        }
         validation.validate_aud = false;
     } else {
         validation.set_audience(&[&cfg.audience]);
     }
-    let data = decode::<DelegationClaims>(token, &key, &validation).map_err(|e| {
-        use jsonwebtoken::errors::ErrorKind;
-        match e.kind() {
-            ErrorKind::InvalidIssuer => Refusal::Issuer,
-            ErrorKind::InvalidAudience => Refusal::Audience,
-            _ => Refusal::BadSignature,
-        }
-    })?;
-    let claims = data.claims;
+    decode::<T>(token, &key, &validation)
+        .map(|d| d.claims)
+        .map_err(|e| {
+            use jsonwebtoken::errors::ErrorKind;
+            match e.kind() {
+                ErrorKind::InvalidIssuer => Refusal::Issuer,
+                ErrorKind::InvalidAudience => Refusal::Audience,
+                _ => Refusal::BadSignature,
+            }
+        })
+}
+
+pub fn verify_delegation(
+    cfg: &DelegationConfig,
+    token: &str,
+    proof: Option<&str>,
+    method: &str,
+    url: &str,
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+) -> Result<VerifiedDelegation, Refusal> {
+    let claims: DelegationClaims = decode_claims(cfg, token, false)?;
 
     if now >= claims.exp {
         return Err(Refusal::Expired);
@@ -282,6 +314,139 @@ pub fn verify_delegation(
         jti: claims.jti,
         issued_at: claims.iat,
         expires_at: claims.exp,
+    })
+}
+
+/// What an enforcement point may rely on after a successful check of a
+/// vouchryx Cross App Access (XAA) bearer access token (block A6, W3-tokenfuse).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAccess {
+    /// `sub`: the user this token is for (vouchryx mints
+    /// `user://<lowercase IdP host>/<IdP sub>`).
+    pub subject: String,
+    /// The chain's last entry: the one actor an XAA access token names, always
+    /// `agent://...`. Kept alongside `chain` rather than making a caller find
+    /// it, the same reason `chainproof::proven_actor` exists one plane over.
+    pub agent: String,
+    /// `[subject] + reverse(act)`, the same assembly `VerifiedDelegation::chain`
+    /// documents.
+    pub chain: Vec<String>,
+    /// Non-empty by construction: this is what an exchange (delegation) token
+    /// never carries, so a delegation token can never be replayed as one.
+    pub client_id: String,
+    pub jti: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccessTokenClaims {
+    #[serde(default)]
+    sub: String,
+    #[serde(default)]
+    jti: String,
+    #[serde(default)]
+    iat: i64,
+    exp: i64,
+    #[serde(default)]
+    cnf: Option<Confirmation>,
+    #[serde(default)]
+    act: Option<Act>,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Verify a vouchryx Cross App Access (XAA) bearer access token.
+///
+/// Shares [`verify_delegation`]'s decode path ([`decode_claims`]) and its
+/// chain assembly ([`chain_of`]), and differs in shape rather than in
+/// mechanism: an access token carries `client_id` (an exchange token never
+/// does) and must never carry `cnf.jkt` (a bound token presented here has
+/// been downgraded to bearer, invariant 29's rule applied to a token this
+/// door never receives a proof for at all).
+///
+/// There is deliberately no `proof`/`method`/`url` parameter, unlike
+/// `verify_delegation`. The MCP broker's XAA door is bearer-only by
+/// construction: a request carrying a `dpop` header alongside
+/// `Authorization: Bearer` is refused before this function is ever called
+/// (two credentials), so a proof never reaches this path and a token
+/// claiming to need one (`cnf.jkt` present) is always a downgrade.
+///
+/// Order, cheapest first: `kid`/key/algorithm/signature (inside
+/// `decode_claims`), `iss` and `aud` (also inside `decode_claims`, `aud`
+/// REQUIRED, an empty configured resource is a refusal rather than "accept
+/// any"), `exp` against the injected clock, `sub` and `jti` non-empty,
+/// `client_id` non-empty, `cnf.jkt` absent, `act` present and its chain
+/// (`[sub] + reverse(act)`) at least two entries long and ending in an
+/// `agent://` entry (a token with no actor names a person, and a person is
+/// not an agent), then `revoked` for every chain entry, root first
+/// (invariant 48).
+pub fn verify_access_token(
+    cfg: &DelegationConfig,
+    token: &str,
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+) -> Result<VerifiedAccess, Refusal> {
+    let claims: AccessTokenClaims = decode_claims(cfg, token, true)?;
+
+    if now >= claims.exp {
+        return Err(Refusal::Expired);
+    }
+    if claims.sub.is_empty() || claims.jti.is_empty() {
+        return Err(Refusal::Malformed);
+    }
+    // THE STEP THAT MAKES THIS AN ACCESS TOKEN AND NOT AN EXCHANGE TOKEN.
+    // vouchryx's RFC 8693 exchange (delegation) tokens never carry `client_id`;
+    // its XAA access tokens always do. Without this check, a delegation token
+    // minted for the LLM proxy's chain-proof door could be replayed here as a
+    // bearer credential.
+    if claims.client_id.is_empty() {
+        return Err(Refusal::Malformed);
+    }
+    // A bound token presented with no proof is a downgrade, and this door
+    // never has a proof to offer: unlike `verify_delegation`, there is no
+    // `proof` parameter at all, so `cnf.jkt` being present is unconditionally
+    // a refusal rather than something checked against a presented key.
+    if claims.cnf.as_ref().is_some_and(|c| !c.jkt.is_empty()) {
+        return Err(Refusal::NoProof);
+    }
+    if claims.act.is_none() {
+        return Err(Refusal::Malformed);
+    }
+    let chain = chain_of(&claims.sub, claims.act.as_ref())?;
+    let is_agent = |leaf: &str| {
+        leaf.strip_prefix("agent://")
+            .is_some_and(|rest| !rest.is_empty())
+    };
+    if chain.len() < 2 || !chain.last().is_some_and(|leaf| is_agent(leaf)) {
+        return Err(Refusal::Malformed);
+    }
+
+    // The chain is read BEFORE the list is asked, same reason and same order
+    // as `verify_delegation`: a subject revocation names a PARTY, and asking
+    // about every entry, root first, is invariant 48's rule.
+    for party in &chain {
+        if revoked(&claims.jti, party, claims.iat) {
+            return Err(Refusal::Revoked);
+        }
+    }
+
+    let agent = chain
+        .last()
+        .expect("checked above: at least two entries")
+        .clone();
+    Ok(VerifiedAccess {
+        subject: claims.sub,
+        agent,
+        chain,
+        client_id: claims.client_id,
+        jti: claims.jti,
+        issued_at: claims.iat,
+        expires_at: claims.exp,
+        scope: claims.scope,
     })
 }
 
@@ -1099,6 +1264,309 @@ mod tests {
                     panic!("{name}: the table names a verdict this test does not know: {other}")
                 }
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // verify_access_token (W3-tokenfuse: the MCP broker's XAA bearer door)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn an_access_token_verifies_and_names_its_agent() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let v = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({})),
+            now,
+            never,
+        )
+        .expect("a good access token");
+        assert_eq!(v.subject, "user://acme/alice");
+        assert_eq!(v.agent, "agent://acme/triage");
+        assert_eq!(v.chain, vec!["user://acme/alice", "agent://acme/triage"]);
+        assert_eq!(v.client_id, XAA_CLIENT_ID);
+        assert_eq!(v.jti, "at-1");
+        assert_eq!(v.issued_at, now);
+        assert_eq!(v.expires_at, now + 300);
+        assert_eq!(v.scope, None);
+    }
+
+    #[test]
+    fn an_access_tokens_scope_is_carried_into_verified_access() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let v = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({"scope": "read"})),
+            now,
+            never,
+        )
+        .expect("a good access token");
+        assert_eq!(v.scope, Some("read".to_string()));
+    }
+
+    /// `require_audience: true` for this function: an empty configured
+    /// resource must never read as "accept any", the opposite of
+    /// `verify_delegation`'s own choice for an empty `TOKENFUSE_DELEGATION_AUDIENCE`.
+    #[test]
+    fn an_empty_configured_resource_refuses_every_access_token() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let mut c = cfg(&issuer);
+        c.audience = String::new();
+        let err = verify_access_token(
+            &c,
+            &access_token(&issuer, now, serde_json::json!({})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Audience);
+    }
+
+    /// Mutant #2 from the W3-tokenfuse brief: `aud` compared by prefix rather
+    /// than exactly. The token's `aud` (`AUD`) is a strict PREFIX of the
+    /// configured resource, never equal to it.
+    #[test]
+    fn an_audience_that_is_only_a_prefix_match_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let mut c = cfg(&issuer);
+        c.audience = format!("{AUD}/mcp");
+        let err = verify_access_token(
+            &c,
+            &access_token(&issuer, now, serde_json::json!({})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Audience);
+    }
+
+    #[test]
+    fn an_expired_access_token_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({"exp": now - 1})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Expired);
+    }
+
+    #[test]
+    fn an_access_token_from_another_issuer_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(
+                &issuer,
+                now,
+                serde_json::json!({"iss": "https://evil.example"}),
+            ),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Issuer);
+    }
+
+    /// Mutant #4: `client_id` requirement dropped. This is what makes the
+    /// token an access token rather than an exchange (delegation) token: a
+    /// token minted by `verify_delegation`'s own fixture has no `client_id`
+    /// at all and must be refused here too (see also
+    /// `an_exchange_token_shaped_delegation_token_is_refused_as_an_access_token`
+    /// below, the HTTP-level twin of this same rule).
+    #[test]
+    fn an_access_token_with_no_client_id_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({"client_id": null})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Malformed);
+    }
+
+    /// A real vouchryx delegation (exchange) token, minted by
+    /// `verify_delegation`'s own fixture, presented at the access-token door:
+    /// it carries no `client_id` (checked first, per the order the brief
+    /// fixes) and also `cnf.jkt` (vouchryx binds every exchange token, which
+    /// would refuse it on its own too, see
+    /// `a_bound_access_token_with_no_proof_is_refused`), so this is refused
+    /// as `Malformed` before the `cnf` check is even reached.
+    #[test]
+    fn an_exchange_token_is_refused_as_an_access_token() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let exchange_tok = token(&issuer, &holder, now, serde_json::json!({}));
+        let err = verify_access_token(&cfg(&issuer), &exchange_tok, now, never).unwrap_err();
+        assert_eq!(err, Refusal::Malformed);
+    }
+
+    /// Mutant #3: `cnf` bound token accepted. There is no `proof` parameter on
+    /// this function at all (unlike `verify_delegation`), so a `cnf.jkt`
+    /// present on the token is unconditionally a downgrade.
+    #[test]
+    fn a_bound_access_token_with_no_proof_is_refused() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let jkt = tokenfuse_dpop::thumbprint(
+            &serde_json::from_value(holder.jwk_value(None)).expect("a jwk"),
+        )
+        .expect("a thumbprint");
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({"cnf": {"jkt": jkt}})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::NoProof);
+    }
+
+    #[test]
+    fn an_access_token_with_no_actor_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(&issuer, now, serde_json::json!({"act": null})),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Malformed);
+    }
+
+    /// A token with no `act` names a person, and a person is not an agent:
+    /// this is the same fact `chainproof::proven_actor` states one plane
+    /// over, checked here at the point the chain is assembled rather than
+    /// afterward.
+    #[test]
+    fn an_access_tokens_actor_that_is_a_person_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let err = verify_access_token(
+            &cfg(&issuer),
+            &access_token(
+                &issuer,
+                now,
+                serde_json::json!({"act": {"sub": "user://acme/eve"}}),
+            ),
+            now,
+            never,
+        )
+        .unwrap_err();
+        assert_eq!(err, Refusal::Malformed);
+    }
+
+    /// Mutant #5: revocation asked about the root only. Naming the AGENT
+    /// (chain[1], never the subject at chain[0]) must still refuse: an
+    /// implementation that only asks about `chain[0]` would miss every case
+    /// here. Seeded sweep, the same shape as `verify_delegation`'s own
+    /// `a_revocation_naming_any_party_in_the_chain_refuses_the_token`.
+    #[test]
+    fn a_revocation_naming_the_agent_in_an_access_tokens_chain_refuses_it() {
+        let (issuer, now) = (Key::new(), 1_800_000_000_i64);
+        for i in 0..200 {
+            let agent = format!("agent://acme/a{i}");
+            let tok = access_token(
+                &issuer,
+                now,
+                serde_json::json!({"act": {"sub": agent}, "jti": format!("at-{i}")}),
+            );
+            // Naming the agent: refused, regardless of which of the two
+            // chain entries the caller of `revoked` is asked about, so long
+            // as the loop does not stop at the subject alone.
+            let revoked_agent = |_: &str, sub: &str, _: i64| sub == agent;
+            assert_eq!(
+                verify_access_token(&cfg(&issuer), &tok, now, revoked_agent).map(|_| ()),
+                Err(Refusal::Revoked),
+                "case {i}: revoking the agent {agent:?} was not honoured"
+            );
+            // Naming a stranger: honoured.
+            assert!(
+                verify_access_token(&cfg(&issuer), &tok, now, |_, sub: &str, _| sub
+                    == "agent://acme/stranger")
+                .is_ok(),
+                "case {i}: a revocation naming a stranger refused the token"
+            );
+        }
+    }
+
+    #[test]
+    fn an_access_token_with_alg_none_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let header = b64(br#"{"alg":"none","typ":"JWT","kid":"v-1"}"#);
+        let claims = b64(serde_json::json!({
+            "iss": ISS, "sub": "user://acme/alice", "aud": AUD,
+            "iat": now, "exp": now + 300, "jti": "at-none",
+            "client_id": XAA_CLIENT_ID, "act": {"sub": "agent://acme/triage"},
+        })
+        .to_string()
+        .as_bytes());
+        let forged = format!("{header}.{claims}.");
+        let err = verify_access_token(&cfg(&issuer), &forged, now, never).unwrap_err();
+        assert_eq!(
+            err,
+            Refusal::Malformed,
+            "an alg:none header must never reach key selection at all"
+        );
+    }
+
+    /// Mutant territory for invariant 29's rule applied to this path: the
+    /// algorithm comes from the KEY (an EC key here, so ES256/ES384 only),
+    /// never from the header, so a header claiming HS256 and "signed" with
+    /// the issuer's own PUBLIC key bytes as an HMAC secret must be refused
+    /// before that secret is ever used.
+    #[test]
+    fn an_access_token_signed_hs256_with_the_public_key_as_secret_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("v-1".to_string());
+        let claims = serde_json::json!({
+            "iss": ISS, "sub": "user://acme/alice", "aud": AUD,
+            "iat": now, "exp": now + 300, "jti": "at-hs256",
+            "client_id": XAA_CLIENT_ID, "act": {"sub": "agent://acme/triage"},
+        });
+        let secret = issuer.jwk_value(None).to_string();
+        let forged = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("jsonwebtoken can encode HS256 with an arbitrary secret");
+        let err = verify_access_token(&cfg(&issuer), &forged, now, never).unwrap_err();
+        assert_eq!(err, Refusal::BadSignature);
+    }
+
+    /// T3's hostile-input layer: neither pure noise nor a plausible
+    /// three-part shape may ever panic this function. A panic here IS the
+    /// test failing; there is no separate assertion to write.
+    #[test]
+    fn two_hundred_hostile_bearer_strings_never_panic_verify_access_token() {
+        let (issuer, now) = (Key::new(), 1_800_000_000_i64);
+        let mut seed: u64 = 20260924;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..200 {
+            let len = 1 + (next() % 512) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() % 256) as u8).collect();
+            let candidate = if i % 2 == 0 {
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                let a = len / 3;
+                let b = 2 * len / 3;
+                format!(
+                    "{}.{}.{}",
+                    b64(&bytes[..a]),
+                    b64(&bytes[a..b]),
+                    b64(&bytes[b..])
+                )
+            };
+            let _ = verify_access_token(&cfg(&issuer), &candidate, now, never);
         }
     }
 }
