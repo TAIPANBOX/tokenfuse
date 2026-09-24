@@ -302,12 +302,13 @@ comparison in #132.
 
 **Counts re-measured 2026-09-24**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1500 passing** (core 356, dpop 21, delegation 60,
+`cargo test --all` runs **1503 passing** (core 359, dpop 21, delegation 60,
 gateway 834, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by
-fourteen more (invariant 64): `crates/core/src/cache.rs`'s
-`SemanticCache::get`/`put` were rewritten around an exact-match index and
-an `RwLock`, and the fourteen new tests are
+seventeen more (invariant 64): `crates/core/src/cache.rs`'s
+`SemanticCache::get`/`put` were rewritten around an exact-match index, an
+`RwLock`, a dense `Vec`-backed partition and amortised O(1) eviction/TTL
+sweeping (two review rounds), and the seventeen new tests are
 `identical_core_twice_replaces_not_appends`,
 `an_exact_hit_never_walks_similarity`,
 `a_miss_still_falls_through_to_the_similarity_walk`,
@@ -315,15 +316,19 @@ an `RwLock`, and the fourteen new tests are
 `an_expired_exact_entry_is_not_served`,
 `expired_entries_disappear_after_a_put`, `zero_vector_embedding_never_matches`,
 `eviction_keeps_the_exact_index_in_step`,
+`a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`,
+`a_refreshed_entry_moves_to_the_back_of_fifo_order_not_out_of_it`,
 `entity_and_length_guards_still_apply_on_the_similarity_path`,
+`entity_guard_blocks_a_near_identical_pair_that_would_otherwise_hit`,
 `threshold_boundary_is_inclusive_on_the_similarity_path`,
 `a_similarity_just_under_the_threshold_never_hits`,
 `the_query_is_normalized_before_the_similarity_walk`,
 `concurrent_get_and_put_never_deadlock_or_cross_wires`, and
 `shadow_mode_still_records_and_reports_would_hits` (which replaces the old
 `shadow_mode_still_never_serves`, corrected to match `get`'s actual
-mode contract). One further ignored, timing-only test
-(`get_cost_at_10k_entries`) is not counted here. Two sibling branches off the same base landed the same day and are both counted here. Delegation grew from 44 to 60 (the sixtieth added in review: any `cnf` claim refuses an access token) and gateway grew by 46 (invariant 62, W3-tokenfuse): the MCP broker's XAA bearer door, `tokenfuse_delegation::verify_access_token`'s own fifteen tests in the delegation crate, and forty-six in the gateway crate (`xaadoor.rs`'s fourteen startup-refusal tests, `chainproof.rs`'s seven `base_config_from_values` tests, one in `mcpbroker.rs` for `something_on_the_door`, `tests/mcp_xaa.rs`'s twenty-two over the live HTTP door, `tests/xaa_startup.rs`'s two against the real binary). Core grew from 340 to
+mode contract). Three further ignored, timing-only tests
+(`get_cost_at_10k_entries`, `put_cost_at_10k_entries`,
+`steady_state_shadow_loop_throughput`) are not counted here. Two sibling branches off the same base landed the same day and are both counted here. Delegation grew from 44 to 60 (the sixtieth added in review: any `cnf` claim refuses an access token) and gateway grew by 46 (invariant 62, W3-tokenfuse): the MCP broker's XAA bearer door, `tokenfuse_delegation::verify_access_token`'s own fifteen tests in the delegation crate, and forty-six in the gateway crate (`xaadoor.rs`'s fourteen startup-refusal tests, `chainproof.rs`'s seven `base_config_from_values` tests, one in `mcpbroker.rs` for `something_on_the_door`, `tests/mcp_xaa.rs`'s twenty-two over the live HTTP door, `tests/xaa_startup.rs`'s two against the real binary). Core grew from 340 to
 342 and gateway grew by 13 more (invariant 61, W2a): two in
 `core::taint` for `declared_tool_defs_in` (both wire shapes, a 200-seed hostile
 sweep); three in `gateway::defaults` for `TOKENFUSE_TOOLS_PRUNE`'s parsing; ten

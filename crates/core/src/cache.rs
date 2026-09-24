@@ -28,14 +28,32 @@
 //! is a second, cryptographically strong check. An exact hit costs no
 //! embedding call and no similarity walk at all. Only a request whose core
 //! text has never been seen before in that partition falls through to the
-//! similarity walk, unchanged in shape from before.
+//! similarity walk.
 //!
 //! `put` of a core that already exists in its partition **replaces** that
-//! entry (new response, cost, `created_millis`) rather than appending a
-//! duplicate, so identical traffic no longer grows a partition without
-//! bound. Eviction at the `max_per_partition` cap is O(1) via a `VecDeque`
-//! of insertion order, with the exact-match index kept in step on both
-//! eviction and replacement.
+//! entry (new response, cost, `created_millis`, same id) rather than
+//! appending a duplicate, so identical traffic no longer grows a partition
+//! without bound.
+//!
+//! Entries live in a **dense `Vec<Entry>`** (`id_to_pos: HashMap<u64, usize>`
+//! maps a stable id to its current slot), so the similarity walk iterates
+//! contiguous memory rather than a `HashMap`'s scattered buckets. Removal is
+//! O(1) via `swap_remove`, with the moved entry's `id_to_pos` slot updated.
+//!
+//! Eviction and TTL sweeping are **amortised O(1)**, not O(n) per call: a
+//! `VecDeque<OrderRecord>` (id + the `created_millis` it was written or last
+//! refreshed with) tracks age order. A record is stale the moment its entry
+//! is gone or has been refreshed since (the entry's live `created_millis` no
+//! longer matches the record's), and a stale record is simply skipped, never
+//! chased down and removed early. `sweep_expired` and `evict_over_cap` each
+//! pop from the front, skip stale records, and stop at the first genuinely
+//! live one (for the TTL sweep) or once back under the cap (for eviction).
+//! Skipped stale records accumulate — one extra per refresh, one per
+//! eviction-via-direct-removal never reached from the front — so
+//! `maybe_compact_order` rebuilds `order` from the live entries, sorted by
+//! `created_millis`, once it has grown past `2 * entries.len() + 16`. That
+//! bound makes compaction itself amortised O(1): it fires only after O(n)
+//! refreshes have accumulated O(n) stale records.
 //!
 //! Embeddings are stored L2-normalized (and the query is normalized once
 //! per lookup), so similarity is a plain dot product rather than a second
@@ -45,12 +63,12 @@
 //!
 //! `get` takes a read lock and never removes anything — expired entries are
 //! skipped while walking, not swept — so concurrent readers are never
-//! serialized against each other. Expiry is swept lazily, per partition,
-//! inside `put`, which already takes a write lock to insert.
+//! serialized against each other. Expiry sweeping and eviction both happen
+//! inside `put`, which already takes a write lock to insert or refresh.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
@@ -244,6 +262,9 @@ pub struct Lookup {
 }
 
 struct Entry {
+    /// Stable identity, independent of this entry's current slot in
+    /// `Partition::entries` (which moves on `swap_remove`).
+    id: u64,
     /// L2-normalized.
     embedding: Vec<f32>,
     entities: BTreeSet<String>,
@@ -260,58 +281,64 @@ struct Entry {
     created_millis: i64,
 }
 
+/// One age-order record: which entry, and the `created_millis` it carried
+/// at the moment this record was pushed. A record is STALE — skip it,
+/// don't act on it — the moment the entry it names is gone, or has since
+/// been refreshed to a different `created_millis` (a newer record for the
+/// same id is already further back in the queue).
+#[derive(Clone, Copy)]
+struct OrderRecord {
+    id: u64,
+    created_millis: i64,
+}
+
 /// One hard partition's entries, kept internally consistent: every id in
-/// `order` and every id in an `exact_index` bucket names a live entry in
-/// `entries`, and vice versa.
+/// `id_to_pos`, and every id in an `exact_index` bucket, names a live entry
+/// at that position in `entries`.
 #[derive(Default)]
 struct Partition {
-    entries: HashMap<u64, Entry>,
-    /// Insertion order, oldest first — the O(1) FIFO eviction queue.
-    order: VecDeque<u64>,
+    /// Dense storage: the similarity walk iterates this directly.
+    entries: Vec<Entry>,
+    /// Stable id → current slot in `entries` (slots move on `swap_remove`).
+    id_to_pos: HashMap<u64, usize>,
+    /// Age order, oldest first. May contain STALE records; see the module
+    /// doc and `is_live_record`.
+    order: VecDeque<OrderRecord>,
     /// Normalized-core hash → candidate entry ids sharing that bucket.
     exact_index: HashMap<u64, Vec<u64>>,
     next_id: u64,
 }
 
 impl Partition {
-    /// Remove one entry by id from every structure that names it. A no-op
-    /// if the id is not present (already removed).
-    fn remove(&mut self, id: u64) {
-        if let Some(entry) = self.entries.remove(&id) {
-            if let Some(bucket) = self.exact_index.get_mut(&entry.index_hash) {
-                bucket.retain(|&x| x != id);
-                if bucket.is_empty() {
-                    self.exact_index.remove(&entry.index_hash);
-                }
-            }
-        }
+    /// A record is live iff its id still names an entry AND that entry's
+    /// current `created_millis` still equals the record's — a refresh
+    /// pushes a NEW record and leaves the old one to be skipped here.
+    fn is_live_record(&self, rec: &OrderRecord) -> bool {
+        self.id_to_pos
+            .get(&rec.id)
+            .map(|&pos| self.entries[pos].created_millis == rec.created_millis)
+            .unwrap_or(false)
     }
 
-    /// Drop every expired entry from this partition: `entries`, its
-    /// `exact_index` bucket, and its slot in `order`. Partition-local and
-    /// run only from `put`, never from `get` (CLAUDE.md invariant 64).
-    fn sweep_expired(&mut self, now_millis: i64, ttl_millis: i64) {
-        let mut removed: Vec<(u64, u64)> = Vec::new();
-        self.entries.retain(|&id, e| {
-            let keep = now_millis - e.created_millis <= ttl_millis;
-            if !keep {
-                removed.push((id, e.index_hash));
-            }
-            keep
-        });
-        if removed.is_empty() {
+    /// Remove one entry by id, O(1) via `swap_remove`. A no-op if the id is
+    /// not present (already removed). Does NOT touch `order`: whatever
+    /// record(s) still name this id become stale and are skipped when next
+    /// encountered at the front.
+    fn remove_by_id(&mut self, id: u64) {
+        let Some(pos) = self.id_to_pos.remove(&id) else {
             return;
+        };
+        let removed = self.entries.swap_remove(pos);
+        if pos < self.entries.len() {
+            let moved_id = self.entries[pos].id;
+            self.id_to_pos.insert(moved_id, pos);
         }
-        for (id, hash) in &removed {
-            if let Some(bucket) = self.exact_index.get_mut(hash) {
-                bucket.retain(|x| x != id);
-                if bucket.is_empty() {
-                    self.exact_index.remove(hash);
-                }
+        if let Some(bucket) = self.exact_index.get_mut(&removed.index_hash) {
+            bucket.retain(|&x| x != id);
+            if bucket.is_empty() {
+                self.exact_index.remove(&removed.index_hash);
             }
         }
-        let removed_ids: HashSet<u64> = removed.iter().map(|(id, _)| *id).collect();
-        self.order.retain(|id| !removed_ids.contains(id));
     }
 
     /// Find a live entry in this partition whose normalized core text is
@@ -320,13 +347,70 @@ impl Partition {
     fn find_exact(&self, index_hash: u64, digest: &[u8; 32]) -> Option<u64> {
         let bucket = self.exact_index.get(&index_hash)?;
         for &id in bucket {
-            if let Some(e) = self.entries.get(&id) {
-                if &e.core_digest == digest {
+            if let Some(&pos) = self.id_to_pos.get(&id) {
+                if &self.entries[pos].core_digest == digest {
                     return Some(id);
                 }
             }
         }
         None
+    }
+
+    /// Amortised O(1) TTL sweep: pop stale and expired records from the
+    /// front of `order`, stopping at the first record that is both live
+    /// and unexpired (age order means nothing further back can be
+    /// expired-and-live without an earlier one also being so, since a
+    /// refresh always re-pushes to the back with a newer timestamp).
+    /// Never enforces the entry cap; see `evict_over_cap`.
+    fn sweep_expired(&mut self, now_millis: i64, ttl_millis: i64) {
+        while let Some(rec) = self.order.front().copied() {
+            if !self.is_live_record(&rec) {
+                self.order.pop_front();
+                continue;
+            }
+            if now_millis - rec.created_millis > ttl_millis {
+                self.order.pop_front();
+                self.remove_by_id(rec.id);
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Amortised O(1) eviction: pop from the front (skipping stale
+    /// records, which cost nothing to skip) until back at or under the
+    /// cap.
+    fn evict_over_cap(&mut self, max_per_partition: usize) {
+        while self.entries.len() > max_per_partition {
+            let Some(rec) = self.order.pop_front() else {
+                break;
+            };
+            if self.is_live_record(&rec) {
+                self.remove_by_id(rec.id);
+            }
+        }
+    }
+
+    /// Bound the stale-record backlog `sweep_expired`/`evict_over_cap`
+    /// would otherwise have to step past one at a time: once `order` has
+    /// grown past `2 * entries.len() + 16`, rebuild it from the live
+    /// entries, sorted by `created_millis`, in one O(n) pass. Amortised
+    /// O(1) per `put`, since this only fires after roughly `entries.len()`
+    /// stale records have accumulated (one per refresh).
+    fn maybe_compact_order(&mut self) {
+        if self.order.len() <= 2 * self.entries.len() + 16 {
+            return;
+        }
+        let mut recs: Vec<OrderRecord> = self
+            .entries
+            .iter()
+            .map(|e| OrderRecord {
+                id: e.id,
+                created_millis: e.created_millis,
+            })
+            .collect();
+        recs.sort_by_key(|r| r.created_millis);
+        self.order = recs.into_iter().collect();
     }
 }
 
@@ -375,10 +459,10 @@ impl SemanticCache {
     /// An identical core (byte-for-byte after trimming) is found through the
     /// exact-match index in O(1) average, with no embedding call and no
     /// similarity walk. Only a core this partition has never seen falls
-    /// through to the similarity walk. Neither path removes anything:
-    /// expired entries are skipped, not swept (that happens in `put`), and
-    /// this whole call runs under a read lock, so it never serializes
-    /// against another concurrent `get`.
+    /// through to the similarity walk, which iterates a dense `Vec<Entry>`.
+    /// Neither path removes anything: expired entries are skipped, not
+    /// swept (that happens in `put`), and this whole call runs under a
+    /// read lock, so it never serializes against another concurrent `get`.
     pub fn get(&self, partition: u64, core: &str, now_millis: i64) -> Option<Lookup> {
         if self.config.mode == CacheMode::Off {
             return None;
@@ -393,10 +477,8 @@ impl SemanticCache {
 
         // Exact-match fast path: O(1) average, no embedding computed.
         if let Some(id) = part.find_exact(index_hash, &digest) {
-            // `find_exact` only returns live entries, but "live" there
-            // means "present", not "unexpired" — expiry is checked here so
-            // the guard applies uniformly to both paths.
-            if let Some(e) = part.entries.get(&id) {
+            if let Some(&pos) = part.id_to_pos.get(&id) {
+                let e = &part.entries[pos];
                 if now_millis - e.created_millis <= self.config.ttl_millis {
                     return Some(Lookup {
                         response: e.response.clone(),
@@ -415,7 +497,7 @@ impl SemanticCache {
         let core_len = core.chars().count();
 
         let mut best: Option<(f32, &Entry)> = None;
-        for e in part.entries.values() {
+        for e in part.entries.iter() {
             if now_millis - e.created_millis > self.config.ttl_millis {
                 continue;
             }
@@ -442,12 +524,14 @@ impl SemanticCache {
 
     /// Store a response for future hits.
     ///
-    /// A core already present in this partition (exact match, TTL still
-    /// live or not — the sweep below runs first) is REPLACED in place:
-    /// new response, cost and `created_millis`, same id, same position in
-    /// the eviction order. A core this partition has not seen is appended
-    /// and, past `max_per_partition`, the oldest entry is evicted in O(1)
-    /// via `order`, with the exact-match index kept in step.
+    /// A core already present in this partition (exact match) is REPLACED
+    /// in place: new response, cost and `created_millis`, same id, same
+    /// slot in `entries`. Its age-order record is superseded by a fresh one
+    /// pushed to the back, so a just-refreshed entry is not evicted as if
+    /// it were still the oldest thing in the partition. A core this
+    /// partition has not seen is appended and, past `max_per_partition`,
+    /// the oldest live entries are evicted. TTL sweeping and eviction are
+    /// both amortised O(1); see the module doc.
     pub fn put(
         &self,
         partition: u64,
@@ -472,12 +556,11 @@ impl SemanticCache {
         let mut store = self.store.write().unwrap();
         let part = store.entry(partition).or_default();
 
-        // Partition-local TTL sweep. `get` never removes anything, so this
-        // is where memory is actually bounded over time.
         part.sweep_expired(now_millis, self.config.ttl_millis);
 
         if let Some(id) = part.find_exact(index_hash, &digest) {
-            if let Some(e) = part.entries.get_mut(&id) {
+            if let Some(&pos) = part.id_to_pos.get(&id) {
+                let e = &mut part.entries[pos];
                 e.response = response;
                 e.content_type = content_type;
                 e.cost_microusd = cost_microusd;
@@ -486,34 +569,41 @@ impl SemanticCache {
                 // unchanged: the normalized core text that produced them is
                 // exactly the same text, by construction of `find_exact`.
             }
+            // The old age-order record for this id is now stale (its
+            // `created_millis` no longer matches); this new one is what
+            // FIFO order and TTL sweeping will act on from here.
+            part.order.push_back(OrderRecord {
+                id,
+                created_millis: now_millis,
+            });
+            part.maybe_compact_order();
             return;
         }
 
         let id = part.next_id;
         part.next_id += 1;
-        part.entries.insert(
+        let pos = part.entries.len();
+        part.entries.push(Entry {
             id,
-            Entry {
-                embedding,
-                entities,
-                core_len,
-                core_digest: digest,
-                index_hash,
-                response,
-                content_type,
-                cost_microusd,
-                created_millis: now_millis,
-            },
-        );
+            embedding,
+            entities,
+            core_len,
+            core_digest: digest,
+            index_hash,
+            response,
+            content_type,
+            cost_microusd,
+            created_millis: now_millis,
+        });
+        part.id_to_pos.insert(id, pos);
         part.exact_index.entry(index_hash).or_default().push(id);
-        part.order.push_back(id);
+        part.order.push_back(OrderRecord {
+            id,
+            created_millis: now_millis,
+        });
 
-        while part.entries.len() > self.config.max_per_partition {
-            match part.order.pop_front() {
-                Some(oldest) => part.remove(oldest),
-                None => break,
-            }
-        }
+        part.evict_over_cap(self.config.max_per_partition);
+        part.maybe_compact_order();
     }
 
     /// Test-only: the number of live entries in a partition (0 if absent).
@@ -566,22 +656,25 @@ impl SemanticCache {
         let part = store.entry(partition).or_default();
         let id = part.next_id;
         part.next_id += 1;
-        part.entries.insert(
+        let pos = part.entries.len();
+        part.entries.push(Entry {
             id,
-            Entry {
-                embedding,
-                entities,
-                core_len,
-                core_digest: digest,
-                index_hash: forced_hash,
-                response,
-                content_type: "test".into(),
-                cost_microusd,
-                created_millis: now_millis,
-            },
-        );
+            embedding,
+            entities,
+            core_len,
+            core_digest: digest,
+            index_hash: forced_hash,
+            response,
+            content_type: "test".into(),
+            cost_microusd,
+            created_millis: now_millis,
+        });
+        part.id_to_pos.insert(id, pos);
         part.exact_index.entry(forced_hash).or_default().push(id);
-        part.order.push_back(id);
+        part.order.push_back(OrderRecord {
+            id,
+            created_millis: now_millis,
+        });
     }
 
     /// Test-only hook: look a core up through the exact-index path using a
@@ -604,7 +697,8 @@ impl SemanticCache {
         let store = self.store.read().unwrap();
         let part = store.get(&partition)?;
         let id = part.find_exact(forced_hash, &digest)?;
-        let e = part.entries.get(&id)?;
+        let &pos = part.id_to_pos.get(&id)?;
+        let e = &part.entries[pos];
         if now_millis - e.created_millis > self.config.ttl_millis {
             return None;
         }
@@ -960,6 +1054,115 @@ mod tests {
     }
 
     #[test]
+    fn a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest() {
+        // Fill to the cap, refresh the OLDEST core (a plain re-put, same
+        // text, new response), then insert one more. Without the refresh
+        // pushing a fresh age-order record, FIFO would still think the
+        // refreshed core is the oldest thing in the partition and evict
+        // it, even though it was just written.
+        let c = SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::On,
+                threshold: 0.9,
+                max_per_partition: 4,
+                ..Default::default()
+            },
+        );
+        let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
+        for i in 0..4 {
+            c.put(
+                p,
+                &format!("distinct question number {i}"),
+                format!("r{i}").into_bytes(),
+                "j".into(),
+                1,
+                i as i64,
+            );
+        }
+        // Refresh the oldest (id 0's core) at a fresh timestamp.
+        c.put(
+            p,
+            "distinct question number 0",
+            b"refreshed".to_vec(),
+            "j".into(),
+            1,
+            100,
+        );
+        // One more insert pushes the partition one over the cap again.
+        c.put(
+            p,
+            "distinct question number 4",
+            b"r4".to_vec(),
+            "j".into(),
+            1,
+            101,
+        );
+
+        assert_eq!(c.entry_count(p), 4, "the cap must still be enforced");
+        let refreshed = c.get(p, "distinct question number 0", 200);
+        assert!(
+            refreshed.is_some(),
+            "the just-refreshed entry must not have been evicted as the oldest"
+        );
+        assert_eq!(refreshed.unwrap().response, b"refreshed");
+        // Question 1 was the actual oldest untouched entry and must be the
+        // one evicted instead.
+        assert!(
+            c.get(p, "distinct question number 1", 200).is_none(),
+            "the next-oldest untouched entry must be evicted instead"
+        );
+    }
+
+    #[test]
+    fn a_refreshed_entry_moves_to_the_back_of_fifo_order_not_out_of_it() {
+        // The other direction from the test above: a refresh is not a
+        // permanent exemption from eviction, it moves the entry to the
+        // BACK of the FIFO queue at its new timestamp. Once enough newer
+        // entries arrive, the refreshed one must become the oldest again
+        // and be evicted like any other. This is what actually catches a
+        // mutant that refreshes an entry's fields but never pushes a fresh
+        // age-order record for it (m8): without that push, the entry has
+        // no live record left in `order` at all and can never be reached
+        // by eviction again, so it survives forever while a genuinely
+        // newer entry gets evicted in its place.
+        let c = SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::On,
+                threshold: 0.9,
+                max_per_partition: 3,
+                ..Default::default()
+            },
+        );
+        let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
+        c.put(p, "q0", b"r0".to_vec(), "j".into(), 1, 0);
+        c.put(p, "q1", b"r1".to_vec(), "j".into(), 1, 1);
+        c.put(p, "q2", b"r2".to_vec(), "j".into(), 1, 2);
+        // Refresh q0: it is now the NEWEST write, not exempt from eviction.
+        c.put(p, "q0", b"refreshed".to_vec(), "j".into(), 1, 100);
+        // Three more distinct inserts, each past the cap: q1 then q2 are
+        // the oldest UNTOUCHED entries and go first; once they are both
+        // gone, q0's refreshed record is the oldest survivor and must go
+        // next, even though it was "just" written relative to q1/q2's
+        // original timestamps.
+        c.put(p, "q3", b"r3".to_vec(), "j".into(), 1, 101);
+        c.put(p, "q4", b"r4".to_vec(), "j".into(), 1, 102);
+        c.put(p, "q5", b"r5".to_vec(), "j".into(), 1, 103);
+
+        assert_eq!(c.entry_count(p), 3, "the cap must still be enforced");
+        assert!(
+            c.get(p, "q0", 200).is_none(),
+            "a refresh moves an entry to the back of FIFO order, it does not \
+             exempt it from eviction forever"
+        );
+        assert!(
+            c.get(p, "q3", 200).is_some(),
+            "q3 is newer than q0's refresh and must survive in its place"
+        );
+    }
+
+    #[test]
     fn entity_and_length_guards_still_apply_on_the_similarity_path() {
         let c = cache(CacheMode::On);
         let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
@@ -981,6 +1184,55 @@ mod tests {
                 1
             )
             .is_none());
+    }
+
+    #[test]
+    fn entity_guard_blocks_a_near_identical_pair_that_would_otherwise_hit() {
+        // Two cores that differ only in a trailing id-like number: similar
+        // enough under HashEmbedder to clear a real similarity threshold,
+        // asserted below as a PRECONDITION, but carrying DIFFERENT
+        // entities. This is a dedicated, non-incidental witness for the
+        // entity guard on the similarity path: unlike
+        // `entity_guard_blocks_number_mismatch`, whose pair happens to
+        // fall under threshold anyway (so removing the guard there does
+        // not flip its assertion), removing the guard here DOES flip this
+        // one, because the precondition guarantees the similarity clears
+        // the bar on its own.
+        let a = "please process the refund for account holder ticket 482103 today";
+        let b = "please process the refund for account holder ticket 482104 today";
+
+        let embedder = HashEmbedder::default();
+        let mut va = embedder.embed(a);
+        l2_normalize(&mut va);
+        let mut vb = embedder.embed(b);
+        l2_normalize(&mut vb);
+        let sim = dot(&va, &vb);
+        assert!(
+            sim > 0.9,
+            "precondition: these two cores must be similar enough to exercise the \
+             guard on the similarity path, got {sim}"
+        );
+        assert_ne!(
+            extract_entities(a),
+            extract_entities(b),
+            "precondition: the two cores must carry different entities"
+        );
+
+        let c = SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::On,
+                threshold: 0.9,
+                entity_guard: true,
+                ..Default::default()
+            },
+        );
+        let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
+        c.put(p, a, b"a-body".to_vec(), "j".into(), 1, 0);
+        assert!(
+            c.get(p, b, 1).is_none(),
+            "different entities must never hit, despite similarity above threshold"
+        );
     }
 
     /// A test-only embedder returning fixed, already-unit-length vectors for
@@ -1142,11 +1394,9 @@ mod tests {
     }
 
     /// Not a correctness test: a timing measurement, run only on request
-    /// (`cargo test -p tokenfuse-core --lib cache::tests::get_cost_at_10k_entries -- --ignored --nocapture`).
-    /// Fills one partition to 10,000 entries (the default `max_per_partition`)
-    /// and times `get` for an exact hit, an exact miss (falls through to the
-    /// similarity walk) and a similarity hit. No assertion is made on the
-    /// numbers; report the PR body's benchmark section, not a gate.
+    /// (`cargo test -p tokenfuse-core --lib cache::tests:: -- --ignored --nocapture`).
+    /// No assertion is made on the numbers; report the PR body's benchmark
+    /// section, not a gate.
     #[test]
     #[ignore]
     fn get_cost_at_10k_entries() {
@@ -1192,6 +1442,110 @@ mod tests {
 
         eprintln!(
             "get() at 10,000 entries/partition: exact hit avg {exact_hit:?}, miss (similarity walk) avg {miss:?}"
+        );
+    }
+
+    /// `put` cost at 10,000 entries/partition: a mix of exact-match
+    /// refreshes (same core seen before) and genuinely new cores (which
+    /// trigger eviction once at the cap), the realistic shape of live
+    /// traffic. Ignored, timing-only, `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn put_cost_at_10k_entries() {
+        let c = SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::On,
+                threshold: 0.97,
+                max_per_partition: 10_000,
+                ..Default::default()
+            },
+        );
+        let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
+        for i in 0..10_000 {
+            c.put(
+                p,
+                &format!("distinct benchmark question number {i} about refunds and billing"),
+                format!("response body {i}").into_bytes(),
+                "application/json".into(),
+                1000,
+                0,
+            );
+        }
+
+        const N: u32 = 2000;
+        let start = std::time::Instant::now();
+        for i in 0..N {
+            // Alternate a refresh of an existing core with a brand-new one
+            // (which evicts, since the partition is already at the cap).
+            let core = if i % 2 == 0 {
+                format!(
+                    "distinct benchmark question number {} about refunds and billing",
+                    i % 10_000
+                )
+            } else {
+                format!("put benchmark new question number {i}")
+            };
+            c.put(
+                p,
+                &core,
+                format!("response {i}").into_bytes(),
+                "application/json".into(),
+                1000,
+                (i as i64) + 1,
+            );
+        }
+        let put_avg = start.elapsed() / N;
+        eprintln!("put() at ~10,000 entries/partition (mixed refresh/new): avg {put_avg:?}");
+    }
+
+    /// A steady-state shadow-mode loop: get() then put() per call, with
+    /// varied cores, partition already at the cap — the actual per-request
+    /// shape issue #319 measured. Ignored, timing-only, `--ignored
+    /// --nocapture`. Reports calls/s, not asserted.
+    #[test]
+    #[ignore]
+    fn steady_state_shadow_loop_throughput() {
+        let c = SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode: CacheMode::Shadow,
+                threshold: 0.97,
+                max_per_partition: 10_000,
+                ..Default::default()
+            },
+        );
+        let p = SemanticCache::partition_key("m", "s", "", "qa", "t");
+        for i in 0..10_000 {
+            c.put(
+                p,
+                &format!("distinct benchmark question number {i} about refunds and billing"),
+                format!("response body {i}").into_bytes(),
+                "application/json".into(),
+                1000,
+                0,
+            );
+        }
+
+        const N: u32 = 4000;
+        let start = std::time::Instant::now();
+        for i in 0..N {
+            let core = format!("steady state call number {i} about a refund or a billing item");
+            std::hint::black_box(c.get(p, &core, (i as i64) + 1));
+            c.put(
+                p,
+                &core,
+                format!("response {i}").into_bytes(),
+                "application/json".into(),
+                1000,
+                (i as i64) + 1,
+            );
+        }
+        let elapsed = start.elapsed();
+        let calls_per_sec = N as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "steady-state shadow loop (get+put) at ~10,000 entries/partition: {calls_per_sec:.0} calls/s ({:?} total for {N} calls)",
+            elapsed
         );
     }
 }

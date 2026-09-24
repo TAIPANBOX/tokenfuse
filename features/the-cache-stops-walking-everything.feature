@@ -53,3 +53,21 @@ Feature: The semantic cache stops walking everything under one lock
     Given many threads put and get against the same partition concurrently
     When they all finish
     Then nothing deadlocks and no thread is ever served another thread's response
+
+  # @test:a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest
+  Scenario: A refresh is not treated as still the oldest entry
+    Given a partition at its cap holds an entry that is then refreshed
+    When one more entry is inserted past the cap
+    Then the refreshed entry survives and the next-oldest untouched entry is evicted
+
+  # @test:a_refreshed_entry_moves_to_the_back_of_fifo_order_not_out_of_it
+  Scenario: A refresh moves an entry to the back of FIFO order, not out of it
+    Given a refreshed entry and several newer entries inserted afterward
+    When enough newer entries arrive to make the refreshed one the oldest again
+    Then the refreshed entry is evicted in its turn and the newer entries survive
+
+  # @test:entity_guard_blocks_a_near_identical_pair_that_would_otherwise_hit
+  Scenario: The entity guard is proven against a pair that would otherwise hit
+    Given two cores whose similarity is confirmed above threshold but whose entities differ
+    When the second core is looked up
+    Then no hit is returned
