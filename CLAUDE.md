@@ -3778,18 +3778,24 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     refuses to start, the same set-but-unusable rule `TOKENFUSE_MCP_KEYS`
     already holds). XAA on requires `TOKENFUSE_DELEGATION_ISSUER` and
     `TOKENFUSE_DELEGATION_JWKS` already configured (the same issuer and key
-    set the delegation door verifies against; `TOKENFUSE_DELEGATION_AUDIENCE`
-    and `TOKENFUSE_DELEGATION_URL` are NOT required by this door, which never
-    checks a proof and so never needs an origin: `chainproof.rs`'s
+    set the delegation door verifies against; `chainproof.rs`'s
     `base_config_from_values`, a pure function, is the one place issuer+JWKS
     are read and parsed, shared by `chainproof::from_env` and
-    `xaadoor::from_env` rather than kept as two copies). XAA on together with
+    `xaadoor::from_env` rather than kept as two copies). This door itself
+    never checks a proof and needs no origin, but the PROCESS does:
+    configuring the issuer and JWKS also turns on the delegation door in the
+    same broker, and that door refuses to start without
+    `TOKENFUSE_DELEGATION_URL` (invariant 31's `htu` rule). @measured
+    `tokenfuse mcp-broker` with `TOKENFUSE_MCP_ACCEPT_XAA=on`, the resource,
+    issuer and JWKS set and `TOKENFUSE_DELEGATION_URL` unset, 2026-09-24: exit
+    2 naming `TOKENFUSE_DELEGATION_URL`. So an operator turning XAA on sets
+    that too, to the broker's own public origin. XAA on together with
     `TOKENFUSE_MCP_REQUIRE_PROOF` refuses to start, naming both: an operator
     who closed the bearer-key door on one axis cannot reopen a different
     bearer door on another. Both names are `experimental` in
     `compat/1.0.json`: the grant is an IETF draft, not a published RFC.
     *(test: `crates/delegation/src/lib.rs`'s `verify_access_token` suite
-    (`an_access_token_verifies_and_names_its_agent` and seventeen refusal/shape
+    (`an_access_token_verifies_and_names_its_agent` and eighteen refusal/shape
     tests, including a 200-case revocation sweep and a 200-case hostile-bearer-string
     sweep); `crates/gateway/tests/mcp_xaa.rs` (22 tests over the live HTTP
     door, including `the_resource_metadata_names_vouchryx`,
@@ -3810,7 +3816,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     (`a_token_from_another_issuer_or_for_another_audience_is_refused`,
     `an_empty_configured_resource_refuses_every_access_token`); `aud`
     compared by prefix (`an_audience_that_is_only_a_prefix_match_is_refused`);
-    `cnf` bound token accepted (`a_bound_access_token_with_no_proof_is_refused`);
+    `cnf` bound token accepted (`a_bound_access_token_with_no_proof_is_refused`),
+    widened in review to ANY `cnf` claim, not only `cnf.jkt`: a certificate-bound
+    (`x5t#S256`, RFC 8705) or empty `cnf` is refused as `NoProof` too
+    (`a_token_bound_by_any_confirmation_method_is_refused`, red first against
+    ec7b3ed, where a certificate-bound token was accepted as bearer);
     `client_id` requirement dropped (`an_access_token_with_no_client_id_is_refused`,
     `an_exchange_token_is_refused_as_an_access_token`); revocation asked about
     the root only (`a_revocation_naming_the_agent_in_an_access_tokens_chain_refuses_it`,

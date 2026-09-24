@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.0.4-brightgreen)
-![tests](https://img.shields.io/badge/tests-1475-brightgreen)
+![tests](https://img.shields.io/badge/tests-1476-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -527,6 +527,8 @@ Scanning catches a poisoned tool before it's approved. The runtime **[MCP creden
 Since 2026-08-06, a non-loopback bind with nothing configured on the broker's door refuses to start rather than only warn, because anything that reaches an open, unauthenticated port could have `{{secret:name}}` handles resolved against the whole vault. **Upgrade consequence, stated plainly:** a deployment that binds the broker to a non-loopback address with no credential configured will not start after this change. Fix it by configuring `TOKENFUSE_MCP_KEYS="secret:key_id,..."`, by keeping the default loopback bind, or, if the open bind is deliberate, by setting `TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` (full detail, including what still only warns: [docs/12](docs/12-mcp-credential-broker.md)).
 
 There are two ways to put something on that door, and the second is newer and stronger. `TOKENFUSE_MCP_KEYS` is a shared secret in a header: whoever captures it holds it. `TOKENFUSE_MCP_CLIENT_IDS` instead names client metadata documents in the shape [CIMD](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) defines, each published by a client at its own https `client_id` URL and naming that client's public keys; a caller then proves possession of one of those keys per request with an [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449) DPoP proof, single-use. Nothing an operator holds is worth stealing, and a captured header is worth nothing after a minute. Both doors can be configured at once while clients move across, and `TOKENFUSE_MCP_REQUIRE_PROOF=1` is how that ends: [docs/24](docs/24-mcp-proof-door.md).
+
+A third, experimental since 2026-09-24: an access token that [vouchryx](https://github.com/TAIPANBOX/vouchryx) issued through Cross App Access, where an enterprise identity provider's assertion about a person (an ID-JAG, `draft-ietf-oauth-identity-assertion-authz-grant-04`) is redeemed for a five-minute token scoped to this broker, presented as `Authorization: Bearer`. Set `TOKENFUSE_MCP_ACCEPT_XAA=on` and `TOKENFUSE_MCP_RESOURCE` (this broker's own resource URL, https, which the token's audience must equal exactly), with `TOKENFUSE_DELEGATION_ISSUER` and `TOKENFUSE_DELEGATION_JWKS` naming vouchryx and `TOKENFUSE_DELEGATION_URL` the broker's public origin (the delegation door in the same process requires it). The broker then publishes [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) metadata at `/.well-known/oauth-protected-resource`, every refusal points at it in `WWW-Authenticate`, a call is attributed to the agent the token names with the person as the root of its chain, and a token for another resource, a token bound to a key, a delegation token presented as bearer, or a token naming a revoked person or agent is refused. With XAA on, a caller presenting no credential is refused even when no other door is configured. The grant is an IETF draft, so both settings are experimental in `compat/1.0.json`; CLAUDE.md invariant 62 holds the rules.
 
 ---
 

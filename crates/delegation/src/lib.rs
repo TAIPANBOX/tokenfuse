@@ -408,9 +408,12 @@ pub fn verify_access_token(
     }
     // A bound token presented with no proof is a downgrade, and this door
     // never has a proof to offer: unlike `verify_delegation`, there is no
-    // `proof` parameter at all, so `cnf.jkt` being present is unconditionally
-    // a refusal rather than something checked against a presented key.
-    if claims.cnf.as_ref().is_some_and(|c| !c.jkt.is_empty()) {
+    // `proof` parameter at all, so a `cnf` claim being present is
+    // unconditionally a refusal rather than something checked against a
+    // presented key. ANY `cnf`, not only `cnf.jkt`: a certificate-bound token
+    // (`x5t#S256`, RFC 8705) is bound to something this door never checks
+    // either, and an empty `cnf` object is a confirmation nobody can read.
+    if claims.cnf.is_some() {
         return Err(Refusal::NoProof);
     }
     if claims.act.is_none() {
@@ -1422,6 +1425,29 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Refusal::NoProof);
+    }
+
+    /// Binding is not only DPoP. A token whose `cnf` names any confirmation
+    /// method (here an RFC 8705 certificate thumbprint) was bound to
+    /// something this bearer door never checks, so presenting it here is the
+    /// same downgrade a `cnf.jkt` is; an empty `cnf` object is refused too,
+    /// because a confirmation claim nobody can read is not a bearer token's.
+    #[test]
+    fn a_token_bound_by_any_confirmation_method_is_refused() {
+        let (issuer, now) = (Key::new(), 1_800_000_000);
+        for cnf in [
+            serde_json::json!({"x5t#S256": "bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"}),
+            serde_json::json!({}),
+        ] {
+            let err = verify_access_token(
+                &cfg(&issuer),
+                &access_token(&issuer, now, serde_json::json!({ "cnf": cnf })),
+                now,
+                never,
+            )
+            .unwrap_err();
+            assert_eq!(err, Refusal::NoProof, "cnf = {cnf}");
+        }
     }
 
     #[test]
