@@ -3988,3 +3988,145 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_typo_cache_value_resolves_to_off_and_warns_in_the_real_binary`
     panicked the same way; the negative control stayed green on both
     sides, as a guard should.)*
+
+64. **A lookup that finds nothing new does no new work, and a lookup that
+    finds a repeat does no walk at all.** `@decided 2026-09-24`. Issue #319:
+    `SemanticCache::get` held one global `Mutex` over the whole store, ran a
+    `retain()` TTL sweep over the whole partition, then a linear `cosine`
+    walk against every stored entry, on every eligible call, in `Shadow`
+    mode as much as `On`. Measured on a 4-core box: 79-92% of gateway CPU in
+    `SemanticCache::get`, 177 req/s with 403s under 50 concurrent agents
+    where the cache off measured 1102 req/s.
+
+    Each partition now keeps an **exact-match index**: a cheap 64-bit hash
+    of the normalized core text maps to the (small) set of entries that
+    might share it, and each candidate is verified against a SHA-256 digest
+    of its own normalized core text before ever being served, so a 64-bit
+    bucket collision can never serve the wrong response. An identical core
+    is found in O(1) average with **no embedding call and no similarity
+    walk at all**; only a core this partition has never seen falls through
+    to the similarity walk. `put` of a core that already exists in its
+    partition **replaces** that entry (new response, cost, `created_millis`,
+    same id) instead of appending a duplicate, so identical traffic no
+    longer grows a partition without bound.
+
+    **Entries live in a dense `Vec<Entry>`**, not a `HashMap`, with
+    `id_to_pos: HashMap<u64, usize>` mapping a stable id to its current
+    slot; the similarity walk iterates contiguous memory, and removal is
+    O(1) via `swap_remove` with the displaced entry's slot updated. This
+    was added in review (a first version kept `entries: HashMap<u64,
+    Entry>`, and the miss path was measured 2.5x SLOWER than the old code
+    because of it; see the measurement below).
+
+    **Eviction and TTL sweeping are amortised O(1), not O(n) per `put`.**
+    A first version's `sweep_expired` did a full `retain()` over every
+    entry in the partition on every `put`, which is the same #319 shape
+    moved from `get` to `put`. The fix: `order: VecDeque<OrderRecord>`
+    (id + the `created_millis` it was written or refreshed with) tracks
+    age order. A record is STALE the moment its entry is gone, or has
+    since been refreshed to a different `created_millis` (a fresh record
+    for the same id is already further back in the queue); a stale record
+    is simply skipped when reached, never chased down and removed early.
+    `sweep_expired` pops from the front, skipping stale records and
+    removing genuinely expired ones, stopping at the first live and
+    unexpired record; `evict_over_cap` does the same, stopping once back
+    at or under the cap. **A refresh pushes a fresh record to the back
+    instead of leaving the old one in place**: without that push, a
+    refreshed entry has no live record left in `order` at all and can
+    never be reached by eviction again, surviving forever while a
+    genuinely newer entry is evicted in its place, which is what a
+    refresh-in-place without moving the entry in eviction order looked
+    like before this round. Stale records accumulate (one per refresh),
+    so `maybe_compact_order` rebuilds `order` from the live entries,
+    sorted by `created_millis`, once it has grown past `2 * entries.len()
+    + 16` — amortised O(1), since compaction only fires after O(n) stale
+    records have built up.
+
+    Embeddings are stored L2-normalized and the query is normalized once
+    per lookup, so similarity is a plain dot product; a zero vector
+    normalizes to itself and dots to `0.0` against anything, never `NaN`,
+    so it can never cross a positive threshold.
+
+    `get` takes a read lock and never removes anything (expired entries
+    are skipped while walking, not swept), so concurrent readers are never
+    serialized against each other; `put` takes a write lock, and that is
+    where TTL sweeping and eviction both run, both amortised O(1).
+
+    **Measured, not only reasoned about, across two rounds.** At 10,000
+    entries per partition (the default cap), release build:
+
+    | | OLD (one lock, always a full walk) | round 1 (`HashMap`-backed) | round 2, this state (`Vec`-backed, amortised) |
+    |---|---|---|---|
+    | exact-repeat `get` | 79.751us | 717ns (~111x) | 633ns (~126x) |
+    | miss `get` (similarity walk) | 83.864us | 207.854us (~2.5x SLOWER) | 72.101us (~1.2x faster) |
+    | `put` (mixed refresh/new) | 29.923us | not measured | 3.77us (~7.9x faster) |
+    | steady-state shadow loop (get+put) | 7421 calls/s | not measured | 12622 calls/s (~1.7x) |
+
+    Round 1 shipped with the miss-path regression named and NOT closed,
+    on the argument that the hot path this fixes is repeated traffic and
+    72-208us is still three orders of magnitude below a live provider
+    call either way. Review asked for it closed anyway, since `put` was
+    still O(n) under the write lock (the same shape as the original bug,
+    moved) and the regression was real; round 2 closes both, and every
+    number in the table above is now at or ahead of the old code.
+    *(gate: not a script gate, the rule is `SemanticCache::get`/`put`
+    themselves, held by `cargo test`. Tests, all in `core::cache::tests`:
+    `identical_core_twice_replaces_not_appends`,
+    `an_exact_hit_never_walks_similarity`,
+    `a_miss_still_falls_through_to_the_similarity_walk`,
+    `hash_collision_never_serves_the_wrong_response` (via a test-only hook
+    forcing two different cores into one bucket, since a real 64-bit
+    SipHash collision cannot be hand-crafted),
+    `an_expired_exact_entry_is_not_served`,
+    `expired_entries_disappear_after_a_put`,
+    `zero_vector_embedding_never_matches`,
+    `eviction_keeps_the_exact_index_in_step`,
+    `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`,
+    `a_refreshed_entry_moves_to_the_back_of_fifo_order_not_out_of_it`,
+    `entity_and_length_guards_still_apply_on_the_similarity_path`,
+    `entity_guard_blocks_a_near_identical_pair_that_would_otherwise_hit`
+    (a dedicated, non-incidental witness added in review: its two cores'
+    similarity above threshold is asserted as a PRECONDITION in the test
+    itself, so removing the guard is guaranteed to flip its assertion,
+    unlike the pre-existing `entity_guard_blocks_number_mismatch`, whose
+    pair happens to fall under threshold anyway),
+    `threshold_boundary_is_inclusive_on_the_similarity_path`,
+    `a_similarity_just_under_the_threshold_never_hits`,
+    `the_query_is_normalized_before_the_similarity_walk` and
+    `concurrent_get_and_put_never_deadlock_or_cross_wires` (8 threads x 200
+    put/get pairs, asserting every response served is the one its own
+    thread just wrote). Every pre-existing test in the module (the
+    original 7) still passes unchanged.
+
+    Nine mutants planted in the product code and reverted, each caught by
+    a named test: the digest check in `find_exact` skipped
+    (`hash_collision_never_serves_the_wrong_response`); the exact path's
+    TTL check dropped (`an_expired_exact_entry_is_not_served`,
+    `ttl_expires_entries`); `put` never checking for an existing entry
+    (`identical_core_twice_replaces_not_appends`); the similarity
+    threshold's `>=` moved to `>`
+    (`threshold_boundary_is_inclusive_on_the_similarity_path`) and to `<=`
+    (`a_similarity_just_under_the_threshold_never_hits`,
+    `the_query_is_normalized_before_the_similarity_walk`); the entity
+    guard removed, now caught directly by the dedicated witness
+    (`entity_guard_blocks_a_near_identical_pair_that_would_otherwise_hit`,
+    also by `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`
+    and `eviction_keeps_the_exact_index_in_step` incidentally); the exact-
+    index cleanup dropped from `remove_by_id`
+    (`expired_entries_disappear_after_a_put`,
+    `eviction_keeps_the_exact_index_in_step`); the query's `l2_normalize`
+    call removed from `get`
+    (`the_query_is_normalized_before_the_similarity_walk`); **m8**, a
+    refresh's fresh age-order record never pushed, caught by
+    `a_refreshed_entry_moves_to_the_back_of_fifo_order_not_out_of_it`
+    (the entry becomes permanently un-evictable and a genuinely newer one
+    is evicted in its place instead; NOT caught by the simpler
+    `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`,
+    whose one-refresh-then-one-insert shape happens to look identical
+    under both the fixed code and this mutant, which is why the second,
+    multi-round test exists); and **m9**, `is_live_record` checking only
+    whether the id is still present rather than whether its
+    `created_millis` still matches (treating a stale, superseded record as
+    live), caught by
+    `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`
+    (the stale old record evicts the refreshed entry too early).)*
