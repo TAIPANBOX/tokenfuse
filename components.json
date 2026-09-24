@@ -77,7 +77,8 @@
             "required": false
           },
           "TOKENFUSE_CACHE": {
-            "required": false
+            "required": false,
+            "default": "off"
           },
           "TOKENFUSE_CACHE_EMBEDDER": {
             "required": false

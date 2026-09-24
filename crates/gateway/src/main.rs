@@ -1007,13 +1007,11 @@ async fn serve() {
     );
     state = state.with_admin_gate(admin_gate);
 
-    // Semantic cache: TOKENFUSE_CACHE = off | shadow | on (default shadow, which
-    // records would-hits without serving them — safe to drop in).
-    let cache_mode = match std::env::var("TOKENFUSE_CACHE").as_deref() {
-        Ok("on") => tokenfuse_core::cache::CacheMode::On,
-        Ok("off") => tokenfuse_core::cache::CacheMode::Off,
-        _ => tokenfuse_core::cache::CacheMode::Shadow,
-    };
+    // Semantic cache: TOKENFUSE_CACHE = off | shadow | on. Default OFF since
+    // invariant 63 (issue #319): SemanticCache::get's single global lock and
+    // linear walk cost every eligible request whether or not an operator
+    // asked for the cache. See tokenfuse_gateway::defaults::cache_mode_from.
+    let cache_mode = tokenfuse_gateway::defaults::cache_mode_from_env();
     state = state.with_cache(Arc::new(tokenfuse_core::SemanticCache::new(
         tokenfuse_gateway::embedder::build(),
         tokenfuse_core::cache::CacheConfig {

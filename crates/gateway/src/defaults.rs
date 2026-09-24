@@ -113,6 +113,40 @@ pub fn tools_prune_mode_from_env() -> ToolsPruneMode {
     tools_prune_mode_from(std::env::var("TOKENFUSE_TOOLS_PRUNE").ok().as_deref())
 }
 
+/// Semantic cache mode (`TOKENFUSE_CACHE`): `off | shadow | on`.
+///
+/// **Unset is `off`**, since invariant 63. It used to be `shadow`, which put
+/// `SemanticCache::get`'s single global `Mutex`, a `retain` sweep and a
+/// linear cosine walk over the whole partition on every non-streaming
+/// eligible call whether or not an operator had ever asked for the cache -
+/// issue #319: 79-92% of gateway CPU in `SemanticCache::get` under load, 50
+/// agents at 177 req/s with 403s where the cache off measured 1102 req/s. A
+/// measurement feature that costs every request by default is the same
+/// mistake `TOKENFUSE_TOOLS_PRUNE` above was written not to make; `shadow`
+/// is still one word away for an operator who wants the projected savings.
+/// An unrecognised value is also `off`, with one warn line naming the value,
+/// the same posture as `tools_prune_mode_from`.
+pub fn cache_mode_from(value: Option<&str>) -> tokenfuse_core::cache::CacheMode {
+    use tokenfuse_core::cache::CacheMode;
+    match value.map(str::trim) {
+        Some("on") => CacheMode::On,
+        Some("shadow") => CacheMode::Shadow,
+        None | Some("") | Some("off") => CacheMode::Off,
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "TOKENFUSE_CACHE must be off, shadow or on; treating this value as off"
+            );
+            CacheMode::Off
+        }
+    }
+}
+
+/// [`cache_mode_from`] against the process environment.
+pub fn cache_mode_from_env() -> tokenfuse_core::cache::CacheMode {
+    cache_mode_from(std::env::var("TOKENFUSE_CACHE").ok().as_deref())
+}
+
 /// [`dlp_mode_from`] against the process environment.
 pub fn dlp_mode_from_env() -> DlpMode {
     dlp_mode_from(std::env::var("TOKENFUSE_DLP").ok().as_deref())
@@ -211,6 +245,31 @@ mod tests {
         }
         for other in ["nope", "disabled", "2", "  "] {
             assert!(require_run_id_from(Some(other)), "{other}");
+        }
+    }
+
+    /// The red-first case for invariant 63: on the unfixed code (`TOKENFUSE_CACHE`
+    /// unset falling to `Shadow`) this assertion fails. It must read `Off`.
+    #[test]
+    fn cache_is_off_when_nothing_is_configured() {
+        use tokenfuse_core::cache::CacheMode;
+        assert_eq!(cache_mode_from(None), CacheMode::Off);
+        assert_eq!(cache_mode_from(Some("")), CacheMode::Off);
+    }
+
+    #[test]
+    fn every_named_cache_mode_is_honoured() {
+        use tokenfuse_core::cache::CacheMode;
+        assert_eq!(cache_mode_from(Some("off")), CacheMode::Off);
+        assert_eq!(cache_mode_from(Some("shadow")), CacheMode::Shadow);
+        assert_eq!(cache_mode_from(Some("on")), CacheMode::On);
+    }
+
+    #[test]
+    fn an_unrecognised_cache_value_is_off_not_a_guess() {
+        use tokenfuse_core::cache::CacheMode;
+        for typo in ["Shadow", "On", "enforce", "1", "true"] {
+            assert_eq!(cache_mode_from(Some(typo)), CacheMode::Off, "{typo}");
         }
     }
 }
