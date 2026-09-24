@@ -3938,3 +3938,91 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     here. And the LLM proxy does not accept XAA: only the
     MCP broker publishes RFC 9728 metadata and only `mcpbroker::handle` reads
     `Authorization: Bearer` this way.
+
+64. **A lookup that finds nothing new does no new work, and a lookup that
+    finds a repeat does no walk at all.** `@decided 2026-09-24`. Issue #319:
+    `SemanticCache::get` held one global `Mutex` over the whole store, ran a
+    `retain()` TTL sweep over the whole partition, then a linear `cosine`
+    walk against every stored entry, on every eligible call, in `Shadow`
+    mode as much as `On`. Measured on a 4-core box: 79-92% of gateway CPU in
+    `SemanticCache::get`, 177 req/s with 403s under 50 concurrent agents
+    where the cache off measured 1102 req/s.
+
+    Each partition now keeps an **exact-match index**: a cheap 64-bit hash
+    of the normalized core text maps to the (small) set of entries that
+    might share it, and each candidate is verified against a SHA-256 digest
+    of its own normalized core text before ever being served, so a 64-bit
+    bucket collision can never serve the wrong response. An identical core
+    is found in O(1) average with **no embedding call and no similarity
+    walk at all**; only a core this partition has never seen falls through
+    to the unchanged linear walk. `put` of a core that already exists in
+    its partition **replaces** that entry (new response, cost,
+    `created_millis`, same id, same eviction-order position) instead of
+    appending a duplicate, so identical traffic no longer grows a
+    partition without bound. Eviction at `max_per_partition` is O(1) via a
+    `VecDeque` of insertion order, with the exact-match index kept
+    consistent on both eviction and replacement.
+
+    Embeddings are stored L2-normalized and the query is normalized once
+    per lookup, so similarity is a plain dot product; a zero vector
+    normalizes to itself and dots to `0.0` against anything, never `NaN`,
+    so it can never cross a positive threshold.
+
+    `get` takes a read lock and never removes anything (expired entries
+    are skipped while walking, not swept), so concurrent readers are never
+    serialized against each other; `put` takes a write lock, and that is
+    where the partition-local TTL sweep runs.
+
+    **Measured, not only reasoned about.** At 10,000 entries per partition
+    (the default cap), release build: the OLD code (one lock, always a
+    full walk) answered an exact-repeat query in 79.751us and a miss in
+    83.864us, indistinguishable, because it did the same O(n) work either
+    way. The NEW code answers an exact-repeat query in 717ns, about 111x
+    faster, and a miss (falling through to the similarity walk) in
+    207.854us, about 2.5x SLOWER than before: the walk now iterates a
+    `HashMap<u64, Entry>` rather than a contiguous `Vec<Entry>`, which
+    costs more per entry than it saves. Left here rather than hidden: the
+    hot path this fixes is repeated/near-repeated traffic, where most
+    calls ARE exact repeats once a cache has run for a while, and the
+    miss path's absolute cost (order 200us) is still three orders of
+    magnitude below a live provider call. A follow-up could recover the
+    miss-path regression with a slab/`Vec`-backed partition indexed by id
+    instead of a `HashMap`; not done here.
+    *(gate: not a script gate, the rule is `SemanticCache::get`/`put`
+    themselves, held by `cargo test`. Tests, all in `core::cache::tests`:
+    `identical_core_twice_replaces_not_appends`,
+    `an_exact_hit_never_walks_similarity`,
+    `a_miss_still_falls_through_to_the_similarity_walk`,
+    `hash_collision_never_serves_the_wrong_response` (via a test-only hook
+    forcing two different cores into one bucket, since a real 64-bit
+    SipHash collision cannot be hand-crafted),
+    `an_expired_exact_entry_is_not_served`,
+    `expired_entries_disappear_after_a_put`,
+    `zero_vector_embedding_never_matches`,
+    `eviction_keeps_the_exact_index_in_step`,
+    `entity_and_length_guards_still_apply_on_the_similarity_path`,
+    `threshold_boundary_is_inclusive_on_the_similarity_path`,
+    `a_similarity_just_under_the_threshold_never_hits`,
+    `the_query_is_normalized_before_the_similarity_walk` and
+    `concurrent_get_and_put_never_deadlock_or_cross_wires` (8 threads x 200
+    put/get pairs, asserting every response served is the one its own
+    thread just wrote). Every pre-existing test in the module (the
+    original 7) still passes unchanged. Seven mutants planted in the
+    product code and reverted, each caught by a named test: the digest
+    check in `find_exact` skipped
+    (`hash_collision_never_serves_the_wrong_response`); the exact path's
+    TTL check dropped (`an_expired_exact_entry_is_not_served`,
+    `ttl_expires_entries`); `put` never checking for an existing entry
+    (`identical_core_twice_replaces_not_appends`); the similarity
+    threshold's `>=` moved to `>`
+    (`threshold_boundary_is_inclusive_on_the_similarity_path`) and to `<=`
+    (`a_similarity_just_under_the_threshold_never_hits`); the entity guard
+    removed (caught by `eviction_keeps_the_exact_index_in_step`, not by
+    `entity_guard_blocks_number_mismatch` as expected: that pair's
+    HashEmbedder-computed similarity happens to stay under the test's own
+    0.9 threshold even with the guard gone, so it is a weaker witness than
+    it looks; recorded here rather than quietly relabelled); `Partition::remove`
+    dropping the exact-index cleanup
+    (`eviction_keeps_the_exact_index_in_step`); and the query's
+    `l2_normalize` call removed from `get`
+    (`the_query_is_normalized_before_the_similarity_walk`).)*
