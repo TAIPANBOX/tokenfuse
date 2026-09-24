@@ -534,3 +534,248 @@ async fn a_filter_outage_in_shadow_costs_only_a_warn_line() {
         "exactly one warn line for the outage, got:\n{log}"
     );
 }
+
+/// A shadow gateway with its decision cache on, for the two cache tests below.
+fn cached_wardryx(url: String) -> Wardryx {
+    Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(60),
+    )
+}
+
+/// A request for `agent` under `run`, declaring `tools` (Anthropic shape).
+fn request_as(agent: &str, run: &str, tools: Value) -> Request<Body> {
+    let body = json!({
+        "model": "test-model",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools
+    })
+    .to_string();
+    Request::post("/v1/messages")
+        .header("x-fuse-run-id", run)
+        .header("x-fuse-agent-id", agent)
+        .header("x-fuse-budget-usd", "5.0")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Bytes are the finest unit this measurement has, so the estimate divides the
+/// SUM of the denied schemas once, the way `estimate_cost` divides a whole
+/// body, rather than truncating each tool and losing up to three bytes per
+/// denied tool before summing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_estimate_rounds_once_over_the_summed_bytes() {
+    let stub = WardryxStub::new(json!({
+        "allowed": ["lookup"],
+        "denied": [
+            {"name": "t_one", "policy": "p", "rule": "deny_tool"},
+            {"name": "t_two", "policy": "p", "rule": "deny_tool"}
+        ],
+        "policy_version": "v1"
+    }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(0),
+    );
+    let sink = RecordingSink::default();
+    let st = state(
+        wardryx,
+        ToolsPruneMode::Shadow,
+        CapturedBody::default(),
+        sink.clone(),
+    );
+    let app = tokenfuse_gateway::app(st);
+
+    let tools = json!([
+        {"name": "lookup", "description": "read only", "input_schema": {}},
+        {"name": "t_one", "description": "d"},
+        {"name": "t_two", "description": "dd"}
+    ]);
+    let one = serde_json::to_string(&tools[1]).unwrap().len() as u64;
+    let two = serde_json::to_string(&tools[2]).unwrap().len() as u64;
+    // The fixture proves something only while the two roundings disagree on it.
+    assert_ne!(
+        (one + two) / 4,
+        one / 4 + two / 4,
+        "the fixture no longer tells rounding once from rounding per tool: {one} + {two}"
+    );
+
+    let resp = app
+        .oneshot(request_as(
+            "agent://shadow-prune-test/caller",
+            "shadow-prune-round",
+            tools,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rec = sink.last();
+    assert_eq!(rec.tools_would_prune, Some(2));
+    assert_eq!(
+        rec.pruned_schema_tokens_est,
+        Some((one + two) / 4),
+        "the denied schemas' bytes are summed, then divided once"
+    );
+}
+
+/// wardryx refuses a filter question that names no agent (`400 agent_id is
+/// required`), so asking it costs a round trip that cannot succeed and would
+/// spend the once-per-process warning on a request shape rather than an
+/// outage. With no `x-fuse-agent-id` nothing is asked and nothing is measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shadow_with_no_agent_id_asks_nothing_and_measures_nothing() {
+    let stub = WardryxStub::new(deny_wire_transfer_response());
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wardryx = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Open,
+        url,
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(0),
+    );
+    let sink = RecordingSink::default();
+    let st = state(
+        wardryx,
+        ToolsPruneMode::Shadow,
+        CapturedBody::default(),
+        sink.clone(),
+    );
+    let app = tokenfuse_gateway::app(st);
+
+    let mut req = request(&anthropic_body());
+    req.headers_mut().remove("x-fuse-agent-id");
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        stub.filter_calls.load(Ordering::SeqCst),
+        0,
+        "a filter question with no subject is never sent"
+    );
+    let rec = sink.last();
+    assert_eq!(rec.tools_offered, None);
+    assert_eq!(rec.tools_would_prune, None);
+    assert_eq!(rec.pruned_schema_tokens_est, None);
+    assert!(resp.headers().get("x-fuse-tools-would-prune").is_none());
+}
+
+/// With the cache on, the same agent declaring the same tool set, in any
+/// order, is answered from the cache: one filter call for two requests, and
+/// both rows carry the same measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeated_tool_set_is_answered_from_the_cache() {
+    let stub = WardryxStub::new(deny_wire_transfer_response());
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let sink = RecordingSink::default();
+    let st = state(
+        cached_wardryx(url),
+        ToolsPruneMode::Shadow,
+        CapturedBody::default(),
+        sink.clone(),
+    );
+    let app = tokenfuse_gateway::app(st);
+
+    let agent = "agent://shadow-prune-test/caller";
+    let first = json!([
+        {"name": "lookup", "description": "read only", "input_schema": {}},
+        {"name": "wire_transfer", "description": "move money", "input_schema": {"type": "object"}},
+        {"name": "send_email", "description": "notify", "input_schema": {}}
+    ]);
+    let reordered = json!([first[2].clone(), first[0].clone(), first[1].clone()]);
+
+    let resp1 = app
+        .clone()
+        .oneshot(request_as(agent, "shadow-prune-cache-1", first))
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let rec1 = sink.last();
+    let resp2 = app
+        .oneshot(request_as(agent, "shadow-prune-cache-2", reordered))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let rec2 = sink.last();
+
+    assert_eq!(
+        stub.filter_calls.load(Ordering::SeqCst),
+        1,
+        "the second request was answered from the cache"
+    );
+    assert_eq!(rec1.tools_would_prune, Some(1));
+    assert_eq!(rec2.tools_offered, rec1.tools_offered);
+    assert_eq!(rec2.tools_would_prune, rec1.tools_would_prune);
+    assert_eq!(rec2.pruned_schema_tokens_est, rec1.pruned_schema_tokens_est);
+}
+
+/// The cache key is the agent AND the tool set: another agent with the same
+/// tools, or the same agent with another tool set, is asked afresh, so one
+/// agent's answer never stands in for another's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cache_never_answers_for_another_agent_or_another_tool_set() {
+    let stub = WardryxStub::new(deny_wire_transfer_response());
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let sink = RecordingSink::default();
+    let st = state(
+        cached_wardryx(url),
+        ToolsPruneMode::Shadow,
+        CapturedBody::default(),
+        sink.clone(),
+    );
+    let app = tokenfuse_gateway::app(st);
+
+    let three = json!([
+        {"name": "lookup", "description": "read only", "input_schema": {}},
+        {"name": "wire_transfer", "description": "move money", "input_schema": {"type": "object"}},
+        {"name": "send_email", "description": "notify", "input_schema": {}}
+    ]);
+    let two = json!([three[0].clone(), three[2].clone()]);
+
+    for (agent, run, tools) in [
+        (
+            "agent://shadow-prune-test/caller",
+            "shadow-prune-key-1",
+            three.clone(),
+        ),
+        (
+            "agent://shadow-prune-test/other",
+            "shadow-prune-key-2",
+            three,
+        ),
+        (
+            "agent://shadow-prune-test/caller",
+            "shadow-prune-key-3",
+            two,
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(request_as(agent, run, tools))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        stub.filter_calls.load(Ordering::SeqCst),
+        3,
+        "another agent, or another tool set, is never answered from the cache"
+    );
+}

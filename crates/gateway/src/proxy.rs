@@ -1548,8 +1548,13 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     let mut tools_offered: Option<u32> = None;
     let mut tools_would_prune: Option<u32> = None;
     let mut pruned_schema_tokens_est: Option<u64> = None;
+    // No subject, no question: wardryx answers a filter question that names no
+    // agent with `400 agent_id is required`, so asking it is a round trip that
+    // cannot succeed and would spend the once-per-process warning on a request
+    // shape rather than an outage. The decide call above keeps its own rule.
     if st.tools_prune == crate::defaults::ToolsPruneMode::Shadow
         && st.wardryx.mode != WardryxMode::Off
+        && !agent_id.is_empty()
     {
         let tool_defs = taint::declared_tool_defs_in(&request);
         if !tool_defs.is_empty() {

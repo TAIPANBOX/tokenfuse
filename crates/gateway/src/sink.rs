@@ -102,15 +102,12 @@ pub struct CallRecord {
     /// error) - never a guess. Not part of budget/ledger accounting: v1 is
     /// observed-only, no enforcement on tool calls.
     pub tool_calls: Option<u32>,
-    /// Shadow tool-pruning measurement (W2a, invariant 61): the number of
-    /// tools this request declared, `None` when nothing was measured (the
-    /// setting is off, the wardryx hook is off, no tool was declared, or the
-    /// `filter_tools` call failed) - never zero for "not measured", since zero
-    /// declared tools is itself a real measured answer this column can also
-    /// carry (`Some(0)`) when the request declared tools and pruning ran but
-    /// found nothing to remove is instead `tools_would_prune: Some(0)`, so
-    /// this field being `Some` at all already implies at least one tool was
-    /// declared.
+    /// Shadow tool-pruning measurement (W2a, invariant 61): how many tools
+    /// this request declared. `None` when nothing was measured: the setting
+    /// is off, the wardryx hook is off, no tool was declared, no agent was
+    /// named, or the `filter_tools` call failed. A measured row always
+    /// declared at least one tool, so this column is never `Some(0)`;
+    /// "measured, and nothing to remove" is `tools_would_prune: Some(0)`.
     ///
     /// Deliberately kept off the Cloud telemetry wire (see `cloudsink.rs`'s
     /// `WireRecord`): `#[serde(skip_serializing)]` below.

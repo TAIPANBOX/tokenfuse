@@ -1805,109 +1805,6 @@ build)`, `cloud apns (feature build)`.
    because it is the gateway's own `unauthorized_response` and sharing it is
    what keeps the two planes from drifting.
 
-61. **Shadow tool pruning measures and never modifies.** (56 to 59 stay reserved,
-    the gap earlier branches numbered in advance and did not use.) A `deny_tool`
-    hit today refuses the whole call once a denied tool is merely OFFERED to the
-    model; nothing removes the denied tools and forwards the rest, and nothing
-    measured how many input tokens are spent on schemas of tools an agent may
-    never use. `TOKENFUSE_TOOLS_PRUNE=off` (default) or `shadow`; any other
-    value is `off` plus one warn line naming the value
-    (`defaults::tools_prune_mode_from`). Shadow only: with the wardryx hook on
-    (any mode, not only `shadow`) and the request declaring at least one tool,
-    one `POST /v1/filter-tools` call (cached like `decide`, keyed
-    `(agent_id, sorted tool-set hash)`, same TTL) asks which of the declared
-    tools wardryx's `deny_tool` rule would deny; for those tools, the estimated
-    input tokens of their schemas, by the gateway's own estimator
-    (`estimate::CHARS_PER_TOKEN`, made `pub(crate)` rather than retyped, per
-    invariant 14's lesson one crate over). `core::taint::declared_tool_defs_in`
-    is `declared_tool_names_in`'s same traversal of both wire shapes, paired
-    with the byte length of each declared tool's whole element
-    (`serde_json::to_string`).
-
-    **With `TOKENFUSE_TOOLS_PRUNE=shadow` the forwarded body is byte-identical
-    in every mode.** Nothing in the wardryx hook, the measurement or the record
-    touches `request` after it is parsed; the three Parquet columns
-    (`tools_offered`, `tools_would_prune`, `pruned_schema_tokens_est`, nullable
-    `UInt32`/`UInt32`/`UInt64`, appended last per invariant 6) and the response
-    header `x-fuse-tools-would-prune` (`<tools_would_prune>;est_tokens=<...>`,
-    only when a measurement succeeded) are read-side additions only. The three
-    columns are `None` together whenever nothing was measured, never zero:
-    the setting off, the wardryx hook off, no tool declared, or the
-    `filter-tools` call failing all leave `None`, while a clean answer that
-    denies nothing is the real `Some(0)`. Every one of the 116-plus
-    `CallRecord` construction sites sets the three fields, `None` where
-    nothing was measured; the one site that measures anything is
-    `SettleGuard::record_row`, fed from `CallAttribution`, filled once at the
-    wardryx hook in `proxy::messages`.
-
-    **A wardryx that predates the route is named once, not per call.** A 404
-    on `/v1/filter-tools` is its own error kind
-    (`WardryxError::FilterRouteNotFound`), distinct from a transport failure, a
-    body that will not decode, or any other non-2xx status (the last of these
-    added beyond the letter of the plan: a 500 with a small JSON body that
-    happens to parse into the wire shape's all-optional fields would otherwise
-    read as a clean, empty answer rather than an outage, so any status outside
-    2xx that is not 404 is also `Transport`). Both kinds warn at most once per
-    process lifetime (`Wardryx::warned_filter_not_found`,
-    `warned_filter_other`, two `AtomicBool`s), and the 404 line says in words
-    that this wardryx has no `/v1/filter-tools` route and shadow pruning
-    measures nothing, so an operator reads why rather than guessing from a
-    generic transport message.
-
-    **The Cloud telemetry wire does not carry the three columns.**
-    `cloudsink::WireRecord` flattens `CallRecord` onto the wire wholesale
-    (`#[serde(flatten)]`), so a new pub field on `CallRecord` would reach
-    `/v1/ingest` by construction; the three new fields carry
-    `#[serde(skip_serializing)]` instead, kept off the wire explicitly rather
-    than by the accident of nobody adding a fourth column there yet. The
-    existing field-count tests (`the_wire_record_carries_the_units_owner_beside_every_existing_field`
-    and its siblings) stay green unchanged, which is the point: this wave adds
-    nothing to what the control plane sees.
-
-    **`TOKENFUSE_TOOLS_PRUNE` is read once, in `serve` only.**
-    `scripts/both-processes-configure-the-same-doors.sh` discovers doors by
-    `<Type>::from_env(` calls, and this setting is read by a plain function
-    (`defaults::tools_prune_mode_from_env`, the same shape as
-    `dlp_mode_from_env`/`require_run_id_from_env` beside it), so it is not one
-    of that gate's discovered subjects and needed no `process-local:` comment
-    to pass it; the reason it belongs in `serve` alone and not `mcp_broker` is
-    stated anyway, at the call site: the broker forwards no model request and
-    declares no tools of its own, so there is nothing here for it to measure.
-
-    Not a script gate: the rule is the wardryx hook's own code, held by
-    `cargo test`.
-    *(test: `core::taint::declared_tool_defs_in_reads_both_wire_shapes`,
-    `declared_tool_defs_in_survives_hostile_shapes` (a 200-seed sweep over
-    generated tool-declaration shapes); `gateway::defaults::tools_prune_is_off_when_nothing_is_configured`,
-    `tools_prune_shadow_is_the_one_word_that_turns_it_on`,
-    `an_unrecognised_tools_prune_value_is_off_not_a_guess`; five in
-    `crates/gateway/tests/shadow_tool_pruning.rs`:
-    `off_makes_no_filter_call`,
-    `shadow_pruning_never_changes_the_forwarded_body_anthropic` and
-    `..._openai`, `shadow_records_the_tools_the_policy_would_remove`,
-    `a_wardryx_without_the_route_is_named_once_and_measures_nothing`,
-    `a_filter_outage_in_shadow_costs_only_a_warn_line`, the last four run
-    against the unfixed wiring first (the wardryx hook's shadow-pruning call
-    disabled behind a stub condition that still compiles): each failed for the
-    reason it asserts, verbatim `left: None right: Some(3)` for the records
-    test and `left: 0 right: 1` (or `2`) on the filter-call count for the
-    other three; `off_makes_no_filter_call` passed on both sides, a guard held
-    instead by mutant P5 below. Scenarios: `features/shadow-tool-pruning.feature`,
-    five, each bound.
-
-    Mutants planted in the product code and reverted: P1, shadow strips the
-    denied tools from the forwarded body, caught by
-    `shadow_pruning_never_changes_the_forwarded_body_anthropic`/`..._openai`;
-    P2, an error records `Some(0)` instead of `None`, caught by
-    `a_filter_outage_in_shadow_costs_only_a_warn_line`; P3, a 404 is treated
-    as success with nothing denied, caught by
-    `a_wardryx_without_the_route_is_named_once_and_measures_nothing`; P4, the
-    estimate sums every declared tool instead of the denied ones, caught by
-    `shadow_records_the_tools_the_policy_would_remove`; P5, `filter_tools` is
-    called when the setting is off, caught by `off_makes_no_filter_call`; P6,
-    `declared_tool_defs_in` reads only the Anthropic shape, caught by
-    `declared_tool_defs_in_reads_both_wire_shapes`.)*
-
 ## Decisions that have no gate yet
 
 This list is debt, and it is here to stay visible rather than to be tidy.
@@ -3668,3 +3565,139 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the first call, the `run_stalled` export arm removed, and the wire type's severity moved to
     high. Scenarios: `features/a-run-that-goes-quiet.feature`, eight, each bound.
     Not a script gate: the rule is a predicate, held by `cargo test`.)*
+
+61. **Shadow tool pruning measures and never modifies.** (Numbered 61, after 60, because
+    56 to 59 stay reserved, the gap earlier branches numbered in advance and did not use.)
+    A `deny_tool` hit today refuses the whole call once a denied tool is merely OFFERED to
+    the model; nothing removes the denied tools and forwards the rest, and nothing measured
+    how many input tokens are spent on schemas of tools an agent may never use.
+    `TOKENFUSE_TOOLS_PRUNE=off` (default) or `shadow`; any other value is `off` plus one
+    warn line naming the value (`defaults::tools_prune_mode_from`). Shadow only: with the
+    wardryx hook on (any mode, not only `shadow`), the request declaring at least one tool
+    and naming its agent in `x-fuse-agent-id`, one `POST /v1/filter-tools` call (cached like
+    `decide`, keyed `(agent_id, sorted tool-set hash)`, same TTL) asks which of the declared
+    tools wardryx's `deny_tool` rule would deny; for those tools, the estimated input tokens
+    of their schemas, by the gateway's own estimator (`estimate::CHARS_PER_TOKEN`, made
+    `pub(crate)` rather than retyped, per invariant 14's lesson one crate over).
+    `core::taint::declared_tool_defs_in` is `declared_tool_names_in`'s same traversal of
+    both wire shapes, paired with the byte length of each declared tool's whole element
+    (`serde_json::to_string`).
+
+    **The forwarded body is byte-identical, whatever this setting and the wardryx mode
+    are.** Nothing in the wardryx hook, the measurement or the record touches `request`
+    after it is parsed; the three Parquet columns (`tools_offered`, `tools_would_prune`,
+    `pruned_schema_tokens_est`, nullable `UInt32`/`UInt32`/`UInt64`, appended last per
+    invariant 6) and the response header `x-fuse-tools-would-prune`
+    (`<tools_would_prune>;est_tokens=<...>`, only when a measurement succeeded) are
+    read-side additions only. The three columns are `None` together whenever nothing was
+    measured, never zero: the setting off, the wardryx hook off, no tool declared, no agent
+    named, or the `filter-tools` call failing all leave `None`, while a clean answer that
+    denies nothing is the real `Some(0)`. Every one of the 116-plus `CallRecord`
+    construction sites sets the three fields, `None` where nothing was measured; the one
+    site that measures anything is `SettleGuard::record_row`, fed from `CallAttribution`,
+    filled once at the wardryx hook in `proxy::messages`.
+
+    **Bytes are summed, then divided once.** The estimate divides the byte total of the
+    denied schemas by `CHARS_PER_TOKEN` a single time, the way `estimate_cost` divides a
+    whole body, rather than truncating each tool and summing what is left, which loses up
+    to three bytes per denied tool before the sum. The money path's rule, one grain per row
+    and rounding once at the aggregate, applied to an estimate.
+
+    **No subject, no question.** A request with no `x-fuse-agent-id` is not measured and
+    no `filter-tools` call is made: wardryx answers such a question `400 agent_id is
+    required`, so asking it is a round trip that cannot succeed, and its failure would spend
+    the once-per-process warning below on a request shape rather than on an outage. The
+    decide call beside it keeps its own rule (shadow observes with whatever attribution it
+    was given).
+
+    **A wardryx that predates the route is named once, not per call.** A 404 on
+    `/v1/filter-tools` is its own error kind (`WardryxError::FilterRouteNotFound`), distinct
+    from a transport failure, a body that will not decode, or any other non-2xx status (the
+    last of these added beyond the letter of the plan: a 500 with a small JSON body that
+    happens to parse into the wire shape's all-optional fields would otherwise read as a
+    clean, empty answer rather than an outage, so any status outside 2xx that is not 404 is
+    also `Transport`). Both kinds warn at most once per process lifetime
+    (`Wardryx::warned_filter_not_found`, `warned_filter_other`, two `AtomicBool`s), and the
+    404 line says in words that this wardryx has no `/v1/filter-tools` route and shadow
+    pruning measures nothing, so an operator reads why rather than guessing from a generic
+    transport message.
+
+    **The Cloud telemetry wire does not carry the three columns.** `cloudsink::WireRecord`
+    flattens `CallRecord` onto the wire wholesale (`#[serde(flatten)]`), so a new pub field
+    on `CallRecord` would reach `/v1/ingest` by construction; the three new fields carry
+    `#[serde(skip_serializing)]` instead, kept off the wire explicitly rather than by the
+    accident of nobody adding a fourth column there yet. The existing field-count tests
+    (`the_wire_record_carries_the_units_owner_beside_every_existing_field` and its
+    siblings) stay green unchanged, which is the point: this wave adds nothing to what the
+    control plane sees.
+
+    **`TOKENFUSE_TOOLS_PRUNE` is read once, in `serve` only.**
+    `scripts/both-processes-configure-the-same-doors.sh` discovers doors by
+    `<Type>::from_env(` calls, and this setting is read by a plain function
+    (`defaults::tools_prune_mode_from_env`, the same shape as
+    `dlp_mode_from_env`/`require_run_id_from_env` beside it), so it is not one of that
+    gate's discovered subjects and needed no `process-local:` comment to pass it; the reason
+    it belongs in `serve` alone and not `mcp_broker` is stated anyway, at the call site: the
+    broker forwards no model request and declares no tools of its own, so there is nothing
+    here for it to measure.
+
+    **Where it says nothing.** The measurement waits for its call on the request path, so
+    while the PDP is not answering a request in shadow pays the timeout twice, once for
+    `decide` and once for `filter-tools`; a failure is never cached, and the two calls are
+    not made concurrently. The filter cache, like the decide cache beside it, is bounded by
+    its TTL on read and by nothing on write: an entry is replaced, never evicted, so a
+    caller able to vary the agent id or the tool set grows it for the life of the process.
+    The warning for a failure other than 404 is once per process lifetime, so a second
+    outage after a recovery shows only as `None` in the three columns, not in the log. A
+    tool declared twice, or one element carrying both an Anthropic `name` and an OpenAI
+    `function.name`, is counted twice in `tools_offered` and priced twice if denied, the
+    traversal `declared_tool_names_in` already had. The measurement is taken before the
+    budget checks, so a call a budget then refuses carries none of it.
+
+    Not a script gate: the rule is the wardryx hook's own code, held by `cargo test`.
+    *(test: `core::taint::declared_tool_defs_in_reads_both_wire_shapes`,
+    `declared_tool_defs_in_survives_hostile_shapes` (a 200-seed sweep over generated
+    tool-declaration shapes); `gateway::defaults::tools_prune_is_off_when_nothing_is_configured`,
+    `tools_prune_shadow_is_the_one_word_that_turns_it_on`,
+    `an_unrecognised_tools_prune_value_is_off_not_a_guess`; nine in
+    `crates/gateway/tests/shadow_tool_pruning.rs`: `off_makes_no_filter_call`,
+    `shadow_pruning_never_changes_the_forwarded_body_anthropic` and `..._openai`,
+    `shadow_records_the_tools_the_policy_would_remove`,
+    `a_wardryx_without_the_route_is_named_once_and_measures_nothing`,
+    `a_filter_outage_in_shadow_costs_only_a_warn_line`,
+    `the_estimate_rounds_once_over_the_summed_bytes`,
+    `shadow_with_no_agent_id_asks_nothing_and_measures_nothing`,
+    `a_repeated_tool_set_is_answered_from_the_cache` and
+    `the_cache_never_answers_for_another_agent_or_another_tool_set`. Red first: the four
+    after `off_makes_no_filter_call` were run against the unfixed wiring (the wardryx hook's
+    shadow-pruning call disabled behind a stub condition that still compiles), each failing
+    for the reason it asserts, verbatim `left: None right: Some(3)` for the records test and
+    `left: 0 right: 1` (or `2`) on the filter-call count for the other three;
+    `off_makes_no_filter_call` passed on both sides, a guard held instead by mutant P5.
+    The two added in review, @measured `cargo test -p tokenfuse-gateway --test
+    shadow_tool_pruning` 2026-09-24 against the implementer's commit 38806d7:
+    `the_estimate_rounds_once_over_the_summed_bytes` read `left: Some(16) right: Some(17)`
+    and `shadow_with_no_agent_id_asks_nothing_and_measures_nothing` `left: 1 right: 0`.
+    The two cache tests pass on the unfixed tree, because the cache was already there, and
+    are held by mutants P9 to P11. Scenarios: `features/shadow-tool-pruning.feature`, five,
+    each bound.
+
+    Mutants planted in the product code and reverted: P1, shadow strips the denied tools
+    from the forwarded body, caught by
+    `shadow_pruning_never_changes_the_forwarded_body_anthropic`/`..._openai`; P2, an error
+    records `Some(0)` instead of `None`, caught by
+    `a_filter_outage_in_shadow_costs_only_a_warn_line`; P3, a 404 is treated as success
+    with nothing denied, caught by
+    `a_wardryx_without_the_route_is_named_once_and_measures_nothing`; P4, the estimate sums
+    every declared tool instead of the denied ones, caught by
+    `shadow_records_the_tools_the_policy_would_remove`; P5, `filter_tools` is called when
+    the setting is off, caught by `off_makes_no_filter_call`; P6, `declared_tool_defs_in`
+    reads only the Anthropic shape, caught by `declared_tool_defs_in_reads_both_wire_shapes`;
+    P7, the estimate truncating each tool and summing, caught by
+    `the_estimate_rounds_once_over_the_summed_bytes` (the red-first run above); P8, the
+    filter question asked with no agent named, caught by
+    `shadow_with_no_agent_id_asks_nothing_and_measures_nothing` (the same); P9, the filter
+    cache never storing an answer, caught by `a_repeated_tool_set_is_answered_from_the_cache`
+    (`left: 2 right: 1`); P10 and P11, the cache key dropping the agent or the tool set,
+    each caught by `the_cache_never_answers_for_another_agent_or_another_tool_set`
+    (`left: 2 right: 3`).)*

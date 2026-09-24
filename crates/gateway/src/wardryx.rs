@@ -927,17 +927,21 @@ impl Wardryx {
         let denied: std::collections::HashSet<&str> =
             outcome.denied.iter().map(|d| d.name.as_str()).collect();
         let mut would_prune: u32 = 0;
-        let mut tokens: u64 = 0;
+        let mut pruned_bytes: u64 = 0;
         for (name, len) in tool_defs {
             if denied.contains(name.as_str()) {
                 would_prune += 1;
-                tokens += (*len as u64) / crate::estimate::CHARS_PER_TOKEN;
+                pruned_bytes += *len as u64;
             }
         }
         ShadowPruneMeasurement {
             tools_offered: Some(tool_defs.len() as u32),
             tools_would_prune: Some(would_prune),
-            pruned_schema_tokens_est: Some(tokens),
+            // Bytes are the finest unit this measurement has: they are summed
+            // and divided ONCE, the way `estimate_cost` divides a whole body,
+            // so N denied tools do not each lose up to three bytes before the
+            // sum (invariant 61, the money path's round-once rule).
+            pruned_schema_tokens_est: Some(pruned_bytes / crate::estimate::CHARS_PER_TOKEN),
         }
     }
 
