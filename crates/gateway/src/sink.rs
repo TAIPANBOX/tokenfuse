@@ -102,6 +102,31 @@ pub struct CallRecord {
     /// error) - never a guess. Not part of budget/ledger accounting: v1 is
     /// observed-only, no enforcement on tool calls.
     pub tool_calls: Option<u32>,
+    /// Shadow tool-pruning measurement (W2a, invariant 61): the number of
+    /// tools this request declared, `None` when nothing was measured (the
+    /// setting is off, the wardryx hook is off, no tool was declared, or the
+    /// `filter_tools` call failed) - never zero for "not measured", since zero
+    /// declared tools is itself a real measured answer this column can also
+    /// carry (`Some(0)`) when the request declared tools and pruning ran but
+    /// found nothing to remove is instead `tools_would_prune: Some(0)`, so
+    /// this field being `Some` at all already implies at least one tool was
+    /// declared.
+    ///
+    /// Deliberately kept off the Cloud telemetry wire (see `cloudsink.rs`'s
+    /// `WireRecord`): `#[serde(skip_serializing)]` below.
+    #[serde(skip_serializing)]
+    pub tools_offered: Option<u32>,
+    /// How many of `tools_offered` wardryx's policy would deny, per the same
+    /// measurement. `None` together with `tools_offered` and
+    /// `pruned_schema_tokens_est` whenever nothing was measured.
+    #[serde(skip_serializing)]
+    pub tools_would_prune: Option<u32>,
+    /// Estimated input tokens spent on the schemas of the tools
+    /// `tools_would_prune` counts, by the gateway's own estimator
+    /// (`estimate::CHARS_PER_TOKEN`). `None` together with the two fields
+    /// above whenever nothing was measured.
+    #[serde(skip_serializing)]
+    pub pruned_schema_tokens_est: Option<u64>,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -220,6 +245,14 @@ impl ParquetSink {
             // so we write an actual Parquet NULL for the former rather than a
             // sentinel default.
             Field::new("tool_calls", DataType::UInt32, true),
+            // Appended W2a (shadow tool pruning) columns - same rule: LAST,
+            // in this order, and genuinely nullable in the WRITE schema like
+            // `tool_calls` above: `None` (nothing measured) and `Some(0)`
+            // (measured and found nothing to prune) are different facts.
+            // See `CallRecord::tools_offered` and invariant 61.
+            Field::new("tools_offered", DataType::UInt32, true),
+            Field::new("tools_would_prune", DataType::UInt32, true),
+            Field::new("pruned_schema_tokens_est", DataType::UInt64, true),
         ]))
     }
 
@@ -272,6 +305,11 @@ impl ParquetSink {
             // just the same "declare it nullable so old files' missing
             // column null-fills legally" rule.
             Field::new("tool_calls", DataType::UInt32, true),
+            // W2a (shadow tool pruning): same treatment once more, so a
+            // trace written before this existed still reads back.
+            Field::new("tools_offered", DataType::UInt32, true),
+            Field::new("tools_would_prune", DataType::UInt32, true),
+            Field::new("pruned_schema_tokens_est", DataType::UInt64, true),
         ]))
     }
 
@@ -348,6 +386,23 @@ impl ParquetSink {
                 // `tool_calls` column above needs.
                 Arc::new(UInt32Array::from(
                     records.iter().map(|r| r.tool_calls).collect::<Vec<_>>(),
+                )),
+                // W2a (shadow tool pruning): same real-null treatment as
+                // `tool_calls` above.
+                Arc::new(UInt32Array::from(
+                    records.iter().map(|r| r.tools_offered).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt32Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.tools_would_prune)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.pruned_schema_tokens_est)
+                        .collect::<Vec<_>>(),
                 )),
             ],
         )?;
@@ -445,6 +500,9 @@ mod tests {
             key_id: String::new(),
             unit: String::new(),
             tool_calls: None,
+            tools_offered: None,
+            tools_would_prune: None,
+            pruned_schema_tokens_est: None,
         }
     }
 

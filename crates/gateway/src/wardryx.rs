@@ -71,6 +71,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -288,6 +289,14 @@ enum WardryxError {
     Decode(String),
     #[error("wardryx returned an unrecognized decision: {0}")]
     UnknownDecision(String),
+    /// A 404 on `/v1/filter-tools`, its own error kind, distinct from every
+    /// other failure: it means this wardryx predates the route rather than
+    /// that the route is temporarily broken, and shadow tool pruning has no
+    /// use for retrying it.
+    #[error(
+        "this wardryx has no /v1/filter-tools route (it predates it); shadow pruning measures nothing"
+    )]
+    FilterRouteNotFound,
 }
 
 /// Talks to the Wardryx `POST {base_url}/v1/decide` endpoint. Kept separate
@@ -356,6 +365,177 @@ impl WardryxClient {
             unreachable: false,
         };
         Ok((outcome, wire.cacheable))
+    }
+
+    /// `POST {base_url}/v1/filter-tools`, same key and timeout as `decide`
+    /// (see this struct's doc). Applies wardryx's `deny_tool` rule to each
+    /// name in `tool_names` alone, in shadow, W2a: measurement only, never
+    /// enforcement. A 404 is reported as its own error kind rather than a
+    /// generic transport/decode failure, since it means this wardryx
+    /// predates the route.
+    async fn filter_tools(
+        &self,
+        req: &FilterToolsWireRequest<'_>,
+    ) -> Result<FilterOutcome, WardryxError> {
+        let endpoint = format!("{}/v1/filter-tools", self.base_url.trim_end_matches('/'));
+        let payload = serde_json::to_vec(req).map_err(|e| WardryxError::Decode(e.to_string()))?;
+        let mut builder = self
+            .http
+            .post(&endpoint)
+            .timeout(self.timeout)
+            .header("content-type", "application/json")
+            .body(payload);
+        if let Some(key) = &self.key {
+            if !key.is_empty() {
+                builder = builder.bearer_auth(key);
+            }
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| WardryxError::Transport(e.to_string()))?;
+        if resp.status().as_u16() == 404 {
+            return Err(WardryxError::FilterRouteNotFound);
+        }
+        if !resp.status().is_success() {
+            return Err(WardryxError::Transport(format!(
+                "wardryx answered {} on /v1/filter-tools",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| WardryxError::Transport(e.to_string()))?;
+        let wire: FilterToolsWireResponse =
+            serde_json::from_slice(&bytes).map_err(|e| WardryxError::Decode(e.to_string()))?;
+        Ok(FilterOutcome {
+            allowed: wire.allowed,
+            denied: wire
+                .denied
+                .into_iter()
+                .map(|d| DeniedTool {
+                    name: d.name,
+                    policy: d.policy,
+                    rule: d.rule,
+                })
+                .collect(),
+            policy_version: wire.policy_version,
+        })
+    }
+}
+
+/// One tool wardryx's policy would deny, from `/v1/filter-tools`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeniedTool {
+    pub name: String,
+    pub policy: Option<String>,
+    pub rule: Option<String>,
+}
+
+/// The result of a `filter_tools` call: which of the requested tool names
+/// wardryx's `deny_tool` rule would remove, and which it would keep. This is
+/// a measurement of what the POLICY says, never an instruction this gateway
+/// acts on in W2a: nothing here changes the forwarded request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterOutcome {
+    pub allowed: Vec<String>,
+    pub denied: Vec<DeniedTool>,
+    pub policy_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilterToolsWireRequest<'a> {
+    agent_id: &'a str,
+    run_id: &'a str,
+    tool_names: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+struct DeniedToolWire {
+    name: String,
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    rule: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilterToolsWireResponse {
+    #[serde(default)]
+    allowed: Vec<String>,
+    #[serde(default)]
+    denied: Vec<DeniedToolWire>,
+    #[serde(default)]
+    policy_version: Option<String>,
+}
+
+/// What shadow tool pruning measured for one request: how many tools were
+/// declared, how many wardryx's policy would remove, and the estimated input
+/// tokens their schemas cost. Every field is `None` together whenever nothing
+/// was measured (the setting is off, the hook is off, no tool was declared,
+/// or the filter-tools call failed) - never zero, because zero is a real
+/// measured answer and `None` is the honest "we do not know" (invariant 61).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShadowPruneMeasurement {
+    pub tools_offered: Option<u32>,
+    pub tools_would_prune: Option<u32>,
+    pub pruned_schema_tokens_est: Option<u64>,
+}
+
+/// One cached `filter_tools` answer, same TTL treatment as [`CacheEntry`]
+/// above: this reuses wardryx's own decision that `deny_tool` alone, unlike
+/// the request-shaped rules `Decide` also applies, is a pure function of
+/// `(agent_id, tool_names)`, so every successful answer is cacheable.
+#[derive(Debug, Clone)]
+struct FilterCacheEntry {
+    outcome: FilterOutcome,
+    cached_at: Instant,
+}
+
+/// Short-TTL in-memory cache for `filter_tools`, keyed the same way
+/// [`Cache::key`] keys `decide` (agent id plus a hash of the sorted tool
+/// set), minus the attestation/chain fields `Filter` never consults.
+struct FilterCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<(String, u64), FilterCacheEntry>>,
+}
+
+impl FilterCache {
+    fn new(ttl: Duration) -> Self {
+        FilterCache {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn key(agent_id: &str, tool_names: &[String]) -> (String, u64) {
+        let mut sorted: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sorted.hash(&mut hasher);
+        (agent_id.to_string(), hasher.finish())
+    }
+
+    fn get(&self, agent_id: &str, tool_names: &[String]) -> Option<FilterOutcome> {
+        let key = Self::key(agent_id, tool_names);
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(&key)?;
+        if entry.cached_at.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(entry.outcome.clone())
+    }
+
+    fn put(&self, agent_id: &str, tool_names: &[String], outcome: FilterOutcome) {
+        let key = Self::key(agent_id, tool_names);
+        self.entries.lock().unwrap().insert(
+            key,
+            FilterCacheEntry {
+                outcome,
+                cached_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -487,6 +667,17 @@ pub struct Wardryx {
     /// What the PDP has answered (see [`Verdicts`]). One mutex acquisition per
     /// wire decision, next to the one `Cache` already takes on the same path.
     verdicts: Mutex<Verdicts>,
+    /// Shadow tool pruning (W2a): the `filter_tools` decision cache.
+    filter_cache: FilterCache,
+    /// Whether this process has already warned that this wardryx has no
+    /// `/v1/filter-tools` route. One line for the process lifetime
+    /// (invariant 61), not one per call.
+    warned_filter_not_found: AtomicBool,
+    /// Whether this process has already warned about every OTHER
+    /// `filter_tools` failure kind (transport, decode, an unrecognised
+    /// status). One line for the process lifetime, distinct from the 404
+    /// warning above.
+    warned_filter_other: AtomicBool,
 }
 
 impl Wardryx {
@@ -499,6 +690,9 @@ impl Wardryx {
             client: None,
             cache: Cache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
             verdicts: Mutex::new(Verdicts::default()),
+            filter_cache: FilterCache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
+            warned_filter_not_found: AtomicBool::new(false),
+            warned_filter_other: AtomicBool::new(false),
         }
     }
 
@@ -519,6 +713,9 @@ impl Wardryx {
             client: Some(WardryxClient::new(base_url, key, timeout)),
             cache: Cache::new(cache_ttl),
             verdicts: Mutex::new(Verdicts::default()),
+            filter_cache: FilterCache::new(cache_ttl),
+            warned_filter_not_found: AtomicBool::new(false),
+            warned_filter_other: AtomicBool::new(false),
         }
     }
 
@@ -664,6 +861,84 @@ impl Wardryx {
     /// What the PDP has answered since this process started.
     pub fn verdicts(&self) -> Verdicts {
         *self.verdicts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shadow tool pruning (W2a): ask wardryx which of `tool_defs` its
+    /// `deny_tool` rule would remove, and price their schemas in estimated
+    /// input tokens. Never changes anything about the call this request
+    /// forwards; it only measures. The caller (`proxy::messages`) is
+    /// responsible for gating this on `TOKENFUSE_TOOLS_PRUNE=shadow`, the
+    /// hook being on, and the request declaring at least one tool - this
+    /// method assumes all three already hold and does not re-check them.
+    ///
+    /// Every field of the result is `None` together on any error: a missing
+    /// client, a transport failure, a body that will not decode, or a 404
+    /// (this wardryx predates `/v1/filter-tools`). Never zero, because zero
+    /// tools_would_prune is a real measured answer this method also returns
+    /// on a clean success with nothing denied.
+    pub async fn measure_shadow_prune(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        tool_defs: &[(String, usize)],
+    ) -> ShadowPruneMeasurement {
+        let none = ShadowPruneMeasurement::default();
+        let tool_names: Vec<String> = tool_defs.iter().map(|(n, _)| n.clone()).collect();
+
+        let outcome = if let Some(cached) = self.filter_cache.get(agent_id, &tool_names) {
+            cached
+        } else {
+            let Some(client) = &self.client else {
+                return none;
+            };
+            let wire = FilterToolsWireRequest {
+                agent_id,
+                run_id,
+                tool_names: &tool_names,
+            };
+            match client.filter_tools(&wire).await {
+                Ok(outcome) => {
+                    self.filter_cache
+                        .put(agent_id, &tool_names, outcome.clone());
+                    outcome
+                }
+                Err(WardryxError::FilterRouteNotFound) => {
+                    if !self.warned_filter_not_found.swap(true, Ordering::SeqCst) {
+                        tracing::warn!(
+                            "wardryx has no /v1/filter-tools route (this wardryx predates it); \
+                             shadow tool pruning measures nothing"
+                        );
+                    }
+                    return none;
+                }
+                Err(e) => {
+                    if !self.warned_filter_other.swap(true, Ordering::SeqCst) {
+                        tracing::warn!(
+                            error = %e,
+                            "wardryx filter-tools call failed; shadow tool pruning measures \
+                             nothing for this failure kind"
+                        );
+                    }
+                    return none;
+                }
+            }
+        };
+
+        let denied: std::collections::HashSet<&str> =
+            outcome.denied.iter().map(|d| d.name.as_str()).collect();
+        let mut would_prune: u32 = 0;
+        let mut tokens: u64 = 0;
+        for (name, len) in tool_defs {
+            if denied.contains(name.as_str()) {
+                would_prune += 1;
+                tokens += (*len as u64) / crate::estimate::CHARS_PER_TOKEN;
+            }
+        }
+        ShadowPruneMeasurement {
+            tools_offered: Some(tool_defs.len() as u32),
+            tools_would_prune: Some(would_prune),
+            pruned_schema_tokens_est: Some(tokens),
+        }
     }
 
     /// Synthesize an outcome for "the PDP could not be reached", per

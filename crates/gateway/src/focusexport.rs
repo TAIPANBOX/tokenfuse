@@ -631,6 +631,9 @@ mod tests {
             key_id: String::new(),
             unit: unit.into(),
             tool_calls,
+            tools_offered: None,
+            tools_would_prune: None,
+            pruned_schema_tokens_est: None,
         }
     }
 

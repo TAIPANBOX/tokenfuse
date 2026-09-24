@@ -12,7 +12,12 @@ use tokenfuse_core::{Microusd, PriceBook, Usage};
 const MARGIN: f64 = 1.15;
 
 /// Rough characters-per-token ratio for English-ish text.
-const CHARS_PER_TOKEN: u64 = 4;
+///
+/// `pub(crate)` since W2a: shadow tool pruning (`wardryx::measure_shadow_prune`)
+/// estimates the tokens a denied tool's schema would have cost by the same
+/// ratio, and a second constant here would drift from this one the moment
+/// either changed (invariant 61).
+pub(crate) const CHARS_PER_TOKEN: u64 = 4;
 
 /// Default assumed output tokens when the request does not cap `max_tokens`.
 const DEFAULT_MAX_TOKENS: u64 = 1_024;

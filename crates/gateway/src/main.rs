@@ -1087,6 +1087,18 @@ async fn serve() {
     tracing::info!(mode = ?wardryx.mode, "wardryx enforcement hook");
     state = state.with_wardryx(Arc::new(wardryx));
 
+    // Shadow tool-pruning measurement (W2a, invariant 61): TOKENFUSE_TOOLS_PRUNE
+    // = off (default) | shadow. Measures, in shadow only, how many input
+    // tokens go to schemas of tools the wardryx policy would deny; the
+    // forwarded request is never modified in any mode.
+    //
+    // process-local: applies to the model request path only; the MCP broker
+    // forwards no model request and declares no tools of its own, so it has
+    // nothing to measure and does not read this variable.
+    let tools_prune = tokenfuse_gateway::defaults::tools_prune_mode_from_env();
+    tracing::info!(?tools_prune, "shadow tool-pruning measurement");
+    state = state.with_tools_prune(tools_prune);
+
     // The delegation door, and the revocation list behind it. The same two
     // calls `mcp_broker` makes, because this process runs the other door and
     // `chainproof::resolve` at proxy.rs reads exactly the same config. Measured

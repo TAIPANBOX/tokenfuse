@@ -337,6 +337,21 @@
         "name": "tool_calls",
         "nullable": true,
         "type": "UInt32"
+      },
+      {
+        "name": "tools_offered",
+        "nullable": true,
+        "type": "UInt32"
+      },
+      {
+        "name": "tools_would_prune",
+        "nullable": true,
+        "type": "UInt32"
+      },
+      {
+        "name": "pruned_schema_tokens_est",
+        "nullable": true,
+        "type": "UInt64"
       }
     ],
     "write_schema": [
@@ -419,6 +434,21 @@
         "name": "tool_calls",
         "nullable": true,
         "type": "UInt32"
+      },
+      {
+        "name": "tools_offered",
+        "nullable": true,
+        "type": "UInt32"
+      },
+      {
+        "name": "tools_would_prune",
+        "nullable": true,
+        "type": "UInt32"
+      },
+      {
+        "name": "pruned_schema_tokens_est",
+        "nullable": true,
+        "type": "UInt64"
       }
     ]
   }
