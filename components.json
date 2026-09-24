@@ -235,6 +235,10 @@
           "TOKENFUSE_ROUTER_RULES": {
             "required": false
           },
+          "TOKENFUSE_TOOLS_PRUNE": {
+            "required": false,
+            "default": "off"
+          },
           "TOKENFUSE_UPSTREAM": {
             "required": false
           },

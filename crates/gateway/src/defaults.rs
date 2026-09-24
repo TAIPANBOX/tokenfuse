@@ -73,6 +73,46 @@ pub fn require_run_id_from(value: Option<&str>) -> bool {
     )
 }
 
+/// Shadow tool-pruning measurement (`TOKENFUSE_TOOLS_PRUNE`): `off | shadow`.
+///
+/// W2a, invariant 61: shadow only MEASURES how many input tokens go to
+/// schemas of tools the wardryx policy would deny; it never changes the
+/// forwarded request in any mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolsPruneMode {
+    #[default]
+    Off,
+    Shadow,
+}
+
+/// **Unset is `off`**, unlike `TOKENFUSE_DLP` above: this is a measurement
+/// feature with a network call attached (`filter_tools`), not a security
+/// control, so there is no argument for defaulting it on the way invariant 17
+/// argues for DLP and `TOKENFUSE_REQUIRE_RUN_ID`. An unrecognised value is
+/// also `off`, with one warn line naming the value it could not parse -
+/// the same "say so, do not guess" posture as every other setting here, just
+/// resolving to the SAFER value (no call, no behaviour change) rather than
+/// the stricter one, because there is no stricter reading of a measurement
+/// toggle.
+pub fn tools_prune_mode_from(value: Option<&str>) -> ToolsPruneMode {
+    match value.map(str::trim) {
+        Some("shadow") => ToolsPruneMode::Shadow,
+        None | Some("") | Some("off") => ToolsPruneMode::Off,
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "TOKENFUSE_TOOLS_PRUNE must be off or shadow; treating this value as off"
+            );
+            ToolsPruneMode::Off
+        }
+    }
+}
+
+/// [`tools_prune_mode_from`] against the process environment.
+pub fn tools_prune_mode_from_env() -> ToolsPruneMode {
+    tools_prune_mode_from(std::env::var("TOKENFUSE_TOOLS_PRUNE").ok().as_deref())
+}
+
 /// [`dlp_mode_from`] against the process environment.
 pub fn dlp_mode_from_env() -> DlpMode {
     dlp_mode_from(std::env::var("TOKENFUSE_DLP").ok().as_deref())
@@ -126,6 +166,32 @@ mod tests {
         assert_eq!(dlp_pii_mode_from(Some("")), DlpMode::Off);
         assert_eq!(dlp_pii_mode_from(Some("mask")), DlpMode::Mask);
         assert_eq!(dlp_pii_mode_from(Some("block")), DlpMode::Block);
+    }
+
+    #[test]
+    fn tools_prune_is_off_when_nothing_is_configured() {
+        assert_eq!(tools_prune_mode_from(None), ToolsPruneMode::Off);
+        assert_eq!(tools_prune_mode_from(Some("")), ToolsPruneMode::Off);
+    }
+
+    #[test]
+    fn tools_prune_shadow_is_the_one_word_that_turns_it_on() {
+        assert_eq!(
+            tools_prune_mode_from(Some("shadow")),
+            ToolsPruneMode::Shadow
+        );
+        assert_eq!(tools_prune_mode_from(Some("off")), ToolsPruneMode::Off);
+    }
+
+    #[test]
+    fn an_unrecognised_tools_prune_value_is_off_not_a_guess() {
+        for typo in ["Shadow", "on", "enforce", "1", "true"] {
+            assert_eq!(
+                tools_prune_mode_from(Some(typo)),
+                ToolsPruneMode::Off,
+                "{typo}"
+            );
+        }
     }
 
     #[test]

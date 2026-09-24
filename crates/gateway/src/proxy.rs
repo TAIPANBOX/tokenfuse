@@ -865,6 +865,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                     // Blocked before the request ever reached the provider -
                     // no response to observe (I1, docs/21-tool-runs.md).
                     tool_calls: None,
+                    tools_offered: None,
+                    tools_would_prune: None,
+                    pruned_schema_tokens_est: None,
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -967,6 +970,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             unit: unit.clone(),
             // Blocked before the request ever reached the provider (I1).
             tool_calls: None,
+            tools_offered: None,
+            tools_would_prune: None,
+            pruned_schema_tokens_est: None,
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1030,6 +1036,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         // Blocked before the request ever reached the
                         // provider (I1).
                         tool_calls: None,
+                        tools_offered: None,
+                        tools_would_prune: None,
+                        pruned_schema_tokens_est: None,
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1156,6 +1165,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         // this cached response structurally could not have
                         // emitted a tool call (I1).
                         tool_calls: Some(0),
+                        tools_offered: None,
+                        tools_would_prune: None,
+                        pruned_schema_tokens_est: None,
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1240,6 +1252,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 unit: unit.clone(),
                 // Blocked before the request ever reached the provider (I1).
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1277,6 +1292,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 unit: unit.clone(),
                 // Blocked before the request ever reached the provider (I1).
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1341,6 +1359,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                 unit: unit.clone(),
                 // Blocked before the request ever reached the provider (I1).
                 tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1475,6 +1496,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         // Blocked before the request ever reached the
                         // provider (I1).
                         tool_calls: None,
+                        tools_offered: None,
+                        tools_would_prune: None,
+                        pruned_schema_tokens_est: None,
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1501,6 +1525,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         // Blocked before the request ever reached the
                         // provider (I1).
                         tool_calls: None,
+                        tools_offered: None,
+                        tools_would_prune: None,
+                        pruned_schema_tokens_est: None,
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -1508,6 +1535,36 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                     return wardryx_hold_response(&run_id, &wardryx_outcome);
                 }
             }
+        }
+    }
+
+    // Shadow tool-pruning measurement (W2a, invariant 61): in shadow only,
+    // with the wardryx hook on and the request declaring at least one tool,
+    // ask wardryx which of the declared tools its policy would deny and
+    // price their schemas in estimated input tokens. This never changes the
+    // forwarded body, in any mode: it is reached only for a call the wardryx
+    // block above did not already block or hold, and nothing below reads
+    // `request` for anything but forwarding it unmodified.
+    let mut tools_offered: Option<u32> = None;
+    let mut tools_would_prune: Option<u32> = None;
+    let mut pruned_schema_tokens_est: Option<u64> = None;
+    // No subject, no question: wardryx answers a filter question that names no
+    // agent with `400 agent_id is required`, so asking it is a round trip that
+    // cannot succeed and would spend the once-per-process warning on a request
+    // shape rather than an outage. The decide call above keeps its own rule.
+    if st.tools_prune == crate::defaults::ToolsPruneMode::Shadow
+        && st.wardryx.mode != WardryxMode::Off
+        && !agent_id.is_empty()
+    {
+        let tool_defs = taint::declared_tool_defs_in(&request);
+        if !tool_defs.is_empty() {
+            let measurement = st
+                .wardryx
+                .measure_shadow_prune(&agent_id, &run_id, &tool_defs)
+                .await;
+            tools_offered = measurement.tools_offered;
+            tools_would_prune = measurement.tools_would_prune;
+            pruned_schema_tokens_est = measurement.pruned_schema_tokens_est;
         }
     }
 
@@ -1547,6 +1604,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                         // Blocked before the request ever reached the
                         // provider (I1).
                         tool_calls: None,
+                        tools_offered: None,
+                        tools_would_prune: None,
+                        pruned_schema_tokens_est: None,
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -1597,6 +1657,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             key_id: key_id.clone(),
             unit: unit.clone(),
             router_route: if parsed.stream { None } else { router_route },
+            tools_offered,
+            tools_would_prune,
+            pruned_schema_tokens_est,
         },
         unit_reservation,
     );
@@ -1633,6 +1696,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
                     unit: unit.clone(),
                     // Blocked before the request ever reached the provider (I1).
                     tool_calls: None,
+                    tools_offered: None,
+                    tools_would_prune: None,
+                    pruned_schema_tokens_est: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -1838,6 +1904,13 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         }
     };
 
+    // W2a, invariant 61: the response header names how many declared tools
+    // wardryx's policy would remove and their estimated token cost, present
+    // only when the shadow measurement above actually ran and succeeded.
+    let pruned_header = tools_would_prune
+        .zip(pruned_schema_tokens_est)
+        .map(|(n, tokens)| format!("{n};est_tokens={tokens}"));
+
     if parsed.stream {
         stream_managed(
             resp,
@@ -1854,6 +1927,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             identity_header,
             router_header,
             wardryx_header,
+            pruned_header,
         )
     } else {
         buffered_managed(
@@ -1878,6 +1952,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             identity_header,
             router_header,
             wardryx_header,
+            pruned_header,
         )
         .await
     }
@@ -1939,6 +2014,7 @@ fn stream_managed(
     identity_header: Option<String>,
     router_header: Option<String>,
     wardryx_header: Option<String>,
+    pruned_header: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let inner = resp.body;
@@ -2045,6 +2121,9 @@ fn stream_managed(
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
     }
+    if let Some(ph) = pruned_header {
+        builder = set_header_checked(builder, "x-fuse-tools-would-prune", &ph);
+    }
     if let Some(ih) = identity_header {
         builder = builder.header("x-fuse-identity", ih);
     }
@@ -2089,6 +2168,7 @@ async fn buffered_managed(
     identity_header: Option<String>,
     router_header: Option<String>,
     wardryx_header: Option<String>,
+    pruned_header: Option<String>,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let content_type = resp
@@ -2193,6 +2273,9 @@ async fn buffered_managed(
                     // "allow" row above; this verdict row isn't a second
                     // model response, so it carries none of its own (I1).
                     tool_calls: None,
+                    tools_offered: None,
+                    tools_would_prune: None,
+                    pruned_schema_tokens_est: None,
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
@@ -2289,6 +2372,9 @@ async fn buffered_managed(
     }
     if let Some(wh) = wardryx_header {
         builder = builder.header("x-fuse-wardryx", wh);
+    }
+    if let Some(ph) = pruned_header {
+        builder = set_header_checked(builder, "x-fuse-tools-would-prune", &ph);
     }
     if let Some(ih) = identity_header {
         builder = builder.header("x-fuse-identity", ih);
@@ -5991,6 +6077,7 @@ pub(crate) mod tests {
             &st,
             String::new(),
             Vec::new(),
+            None,
             None,
             None,
             None,

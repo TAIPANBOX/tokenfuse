@@ -190,6 +190,14 @@ pub struct CallAttribution {
     /// path by `handle`'s choice: a routed stream keeps the zero its row carried before the
     /// row moved in here, and counting its avoided spend is a separate decision.
     pub router_route: Option<(String, String)>,
+    /// Shadow tool-pruning measurement (W2a, invariant 61), taken at the
+    /// wardryx hook in `proxy::messages` and carried through to the `allow`
+    /// row unchanged: how many tools this request declared, how many
+    /// wardryx's policy would deny, and their estimated input-token cost.
+    /// `None` together whenever nothing was measured.
+    pub tools_offered: Option<u32>,
+    pub tools_would_prune: Option<u32>,
+    pub pruned_schema_tokens_est: Option<u64>,
 }
 
 /// A reservation kept outstanding on purpose (D7): the request was handed to the provider and
@@ -526,6 +534,9 @@ impl SettleGuard {
             key_id: a.key_id.clone(),
             unit: a.unit.clone(),
             tool_calls: usage.tool_calls,
+            tools_offered: a.tools_offered,
+            tools_would_prune: a.tools_would_prune,
+            pruned_schema_tokens_est: a.pruned_schema_tokens_est,
         });
     }
 }

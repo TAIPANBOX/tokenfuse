@@ -70,6 +70,9 @@ pub struct AppState {
     /// Wardryx enforcement hook (a PEP): enforces decisions made by the
     /// Wardryx policy service (a PDP). Off by default. See `crate::wardryx`.
     pub wardryx: Arc<Wardryx>,
+    /// Shadow tool-pruning measurement (W2a, invariant 61). Off by default:
+    /// no `filter_tools` call, no behaviour change. See `crate::defaults`.
+    pub tools_prune: crate::defaults::ToolsPruneMode,
     /// The delegation issuer's keys, or `None` when no issuer is configured.
     ///
     /// `None` is the default and it is not a degraded mode: it means every
@@ -544,6 +547,7 @@ impl AppState {
             router: Arc::new(Router::disabled()),
             wasm: None,
             wardryx: Arc::new(Wardryx::disabled()),
+            tools_prune: crate::defaults::ToolsPruneMode::Off,
             history: Arc::new(Mutex::new(HashMap::new())),
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(TaintStore::default()),
@@ -651,6 +655,12 @@ impl AppState {
     /// Attach the Wardryx enforcement hook. Chainable.
     pub fn with_wardryx(mut self, wardryx: Arc<Wardryx>) -> Self {
         self.wardryx = wardryx;
+        self
+    }
+
+    /// Set the shadow tool-pruning mode (W2a). Chainable.
+    pub fn with_tools_prune(mut self, mode: crate::defaults::ToolsPruneMode) -> Self {
+        self.tools_prune = mode;
         self
     }
 

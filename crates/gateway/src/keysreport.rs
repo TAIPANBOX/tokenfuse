@@ -325,6 +325,9 @@ mod tests {
             key_id: key_id.into(),
             unit: String::new(),
             tool_calls: None,
+            tools_offered: None,
+            tools_would_prune: None,
+            pruned_schema_tokens_est: None,
         }
     }
 
