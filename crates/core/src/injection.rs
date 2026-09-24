@@ -568,7 +568,15 @@ fn build_excerpt(
 /// protect none of them from the next unescaped field. Escaping belongs to the
 /// renderer; what a producer owes is a value that cannot break its own
 /// container and carries nothing a reader executes by accident.
-fn sanitise(text: &str) -> String {
+///
+/// # Its other caller
+///
+/// Public because the gateway's wardryx hook quotes a policy plane's error
+/// message into a fallback reason, which travels to the same readers by the
+/// same roads: the log, the `dependency_failed` event, the 403 an agent reads.
+/// That text is somebody else's too, and a second copy of this list over there
+/// is the defect the doc on `INVISIBLE` above names.
+pub fn sanitise(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {

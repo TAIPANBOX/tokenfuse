@@ -356,7 +356,10 @@ pub enum DependencyStage {
     /// reported generating; without this stage a provider refusing every
     /// call was invisible on the bus (tokenfuse#260).
     Response,
-    /// The policy plane could not be asked for a decision.
+    /// The policy plane gave no decision: it could not be asked, or it
+    /// answered with a status outside 2xx (a wrong key, a question it
+    /// refused, a 5xx), which `data.detail` names. Not [`Self::Response`]:
+    /// that stage is a PROVIDER's refusal and is rendered as one downstream.
     Decide,
 }
 
@@ -377,11 +380,13 @@ impl DependencyStage {
 pub enum DependencyEffect {
     /// The call did not complete and the caller got an error.
     CallFailed,
-    /// The policy plane was unreachable and `failmode=open` let the call
-    /// through. Nothing governed it.
+    /// The policy plane gave no verdict (unreachable, or it answered with an
+    /// error status) and `failmode=open` let the call through. Nothing
+    /// governed it.
     AllowedUngoverned,
-    /// The policy plane was unreachable and `failmode=closed` refused the
-    /// call. Nobody was asked; no policy denied it.
+    /// The policy plane gave no verdict (unreachable, or it answered with an
+    /// error status) and `failmode=closed` refused the call. No policy
+    /// denied it.
     DeniedUnasked,
 }
 

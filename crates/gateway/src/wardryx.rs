@@ -24,10 +24,11 @@
 //! - `enforce`: a `deny`/`hold` decision short-circuits the request with an
 //!   HTTP 403.
 //!
-//! `FailMode` governs what happens when the PDP can't be reached in time:
-//! `open` treats an outage as `allow`, `closed` as `deny`. It only changes
-//! which decision is synthesized; the mode above still decides whether that
-//! decision can actually block.
+//! `FailMode` governs what happens when the PDP can't be reached in time, or
+//! answers without a verdict (a status outside 2xx): `open` treats an outage
+//! as `allow`, `closed` as `deny`. It only changes which decision is
+//! synthesized; the mode above still decides whether that decision can
+//! actually block.
 //!
 //! A short-TTL in-memory cache keyed by `(agent_id, sorted tool-set hash,
 //! attestation_method)` skips the network round trip on repeat calls in a hot
@@ -101,8 +102,9 @@ pub enum WardryxMode {
     Enforce,
 }
 
-/// What to do when the PDP can't be reached (timeout or transport error)
-/// before this call's deadline.
+/// What to do when no verdict comes back before this call's deadline: the
+/// PDP can't be reached (timeout or transport error), or it answers with a
+/// status outside 2xx (`WardryxError::Refused`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailMode {
     /// Treat an unreachable PDP as `allow`: the request proceeds.
@@ -171,9 +173,13 @@ pub struct Verdicts {
     pub allow: u64,
     pub deny: u64,
     pub hold: u64,
-    /// Outcomes this gateway synthesized because the PDP could not be reached.
-    /// Not verdicts, deliberately kept beside them: a plane that is failing
-    /// open looks identical to a healthy one from every other angle.
+    /// Outcomes this gateway synthesized because no verdict came back: the
+    /// PDP could not be reached, or it answered with a status outside 2xx
+    /// (`WardryxError::Refused`, a wrong key or a question it refused). The
+    /// name predates the second case and is on the wire of
+    /// `/v1/policy-plane`, so it stays. Not verdicts, deliberately kept beside
+    /// them: a plane that is failing open looks identical to a healthy one
+    /// from every other angle.
     pub unreachable_fallbacks: u64,
     /// Epoch millis of the last of each, `0` for never.
     pub last_allow_millis: i64,
@@ -192,8 +198,12 @@ pub struct WardryxOutcome {
     /// Set only on `hold`: the id the caller references, via
     /// `x-fuse-approval-token` once approved, to resubmit the request.
     pub approval_id: Option<String>,
-    /// This outcome was SYNTHESIZED because the PDP could not be reached, and
-    /// no policy engine produced it.
+    /// This outcome was SYNTHESIZED because no verdict came back, and no
+    /// policy engine produced it: the PDP could not be reached, its answer
+    /// could not be read, or it answered with a status outside 2xx
+    /// (`WardryxError::Refused`). The name predates the last case and is kept,
+    /// because what `proxy` and `mcpbroker` key on is "no policy decided
+    /// this", which is true of all three; `reason` says which.
     ///
     /// A field rather than a caller parsing `reason` for the word
     /// "unreachable": the reason is an operator-facing string that exists to
@@ -297,6 +307,89 @@ enum WardryxError {
         "this wardryx has no /v1/filter-tools route (it predates it); shadow pruning measures nothing"
     )]
     FilterRouteNotFound,
+    /// The PDP ANSWERED, with a status outside 2xx: wardryx refusing the call
+    /// (400 for a question with no subject, 401 for a wrong key) or failing
+    /// to decide it (5xx), or something in front of it answering instead.
+    /// Checked before the body is decoded, because a refusal's body is an
+    /// error message and reading it as a decision reports the refusal as bad
+    /// JSON, which sends an operator to look at a parser when the PDP told
+    /// them what was wrong. `detail` is wardryx's own `{"error": ...}` message
+    /// when the body carries one, else the status's standard reason phrase;
+    /// either way one line, cleaned by [`quoted`] and capped.
+    #[error("wardryx answered {status} on {route}: {detail}")]
+    Refused {
+        route: &'static str,
+        status: u16,
+        detail: String,
+    },
+}
+
+impl WardryxError {
+    /// What a failmode fallback's reason says happened. A PDP that answered
+    /// was not unreachable, so a refusal says what it answered; every other
+    /// kind keeps the sentence it has always had.
+    fn as_reason(&self) -> String {
+        match self {
+            WardryxError::Refused { .. } => self.to_string(),
+            other => format!("wardryx unreachable ({other})"),
+        }
+    }
+}
+
+/// How much of a refusal's body is read to find wardryx's message. Its
+/// `{"error": ...}` is one short sentence, and a body in any other shape is
+/// not quoted at all, so nothing past this can change what is reported.
+const REFUSAL_BODY_MAX_BYTES: usize = 4 * 1024;
+
+/// The longest message a refusal quotes. Chosen so the whole fallback reason
+/// for `/v1/decide` (61 characters around the message at the longest status
+/// and failmode, plus the cut marker) stays inside the 200 characters
+/// `dependency_failed` keeps of it, so the event never cuts the sentence
+/// that names the status.
+const REFUSAL_DETAIL_MAX_CHARS: usize = 120;
+
+/// `text` as one line safe to log, record and hand back to a caller: control
+/// and invisible characters made harmless by the same function the injection
+/// detector's excerpts use, runs of whitespace collapsed, and at most
+/// [`REFUSAL_DETAIL_MAX_CHARS`] characters, cut with `…`.
+fn quoted(text: &str) -> String {
+    let flat = tokenfuse_core::injection::sanitise(text);
+    let one_line = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= REFUSAL_DETAIL_MAX_CHARS {
+        return one_line;
+    }
+    let mut cut: String = one_line.chars().take(REFUSAL_DETAIL_MAX_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// Turn an answer outside 2xx into [`WardryxError::Refused`]. Reads at most
+/// [`REFUSAL_BODY_MAX_BYTES`] of the body, and a body that breaks mid-read is
+/// still a refusal: the status line arrived, and that is the fact reported.
+async fn refusal(route: &'static str, mut resp: reqwest::Response) -> WardryxError {
+    let status = resp.status();
+    let mut body = Vec::new();
+    while body.len() < REFUSAL_BODY_MAX_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(REFUSAL_BODY_MAX_BYTES);
+    let said = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(quoted))
+        .filter(|s| !s.is_empty());
+    WardryxError::Refused {
+        route,
+        status: status.as_u16(),
+        detail: said.unwrap_or_else(|| {
+            status
+                .canonical_reason()
+                .unwrap_or("no reason given")
+                .to_string()
+        }),
+    }
 }
 
 /// Talks to the Wardryx `POST {base_url}/v1/decide` endpoint. Kept separate
@@ -345,6 +438,9 @@ impl WardryxClient {
             .send()
             .await
             .map_err(|e| WardryxError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(refusal("/v1/decide", resp).await);
+        }
         let bytes = resp
             .bytes()
             .await
@@ -372,7 +468,8 @@ impl WardryxClient {
     /// name in `tool_names` alone, in shadow, W2a: measurement only, never
     /// enforcement. A 404 is reported as its own error kind rather than a
     /// generic transport/decode failure, since it means this wardryx
-    /// predates the route.
+    /// predates the route; any other status outside 2xx is
+    /// [`WardryxError::Refused`], the same kind `decide` reports.
     async fn filter_tools(
         &self,
         req: &FilterToolsWireRequest<'_>,
@@ -398,10 +495,7 @@ impl WardryxClient {
             return Err(WardryxError::FilterRouteNotFound);
         }
         if !resp.status().is_success() {
-            return Err(WardryxError::Transport(format!(
-                "wardryx answered {} on /v1/filter-tools",
-                resp.status()
-            )));
+            return Err(refusal("/v1/filter-tools", resp).await);
         }
         let bytes = resp
             .bytes()
@@ -674,9 +768,9 @@ pub struct Wardryx {
     /// (invariant 61), not one per call.
     warned_filter_not_found: AtomicBool,
     /// Whether this process has already warned about every OTHER
-    /// `filter_tools` failure kind (transport, decode, an unrecognised
-    /// status). One line for the process lifetime, distinct from the 404
-    /// warning above.
+    /// `filter_tools` failure kind (transport, decode, a status outside 2xx
+    /// other than 404). One line for the process lifetime, distinct from the
+    /// 404 warning above.
     warned_filter_other: AtomicBool,
 }
 
@@ -769,8 +863,9 @@ impl Wardryx {
     }
 
     /// Ask the PDP (or the cache) what to do about this call. Always
-    /// returns an outcome: transport/timeout/decode failures are absorbed
-    /// here via `failmode`, never surfaced as a `Result` to the caller.
+    /// returns an outcome: transport/timeout/decode failures and an answer
+    /// outside 2xx are absorbed here via `failmode`, never surfaced as a
+    /// `Result` to the caller.
     /// Only meant to be called when `mode != Off` (see `proxy::messages`);
     /// `client` is guaranteed `Some` whenever that holds (see `from_env`),
     /// but a missing client still fails safe via `failmode` rather than
@@ -785,7 +880,7 @@ impl Wardryx {
             return cached;
         }
         let Some(client) = &self.client else {
-            return self.fallback("wardryx hook has no client configured");
+            return self.fallback("wardryx unreachable (wardryx hook has no client configured)");
         };
 
         let wire = DecideWireRequest {
@@ -820,8 +915,11 @@ impl Wardryx {
                     failmode = ?self.failmode,
                     "wardryx decide call failed; applying failmode"
                 );
+                // Every kind, a refusal included, is a fallback and never a
+                // verdict (invariant 19): an answer with no decision in it
+                // governed nothing, whatever its status says about the PDP.
                 self.record_unreachable_at(now_millis());
-                self.fallback(&e.to_string())
+                self.fallback(&e.as_reason())
             }
         }
     }
@@ -872,10 +970,11 @@ impl Wardryx {
     /// method assumes all three already hold and does not re-check them.
     ///
     /// Every field of the result is `None` together on any error: a missing
-    /// client, a transport failure, a body that will not decode, or a 404
-    /// (this wardryx predates `/v1/filter-tools`). Never zero, because zero
-    /// tools_would_prune is a real measured answer this method also returns
-    /// on a clean success with nothing denied.
+    /// client, a transport failure, a body that will not decode, a 404
+    /// (this wardryx predates `/v1/filter-tools`), or any other status
+    /// outside 2xx. Never zero, because zero tools_would_prune is a real
+    /// measured answer this method also returns on a clean success with
+    /// nothing denied.
     pub async fn measure_shadow_prune(
         &self,
         agent_id: &str,
@@ -945,10 +1044,14 @@ impl Wardryx {
         }
     }
 
-    /// Synthesize an outcome for "the PDP could not be reached", per
-    /// `failmode`. Never cached: a transient outage should not stick around
-    /// for the cache TTL once the PDP recovers.
-    fn fallback(&self, detail: &str) -> WardryxOutcome {
+    /// Synthesize an outcome for "no verdict came back", per `failmode`:
+    /// the PDP could not be reached, or it answered with an error status.
+    /// `what_happened` is the first half of the reason, from
+    /// [`WardryxError::as_reason`]. Never cached: a transient outage should
+    /// not stick around for the cache TTL once the PDP recovers, and a
+    /// refusal (a wrong key fixed, an identity header added) no more than an
+    /// outage.
+    fn fallback(&self, what_happened: &str) -> WardryxOutcome {
         let decision = match self.failmode {
             FailMode::Open => WardryxDecision::Allow,
             FailMode::Closed => WardryxDecision::Deny,
@@ -957,7 +1060,7 @@ impl Wardryx {
             decision,
             policy_version: None,
             reason: Some(format!(
-                "wardryx unreachable ({detail}); failmode={:?} applied",
+                "{what_happened}; failmode={:?} applied",
                 self.failmode
             )),
             approval_id: None,
@@ -1165,5 +1268,369 @@ mod tests {
             })
             .await;
         assert_eq!(outcome.decision, WardryxDecision::Deny);
+    }
+
+    // -- a PDP that ANSWERS with a non-2xx status is a refusal, not bad JSON --
+    //
+    // Measured 2026-09-24 on a live gateway in shadow mode with no
+    // x-fuse-agent-id: wardryx answered 400 ("agent_id and run_id are
+    // required") and this hook logged "wardryx response was not valid JSON:
+    // missing field `decision`", sending an operator to look at JSON when the
+    // PDP had refused the call. A wrong key (401) and a 5xx read the same way.
+
+    fn ctx_for(agent: &str) -> DecideContext {
+        DecideContext {
+            chain_proven: false,
+            agent_id: agent.into(),
+            run_id: "r".into(),
+            on_behalf_of: vec![],
+            tool_names: vec![],
+            domains: vec![],
+            steps: 0,
+            model: "m".into(),
+            est_cost_usd: 0.0,
+            attestation_method: None,
+            approval_token: None,
+        }
+    }
+
+    /// A stub PDP answering every `POST /v1/decide` with `status` and `body`,
+    /// counting the calls it received.
+    async fn answering_pdp(
+        status: u16,
+        body: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        answering("/v1/decide", status, body).await
+    }
+
+    /// The same stub on any route.
+    async fn answering(
+        route: &'static str,
+        status: u16,
+        body: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::response::IntoResponse;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            route,
+            axum::routing::post(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                let body = body.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l, app).await;
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    fn hook(url: String, failmode: FailMode, cache_ttl: Duration) -> Wardryx {
+        Wardryx::new(
+            WardryxMode::Shadow,
+            failmode,
+            url,
+            None,
+            Duration::from_secs(2),
+            cache_ttl,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The guard only serialises the tests that read the process-wide log
+    // buffer, and nothing this test spawns ever takes it, so holding it
+    // across the awaits below cannot deadlock, whatever thread they resume on.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refusal_is_logged_and_reasoned_by_its_status_not_as_bad_json() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        let (url, _) = answering_pdp(
+            400,
+            r#"{"error":"agent_id and run_id are required"}"#.to_string(),
+        )
+        .await;
+        let w = hook(url, FailMode::Open, Duration::from_secs(0));
+
+        let outcome = w.decide(ctx_for("")).await;
+
+        assert_eq!(
+            outcome.decision,
+            WardryxDecision::Allow,
+            "failmode open, unchanged"
+        );
+        assert!(
+            outcome.unreachable,
+            "a refusal is still a fallback, not a verdict"
+        );
+        let reason = outcome.reason.expect("a fallback always carries a reason");
+        assert!(
+            reason.contains("400"),
+            "the reason names the status: {reason}"
+        );
+        assert!(
+            reason.contains("agent_id and run_id are required"),
+            "the reason carries what the PDP said: {reason}"
+        );
+        assert!(!reason.contains("not valid JSON"), "{reason}");
+        assert!(
+            !reason.contains("unreachable"),
+            "a PDP that answered was not unreachable: {reason}"
+        );
+        // Found by what this PDP said rather than by the message alone: the
+        // buffer is process-wide and other tests here log the same message
+        // concurrently without the lock.
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        let line = log
+            .lines()
+            .find(|l| {
+                l.contains("wardryx decide call failed")
+                    && l.contains("agent_id and run_id are required")
+            })
+            .unwrap_or_else(|| panic!("one warn line quoting the refusal, got:\n{log}"));
+        assert!(
+            line.contains("400"),
+            "the logged error names the status: {line}"
+        );
+        assert!(!line.contains("not valid JSON"), "{line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The guard only serialises the tests that read the process-wide log
+    // buffer, and nothing this test spawns ever takes it, so holding it
+    // across the awaits below cannot deadlock, whatever thread they resume on.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_filter_tools_refusal_names_its_status_and_what_wardryx_said() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        let (url, _) = answering(
+            "/v1/filter-tools",
+            401,
+            r#"{"error":"missing or invalid bearer token"}"#.to_string(),
+        )
+        .await;
+        let w = hook(url, FailMode::Open, Duration::from_secs(0));
+
+        let m = w
+            .measure_shadow_prune("agent://t/a", "r", &[("gh_api".to_string(), 40)])
+            .await;
+
+        assert_eq!(
+            m,
+            ShadowPruneMeasurement::default(),
+            "a refusal measures nothing"
+        );
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        let line = log
+            .lines()
+            .find(|l| {
+                l.contains("wardryx filter-tools call failed")
+                    && l.contains("missing or invalid bearer token")
+            })
+            .unwrap_or_else(|| panic!("one warn line quoting the refusal, got:\n{log}"));
+        assert!(line.contains("401"), "{line}");
+        assert!(
+            !line.contains("request failed"),
+            "the request did not fail, the PDP answered: {line}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_non_2xx_names_its_status_and_the_failmode_is_unchanged() {
+        for (status, body, failmode, detail) in [
+            (
+                401,
+                r#"{"error":"unauthorized"}"#,
+                FailMode::Closed,
+                "unauthorized",
+            ),
+            (403, r#"{"error":"forbidden"}"#, FailMode::Open, "forbidden"),
+            (
+                500,
+                "internal oops, not json",
+                FailMode::Closed,
+                "Internal Server Error",
+            ),
+            (503, "", FailMode::Open, "Service Unavailable"),
+            // wardryx's shape with nothing in it says nothing: the standard
+            // phrase stands in, never an empty quote.
+            (400, r#"{"error":"  "}"#, FailMode::Open, "Bad Request"),
+            // A status with no standard phrase still names itself.
+            (599, "", FailMode::Closed, "no reason given"),
+        ] {
+            let (url, _) = answering_pdp(status, body.to_string()).await;
+            let w = hook(url, failmode, Duration::from_secs(0));
+            let outcome = w.decide(ctx_for("agent://t/a")).await;
+            let expected = match failmode {
+                FailMode::Open => WardryxDecision::Allow,
+                FailMode::Closed => WardryxDecision::Deny,
+            };
+            assert_eq!(outcome.decision, expected, "status {status}");
+            assert!(outcome.unreachable, "status {status}");
+            let reason = outcome.reason.unwrap();
+            assert!(reason.contains(&status.to_string()), "{status}: {reason}");
+            assert!(reason.contains(detail), "{status}: {reason}");
+            assert!(!reason.contains("not valid JSON"), "{status}: {reason}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_is_counted_as_a_fallback_and_never_cached() {
+        let (url, calls) = answering_pdp(401, r#"{"error":"unauthorized"}"#.to_string()).await;
+        // A cache that WOULD reuse an answer, so reuse is observable.
+        let w = hook(url, FailMode::Open, Duration::from_secs(60));
+
+        w.decide(ctx_for("agent://t/a")).await;
+        w.decide(ctx_for("agent://t/a")).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a refusal is never cached");
+        let v = w.verdicts();
+        assert_eq!(
+            v.unreachable_fallbacks, 2,
+            "counted as a fallback each time"
+        );
+        assert_eq!(
+            (v.allow, v.deny, v.hold),
+            (0, 0, 0),
+            "and never as a verdict"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_2xx_that_does_not_decode_stays_a_decode_error() {
+        let (url, _) = answering_pdp(200, r#"{"not":"a decision"}"#.to_string()).await;
+        let w = hook(url, FailMode::Open, Duration::from_secs(0));
+        let reason = w.decide(ctx_for("agent://t/a")).await.reason.unwrap();
+        assert!(reason.contains("not valid JSON"), "{reason}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pdp_nobody_can_reach_is_still_called_unreachable() {
+        let w = hook(
+            "http://127.0.0.1:1".into(),
+            FailMode::Open,
+            Duration::from_secs(0),
+        );
+        let reason = w.decide(ctx_for("agent://t/a")).await.reason.unwrap();
+        assert!(reason.contains("unreachable"), "{reason}");
+    }
+
+    /// A PDP whose refusal never ends: a status line, then a chunked body
+    /// written until the reader goes away. Raw TCP, because a handler here
+    /// cannot stream an endless body without a dependency this crate lacks.
+    async fn endless_refusal() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 64 * 1024];
+                    let _ = sock.read(&mut request).await;
+                    let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                                transfer-encoding: chunked\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let piece = "x".repeat(16 * 1024);
+                    let chunk = format!("{:x}\r\n{piece}\r\n", piece.len());
+                    while sock.write_all(chunk.as_bytes()).await.is_ok() {}
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_whose_body_never_ends_is_reported_without_waiting_for_it() {
+        let url = endless_refusal().await;
+        let w = Wardryx::new(
+            WardryxMode::Shadow,
+            FailMode::Closed,
+            url,
+            None,
+            Duration::from_secs(10),
+            Duration::from_secs(0),
+        );
+
+        let started = Instant::now();
+        let outcome = w.decide(ctx_for("agent://t/a")).await;
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_secs(3),
+            "the body is read to its cap and dropped, not to the 10 s timeout: {took:?}"
+        );
+        assert_eq!(
+            outcome.decision,
+            WardryxDecision::Deny,
+            "failmode closed, unchanged"
+        );
+        let reason = outcome.reason.unwrap();
+        assert!(reason.contains("400"), "{reason}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hostile_refusal_body_becomes_one_short_line() {
+        let mut seed: u64 = 0x5eed_0924;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pieces = [
+            "\n",
+            "\r",
+            "\u{0}",
+            "\u{1b}[31m",
+            "\t",
+            "é",
+            "{",
+            "\"",
+            "x",
+            "\u{202e}",
+            "\u{200b}",
+            "\u{2028}",
+            "\u{85}",
+        ];
+        for round in 0..40 {
+            let mut msg = String::new();
+            for _ in 0..(next() % 3000) {
+                msg.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            let body = if round % 2 == 0 {
+                serde_json::json!({ "error": msg }).to_string()
+            } else {
+                msg.clone()
+            };
+            let (url, _) = answering_pdp(400, body).await;
+            let w = hook(url, FailMode::Open, Duration::from_secs(0));
+            let reason = w.decide(ctx_for("agent://t/a")).await.reason.unwrap();
+            assert!(
+                !reason
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{200b}' | '\u{2028}')),
+                "round {round}: a control or invisible character reached the reason: {reason:?}"
+            );
+            assert!(
+                reason.chars().count() <= 300,
+                "round {round}: {} characters",
+                reason.chars().count()
+            );
+            assert!(reason.contains("400"), "round {round}: {reason:?}");
+        }
     }
 }

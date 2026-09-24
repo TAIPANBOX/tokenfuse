@@ -485,6 +485,14 @@ async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
         1,
         "exactly one warn line naming /v1/filter-tools for the process lifetime, got:\n{log}"
     );
+    // And it says WHY: a 404 is its own kind, never read as one more refusal
+    // of a route that exists, which would send an operator after a broken
+    // wardryx when this one simply predates the route.
+    assert!(
+        warn_lines[0].contains("has no /v1/filter-tools route"),
+        "the line says the route is missing, got: {}",
+        warn_lines[0]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -990,3 +990,108 @@ async fn a_proven_chain_reaches_the_pdp_from_the_token() {
         "asked: {asked}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A policy plane that ANSWERED with a non-2xx status refused the call; it was
+// not unreachable and its body was not bad JSON. Measured 2026-09-24 on a live
+// gateway in shadow mode with no x-fuse-agent-id: wardryx answered 400 and
+// the trail said "not valid JSON: missing field `decision`".
+// ---------------------------------------------------------------------------
+
+/// A PDP that answers every `POST /v1/decide` with `status` and a JSON body.
+async fn refusing_pdp(status: u16, body: Value) -> String {
+    use axum::response::IntoResponse;
+    let app = Router::new().route(
+        "/v1/decide",
+        post(move || {
+            let body = body.clone();
+            async move { (StatusCode::from_u16(status).unwrap(), Json(body)).into_response() }
+        }),
+    );
+    spawn_server(app).await
+}
+
+#[tokio::test]
+async fn a_pdp_refusal_in_shadow_reaches_the_trail_by_its_status_not_as_bad_json() {
+    let (events, path) = recording_exporter("refused-400");
+    // What wardryx answers a question with no subject; the stub answers it to
+    // every call, so the request below can carry an agent id and the event
+    // has somebody to be filed under (SPEC 6.1 skips it otherwise).
+    let url = refusing_pdp(400, json!({"error": "agent_id and run_id are required"})).await;
+    let hook = Wardryx::new(
+        WardryxMode::Shadow,
+        FailMode::Closed,
+        url,
+        None,
+        Duration::from_secs(2),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "shadow never blocks");
+
+    let found = dependency_failures_at(&path);
+    assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+    let e = &found[0];
+    assert_eq!(e["data"]["effect"], "allowed_ungoverned");
+    let detail = e["data"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("400"),
+        "the trail names the status: {detail}"
+    );
+    assert!(
+        detail.contains("agent_id and run_id are required"),
+        "and what the PDP said: {detail}"
+    );
+    assert!(!detail.contains("not valid JSON"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_wrong_key_401_is_recorded_as_a_refusal_and_still_fails_closed() {
+    let (events, path) = recording_exporter("refused-401");
+    let url = refusing_pdp(401, json!({"error": "unauthorized"})).await;
+    let hook = Wardryx::new(
+        WardryxMode::Enforce,
+        FailMode::Closed,
+        url,
+        None,
+        Duration::from_secs(2),
+        Duration::from_secs(0),
+    );
+    let st = state(hook).with_events(events);
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request(&body()))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "failmode closed refuses the call, exactly as before this change"
+    );
+
+    let found = dependency_failures_at(&path);
+    assert_eq!(found.len(), 1, "exactly one event, got {found:?}");
+    let e = &found[0];
+    assert_eq!(e["data"]["dependency"], "policy_plane");
+    assert_eq!(e["data"]["stage"], "decide");
+    assert_eq!(e["data"]["effect"], "denied_unasked");
+    let detail = e["data"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("401"),
+        "the trail names the status: {detail}"
+    );
+    assert!(
+        detail.contains("unauthorized"),
+        "and what the PDP said: {detail}"
+    );
+    assert!(!detail.contains("not valid JSON"), "{detail}");
+    assert!(
+        !detail.contains("unreachable"),
+        "a PDP that answered 401 was reachable: {detail}"
+    );
+}

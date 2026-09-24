@@ -831,6 +831,76 @@ build)`, `cloud apns (feature build)`.
    `an_unreachable_pdp_never_counts_as_an_allow`. Every one was checked against
    its own mutant)*
 
+   **A PDP that answers with a status outside 2xx is reported by that status,
+   and it is still a fallback.** The range's sentence above was also this
+   gateway's own wording until 2026-09-24: `WardryxClient::decide` decoded
+   every answer as a decision, so wardryx's 400 for a question with no subject
+   (`agent_id and run_id are required`), a 401 for a wrong
+   `TOKENFUSE_WARDRYX_KEY` and a 5xx each became ``wardryx unreachable (wardryx
+   response was not valid JSON: missing field `decision` ...)``, first seen that
+   day on a live gateway in shadow mode. The status is now checked before the
+   body is decoded, and an answer outside 2xx is `WardryxError::Refused`,
+   naming the route, the status, and wardryx's own `{"error": ...}` message
+   when the body carries one, else the standard reason phrase. The message is
+   cleaned by `injection::sanitise`, the one copy of the invisible-character
+   list, and capped at 120 characters, and at most 4 KiB of the body is read.
+   The reason then reads `wardryx answered 401 on /v1/decide: missing or
+   invalid bearer token; failmode=Closed applied`. A 2xx that does not decode
+   stays `Decode`, and a PDP nobody can reach still says `wardryx unreachable`.
+   `@decided 2026-09-24`: an answer outside 2xx is its own kind naming the
+   status, the failmode decides it exactly as before, it is never cached, and
+   a 2xx that does not decode stays a decode error.
+
+   What does not move is this invariant's half. A refusal is a fallback and
+   never a verdict: it is counted in `unreachable_fallbacks`, whose name
+   predates the case and is on the wire of `/v1/policy-plane`, so it stays.
+   `WardryxOutcome::unreachable` stays true for it, because what `proxy` and
+   `mcpbroker` key on is "no policy decided this". Invariant 24's
+   `dependency_failed` fires for it at stage `decide`, with the reason as its
+   detail, which the 120-character cap keeps inside the 200 the event holds.
+   `@claude 2026-09-24`: stage `decide` and not `response`, because `response`
+   is a provider's refusal and heraldyx renders it as one; and
+   `/v1/filter-tools` reports every status outside 2xx except 404 as the same
+   kind (invariant 61), so one fact has one kind on both routes.
+
+   **Where it says nothing.** A wrong key warns on every call, as every decide
+   failure always has; invariant 13's once-per-status rule is not applied
+   here. A body in any shape other than wardryx's is not quoted, so a proxy
+   answering in front of wardryx shows only its status and standard phrase.
+   The reason reaches a caller's 403 under enforce with `failmode=closed`, as
+   every fallback reason already did. heraldyx renders none of `data`, the
+   detail included, so its mail for a refusal still says the plane could not
+   be reached, as it did before this change; telling a refusal apart there
+   needs a structured member on the event, which is an agent-passport SPEC
+   change and not made here. A 2xx body is still read whole, so a PDP answering
+   200 with a body that never ends holds the call until the timeout. And
+   `UnknownDecision` still quotes the PDP's `decision` string uncleaned and
+   uncapped.
+   *(test: in `gateway::wardryx`,
+   `a_refusal_is_logged_and_reasoned_by_its_status_not_as_bad_json`,
+   `every_non_2xx_names_its_status_and_the_failmode_is_unchanged`,
+   `a_refusal_is_counted_as_a_fallback_and_never_cached`,
+   `a_2xx_that_does_not_decode_stays_a_decode_error`,
+   `a_pdp_nobody_can_reach_is_still_called_unreachable`,
+   `a_hostile_refusal_body_becomes_one_short_line` (40 seeded rounds),
+   `a_refusal_whose_body_never_ends_is_reported_without_waiting_for_it` and
+   `a_filter_tools_refusal_names_its_status_and_what_wardryx_said`; in
+   `tests/wardryx.rs`,
+   `a_pdp_refusal_in_shadow_reaches_the_trail_by_its_status_not_as_bad_json` and
+   `a_wrong_key_401_is_recorded_as_a_refusal_and_still_fails_closed`. Red first,
+   @measured `cargo test -p tokenfuse-gateway` against 3fe4f6e with these tests
+   added 2026-09-24: the 401 trail detail read ``wardryx unreachable (wardryx
+   response was not valid JSON: missing field `decision` at line 1 column 24);
+   failmode=Closed applied``, and the endless-body test waited 10.08 s for the
+   timeout. Three guards (the fallback count with the cache, `Decode`, and an
+   unreachable plane) were green on both sides and are held by mutants
+   instead. Fifteen mutants planted in the product code and reverted, each
+   caught by name in the pull request. One of them, a 404 on
+   `/v1/filter-tools` read as a refusal, passed
+   `a_wardryx_without_the_route_is_named_once_and_measures_nothing` until that
+   test asserted the line says the route is missing. Scenarios:
+   `features/a-pdp-that-answers-is-not-unreachable.feature`, eight, each bound)*
+
 20. **A door with nothing behind it does not open onto the network.** The MCP
    credential-broker resolves `{{secret:NAME}}` handles against the whole
    vault and forwards to any configured upstream, so anything that reaches
@@ -1083,7 +1153,10 @@ build)`, `cloud apns (feature build)`.
    and wardryx writes no `policy_allow` of its own because wardryx is the thing
    that is down. So the response carries `x-fuse-wardryx: allow`, which is true
    about what this gateway did and false about what any policy decided, and the
-   trail cannot tell a governed call from an ungoverned one.
+   trail cannot tell a governed call from an ungoverned one. A PDP that
+   answered with a status outside 2xx is the same event, since it governed
+   nothing either; since 2026-09-24 its detail names the status rather than a
+   decode error (invariant 19).
 
    **Why it is one type and not one per dependency.** `data.dependency` names
    which; `data.effect` names what this gateway then did, and that member is
@@ -3616,7 +3689,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     last of these added beyond the letter of the plan: a 500 with a small JSON body that
     happens to parse into the wire shape's all-optional fields would otherwise read as a
     clean, empty answer rather than an outage, so any status outside 2xx that is not 404 is
-    also `Transport`). Both kinds warn at most once per process lifetime
+    also refused before decoding). That other status was reported as `Transport` until
+    2026-09-24 and is `WardryxError::Refused` since, the kind `decide` reports (invariant
+    19), so the warning names the status and wardryx's own message and no longer says the
+    request failed. Both kinds warn at most once per process lifetime
     (`Wardryx::warned_filter_not_found`, `warned_filter_other`, two `AtomicBool`s), and the
     404 line says in words that this wardryx has no `/v1/filter-tools` route and shadow
     pruning measures nothing, so an operator reads why rather than guessing from a generic
