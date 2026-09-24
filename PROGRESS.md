@@ -302,8 +302,8 @@ comparison in #132.
 
 **Counts re-measured 2026-09-24**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1476 passing** (core 342, dpop 21, delegation 60,
-gateway 824, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1486 passing** (core 342, dpop 21, delegation 60,
+gateway 834, cloud 228, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Two sibling branches off the same base landed the same day and are both counted here. Delegation grew from 44 to 60 (the sixtieth added in review: any `cnf` claim refuses an access token) and gateway grew by 46 (invariant 62, W3-tokenfuse): the MCP broker's XAA bearer door, `tokenfuse_delegation::verify_access_token`'s own fifteen tests in the delegation crate, and forty-six in the gateway crate (`xaadoor.rs`'s fourteen startup-refusal tests, `chainproof.rs`'s seven `base_config_from_values` tests, one in `mcpbroker.rs` for `something_on_the_door`, `tests/mcp_xaa.rs`'s twenty-two over the live HTTP door, `tests/xaa_startup.rs`'s two against the real binary). Core grew from 340 to
 342 and gateway grew by 13 more (invariant 61, W2a): two in
 `core::taint` for `declared_tool_defs_in` (both wire shapes, a 200-seed hostile
