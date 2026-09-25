@@ -10,7 +10,7 @@
 
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
-![release](https://img.shields.io/badge/release-v1.1.0-brightgreen)
+![release](https://img.shields.io/badge/release-v1.1.1-brightgreen)
 ![tests](https://img.shields.io/badge/tests-1509-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -26,7 +26,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 > **⚡ Try it in one command**, no signup, no account:
 > ```bash
-> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.0
+> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.1
 > ```
 > `TOKENFUSE_ALLOW_STUB=1` is what makes this offline: with no provider behind
 > it, the gateway answers from a built-in stub and meters a fixed 1000/500
@@ -314,7 +314,7 @@ TokenFuse is a **proxy**: start it, then point your agent at it instead of the p
 Published to GitHub Container Registry, so it runs anywhere with Docker, nothing to compile:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.0
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.1
 ```
 
 A working gateway on **http://localhost:4100**, answering from a built-in fake
@@ -347,7 +347,7 @@ Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your a
 ```bash
 docker run -p 4100:4100 \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.1.0
+  ghcr.io/taipanbox/tokenfuse:v1.1.1
 ```
 
 Then change **one line** in your app, the base URL:
@@ -390,7 +390,7 @@ curl http://localhost:4100/v1/messages \
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.1.0
+  ghcr.io/taipanbox/tokenfuse:v1.1.1
 ```
 
 `TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
@@ -402,7 +402,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 Every release from v0.5.0 on is signed keyless with Sigstore and carries a build-provenance attestation and an SBOM. The image tag is pinned on purpose: there is no `:latest`, so what you run is what a release page describes. With `cosign` and `gh` installed:
 
 ```bash
-tag=v1.1.0
+tag=v1.1.1
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-identity "https://github.com/TAIPANBOX/tokenfuse/.github/workflows/release.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
@@ -413,10 +413,10 @@ gh attestation verify tokenfuse-x86_64-unknown-linux-musl -R TAIPANBOX/tokenfuse
 The image:
 
 ```bash
-cosign verify ghcr.io/taipanbox/tokenfuse:v1.1.0 \
+cosign verify ghcr.io/taipanbox/tokenfuse:v1.1.1 \
   --certificate-identity-regexp '^https://github.com/TAIPANBOX/tokenfuse/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.1.0 -R TAIPANBOX/tokenfuse
+gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.1.1 -R TAIPANBOX/tokenfuse
 ```
 
 Releases before v0.5.0 carry checksums only. Verified on 2026-09-13 from a machine that built nothing: `sha256sum -c` OK on a downloaded binary, and `gh attestation verify` on the binary and on the image both returned a SLSA provenance v1 statement signed by this workflow at `refs/tags/v0.5.0`. The release assets are plain binaries, not archives: `tokenfuse-<target>` and `tokenfuse-cloud-<target>`.
@@ -581,7 +581,7 @@ Since v0.4.0, on `main`: TokenFuse is now **free end to end** (the last plan-ent
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.0   # gateway, offline
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.1.1   # gateway, offline
 cd cloud && docker compose up                                                    # + Cloud dashboard (:3000)
 ```
 
