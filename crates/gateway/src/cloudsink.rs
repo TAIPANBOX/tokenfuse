@@ -1171,6 +1171,30 @@ mod tests {
         r
     }
 
+    /// Flush once no drain is in flight, so this flush's own drain is the one
+    /// that runs.
+    ///
+    /// `drain` lets one drainer run at a time and a flush that finds the flag
+    /// held does nothing, on purpose: in the gateway the 2 s flush tick in
+    /// `main.rs` retries. A test has no tick. A drainer started during the
+    /// outage can still hold the flag when a test brings the plane back and
+    /// flushes; that flush is then a no-op, the old drainer's POST already
+    /// failed against the plane that was down, it puts its chunk back and
+    /// exits, and nothing drains again. The test then waits out its whole
+    /// bound for records that were never sent: the one-off CI timeout of
+    /// `the_cap_drops_the_oldest_and_says_so_once` on 2026-09-25. Waiting for
+    /// the flag first removes the race rather than widening the wait: once it
+    /// is clear, nothing in these tests starts another drain until this flush.
+    /// The flag is cleared after `outage_ended` logs, so the drained line alone
+    /// does not mean the drainer is gone.
+    async fn flush_when_idle(sink: &CloudSink) {
+        wait_long("no drain in flight", || {
+            !sink.queue.draining.load(Ordering::Acquire)
+        })
+        .await;
+        sink.flush();
+    }
+
     /// `wait_for` with 3 000 polls (30 s), for the cap test's 500 POSTs.
     async fn wait_long(label: &str, mut done: impl FnMut() -> bool) {
         for _ in 0..3_000 {
@@ -1233,7 +1257,7 @@ mod tests {
         );
 
         toggle.set(Plane::Up);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("every record to arrive", || {
             toggle.received_run_ids().len() == 60
         })
@@ -1289,12 +1313,12 @@ mod tests {
         assert_eq!(lines_at(&log_text(), "WARN", QUEUED).len(), 1);
 
         toggle.set(Plane::Up);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("the queue to drain", || log_text().contains(DRAINED)).await;
 
         toggle.set(Plane::Down);
         sink.record(record_named("after-recovery"));
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("a fourth debug push-failed line", || {
             log_text()
                 .lines()
@@ -1352,7 +1376,7 @@ mod tests {
         }
 
         toggle.up_for(usize::MAX);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_long("all 10 000 surviving records to arrive", || {
             toggle.received_run_ids().len() == 10_000
         })
@@ -1434,7 +1458,7 @@ mod tests {
         );
 
         toggle.set(Plane::Up);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("the body to arrive", || {
             !toggle.bodies.lock().unwrap().is_empty()
         })
@@ -1474,7 +1498,7 @@ mod tests {
         wait_for("batches B and C to queue", || sink.queued() == 60).await;
 
         toggle.up_for(1);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("batch A's ids to arrive", || {
             toggle.received_run_ids().len() == 20
         })
@@ -1488,7 +1512,7 @@ mod tests {
         );
 
         toggle.set(Plane::Up);
-        sink.flush();
+        flush_when_idle(&sink).await;
         wait_for("all 60 to arrive in order", || {
             toggle.received_run_ids().len() == 60
         })
