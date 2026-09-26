@@ -483,6 +483,20 @@ td.num {
   background: var(--amber);
   box-shadow: 0 0 9px var(--amber);
 }
+/* Incident severity dots (info/low/medium/high/critical folded to three
+   bands, matching the alert dots' crit/near above rather than adding a
+   fourth color to the read-as-an-instrument palette). */
+.arow .d.high {
+  background: var(--ember);
+  box-shadow: 0 0 9px var(--ember);
+}
+.arow .d.medium {
+  background: var(--amber);
+  box-shadow: 0 0 9px var(--amber);
+}
+.arow .d.low {
+  background: var(--faint);
+}
 .arow .tx {
   flex: 1;
   min-width: 0;
