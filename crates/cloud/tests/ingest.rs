@@ -19,6 +19,7 @@ fn state_with(store: Arc<Store>) -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     // A read-only credential for the SAME org. Every other test here uses the
@@ -29,6 +30,18 @@ fn state_with(store: Arc<Store>) -> AppState {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
+        },
+    );
+    // A site-scoped ingest key (invariant 65): the least privilege a remote
+    // gateway needs. Bound to "site-a", so a push made with it is attributed
+    // there without the body naming anything.
+    keys.insert(
+        "ingestkey".to_string(),
+        Principal {
+            org: "acme".into(),
+            role: "ingest".into(),
+            site: Some("site-a".into()),
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)
@@ -284,6 +297,96 @@ async fn a_viewer_cannot_manufacture_a_budget_exhausted_incident() {
         store.decision_counts("acme").get("budget_exceeded"),
         Some(&3),
         "and really does land in the counts /v1/compliance grades controls from"
+    );
+}
+
+// -- invariant 65: the ingest role, and the site it names ------------------
+
+/// The narrow credential this whole invariant exists for: a site-scoped
+/// `ingest` key may push telemetry, and every record in the push lands
+/// attributed to its bound site.
+#[tokio::test]
+async fn an_ingest_key_may_push_telemetry() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer ingestkey")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let gws = store.gateways("acme");
+    assert_eq!(gws.len(), 1, "{gws:?}");
+    assert_eq!(gws[0].site, "site-a");
+    assert_eq!(gws[0].spent_microusd, 1000);
+}
+
+/// A read-only credential still cannot ingest once the `ingest` role exists
+/// beside it - the new role narrows `admin`, it does not widen `viewer`.
+#[tokio::test]
+async fn a_viewer_key_still_cannot_ingest() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer viewerkey")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"records":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// The body cannot choose a site: `CallRecord` has no `site`/`gateway` field
+/// to read one from, so an attempt to spoof one is just an extra, ignored
+/// JSON key (this crate derives no `deny_unknown_fields` anywhere). Only the
+/// pushing key's OWN bound site (`site-a`, invariant 65) ever appears.
+#[tokio::test]
+async fn a_record_cannot_choose_its_site() {
+    let store = Arc::new(Store::new());
+    let router = app(state_with(Arc::clone(&store)));
+
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude","decision":"allow","cost_microusd":1000,"step":1,"site":"spoofed","gateway":"spoofed"}
+    ]}"#;
+
+    let resp = router
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer ingestkey")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let gws = store.gateways("acme");
+    assert_eq!(gws.len(), 1, "{gws:?}");
+    assert_eq!(
+        gws[0].site, "site-a",
+        "only the credential's own site appears"
+    );
+    assert!(
+        !gws.iter().any(|g| g.site == "spoofed"),
+        "a field in the body must never name a site: {gws:?}"
     );
 }
 

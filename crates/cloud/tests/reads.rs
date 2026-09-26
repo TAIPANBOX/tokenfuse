@@ -19,6 +19,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -26,6 +27,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -33,6 +35,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "beta".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     (
@@ -601,6 +604,35 @@ async fn the_compliance_response_carries_exactly_the_fields_the_schema_declares(
     );
 }
 
+/// `GET /v1/gateways` (invariant 65): gated like every other read - `401`
+/// with no credential, `200` for a viewer - and each site's push shows up
+/// attributed by the CREDENTIAL that pushed it, never anything in the batch.
+#[tokio::test]
+async fn gateways_endpoint_requires_a_credential_and_a_viewer_may_read() {
+    let (state, store) = test_state();
+    store.ingest_from(
+        "acme",
+        Some("site-a"),
+        &[CallRecord {
+            run_id: "r1".into(),
+            decision: "allow".into(),
+            cost_microusd: 1000,
+            ts_millis: 10,
+            ..Default::default()
+        }],
+    );
+
+    let (no_key, _) = get(&state, "/v1/gateways", None).await;
+    assert_eq!(no_key, StatusCode::UNAUTHORIZED);
+
+    let (status, v) = get(&state, "/v1/gateways", Some("viewerkey")).await;
+    assert_eq!(status, StatusCode::OK);
+    let gws = v.as_array().expect("gateways is an array");
+    assert_eq!(gws.len(), 1, "{gws:?}");
+    assert_eq!(gws[0]["site"], "site-a");
+    assert_eq!(gws[0]["spent_microusd"], 1000);
+}
+
 #[tokio::test]
 async fn compliance_requires_a_valid_key() {
     let (state, _) = test_state();
@@ -619,7 +651,13 @@ async fn reads_require_a_valid_key() {
     assert_eq!(wrong_key, StatusCode::UNAUTHORIZED);
 
     // The new read endpoints are gated too.
-    for path in ["/v1/agents", "/v1/savings", "/v1/units", "/v1/unit-budgets"] {
+    for path in [
+        "/v1/agents",
+        "/v1/savings",
+        "/v1/units",
+        "/v1/unit-budgets",
+        "/v1/gateways",
+    ] {
         let (no_key, _) = get(&state, path, None).await;
         assert_eq!(no_key, StatusCode::UNAUTHORIZED, "{path} unauth");
         let (wrong_key, _) = get(&state, path, Some("nope")).await;

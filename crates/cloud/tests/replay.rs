@@ -21,6 +21,7 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -28,6 +29,7 @@ fn keys() -> HashMap<String, Principal> {
         Principal {
             org: "beta".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys

@@ -128,6 +128,7 @@ fn state_with_oidc() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8).with_oidc(Some(cfg()))
@@ -142,6 +143,7 @@ fn state_keys_only() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)

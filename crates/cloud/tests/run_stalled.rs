@@ -49,6 +49,7 @@ fn state_with_a_fast_stall_floor() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -56,6 +57,7 @@ fn state_with_a_fast_stall_floor() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
         },
     );
     (

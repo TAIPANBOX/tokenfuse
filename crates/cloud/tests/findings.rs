@@ -18,6 +18,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -25,6 +26,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
         },
     );
     (
