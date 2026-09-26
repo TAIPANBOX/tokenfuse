@@ -18,6 +18,7 @@ fn state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)
@@ -46,6 +47,8 @@ fn spec_covers_every_endpoint() {
         "/v1/units",
         "/v1/units/{id}/budget",
         "/v1/unit-budgets",
+        // invariant 65: per-site (gateway) ingest rollup.
+        "/v1/gateways",
         "/v1/incidents",
         "/v1/incidents/{id}/ack",
         "/v1/compliance",
@@ -67,6 +70,7 @@ fn spec_covers_every_endpoint() {
         "Alert",
         "CallRecord",
         "UnitAgg",
+        "GatewayAgg",
         "Incident",
         "ComplianceReportSchema",
         "ControlEvidenceSchema",

@@ -4130,3 +4130,104 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     live), caught by
     `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`
     (the stale old record evicts the refreshed entry too early).)*
+
+65. **A gateway's site is named by the key it pushed with, never by anything in
+    the request.** `@decided 2026-09-26`. Measured while designing a two-site
+    deployment: `WireRecord` (`crates/gateway/src/cloudsink.rs`) carries no
+    gateway identity at all, so two sites pushing to one Cloud cannot be told
+    apart in `/v1/runs`, `/v1/owners`, or anywhere else - their spend mixes
+    into one pile - and a site that stops pushing is invisible, because
+    nothing distinguishes "this site went quiet" from "this org has no
+    traffic right now" (tokenfuse#296).
+
+    The key spec (`crates/cloud/src/keys.rs`) extends from `key:org[:role]` to
+    `key:org[:role[:site]]`. The 4th segment, present and non-empty, must
+    match `^[a-z0-9][a-z0-9._-]{0,62}$` (checked by hand: this crate does not
+    depend on `regex`) or the WHOLE entry is skipped, fail-closed like any
+    other malformed spec - a key with an invalid site authenticates nobody,
+    rather than being silently admitted with no site. An empty 4th segment
+    (`k:o:admin:`) means no site, same as the segment being absent; a 2- or
+    3-segment spec parses exactly as before; more than 4 segments is
+    malformed and skipped, same as any other shape this parser refuses.
+
+    `Mutator::site` (`crates/cloud/src/http.rs`) carries the resolved
+    `Principal::site` on the ORG-KEY authorization path only; the OIDC and
+    paired-device paths always set `None`, since neither is the credential
+    shape a remote gateway actually holds. `/v1/ingest` calls
+    `Store::ingest_from(&org, site, &records)`, which folds every record in
+    that ONE push into `Inner::gateways[org][site-or-"unnamed"]`
+    (`GatewayAcc`): `pushes` and `first_push_millis`/`last_push_millis` once
+    per push (server time - a gateway's own clock is not trusted for "is this
+    site alive"), `calls` per record, and `spent_microusd`/`tool_calls`
+    through exactly the same `is_blocked` gate and saturating arithmetic
+    `OrgTotals` uses. An empty batch still counts as a push (a heartbeat) and
+    still moves `last_push_millis`. A NEW site past `MAX_GATEWAYS_PER_ORG`
+    (1,024) folds into `"unnamed"` rather than evicting an existing site's
+    counters, the same cardinality shape `MAX_UNIT_MONTH_KEYS` already holds
+    for units. `RunAgg` gains `site: String`, "last non-empty wins" across a
+    run's calls exactly like `unit`/`owner`, set from the pushing principal's
+    site and never from the record. `GET /v1/gateways` (`GatewayAgg`, sorted
+    by `last_push_millis` descending then site ascending) reads like every
+    other read here - any org-key role, a paired device, or OIDC, via
+    `org_for` - so a viewer or an `ingest` key may both watch it.
+
+    A gateway record has no field that could name a site even if it wanted
+    to: `CallRecord` carries no `site`/`gateway` key, and this crate derives
+    no type with `deny_unknown_fields` anywhere, so a body that tries to smuggle
+    one in is silently ignored, exactly like any other stray JSON key already
+    is. The gateway BINARY is not changed at all: it keeps POSTing to
+    `/v1/ingest` with whatever key it was configured with, and the Cloud
+    alone decides what that key is allowed to name.
+
+    A second, narrower credential exists beside `admin`/`viewer`: `ingest`.
+    Without it, a remote site's key would have to be `admin` to push
+    telemetry at all, and `admin` can also kill a run, set a budget, or pair
+    a device for the WHOLE org - every site would then hold a full org-admin
+    secret just to phone home. `AppState::authorize_ingest` accepts `admin`
+    OR `ingest` on the org-key path only, falling through to
+    `AppState::authorize_mutation` (still `admin`-only on both its paths) for
+    OIDC and paired devices, so pushing through either of those needs the
+    same credential it always did. Every other mutation - kill, a run or unit
+    budget, an incident ack, findings, pairing, device registration - still
+    goes through `authorize_mutation` unchanged, so an `ingest` key is
+    refused there exactly like a `viewer` key: 403, never a silent 200 and
+    never the 401 that would suggest the key itself is unknown. Reads are
+    unaffected: `org_for` never looks at role, so an `ingest` key already
+    reads everything a `viewer` reads, including the four polls the
+    gateway's own `CloudSink` makes with its ingest key
+    (`/v1/units`, `/v1/budgets`, `/v1/unit-budgets`, `/v1/kills`). The
+    recommended form for a site's key is `secret:org:ingest:site-name`.
+    *(tests: `keys::tests`: `a_fourth_segment_is_parsed_as_the_site`,
+    `an_empty_fourth_segment_means_no_site`,
+    `an_invalid_site_name_skips_the_whole_entry`,
+    `five_segments_are_malformed_and_skipped`,
+    `three_segment_specs_parse_exactly_as_before`; `store::tests`:
+    `a_key_bound_to_a_site_attributes_every_record_it_pushes_to_that_site`,
+    `an_unbound_key_pushes_into_the_unnamed_bucket`,
+    `last_push_is_server_time_not_the_records_timestamp`,
+    `an_empty_batch_is_a_heartbeat`,
+    `blocked_rows_count_as_calls_but_not_as_spend_at_the_gateway_level`,
+    `a_site_past_the_cap_folds_into_unnamed`,
+    `gateways_survive_a_snapshot_round_trip`,
+    `an_old_snapshot_without_gateways_loads_empty`,
+    `the_run_keeps_the_last_named_site`; HTTP-level, `crates/cloud/tests/`:
+    `ingest.rs`'s `an_ingest_key_may_push_telemetry`,
+    `a_record_cannot_choose_its_site`, `a_viewer_key_still_cannot_ingest`;
+    `mutations.rs`'s `an_ingest_key_cannot_kill_a_run_or_set_a_budget`,
+    `an_ingest_key_may_read_units_and_unit_budgets`; `reads.rs`'s
+    `gateways_endpoint_requires_a_credential_and_a_viewer_may_read`.
+    Scenarios: `features/a-site-is-named-by-its-key.feature`, seven, each
+    bound. Not a script gate: the rule is `Store::ingest_at_from`'s fold and
+    `AppState::authorize_ingest`'s role check, held by `cargo test`.)*
+
+    **Where it says nothing.** `@claude` 2026-09-26: the key names the site,
+    but the gateway PROCESS is still not authenticated cryptographically -
+    the plane cannot tell "the real gateway at this site pushed this" from
+    "someone holding this site's key did", the same gap `Store::ingest`'s own
+    honesty note already names for the org-key credential generally. A
+    site's silence is now visible (`last_push_millis` on `GET /v1/gateways`),
+    but nothing pages anybody when a site goes quiet - unlike `run_stalled`
+    (invariant 60) for a run, there is no detector here, only a number a
+    human or a future detector would have to read. And a stolen site key can
+    still push arbitrary telemetry as that site, same as any other credential
+    compromise this repository has not solved.

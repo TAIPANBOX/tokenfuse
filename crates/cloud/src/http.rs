@@ -39,8 +39,8 @@ use crate::keys::Principal;
 use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
-    AgentAgg, AgentWindowSpend, Alert, CallRecord, Incident, OwnerAgg, RunAgg, SavingsSummary,
-    SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
+    AgentAgg, AgentWindowSpend, Alert, CallRecord, GatewayAgg, Incident, OwnerAgg, RunAgg,
+    SavingsSummary, SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -53,7 +53,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, spend, agents, units, owners, savings, summary, alerts, series, kill, kills, set_budget,
+        ingest, runs, spend, agents, units, owners, gateways, savings, summary, alerts, series, kill, kills, set_budget,
         budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
         compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
         register_apns, register_activity,
@@ -66,6 +66,7 @@ use crate::store::{
         AgentAgg,
         UnitAgg,
         OwnerAgg,
+        GatewayAgg,
         SavingsSummary,
         Summary,
         Alert,
@@ -275,6 +276,7 @@ impl AppState {
             return Ok(Mutator {
                 org: p.org.clone(),
                 actor: key_actor(token),
+                site: p.site.clone(),
             });
         }
         // OIDC bearer (when configured). Only a *valid* token that maps to a
@@ -289,6 +291,7 @@ impl AppState {
                 return Ok(Mutator {
                     org: v.principal.org,
                     actor: v.actor,
+                    site: None,
                 });
             }
         }
@@ -299,7 +302,38 @@ impl AppState {
         Ok(Mutator {
             actor: format!("device:{}", device.device_id),
             org: device.org,
+            site: None,
         })
+    }
+
+    /// Authorize a push to `/v1/ingest`. Like [`AppState::authorize_mutation`],
+    /// but on the **org-key path only** a role of `ingest` is accepted beside
+    /// `admin` (invariant 65): the least privilege a remote gateway needs,
+    /// since `admin` can also kill runs, set budgets and pair devices for the
+    /// whole org, which every site pushing telemetry would otherwise have to
+    /// hold. OIDC and paired-device credentials are unchanged - falling
+    /// through to [`AppState::authorize_mutation`] itself, which still
+    /// requires `admin` on both - so pushing through either of those still
+    /// needs the same credential it always did.
+    fn authorize_ingest(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        headers: &HeaderMap,
+    ) -> Result<Mutator, AuthError> {
+        let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
+        if let Some(p) = self.keys.get(token) {
+            if p.role != "admin" && p.role != "ingest" {
+                return Err(AuthError::Forbidden);
+            }
+            return Ok(Mutator {
+                org: p.org.clone(),
+                actor: key_actor(token),
+                site: p.site.clone(),
+            });
+        }
+        self.authorize_mutation(method, path, body, headers)
     }
 
     /// Authorize a device managing **its own** state (APNs token, activities):
@@ -322,6 +356,11 @@ struct Mutator {
     /// `key:<fingerprint>` for an admin org key, or `device:<id>` for a paired
     /// admin device. Never the raw bearer secret.
     actor: String,
+    /// The site (gateway) this credential is bound to (invariant 65), from
+    /// the org key's [`Principal::site`]. `None` for an OIDC or paired-device
+    /// mutator: only the org-key path can name a site, since that is the
+    /// credential shape a remote gateway actually holds.
+    site: Option<String>,
 }
 
 /// A mutation authorization failure, small so it doesn't bloat handler `Result`s.
@@ -353,6 +392,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/agents", get(agents))
         .route("/v1/units", get(units))
         .route("/v1/owners", get(owners))
+        .route("/v1/gateways", get(gateways))
         .route("/v1/savings", get(savings))
         .route("/v1/summary", get(summary))
         .route("/v1/alerts", get(alerts))
@@ -637,11 +677,15 @@ struct AlertQuery {
 
 /// A gateway pushes a batch of settled calls for its org.
 ///
-/// Admin-gated through the same [`AppState::authorize_mutation`] every other
-/// write uses. It was authorized with `org_for`, the READ resolver, which
-/// accepts any principal that maps to an org: a viewer org key, a paired
-/// device token of any role, a viewer-scoped OIDC token. Ingest is a write,
-/// and the reason that matters is what the written records then do.
+/// Authorized by [`AppState::authorize_ingest`]: an org key with role `admin`
+/// or `ingest` (invariant 65), or, falling through to
+/// [`AppState::authorize_mutation`], a paired admin device or an admin OIDC
+/// token - those two are unchanged and still require `admin`. Before the
+/// `ingest` role existed this endpoint was admin-only outright, and before
+/// that it was authorized with `org_for`, the READ resolver, which accepted
+/// any principal that maps to an org: a viewer org key, a paired device token
+/// of any role, a viewer-scoped OIDC token. Ingest is a write, and the reason
+/// that matters is what the written records then do.
 ///
 /// A record is not inert evidence. Three of them carrying `budget_exceeded`
 /// and a `run_id` the caller chose raise a High `budget_exhausted` incident
@@ -655,9 +699,15 @@ struct AlertQuery {
 /// The value-level hardening around this (costs clamped at zero, saturating
 /// adds, `is_known_decision`, every map cardinality-bounded) is unchanged and
 /// still load-bearing: it defends against the credential that IS allowed
-/// here. There is still no gateway-specific credential, so a record remains
-/// untrusted input even from an admin (see `Store::ingest`'s honesty note).
-/// This closes the role gap, not the credential gap.
+/// here. There is still no gateway-specific credential: an `ingest` key still
+/// cannot be told apart from another holder of the same secret, so a record
+/// remains untrusted input even from an admin or ingest key (see
+/// `Store::ingest`'s honesty note). What invariant 65 DOES add: a key bound to
+/// a site (the key spec's 4th segment, `keys.rs`) has every record it pushes
+/// attributed to that site by the plane itself, from `Mutator::site`, never
+/// from anything in this request's body or headers; an unbound key's records
+/// land in the `"unnamed"` bucket (`Store::ingest_from`). This closes the role
+/// gap and names the site, not the credential gap.
 #[utoipa::path(
     post, path = "/v1/ingest",
     request_body = IngestBody,
@@ -665,12 +715,12 @@ struct AlertQuery {
         (status = 200, description = "records accepted", body = IngestResponse),
         (status = 400, description = "malformed json", body = ErrorResponse),
         (status = 401, description = "unauthorized", body = ErrorResponse),
-        (status = 403, description = "admin role required", body = ErrorResponse),
+        (status = 403, description = "admin or ingest role required", body = ErrorResponse),
     ),
     tag = "telemetry"
 )]
 async fn ingest(State(st): State<AppState>, headers: HeaderMap, uri: Uri, body: Bytes) -> Response {
-    let Mutator { org, .. } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+    let Mutator { org, site, .. } = match st.authorize_ingest("POST", uri.path(), &body, &headers) {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -679,7 +729,7 @@ async fn ingest(State(st): State<AppState>, headers: HeaderMap, uri: Uri, body: 
         Err(_) => return bad_json(),
     };
     let accepted = parsed.records.len();
-    st.store.ingest(&org, &parsed.records);
+    st.store.ingest_from(&org, site.as_deref(), &parsed.records);
     (StatusCode::OK, Json(IngestResponse { accepted })).into_response()
 }
 
@@ -865,6 +915,37 @@ async fn owners(State(st): State<AppState>, headers: HeaderMap) -> Response {
     (StatusCode::OK, Json(st.store.owners(&org))).into_response()
 }
 
+/// The caller org's per-site (gateway) ingest rollup, most-recently-heard-from
+/// first (invariant 65).
+///
+/// The site names the CREDENTIAL that pushed, never anything in a record: a
+/// key bound to a site by its spec's 4th segment (`keys.rs`) has every push
+/// it makes attributed there; an unbound key's pushes land under the literal
+/// `"unnamed"`. Reads like the other reads here - any org-key role, a paired
+/// device, or (when configured) OIDC, via `org_for` - so a viewer or an
+/// `ingest` key may both watch this.
+///
+/// `last_push_millis` is when this plane last HEARD from the site (its own
+/// clock, set at ingest time), the figure to read a silent site from - see
+/// the dashboard's five-minute "silent" label. `last_record_millis` is the
+/// newest call TIMESTAMP the site has ever reported, which is descriptive
+/// only and not trusted for liveness (a gateway's own clock is not trusted for
+/// that, invariant 65).
+#[utoipa::path(
+    get, path = "/v1/gateways",
+    responses(
+        (status = 200, description = "aggregated sites (gateways), most-recently-heard-from first; an unbound key's pushes roll up under \"unnamed\"", body = Vec<GatewayAgg>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn gateways(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(org) = st.org_for(&headers) else {
+        return unauthorized();
+    };
+    (StatusCode::OK, Json(st.store.gateways(&org))).into_response()
+}
+
 /// The caller org's FinOps savings: budget-protection blocked (avoided) spend,
 /// semantic-cache savings, and model-router savings, plus their total.
 #[utoipa::path(
@@ -1019,7 +1100,8 @@ async fn kill(
     uri: Uri,
     Path(run): Path<String>,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+    let Mutator { org, actor, .. } = match st.authorize_mutation("POST", uri.path(), b"", &headers)
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -1067,10 +1149,11 @@ async fn set_budget(
     Path(run): Path<String>,
     body: Bytes,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let Mutator { org, actor, .. } =
+        match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
     let parsed: BudgetBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(_) => return bad_json(),
@@ -1126,10 +1209,11 @@ async fn set_unit_budget(
     Path(unit): Path<String>,
     body: Bytes,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let Mutator { org, actor, .. } =
+        match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
     let parsed: BudgetBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(_) => return bad_json(),
@@ -1235,10 +1319,11 @@ async fn external_findings(
     Query(params): Query<ExternalFindingParams>,
     body: axum::body::Bytes,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), &body, &headers) {
-        Ok(m) => m,
-        Err(e) => return e.into_response(),
-    };
+    let Mutator { org, actor, .. } =
+        match st.authorize_mutation("POST", uri.path(), &body, &headers) {
+            Ok(m) => m,
+            Err(e) => return e.into_response(),
+        };
     let findings: Vec<ExternalFinding> = match serde_json::from_slice(&body) {
         Ok(f) => f,
         Err(e) => {
@@ -1358,7 +1443,8 @@ async fn ack_incident(
     uri: Uri,
     Path(id): Path<String>,
 ) -> Response {
-    let Mutator { org, actor } = match st.authorize_mutation("POST", uri.path(), b"", &headers) {
+    let Mutator { org, actor, .. } = match st.authorize_mutation("POST", uri.path(), b"", &headers)
+    {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };

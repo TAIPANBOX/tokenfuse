@@ -24,6 +24,7 @@ fn state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)

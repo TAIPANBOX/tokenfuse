@@ -19,6 +19,7 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -26,6 +27,18 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
+        },
+    );
+    // A site-scoped ingest key (invariant 65) - narrow on purpose: it may
+    // push telemetry, but every mutation below must refuse it exactly like a
+    // viewer.
+    keys.insert(
+        "ingestkey".into(),
+        Principal {
+            org: "acme".into(),
+            role: "ingest".into(),
+            site: Some("site-a".into()),
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)
@@ -217,6 +230,56 @@ async fn incident_ack_flow_and_rbac() {
     let (status, list) = send(&state, "GET", "/v1/incidents", Some("devkey"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list[0]["acknowledged"], true);
+}
+
+/// Invariant 65: `ingest` is narrow on purpose. It may push telemetry
+/// (covered in `crates/cloud/tests/ingest.rs`), but every other mutation
+/// here - kill, a run budget, a unit budget, and pairing - must refuse it
+/// exactly like a viewer (403, never a silent 200 and never a 401 that would
+/// suggest the key itself is unknown).
+#[tokio::test]
+async fn an_ingest_key_cannot_kill_a_run_or_set_a_budget() {
+    let state = test_state();
+
+    let (status, _) = send(&state, "POST", "/v1/runs/r1/kill", Some("ingestkey"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "kill");
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/runs/r1/budget",
+        Some("ingestkey"),
+        Some(r#"{"budget_usd":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "run budget");
+
+    let (status, _) = send(
+        &state,
+        "POST",
+        "/v1/units/treasury/budget",
+        Some("ingestkey"),
+        Some(r#"{"budget_usd":1}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unit budget");
+
+    let (status, _) = send(&state, "POST", "/v1/pair/new", Some("ingestkey"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "pairing");
+}
+
+/// Invariant 65's read half: an `ingest` key reads exactly what a viewer
+/// reads - all four reads `crates/gateway/src/cloudsink.rs` polls with the
+/// same key it ingests with (`/v1/units`, `/v1/budgets`, `/v1/unit-budgets`,
+/// `/v1/kills`), via `org_for`, which never looks at role.
+#[tokio::test]
+async fn an_ingest_key_may_read_units_and_unit_budgets() {
+    let state = test_state();
+
+    for path in ["/v1/units", "/v1/budgets", "/v1/unit-budgets", "/v1/kills"] {
+        let (status, _) = send(&state, "GET", path, Some("ingestkey"), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
 }
 
 #[tokio::test]

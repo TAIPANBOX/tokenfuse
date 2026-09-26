@@ -19,6 +19,7 @@ fn state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     AppState::new(Arc::new(Store::new()), Arc::new(keys), 0.8)
@@ -108,6 +109,7 @@ async fn stream_emits_incident_event() {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), 0.8);

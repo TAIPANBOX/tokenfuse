@@ -247,6 +247,7 @@ pub fn verify(cfg: &OidcConfig, token: &str) -> Option<Verified> {
         principal: Principal {
             org,
             role: role.to_string(),
+            site: None,
         },
         actor: format!("oidc:{subject}"),
     })

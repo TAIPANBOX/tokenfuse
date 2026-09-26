@@ -21,6 +21,7 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "admin".into(),
+            site: None,
         },
     );
     keys.insert(
@@ -28,6 +29,7 @@ fn test_state() -> AppState {
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
+            site: None,
         },
     );
     AppState::new(store, Arc::new(keys), 0.8)

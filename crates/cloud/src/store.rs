@@ -210,6 +210,19 @@ pub struct RunAgg {
     /// `serde(default)` so pre-owner-fold snapshots still load.
     #[serde(default)]
     pub owner: String,
+    /// The site (gateway) this run's calls were pushed as: the pushing key's
+    /// bound site (invariant 65, `keys.rs`'s 4th key-spec segment), never
+    /// anything from the record itself. `""` when no call on this run was
+    /// pushed by a site-bound key, which is every run from a deployment with
+    /// no site-scoped keys - folds into the literal `"unassigned"` bucket
+    /// nowhere; unlike `unit`/`owner` there is no per-run read that needs
+    /// that bucket, only [`Store::gateways`]'s own per-site accumulator
+    /// (`Inner::gateways`), which is keyed independently at ingest time.
+    /// "Last non-empty wins" across this run's calls, the same rule `unit`
+    /// and `owner` use. `serde(default)` so pre-invariant-65 snapshots still
+    /// load.
+    #[serde(default)]
+    pub site: String,
     pub spent_microusd: i64,
     pub calls: u64,
     pub cache_hits: u64,
@@ -356,6 +369,35 @@ pub struct OwnerAgg {
     pub tool_calls: u64,
 }
 
+/// Per-site (gateway) ingest rollup (invariant 65): which site pushed, how
+/// much, and when this plane last heard from it.
+///
+/// Unlike [`UnitAgg`]/[`OwnerAgg`], this is not folded from [`RunAgg`] at read
+/// time - [`Inner::gateways`] already keeps the exact per-push accumulator
+/// ([`GatewayAcc`]), so there is nothing to re-derive and no eviction caveat:
+/// a site's totals here are exact for the store's whole retained history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct GatewayAgg {
+    /// The site name from the pushing key's spec (`keys.rs`), or the literal
+    /// `"unnamed"` for a key bound to no site (never `""` - see the struct
+    /// doc).
+    pub site: String,
+    pub spent_microusd: i64,
+    pub calls: u64,
+    pub tool_calls: u64,
+    /// Ingest calls this site has made, one per `/v1/ingest` POST including
+    /// an empty batch (a heartbeat).
+    pub pushes: u64,
+    pub first_push_millis: i64,
+    /// When this plane last HEARD from the site - its own clock, set at
+    /// ingest time. The figure "has this site gone silent" reads.
+    pub last_push_millis: i64,
+    /// The newest call timestamp the site has ever reported. Descriptive
+    /// only, from the pushed records themselves - never used to judge
+    /// liveness (a gateway's own clock is not trusted for that).
+    pub last_record_millis: i64,
+}
+
 /// Milliseconds per UTC day (for [`month_key`]).
 const DAY_MILLIS: i64 = 86_400_000;
 
@@ -395,6 +437,33 @@ pub(crate) fn month_key(ts_millis: i64) -> String {
 /// hide spend. The cost is that attribution around a month boundary can
 /// drift from the gateway's call-time window by the telemetry batching
 /// delay - seconds, and only for calls in flight exactly at the boundary.
+/// One site's (gateway's) ingest accumulator, keyed by site name (or the
+/// literal `"unnamed"`) in [`Inner::gateways`] (invariant 65). Exact, unlike
+/// [`UnitAgg`]/[`OwnerAgg`]: nothing here is folded from [`RunAgg`], so
+/// nothing here is subject to `MAX_RUNS_PER_ORG` eviction.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct GatewayAcc {
+    /// Real spend (blocked/avoided-spend rows excluded, the same gate as
+    /// every other spend fold - `is_blocked`).
+    spent_microusd: i64,
+    calls: u64,
+    tool_calls: u64,
+    /// Server time (`ingest_at_from`'s own `now_ms`) of this bucket's first
+    /// push.
+    first_push_millis: i64,
+    /// Server time of this bucket's most recent push - what "is this site
+    /// alive" reads (invariant 65: a gateway's own clock is not trusted for
+    /// that, unlike `last_record_millis` below).
+    last_push_millis: i64,
+    /// The latest `ts_millis` among records this site has ever pushed.
+    /// Descriptive only - it comes from the batch, not the plane's clock, so
+    /// it is never used to decide whether a site has gone silent.
+    last_record_millis: i64,
+    /// Ingest calls this site has made, one per `/v1/ingest` POST including
+    /// an empty batch (a heartbeat, invariant 65).
+    pushes: u64,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct UnitMonthAcc {
     /// UTC `YYYY-MM` this accumulator covers (see [`month_key`]).
@@ -818,6 +887,16 @@ const MAX_BREAK_KEYS: usize = 10_000;
 /// abuse reaches it.
 const MAX_UNIT_MONTH_KEYS: usize = 4_096;
 
+/// Hard cap on distinct site buckets in each org's [`Inner::gateways`] map -
+/// the same `/v1/ingest` cardinality concern as [`MAX_UNIT_MONTH_KEYS`]
+/// (invariant 65): a site name only ever comes from a key an operator minted,
+/// but a compromised or misconfigured key is still attacker-adjacent input.
+/// A NEW site past the cap folds into `"unnamed"` rather than evicting, for
+/// the same reason `MAX_UNIT_MONTH_KEYS` doesn't evict: evicting could
+/// silently zero a real site's counters mid-incident, while the overflow
+/// bucket stays visible. Far above any real fleet's site count.
+const MAX_GATEWAYS_PER_ORG: usize = 1_024;
+
 /// Default alert-fraction threshold (mirrors `TOKENFUSE_CLOUD_ALERT_PCT`'s
 /// documented default in `main.rs`), used by [`Store::with_incident_config`]
 /// when no explicit value is given. `Store` needs its OWN copy of this
@@ -1016,6 +1095,12 @@ struct Inner {
     /// the same key [`Store::units`] folds unmapped runs under - so the
     /// read-side join is direct. Bounded by [`MAX_UNIT_MONTH_KEYS`].
     unit_months: HashMap<String, HashMap<String, UnitMonthAcc>>,
+    /// org → site (gateway) → ingest accumulator (persisted, invariant 65).
+    /// Keyed by the pushing key's bound site, or the literal `"unnamed"` for
+    /// an unbound key - the same resolved-bucket-as-key shape `unit_months`
+    /// uses, for the same reason (a direct read-side join, no re-derivation).
+    /// Bounded by [`MAX_GATEWAYS_PER_ORG`].
+    gateways: HashMap<String, HashMap<String, GatewayAcc>>,
     /// org → wire `decision` string → total occurrences (persisted). Folded in
     /// [`Store::ingest`] over EVERY record — including blocked ones, since a
     /// block is compliance *evidence* (the guard fired), not spend. Feeds the
@@ -1091,6 +1176,7 @@ struct SnapshotRef<'a> {
     savings: &'a HashMap<String, SavingsAcc>,
     spend_days: &'a HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     unit_months: &'a HashMap<String, HashMap<String, UnitMonthAcc>>,
+    gateways: &'a HashMap<String, HashMap<String, GatewayAcc>>,
     decision_counts: &'a HashMap<String, HashMap<String, u64>>,
     incidents: &'a HashMap<String, HashMap<String, Incident>>,
     audit: &'a HashMap<String, Vec<AuditEntry>>,
@@ -1131,6 +1217,15 @@ struct SnapshotOwned {
     spend_days: HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     #[serde(default)]
     unit_months: HashMap<String, HashMap<String, UnitMonthAcc>>,
+    /// Missing on snapshots that predate invariant 65 - `default` loads
+    /// empty, so `gateways()` reports no sites until fresh telemetry
+    /// accumulates. Deliberately NOT backfilled from `orgs`: there is no
+    /// per-site source in old data (a pre-invariant-65 `CallRecord` carries no
+    /// site and an old `RunAgg` carries no `site` field to read one from), so
+    /// there is nothing honest to backfill it with - the same reasoning
+    /// `unit_months` and `spend_days` give for the same choice above.
+    #[serde(default)]
+    gateways: HashMap<String, HashMap<String, GatewayAcc>>,
     /// Missing on pre-compliance snapshots — `default` loads empty, so
     /// `decision_counts()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
@@ -1317,21 +1412,58 @@ impl Store {
     /// per affected run plus an `incident` per tripped detector. Uses the store's
     /// own wall clock; see [`Store::ingest_at`] for the testable inner form.
     ///
+    /// Equivalent to [`Store::ingest_from`] with no site: every record folds
+    /// into the `"unnamed"` gateway bucket. Kept as its own entry point so
+    /// every existing caller (a deployment with no site-scoped keys) is
+    /// unaffected.
+    ///
     /// Honesty note: `/v1/ingest` authenticates the ORG CREDENTIAL presented on
-    /// the request (an ADMIN credential, narrowed 2026-08-05), not
+    /// the request (an ADMIN or, since invariant 65, an INGEST credential,
+    /// narrowed 2026-08-05 and again 2026-09-26), not
     /// the gateway process cryptographically. There is currently no
     /// gateway-specific credential, so this store cannot distinguish "the real
     /// gateway pushed this" from "some holder of an org key pushed this" — a
     /// gateway-specific credential is future work. `decision` is accordingly
     /// treated as untrusted per-record input and gated through
     /// [`is_known_decision`] before it can become compliance/incident evidence.
+    /// What invariant 65 adds is narrower and orthogonal: WHICH site a record
+    /// counts against is the pushing key's own bound site, from
+    /// `AppState::Mutator::site`, never anything this untrusted body could
+    /// name for itself.
     pub fn ingest(&self, org: &str, records: &[CallRecord]) {
-        self.ingest_at(org, records, now_millis());
+        self.ingest_from(org, None, records);
+    }
+
+    /// [`Store::ingest`], additionally attributing every record in this push
+    /// to `site` (invariant 65) - the CREDENTIAL's bound site, never anything
+    /// read from `records` themselves. `None` (an unbound key) folds into the
+    /// literal `"unnamed"` gateway bucket, same as `Store::ingest`.
+    pub fn ingest_from(&self, org: &str, site: Option<&str>, records: &[CallRecord]) {
+        self.ingest_at_from(org, site, records, now_millis());
     }
 
     /// [`Store::ingest`] with an explicit `now_ms` (the same "now" `series`
     /// takes), so incident windows are deterministic in tests.
+    ///
+    /// `#[cfg(test)]`: every call site left in the workspace is a test (this
+    /// crate's own `mod tests`, `push.rs`'s), now that `ingest`/`ingest_from`
+    /// go through [`Store::ingest_at_from`] directly - a plain `pub(crate)`
+    /// here would be genuinely unreachable from a non-test build and trip
+    /// `-D warnings`' dead-code lint honestly, not spuriously.
+    #[cfg(test)]
     pub(crate) fn ingest_at(&self, org: &str, records: &[CallRecord], now_ms: i64) {
+        self.ingest_at_from(org, None, records, now_ms);
+    }
+
+    /// [`Store::ingest_from`] with an explicit `now_ms`, the testable inner
+    /// form every other `ingest*` entry point calls through.
+    pub(crate) fn ingest_at_from(
+        &self,
+        org: &str,
+        site: Option<&str>,
+        records: &[CallRecord],
+        now_ms: i64,
+    ) {
         let mut updated: Vec<RunAgg> = Vec::new();
         let mut fired: HashMap<String, Incident> = HashMap::new();
         // Per-incident extra `data` fields, by incident id: today only
@@ -1368,6 +1500,34 @@ impl Store {
                 // (see [`UnitMonthAcc`]: a forged record timestamp must not
                 // reset a month window).
                 let month_now = month_key(now_ms);
+
+                // Invariant 65: one push (this whole `ingest_at_from` call)
+                // is one gateway "heartbeat", attributed to the CREDENTIAL's
+                // site for the whole batch - `site` is fixed per push, never
+                // per record. Resolve the bucket once here, bounded by
+                // `MAX_GATEWAYS_PER_ORG` the same way `unit_months` is bounded
+                // above: a NEW site past the cap folds into "unnamed" rather
+                // than evicting.
+                let gateways = inner.gateways.entry(org.to_string()).or_default();
+                let gateway_key: String = match site {
+                    Some(s) if !s.is_empty() => {
+                        if gateways.contains_key(s) || gateways.len() < MAX_GATEWAYS_PER_ORG {
+                            s.to_string()
+                        } else {
+                            "unnamed".to_string()
+                        }
+                    }
+                    _ => "unnamed".to_string(),
+                };
+                let gacc = gateways.entry(gateway_key).or_default();
+                gacc.pushes += 1;
+                if gacc.first_push_millis == 0 {
+                    gacc.first_push_millis = now_ms;
+                }
+                // Server time, deliberately: this is what "is the site alive"
+                // has to read (invariant 65), not a gateway's own clock.
+                gacc.last_push_millis = now_ms;
+
                 for r in records {
                     // C4: `cost_microusd`/`saved_microusd` are attacker-
                     // controlled (a record is untrusted input). A negative value is
@@ -1449,9 +1609,19 @@ impl Store {
                         totals.spent_microusd = totals.spent_microusd.saturating_add(cost);
                         agg.tool_calls = agg.tool_calls.saturating_add(tool_calls);
                         totals.tool_calls = totals.tool_calls.saturating_add(tool_calls);
+                        // Invariant 65: same clamped `cost`, same saturating
+                        // fold, same blocked-row gate as `totals` above - a
+                        // block is a guard firing, not spend, whichever site
+                        // it came from.
+                        gacc.spent_microusd = gacc.spent_microusd.saturating_add(cost);
+                        gacc.tool_calls = gacc.tool_calls.saturating_add(tool_calls);
                     }
                     agg.calls += 1;
                     totals.calls += 1;
+                    gacc.calls += 1;
+                    if r.ts_millis > gacc.last_record_millis {
+                        gacc.last_record_millis = r.ts_millis;
+                    }
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
                     }
@@ -1484,6 +1654,17 @@ impl Store {
                         agg.owner = r.owner.clone();
                     } else if let Some(owner) = owner_of_chain(&r.on_behalf_of) {
                         agg.owner = owner;
+                    }
+                    // Invariant 65, same "last non-empty wins" rule: the
+                    // site is this PUSH's credential-bound site, never
+                    // anything `r` itself could carry - a record has no site
+                    // field to read one from (see `Store::ingest_from`'s
+                    // doc). An unbound key (`site: None`) never clears a
+                    // site an earlier, bound push already named.
+                    if let Some(s) = site {
+                        if !s.is_empty() {
+                            agg.site = s.to_string();
+                        }
                     }
                     if r.step > agg.steps {
                         agg.steps = r.step;
@@ -2588,6 +2769,44 @@ impl Store {
         out
     }
 
+    /// An org's per-site (gateway) ingest rollup, most-recently-heard-from
+    /// first (invariant 65).
+    ///
+    /// Unlike [`Store::units`]/[`Store::owners`], nothing is folded from
+    /// [`RunAgg`] here: [`Inner::gateways`] already keeps the exact per-push
+    /// accumulator, keyed by site, so this is a direct read with no
+    /// eviction caveat.
+    pub fn gateways(&self, org: &str) -> Vec<GatewayAgg> {
+        let inner = self.inner.read().unwrap();
+        let mut out: Vec<GatewayAgg> = inner
+            .gateways
+            .get(org)
+            .map(|sites| {
+                sites
+                    .iter()
+                    .map(|(site, acc)| GatewayAgg {
+                        site: site.clone(),
+                        spent_microusd: acc.spent_microusd,
+                        calls: acc.calls,
+                        tool_calls: acc.tool_calls,
+                        pushes: acc.pushes,
+                        first_push_millis: acc.first_push_millis,
+                        last_push_millis: acc.last_push_millis,
+                        last_record_millis: acc.last_record_millis,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Most-recently-heard-from first (the "which sites need attention"
+        // question), site name as the tiebreak so the order is stable.
+        out.sort_by(|a, b| {
+            b.last_push_millis
+                .cmp(&a.last_push_millis)
+                .then_with(|| a.site.cmp(&b.site))
+        });
+        out
+    }
+
     /// An org's live FinOps savings totals (blocked/avoided spend + cache
     /// savings + router savings). Accumulated incrementally in
     /// [`Store::ingest`] and persisted.
@@ -3052,6 +3271,7 @@ impl Store {
                 savings: &inner.savings,
                 spend_days: &inner.spend_days,
                 unit_months: &inner.unit_months,
+                gateways: &inner.gateways,
                 decision_counts: &inner.decision_counts,
                 incidents: &inner.incidents,
                 audit: &inner.audit,
@@ -3084,6 +3304,7 @@ impl Store {
         inner.savings = snap.savings;
         inner.spend_days = snap.spend_days;
         inner.unit_months = snap.unit_months;
+        inner.gateways = snap.gateways;
         inner.decision_counts = snap.decision_counts;
         inner.incidents = snap.incidents;
         inner.audit = snap.audit;
@@ -4249,6 +4470,186 @@ mod tests {
 
         let old: CallRecord = serde_json::from_str(r#"{"run_id":"r1"}"#).unwrap();
         assert_eq!(old.owner, "");
+    }
+
+    // -- invariant 65: the site is named by the key, not the record --------
+
+    #[test]
+    fn a_key_bound_to_a_site_attributes_every_record_it_pushes_to_that_site() {
+        let s = Store::new();
+        s.ingest_from("acme", Some("site-a"), &[rec("r1", 1000), rec("r2", 2000)]);
+        let gws = s.gateways("acme");
+        assert_eq!(gws.len(), 1, "{gws:?}");
+        assert_eq!(gws[0].site, "site-a");
+        assert_eq!(gws[0].spent_microusd, 3000);
+        assert_eq!(gws[0].calls, 2);
+        assert_eq!(gws[0].pushes, 1);
+    }
+
+    #[test]
+    fn an_unbound_key_pushes_into_the_unnamed_bucket() {
+        let s = Store::new();
+        s.ingest_from("acme", None, &[rec("r1", 500)]);
+        let gws = s.gateways("acme");
+        assert_eq!(gws.len(), 1, "{gws:?}");
+        assert_eq!(gws[0].site, "unnamed");
+        assert_eq!(gws[0].spent_microusd, 500);
+    }
+
+    #[test]
+    fn last_push_is_server_time_not_the_records_timestamp() {
+        let s = Store::new();
+        let server_now = 5_000_000;
+        // Records carry timestamps far in the past and far in the future -
+        // neither must move `last_push_millis`, which is the plane's own
+        // clock at the moment of the push.
+        s.ingest_at_from(
+            "acme",
+            Some("site-a"),
+            &[
+                CallRecord {
+                    run_id: "r1".into(),
+                    decision: "allow".into(),
+                    ts_millis: 1, // far in the past
+                    ..Default::default()
+                },
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "allow".into(),
+                    ts_millis: 9_999_999_999, // far in the future
+                    ..Default::default()
+                },
+            ],
+            server_now,
+        );
+        let gws = s.gateways("acme");
+        assert_eq!(gws[0].last_push_millis, server_now);
+        assert_eq!(gws[0].first_push_millis, server_now);
+        // Descriptive only: the newest RECORD timestamp, unrelated to the
+        // plane's own clock above.
+        assert_eq!(gws[0].last_record_millis, 9_999_999_999);
+    }
+
+    #[test]
+    fn an_empty_batch_is_a_heartbeat() {
+        let s = Store::new();
+        s.ingest_at_from("acme", Some("site-a"), &[], 1_000);
+        let gws = s.gateways("acme");
+        assert_eq!(
+            gws.len(),
+            1,
+            "an empty push still opens the bucket: {gws:?}"
+        );
+        assert_eq!(gws[0].pushes, 1);
+        assert_eq!(gws[0].calls, 0);
+        assert_eq!(gws[0].last_push_millis, 1_000);
+
+        // A second, later empty push is a second heartbeat.
+        s.ingest_at_from("acme", Some("site-a"), &[], 2_000);
+        let gws = s.gateways("acme");
+        assert_eq!(gws[0].pushes, 2);
+        assert_eq!(gws[0].last_push_millis, 2_000);
+    }
+
+    #[test]
+    fn blocked_rows_count_as_calls_but_not_as_spend_at_the_gateway_level() {
+        // Mirrors the same `is_blocked` gate `OrgTotals`/`RunAgg` are folded
+        // through: a block is a guard firing, not spend, whichever site it
+        // came from.
+        let s = Store::new();
+        s.ingest_from(
+            "acme",
+            Some("site-a"),
+            &[
+                rec("r1", 1000),
+                CallRecord {
+                    run_id: "r2".into(),
+                    decision: "budget_exceeded".into(),
+                    cost_microusd: 999_999,
+                    ..Default::default()
+                },
+            ],
+        );
+        let gws = s.gateways("acme");
+        assert_eq!(gws[0].calls, 2, "both calls counted");
+        assert_eq!(
+            gws[0].spent_microusd, 1000,
+            "the blocked row's avoided-spend estimate must not inflate real spend"
+        );
+    }
+
+    #[test]
+    fn a_site_past_the_cap_folds_into_unnamed() {
+        let s = Store::new();
+        for i in 0..MAX_GATEWAYS_PER_ORG {
+            s.ingest_from("acme", Some(&format!("site-{i}")), &[rec("r", 1)]);
+        }
+        // The cap is already reached; a brand new site name now folds into
+        // "unnamed" rather than being admitted as (cap + 1)th bucket.
+        s.ingest_from("acme", Some("one-too-many"), &[rec("r", 7)]);
+        let gws = s.gateways("acme");
+        assert_eq!(gws.len(), MAX_GATEWAYS_PER_ORG + 1, "the +1 is \"unnamed\"");
+        let unnamed = gws
+            .iter()
+            .find(|g| g.site == "unnamed")
+            .expect("unnamed bucket");
+        assert_eq!(unnamed.spent_microusd, 7);
+        assert!(
+            !gws.iter().any(|g| g.site == "one-too-many"),
+            "the over-cap site must never get its own bucket: {gws:?}"
+        );
+    }
+
+    #[test]
+    fn gateways_survive_a_snapshot_round_trip() {
+        let s = Store::new();
+        s.ingest_from("acme", Some("site-a"), &[rec("r1", 1500)]);
+        let dir = std::env::temp_dir().join(format!("tf-gw-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.json");
+        s.save(&path).unwrap();
+
+        let s2 = Store::new();
+        s2.load(&path).unwrap();
+        let gws = s2.gateways("acme");
+        assert_eq!(gws.len(), 1, "{gws:?}");
+        assert_eq!(gws[0].site, "site-a");
+        assert_eq!(gws[0].spent_microusd, 1500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_snapshot_without_gateways_loads_empty() {
+        // A pre-invariant-65 snapshot has no `gateways` member at all - the
+        // shape `unit_months`'s own pre-existing test pins for that field.
+        let dir = std::env::temp_dir().join(format!("tf-gw-old-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.json");
+        std::fs::write(&path, r#"{"orgs":{"acme":{}}}"#).unwrap();
+
+        let s = Store::new();
+        s.load(&path).unwrap();
+        assert!(
+            s.gateways("acme").is_empty(),
+            "no per-site source in old data; never backfilled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_run_keeps_the_last_named_site() {
+        let s = Store::new();
+        // First call from a site-bound key names the run's site...
+        s.ingest_from("acme", Some("site-a"), &[rec("r1", 100)]);
+        // ...a later call on the SAME run from an unbound key must not erase
+        // it - "last non-empty wins", same rule `unit`/`owner` use.
+        s.ingest_from("acme", None, &[rec("r1", 50)]);
+        let run = s
+            .runs("acme")
+            .into_iter()
+            .find(|r| r.run_id == "r1")
+            .expect("run r1");
+        assert_eq!(run.site, "site-a");
     }
 
     #[test]

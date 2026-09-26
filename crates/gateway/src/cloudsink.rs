@@ -535,7 +535,8 @@ fn report_refusal(reported: &Mutex<HashSet<u16>>, status: reqwest::StatusCode, u
 
 /// One `GET {base}/v1/units` with the org key, the body read chunk by chunk
 /// under `SEED_MAX_BODY_BYTES`. The key the gateway needs for `/v1/ingest`
-/// (an admin org key) passes `/v1/units`, which accepts any org key.
+/// (an admin org key, or, since invariant 65, a site-scoped `ingest` key)
+/// passes `/v1/units`, which accepts any org key.
 async fn fetch_unit_months(
     client: &reqwest::Client,
     base: &str,

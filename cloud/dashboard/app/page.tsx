@@ -19,6 +19,11 @@ type Run = {
   // rendered blank. Optional because a Cloud older than #310 omits the key
   // entirely rather than sending "".
   owner?: string;
+  // The site (gateway) that pushed this run's calls, from the pushing key's
+  // bound site (invariant 65) - never anything the run's own records could
+  // claim. "" is the ordinary case, a run pushed by an unbound key. Optional
+  // because a Cloud older than invariant 65 omits the key entirely.
+  site?: string;
 };
 type Summary = { runs: number; calls: number; spent_microusd: number; tool_calls: number };
 type Bucket = { t: number; cost_microusd: number; calls: number; blocked: number };
@@ -64,6 +69,23 @@ type Owner = {
   last_seen_millis: number;
   tool_calls: number;
 };
+// Per-site (gateway) ingest rollup (GET /v1/gateways, GatewayAgg, invariant
+// 65): which site pushed, how much, and when this plane last heard from it.
+// The literal id "unnamed" is the server's own fold for a push from a key
+// bound to no site - never a blank string. last_push_millis is the plane's
+// OWN clock at the moment of the push (the figure "has this site gone
+// silent" reads); last_record_millis is only the newest call TIMESTAMP the
+// site has ever reported, descriptive and never used for liveness.
+type Gateway = {
+  site: string;
+  spent_microusd: number;
+  calls: number;
+  tool_calls: number;
+  pushes: number;
+  first_push_millis: number;
+  last_push_millis: number;
+  last_record_millis: number;
+};
 // One detector finding (GET /v1/incidents, Incident). severity is always one
 // of these five wire strings (tokenfuse_core::Severity, lowercased).
 // run_id/agent_id are absent for an org-scoped detector (spend_spike).
@@ -97,6 +119,11 @@ const INCIDENT_LABELS: Record<string, string> = {
   run_stalled: "Run stalled",
 };
 const incidentLabel = (kind: string) => INCIDENT_LABELS[kind] || kind;
+
+// A site with no push in this long reads as "silent" on the Gateways card
+// (invariant 65: nothing pages anybody when this happens, so the label is
+// the only signal a human gets).
+const SILENT_AFTER_MS = 5 * 60 * 1000;
 
 function ago(ms: number): string {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -169,6 +196,9 @@ export default function Page() {
   // null means "not available on this plane" (unreachable or older Cloud),
   // distinct from an empty array meaning "fetched, no incidents open".
   const [incidents, setIncidents] = useState<Incident[] | null>(null);
+  // Same null-vs-empty rule as incidents above: null is "not available on
+  // this plane", [] is "reachable, nobody has pushed yet".
+  const [gateways, setGateways] = useState<Gateway[] | null>(null);
   const [status, setStatus] = useState("");
   const [armed, setArmed] = useState<string | null>(null);
 
@@ -202,7 +232,7 @@ export default function Page() {
   const refresh = useCallback(async () => {
     if (!connected || !key) return;
     try {
-      const [runsRes, sumRes, budRes, serRes, alertRes, sav, unitsRes, unitBud, own, inc] =
+      const [runsRes, sumRes, budRes, serRes, alertRes, sav, unitsRes, unitBud, own, inc, gws] =
         await Promise.all([
           api("/v1/runs"),
           api("/v1/summary"),
@@ -240,6 +270,13 @@ export default function Page() {
           api("/v1/incidents")
             .then((r) => r.json() as Promise<Incident[]>)
             .catch(() => null),
+          // Gateways (GET /v1/gateways, GatewayAgg, invariant 65): same
+          // absent-vs-empty rule as incidents above - a plane that cannot be
+          // reached, or predates this endpoint, must read as "not
+          // available", never as the false-positive "no gateways pushed".
+          api("/v1/gateways")
+            .then((r) => r.json() as Promise<Gateway[]>)
+            .catch(() => null),
         ]);
       const rs: Run[] = await runsRes.json();
       const bud: Record<string, number> = await budRes.json();
@@ -254,6 +291,7 @@ export default function Page() {
       setUnitBudgets(unitBud);
       setOwners(own);
       setIncidents(inc);
+      setGateways(gws);
       setSummary(await sumRes.json());
       setSeries(await serRes.json());
       setAlerts(await alertRes.json());
@@ -528,6 +566,7 @@ export default function Page() {
                       <th>Run</th>
                       <th>Model</th>
                       <th>Owner</th>
+                      <th>Site</th>
                       <th>Spent / cap</th>
                       <th className="num">Calls</th>
                       <th className="num">Steps</th>
@@ -556,6 +595,14 @@ export default function Page() {
                               style={!r.owner ? { color: "var(--faint)" } : undefined}
                             >
                               {r.owner || "not reported"}
+                            </span>
+                          </td>
+                          <td>
+                            <span
+                              className="rmodel"
+                              style={!r.site ? { color: "var(--faint)" } : undefined}
+                            >
+                              {r.site || "not named"}
                             </span>
                           </td>
                           <td className="spentcell">
@@ -852,6 +899,81 @@ export default function Page() {
                                     {o.runs} {o.runs === 1 ? "run" : "runs"} · {o.agents}{" "}
                                     {o.agents === 1 ? "agent" : "agents"}
                                   </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="card">
+                <div className="sechead">
+                  <div className="t">Gateways</div>
+                  <div className="r">by site</div>
+                </div>
+                {/* Same absent-vs-empty rule as Incidents above: gateways ===
+                    null means the endpoint could not be read (unreachable
+                    plane, or one old enough to predate invariant 65), never
+                    shown as "nothing has pushed", which would read as
+                    measured when nothing was. */}
+                {gateways === null ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    Not available on this plane.
+                  </div>
+                ) : gateways.length === 0 ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    No gateways have pushed yet.
+                  </div>
+                ) : (
+                  <div className="tablewrap">
+                    <table className="narrow">
+                      <thead>
+                        <tr>
+                          <th>Site</th>
+                          <th>Spent</th>
+                          <th>Last push</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {gateways
+                          .slice()
+                          .sort((a, b) => b.last_push_millis - a.last_push_millis)
+                          .map((g) => {
+                            const unnamed = g.site === "unnamed";
+                            // A visible text label, not colour alone
+                            // (invariant 65: nothing pages anybody when a
+                            // site goes quiet, so this label is the only
+                            // signal a human gets).
+                            const silent = Date.now() - g.last_push_millis > SILENT_AFTER_MS;
+                            return (
+                              <tr key={g.site}>
+                                <td>
+                                  <span
+                                    className="rid"
+                                    style={unnamed ? { color: "var(--dim)" } : undefined}
+                                  >
+                                    {g.site}
+                                  </span>
+                                </td>
+                                {/* Two-plus-one columns, the Owners card's own
+                                    narrow-rail shape: the count rides under
+                                    the spend rather than its own column. */}
+                                <td className="spentcell">
+                                  <div className="nrow">
+                                    <b>{usd(g.spent_microusd)}</b>
+                                  </div>
+                                  <div className="nocap">
+                                    {g.calls} {g.calls === 1 ? "call" : "calls"}
+                                  </div>
+                                </td>
+                                <td>
+                                  <div style={silent ? { color: "var(--amber)" } : undefined}>
+                                    {ago(g.last_push_millis)}
+                                  </div>
+                                  {silent && <div className="nocap">silent</div>}
                                 </td>
                               </tr>
                             );
