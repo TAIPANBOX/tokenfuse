@@ -336,6 +336,11 @@ table {
   border-collapse: collapse;
   min-width: 560px;
 }
+/* A two-column table that lives in the narrow rail (Owners): the 560px floor
+   is for the wide Runs table and would push the second column off the card. */
+table.narrow {
+  min-width: 0;
+}
 thead th {
   font-family: var(--fm);
   font-size: 9.5px;

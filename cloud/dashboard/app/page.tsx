@@ -816,13 +816,11 @@ export default function Page() {
                   </div>
                 ) : (
                   <div className="tablewrap">
-                    <table>
+                    <table className="narrow">
                       <thead>
                         <tr>
                           <th>Owner</th>
-                          <th className="num">Spent</th>
-                          <th className="num">Runs</th>
-                          <th className="num">Agents</th>
+                          <th>Spent</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -841,9 +839,20 @@ export default function Page() {
                                     {o.owner || "not reported"}
                                   </span>
                                 </td>
-                                <td className="num">{usd(o.spent_microusd)}</td>
-                                <td className="num">{o.runs}</td>
-                                <td className="num">{o.agents}</td>
+                                {/* Two columns, not four: this card sits in the
+                                    narrow rail, and separate Runs/Agents columns
+                                    pushed the spend itself past the card's edge.
+                                    The counts ride under the sum, the Business
+                                    units card's own nrow/nocap shape. */}
+                                <td className="spentcell">
+                                  <div className="nrow">
+                                    <b>{usd(o.spent_microusd)}</b>
+                                  </div>
+                                  <div className="nocap">
+                                    {o.runs} {o.runs === 1 ? "run" : "runs"} · {o.agents}{" "}
+                                    {o.agents === 1 ? "agent" : "agents"}
+                                  </div>
+                                </td>
                               </tr>
                             );
                           })}
