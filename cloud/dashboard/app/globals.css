@@ -336,6 +336,11 @@ table {
   border-collapse: collapse;
   min-width: 560px;
 }
+/* A two-column table that lives in the narrow rail (Owners): the 560px floor
+   is for the wide Runs table and would push the second column off the card. */
+table.narrow {
+  min-width: 0;
+}
 thead th {
   font-family: var(--fm);
   font-size: 9.5px;
@@ -482,6 +487,20 @@ td.num {
 .arow .d.near {
   background: var(--amber);
   box-shadow: 0 0 9px var(--amber);
+}
+/* Incident severity dots (info/low/medium/high/critical folded to three
+   bands, matching the alert dots' crit/near above rather than adding a
+   fourth color to the read-as-an-instrument palette). */
+.arow .d.high {
+  background: var(--ember);
+  box-shadow: 0 0 9px var(--ember);
+}
+.arow .d.medium {
+  background: var(--amber);
+  box-shadow: 0 0 9px var(--amber);
+}
+.arow .d.low {
+  background: var(--faint);
 }
 .arow .tx {
   flex: 1;

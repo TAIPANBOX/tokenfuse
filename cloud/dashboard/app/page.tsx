@@ -13,6 +13,12 @@ type Run = {
   killed: boolean;
   // Tool calls the model emitted across this run's calls (I1, docs/21-tool-runs.md).
   tool_calls: number;
+  // The human this run is answerable to (RunAgg.owner, #295/#310): the
+  // unit's configured owner, else the delegation chain's root user://
+  // principal. "" is the ordinary case, a run nobody delegated - never
+  // rendered blank. Optional because a Cloud older than #310 omits the key
+  // entirely rather than sending "".
+  owner?: string;
 };
 type Summary = { runs: number; calls: number; spent_microusd: number; tool_calls: number };
 type Bucket = { t: number; cost_microusd: number; calls: number; blocked: number };
@@ -45,8 +51,68 @@ type Unit = {
   month_spent_microusd?: number;
   month_calls?: number;
 };
+// Per-owner spend rollup (GET /v1/owners, OwnerAgg): the human a run is
+// answerable to, folded across every unit and agent acting on their behalf.
+// The literal id "unassigned" is the server's own fold for a run whose chain
+// named no human - never a blank string.
+type Owner = {
+  owner: string;
+  spent_microusd: number;
+  calls: number;
+  runs: number;
+  agents: number;
+  last_seen_millis: number;
+  tool_calls: number;
+};
+// One detector finding (GET /v1/incidents, Incident). severity is always one
+// of these five wire strings (tokenfuse_core::Severity, lowercased).
+// run_id/agent_id are absent for an org-scoped detector (spend_spike).
+// summary is the Cloud's own sentence when it has one (mostly external
+// findings); TokenFuse's own detectors are described by `kind` alone.
+type Incident = {
+  id: string;
+  run_id: string | null;
+  agent_id: string | null;
+  kind: string;
+  severity: "info" | "low" | "medium" | "high" | "critical";
+  first_seen_millis: number;
+  last_seen_millis: number;
+  occurrences: number;
+  acknowledged: boolean;
+  source?: string | null;
+  summary?: string | null;
+};
 
 const usd = (micro: number) => "$" + (micro / 1e6).toFixed(2);
+
+// Detector kind -> a readable label. Falls back to the raw wire string for a
+// kind this dashboard does not yet know the words for, which is honest
+// (the Cloud's own wording) rather than a guess.
+const INCIDENT_LABELS: Record<string, string> = {
+  budget_exhausted: "Budget exhausted",
+  sustained_loop: "Sustained loop",
+  spend_spike: "Spend spike",
+  fanout_explosion: "Fan-out explosion",
+  budget_threshold: "Near budget",
+  run_stalled: "Run stalled",
+};
+const incidentLabel = (kind: string) => INCIDENT_LABELS[kind] || kind;
+
+function ago(ms: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + "s ago";
+  const m = Math.round(s / 60);
+  if (m < 60) return m + "m ago";
+  const h = Math.round(m / 60);
+  if (h < 24) return h + "h ago";
+  return Math.round(h / 24) + "d ago";
+}
+
+function sevClass(s: Incident["severity"]): string {
+  if (s === "critical" || s === "high") return "high";
+  if (s === "medium") return "medium";
+  return "low";
+}
 
 function heatClass(frac: number, killed: boolean): "mint" | "amber" | "ember" {
   if (killed) return "mint";
@@ -99,6 +165,10 @@ export default function Page() {
   const [series, setSeries] = useState<Bucket[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [savings, setSavings] = useState<Savings | null>(null);
+  const [owners, setOwners] = useState<Owner[]>([]);
+  // null means "not available on this plane" (unreachable or older Cloud),
+  // distinct from an empty array meaning "fetched, no incidents open".
+  const [incidents, setIncidents] = useState<Incident[] | null>(null);
   const [status, setStatus] = useState("");
   const [armed, setArmed] = useState<string | null>(null);
 
@@ -132,32 +202,45 @@ export default function Page() {
   const refresh = useCallback(async () => {
     if (!connected || !key) return;
     try {
-      const [runsRes, sumRes, budRes, serRes, alertRes, sav, unitsRes, unitBud] = await Promise.all([
-        api("/v1/runs"),
-        api("/v1/summary"),
-        api("/v1/budgets"),
-        api("/v1/series?window=15m&step=60s"),
-        api("/v1/alerts"),
-        // Savings can be absent on an older plane, exactly like /v1/units
-        // below. Swallow the error so the rest of the dashboard still
-        // refreshes; the tile hides. This used to say "a paid-plan feature:
-        // 402 on free plans", which stopped being true when plan entitlements
-        // were removed from the product (#123, #125): there are no plans, so
-        // there is no 402 to catch, and the only reason left to be defensive
-        // here is a plane that predates the endpoint.
-        api("/v1/savings")
-          .then((r) => r.json() as Promise<Savings>)
-          .catch(() => null),
-        // Units + their monthly caps (docs/20). Absent on an older plane that
-        // predates the identity map: swallow so the rest still refreshes and
-        // the Business units card simply shows nothing.
-        api("/v1/units")
-          .then((r) => r.json() as Promise<Unit[]>)
-          .catch(() => [] as Unit[]),
-        api("/v1/unit-budgets")
-          .then((r) => r.json() as Promise<Record<string, number>>)
-          .catch(() => ({}) as Record<string, number>),
-      ]);
+      const [runsRes, sumRes, budRes, serRes, alertRes, sav, unitsRes, unitBud, own, inc] =
+        await Promise.all([
+          api("/v1/runs"),
+          api("/v1/summary"),
+          api("/v1/budgets"),
+          api("/v1/series?window=15m&step=60s"),
+          api("/v1/alerts"),
+          // Savings can be absent on an older plane, exactly like /v1/units
+          // below. Swallow the error so the rest of the dashboard still
+          // refreshes; the tile hides. This used to say "a paid-plan feature:
+          // 402 on free plans", which stopped being true when plan entitlements
+          // were removed from the product (#123, #125): there are no plans, so
+          // there is no 402 to catch, and the only reason left to be defensive
+          // here is a plane that predates the endpoint.
+          api("/v1/savings")
+            .then((r) => r.json() as Promise<Savings>)
+            .catch(() => null),
+          // Units + their monthly caps (docs/20). Absent on an older plane that
+          // predates the identity map: swallow so the rest still refreshes and
+          // the Business units card simply shows nothing.
+          api("/v1/units")
+            .then((r) => r.json() as Promise<Unit[]>)
+            .catch(() => [] as Unit[]),
+          api("/v1/unit-budgets")
+            .then((r) => r.json() as Promise<Record<string, number>>)
+            .catch(() => ({}) as Record<string, number>),
+          // Owners (GET /v1/owners, OwnerAgg): same graceful-absence rule as
+          // /v1/units above - an older plane simply shows no owner rollup.
+          api("/v1/owners")
+            .then((r) => r.json() as Promise<Owner[]>)
+            .catch(() => [] as Owner[]),
+          // Incidents (GET /v1/incidents): unlike the fetches above, a failure
+          // here is kept visible rather than swallowed into an empty list -
+          // an unreachable or older plane must read as "not available", never
+          // as the false-positive "no incidents open".
+          api("/v1/incidents")
+            .then((r) => r.json() as Promise<Incident[]>)
+            .catch(() => null),
+        ]);
       const rs: Run[] = await runsRes.json();
       const bud: Record<string, number> = await budRes.json();
       rs.sort((a, b) => {
@@ -169,6 +252,8 @@ export default function Page() {
       setBudgets(bud);
       setUnits(unitsRes);
       setUnitBudgets(unitBud);
+      setOwners(own);
+      setIncidents(inc);
       setSummary(await sumRes.json());
       setSeries(await serRes.json());
       setAlerts(await alertRes.json());
@@ -442,6 +527,7 @@ export default function Page() {
                     <tr>
                       <th>Run</th>
                       <th>Model</th>
+                      <th>Owner</th>
                       <th>Spent / cap</th>
                       <th className="num">Calls</th>
                       <th className="num">Steps</th>
@@ -463,6 +549,14 @@ export default function Page() {
                           </td>
                           <td>
                             <span className="rmodel">{r.model || "—"}</span>
+                          </td>
+                          <td>
+                            <span
+                              className="rmodel"
+                              style={!r.owner ? { color: "var(--faint)" } : undefined}
+                            >
+                              {r.owner || "not reported"}
+                            </span>
                           </td>
                           <td className="spentcell">
                             {budget > 0 ? (
@@ -527,6 +621,70 @@ export default function Page() {
             </div>
 
             <div className="rail">
+              <div className="card">
+                <div className="sechead">
+                  <div className="t">Incidents</div>
+                  <div className="r">detector findings</div>
+                </div>
+                {/* Distinct from Alerts below: an alert is this dashboard's own
+                    live budget-fraction read of /v1/runs, computed here.
+                    An incident is the Cloud's own detector finding
+                    (/v1/incidents) - a budget block count, a loop repeat, a
+                    run gone quiet (run_stalled, invariant 60) and so on.
+                    incidents === null means the endpoint could not be read
+                    (unreachable plane, or one old enough to lack it): that is
+                    never shown as "none open", which would read as measured
+                    when nothing was. */}
+                {incidents === null ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    Not available on this plane.
+                  </div>
+                ) : incidents.length === 0 ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    No incidents open.
+                  </div>
+                ) : (
+                  incidents
+                    .slice()
+                    .sort((a, b) => b.last_seen_millis - a.last_seen_millis)
+                    .map((inc) => (
+                      <div className="arow" key={inc.id}>
+                        <span className={"d " + sevClass(inc.severity)} />
+                        <div className="tx">
+                          <div className="m">
+                            {incidentLabel(inc.kind)}
+                            {inc.run_id ? (
+                              <>
+                                {" "}
+                                · run <span className="id">{inc.run_id}</span>
+                              </>
+                            ) : (
+                              " · org-wide"
+                            )}
+                          </div>
+                          <div className="s">
+                            {inc.summary || (inc.agent_id ? `agent ${inc.agent_id}` : "unattributed")}
+                            {inc.occurrences > 1 ? ` · x${inc.occurrences}` : ""}
+                          </div>
+                        </div>
+                        <span
+                          className="pct"
+                          style={{
+                            color:
+                              inc.severity === "critical" || inc.severity === "high"
+                                ? "var(--ember)"
+                                : inc.severity === "medium"
+                                  ? "var(--amber)"
+                                  : "var(--dim)",
+                          }}
+                        >
+                          {ago(inc.last_seen_millis)}
+                        </span>
+                      </div>
+                    ))
+                )}
+              </div>
+
               <div className="card">
                 <div className="sechead">
                   <div className="t">Alerts</div>
@@ -641,6 +799,63 @@ export default function Page() {
                             </tr>
                           );
                         })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="card">
+                <div className="sechead">
+                  <div className="t">Owners</div>
+                  <div className="r">by human</div>
+                </div>
+                {owners.length === 0 ? (
+                  <div className="empty" style={{ padding: "28px 20px" }}>
+                    No owners yet. Map units to owners (docs/20), then send traffic.
+                  </div>
+                ) : (
+                  <div className="tablewrap">
+                    <table className="narrow">
+                      <thead>
+                        <tr>
+                          <th>Owner</th>
+                          <th>Spent</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {owners
+                          .slice()
+                          .sort((a, b) => b.spent_microusd - a.spent_microusd)
+                          .map((o) => {
+                            const unassigned = o.owner === "unassigned";
+                            return (
+                              <tr key={o.owner}>
+                                <td>
+                                  <span
+                                    className="rid"
+                                    style={unassigned ? { color: "var(--dim)" } : undefined}
+                                  >
+                                    {o.owner || "not reported"}
+                                  </span>
+                                </td>
+                                {/* Two columns, not four: this card sits in the
+                                    narrow rail, and separate Runs/Agents columns
+                                    pushed the spend itself past the card's edge.
+                                    The counts ride under the sum, the Business
+                                    units card's own nrow/nocap shape. */}
+                                <td className="spentcell">
+                                  <div className="nrow">
+                                    <b>{usd(o.spent_microusd)}</b>
+                                  </div>
+                                  <div className="nocap">
+                                    {o.runs} {o.runs === 1 ? "run" : "runs"} · {o.agents}{" "}
+                                    {o.agents === 1 ? "agent" : "agents"}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
                       </tbody>
                     </table>
                   </div>
