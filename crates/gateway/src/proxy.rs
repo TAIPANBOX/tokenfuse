@@ -562,6 +562,26 @@ pub async fn chat_completions(
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`
 /// rather than calling this directly - see `tests/wire_door.rs`.
+/// Invariant 70: credit a run's Cloud-known spend the moment it is opened
+/// fresh in this process, before anything else touches its ledger state.
+/// Called only where the caller has already established the run had no
+/// snapshot a moment ago (a fresh `open_run`, never a run already open
+/// here), so a no-op result (`false`) is not this call's business to react
+/// to: it means either nothing was pending for this run_id, or a racing
+/// request for the same run_id already took it, and either is a normal
+/// outcome, not a fault.
+async fn credit_run_seed_if_any(st: &AppState, run_id: &str, generation: u64) {
+    if let Some(seed) = st.take_run_seed(run_id) {
+        if st.ledger.seed_spend(run_id, seed, generation).await {
+            tracing::info!(
+                run = %run_id,
+                seed_usd = seed.as_usd(),
+                "seeded this run's spend from the control plane before its first admission here"
+            );
+        }
+    }
+}
+
 async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
     // A process forwards to one upstream endpoint, so it serves the door
     // matching that upstream's shape and refuses the other one loudly, before
@@ -646,14 +666,23 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         if st.ledger.snapshot(p).await.is_none() {
             if let Some(b) = st.cloud_budget(p) {
                 match st.ledger.open_run(p, b, None).await {
-                    Ok(_) => tracing::info!(parent = %p, child = %run_id, budget_usd = b.as_usd(),
-                        "opened a parent run at its Cloud-managed budget on first sight, declared by a child"),
+                    Ok(o) => {
+                        tracing::info!(parent = %p, child = %run_id, budget_usd = b.as_usd(),
+                            "opened a parent run at its Cloud-managed budget on first sight, declared by a child");
+                        credit_run_seed_if_any(&st, p, o.generation).await;
+                    }
                     Err(e) => tracing::warn!(parent = %p, child = %run_id, error = %e,
                         "could not open the parent at its Cloud-managed budget"),
                 }
             }
         }
     }
+    // Invariant 70: this must be checked BEFORE `open_run` below, since
+    // `open_run` itself creates a fresh, zero-spend entry the instant it
+    // sees a run_id this process has never opened; the snapshot read after
+    // that point can no longer tell "just opened, never seen before" apart
+    // from "already open, called again".
+    let run_is_fresh = st.ledger.snapshot(&run_id).await.is_none();
     let opened = match st.ledger.open_run(&run_id, budget, parent.as_deref()).await {
         Ok(o) => o,
         Err(e) => {
@@ -661,6 +690,9 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             return parent_run_refused(&run_id, &e);
         }
     };
+    if run_is_fresh {
+        credit_run_seed_if_any(&st, &run_id, opened.generation).await;
+    }
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
     let parent_run_id = opened.parent.clone().unwrap_or_default();
@@ -3396,6 +3428,10 @@ pub(crate) mod tests {
         fn settle(&self, reservation: &Reservation, actual: Microusd) {
             self.0.settle(reservation, actual);
         }
+
+        async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
+            self.0.seed_spend(run_id, amount, generation).await
+        }
     }
 
     fn state(mode: Mode, provider: StubProvider) -> AppState {
@@ -3526,6 +3562,167 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "2");
         assert_eq!(ledger.snapshot("run-1").await.unwrap().steps, 2);
+    }
+
+    // --- invariant 70: a restarted gateway enforces the Cloud's run spend --
+
+    /// The measured defect this fix closes (forge k3d lab, 2026-09-27): a
+    /// gateway restarted with the Cloud reporting a run already at or past
+    /// its budget kept answering, because the fresh in-process ledger reads
+    /// every run's spend as zero. On UNFIXED code (no seed applied at
+    /// open_run) this exact request is admitted, `StatusCode::OK`; this test
+    /// is run against both to prove the difference (see the report for the
+    /// unfixed-code run).
+    #[tokio::test]
+    async fn a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        // Mirrors the measured repro: a USD 0.05 budget, USD 0.0547 already
+        // spent in the Cloud (109%). Any nonzero estimate on top must
+        // refuse. On UNFIXED code (no seed applied at open_run) this exact
+        // request is admitted with `StatusCode::OK`, because a fresh
+        // in-process ledger reads this run's spend as zero and the small
+        // per-call estimate alone fits comfortably under a 50,000-microUSD
+        // budget.
+        st.set_run_seed(HashMap::from([("run-1".to_string(), Microusd(54_700))]));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-1")
+            .header("x-fuse-budget-usd", "0.05")
+            .body(Body::from(body(1)))
+            .unwrap();
+
+        let resp = call(st.clone(), req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "seeded spend is already 109% of budget; any nonzero estimate must be refused"
+        );
+        // The seed applied and nothing else did: a refused reserve commits
+        // nothing on top of it.
+        let snap = st.ledger.snapshot("run-1").await.unwrap();
+        assert_eq!(snap.spent, Microusd(54_700));
+        assert_eq!(snap.reserved, Microusd::ZERO);
+    }
+
+    /// The companion case: seeded spend comfortably under the budget still
+    /// lets the run through, and admits the estimate on top of the seed
+    /// rather than in place of it.
+    #[tokio::test]
+    async fn a_restarted_gateway_admits_a_run_the_cloud_reported_comfortably_under_budget() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        st.set_run_seed(HashMap::from([("run-1".to_string(), Microusd(1_000))]));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-1")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let snap = st.ledger.snapshot("run-1").await.unwrap();
+        assert!(
+            snap.spent > Microusd(1_000),
+            "the call's own settled cost must land on top of the 1,000-microUSD seed"
+        );
+    }
+
+    /// Seed plus later local spend must add, exactly once each, never twice:
+    /// a run seeded with the Cloud's figure and then called twice settles at
+    /// seed + cost1 + cost2, verified against an identical unseeded run
+    /// making the same two calls, whose spend after two calls IS cost1 +
+    /// cost2 by definition.
+    #[tokio::test]
+    async fn seeded_spend_and_two_later_settlements_add_exactly_once_each() {
+        let seed = Microusd(500_000);
+        let st_seeded = state(Mode::Enforce, StubProvider::default());
+        st_seeded.set_run_seed(HashMap::from([("seeded".to_string(), seed)]));
+        let st_control = state(Mode::Enforce, StubProvider::default());
+
+        let mk = |run: &str| {
+            Request::post("/v1/messages")
+                .header("x-fuse-run-id", run)
+                .header("x-fuse-budget-usd", "50.0")
+                .body(Body::from(body(500)))
+                .unwrap()
+        };
+
+        assert_eq!(
+            call(st_seeded.clone(), mk("seeded")).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(st_control.clone(), mk("control")).await.status(),
+            StatusCode::OK
+        );
+        let after_one_call = st_seeded.ledger.snapshot("seeded").await.unwrap().spent;
+        let cost_one_call = st_control.ledger.snapshot("control").await.unwrap().spent;
+        assert_eq!(
+            after_one_call,
+            seed + cost_one_call,
+            "the seed must be added exactly once beside the first call's own cost"
+        );
+
+        assert_eq!(
+            call(st_seeded.clone(), mk("seeded")).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(st_control.clone(), mk("control")).await.status(),
+            StatusCode::OK
+        );
+        let after_two_calls = st_seeded.ledger.snapshot("seeded").await.unwrap().spent;
+        let cost_two_calls = st_control.ledger.snapshot("control").await.unwrap().spent;
+        assert_eq!(
+            after_two_calls,
+            seed + cost_two_calls,
+            "a second call must not re-apply the seed: only its own settled cost is new"
+        );
+    }
+
+    /// A run this gateway never sees a call for is never seeded at all: the
+    /// pending map is per run_id, and an unrelated run_id's seed does not
+    /// leak onto a call this gateway actually serves.
+    #[tokio::test]
+    async fn a_run_with_no_matching_seed_is_unaffected() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        st.set_run_seed(HashMap::from([(
+            "some-other-run".to_string(),
+            Microusd(999),
+        )]));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-1")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            st.take_run_seed("some-other-run").is_some(),
+            "the unrelated seed must still be sitting there, untouched"
+        );
+    }
+
+    /// The parent-opened-on-first-sight path (invariant 49, D1's exception)
+    /// gets the same treatment: a parent opened from its Cloud budget on a
+    /// child's first call is also seeded, if the Cloud reported spend for
+    /// it, before the child's own reservation is checked against it.
+    #[tokio::test]
+    async fn a_cloud_budget_parent_opened_on_first_sight_is_also_seeded() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        st.set_cloud_budgets(HashMap::from([("parent".to_string(), Microusd(11_500))]));
+        st.set_run_seed(HashMap::from([("parent".to_string(), Microusd(1_000))]));
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "child")
+            .header("x-fuse-parent-run-id", "parent")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(100)))
+            .unwrap();
+        let resp = call(st.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parent = st.ledger.snapshot("parent").await.unwrap();
+        assert_eq!(
+            parent.spent,
+            Microusd(1_000) + Microusd(10_500),
+            "the parent's Cloud-reported seed and the child's settled cost must both be present"
+        );
     }
 
     #[tokio::test]

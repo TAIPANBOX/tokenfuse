@@ -1196,6 +1196,21 @@ async fn serve() {
                     stb.set_cloud_budgets(budgets);
                 },
             );
+            // Invariant 70: stage this org's Cloud-known per-run spend so a
+            // run this gateway opens fresh (its first admission since this
+            // process started) is checked against that spend plus whatever
+            // is settled from here on, instead of silently starting at
+            // zero. Synchronously and before the listener binds, the same
+            // posture invariant 52 already takes for the unit seed below;
+            // unlike that one, this is not gated on the identity map, since
+            // every gateway enforces per-run budgets, with or without one.
+            let _ = tokenfuse_gateway::cloudsink::seed_run_ledger(
+                &base,
+                &key,
+                &state,
+                tokenfuse_gateway::sink::now_millis(),
+            )
+            .await;
             // Pull centrally-managed per-unit monthly caps (docs/20). Only
             // when the identity map is on: an unconfigured gateway has no
             // units to apply them to, so it does not poll the endpoint.

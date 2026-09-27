@@ -25,6 +25,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::sink::{CallRecord, EventSink};
+use crate::state::AppState;
 use crate::unitledger::{month_key, SeedOutcome, UnitLedger};
 use tokenfuse_core::Microusd;
 
@@ -849,6 +850,195 @@ async fn seed_unit_ledger_within(
             "the unit month could not be seeded from the control plane: every unit starts this \
              month at zero and a central cap is enforced against this gateway's own tally until \
              the next restart"
+        ),
+    }
+    result
+}
+
+/// Invariant 70: how far back `GET /v1/runs` is asked to look for the
+/// startup run-spend seed. Thirty-one days, not one: a run id can be
+/// long-lived and quiet (the console's copilot writes every question to the
+/// same `genaryx-copilot` run, and an operator may not ask for a day), and a
+/// run skipped here restarts from zero, which is the defect this seed closes.
+/// The month is what the Cloud keeps money by, and a recency bound still
+/// keeps the answer small without trusting `RUN_SEED_MAX_BODY_BYTES` alone:
+/// `/v1/runs` already supports `since_millis` (its own `RunsQuery`).
+const RUN_SEED_WINDOW_MILLIS: i64 = 31 * 24 * 60 * 60 * 1000;
+
+/// Invariant 70: the most `GET /v1/runs` may answer with for the seed, the
+/// same defence `SEED_MAX_BODY_BYTES` gives the unit seed and for the same
+/// reason: the answer is untrusted input arriving at startup, and it must
+/// not decide how much this process allocates. `/v1/runs` has no per-org cap
+/// as tight as `MAX_UNIT_MONTH_KEYS`, which is the other reason the window
+/// above exists: bound the ROWS first, then bound the BYTES as a backstop.
+const RUN_SEED_MAX_BODY_BYTES: usize = 4 << 20;
+
+/// One `/v1/runs` row, the three fields the run seed reads. `run_id` and
+/// `spent_microusd` defaulted for the same reason `UnitMonthRow`'s fields
+/// are: a hostile or merely-old control plane answers rows missing either,
+/// and they must parse and then be skipped, not refuse the whole answer.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RunSpendRow {
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub spent_microusd: i64,
+    /// A killed run has no next call to seed for; skipped rather than
+    /// spending a pending-map slot nothing will ever consume.
+    #[serde(default)]
+    pub killed: bool,
+}
+
+/// What the run seed did, for the one log line and for tests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunSeedReport {
+    /// `(run_id, spent_microusd)` staged to be applied on that run's first
+    /// admission in this process, sorted by run_id.
+    pub seeded: Vec<(String, i64)>,
+    /// Rows with a blank run_id or a negative figure.
+    pub skipped_invalid: usize,
+    /// Rows for a run the control plane has already marked killed.
+    pub skipped_killed: usize,
+}
+
+/// One `GET {base}/v1/runs?since_millis=...` with the org key, the body read
+/// chunk by chunk under `RUN_SEED_MAX_BODY_BYTES`. The same key that passes
+/// `/v1/units` passes this route (any org key; invariant 52's comment
+/// applies here unchanged).
+async fn fetch_run_spend(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    since_millis: i64,
+) -> Result<Vec<u8>, SeedError> {
+    let url = format!(
+        "{}/v1/runs?since_millis={}",
+        base.trim_end_matches('/'),
+        since_millis
+    );
+    let mut resp = client
+        .get(&url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| SeedError::Transport(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(SeedError::Status(resp.status().as_u16()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| SeedError::Transport(e.to_string()))?
+    {
+        if body.len() + chunk.len() > RUN_SEED_MAX_BODY_BYTES {
+            return Err(SeedError::BodyTooLarge(RUN_SEED_MAX_BODY_BYTES));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Pure: bytes to rows, or why not.
+pub fn parse_run_spend(body: &[u8]) -> Result<Vec<RunSpendRow>, SeedError> {
+    serde_json::from_slice::<Vec<RunSpendRow>>(body)
+        .map_err(|e| SeedError::Malformed(e.to_string()))
+}
+
+/// Pure: turn `/v1/runs` rows into the pending seed map `AppState` will
+/// consult when each run is first opened in this process, and say what
+/// happened. A run named twice keeps its LAST row (the control plane does
+/// not send duplicates; a hostile body might, and last-writer-wins is the
+/// same rule `unit`/`owner` folding already uses elsewhere in this crate).
+pub fn apply_run_spend(rows: Vec<RunSpendRow>) -> (HashMap<String, Microusd>, RunSeedReport) {
+    let mut pending = HashMap::new();
+    let mut report = RunSeedReport::default();
+    for row in rows {
+        if row.run_id.trim().is_empty() || row.spent_microusd < 0 {
+            report.skipped_invalid += 1;
+            continue;
+        }
+        if row.killed {
+            report.skipped_killed += 1;
+            continue;
+        }
+        pending.insert(row.run_id.clone(), Microusd(row.spent_microusd));
+    }
+    report.seeded = pending
+        .iter()
+        .map(|(run, amount)| (run.clone(), amount.0))
+        .collect();
+    report.seeded.sort();
+    (pending, report)
+}
+
+/// The startup run-spend seed (invariant 70): fetch, parse, stage into
+/// `state`'s pending map, one line. Never refuses to start: every `Err` is
+/// one WARN and a gateway that seeds nothing, which is what every gateway
+/// did before this existed and is invariant 52's own posture applied to
+/// runs. Unlike the unit seed this is not gated on the identity map: every
+/// gateway tracks per-run budgets, with or without one.
+pub async fn seed_run_ledger(
+    base: &str,
+    key: &str,
+    state: &AppState,
+    now_millis: i64,
+) -> Result<RunSeedReport, SeedError> {
+    seed_run_ledger_within(base, key, state, now_millis, SEED_TIMEOUT).await
+}
+
+async fn seed_run_ledger_within(
+    base: &str,
+    key: &str,
+    state: &AppState,
+    now_millis: i64,
+    within: Duration,
+) -> Result<RunSeedReport, SeedError> {
+    let since_millis = now_millis - RUN_SEED_WINDOW_MILLIS;
+    let url = format!(
+        "{}/v1/runs?since_millis={}",
+        base.trim_end_matches('/'),
+        since_millis
+    );
+    let client = reqwest::Client::new();
+    let fetched =
+        match tokio::time::timeout(within, fetch_run_spend(&client, base, key, since_millis)).await
+        {
+            Ok(r) => r,
+            Err(_) => Err(SeedError::TimedOut(within)),
+        };
+    let result = fetched.and_then(|body| parse_run_spend(&body)).map(|rows| {
+        let (pending, report) = apply_run_spend(rows);
+        state.set_run_seed(pending);
+        report
+    });
+    match &result {
+        Ok(report) => {
+            let mut listed: Vec<String> = report
+                .seeded
+                .iter()
+                .take(32)
+                .map(|(r, s)| format!("{r}={s}"))
+                .collect();
+            if report.seeded.len() > 32 {
+                listed.push("...".to_string());
+            }
+            tracing::info!(
+                url = %url,
+                runs = report.seeded.len(),
+                seeded = %listed.join(" "),
+                skipped_invalid = report.skipped_invalid,
+                skipped_killed = report.skipped_killed,
+                "seeded pending run spend from the control plane: the next call on each of these \
+                 runs is checked against its Cloud-known spend plus whatever this gateway settles \
+                 from here on"
+            );
+        }
+        Err(e) => tracing::warn!(
+            url = %url,
+            reason = %e,
+            "pending run spend could not be seeded from the control plane: every run this \
+             gateway opens fresh starts its spend at zero until the next restart"
         ),
     }
     result
@@ -2038,6 +2228,264 @@ mod tests {
                     assert_ne!(u, "unassigned", "seed {i}b: unassigned seeded: {body_b}");
                     assert!(*s >= 0, "seed {i}b: negative seeded: {body_b}");
                     assert_eq!(ledger_b.spent(u, now), Microusd(*s), "seed {i}b: {body_b}");
+                }
+            }
+        }
+    }
+
+    // --- invariant 70: the run-spend seed, a stub /v1/runs -------------------
+
+    /// Answers `GET /v1/runs` (any query string) with `status` and `body`
+    /// verbatim, the run-seed twin of `stub_units`.
+    async fn stub_runs(status: u16, body: String) -> String {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/v1/runs",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A `/v1/runs` that never answers, for the seed's own timeout.
+    async fn stall_runs() -> String {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/v1/runs",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                axum::http::StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn run_row(run_id: &str, spent_microusd: i64, killed: bool) -> RunSpendRow {
+        RunSpendRow {
+            run_id: run_id.to_string(),
+            spent_microusd,
+            killed,
+        }
+    }
+
+    /// A no-op provider: none of the run-seed tests below dispatch a call, so
+    /// this stub only needs to exist to satisfy `AppState::new`'s type.
+    struct NeverCalledProvider;
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for NeverCalledProvider {
+        async fn send(
+            &self,
+            _headers: axum::http::HeaderMap,
+            _body: bytes::Bytes,
+        ) -> Result<crate::provider::ProviderResponse, crate::provider::ProviderError> {
+            panic!("run-seed tests never dispatch a call")
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(
+            Arc::new(tokenfuse_core::Ledger::new()),
+            Arc::new(tokenfuse_core::PriceBook::new()),
+            Arc::new(tokenfuse_core::Policy::default()),
+            Arc::new(NeverCalledProvider),
+            "test-policy",
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_run_spend_is_seeded_from_the_control_plane() {
+        let _g = log_lock();
+        clear_log();
+        let now = now_millis();
+        let body = r#"[{"run_id":"r-aws","spent_microusd":54700,"killed":false},{"run_id":"r-gcp","spent_microusd":980},{"run_id":"r-dead","spent_microusd":5,"killed":true}]"#;
+        let base = stub_runs(200, body.to_string()).await;
+        let state = test_state();
+        let report = seed_run_ledger(&base, "k", &state, now).await.unwrap();
+
+        assert_eq!(
+            report.seeded,
+            vec![("r-aws".to_string(), 54700), ("r-gcp".to_string(), 980)]
+        );
+        assert_eq!(report.skipped_killed, 1);
+        assert_eq!(report.skipped_invalid, 0);
+
+        assert_eq!(state.take_run_seed("r-aws"), Some(Microusd(54700)));
+        assert_eq!(state.take_run_seed("r-gcp"), Some(Microusd(980)));
+        assert_eq!(state.take_run_seed("r-dead"), None);
+        // Taken once already: gone now, exactly the "applies at most once"
+        // contract `take_run_seed` exists for.
+        assert_eq!(state.take_run_seed("r-aws"), None);
+
+        let log = log_text();
+        let seeded_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("INFO") && l.contains("seeded pending run spend"))
+            .collect();
+        assert_eq!(seeded_lines.len(), 1, "{log}");
+        assert!(seeded_lines[0].contains("runs=2"), "{}", seeded_lines[0]);
+        assert!(
+            seeded_lines[0].contains("r-aws=54700"),
+            "{}",
+            seeded_lines[0]
+        );
+        assert!(
+            seeded_lines[0].contains("skipped_killed=1"),
+            "{}",
+            seeded_lines[0]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_control_plane_that_cannot_be_reached_seeds_no_runs_and_warns_once() {
+        let _g = log_lock();
+        clear_log();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let now = now_millis();
+        let state = test_state();
+        let result = seed_run_ledger(&format!("http://{addr}"), "k", &state, now).await;
+        assert!(matches!(result, Err(SeedError::Transport(_))), "{result:?}");
+        assert_eq!(state.take_run_seed("anything"), None);
+        let log = log_text();
+        let warns: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("pending run spend could not be seeded"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_seed_that_does_not_answer_in_time_seeds_nothing() {
+        let _g = log_lock();
+        clear_log();
+        let base = stall_runs().await;
+        let now = now_millis();
+        let state = test_state();
+        let result =
+            seed_run_ledger_within(&base, "k", &state, now, Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(SeedError::TimedOut(_))), "{result:?}");
+        assert_eq!(state.take_run_seed("anything"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_seed_that_the_control_plane_refuses_seeds_nothing() {
+        let now = now_millis();
+        for status in [403u16, 404] {
+            let _g = log_lock();
+            clear_log();
+            let base = stub_runs(status, "{}".to_string()).await;
+            let state = test_state();
+            let result = seed_run_ledger(&base, "k", &state, now).await;
+            assert!(
+                matches!(result, Err(SeedError::Status(s)) if s == status),
+                "{result:?}"
+            );
+            assert_eq!(state.take_run_seed("anything"), None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runs_body_that_is_not_json_seeds_nothing() {
+        let now = now_millis();
+        for body in ["not json", r#"{"runs":[]}"#] {
+            let _g = log_lock();
+            clear_log();
+            let base = stub_runs(200, body.to_string()).await;
+            let state = test_state();
+            let result = seed_run_ledger(&base, "k", &state, now).await;
+            assert!(
+                matches!(result, Err(SeedError::Malformed(_))),
+                "{body}: {result:?}"
+            );
+            assert_eq!(state.take_run_seed("anything"), None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_no_cloud_row_is_never_seeded() {
+        let now = now_millis();
+        let base = stub_runs(
+            200,
+            r#"[{"run_id":"r-aws","spent_microusd":1}]"#.to_string(),
+        )
+        .await;
+        let state = test_state();
+        seed_run_ledger(&base, "k", &state, now).await.unwrap();
+        assert_eq!(state.take_run_seed("r-never-called"), None);
+    }
+
+    #[test]
+    fn a_negative_or_blank_run_id_is_refused_as_hostile() {
+        let (pending, report) = apply_run_spend(vec![
+            run_row("r-aws", -5, false),
+            run_row("", 1, false),
+            run_row("  ", 1, false),
+        ]);
+        assert_eq!(report.skipped_invalid, 3);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_killed_run_is_never_seeded() {
+        let (pending, report) = apply_run_spend(vec![run_row("r-dead", 500, true)]);
+        assert_eq!(report.skipped_killed, 1);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_runs_body_is_refused_before_it_is_parsed() {
+        let _g = log_lock();
+        clear_log();
+        let now = now_millis();
+        let body = " ".repeat(RUN_SEED_MAX_BODY_BYTES + 1);
+        let base = stub_runs(200, body).await;
+        let state = test_state();
+        let result = seed_run_ledger(&base, "k", &state, now).await;
+        assert!(
+            matches!(result, Err(SeedError::BodyTooLarge(n)) if n == RUN_SEED_MAX_BODY_BYTES),
+            "{result:?}"
+        );
+    }
+
+    /// A body the control plane never wrote. Same discipline as
+    /// `hostile_units_bodies_never_panic_and_never_seed`: the seed must
+    /// never panic and must never stage a blank run_id or a negative figure.
+    #[test]
+    fn hostile_runs_bodies_never_panic_and_never_seed() {
+        for i in 0..200u64 {
+            let mut x = i;
+            let mut next = || {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                x
+            };
+            let len = (next() % 512) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() % 256) as u8).collect();
+            if let Ok(rows) = parse_run_spend(&bytes) {
+                let (pending, _report) = apply_run_spend(rows);
+                for (run, amount) in &pending {
+                    assert!(!run.trim().is_empty(), "seed {i}: blank run_id staged");
+                    assert!(amount.0 >= 0, "seed {i}: negative amount staged");
                 }
             }
         }

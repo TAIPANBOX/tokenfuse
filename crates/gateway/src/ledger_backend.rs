@@ -67,6 +67,22 @@ pub trait LedgerBackend: Send + Sync {
     /// Settle a reservation with its actual cost. Fire-and-forget: no result,
     /// callable from a non-async `Drop`.
     fn settle(&self, reservation: &Reservation, actual: Microusd);
+
+    /// Seed a run's committed spend from the Cloud control plane before its
+    /// first admission in this process (invariant 70), the run-level twin of
+    /// `UnitLedger::seed_month`. `true` only if it actually applied: the run
+    /// must be open and must have neither spend nor a reservation here yet.
+    ///
+    /// The `cluster` (raft) backend does not implement this: seeding a
+    /// replicated run's `spent` from a value the state machine never
+    /// computed is a schema-identity decision of its own (see this file's
+    /// top-of-file note on invariant 5), not one this change makes. A
+    /// gateway running the HA backend keeps today's behaviour: every run
+    /// starts its spend at zero after a restart. Named rather than silent,
+    /// the same posture invariant 49's own text already takes for that
+    /// backend ("compiled out of every shipped image"; `stack-k8s` and
+    /// `stack-single` never build the `cluster` feature in).
+    async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool;
 }
 
 /// The default in-process backend: a thin async wrapper over the sync `Ledger`.
@@ -111,5 +127,9 @@ impl LedgerBackend for LocalLedger {
                 "settle ignored: not outstanding"
             );
         }
+    }
+
+    async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
+        self.0.seed_spend(run_id, amount, generation)
     }
 }

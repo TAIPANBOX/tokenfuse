@@ -533,6 +533,35 @@ impl Ledger {
         Settlement::Applied { links, dropped }
     }
 
+    /// Seed a run's committed spend from an external source (the Cloud
+    /// control plane, invariant 70), added to what this process has already
+    /// recorded for the SAME generation of the run: `generation` is the one
+    /// `open_run` returned to the caller, so a run closed and reopened since
+    /// is left alone. Applying at most once is the caller's job and it holds
+    /// it by construction: the seed is taken out of the gateway's seed map
+    /// (`take_run_seed`) by exactly one request. It deliberately does NOT
+    /// require the run to be untouched: two first requests after a restart
+    /// race, and the one that did not open the run may reserve before the
+    /// opener credits; refusing then dropped the seed and the run restarted
+    /// from zero, the defect this exists to close (measured by
+    /// `a_seed_survives_a_reservation_another_request_made_first`). A
+    /// negative amount is refused (hostile input, mirrors
+    /// `UnitLedger::seed_month`). Never creates a run.
+    pub fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
+        if amount < Microusd::ZERO {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(s) = inner.runs.get_mut(run_id) else {
+            return false;
+        };
+        if s.closed || s.generation != generation {
+            return false;
+        }
+        s.spent = Microusd(s.spent.0.saturating_add(amount.0));
+        true
+    }
+
     /// Snapshot a run's accounting state. Closed runs are included, with
     /// their final figures, until the next `open_run` reopens them.
     pub fn snapshot(&self, run_id: &str) -> Option<RunSnapshot> {
@@ -630,6 +659,137 @@ mod tests {
         assert_eq!(after.reserved, Microusd::ZERO);
         assert_eq!(after.spent, usd(0.8));
         assert_eq!(after.remaining(), usd(4.2));
+    }
+
+    // --- invariant 70: seeding a run's spend before its first admission ---
+
+    #[test]
+    fn seed_spend_applies_to_a_fresh_open_run() {
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(5.0), None)
+            .expect("opens")
+            .generation;
+        assert!(ledger.seed_spend("r1", usd(2.0), g));
+        let snap = ledger.snapshot("r1").unwrap();
+        assert_eq!(snap.spent, usd(2.0));
+        assert_eq!(snap.reserved, Microusd::ZERO);
+    }
+
+    #[test]
+    fn seed_spend_is_a_noop_on_a_run_this_ledger_never_opened() {
+        let ledger = Ledger::new();
+        assert!(!ledger.seed_spend("ghost", usd(2.0), 1));
+        assert!(ledger.snapshot("ghost").is_none());
+    }
+
+    #[test]
+    fn a_seed_for_a_generation_that_has_been_closed_or_reopened_is_refused() {
+        let ledger = Ledger::new();
+        let g1 = ledger
+            .open_run("r1", usd(5.0), None)
+            .expect("opens")
+            .generation;
+        ledger.close_run("r1");
+        assert!(
+            !ledger.seed_spend("r1", usd(2.0), g1),
+            "a closed run takes no seed"
+        );
+        let g2 = ledger
+            .open_run("r1", usd(5.0), None)
+            .expect("reopens")
+            .generation;
+        assert_ne!(g1, g2);
+        assert!(
+            !ledger.seed_spend("r1", usd(2.0), g1),
+            "a stale generation takes no seed"
+        );
+        assert_eq!(ledger.snapshot("r1").unwrap().spent, Microusd::ZERO);
+        assert!(ledger.seed_spend("r1", usd(2.0), g2));
+    }
+
+    #[test]
+    fn a_seed_survives_a_reservation_another_request_made_first() {
+        // Two first requests for one run after a restart: the one that opened
+        // it has not credited the seed yet when the other one reserves. The
+        // seed must still land, or the run restarts from zero: the defect.
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(1.0), None)
+            .expect("opens")
+            .generation;
+        let res = ledger.reserve("r1", usd(0.1)).unwrap();
+        assert!(ledger.seed_spend("r1", usd(0.9), g));
+        ledger.settle(&res, usd(0.1));
+        assert_eq!(ledger.snapshot("r1").unwrap().spent, usd(1.0));
+        assert!(
+            ledger.reserve("r1", usd(0.01)).is_err(),
+            "seed + local spend is the whole budget"
+        );
+    }
+
+    #[test]
+    fn a_seed_adds_to_spend_already_settled_in_the_same_generation() {
+        // The other first request reserved AND settled before the opener
+        // credited: the seed is added to that, never written over it.
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(1.0), None)
+            .expect("opens")
+            .generation;
+        let res = ledger.reserve("r1", usd(0.1)).unwrap();
+        ledger.settle(&res, usd(0.1));
+        assert!(ledger.seed_spend("r1", usd(0.9), g));
+        assert_eq!(ledger.snapshot("r1").unwrap().spent, usd(1.0));
+    }
+
+    #[test]
+    fn seed_spend_refuses_a_negative_amount() {
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(5.0), None)
+            .expect("opens")
+            .generation;
+        assert!(!ledger.seed_spend("r1", Microusd(-1), g));
+        assert_eq!(ledger.snapshot("r1").unwrap().spent, Microusd::ZERO);
+    }
+
+    #[test]
+    fn a_run_seeded_at_or_over_its_budget_refuses_its_very_next_reservation() {
+        // The money property this whole feature exists for: a gateway
+        // restarted with the Cloud reporting a run already at or past its
+        // budget must refuse that run's next call, not silently admit it
+        // because the fresh in-process ledger reads spent as zero.
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(1.0), None)
+            .expect("opens")
+            .generation;
+        assert!(ledger.seed_spend("r1", usd(1.0), g));
+        let err = ledger.reserve("r1", usd(0.01)).unwrap_err();
+        match err {
+            BudgetError::Exceeded { spent, budget, .. } => {
+                assert_eq!(spent, usd(1.0));
+                assert_eq!(budget, usd(1.0));
+            }
+            other => panic!("expected Exceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_seeded_under_its_budget_admits_and_adds_on_top_without_double_counting() {
+        let ledger = Ledger::new();
+        let g = ledger
+            .open_run("r1", usd(5.0), None)
+            .expect("opens")
+            .generation;
+        assert!(ledger.seed_spend("r1", usd(3.0), g));
+        let res = ledger.reserve("r1", usd(1.0)).unwrap();
+        ledger.settle(&res, usd(1.0));
+        let snap = ledger.snapshot("r1").unwrap();
+        // 3.0 seeded + 1.0 settled here, exactly once each, never summed twice.
+        assert_eq!(snap.spent, usd(4.0));
+        assert_eq!(snap.reserved, Microusd::ZERO);
     }
 
     #[test]

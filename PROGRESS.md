@@ -304,9 +304,11 @@ comparison in #132.
 
 **Counts re-measured 2026-09-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1559 passing** (core 364, dpop 21, delegation 60,
-gateway 865, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
+`cargo test --all` runs **1582 passing** (core 372, dpop 21, delegation 60,
+gateway 880, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Core and gateway
+grew with invariant 70 (a restarted gateway seeds each run's spend from the
+Cloud before its first admission, tokenfuse#346). Gateway grew by
 seven (invariant 69, tokenfuse#342's credential-leak fix): a DPoP-scheme
 delegation credential presented as `Authorization: DPoP <token>` reached the
 upstream provider unchanged, because `HttpProvider::send`'s
@@ -333,7 +335,26 @@ seven more (invariant 68): `proxy::tests::a_refused_delegation_token_is_not_told
 and `proxy::tests::a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause`
 in the lib suite, `tests/mcp_broker.rs::a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential`,
 and the four in `tests/delegation_htu_matches_wire.rs` - see invariant 68 for
-the red-first evidence. Gateway also grew by
+the red-first evidence. Core grew by six and gateway by fifteen more
+(invariant 70, tokenfuse#341's sibling: the gateway now seeds pending
+per-run spend from the Cloud at startup, the run-level twin of invariant
+52's unit seed): six in `ledger::tests`
+(`seed_spend_applies_to_a_fresh_open_run`,
+`seed_spend_is_a_noop_on_a_run_this_ledger_never_opened`,
+`seed_spend_never_applies_once_the_run_has_spent_or_reserved_here`,
+`seed_spend_refuses_a_negative_amount`,
+`a_run_seeded_at_or_over_its_budget_refuses_its_very_next_reservation`,
+`a_run_seeded_under_its_budget_admits_and_adds_on_top_without_double_counting`);
+ten in `cloudsink::tests` for the `/v1/runs` fetch/parse/apply/stage pipeline;
+and five in `proxy::tests`
+(`a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget`,
+red first, `left: 200 right: 402` against the unfixed proxy;
+`a_restarted_gateway_admits_a_run_the_cloud_reported_comfortably_under_budget`,
+`seeded_spend_and_two_later_settlements_add_exactly_once_each`,
+`a_run_with_no_matching_seed_is_unaffected`,
+`a_cloud_budget_parent_opened_on_first_sight_is_also_seeded`) - see
+invariant 70 for the red-first evidence and the three mutants. Gateway also
+grew by
 eleven more (invariant 66, tokenfuse#296's heartbeat half): five in
 `cloudsink::tests` pinning `cloud_heartbeat_seconds_from`'s parsing
 (`cloud_heartbeat_default_when_unset_or_empty`, `cloud_heartbeat_zero_is_off`,
