@@ -156,7 +156,13 @@ fn codex_held_seeded_integer_arithmetic_matches_i128_oracle() {
             cache_write_1h_tokens: n / 11,
             ..Default::default()
         };
-        let oracle = [
+        // Invariant 67: the sum of the five raw numerators is divided once,
+        // rounding up on a positive remainder, rather than each part being
+        // floored and divided on its own before the sum (this oracle floored
+        // per part until 2026-09-27, which is the same under-charge the fix
+        // closes: encoding the defect into the oracle that is meant to catch
+        // it).
+        let numerator: i128 = [
             (u.input_tokens, 3_000_000i128),
             (u.output_tokens, 15_000_000),
             (u.cache_read_tokens, 300_000),
@@ -164,9 +170,10 @@ fn codex_held_seeded_integer_arithmetic_matches_i128_oracle() {
             (u.cache_write_1h_tokens, 6_000_000),
         ]
         .into_iter()
-        .map(|(n, p)| i128::from(n) * p / 1_000_000)
-        .sum::<i128>()
-        .min(i64::MAX as i128) as i64;
+        .map(|(n, p)| i128::from(n) * p)
+        .sum();
+        let (q, r) = (numerator / 1_000_000, numerator % 1_000_000);
+        let oracle = (if r > 0 { q + 1 } else { q }).min(i64::MAX as i128) as i64;
         assert_eq!(p.cost(&u), Microusd(oracle), "pricing oracle case {case}");
         let a = seed as i64;
         let b = seed.rotate_left(17) as i64;

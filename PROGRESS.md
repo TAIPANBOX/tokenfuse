@@ -302,11 +302,26 @@ comparison in #132.
 
 ## Test status
 
-**Counts re-measured 2026-09-26**, each by the command named, because the set
+**Counts re-measured 2026-09-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1540 passing** (core 359, dpop 21, delegation 60,
+`cargo test --all` runs **1545 passing** (core 364, dpop 21, delegation 60,
 gateway 851, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
+states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by five
+more (invariant 67, tokenfuse#341's rounding fix): `crates/core/src/pricing.rs`'s
+`ModelPrice::cost` summed each of five priced parts to `i64` and floored it
+before adding the parts together, so a call with a fractional micro-USD
+anywhere in it was under-charged by up to just under one micro-USD per part -
+measured on a live cluster as a real `gpt-4o-mini` call (13 input, 2 completion
+tokens) priced at 2 micro-USD where the exact figure is 3.15. The fix sums the
+five raw numerators in `i128` and rounds the total once, toward
+over-charging. New tests:
+`the_measured_gpt_4o_mini_call_ceils_to_four_micro_usd_not_two` (red against
+the unfixed code, `left: 2 right: 4`),
+`a_call_whose_every_part_divides_exactly_rounds_nothing`,
+`two_inexact_parts_that_sum_to_a_whole_micro_usd_round_only_once` (red
+against the unfixed code, `left: 0 right: 1`),
+`every_one_of_the_five_priced_parts_is_summed`, and
+`a_large_multi_part_case_sums_exactly_with_no_overflow`. Gateway grew by
 eleven more (invariant 66, tokenfuse#296's heartbeat half): five in
 `cloudsink::tests` pinning `cloud_heartbeat_seconds_from`'s parsing
 (`cloud_heartbeat_default_when_unset_or_empty`, `cloud_heartbeat_zero_is_off`,
