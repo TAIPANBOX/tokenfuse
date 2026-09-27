@@ -4231,3 +4231,115 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     human or a future detector would have to read. And a stolen site key can
     still push arbitrary telemetry as that site, same as any other credential
     compromise this repository has not solved.
+
+66. **A quiet gateway still says it is alive.** Measured 2026-09-26 on a
+    two-site run (a GCP hub and a site at home): invariant 65 gave the Cloud
+    `GET /v1/gateways` with `last_push_millis` set by the Cloud's own clock,
+    and the Cloud already counts an empty push as a heartbeat. But
+    `CloudSink` (`crates/gateway/src/cloudsink.rs`) only ever pushed when it
+    had records, so an idle but healthy site and a dead site looked identical
+    once both had been quiet for five minutes - `pushes=2` after two bursts
+    of calls and nothing at all between them.
+
+    `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` (default 30, `0` off, read once at
+    startup by `cloud_heartbeat_seconds_from_env`, only when a Cloud is
+    configured, the same condition that builds a `CloudSink` at all) drives a
+    background task, `CloudSink::spawn_heartbeat`, that POSTs
+    `{"records": []}` to `{base}/v1/ingest` with the same key and the same
+    push timeout whenever a whole interval has passed since anything reached
+    the Cloud with an HTTP answer - accepted or refused, either counts.
+    `Pusher::post` marks the shared clock (an `Arc<AtomicI64>` of millis since
+    a fixed `Instant`, so the request path never reads the wall clock) the
+    moment an answer comes back, whether the push was a real batch, a
+    heartbeat, or one popped off the retry queue by the drainer; a push of
+    real records therefore resets the clock exactly like a heartbeat would,
+    so under traffic no heartbeat is ever sent.
+
+    **The interval is the period, not half of it.** The task sleeps until
+    exactly one interval after the Cloud last answered, never to the next
+    beat of a fixed ticker. The first version ticked every interval and asked
+    "has a whole interval passed?"; the heartbeat's own answer lands a few
+    hundred milliseconds after the tick that sent it, so the next tick found
+    29.7 s of 30 and skipped, and the real period doubled. Measured live on
+    2026-09-27 through the hub entry (stack-k8s `53-hub-entry.yaml`) on a GCP
+    hub with the home site idle: `pushes` rose by one a minute and
+    `last_push` reached 59 s under the 30 s default. No test had caught it,
+    because every test waited for "at least one" heartbeat.
+
+    **A misconfigured value is the default, not a guess, and a small one is
+    clamped rather than trusted.** Unset or empty is 30; a value that does
+    not parse as a non-negative integer at all is 30 with one warn line
+    naming it, the same "say so, do not guess" posture `defaults.rs` already
+    holds for `TOKENFUSE_CACHE` and `TOKENFUSE_TOOLS_PRUNE` (invariants 61,
+    63). A positive value under 5 seconds is clamped up to 5, also with one
+    warn line, so a typo (`3` meant to be `30`) cannot turn a liveness signal
+    into a way to hammer the control plane; `0` is the one value that means
+    off, and it is trusted as written; it is not a "value below the minimum".
+
+    **A heartbeat is never queued and never replayed, and that is the
+    invariant's other half.** invariant 53's retry queue exists so a real
+    batch survives an outage and lands once the plane is reachable again; a
+    heartbeat is the opposite kind of fact, a statement about THIS instant,
+    and replaying an old one after an outage would make a site that was
+    genuinely down for an hour read as having been alive throughout it - the
+    exact lie a heartbeat exists to prevent. So a failed heartbeat is simply
+    lost: `maybe_heartbeat` never touches `Queue`, and a transport error on
+    it is at most a `debug!` line, since the queue's own once-per-outage
+    warning already tells the operator the control plane cannot be reached.
+    A refused heartbeat (a non-2xx status) DOES go through the ordinary
+    `report_refusal` path, so it warns once per distinct status exactly as a
+    refused real batch does (invariant 13) - a refusal is a fact about this
+    key and this plane, not about this instant, and hiding it because the
+    push happened to carry no records would be the same silence invariant 13
+    already closed.
+
+    **The drain proves liveness on its own, so a heartbeat during one would
+    be a redundant, racing answer to the same question.** While the retry
+    queue is holding anything, `maybe_heartbeat` returns without attempting a
+    push at all: the drainer is already telling the control plane this
+    gateway is here, and a heartbeat racing it could arrive out of order with
+    the batch the drainer is trying to land.
+
+    `@decided 2026-09-26`: a site's liveness must be visible on its own,
+    never only as a side effect of it having something to report.
+
+    `@claude` 2026-09-26, what this does not do: it is an interval, not a
+    real-time signal, so a genuinely dead site is indistinguishable from a
+    healthy one for up to one heartbeat interval after it dies; it proves the
+    gateway PROCESS and its network path to the Cloud, never that the agents
+    behind it are doing anything useful; and, like invariant 65's own
+    boundary, nothing here pages anybody when a site's `last_push_millis`
+    stops moving - there is still no `run_stalled`-shaped detector (invariant
+    60) for a gateway itself, only a number on `GET /v1/gateways` a human or
+    a future detector would have to read.
+    *(tests, `gateway::cloudsink`: `cloud_heartbeat_default_when_unset_or_empty`,
+    `cloud_heartbeat_zero_is_off`, `cloud_heartbeat_junk_is_the_default`,
+    `cloud_heartbeat_small_positive_values_clamp_to_the_minimum`,
+    `cloud_heartbeat_thirty_is_thirty` for the parser;
+    `an_idle_gateway_sends_a_heartbeat`,
+    `an_idle_gateway_heartbeats_once_per_interval`,
+    `a_gateway_with_traffic_sends_no_heartbeat`,
+    `a_failed_heartbeat_is_never_queued`, `no_heartbeat_while_the_queue_drains`
+    and `heartbeats_off_when_zero` for the behaviour.
+    `an_idle_gateway_heartbeats_once_per_interval` was red against the
+    ticker: 3 heartbeats in 5.5 intervals where it requires at least 4. Red first against a
+    no-op parser (always returning the default) and a no-op `maybe_heartbeat`
+    (returning without posting): `cloud_heartbeat_zero_is_off` read
+    `left: 30 right: 0`, `cloud_heartbeat_small_positive_values_clamp_to_the_minimum`
+    read `left: 30 right: 5`, `cloud_heartbeat_thirty_is_thirty` read
+    `left: 30 right: 60`, and `an_idle_gateway_sends_a_heartbeat` and
+    `a_failed_heartbeat_is_never_queued` each timed out waiting for a push
+    that never came. `cloud_heartbeat_junk_is_the_default` and
+    `cloud_heartbeat_default_when_unset_or_empty` pass under that same
+    no-op parser, as does `a_gateway_with_traffic_sends_no_heartbeat` and
+    `heartbeats_off_when_zero` under the no-op heartbeat: each is a guard
+    the way this file already uses the term, asserting a property that
+    holds vacuously under the simplest wrong implementation and is worth
+    pinning anyway so a later change cannot reintroduce the fault
+    unnoticed. `no_heartbeat_while_the_queue_drains` calls
+    `maybe_heartbeat` directly with the clock forced stale and a record
+    already queued, so it needs no timing race and is deterministic by
+    construction. Scenarios:
+    `features/a-quiet-gateway-still-says-it-is-alive.feature`, seven, each
+    bound. Not a script gate: the rule is `CloudSink::maybe_heartbeat`'s own
+    code, held by `cargo test`.)*

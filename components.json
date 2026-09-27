@@ -86,6 +86,10 @@
           "TOKENFUSE_CLIENT_KEYS": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_HEARTBEAT_SECONDS": {
+            "required": false,
+            "default": "30"
+          },
           "TOKENFUSE_DATA_DIR": {
             "required": false
           },

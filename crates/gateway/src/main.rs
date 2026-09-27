@@ -1231,6 +1231,12 @@ async fn serve() {
                 tokenfuse_gateway::cloudsink::CloudSink::new(base, key)
                     .with_unit_owners(state.identity.unit_owners()),
             );
+            // A gateway with nothing to say still says it is alive (invariant
+            // 66): otherwise an idle but healthy site and a dead one both go
+            // quiet on GET /v1/gateways once neither has pushed for a while.
+            // TOKENFUSE_CLOUD_HEARTBEAT_SECONDS, default 30, 0 turns it off.
+            let heartbeat_secs = tokenfuse_gateway::cloudsink::cloud_heartbeat_seconds_from_env();
+            cloud.spawn_heartbeat(std::time::Duration::from_secs(heartbeat_secs));
             // Periodic flush so telemetry ships promptly, not only once a batch fills.
             let flusher = cloud.clone();
             tokio::spawn(async move {
