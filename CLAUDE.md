@@ -4590,3 +4590,149 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `features/a-delegation-credential-never-reaches-a-provider.feature`,
     seven, each bound. Not a script gate: the rule is
     `HttpProvider::send`'s own copy loop, held by `cargo test`.)*
+
+70. **A restarted gateway remembers what a run has already spent, not only
+    what a unit has.** Invariant 52 seeds the per-unit month from the Cloud at
+    startup; the per-run ledger stayed unseeded, so every restart silently
+    reset every run's budget accounting to zero, regardless of what the Cloud
+    already knew. Measured 2026-09-27 on the forge k3d lab (v1.4.0): run
+    `genaryx-copilot` had a Cloud budget of USD 0.05 and USD 0.0547 spent in
+    the Cloud (109%), and a gateway restarted earlier that day kept answering
+    it; lowering the budget to USD 0.001 then answered `spent_usd:
+    0.029466`, exactly the spend since that restart. A run's budget is only
+    as real as the gateway's memory of what it has already cost, and a
+    restart erased that memory while the Cloud's own figure sat one HTTP call
+    away.
+
+    **The shape mirrors invariant 52's, at the run level rather than the
+    unit level, and the differences are load-bearing.** A unit's cap and its
+    spend are two independent things (`UnitLedger::effective_cap` reads a
+    separate map from `seed_month`'s state), so seeding spend into an
+    existing state map at startup is enough. A run's `RunState` has no such
+    split: `Ledger::open_run` creates it, budget and zero spend together, and
+    every later call to `open_run` for that same run_id (`Shape::Open`)
+    updates only budget and parent, never spend. So a run cannot be seeded
+    before it exists, and it does not exist until this process's first
+    request for it arrives, which is also too late to seed synchronously
+    before the listener binds the way the unit seed does.
+
+    The fix is therefore two pieces instead of one. `cloudsink::seed_run_ledger`
+    still runs once, synchronously, before the listener binds: one `GET
+    /v1/runs?since_millis=<now - 24h>` (Cloud's own windowing, invariant 65's
+    sibling endpoint; the window is a boundary decision below), the body
+    bounded the same way the unit seed's is (`RUN_SEED_MAX_BODY_BYTES`, 4
+    MiB), building a pending map (`AppState.run_seed`, replace-all like
+    `cloud_budgets`) of run_id to Cloud-known spend, skipping a killed run (no
+    next call to seed for), a blank run_id or a negative figure (hostile
+    input). Then, in `proxy::handle`, at the exact point a run is opened
+    FRESH in this process (checked by reading `st.ledger.snapshot(&run_id)`
+    for `None` immediately BEFORE calling `open_run`, since after that call
+    every run has a zero-spend snapshot and "just created" and "already open,
+    called again" become indistinguishable), `credit_run_seed_if_any` takes
+    the pending entry (removing it, so it can apply at most once even under
+    a race between two first requests for the same run_id) and credits it via
+    a new `Ledger::seed_spend`, which itself refuses to apply unless the
+    run's spent AND reserved are still exactly zero, a second, independent
+    guard against ever crediting on top of this process's own activity. This
+    happens before the budget gate reads the run's spend, so the very first
+    call after a restart is checked against the seed, not against zero
+    (invariant 42's own admission predicate, `exceeds`, is untouched: it
+    always read `spent + reserved + estimate`, and seeding simply gives
+    `spent` its true starting value before that predicate is ever asked).
+    The parent-opened-on-first-sight path (D1's exception, invariant 49) gets
+    the identical treatment at its own call site, since a parent opened from
+    its Cloud budget is exactly as fresh as any other never-before-seen run.
+
+    **Why this cannot double-count against telemetry still queued and not
+    yet delivered.** The seed is fetched once, synchronously, before any
+    request is served, so at the moment it is fetched this process's own
+    ledger is empty: there is nothing for the Cloud's figure to be added on
+    top of except zero. A prior process's spend that reached the Cloud before
+    it restarted or crashed is exactly what should be credited once; spend
+    that was still sitting in that prior process's `CloudSink` queue
+    (invariant 53) when it died is lost with the queue, so the Cloud's figure
+    can only be stale LOW for that window, never double-counted high. Nothing
+    after startup re-fetches or re-applies the seed, so there is no second
+    window in which the same Cloud figure could be added again.
+
+    **Scope, decided rather than assumed honest.** Every run in the window is
+    seeded, not only those with a Cloud-managed budget: a client-supplied
+    budget run accumulates real spend in the Cloud's telemetry too, and the
+    measured defect is general, not specific to centrally-managed budgets.
+    The 24-hour window is a recency bound, not a completeness one: a run this
+    gateway would still enforce is one a caller can still call, which means
+    it called recently, and a run quiet for a day is over: seeding it spends
+    a pending-map slot no call will ever consume. Startup only, never
+    periodic: a periodic re-seed would have to reconcile against this
+    process's own settles in between, which is exactly the double-counting
+    risk invariant 52 avoids by seeding once, before serving.
+
+    **The raft (`cluster`) backend does not implement this.** `LedgerBackend::seed_spend`
+    is a new trait METHOD, which the trait's own top-of-file note says needs
+    none of invariant 5's schema-identity discipline: it fails to compile
+    until both backends implement it, and `RaftLedger::seed_spend` is a
+    deliberate, named no-op (`false`), always. A gateway running HA keeps
+    today's behaviour, spend at zero after a restart, an accepted gap since
+    the `cluster` feature is compiled out of every shipped image (invariant
+    49's own text already takes this posture for the same backend).
+    *(test: `ledger::tests::seed_spend_applies_to_a_fresh_open_run`,
+    `seed_spend_is_a_noop_on_a_run_this_ledger_never_opened`,
+    `seed_spend_never_applies_once_the_run_has_spent_or_reserved_here`,
+    `seed_spend_refuses_a_negative_amount`,
+    `a_run_seeded_at_or_over_its_budget_refuses_its_very_next_reservation`,
+    `a_run_seeded_under_its_budget_admits_and_adds_on_top_without_double_counting`;
+    `cloudsink::tests::pending_run_spend_is_seeded_from_the_control_plane`,
+    `a_control_plane_that_cannot_be_reached_seeds_no_runs_and_warns_once`,
+    `a_run_seed_that_does_not_answer_in_time_seeds_nothing`,
+    `a_run_seed_that_the_control_plane_refuses_seeds_nothing`,
+    `a_runs_body_that_is_not_json_seeds_nothing`,
+    `a_run_with_no_cloud_row_is_never_seeded`,
+    `a_negative_or_blank_run_id_is_refused_as_hostile`,
+    `a_killed_run_is_never_seeded`,
+    `an_oversized_runs_body_is_refused_before_it_is_parsed`,
+    `hostile_runs_bodies_never_panic_and_never_seed` (200 seeds);
+    `proxy::tests::a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget`,
+    `a_restarted_gateway_admits_a_run_the_cloud_reported_comfortably_under_budget`,
+    `seeded_spend_and_two_later_settlements_add_exactly_once_each`,
+    `a_run_with_no_matching_seed_is_unaffected`,
+    `a_cloud_budget_parent_opened_on_first_sight_is_also_seeded`. Red first,
+    @measured `cargo test -p tokenfuse-gateway --lib` against the unfixed
+    proxy (the two `credit_run_seed_if_any` call sites removed) 2026-09-27:
+    `a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget`
+    panicked `assertion `left == right` failed: seeded spend is already 109%
+    of budget; any nonzero estimate must be refused, left: 200 right: 402`
+    (the call that must be refused was admitted), and
+    `a_cloud_budget_parent_opened_on_first_sight_is_also_seeded` panicked
+    `left: Microusd(10500) right: Microusd(11500)` (the parent's seed never
+    landed). Every other new test names an API this change adds (`seed_spend`,
+    `AppState.run_seed`, `seed_run_ledger`) and is red by compile against the
+    unfixed tree. Three mutants planted in the product code 2026-09-27 and
+    reverted, each caught by name: the two `credit_run_seed_if_any` call
+    sites commented out (seed ignored entirely), caught by
+    `a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget`
+    and `a_cloud_budget_parent_opened_on_first_sight_is_also_seeded`;
+    `Ledger::seed_spend`'s freshness guard removed (a seed could land on top
+    of this process's own spend or reservation, adding rather than
+    replacing-from-zero, or applying twice), caught by
+    `seed_spend_never_applies_once_the_run_has_spent_or_reserved_here`; and
+    the seed credited AFTER the budget gate instead of before it (the seed
+    exists but arrives too late for the very first call to see), caught by
+    `a_restarted_gateway_refuses_a_run_the_cloud_reported_already_at_its_budget`
+    reading `left: 200 right: 402` again. Scenarios:
+    `features/a-restarted-gateway-remembers-run-spend.feature`, eight, each
+    bound. Not a script gate: the rule is `proxy::handle`'s own call sites and
+    `Ledger::seed_spend`'s guard, held by `cargo test`.)*
+
+    **Where it says nothing.** A run closed and then reopened within the SAME
+    process loses its seed opportunity: `open_run`'s `Shape::Closed` branch
+    resets spend to zero on reopen, but the pre-open snapshot read (taken
+    before `open_run` runs, to decide freshness) still sees the run's OLD,
+    non-empty snapshot from before it closed, so `run_is_fresh` reads false
+    and the pending seed, if never consumed, sits unused for a run_id that
+    will never ask for it again in this process's lifetime. This is narrow
+    (closing a run mid-process is not the ordinary path) and named rather
+    than fixed here. The parent-opened-on-first-sight seeding path is
+    unit-tested but not measured against a live Cloud the way the appliance
+    run measured the unit seed. And exactly as invariant 52's own text says
+    of the unit seed: startup only, no refresh, no retry; a Cloud unreachable
+    at startup leaves every run's seed unstaged until the next restart.

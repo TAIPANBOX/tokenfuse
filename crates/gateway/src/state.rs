@@ -89,6 +89,12 @@ pub struct AppState {
     /// Per-run budgets pushed from the Cloud control plane (override the
     /// client-supplied budget). Empty unless cloud mode is on.
     cloud_budgets: Arc<Mutex<HashMap<String, Microusd>>>,
+    /// Per-run committed spend fetched from the Cloud control plane at
+    /// startup (invariant 70), consumed exactly once per run: the first time
+    /// a run is opened fresh in this process, `take_run_seed` removes its
+    /// entry and the caller credits it via `LedgerBackend::seed_spend`.
+    /// Empty unless cloud mode is on; never repopulated after startup.
+    run_seed: Arc<Mutex<HashMap<String, Microusd>>>,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
@@ -552,6 +558,7 @@ impl AppState {
             killed: Arc::new(Mutex::new(HashSet::new())),
             taint: Arc::new(TaintStore::default()),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
+            run_seed: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventExporter::disabled()),
             agent_id_mode: crate::agentids::AgentIdMode::default(),
             client_keys: Arc::new(ClientKeys::default()),
@@ -599,6 +606,20 @@ impl AppState {
     /// The Cloud-managed budget for a run, if one has been set.
     pub fn cloud_budget(&self, run_id: &str) -> Option<Microusd> {
         self.cloud_budgets.lock().unwrap().get(run_id).copied()
+    }
+
+    /// Replace the full pending run-seed map (the startup seed, invariant
+    /// 69). Called once, before the listener binds; never after.
+    pub fn set_run_seed(&self, seed: HashMap<String, Microusd>) {
+        *self.run_seed.lock().unwrap() = seed;
+    }
+
+    /// Take (and remove) the pending seed for a run, if one exists. Removing
+    /// on read is what makes the seed apply at most once: a second caller
+    /// for the same run_id, whether racing the first or arriving later,
+    /// finds nothing left to apply.
+    pub fn take_run_seed(&self, run_id: &str) -> Option<Microusd> {
+        self.run_seed.lock().unwrap().remove(run_id)
     }
 
     /// Replace the ledger backend (e.g. a raft-replicated one). Chainable.

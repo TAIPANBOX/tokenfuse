@@ -341,4 +341,12 @@ impl LedgerBackend for RaftLedger {
             }
         });
     }
+
+    /// Not implemented for the raft backend (invariant 70's own doc on the
+    /// trait explains why): every gateway sharing the cluster keeps today's
+    /// restart behaviour, spend at zero, which HA already accepts as a
+    /// named gap in several other corners (invariants 42, 49).
+    async fn seed_spend(&self, _run_id: &str, _amount: Microusd) -> bool {
+        false
+    }
 }
