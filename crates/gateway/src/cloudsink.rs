@@ -855,16 +855,15 @@ async fn seed_unit_ledger_within(
     result
 }
 
-/// Invariant 69: how far back `GET /v1/runs` is asked to look for the
-/// startup run-spend seed. A run this gateway would still enforce is one a
-/// caller can still call, which means it called recently; a run last seen a
-/// day ago is over, and seeding it costs a slot in the pending map for no
-/// call that will ever arrive. Bounding by recency rather than asking for
-/// every run this org has ever had is also what keeps the answer small
-/// without trusting `RUN_SEED_MAX_BODY_BYTES` alone to do it: `/v1/runs`
-/// already supports `since_millis` (its own `RunsQuery`), so this reuses a
-/// window the endpoint was built to answer rather than adding a second one.
-const RUN_SEED_WINDOW_MILLIS: i64 = 24 * 60 * 60 * 1000;
+/// Invariant 70: how far back `GET /v1/runs` is asked to look for the
+/// startup run-spend seed. Thirty-one days, not one: a run id can be
+/// long-lived and quiet (the console's copilot writes every question to the
+/// same `genaryx-copilot` run, and an operator may not ask for a day), and a
+/// run skipped here restarts from zero, which is the defect this seed closes.
+/// The month is what the Cloud keeps money by, and a recency bound still
+/// keeps the answer small without trusting `RUN_SEED_MAX_BODY_BYTES` alone:
+/// `/v1/runs` already supports `since_millis` (its own `RunsQuery`).
+const RUN_SEED_WINDOW_MILLIS: i64 = 31 * 24 * 60 * 60 * 1000;
 
 /// Invariant 69: the most `GET /v1/runs` may answer with for the seed, the
 /// same defence `SEED_MAX_BODY_BYTES` gives the unit seed and for the same

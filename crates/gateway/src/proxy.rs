@@ -570,9 +570,9 @@ pub async fn chat_completions(
 /// to: it means either nothing was pending for this run_id, or a racing
 /// request for the same run_id already took it, and either is a normal
 /// outcome, not a fault.
-async fn credit_run_seed_if_any(st: &AppState, run_id: &str) {
+async fn credit_run_seed_if_any(st: &AppState, run_id: &str, generation: u64) {
     if let Some(seed) = st.take_run_seed(run_id) {
-        if st.ledger.seed_spend(run_id, seed).await {
+        if st.ledger.seed_spend(run_id, seed, generation).await {
             tracing::info!(
                 run = %run_id,
                 seed_usd = seed.as_usd(),
@@ -666,10 +666,10 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         if st.ledger.snapshot(p).await.is_none() {
             if let Some(b) = st.cloud_budget(p) {
                 match st.ledger.open_run(p, b, None).await {
-                    Ok(_) => {
+                    Ok(o) => {
                         tracing::info!(parent = %p, child = %run_id, budget_usd = b.as_usd(),
                             "opened a parent run at its Cloud-managed budget on first sight, declared by a child");
-                        credit_run_seed_if_any(&st, p).await;
+                        credit_run_seed_if_any(&st, p, o.generation).await;
                     }
                     Err(e) => tracing::warn!(parent = %p, child = %run_id, error = %e,
                         "could not open the parent at its Cloud-managed budget"),
@@ -691,7 +691,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
         }
     };
     if run_is_fresh {
-        credit_run_seed_if_any(&st, &run_id).await;
+        credit_run_seed_if_any(&st, &run_id, opened.generation).await;
     }
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
@@ -3429,8 +3429,8 @@ pub(crate) mod tests {
             self.0.settle(reservation, actual);
         }
 
-        async fn seed_spend(&self, run_id: &str, amount: Microusd) -> bool {
-            self.0.seed_spend(run_id, amount).await
+        async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
+            self.0.seed_spend(run_id, amount, generation).await
         }
     }
 

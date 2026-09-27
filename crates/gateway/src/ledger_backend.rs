@@ -82,7 +82,7 @@ pub trait LedgerBackend: Send + Sync {
     /// the same posture invariant 49's own text already takes for that
     /// backend ("compiled out of every shipped image"; `stack-k8s` and
     /// `stack-single` never build the `cluster` feature in).
-    async fn seed_spend(&self, run_id: &str, amount: Microusd) -> bool;
+    async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool;
 }
 
 /// The default in-process backend: a thin async wrapper over the sync `Ledger`.
@@ -129,7 +129,7 @@ impl LedgerBackend for LocalLedger {
         }
     }
 
-    async fn seed_spend(&self, run_id: &str, amount: Microusd) -> bool {
-        self.0.seed_spend(run_id, amount)
+    async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
+        self.0.seed_spend(run_id, amount, generation)
     }
 }

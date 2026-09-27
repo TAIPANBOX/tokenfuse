@@ -4618,7 +4618,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     The fix is therefore two pieces instead of one. `cloudsink::seed_run_ledger`
     still runs once, synchronously, before the listener binds: one `GET
-    /v1/runs?since_millis=<now - 24h>` (Cloud's own windowing, invariant 65's
+    /v1/runs?since_millis=<now - 31 days>` (Cloud's own windowing, invariant 65's
     sibling endpoint; the window is a boundary decision below), the body
     bounded the same way the unit seed's is (`RUN_SEED_MAX_BODY_BYTES`, 4
     MiB), building a pending map (`AppState.run_seed`, replace-all like
@@ -4631,9 +4631,16 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     called again" become indistinguishable), `credit_run_seed_if_any` takes
     the pending entry (removing it, so it can apply at most once even under
     a race between two first requests for the same run_id) and credits it via
-    a new `Ledger::seed_spend`, which itself refuses to apply unless the
-    run's spent AND reserved are still exactly zero, a second, independent
-    guard against ever crediting on top of this process's own activity. This
+    a new `Ledger::seed_spend`, bound to the generation `open_run` returned
+    (a run closed and reopened since takes no seed) and ADDED to whatever
+    this process has already recorded for that generation. It does not
+    require the run to be untouched: two first requests race, and the one
+    that did not open the run can reserve before the opener credits; a
+    guard that refused then dropped the seed and the run restarted from
+    zero (review, `a_seed_survives_a_reservation_another_request_made_first`,
+    red on the first version). At most once is held by the take, and the
+    seed is fetched before any request is served, so nothing of this
+    process's own is in the Cloud's figure. This
     happens before the budget gate reads the run's spend, so the very first
     call after a restart is checked against the seed, not against zero
     (invariant 42's own admission predicate, `exceeds`, is untouched: it
@@ -4659,10 +4666,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     seeded, not only those with a Cloud-managed budget: a client-supplied
     budget run accumulates real spend in the Cloud's telemetry too, and the
     measured defect is general, not specific to centrally-managed budgets.
-    The 24-hour window is a recency bound, not a completeness one: a run this
-    gateway would still enforce is one a caller can still call, which means
-    it called recently, and a run quiet for a day is over: seeding it spends
-    a pending-map slot no call will ever consume. Startup only, never
+    The window is 31 days, widened in review from 24 hours: a run id can be
+    long-lived and quiet (the console's copilot writes every question to one
+    `genaryx-copilot` run), and a run left out restarts from zero, the defect
+    itself; the month is what the Cloud keeps money by. Startup only, never
     periodic: a periodic re-seed would have to reconcile against this
     process's own settles in between, which is exactly the double-counting
     risk invariant 52 avoids by seeding once, before serving.
