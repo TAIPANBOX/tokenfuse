@@ -331,11 +331,27 @@ impl CloudSink {
     /// transport failure puts the batch at the FRONT of the queue (it was taken
     /// while the queue was empty, so before anything appended since). Nothing
     /// here awaits, nothing here touches the network.
+    ///
+    /// The decision also checks `draining`, not `is_holding()` alone, and that
+    /// is load-bearing (tokenfuse#344's CI flake): `drain()`'s own loop calls
+    /// `pop_front_chunk` BEFORE it knows whether that chunk's `post` will
+    /// succeed, which makes `records` transiently empty for the whole
+    /// `.await` of that one POST, even though a chunk is still, in every
+    /// sense that matters, "in flight" and will be pushed back to the FRONT
+    /// on failure. A `ship()` that read `is_holding()` alone in that window
+    /// took the fast path too, spawning an independent, unordered POST that
+    /// raced the drain's own retry: whichever one called `push_front_capped`
+    /// LAST won the true front of the queue, which is how a batch queued
+    /// later could be delivered before one already in flight. `draining`
+    /// stays `true` for the drain task's entire loop, every pop/post/push-
+    /// back cycle included, so checking it closes exactly that window: while
+    /// a drain is responsible for the queue, every new batch queues behind
+    /// it rather than racing it.
     fn ship(&self, records: Vec<CallRecord>) {
         if records.is_empty() {
             return;
         }
-        if self.queue.is_holding() {
+        if self.queue.is_holding() || self.queue.draining.load(Ordering::Acquire) {
             self.queue.push_back_capped(records);
             self.drain();
             return;
@@ -1574,6 +1590,68 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for {label}");
+    }
+
+    // --- tokenfuse#344: a ship() racing a drain's own pop/post/push-back ----
+
+    /// The root cause of the flake on tokenfuse#344's CI
+    /// (`the_cap_drops_the_oldest_and_says_so_once` delivered `r05646`
+    /// before `r00026`): `drain()`'s loop calls `pop_front_chunk` before it
+    /// knows whether the popped chunk's own `post` will succeed, so
+    /// `records` reads empty for the whole `.await` of that POST even though
+    /// a chunk is still logically in flight and will be pushed back to the
+    /// FRONT on failure. `ship()` reading `is_holding()` alone in that exact
+    /// window took the fast path too: an independent, unordered POST that
+    /// then raced the drain's own retry to call `push_front_capped` last (a
+    /// batch queued LATER, landing at the front, if its own attempt happened
+    /// to resolve after the drain's).
+    ///
+    /// Deterministic, no networking: `draining` is set directly to model the
+    /// exact window `drain()`'s own loop holds it for (from the moment it
+    /// claims the queue to the moment it releases it, regardless of whether
+    /// `records` is momentarily empty inside that span), and this asserts
+    /// only what `ship()` decided SYNCHRONOUSLY, before yielding to any
+    /// spawned task, so nothing here waits on the network at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ship_call_while_a_drain_is_in_progress_appends_rather_than_racing_it() {
+        let sink = CloudSink::new("http://127.0.0.1:1", "k");
+        // Nothing queued right now (mirrors the instant right after
+        // `pop_front_chunk` empties `records` inside `drain()`'s loop), but a
+        // drain IS in progress and will remain responsible for this queue
+        // until its own loop finishes.
+        assert_eq!(sink.queued(), 0);
+        sink.queue.draining.store(true, Ordering::Release);
+
+        sink.ship(vec![record_named("r-queued-behind-the-drain")]);
+
+        assert_eq!(
+            sink.queued(),
+            1,
+            "a ship() call while a drain is in progress must append behind it \
+             synchronously, not spawn an independent send that could resolve \
+             out of order with the drain's own retry"
+        );
+    }
+
+    /// The guard's other half: once the drain that was holding the queue
+    /// responsible finishes (`draining` back to `false`) and nothing is
+    /// queued, a fresh `ship()` still takes the ordinary fast path, exactly
+    /// as before this fix. Without this, the fix above could have been
+    /// "always queue, never take the fast path", which changes throughput
+    /// in the healthy case and would fail
+    /// `record_and_flush_return_without_waiting_for_the_control_plane`'s own
+    /// assertion that a still-in-flight, not-yet-failed send is not queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ship_call_with_no_drain_in_progress_still_takes_the_fast_path() {
+        let sink = CloudSink::new("http://127.0.0.1:1", "k");
+        assert!(!sink.queue.draining.load(Ordering::Acquire));
+        sink.ship(vec![record_named("r-fast-path")]);
+        assert_eq!(
+            sink.queued(),
+            0,
+            "with no drain in progress, ship() must still send directly rather \
+             than queuing first"
+        );
     }
 
     // --- the retry queue (#294): the tests -----------------------------------
