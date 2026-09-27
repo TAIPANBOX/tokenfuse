@@ -4485,3 +4485,108 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     answer, distinct from the client-credential door, while staying just as
     cause-free to the caller; the operator's log is not held to that same
     silence.
+
+69. **A delegation credential is never a provider credential, and it must not
+    leave this process wearing one.** Reported 2026-09-27 on the forge k3d
+    lab (tokenfuse v1.4.0, no provider key configured): a caller presented a
+    vouchryx delegation token as `Authorization: DPoP <token>` plus a `dpop`
+    proof header. `chainproof::resolve` verified it (invariant 31) and the
+    gateway admitted the call (`x-fuse: managed`); `HttpProvider::send`
+    (`crates/gateway/src/provider.rs`) then forwarded the SAME
+    `Authorization` header to the upstream, because `FORWARD_HEADERS`
+    carries `authorization` for the OpenAI door's own pass-through provider
+    key (`Authorization: Bearer <key>`) and the copy loop forwarded whatever
+    scheme that header held. Anthropic answered `401 "Invalid bearer
+    token"`: it had received the delegation token, not a provider key. Two
+    losses in one defect: the operator's DPoP-bound, five-minute delegation
+    credential (not replayable without the holder key, but a credential all
+    the same) went to a third party, and a delegated call could fail
+    upstream for a reason that has nothing to do with the caller's actual
+    permissions.
+
+    The fix is one check at the one site that forwards headers upstream: a
+    new `is_dpop_scheme` reads an `Authorization` header's auth-scheme token
+    case-insensitively (RFC 7235 §2.1's own rule for scheme comparisons,
+    recognising `DPoP`, `dpop`, `DPOP`, `Dpop`, and so on) and
+    `HttpProvider::send`'s copy loop skips `authorization` whenever it
+    reads `DPoP`, whatever `FORWARD_HEADERS` otherwise allows. A genuine
+    provider key, `Authorization: Bearer <key>`, is untouched: only the
+    scheme token decides, never whether the request happened to carry a run
+    id or a chain.
+
+    **Deliberately its own check, not a call to `chainproof::dpop_credential`.**
+    That function answers "did this resolve as a delegation credential this
+    gateway verified" and recognises only the two exact-cased forms this
+    gateway's own code emits (`DPoP `, `dpop `); a caller need not spell the
+    scheme that way for a third party to still be able to read it as one.
+    And the rule holds with the delegation door entirely OFF, which is the
+    decision this invariant records explicitly: with no
+    `TOKENFUSE_DELEGATION_ISSUER`/`_JWKS` configured, `chainproof::resolve`'s
+    first branch returns `Chain::Claimed` without ever inspecting the token,
+    so nothing in the resolution path even runs. `DPoP` is never a provider
+    credential regardless, so the stripping rule in `HttpProvider::send` is a
+    property of the header alone and does not read `st.chain_proof` at all;
+    an unmanaged pass-through call (no `x-fuse-run-id`, `require_run_id`
+    off) reaches the very same `send`, so it is covered without a second
+    check anywhere.
+
+    **The MCP broker's own forward was already safe, and stays a guard.**
+    `mcpbroker::process`'s forward to the real upstream MCP server
+    (`crates/gateway/src/mcpbroker.rs`, the JSON-RPC forward site) sets only
+    `content-type` on the outbound request; it never read `authorization` or
+    `dpop` off the caller's headers to begin with, unlike the LLM proxy's
+    `HttpProvider`. A test proves this rather than only reading the source,
+    so a future change that adds outbound headers to that broker cannot
+    reintroduce the leak unnoticed.
+
+    **Both doors, one fix.** `proxy::handle` is the one function the
+    Anthropic and OpenAI doors are both served through (invariant 55), and
+    `HttpProvider::send` is the one site either door's request reaches the
+    real upstream through, so the fix and its test both hold on
+    `/v1/chat/completions` as much as `/v1/messages` with no door-specific
+    code.
+    *(test: `provider::tests::a_dpop_scheme_authorization_is_never_forwarded_to_upstream`,
+    run red first against the unfixed copy loop
+    (`left: String("DPoP eyJhbGciOiJFUzI1NiJ9...") right: ""`);
+    `provider::tests::http_provider_forwards_a_bearer_authorization_to_upstream`,
+    the guard, green on both sides;
+    `provider::tests::dpop_scheme_check_is_case_insensitive` for the scheme
+    parser alone. Driven through the real proxy handler with a real
+    `HttpProvider` against a real local upstream (not a hand-built
+    `HeaderMap` passed straight to `HttpProvider::send`):
+    `proxy::tests::a_resolved_dpop_delegation_credential_never_reaches_the_provider`
+    (a delegation issuer configured, a proven chain), red first
+    (`left: String("DPoP eyJ...") right: ""`), and its sibling
+    `proxy::tests::a_dpop_authorization_the_gateway_never_resolved_still_does_not_reach_the_provider`
+    (no delegation issuer configured at all), also red first
+    (`left: String("DPoP not-a-real-vouchryx-token") right: ""`). The OpenAI
+    door: `tests/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`,
+    driven through the real router. The MCP broker's own guard:
+    `tests/mcp_broker.rs::a_resolved_delegation_credential_never_reaches_the_mcp_upstream`.
+    Mutants planted in the product code and reverted, byte for byte
+    (`diff` against the pre-mutant tree confirmed clean after each restore):
+    M1, the whole `if *name == "authorization" && is_dpop_scheme(v) {
+    continue; }` block deleted from `HttpProvider::send` (the original
+    defect, restored): caught by
+    `provider::tests::a_dpop_scheme_authorization_is_never_forwarded_to_upstream`,
+    `proxy::tests::a_resolved_dpop_delegation_credential_never_reaches_the_provider`
+    and `proxy::tests::a_dpop_authorization_the_gateway_never_resolved_still_does_not_reach_the_provider`
+    (all three the exact red-first failures quoted above). M2, "strip only
+    on the Anthropic door": the same block removed from `HttpProvider::send`
+    and an equivalent, ad hoc strip added instead inside `proxy::messages`
+    alone (the Anthropic door's own handler), leaving `proxy::chat_completions`
+    (the OpenAI door) and `HttpProvider::send` itself untouched. Both
+    `proxy::tests` tests above stayed GREEN under M2 (they only ever drive
+    the Anthropic door), which is exactly the false confidence a door-local
+    fix gives; caught by
+    `provider::tests::a_dpop_scheme_authorization_is_never_forwarded_to_upstream`
+    (calls `HttpProvider::send` directly, bypassing `messages` entirely) and
+    by `tests/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`
+    (`left: String("DPoP not-a-real-vouchryx-token") right: ""`), which is
+    the test this invariant's "both doors, one fix" claim rests on. The
+    mcp_broker guard test stayed green under both mutants, correctly: it
+    is a guard on an already-safe path, not a witness to this fix.
+    Scenarios:
+    `features/a-delegation-credential-never-reaches-a-provider.feature`,
+    seven, each bound. Not a script gate: the rule is
+    `HttpProvider::send`'s own copy loop, held by `cargo test`.)*

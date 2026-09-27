@@ -304,9 +304,16 @@ comparison in #132.
 
 **Counts re-measured 2026-09-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1552 passing** (core 364, dpop 21, delegation 60,
-gateway 858, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by five
+`cargo test --all` runs **1559 passing** (core 364, dpop 21, delegation 60,
+gateway 865, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
+seven (invariant 69, tokenfuse#342's credential-leak fix): a DPoP-scheme
+delegation credential presented as `Authorization: DPoP <token>` reached the
+upstream provider unchanged, because `HttpProvider::send`'s
+`FORWARD_HEADERS` allowlist carries `authorization` for the OpenAI door's
+own pass-through provider key and forwarded whatever scheme that header
+held. Fixed by one scheme check at that one site; see CLAUDE.md invariant
+69 for the full account and the mutation tests. Core grew by five
 more (invariant 67, tokenfuse#341's rounding fix): `crates/core/src/pricing.rs`'s
 `ModelPrice::cost` summed each of five priced parts to `i64` and floored it
 before adding the parts together, so a call with a fractional micro-USD

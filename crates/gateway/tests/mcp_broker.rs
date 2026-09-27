@@ -43,6 +43,31 @@ async fn stub(Json(req): Json<Value>) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": { "echo": req.get("params").cloned() } }))
 }
 
+/// Like `stub`, plus it echoes back whichever `authorization`/`dpop` HTTP
+/// headers it actually received, so a test can prove what left the broker's
+/// own outbound leg, not only what the JSON-RPC body carried.
+async fn stub_echoing_auth_headers(
+    headers: axum::http::HeaderMap,
+    Json(req): Json<Value>,
+) -> Json<Value> {
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Json(json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": {
+            "echo": req.get("params").cloned(),
+            "authorization_seen": get("authorization"),
+            "dpop_seen": get("dpop"),
+        }
+    }))
+}
+
 async fn spawn_server(router: Router) -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -1915,6 +1940,71 @@ async fn a_proven_chain_comes_from_the_token_and_not_from_the_header() {
             "agent://acme.example/orchestrator"
         ]),
         "the chain the PDP was asked about must be the ISSUER's, root first. asked: {asked}"
+    );
+}
+
+/// Invariant 69's rule at this door: a delegation credential the caller
+/// presents (`Authorization: DPoP <token>` plus a `dpop` proof) is a chain
+/// proof this broker RESOLVES, never a credential it hands on. This is a
+/// guard, not a fix: `process`'s forward to the real MCP server only ever
+/// set `content-type` on the outbound request, never `authorization` or
+/// `dpop` (`crates/gateway/src/mcpbroker.rs`, the JSON-RPC forward site),
+/// unlike the LLM proxy's `HttpProvider`, whose `FORWARD_HEADERS` includes
+/// `authorization` for the OpenAI door's pass-through provider key and did
+/// leak a resolved DPoP credential until that fix. Proven here so a future
+/// change that adds outbound headers to this broker cannot reintroduce the
+/// leak unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resolved_delegation_credential_never_reaches_the_mcp_upstream() {
+    use tokenfuse_delegation::testing::{proof_at, token};
+    let upstream = spawn_server(Router::new().route("/", post(stub_echoing_auth_headers))).await;
+    let (pdp, _seen) = capturing_pdp("allow").await;
+    let (router, issuer, holder) = broker_proving(upstream, pdp);
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+    let dpop = proof_at(
+        &holder,
+        now,
+        "POST",
+        "https://tokenfuse.acme.example/",
+        "p-mcp-fwd-1",
+    );
+
+    let http = reqwest::Client::new();
+    let resp: Value = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("authorization", format!("DPoP {tok}"))
+        .header(tokenfuse_gateway::mcpdoor::PROOF_HEADER, &dpop)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp["result"]["authorization_seen"], "",
+        "the delegation credential reached the upstream MCP server: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["dpop_seen"], "",
+        "the dpop proof reached the upstream MCP server: {resp}"
     );
 }
 

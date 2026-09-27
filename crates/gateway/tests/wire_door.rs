@@ -189,3 +189,81 @@ async fn a_streamed_openai_request_reaching_the_provider_carries_the_usage_reque
          it did not, got {v}"
     );
 }
+
+/// Invariant 69, for the OpenAI door specifically. `proxy::handle` is the
+/// one function both doors are served through (its own doc comment says
+/// so), and `provider::HttpProvider::send` is the one site that forwards
+/// headers upstream, so a DPoP-scheme `Authorization` must be stripped here
+/// exactly as it is proven on the Anthropic door in
+/// `proxy::tests::a_resolved_dpop_delegation_credential_never_reaches_the_provider`
+/// and its no-delegation-configured sibling. Driven through the real router
+/// with a real `HttpProvider` posting to a real local echo server, so this
+/// is not a duplicate of the unit-level `provider::tests` coverage: it
+/// proves the OTHER door reaches that same fixed code, not only that the
+/// code itself is fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either() {
+    async fn echo(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Value> {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        axum::Json(serde_json::json!({ "authorization_seen": get("authorization") }))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = axum::Router::new().route("/", axum::routing::post(echo));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let prices = tokenfuse_core::PriceBook::new().with(
+        "test-model",
+        tokenfuse_core::ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
+    );
+    let state = tokenfuse_gateway::state::AppState::new(
+        std::sync::Arc::new(tokenfuse_core::Ledger::new()),
+        std::sync::Arc::new(prices),
+        std::sync::Arc::new(tokenfuse_core::Policy {
+            mode: tokenfuse_core::Mode::Enforce,
+            ..Default::default()
+        }),
+        std::sync::Arc::new(tokenfuse_gateway::provider::HttpProvider::new(format!(
+            "http://{addr}"
+        ))),
+        "wire-door-test-policy",
+    )
+    .with_wire(Wire::OpenAi);
+    let app = tokenfuse_gateway::app(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-fuse-run-id", "r-openai-dpop-1")
+                .header("authorization", "DPoP not-a-real-vouchryx-token")
+                .body(Body::from(openai_body()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the call must reach the provider as an ordinary managed call, not be refused"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let echoed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        echoed["authorization_seen"], "",
+        "the DPoP-scheme Authorization reached the provider on the OpenAI \
+         door: {echoed}"
+    );
+}
