@@ -278,6 +278,60 @@ cloud. Volume stayed low: about half a call per second across two agents. The ra
 not part of this run. Only the tailnet-bound gateway was rebooted; its reboot survival on the
 default loopback bind is untested here.
 
+## Two sites, a heartbeat, a revoked delegation and a third-party agent team (2026-09-26 and 27)
+
+2026-09-26 and 2026-09-27: a hub on GCP (stack-k8s, three e2-standard-2 VMs) and a second site at
+home (a three-node k3d cluster on a Debian 13 mini PC, the gateway at `v1.1.1`, then the builds of
+#337, then the released `v1.3.0`), and on 2026-09-27 the home cluster on its own with the released
+`v1.3.0` gateway and control plane. Full detail: the rows dated 2026-09-26 and 2026-09-27 in
+[estate-gates/PROVEN.md](https://github.com/TAIPANBOX/estate-gates/blob/main/PROVEN.md).
+
+**Two sites, one control plane, no VPN.** The home gateway reached the hub over outbound HTTPS with
+an `ingest` key bound to its site (#333). `GET /v1/gateways` showed both sites by name, and a run
+from home was labelled `site=forge-home`. One wardryx policy written once on the hub refused calls
+at both gateways, and both answered again within 5 s of its removal. With the home site cut from the
+hub, its gateway refused in 255 ms (`failmode=closed`) and its telemetry queued and replayed with
+nothing lost. A run killed through the hub's Cloud was refused `402` within 4 s.
+
+**An idle site stays visible (#337, invariant 66).** The home site idle, the hub's `/v1/gateways`
+sampled every 30 s: without the heartbeat its last push aged from 34 s to 286 s in four minutes;
+the first build of #337 pushed only every other interval (last push 20 to 59 s), a defect the unit
+tests had missed; with the fix, one push about every 31 s and a last push of 14 to 22 s. The
+released `v1.3.0`, idle on the home cluster, pushed every 30 s with its last push at 21 s.
+
+**A delegation revoked mid-run.** vouchryx ran in the home cluster; the gateway verified
+DPoP-bound delegation tokens (`TOKENFUSE_DELEGATION_*`) and polled `/v1/revocations` every second,
+and wardryx required a proved chain for the agent. A claimed chain with no token: `403`. With a
+token and a fresh proof per call, three real Claude Haiku 4.5 calls answered. The subject revoked at
+08:39:44.606 UTC: a call 0.9 s later still answered, the call 2.2 s later was refused, and every
+one after it.
+
+**A third-party agent framework, governed per agent.** Three Hermes agents
+(`nousresearch/hermes-agent:v2026.9.24`), each with its own `x-fuse-agent-id` and run, called Claude
+Haiku 4.5 through a gateway on the OpenAI wire whose upstream was Anthropic's OpenAI-compatible
+endpoint. The Cloud's per-agent spend matched the tokens Hermes itself counted, to the micro-dollar
+(USD 0.015317 for one turn), where Hermes reported its own cost as unknown. A wardryx
+`deny_above_usd` on one agent: `403 wardryx_denied` before the provider. A run capped at USD 0.025:
+the second turn `402`. A `require_human_above_usd` hold: `403` with an `approval_id`, granted by the
+operator, the turn resubmitted with `x-fuse-approval-token` answered, and the same token refused the
+second time. USD 0.105 across the team.
+
+**The OpenAI door against OpenAI, with a real key.** `gpt-4o-mini` through a gateway with
+`TOKENFUSE_UPSTREAM=https://api.openai.com/v1/chat/completions`: no run id, `400
+metering_required`; four calls `200` with `x-fuse-price: known` and `x-fuse-wardryx: allow`; a
+streamed call with `include_usage` settled from the stream's usage; a run budget below one call's
+estimate, `402` in OpenAI's error shape (`code`, `message`, `param` beside `type` and `reason`).
+
+**The console's own copilot, governed by this gateway.** Genaryx's Felyx pointed at the gateway
+with policy enforced was refused `400 identity_required` (it sent no agent id); with genaryx#81 it
+answered, and a run budget lowered under it stopped it with `402` before the provider.
+
+Found by these runs and not yet fixed here: each part of a call's cost is rounded down on its own
+(13 input and 2 output tokens on `gpt-4o-mini` charged 2 micro-USD where the book gives 3.15); a
+refused delegation token is answered with the client-credential `401`, whose text points at
+`x-fuse-key`, and the log names every refusal `BadToken`, so a revocation and a key mismatch read
+alike.
+
 ## Method
 
 Disposable Hetzner VPS boxes (deleted after each run) and short-lived cloud instances; code delivered as
