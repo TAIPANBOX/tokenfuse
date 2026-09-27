@@ -1614,6 +1614,10 @@ mod tests {
     /// spawned task, so nothing here waits on the network at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ship_call_while_a_drain_is_in_progress_appends_rather_than_racing_it() {
+        // Holds the log lock: its sink can write the outage line into the
+        // process-wide capture another test is counting (a CI flake of
+        // `one_transition_line_per_outage`, 2026-09-27).
+        let _g = log_lock();
         let sink = CloudSink::new("http://127.0.0.1:1", "k");
         // Nothing queued right now (mirrors the instant right after
         // `pop_front_chunk` empties `records` inside `drain()`'s loop), but a
@@ -1643,6 +1647,10 @@ mod tests {
     /// assertion that a still-in-flight, not-yet-failed send is not queued.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ship_call_with_no_drain_in_progress_still_takes_the_fast_path() {
+        // Holds the log lock: its sink can write the outage line into the
+        // process-wide capture another test is counting (a CI flake of
+        // `one_transition_line_per_outage`, 2026-09-27).
+        let _g = log_lock();
         let sink = CloudSink::new("http://127.0.0.1:1", "k");
         assert!(!sink.queue.draining.load(Ordering::Acquire));
         sink.ship(vec![record_named("r-fast-path")]);
@@ -1977,6 +1985,10 @@ mod tests {
     /// path: `record`/`flush` must return long before a 10 s stall resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn record_and_flush_return_without_waiting_for_the_control_plane() {
+        // Holds the log lock: its sink can write the outage line into the
+        // process-wide capture another test is counting (a CI flake of
+        // `one_transition_line_per_outage`, 2026-09-27).
+        let _g = log_lock();
         let (base, _toggle) = toggle_control_plane(Plane::Stall).await;
         let sink = Arc::new(CloudSink::new(base, "k"));
 
