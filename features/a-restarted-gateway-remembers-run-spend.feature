@@ -78,3 +78,13 @@ Feature: A restarted gateway remembers what a run has already spent
     When the gateway seeds
     Then the killed run is skipped and counted
     And the unmentioned run has nothing staged for it at all
+
+  # @test:a_seed_survives_a_reservation_another_request_made_first
+  # @test:a_seed_adds_to_spend_already_settled_in_the_same_generation
+  # @test:a_seed_for_a_generation_that_has_been_closed_or_reopened_is_refused
+  Scenario: Two first requests after a restart race, and the seed still lands once
+    Given a restarted gateway holds a Cloud seed for a run
+    And a second request for that run reserved, or even settled, before the one that opened it credited the seed
+    When the seed is credited
+    Then it is added to what the run already recorded here, never dropped and never written over it
+    And a run closed and reopened since takes no seed
