@@ -9,12 +9,16 @@
 //! restart loses the queue, and the local Parquet trace remains the source of
 //! truth. Every record carries its unit's owner beside the trace's fields
 //! (invariant 54). At startup the unit ledger's month is seeded from the same
-//! control plane (`seed_unit_ledger`, invariant 52). Enable with
+//! control plane (`seed_unit_ledger`, invariant 52). An idle gateway still
+//! pushes an empty batch every `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` so
+//! `GET /v1/gateways`' `last_push_millis` (invariant 65) does not read a
+//! healthy, quiet site as a dead one (`spawn_heartbeat`, invariant 66); a
+//! heartbeat is never queued and never replayed. Enable with
 //! `TOKENFUSE_CLOUD_URL` + `TOKENFUSE_CLOUD_KEY`; composes with other sinks via
 //! `TeeSink`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +53,65 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The literal the control plane files unattributed spend under
 /// (`crates/cloud/src/store.rs`, `units_at`/`owners`); never a unit here.
 const UNASSIGNED: &str = "unassigned";
+
+/// Invariant 66: `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` unset or empty.
+const HEARTBEAT_DEFAULT_SECS: u64 = 30;
+
+/// Invariant 66: the smallest interval a configured value is allowed to run
+/// at. A smaller positive value is clamped up to this, so a typo (`3` meant
+/// to be `30`) cannot turn the heartbeat into a way to hammer the control
+/// plane.
+const HEARTBEAT_MIN_SECS: u64 = 5;
+
+/// The heartbeat interval (`TOKENFUSE_CLOUD_HEARTBEAT_SECONDS`, invariant 66):
+/// how often an otherwise-idle gateway pushes an empty batch so a quiet but
+/// healthy site is not indistinguishable from a dead one on
+/// `GET /v1/gateways` (`last_push_millis`, invariant 65 already counts an
+/// empty push as a heartbeat). Read once at startup, same posture
+/// `defaults::cache_mode_from` sets for `TOKENFUSE_CACHE`: unset or empty is
+/// the default; a value that does not parse as a non-negative integer at all
+/// is also the default, with one warn line naming it, because a typo must
+/// never silently change behaviour; `0` turns heartbeats off outright, for an
+/// operator whose deployment already has its own liveness signal; anything
+/// from 1 to `HEARTBEAT_MIN_SECS - 1` is clamped up to the minimum, with the
+/// same one warn line.
+pub fn cloud_heartbeat_seconds_from(value: Option<&str>) -> u64 {
+    let raw = match value.map(str::trim) {
+        None | Some("") => return HEARTBEAT_DEFAULT_SECS,
+        Some(raw) => raw,
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => 0,
+        Ok(n) if n < HEARTBEAT_MIN_SECS => {
+            tracing::warn!(
+                value = %raw,
+                clamped_to = HEARTBEAT_MIN_SECS,
+                "TOKENFUSE_CLOUD_HEARTBEAT_SECONDS is below the minimum effective interval; \
+                 clamping to {HEARTBEAT_MIN_SECS}s so a typo cannot hammer the control plane"
+            );
+            HEARTBEAT_MIN_SECS
+        }
+        Ok(n) => n,
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default = HEARTBEAT_DEFAULT_SECS,
+                "TOKENFUSE_CLOUD_HEARTBEAT_SECONDS is not a non-negative integer; \
+                 using the default of {HEARTBEAT_DEFAULT_SECS}s"
+            );
+            HEARTBEAT_DEFAULT_SECS
+        }
+    }
+}
+
+/// [`cloud_heartbeat_seconds_from`] against the process environment.
+pub fn cloud_heartbeat_seconds_from_env() -> u64 {
+    cloud_heartbeat_seconds_from(
+        std::env::var("TOKENFUSE_CLOUD_HEARTBEAT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// #293: how long the startup seed may take in all, connect to last byte.
 /// Bounded because it runs before the listener binds: a control plane that
@@ -131,13 +194,23 @@ pub struct CloudSink {
     unit_owners: Arc<HashMap<String, String>>,
 }
 
-/// What one push needs, shared by the fast path and the drainer.
+/// What one push needs, shared by the fast path, the drainer and the heartbeat.
 struct Pusher {
     url: String,
     key: String,
     client: reqwest::Client,
     /// Non-success statuses this sink has already warned about (invariant 13).
     reported: Mutex<HashSet<u16>>,
+    /// Base instant for `last_reached_millis`, so the clock is monotonic and
+    /// needs no wall-clock read on the request path (invariant 66).
+    epoch: std::time::Instant,
+    /// Millis since `epoch` of the last push that got an HTTP answer, success
+    /// or refusal alike - "reached the Cloud" for the heartbeat's purpose.
+    /// Zero at construction, which is "just now": a gateway that has pushed
+    /// nothing yet does not fire a heartbeat at the instant it starts.
+    /// Shared with the heartbeat task; real traffic resets it, so under
+    /// traffic no heartbeat is ever sent (invariant 66).
+    last_reached_millis: AtomicI64,
 }
 
 enum PushOutcome {
@@ -234,6 +307,8 @@ impl CloudSink {
                 key: key.into(),
                 client,
                 reported: Mutex::new(HashSet::new()),
+                epoch: std::time::Instant::now(),
+                last_reached_millis: AtomicI64::new(0),
             }),
             buf: Mutex::new(Vec::new()),
             queue: Arc::new(Queue::default()),
@@ -350,6 +425,59 @@ impl CloudSink {
         }
     }
 
+    /// Spawn the background heartbeat task (invariant 66): ticks every
+    /// `interval` and, if nothing has reached the Cloud in that long, POSTs an
+    /// empty batch so `GET /v1/gateways` can tell an idle site from a dead
+    /// one. A no-op when `interval` is zero (`TOKENFUSE_CLOUD_HEARTBEAT_SECONDS=0`,
+    /// heartbeats off): `tokio::time::interval` refuses a zero duration, and
+    /// zero is this setting's own "off", not a very fast heartbeat.
+    ///
+    /// Only reached when a Cloud is configured, the same condition that builds
+    /// a `CloudSink` at all (`main.rs`).
+    pub fn spawn_heartbeat(self: &Arc<Self>, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let sink = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                sink.maybe_heartbeat(interval).await;
+            }
+        });
+    }
+
+    /// One heartbeat tick's worth of work. Never touches `queue`: a heartbeat
+    /// is never queued and never replayed, because queueing it would let a
+    /// replay after an outage make a silent site look alive in the past
+    /// (invariant 66).
+    async fn maybe_heartbeat(&self, interval: Duration) {
+        // The drain itself proves liveness, and racing a heartbeat against it
+        // would be a second, redundant answer to the same question.
+        if self.queue.is_holding() {
+            return;
+        }
+        let elapsed =
+            self.push.millis_since_epoch() - self.push.last_reached_millis.load(Ordering::SeqCst);
+        if elapsed < interval.as_millis() as i64 {
+            return;
+        }
+        match self.push.post(&[], &self.unit_owners).await {
+            PushOutcome::Accepted => {}
+            PushOutcome::Refused(status) => {
+                report_refusal(&self.push.reported, status, &self.push.url)
+            }
+            // A transport error here is at most a debug line: the queue's own
+            // "cannot reach the control plane" warning already tells the
+            // operator, and this attempt is simply lost, never queued.
+            PushOutcome::Unreachable(e) => tracing::debug!("cloud telemetry heartbeat failed: {e}"),
+            PushOutcome::Unencodable(e) => {
+                tracing::debug!("cloud telemetry heartbeat encode failed: {e}")
+            }
+        }
+    }
+
     #[cfg(test)]
     fn queued(&self) -> usize {
         self.queue.records.lock().unwrap().len()
@@ -357,6 +485,11 @@ impl CloudSink {
 }
 
 impl Pusher {
+    /// POST one batch, real or a heartbeat's empty one. Whenever an HTTP
+    /// answer comes back at all - accepted or refused, invariant 66 treats
+    /// both as "reached the Cloud" - `last_reached_millis` is updated here,
+    /// once, so `ship`, `drain` and the heartbeat all share one definition of
+    /// "reached" without each remembering to mark it.
     async fn post(&self, records: &[CallRecord], owners: &HashMap<String, String>) -> PushOutcome {
         let payload = match serde_json::to_vec(&Batch {
             records: wire(records, owners),
@@ -372,9 +505,25 @@ impl Pusher {
             .body(payload);
         match req.send().await {
             Err(e) => PushOutcome::Unreachable(e),
-            Ok(resp) if resp.status().is_success() => PushOutcome::Accepted,
-            Ok(resp) => PushOutcome::Refused(resp.status()),
+            Ok(resp) if resp.status().is_success() => {
+                self.mark_reached();
+                PushOutcome::Accepted
+            }
+            Ok(resp) => {
+                self.mark_reached();
+                PushOutcome::Refused(resp.status())
+            }
         }
+    }
+
+    fn millis_since_epoch(&self) -> i64 {
+        self.epoch.elapsed().as_millis() as i64
+    }
+
+    /// Record that a push (real or heartbeat) just got an HTTP answer.
+    fn mark_reached(&self) {
+        self.last_reached_millis
+            .store(self.millis_since_epoch(), Ordering::SeqCst);
     }
 }
 
@@ -2045,6 +2194,217 @@ mod tests {
         assert!(
             refusals_at(&log, "WARN").is_empty(),
             "nothing refused this push, so nothing may be reported as refused:\n{log}"
+        );
+    }
+
+    // --- the heartbeat interval parser (invariant 66) -----------------------
+
+    #[test]
+    fn cloud_heartbeat_default_when_unset_or_empty() {
+        assert_eq!(cloud_heartbeat_seconds_from(None), 30);
+        assert_eq!(cloud_heartbeat_seconds_from(Some("")), 30);
+        assert_eq!(cloud_heartbeat_seconds_from(Some("  ")), 30);
+    }
+
+    #[test]
+    fn cloud_heartbeat_zero_is_off() {
+        assert_eq!(cloud_heartbeat_seconds_from(Some("0")), 0);
+    }
+
+    #[test]
+    fn cloud_heartbeat_junk_is_the_default() {
+        for junk in ["off", "thirty", "-1", "3.5", "1e3", "  nope  "] {
+            assert_eq!(cloud_heartbeat_seconds_from(Some(junk)), 30, "{junk}");
+        }
+    }
+
+    #[test]
+    fn cloud_heartbeat_small_positive_values_clamp_to_the_minimum() {
+        for small in ["1", "2", "3", "4"] {
+            assert_eq!(cloud_heartbeat_seconds_from(Some(small)), 5, "{small}");
+        }
+    }
+
+    #[test]
+    fn cloud_heartbeat_thirty_is_thirty() {
+        assert_eq!(cloud_heartbeat_seconds_from(Some("30")), 30);
+        assert_eq!(cloud_heartbeat_seconds_from(Some("60")), 60);
+        assert_eq!(cloud_heartbeat_seconds_from(Some("5")), 5);
+    }
+
+    // --- the heartbeat itself (invariant 66): the tests ---------------------
+    //
+    // A heartbeat's own push must never be mistaken for a real record, so
+    // every test here reads the STUB's own received bodies rather than a
+    // counter this code adds for its own benefit - the same discipline the
+    // refusal tests above hold for the log.
+
+    /// A gateway with nothing to push still says it is alive: with a short
+    /// heartbeat interval and no traffic at all, the stub sees a push whose
+    /// `records` array is empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_gateway_sends_a_heartbeat() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = Arc::new(CloudSink::with_options(
+            base,
+            "k",
+            Duration::from_millis(200),
+        ));
+        sink.spawn_heartbeat(Duration::from_millis(30));
+
+        wait_for("an idle heartbeat to reach the stub", || {
+            !toggle.bodies.lock().unwrap().is_empty()
+        })
+        .await;
+
+        assert!(
+            toggle.received_run_ids().is_empty(),
+            "an idle gateway pushed nothing but heartbeats, which carry no records"
+        );
+        let bodies = toggle.bodies.lock().unwrap();
+        let batch: ReceivedBatch =
+            serde_json::from_slice(&bodies[0]).expect("a heartbeat body is valid JSON");
+        assert!(
+            batch.records.is_empty(),
+            "a heartbeat POSTs {{\"records\": []}}, not a record of its own"
+        );
+    }
+
+    /// Real records flowing more often than the heartbeat interval reset the
+    /// clock every time, so under traffic no heartbeat is ever sent: none of
+    /// the pushes the stub receives is an empty one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gateway_with_traffic_sends_no_heartbeat() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = Arc::new(CloudSink::with_options(
+            base,
+            "k",
+            Duration::from_millis(200),
+        ));
+        sink.spawn_heartbeat(Duration::from_millis(200));
+
+        for i in 0..12 {
+            sink.record(record_named(&format!("traffic-{i:02}")));
+            sink.flush();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for("every record to arrive", || {
+            toggle.received_run_ids().len() == 12
+        })
+        .await;
+
+        let bodies = toggle.bodies.lock().unwrap();
+        for body in bodies.iter() {
+            let batch: ReceivedBatch = serde_json::from_slice(body).expect("valid JSON");
+            assert!(
+                !batch.records.is_empty(),
+                "traffic arriving faster than the heartbeat interval must never let an \
+                 empty push through"
+            );
+        }
+    }
+
+    /// A heartbeat that fails never enters the retry queue: it is simply
+    /// lost, because queueing it would let a replay after an outage make a
+    /// silent site look alive in the past. Several heartbeat intervals pass
+    /// while the plane is unreachable, and the queue stays empty throughout;
+    /// once the plane comes back, every push it then receives is a fresh
+    /// heartbeat, never one "recovered" from a queue that was never used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_heartbeat_is_never_queued() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Down).await;
+        let sink = Arc::new(CloudSink::with_options(
+            base,
+            "k",
+            Duration::from_millis(200),
+        ));
+        sink.spawn_heartbeat(Duration::from_millis(30));
+
+        // A few failed heartbeat ticks, well past the interval.
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        assert_eq!(
+            sink.queued(),
+            0,
+            "a heartbeat must never enter the retry queue, failed or not"
+        );
+
+        toggle.set(Plane::Up);
+        wait_for("the plane to answer a heartbeat after recovery", || {
+            !toggle.bodies.lock().unwrap().is_empty()
+        })
+        .await;
+
+        assert_eq!(
+            sink.queued(),
+            0,
+            "nothing was ever queued, so recovery must not create anything to replay"
+        );
+        assert!(
+            toggle.received_run_ids().is_empty(),
+            "a lost heartbeat must never come back as a replayed record"
+        );
+    }
+
+    /// The drain itself proves liveness: while the retry queue is holding
+    /// anything, a heartbeat tick must not race it by pushing a second,
+    /// redundant answer to "is this site alive". Exercised directly against
+    /// `maybe_heartbeat` (bypassing the tick loop) so the assertion needs no
+    /// timing race: the clock is forced stale enough that a heartbeat would
+    /// otherwise fire, and something is queued as an outage would leave it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_heartbeat_while_the_queue_drains() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = CloudSink::with_options(base, "k", Duration::from_millis(200));
+        // Force the shared clock stale enough that a heartbeat would
+        // otherwise fire on the next check.
+        sink.push
+            .last_reached_millis
+            .store(-1_000_000, Ordering::SeqCst);
+        // Simulate an outage: something is queued and waiting to be drained.
+        sink.queue.push_back_capped(vec![record_named("queued-1")]);
+
+        sink.maybe_heartbeat(Duration::from_millis(10)).await;
+
+        assert!(
+            toggle.bodies.lock().unwrap().is_empty(),
+            "the drain itself proves liveness; a heartbeat must not race it"
+        );
+    }
+
+    /// `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS=0` (or the parser's `0`) turns
+    /// heartbeats off outright: `spawn_heartbeat` with a zero interval spawns
+    /// no task at all, so nothing is ever pushed even after several would-be
+    /// intervals pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeats_off_when_zero() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = Arc::new(CloudSink::with_options(
+            base,
+            "k",
+            Duration::from_millis(200),
+        ));
+        sink.spawn_heartbeat(Duration::from_secs(0));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            toggle.bodies.lock().unwrap().is_empty(),
+            "an interval of zero must mean off, not a very fast heartbeat"
         );
     }
 }

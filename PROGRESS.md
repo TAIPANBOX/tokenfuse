@@ -259,6 +259,7 @@ comparison in #132.
 | Cloud Next.js dashboard | ✅ done | `cloud/dashboard` (Next.js App Router, TS, static export): connect form (base URL + org key), summary cards, spend-by-run chart, runs table with **Kill** + **Budget** actions, 3 s auto-refresh. Talks to the control plane from the browser; control plane sends CORS headers. Built to static files, served by nginx → `ghcr.io/taipanbox/tokenfuse-dashboard`, in `docker compose` on `:3000`. Own CI job `dashboard` (npm ci + next build). The embedded vanilla-JS dashboard remains for a zero-deploy quick look. |
 | Cloud durable store | ✅ done | Control-plane state (org→run aggregates, kills, budgets) persists across restarts: `TOKENFUSE_CLOUD_DATA=<path>` loads a JSON snapshot on startup and autosaves every 2 s (atomic tmp+rename), zero external deps. Distroless image ships a non-root-owned `/data`; compose mounts a `cloud-data` volume. Test `persistence_round_trip` (it was `TestPersistenceRoundTrip` here until 2026-08-06, a Go name for a test that has been Rust since the cutover). SQL/columnar (Postgres/ClickHouse) for scale is a drop-in behind the same `Store`. |
 | Gateway naming: `GET /v1/gateways` (2026-09-26, invariant 65) | ✅ done | A key spec's optional 4th segment (`key:org:role:site`) binds it to one site; `/v1/ingest` attributes every record in a push to the CREDENTIAL's site, never anything the body names, folding into the literal `"unnamed"` bucket for an unbound key. `GET /v1/gateways` (`GatewayAgg`) reports each site's spend, calls, and `last_push_millis` (the plane's own clock - the figure a silent site is read from). A new `ingest` role may push telemetry and read like a viewer, but is refused like one on every mutation, so a remote site's key no longer needs to be `admin`. The dashboard gained a Gateways rail card (silent past 5 minutes) and a Site column on Runs. tokenfuse#296. |
+| A quiet gateway still says it is alive (2026-09-26, invariant 66) | ✅ done | Measured on a two-site run: `GET /v1/gateways`' `last_push_millis` (invariant 65) is set by the Cloud's own clock and already counts an empty push as a heartbeat, but `CloudSink` only pushed when it had records, so an idle-but-healthy site and a dead one looked identical after five quiet minutes. `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` (default 30, `0` off, values under 5 clamped up with a warning) drives `CloudSink::spawn_heartbeat`, a background task that POSTs `{"records": []}` when nothing else has reached the Cloud in that long; real traffic shares the same clock (`Pusher::post` marks it on every accepted or refused answer), so under traffic no heartbeat is ever sent. A heartbeat is never queued and never replayed - a failed one is simply lost, and it is skipped outright while the retry queue (invariant 53) is draining, since the drain itself already proves liveness. tokenfuse#296's other half. |
 | Cloud central budgets | ✅ done | Control plane: `POST /v1/runs/{run}/budget {budget_usd}` + `GET /v1/budgets`; dashboard **Budget** button per run. Gateway: `cloudsink::spawn_budget_poller` fetches `/v1/budgets` every 3 s → `AppState.cloud_budgets`; `proxy` `open_run` uses the cloud budget over the `x-fuse-budget-usd` header. Verified e2e: header `$999999` + cloud `$0.0001` → 402. Lets an operator tighten a runaway cap centrally. |
 | Cloud kill-switch (kill from cloud) | ✅ done | Control plane: `POST /v1/runs/{run}/kill` + `GET /v1/kills` (per-org), `RunAgg.killed`; dashboard gains a per-run **Kill** button. Gateway: `cloudsink::spawn_kill_poller` fetches `/v1/kills` every 3 s and applies each id to the local kill set → the run is hard-stopped (`402 killed`) across the whole org fleet. `TOKENFUSE_CLOUD_URL` is now a base URL. Verified e2e: kill in cloud → gateway returns 402 `killed`. |
 | Gateway → Cloud telemetry (`CloudSink`) | ✅ done | `crates/gateway/src/cloudsink.rs`: batches settled `CallRecord`s and POSTs them async (periodic flush; since #294 a push that cannot reach the control plane is queued, 10,000 records, oldest dropped first, and replayed in order, invariant 53; since #295 every record carries the unit's `owner`, invariant 54; since #293 the unit ledger seeds its month from `/v1/units` at startup, invariant 52) to the control plane; `TOKENFUSE_CLOUD_URL` + `TOKENFUSE_CLOUD_KEY`, composed via `TeeSink`. `CallRecord` gained `Serialize`. Verified end-to-end: 3 calls → Cloud shows 3 runs / $0.0315. `cloud/docker-compose.yml` runs the whole stack (`docker compose up`). |
@@ -303,15 +304,26 @@ comparison in #132.
 
 **Counts re-measured 2026-09-26**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1529 passing** (core 359, dpop 21, delegation 60,
-gateway 840, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Cloud grew by
+`cargo test --all` runs **1539 passing** (core 359, dpop 21, delegation 60,
+gateway 850, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
+ten more (invariant 66, tokenfuse#296's heartbeat half): five in
+`cloudsink::tests` pinning `cloud_heartbeat_seconds_from`'s parsing
+(`cloud_heartbeat_default_when_unset_or_empty`, `cloud_heartbeat_zero_is_off`,
+`cloud_heartbeat_junk_is_the_default`,
+`cloud_heartbeat_small_positive_values_clamp_to_the_minimum`,
+`cloud_heartbeat_thirty_is_thirty`), and five for `spawn_heartbeat`'s
+behaviour (`an_idle_gateway_sends_a_heartbeat`,
+`a_gateway_with_traffic_sends_no_heartbeat`,
+`a_failed_heartbeat_is_never_queued`, `no_heartbeat_while_the_queue_drains`,
+`heartbeats_off_when_zero`) - see invariant 66 for the red-first evidence.
+Cloud grew by
 twenty more (invariant 65): five in `keys::tests` for the key spec's new
 site segment, nine in `store::tests` for the per-site ingest fold and its
 snapshot persistence, and six HTTP-level tests across
 `crates/cloud/tests/ingest.rs`, `mutations.rs` and `reads.rs` for the new
 `ingest` role and `GET /v1/gateways` - see invariant 65 for every name.
-Gateway grew by
+Gateway also grew by
 six more (invariant 63): three unit tests,
 `defaults::tests::cache_is_off_when_nothing_is_configured`,
 `every_named_cache_mode_is_honoured` and `an_unrecognised_cache_value_is_off_not_a_guess`,
