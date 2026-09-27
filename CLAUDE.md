@@ -4343,3 +4343,74 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `features/a-quiet-gateway-still-says-it-is-alive.feature`, seven, each
     bound. Not a script gate: the rule is `CloudSink::maybe_heartbeat`'s own
     code, held by `cargo test`.)*
+
+67. **A call's cost is rounded once, on the sum, and only toward
+    over-charging.** `ModelPrice::cost` (`crates/core/src/pricing.rs`) prices
+    up to five parts of a usage record (input, output, cache read, cache
+    write, cache write 1h) at their own per-Mtok rate and adds them together.
+    Until this fix each part was divided by 1,000,000, and so floored, on its
+    own, before the parts were summed. Measured on a live cluster
+    2026-09-27: a real `gpt-4o-mini` call, `prompt_tokens 13`,
+    `completion_tokens 2`, was answered `x-fuse-cost-usd: 0.000002`; the price
+    book's $0.15/$0.60 per Mtok rates give 13 x 0.15 + 2 x 0.60 = 3.15
+    micro-USD, not 2 (tokenfuse#341). This function's own doc already names
+    the safe direction as over-charging, since under-charging is what lets a
+    call pass a budget check a correct price would have refused; flooring
+    each part was the opposite of that, on every call with a fractional
+    micro-USD anywhere in it, which is most of them.
+
+    **The fix sums first and rounds once.** Every part's raw numerator
+    (`tokens * price_per_mtok`, not yet divided) is kept in an `i128` and
+    added to the others; only the total is divided by 1,000,000, and a
+    positive remainder rounds that total up by one micro-USD, never down.
+    Rounding per part and rounding the sum are not the same rule even where
+    neither is a floor: two parts each worth exactly half a micro-USD floor
+    to zero apiece and ceil to two apiece, but sum to exactly one whole
+    micro-USD, which only rounding the sum, once, ever lands on.
+
+    **The saturating and clamping behaviour for absurd inputs is unchanged.**
+    A negative total (a misconfigured negative rate, constructible through
+    `ModelPrice`'s public fields) still clamps to zero before any rounding,
+    never ceiling to one. An overflowing token count still saturates at
+    `i64::MAX`: summing five `i128` numerators before dividing is a wider
+    intermediate than the old code's four already-small `i64`s, but `i128`'s
+    range (roughly 1.7e38) is nowhere near what five `saturating_mul`
+    products (each itself capped at `i128::MAX`) can reach, so the sum cannot
+    wrap, and `saturating_add` is used throughout regardless.
+
+    **What was checked for a stored or displayed figure changing meaning.**
+    `estimate.rs`'s margin already applies its own `.ceil()` on top of
+    whatever `PriceBook::cost` returns and does not re-floor anything, so a
+    raw cost that was already a whole micro-USD (every value in its own
+    tests) estimates identically; a raw cost that newly rounds up by one
+    micro-USD would carry that one micro-USD into the margin, which is the
+    fix working as intended, not a regression. `settle.rs`, `router.rs`'s
+    savings figure and every caller under `crates/gateway/src/` call
+    `PriceBook::cost`/`ModelPrice::cost` rather than re-deriving the
+    arithmetic, so they inherit the corrected figure without their own
+    changes. `savings.rs`, `outcomes.rs`, `focusexport.rs` and the Cloud
+    aggregation in `crates/cloud/src/store.rs` all read an already-settled
+    `cost_microusd` off a `CallRecord`; none re-prices from token counts, so
+    none needed a code change, and each now aggregates the corrected,
+    slightly higher, per-call figures. The one pre-existing test whose
+    expected value changed is `a_one_hour_cache_write_is_priced_at_the_one_hour_rate`'s
+    `five_minute_only` case (176,436 to 176,437: 176,436.25 micro-USD ceils
+    up), and `codex_held_seeded_integer_arithmetic_matches_i128_oracle`'s
+    oracle, which had encoded the per-part floor directly and now sums first
+    and rounds once, matching the fix.
+    *(scenarios: `features/a-cost-rounds-once-toward-the-safe-side.feature`,
+    seven, each bound. Tests, `pricing::tests`:
+    `the_measured_gpt_4o_mini_call_ceils_to_four_micro_usd_not_two` (red
+    against the unfixed floor-per-part code: `left: 2 right: 4`),
+    `a_call_whose_every_part_divides_exactly_rounds_nothing`,
+    `two_inexact_parts_that_sum_to_a_whole_micro_usd_round_only_once` (red
+    against the unfixed code: `left: 0 right: 1`),
+    `every_one_of_the_five_priced_parts_is_summed`,
+    `a_large_multi_part_case_sums_exactly_with_no_overflow`, plus the
+    existing `a_negative_rate_never_produces_a_negative_cost`,
+    `an_unpayable_request_saturates_at_the_top_rather_than_wrapping_to_the_bottom`
+    and `every_token_field_saturates_and_the_sum_of_four_maxima_does_not_wrap`,
+    unchanged and still green. Not a script gate: the rule is
+    `ModelPrice::cost`'s own code, held by `cargo test`.)*
+    `@decided 2026-09-27`: a call's cost sums every priced part before
+    dividing, and rounds the sum once, toward over-charging.
