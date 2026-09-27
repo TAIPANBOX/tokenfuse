@@ -304,16 +304,17 @@ comparison in #132.
 
 **Counts re-measured 2026-09-26**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1539 passing** (core 359, dpop 21, delegation 60,
-gateway 850, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1540 passing** (core 359, dpop 21, delegation 60,
+gateway 851, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by
-ten more (invariant 66, tokenfuse#296's heartbeat half): five in
+eleven more (invariant 66, tokenfuse#296's heartbeat half): five in
 `cloudsink::tests` pinning `cloud_heartbeat_seconds_from`'s parsing
 (`cloud_heartbeat_default_when_unset_or_empty`, `cloud_heartbeat_zero_is_off`,
 `cloud_heartbeat_junk_is_the_default`,
 `cloud_heartbeat_small_positive_values_clamp_to_the_minimum`,
-`cloud_heartbeat_thirty_is_thirty`), and five for `spawn_heartbeat`'s
+`cloud_heartbeat_thirty_is_thirty`), and six for `spawn_heartbeat`'s
 behaviour (`an_idle_gateway_sends_a_heartbeat`,
+`an_idle_gateway_heartbeats_once_per_interval`,
 `a_gateway_with_traffic_sends_no_heartbeat`,
 `a_failed_heartbeat_is_never_queued`, `no_heartbeat_while_the_queue_drains`,
 `heartbeats_off_when_zero`) - see invariant 66 for the red-first evidence.

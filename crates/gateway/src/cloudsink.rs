@@ -425,12 +425,12 @@ impl CloudSink {
         }
     }
 
-    /// Spawn the background heartbeat task (invariant 66): ticks every
-    /// `interval` and, if nothing has reached the Cloud in that long, POSTs an
+    /// Spawn the background heartbeat task (invariant 66): whenever a whole
+    /// `interval` has passed since the Cloud last answered anything, POSTs an
     /// empty batch so `GET /v1/gateways` can tell an idle site from a dead
-    /// one. A no-op when `interval` is zero (`TOKENFUSE_CLOUD_HEARTBEAT_SECONDS=0`,
-    /// heartbeats off): `tokio::time::interval` refuses a zero duration, and
-    /// zero is this setting's own "off", not a very fast heartbeat.
+    /// one; an idle gateway therefore pushes once per `interval`. A no-op when
+    /// `interval` is zero (`TOKENFUSE_CLOUD_HEARTBEAT_SECONDS=0`, heartbeats
+    /// off): zero is this setting's own "off", not a very fast heartbeat.
     ///
     /// Only reached when a Cloud is configured, the same condition that builds
     /// a `CloudSink` at all (`main.rs`).
@@ -440,40 +440,70 @@ impl CloudSink {
         }
         let sink = Arc::clone(self);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
             loop {
-                tick.tick().await;
-                sink.maybe_heartbeat(interval).await;
+                // Sleep until exactly one interval after the Cloud last
+                // answered, not to the next tick of a fixed ticker: the
+                // heartbeat's own answer lands a little after it was due, so
+                // a ticker finds "not quite an interval yet" and skips,
+                // doubling the real period (measured live 2026-09-27: a 30 s
+                // setting pushed every ~63 s).
+                tokio::time::sleep(sink.heartbeat_wait(interval)).await;
+                if !sink.maybe_heartbeat(interval).await {
+                    // Nothing answered (the queue is draining, or the Cloud is
+                    // unreachable), so the clock did not move: wait a whole
+                    // interval before asking again rather than spin.
+                    tokio::time::sleep(interval).await;
+                }
             }
         });
+    }
+
+    /// How long until a heartbeat is due: one `interval` after the Cloud last
+    /// answered anything, zero if that moment has passed.
+    fn heartbeat_wait(&self, interval: Duration) -> Duration {
+        let elapsed =
+            self.push.millis_since_epoch() - self.push.last_reached_millis.load(Ordering::SeqCst);
+        let due = interval.as_millis() as i64 - elapsed;
+        if due <= 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(due as u64)
+        }
     }
 
     /// One heartbeat tick's worth of work. Never touches `queue`: a heartbeat
     /// is never queued and never replayed, because queueing it would let a
     /// replay after an outage make a silent site look alive in the past
     /// (invariant 66).
-    async fn maybe_heartbeat(&self, interval: Duration) {
+    ///
+    /// Returns whether the clock is now fresh without a wait: `true` when the
+    /// heartbeat was not due yet (traffic answered in the meantime) or the
+    /// Cloud answered it, accepted or refused; `false` when nothing answered.
+    async fn maybe_heartbeat(&self, interval: Duration) -> bool {
         // The drain itself proves liveness, and racing a heartbeat against it
         // would be a second, redundant answer to the same question.
         if self.queue.is_holding() {
-            return;
+            return false;
         }
-        let elapsed =
-            self.push.millis_since_epoch() - self.push.last_reached_millis.load(Ordering::SeqCst);
-        if elapsed < interval.as_millis() as i64 {
-            return;
+        if !self.heartbeat_wait(interval).is_zero() {
+            return true;
         }
         match self.push.post(&[], &self.unit_owners).await {
-            PushOutcome::Accepted => {}
+            PushOutcome::Accepted => true,
             PushOutcome::Refused(status) => {
-                report_refusal(&self.push.reported, status, &self.push.url)
+                report_refusal(&self.push.reported, status, &self.push.url);
+                true
             }
             // A transport error here is at most a debug line: the queue's own
             // "cannot reach the control plane" warning already tells the
             // operator, and this attempt is simply lost, never queued.
-            PushOutcome::Unreachable(e) => tracing::debug!("cloud telemetry heartbeat failed: {e}"),
+            PushOutcome::Unreachable(e) => {
+                tracing::debug!("cloud telemetry heartbeat failed: {e}");
+                false
+            }
             PushOutcome::Unencodable(e) => {
-                tracing::debug!("cloud telemetry heartbeat encode failed: {e}")
+                tracing::debug!("cloud telemetry heartbeat encode failed: {e}");
+                false
             }
         }
     }
@@ -2380,6 +2410,36 @@ mod tests {
         assert!(
             toggle.bodies.lock().unwrap().is_empty(),
             "the drain itself proves liveness; a heartbeat must not race it"
+        );
+    }
+
+    /// An idle gateway heartbeats once per interval, not once per two. The
+    /// heartbeat's own answer resets the shared clock a few milliseconds
+    /// AFTER the moment it was due, so a fixed ticker that asks "has a whole
+    /// interval passed?" finds it has not, skips, and only fires on the tick
+    /// after: the real period doubles. Measured live on 2026-09-27 before this
+    /// test existed: a 30 s default pushed every ~63 s. Over 5.5 intervals of
+    /// idling, at least 4 heartbeats must arrive (5 is the ideal; the doubled
+    /// period gives 2 or 3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_gateway_heartbeats_once_per_interval() {
+        let _g = log_lock();
+        clear_log();
+
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = Arc::new(CloudSink::with_options(
+            base,
+            "k",
+            Duration::from_millis(200),
+        ));
+        sink.spawn_heartbeat(Duration::from_millis(200));
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let beats = toggle.bodies.lock().unwrap().len();
+        assert!(
+            beats >= 4,
+            "an idle gateway must heartbeat every interval: {beats} heartbeats in 5.5 intervals"
         );
     }
 

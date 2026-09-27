@@ -43,6 +43,12 @@ Feature: A quiet gateway still says it is alive
     When the interval elapses
     Then it POSTs an empty records array to /v1/ingest
 
+  # @test:an_idle_gateway_heartbeats_once_per_interval
+  Scenario: The interval is the period, not half of it
+    Given a gateway with no traffic and a heartbeat interval of N seconds
+    When several intervals elapse
+    Then a heartbeat reaches the Cloud once every N seconds, not once every 2N
+
   # @test:a_gateway_with_traffic_sends_no_heartbeat
   Scenario: Traffic resets the heartbeat clock
     Given a gateway pushing real records more often than the heartbeat interval

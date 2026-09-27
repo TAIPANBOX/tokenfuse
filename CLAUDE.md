@@ -4244,16 +4244,27 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` (default 30, `0` off, read once at
     startup by `cloud_heartbeat_seconds_from_env`, only when a Cloud is
     configured, the same condition that builds a `CloudSink` at all) drives a
-    background task, `CloudSink::spawn_heartbeat`, that ticks every interval
-    and POSTs `{"records": []}` to `{base}/v1/ingest` with the same key and
-    the same push timeout, but only when nothing else has reached the Cloud
-    with an HTTP answer - accepted or refused, either counts - in that long.
+    background task, `CloudSink::spawn_heartbeat`, that POSTs
+    `{"records": []}` to `{base}/v1/ingest` with the same key and the same
+    push timeout whenever a whole interval has passed since anything reached
+    the Cloud with an HTTP answer - accepted or refused, either counts.
     `Pusher::post` marks the shared clock (an `Arc<AtomicI64>` of millis since
     a fixed `Instant`, so the request path never reads the wall clock) the
     moment an answer comes back, whether the push was a real batch, a
     heartbeat, or one popped off the retry queue by the drainer; a push of
     real records therefore resets the clock exactly like a heartbeat would,
     so under traffic no heartbeat is ever sent.
+
+    **The interval is the period, not half of it.** The task sleeps until
+    exactly one interval after the Cloud last answered, never to the next
+    beat of a fixed ticker. The first version ticked every interval and asked
+    "has a whole interval passed?"; the heartbeat's own answer lands a few
+    hundred milliseconds after the tick that sent it, so the next tick found
+    29.7 s of 30 and skipped, and the real period doubled. Measured live on
+    2026-09-27 through the hub entry (stack-k8s `53-hub-entry.yaml`) on a GCP
+    hub with the home site idle: `pushes` rose by one a minute and
+    `last_push` reached 59 s under the 30 s default. No test had caught it,
+    because every test waited for "at least one" heartbeat.
 
     **A misconfigured value is the default, not a guess, and a small one is
     clamped rather than trusted.** Unset or empty is 30; a value that does
@@ -4306,9 +4317,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `cloud_heartbeat_small_positive_values_clamp_to_the_minimum`,
     `cloud_heartbeat_thirty_is_thirty` for the parser;
     `an_idle_gateway_sends_a_heartbeat`,
+    `an_idle_gateway_heartbeats_once_per_interval`,
     `a_gateway_with_traffic_sends_no_heartbeat`,
     `a_failed_heartbeat_is_never_queued`, `no_heartbeat_while_the_queue_drains`
-    and `heartbeats_off_when_zero` for the behaviour. Red first against a
+    and `heartbeats_off_when_zero` for the behaviour.
+    `an_idle_gateway_heartbeats_once_per_interval` was red against the
+    ticker: 3 heartbeats in 5.5 intervals where it requires at least 4. Red first against a
     no-op parser (always returning the default) and a no-op `maybe_heartbeat`
     (returning without posting): `cloud_heartbeat_zero_is_off` read
     `left: 30 right: 0`, `cloud_heartbeat_small_positive_values_clamp_to_the_minimum`
@@ -4326,6 +4340,6 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `maybe_heartbeat` directly with the clock forced stale and a record
     already queued, so it needs no timing race and is deterministic by
     construction. Scenarios:
-    `features/a-quiet-gateway-still-says-it-is-alive.feature`, six, each
+    `features/a-quiet-gateway-still-says-it-is-alive.feature`, seven, each
     bound. Not a script gate: the rule is `CloudSink::maybe_heartbeat`'s own
     code, held by `cargo test`.)*
