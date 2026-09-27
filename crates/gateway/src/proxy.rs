@@ -8814,6 +8814,141 @@ pub(crate) mod tests {
         h
     }
 
+    // -- invariant 69: a DPoP delegation credential never reaches upstream --
+
+    /// A stub upstream that echoes back whichever auth-shaped HTTP headers
+    /// it actually received, driven by a REAL `HttpProvider` rather than a
+    /// hand-built `HeaderMap` passed straight to `HttpProvider::send`: this
+    /// runs the full production forwarding path (`handle` -> `buffered_managed`
+    /// -> `Provider::send`).
+    async fn echo_auth_headers_stub() -> String {
+        async fn echo(headers: HeaderMap) -> axum::Json<serde_json::Value> {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            axum::Json(serde_json::json!({
+                "authorization_seen": get("authorization"),
+                "dpop_seen": get("dpop"),
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/", axum::routing::post(echo));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        format!("http://{addr}")
+    }
+
+    /// The MEASURED defect (2026-09-27, forge k3d lab, tokenfuse v1.4.0, no
+    /// provider key configured), driven through the real handler with a real
+    /// `HttpProvider`, so this exercises the production forwarding code
+    /// rather than a hand-built `HeaderMap` passed straight to
+    /// `HttpProvider::send`: a caller presents a vouchryx-style delegation
+    /// token as `Authorization: DPoP <token>` plus a `dpop` proof.
+    /// `chainproof::resolve` verifies it (the delegation door is configured
+    /// here, `with_chain_proof`), the call is admitted (`x-fuse: managed`),
+    /// and until this fix the SAME `Authorization` header reached the
+    /// upstream, because `provider::FORWARD_HEADERS` includes
+    /// `authorization` for the OpenAI door's pass-through provider key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolved_dpop_delegation_credential_never_reaches_the_provider() {
+        use tokenfuse_delegation::testing::{cfg, proof_at, token, Key};
+
+        let endpoint = echo_auth_headers_stub().await;
+        let (issuer, holder) = (Key::new(), Key::new());
+        let st = state_with_provider(Arc::new(crate::provider::HttpProvider::new(endpoint)))
+            .with_chain_proof(
+                Some(Arc::new(crate::chainproof::Proving {
+                    cfg: cfg(&issuer),
+                    origin: PROVING_ORIGIN.to_string(),
+                })),
+                None,
+            );
+
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-fwd-1",
+        );
+
+        let resp = messages(
+            State(st),
+            proven_headers(&tok, &dpop),
+            Bytes::from(body(100)),
+        )
+        .await;
+        assert_eq!(
+            resp.headers().get("x-fuse").unwrap(),
+            "managed",
+            "the call was not on the managed path this defect is about"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let echoed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            echoed["authorization_seen"], "",
+            "a delegation credential this gateway RESOLVED still reached the \
+             provider: {echoed}"
+        );
+        assert_eq!(
+            echoed["dpop_seen"], "",
+            "the dpop proof reached the provider: {echoed}"
+        );
+    }
+
+    /// The decision this task asked for named explicitly: a DPoP-scheme
+    /// Authorization the gateway did NOT resolve (no delegation issuer
+    /// configured at all, the door entirely off) must still never reach the
+    /// provider. `chainproof::resolve` reads it as `Chain::Claimed` and
+    /// otherwise ignores it in that configuration, but `DPoP` is never a
+    /// provider credential regardless of whether this gateway's own
+    /// delegation feature is even turned on, so the stripping rule in
+    /// `HttpProvider::send` (invariant 69) is a property of the header
+    /// alone, not of `chainproof::resolve`'s outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dpop_authorization_the_gateway_never_resolved_still_does_not_reach_the_provider() {
+        let endpoint = echo_auth_headers_stub().await;
+        // No `.with_chain_proof(..)`: the delegation door is off.
+        let st = state_with_provider(Arc::new(crate::provider::HttpProvider::new(endpoint)));
+
+        let headers = proven_headers("not-a-real-vouchryx-token", "not-a-real-proof");
+        let resp = messages(State(st), headers, Bytes::from(body(100))).await;
+        assert_eq!(
+            resp.headers().get("x-fuse").unwrap(),
+            "managed",
+            "the call was not on the managed path this defect is about"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let echoed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            echoed["authorization_seen"], "",
+            "a DPoP Authorization the delegation door never resolved still \
+             reached the provider: {echoed}"
+        );
+        assert_eq!(
+            echoed["dpop_seen"], "",
+            "the dpop proof reached the provider: {echoed}"
+        );
+    }
+
     /// A conversation whose newest tool result carries an injection.
     fn injected_bytes() -> Bytes {
         Bytes::from(injected_body().to_string())

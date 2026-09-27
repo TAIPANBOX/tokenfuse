@@ -476,6 +476,14 @@ fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Valu
 /// (OpenAI-style bearer auth) or as `x-api-key` (Anthropic's native auth
 /// header; without it Anthropic rejects the request with 401 "x-api-key
 /// header is required" even though `anthropic-version` made it through).
+///
+/// `authorization` is on this list for the OpenAI door's pass-through
+/// credential, `Bearer <provider key>`, and is filtered by scheme rather
+/// than dropped outright: see `is_dpop_scheme` on `send` below (invariant
+/// 69). `dpop`, the MCP door's proof-of-possession header
+/// (`mcpdoor::PROOF_HEADER`), is deliberately absent from this list and
+/// always was — no shipped door ever forwarded it — so this file's own
+/// forwarding never sends it regardless of scheme.
 const FORWARD_HEADERS: &[&str] = &[
     "authorization",
     "x-api-key",
@@ -486,6 +494,28 @@ const FORWARD_HEADERS: &[&str] = &[
     "content-type",
     "accept",
 ];
+
+/// Whether an `Authorization` header's auth-scheme token is `DPoP` (RFC
+/// 9449), read case-insensitively (RFC 7235 §2.1's own rule for auth-scheme
+/// comparisons).
+///
+/// Deliberately its own check rather than a call to
+/// `chainproof::dpop_credential`: that function answers "did this resolve as
+/// a delegation credential this gateway verified" and only recognises the
+/// two exact-cased forms this gateway's own code emits (`DPoP `, `dpop `).
+/// This answers a different and broader question, "could a third party read
+/// this as one at all", which is what decides what may leave the process. A
+/// caller need not spell the scheme the way vouchryx does, an operator need
+/// not have configured a delegation issuer, and `chainproof::resolve` need
+/// not even have been called on this request (the unmanaged pass-through
+/// below never resolves a chain at all) for the answer here to still be
+/// "never forward it" (invariant 69).
+fn is_dpop_scheme(v: &axum::http::HeaderValue) -> bool {
+    v.to_str()
+        .ok()
+        .and_then(|s| s.split_whitespace().next())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("dpop"))
+}
 
 /// Forwards requests to a real upstream endpoint and streams the response back,
 /// parsing usage out of the bytes as they flow.
@@ -538,6 +568,17 @@ impl Provider for HttpProvider {
         let mut req = self.client.post(&self.endpoint).body(body.to_vec());
         for name in FORWARD_HEADERS {
             if let Some(v) = headers.get(*name) {
+                // A DPoP-scheme Authorization is a delegation credential
+                // (RFC 9449 / RFC 8693 §5), never a provider API key,
+                // whatever this gateway's own delegation door made of it:
+                // with no issuer configured `chainproof::resolve` reads it
+                // as `Claimed` and otherwise ignores it, and with one
+                // configured it has already been consumed into a proven or
+                // refused chain by the time this call is dispatched. Either
+                // way it must not leave this process (invariant 69).
+                if *name == "authorization" && is_dpop_scheme(v) {
+                    continue;
+                }
                 req = req.header(*name, v);
             }
         }
@@ -693,6 +734,7 @@ impl Provider for StubProvider {
 mod tests {
     use super::*;
     use crate::pricebook::default_price_book;
+    use axum::http::HeaderValue;
     use tokenfuse_core::{Microusd, ModelPrice};
 
     #[test]
@@ -1153,6 +1195,154 @@ mod tests {
         // No Authorization header was sent in this request, and none should
         // be fabricated.
         assert_eq!(received["authorization"], "");
+    }
+
+    // -- invariant 69: a DPoP delegation credential never reaches upstream --
+
+    /// The MEASURED defect (2026-09-27, forge k3d lab, tokenfuse v1.4.0, no
+    /// provider key configured): a caller presents a vouchryx delegation
+    /// token as `Authorization: DPoP <token>` plus a `dpop` proof header.
+    /// `FORWARD_HEADERS` includes `authorization` for the OpenAI door's
+    /// pass-through provider key, and until this fix the copy loop forwarded
+    /// whatever scheme that header carried, DPoP included. Anthropic
+    /// answered `401 "Invalid bearer token"` on a live gateway: it had
+    /// received the delegation token, not a provider key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dpop_scheme_authorization_is_never_forwarded_to_upstream() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn echo_auth_headers(headers: HeaderMap) -> Json<Value> {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Json(json!({
+                "authorization": get("authorization"),
+                "dpop": get("dpop"),
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/", post(echo_auth_headers));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let provider = HttpProvider::new(format!("http://{addr}"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "DPoP eyJhbGciOiJFUzI1NiJ9.delegation-token.sig"
+                .parse()
+                .unwrap(),
+        );
+        // Not in FORWARD_HEADERS at all (see the const's own doc comment),
+        // so it can never cross regardless of scheme; asserted here anyway
+        // so this one test pins both halves of invariant 69's rule at the
+        // single site that enforces it.
+        headers.insert("dpop", "proof-jwt".parse().unwrap());
+
+        let resp = provider
+            .send(headers, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let mut body = resp.body;
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        let received: Value = serde_json::from_slice(&collected).unwrap();
+
+        assert_eq!(
+            received["authorization"], "",
+            "a DPoP-scheme Authorization reached the upstream provider"
+        );
+        assert_eq!(
+            received["dpop"], "",
+            "the dpop proof header reached the upstream provider"
+        );
+    }
+
+    /// The guard beside it: a genuine pass-through provider key,
+    /// `Authorization: Bearer <key>` (the OpenAI door's own credential),
+    /// must keep working unchanged. Green before and after the fix above;
+    /// if this ever goes red the fix over-corrected into stripping a real
+    /// provider key rather than only a DPoP-scheme one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_provider_forwards_a_bearer_authorization_to_upstream() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn echo_auth_headers(headers: HeaderMap) -> Json<Value> {
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            Json(json!({ "authorization": get("authorization") }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/", post(echo_auth_headers));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let provider = HttpProvider::new(format!("http://{addr}"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer sk-test-openai-key".parse().unwrap(),
+        );
+
+        let resp = provider
+            .send(headers, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let mut body = resp.body;
+        let mut collected = Vec::new();
+        while let Some(chunk) = body.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        let received: Value = serde_json::from_slice(&collected).unwrap();
+        assert_eq!(received["authorization"], "Bearer sk-test-openai-key");
+    }
+
+    /// The scheme check is case-insensitive (RFC 7235 §2.1), independent of
+    /// `chainproof::dpop_credential`'s own narrower, exact-cased parsing.
+    #[test]
+    fn dpop_scheme_check_is_case_insensitive() {
+        for scheme in ["DPoP", "dpop", "DPOP", "Dpop", "dPoP"] {
+            let v: HeaderValue = format!("{scheme} sometoken").parse().unwrap();
+            assert!(
+                is_dpop_scheme(&v),
+                "{scheme:?} was not read as the DPoP auth-scheme"
+            );
+        }
+        for not_dpop in ["Bearer sometoken", "DPoPX sometoken", "DPo sometoken"] {
+            let v: HeaderValue = not_dpop.parse().unwrap();
+            assert!(
+                !is_dpop_scheme(&v),
+                "{not_dpop:?} was wrongly read as the DPoP auth-scheme"
+            );
+        }
+        assert!(!is_dpop_scheme(&HeaderValue::from_static("")));
     }
 
     // -- invariant 55: usage is read from SSE events, not from lines (F06) -
