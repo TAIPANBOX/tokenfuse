@@ -744,7 +744,16 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             .get(crate::mcpdoor::PROOF_HEADER)
             .and_then(|v| v.to_str().ok()),
         "POST",
-        "/v1/messages",
+        // The door this call actually arrived on, not a literal. Until
+        // 2026-09-27 this named `/v1/messages` regardless of `wire`: on a
+        // gateway serving the OpenAI door (`/v1/chat/completions`), shared by
+        // this same `handle` per invariant 55's parameterisation, a proof
+        // correctly naming the real path was refused (`htu` compared against
+        // the wrong URL), and a proof naming `/v1/messages` was wrongly
+        // accepted there instead. `wire` is guaranteed to equal `st.wire` by
+        // this point (the mismatch guard above already refused otherwise),
+        // so `wire.route_path()` is always this request's own door.
+        wire.route_path(),
         &declared_chain,
         chain_now,
         crate::revocations::hook(&st.revocations, chain_now),
@@ -755,8 +764,8 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
     let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
     let (on_behalf_of_chain, delegation_proof) = match resolved {
         crate::chainproof::Chain::Refused(why) => {
-            tracing::warn!(reason = ?why, "proxy: refused a delegation token");
-            return unauthorized_response();
+            crate::chainproof::log_delegation_refusal("proxy", why);
+            return delegation_refused_response();
         }
         crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
         crate::chainproof::Chain::Claimed(chain) => (chain, None),
@@ -2441,6 +2450,51 @@ pub(crate) fn unauthorized_response() -> Response {
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "application/json")
         .header("x-fuse", "unauthorized")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// `401` for a request whose delegation proof (`chainproof::resolve`) was
+/// refused: a bad signature, an expired or revoked token, a token bound to a
+/// key the caller does not hold, or a declared chain that contradicted the
+/// verified one.
+///
+/// # Why this is not `unauthorized_response()`
+///
+/// Found live 2026-09-27: a delegation door configured with no client keys at
+/// all still answered a refused delegation proof with "this gateway requires
+/// a client credential in the `x-fuse-key` header", which sends a caller with
+/// a delegation problem to fix a header that was never in play. The wire must
+/// still not distinguish WHICH refusal this was, the same reason
+/// `chainproof::resolve`'s own module doc gives for folding nine causes into
+/// one: narrating which of several checks failed to the CALLER is an oracle.
+/// This response is that single, cause-free answer, just spelled so it names
+/// the actual credential that was refused.
+///
+/// Shared by `mcpbroker`'s classic delegation-chain check for the same
+/// reason `unauthorized_response` is shared: one function, so the two doors
+/// cannot drift apart on the wording. The MCP broker's OWN door credential
+/// (`mcpdoor::admit`'s bearer key / proof-of-possession refusal) and its XAA
+/// bearer-token refusal are unaffected and keep answering through
+/// `mcpbroker::unauthorized`, which still wraps `unauthorized_response()`:
+/// both of those really are refusals of a credential presented AT that door,
+/// and invariant 62 already documents every 401 on that broker, XAA included,
+/// as deliberately sharing the client-credential shape (with
+/// `WWW-Authenticate` added). This function is for the one case that is not
+/// about a door credential at all: a chain PROOF, judged by `chainproof`,
+/// shared by both the LLM proxy and the MCP broker's classic door.
+pub(crate) fn delegation_refused_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "delegation_refused",
+            "reason": "the delegation proof presented with this request was refused",
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-fuse", "delegation_refused")
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }
@@ -8886,6 +8940,140 @@ pub(crate) mod tests {
             "agreement was recorded as a mismatch"
         );
         std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+    }
+
+    /// A refused delegation token used to be answered with the client-key
+    /// door's own 401: "this gateway requires a client credential in the
+    /// `x-fuse-key` header". Found live 2026-09-27 on a gateway with
+    /// `TOKENFUSE_DELEGATION_ISSUER`/`JWKS`/`AUDIENCE`/`URL`/`REVOCATIONS` set
+    /// and NO client keys configured at all: the caller's problem was a
+    /// delegation proof, and the answer sent it to configure a header that
+    /// was never in play. The wire must still not distinguish WHICH refusal
+    /// this was (`chainproof::resolve`'s own rule), so this only checks the
+    /// message no longer names `x-fuse-key` and carries its own `type`.
+    #[tokio::test]
+    async fn a_refused_delegation_token_is_not_told_to_fix_a_client_credential() {
+        use tokenfuse_delegation::testing::{proof_at, Key};
+        let (st, _issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let now = crate::sink::now_millis() / 1000;
+        // Signed by a key the configured issuer never published: BadSignature.
+        let forger = Key::new();
+        let tok = tokenfuse_delegation::testing::token(
+            &forger,
+            &holder,
+            now,
+            serde_json::json!({"exp": now + 300}),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-forged",
+        );
+        let headers = proven_headers(&tok, &dpop);
+
+        let res = messages(State(st), headers, injected_bytes()).await;
+        assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["type"], "delegation_refused",
+            "a refused delegation proof must carry its own type, not the client-key \
+             door's: {body}"
+        );
+        let reason = body["error"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            !reason.contains("x-fuse-key") && !reason.contains("client credential"),
+            "a caller with a delegation problem must not be told to fix a header \
+             that was never in play: {body}"
+        );
+    }
+
+    /// invariant 68, layer 1: the operator's log used to fold all nine
+    /// `tokenfuse_delegation::Refusal` causes into one `reason=BadToken`, so a
+    /// forged signature and a revoked, otherwise-valid token read identically.
+    /// This drives both through the real door and asserts the log line names
+    /// each cause distinctly, never the token itself.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        use tokenfuse_delegation::testing::{proof_at, token, Key};
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let now = crate::sink::now_millis() / 1000;
+
+        // A token vouchryx would have minted with jti "tok-1", now revoked.
+        let mut revocations = tokenfuse_delegation::revocations::Revocations::new(
+            tokenfuse_delegation::revocations::DEFAULT_MAX_AGE_SECS,
+            tokenfuse_delegation::revocations::FailMode::Open,
+        );
+        revocations.install(
+            tokenfuse_delegation::revocations::Snapshot {
+                revocations: vec![tokenfuse_delegation::revocations::Revocation {
+                    jti: "tok-1".to_string(),
+                    ..Default::default()
+                }],
+                as_of: now + 1,
+            },
+            now,
+        );
+        let chain_proof = st.chain_proof.clone();
+        let st = st.with_chain_proof(
+            chain_proof,
+            Some(Arc::new(std::sync::RwLock::new(revocations))),
+        );
+        let revoked_tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({"jti": "tok-1", "exp": now + 300}),
+        );
+        let revoked_dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-revoked",
+        );
+        let res = messages(
+            State(st.clone()),
+            proven_headers(&revoked_tok, &revoked_dpop),
+            injected_bytes(),
+        )
+        .await;
+        assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // A different token, signed by a key the issuer never published.
+        let forger = Key::new();
+        let forged_tok = token(&forger, &holder, now, serde_json::json!({"exp": now + 300}));
+        let forged_dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-forged-2",
+        );
+        let res = messages(
+            State(st),
+            proven_headers(&forged_tok, &forged_dpop),
+            injected_bytes(),
+        )
+        .await;
+        assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        assert!(
+            log.contains("Revoked"),
+            "the revoked token's cause must be in the log: {log}"
+        );
+        assert!(
+            log.contains("BadSignature"),
+            "the forged token's cause must be in the log, distinct from the \
+             revoked one's: {log}"
+        );
     }
 
     /// The blast radius of turning `TOKENFUSE_IDENTITY_STRICT` on by default,

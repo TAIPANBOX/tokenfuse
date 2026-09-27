@@ -741,6 +741,29 @@ fn unauthorized(st: &BrokerState) -> Response {
     resp
 }
 
+/// The classic door's delegation-chain refusal (`chainproof::resolve`'s
+/// `Chain::Refused`), which is a chain PROOF failing, never the broker's own
+/// door credential: `unauthorized` above answers those. Until this existed
+/// both shared `unauthorized`'s wording, so a caller whose delegation token
+/// was refused, on a broker that never configured `TOKENFUSE_MCP_KEYS`, was
+/// told to fix a client credential that was never in play (the same defect
+/// `proxy::delegation_refused_response`'s doc names on the LLM door).
+///
+/// Still carries `WWW-Authenticate` when XAA is on, same as `unauthorized`:
+/// invariant 62's "every 401 this broker gives while XAA is on carries
+/// `WWW-Authenticate`" is about the HEADER, not about which body accompanies
+/// it, and this is still a refusal an OAuth client may want pointed at the
+/// resource metadata.
+fn delegation_refused(st: &BrokerState) -> Response {
+    let mut resp = crate::proxy::delegation_refused_response();
+    if let Some(xaa) = &st.xaa {
+        if let Ok(v) = HeaderValue::from_str(&crate::xaadoor::www_authenticate_value(xaa)) {
+            resp.headers_mut().insert(WWW_AUTHENTICATE, v);
+        }
+    }
+    resp
+}
+
 /// `Authorization: Bearer <credential>`, trimmed, `None` if blank or if the
 /// scheme is not `bearer`. The scheme is matched case-insensitively (RFC
 /// 7235 section 2.1: `auth-scheme` is a token, and tokens are compared
@@ -1011,10 +1034,11 @@ async fn handle(
     let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
     let (on_behalf_of, delegation_proof) = match resolved {
         crate::chainproof::Chain::Refused(why) => {
-            // The same 401 the door gives, for the same reason: which refusal
-            // it was is an oracle, and the operator's log is where it belongs.
-            tracing::warn!(reason = ?why, "mcp broker: refused a delegation token");
-            return unauthorized(&st);
+            // The wire answer is cause-free and no longer the door's own
+            // client-credential 401 (see `proxy::delegation_refused_response`);
+            // the operator's log still gets the precise cause.
+            crate::chainproof::log_delegation_refusal("mcp_broker", why);
+            return delegation_refused(&st);
         }
         crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
         crate::chainproof::Chain::Claimed(chain) => (chain, None),

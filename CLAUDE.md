@@ -4414,3 +4414,74 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `ModelPrice::cost`'s own code, held by `cargo test`.)*
     `@decided 2026-09-27`: a call's cost sums every priced part before
     dividing, and rounds the sum once, toward over-charging.
+
+68. **A refused delegation proof is answered by its own name, and the
+    operator's log keeps what the wire will not say.** Measured live
+    2026-09-27 on a gateway with `TOKENFUSE_DELEGATION_ISSUER`/`JWKS`/
+    `AUDIENCE`/`URL`/`REVOCATIONS` set and no client keys configured at all:
+    a vouchryx-issued, DPoP-bound delegation token that `chainproof::resolve`
+    refused was answered with the client-key door's own 401, "this gateway
+    requires a client credential in the `x-fuse-key` header" - a header that
+    was never in play, on a caller whose problem was the delegation proof.
+    Both the LLM proxy (`/v1/messages`, `/v1/chat/completions`) and the MCP
+    broker's classic door share `Chain::Refused(why)` from one call, so both
+    shared the wrong answer.
+
+    The wire still answers every cause the SAME way, `resolve`'s own rule for
+    the reason its module doc already gives: narrating which of nine checks
+    failed to the caller is an oracle. What moved is the WORDING and the
+    `type`: `delegation_refused`, naming no client credential and no
+    `x-fuse-key`, shared by both doors through one function so they cannot
+    drift apart. The MCP broker's own door credential (a bad `x-fuse-key`, a
+    bad proof of possession) and its XAA bearer-token refusal are unaffected
+    and keep answering through the broker's existing client-credential 401;
+    invariant 62 already documents every 401 that broker gives while XAA is
+    on as deliberately sharing that shape (with `WWW-Authenticate` added),
+    and this leaves that alone.
+
+    The OPERATOR's log is a different question, and it used to fold all nine
+    `tokenfuse_delegation::Refusal` causes into one `reason=BadToken`, so a
+    revoked token and a forged signature were the same line. The cause now
+    travels with the refusal (`ChainRefusal::BadToken` carries the
+    `Refusal`) and the log names it, never the token itself; no agent-event
+    carries this refusal at either door (matching the bearer door, invariant
+    30's own "where it says nothing"), so nothing else needed a matching
+    change.
+
+    A third, unrelated defect surfaced while reading this path: `handle` is
+    the one function both the Anthropic and the OpenAI doors are served
+    through (invariant 55), and it built the URL a proof's `htu` is checked
+    against from a literal `"/v1/messages"` regardless of which door the
+    request actually arrived on. A correct proof for the OpenAI door,
+    naming `/v1/chat/completions`, was refused; a proof naming the WRONG
+    door's path, `/v1/messages`, was wrongly accepted there instead. Each
+    wire's own `route_path()` is now what its proof is checked against.
+    `mcpbroker::handle` was never affected: it already passed the real
+    request path (`uri.path()`), not a literal.
+    *(test: `proxy::tests::a_refused_delegation_token_is_not_told_to_fix_a_client_credential`
+    and `proxy::tests::a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause`,
+    both run against the unfixed tree first:
+    `a_refused_delegation_token_is_not_told_to_fix_a_client_credential` read
+    `left: "unauthorized" right: "delegation_refused"`, with the reason
+    quoting "this gateway requires a client credential in the `x-fuse-key`
+    header" in full; `a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause`
+    found every one of three captured log lines reading
+    `reason=BadToken`, none naming `Revoked` or `BadSignature`.
+    `tests/mcp_broker.rs::a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential`
+    is the same test at the MCP door, red the same way. `tests/delegation_htu_matches_wire.rs`
+    holds the third finding: `a_proof_naming_the_real_openai_path_is_accepted_on_the_openai_door`
+    was red `left: 401 right: 200` and `a_proof_naming_the_anthropic_path_is_refused_on_the_openai_door`
+    was red the other way, `left: 200 right: 401`, against the unfixed literal;
+    `a_proof_naming_the_real_anthropic_path_is_accepted_on_the_anthropic_door`
+    and `a_proof_naming_the_openai_path_is_refused_on_the_anthropic_door` are
+    the guards, green on both sides, proving the fix did not just move the
+    bug from one door to the other. Scenarios:
+    `features/a-delegation-refusal-names-itself.feature` (three) and
+    `features/a-delegation-proofs-htu-matches-its-own-wire.feature` (four),
+    each bound. Not a script gate: the rule is `chainproof::resolve`'s own
+    callers, held by `cargo test`.)*
+
+    `@decided 2026-09-27`: a refused delegation proof gets its own wire
+    answer, distinct from the client-credential door, while staying just as
+    cause-free to the caller; the operator's log is not held to that same
+    silence.

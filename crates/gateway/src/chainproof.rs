@@ -134,8 +134,12 @@ pub enum Chain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainRefusal {
-    /// A token was presented and did not verify.
-    BadToken,
+    /// A token was presented and did not verify. Carries the delegation
+    /// crate's own [`Refusal`], so the OPERATOR's log can tell a revoked
+    /// token from a forged one; the WIRE must still answer both the same way
+    /// (see `proxy::delegation_refused_response`), which is why this is never
+    /// matched on outside a `tracing::warn!` field.
+    BadToken(Refusal),
     /// A token verified and the caller also declared a different chain.
     Contradicted,
 }
@@ -184,7 +188,7 @@ pub fn resolve(
         // wildcard, so a variant added to `Refusal` later fails to compile here
         // instead of silently joining this arm.
         Err(
-            Refusal::Malformed
+            reason @ (Refusal::Malformed
             | Refusal::BadSignature
             | Refusal::Issuer
             | Refusal::Audience
@@ -192,8 +196,8 @@ pub fn resolve(
             | Refusal::NotBound
             | Refusal::NoProof
             | Refusal::WrongKey
-            | Refusal::Revoked,
-        ) => return Chain::Refused(ChainRefusal::BadToken),
+            | Refusal::Revoked),
+        ) => return Chain::Refused(ChainRefusal::BadToken(reason)),
     };
 
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
@@ -256,6 +260,30 @@ pub fn proven_actor(chain: &Chain) -> Option<&str> {
         leaf.strip_prefix("agent://")
             .is_some_and(|rest| !rest.is_empty())
     })
+}
+
+/// One warn line for a refused delegation chain, shared by both doors so
+/// neither logs a shape the other does not.
+///
+/// The wire answer both doors give (`proxy::delegation_refused_response`) is
+/// deliberately cause-free: `resolve`'s own module doc gives the reason, and
+/// folding nine `Refusal` variants into one `ChainRefusal::BadToken` used to
+/// fold them again here, so an operator saw `reason=BadToken` for a forged
+/// signature and for a revoked, otherwise-valid token alike. This carries the
+/// precise cause instead, at `warn`, and never the token itself.
+pub(crate) fn log_delegation_refusal(door: &'static str, why: ChainRefusal) {
+    match why {
+        ChainRefusal::BadToken(cause) => {
+            tracing::warn!(door, ?cause, "refused a delegation token");
+        }
+        ChainRefusal::Contradicted => {
+            tracing::warn!(
+                door,
+                "refused a delegation token: the declared chain contradicted \
+                 the verified one"
+            );
+        }
+    }
 }
 
 /// Order AND membership. Compared both ways on purpose: an equal-length
@@ -610,7 +638,10 @@ mod tests {
             "agent://acme/triage".to_string(),
         ]);
         assert_eq!(proven_actor(&claimed), None);
-        assert_eq!(proven_actor(&Chain::Refused(ChainRefusal::BadToken)), None);
+        assert_eq!(
+            proven_actor(&Chain::Refused(ChainRefusal::BadToken(Refusal::Expired))),
+            None
+        );
     }
 
     /// A token with no `act` is a person calling directly. The last element is
