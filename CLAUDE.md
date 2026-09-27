@@ -4743,3 +4743,89 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     run measured the unit seed. And exactly as invariant 52's own text says
     of the unit seed: startup only, no refresh, no retry; a Cloud unreachable
     at startup leaves every run's seed unstaged until the next restart.
+
+71. **A queue a drain is still responsible for is never raced by a fresh
+    send.** tokenfuse#344's CI ran
+    `cloudsink::tests::the_cap_drops_the_oldest_and_says_so_once` once and it
+    failed: the first record the control plane received back was `r05646`
+    where `r00026` was expected, a later batch delivered before an earlier
+    one. A rerun passed; 75 local repeats of the same test did not reproduce
+    it. The cause is real and was found by reading, then reproduced
+    deterministically, not by chasing the timing.
+
+    `CloudSink::ship` decided whether to append behind the queue or send
+    directly by asking `Queue::is_holding()` alone, `!records.is_empty()`.
+    But `drain()`'s own loop calls `pop_front_chunk` BEFORE it knows whether
+    that chunk's `post` will succeed, so `records` reads empty for the whole
+    `.await` of that one POST even though a chunk is still, in every sense
+    that matters, in flight and will be pushed back to the FRONT on failure.
+    A `ship()` call landing in that exact window read "nothing queued" and
+    took the fast path too: an independent, unordered POST racing the
+    drain's own retry to call `push_front_capped` last. Both push to the
+    front; whichever call happens LAST wins that position, so a batch queued
+    LATER, if its own attempt resolved after the drain's, landed in front of
+    one already in flight - not a corruption, a genuine race between two
+    equally valid-looking "nothing is queued right now" reads.
+
+    Under 10,000-plus queued records and roughly 500 concurrent `flush()`
+    calls (the cap test's own shape, `tokenfuse#344`'s CI run), `drain()`'s
+    loop pops and retries a chunk on every failed POST for as long as the
+    control plane stays down, opening this exact window over and over; the
+    fault needs one of those windows to overlap a fresh `ship()` call
+    closely enough that the fast path's own network round trip resolves
+    after the drain's retry does, which real localhost TCP timing usually
+    does not do, and occasionally does. That is why one CI run hit it and 75
+    local repeats did not: neither number says anything about whether the
+    race exists, only about how often this machine's scheduler lines the two
+    up.
+
+    `ship()` now also checks `draining`, which `drain()` holds `true` for
+    its entire loop, every pop/post/push-back cycle included, not only while
+    `records` happens to be non-empty. That closes exactly the window: while
+    a drain is responsible for the queue, every new batch queues behind it
+    instead of racing it. `draining` already existed as the single-flight
+    guard for `drain()` itself (invariant 53); this reuses it rather than
+    adding a second flag; the two fields answer two different questions
+    (drain running vs. queue non-empty) and needed both checked together,
+    not one relabelled as the other.
+
+    **Not "always queue, never send directly", which was considered and
+    is wrong.** That would close the race too, by removing the fast path
+    entirely, but it also removes the property `record_and_flush_return_without_waiting_for_the_control_plane`
+    already pins: a send that is merely SLOW (not yet failed) must stay
+    outside the queue, in flight in the background, so `queued()` reads 0
+    while up to `BATCH`-sized bursts run concurrently against the network.
+    Routing every send through the single-flight drainer would serialise
+    them, changing the healthy-path throughput this design keeps the fast
+    path for, and that test would start failing for a different reason: a
+    stalled send would sit inside `records` rather than in flight beside it.
+    `draining` is checked because it is exactly the fact `is_holding()`
+    alone could not see, not because the fast path itself was the fault.
+
+    **Where it says nothing.** Two `ship()` calls that are both the FIRST
+    ever send of a fresh outage (no drain has started yet, so `draining` is
+    still `false` for both) can still race each other directly: this fix
+    does not reach that window, only the far wider and, on this evidence,
+    the actually-hit one inside an ongoing drain's own retry loop. The
+    existing "cause the outage with ONE batch and wait for `queued() ==
+    BATCH` before pushing the batches whose order is asserted" rule these
+    tests already followed is what keeps that narrower race out of the
+    suite's own way; a caller outside this test file that fires two
+    concurrent first sends of an outage is not covered by this fix.
+    *(test: `cloudsink::tests::a_ship_call_while_a_drain_is_in_progress_appends_rather_than_racing_it`,
+    deterministic and network-free: sets `draining` directly (the exact
+    state `drain()`'s own loop holds for its whole span, not only while
+    `records` is non-empty) and asserts `ship()` appended synchronously
+    before yielding to any spawned task. Red first against the unfixed
+    `is_holding()`-only check: `left: 0 right: 1` (nothing was queued; the
+    call had silently taken the fast path instead).
+    `cloudsink::tests::a_ship_call_with_no_drain_in_progress_still_takes_the_fast_path`
+    is the guard, green on both sides, proving the fix does not fall back to
+    "always queue" (see above). Both pass on `origin/main` at `6a63927` in
+    their compiled form (the fields they read already existed), so the red
+    run above is by assertion, not by compile. Every existing test in
+    `cloudsink::tests` (650 in the crate's `--lib` suite) stayed green,
+    including 20 repeats of `the_cap_drops_the_oldest_and_says_so_once`
+    itself run individually after the fix landed, none of them the
+    once-per-many-runs failure CI happened to hit. Not a script gate: the
+    rule is `CloudSink::ship`'s own condition, held by `cargo test`.)*
