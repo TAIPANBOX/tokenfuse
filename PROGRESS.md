@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-09-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1545 passing** (core 364, dpop 21, delegation 60,
-gateway 851, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1552 passing** (core 364, dpop 21, delegation 60,
+gateway 858, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by five
 more (invariant 67, tokenfuse#341's rounding fix): `crates/core/src/pricing.rs`'s
 `ModelPrice::cost` summed each of five priced parts to `i64` and floored it
@@ -322,6 +322,11 @@ the unfixed code, `left: 2 right: 4`),
 against the unfixed code, `left: 0 right: 1`),
 `every_one_of_the_five_priced_parts_is_summed`, and
 `a_large_multi_part_case_sums_exactly_with_no_overflow`. Gateway grew by
+seven more (invariant 68): `proxy::tests::a_refused_delegation_token_is_not_told_to_fix_a_client_credential`
+and `proxy::tests::a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause`
+in the lib suite, `tests/mcp_broker.rs::a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential`,
+and the four in `tests/delegation_htu_matches_wire.rs` - see invariant 68 for
+the red-first evidence. Gateway also grew by
 eleven more (invariant 66, tokenfuse#296's heartbeat half): five in
 `cloudsink::tests` pinning `cloud_heartbeat_seconds_from`'s parsing
 (`cloud_heartbeat_default_when_unset_or_empty`, `cloud_heartbeat_zero_is_off`,

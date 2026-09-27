@@ -1975,6 +1975,70 @@ async fn a_token_and_a_header_that_disagree_are_refused_rather_than_reconciled()
     );
 }
 
+/// The classic MCP door shares `chainproof::resolve` with the LLM proxy
+/// (`chainproof::log_delegation_refusal` says so, and both call sites do), so
+/// the same defect the LLM door had applies here too: a refused delegation
+/// token used to be answered with `TOKENFUSE_MCP_KEYS`'s own 401, "this
+/// gateway requires a client credential in the `x-fuse-key` header" - wrong
+/// even for a broker that never configured that variable at all, which this
+/// fixture (`broker_proving`) does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential() {
+    use tokenfuse_delegation::testing::{proof_at, token, Key};
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, _seen) = capturing_pdp("allow").await;
+    let (router, _issuer, holder) = broker_proving(upstream, pdp);
+    let broker_url = spawn_server(router).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    // Signed by a key the configured issuer never published: BadSignature.
+    let forger = Key::new();
+    let tok = token(
+        &forger,
+        &holder,
+        now,
+        json!({"sub": "user://acme.example/alice"}),
+    );
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("authorization", format!("DPoP {tok}"))
+        .header(
+            tokenfuse_gateway::mcpdoor::PROOF_HEADER,
+            proof_at(
+                &holder,
+                now,
+                "POST",
+                "https://tokenfuse.acme.example/",
+                "p-forged-mcp",
+            ),
+        )
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": {} }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["type"], "delegation_refused",
+        "the MCP door's delegation-chain refusal must carry its own type, not the \
+         broker's own door-credential one: {body}"
+    );
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("x-fuse-key") && !reason.contains("client credential"),
+        "a caller with a delegation problem must not be told to fix a header \
+         that was never in play: {body}"
+    );
+}
+
 /// The broker half of the record, which had no test at all.
 ///
 /// Measured 2026-08-26: `emit_tool_call` passed `None` for the chain while the
