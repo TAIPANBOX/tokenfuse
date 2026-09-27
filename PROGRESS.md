@@ -304,7 +304,7 @@ comparison in #132.
 
 **Counts re-measured 2026-09-27**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1580 passing** (core 370, dpop 21, delegation 60,
+`cargo test --all` runs **1582 passing** (core 372, dpop 21, delegation 60,
 gateway 880, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core and gateway
 grew with invariant 70 (a restarted gateway seeds each run's spend from the

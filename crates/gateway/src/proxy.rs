@@ -562,7 +562,7 @@ pub async fn chat_completions(
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`
 /// rather than calling this directly - see `tests/wire_door.rs`.
-/// Invariant 69: credit a run's Cloud-known spend the moment it is opened
+/// Invariant 70: credit a run's Cloud-known spend the moment it is opened
 /// fresh in this process, before anything else touches its ledger state.
 /// Called only where the caller has already established the run had no
 /// snapshot a moment ago (a fresh `open_run`, never a run already open
@@ -677,7 +677,7 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
             }
         }
     }
-    // Invariant 69: this must be checked BEFORE `open_run` below, since
+    // Invariant 70: this must be checked BEFORE `open_run` below, since
     // `open_run` itself creates a fresh, zero-spend entry the instant it
     // sees a run_id this process has never opened; the snapshot read after
     // that point can no longer tell "just opened, never seen before" apart

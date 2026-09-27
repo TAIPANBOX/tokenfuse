@@ -1196,7 +1196,7 @@ async fn serve() {
                     stb.set_cloud_budgets(budgets);
                 },
             );
-            // Invariant 69: stage this org's Cloud-known per-run spend so a
+            // Invariant 70: stage this org's Cloud-known per-run spend so a
             // run this gateway opens fresh (its first admission since this
             // process started) is checked against that spend plus whatever
             // is settled from here on, instead of silently starting at

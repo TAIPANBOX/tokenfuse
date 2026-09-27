@@ -865,7 +865,7 @@ async fn seed_unit_ledger_within(
 /// `/v1/runs` already supports `since_millis` (its own `RunsQuery`).
 const RUN_SEED_WINDOW_MILLIS: i64 = 31 * 24 * 60 * 60 * 1000;
 
-/// Invariant 69: the most `GET /v1/runs` may answer with for the seed, the
+/// Invariant 70: the most `GET /v1/runs` may answer with for the seed, the
 /// same defence `SEED_MAX_BODY_BYTES` gives the unit seed and for the same
 /// reason: the answer is untrusted input arriving at startup, and it must
 /// not decide how much this process allocates. `/v1/runs` has no per-org cap
