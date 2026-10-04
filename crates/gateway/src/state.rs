@@ -95,6 +95,18 @@ pub struct AppState {
     /// entry and the caller credits it via `LedgerBackend::seed_spend`.
     /// Empty unless cloud mode is on; never repopulated after startup.
     run_seed: Arc<Mutex<HashMap<String, Microusd>>>,
+    /// The operator's ceiling on any run budget the CALLER or a default
+    /// chose (`TOKENFUSE_MAX_RUN_BUDGET_USD`, invariant 73). `None` (unset)
+    /// is the historical behaviour: a run's budget is whatever the caller's
+    /// `x-fuse-budget-usd` header, the policy default or the built-in $5
+    /// says. A Cloud-managed budget is the operator's own word and is never
+    /// clamped by it.
+    pub max_run_budget: Option<Microusd>,
+    /// Runs whose clamp has already been logged, so the line is once per run
+    /// and not once per call. Bounded: past `CLAMP_LOG_CAP` entries the set
+    /// is cleared and a run may log once more, which costs a repeated line
+    /// and never memory.
+    budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
@@ -141,6 +153,10 @@ pub struct AppState {
     /// body the upstream cannot read.
     pub wire: crate::wire::Wire,
 }
+
+/// How many runs the once-per-run clamp log remembers before it starts over.
+/// Run ids are caller-chosen, so the set cannot be allowed to grow with them.
+pub const CLAMP_LOG_CAP: usize = 8192;
 
 /// The one label no review can take off a run.
 ///
@@ -559,6 +575,8 @@ impl AppState {
             taint: Arc::new(TaintStore::default()),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             run_seed: Arc::new(Mutex::new(HashMap::new())),
+            max_run_budget: None,
+            budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
             events: Arc::new(EventExporter::disabled()),
             agent_id_mode: crate::agentids::AgentIdMode::default(),
             client_keys: Arc::new(ClientKeys::default()),
@@ -606,6 +624,24 @@ impl AppState {
     /// The Cloud-managed budget for a run, if one has been set.
     pub fn cloud_budget(&self, run_id: &str) -> Option<Microusd> {
         self.cloud_budgets.lock().unwrap().get(run_id).copied()
+    }
+
+    /// Set the operator's ceiling on a caller-chosen run budget (invariant
+    /// 73). Chainable. `None` leaves every budget as the caller declared it.
+    pub fn with_max_run_budget(mut self, ceiling: Option<Microusd>) -> Self {
+        self.max_run_budget = ceiling;
+        self
+    }
+
+    /// Record that `run_id`'s budget was clamped to the ceiling and say
+    /// whether this is the first time this process has noted it, so the
+    /// caller logs once per run rather than once per call.
+    pub fn note_budget_clamp(&self, run_id: &str) -> bool {
+        let mut seen = self.budget_clamp_logged.lock().unwrap();
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains(run_id) {
+            seen.clear();
+        }
+        seen.insert(run_id.to_string())
     }
 
     /// Replace the full pending run-seed map (the startup seed, invariant
@@ -939,5 +975,26 @@ mod block_ledger_tests {
         st.note_blocks("r", &trimmed);
         // The turn after, the head is back.
         assert!(st.split_history("r", &full).unreviewed.is_empty());
+    }
+
+    /// The once-per-run clamp log must not grow with caller-chosen run ids:
+    /// a run is noted once, a second note is not news, and the set starts
+    /// over at the cap instead of growing past it.
+    #[test]
+    fn the_clamp_log_notes_a_run_once_and_stays_bounded() {
+        use tokenfuse_core::{Ledger, Policy, PriceBook};
+        let st = AppState::new(
+            Arc::new(Ledger::new()),
+            Arc::new(PriceBook::new()),
+            Arc::new(Policy::default()),
+            Arc::new(crate::provider::StubProvider::default()),
+            "t",
+        );
+        assert!(st.note_budget_clamp("a"));
+        assert!(!st.note_budget_clamp("a"));
+        for i in 0..(CLAMP_LOG_CAP * 2) {
+            st.note_budget_clamp(&format!("run-{i}"));
+        }
+        assert!(st.budget_clamp_logged.lock().unwrap().len() <= CLAMP_LOG_CAP);
     }
 }

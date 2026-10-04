@@ -304,9 +304,12 @@ comparison in #132.
 
 **Counts re-measured 2026-10-04**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1587 passing** (core 372, dpop 21, delegation 60,
-gateway 885, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by three
+`cargo test --all` runs **1604 passing** (core 372, dpop 21, delegation 60,
+gateway 902, cloud 248, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 17
+with invariant 73 (`TOKENFUSE_MAX_RUN_BUDGET_USD`, the operator's ceiling on a run
+budget the caller declares: 3 in `defaults`, 10 in `proxy`, 1 in `state`, 3 in
+`tests/run_budget_ceiling_startup.rs`). Gateway grew by three
 with invariant 72 (a mistyped `TOKENFUSE_MODE` refuses to start). Core and gateway
 grew with invariant 70 (a restarted gateway seeds each run's spend from the
 Cloud before its first admission, tokenfuse#346). Gateway grew by

@@ -4851,3 +4851,72 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `left: Ok(Shadow) right: Ok(Enforce)` for `"Enforce"`; the old match is
     both mutants at once (no refusal arm, no case folding). Not a script
     gate: the rule is the parser's own, held by `cargo test`.)*
+
+73. **The budget a caller declares for its own run has an operator ceiling.**
+    A run's budget came from `x-fuse-budget-usd`, the header the AGENT sends,
+    and `Ledger::open_run` rewrites an open run's budget with the latest
+    call's, so in every deployment with no client keys, no identity map and
+    no unit caps (the launcher deployments) the per-run ceiling was whatever
+    the agent declared, and its next call could widen it. Widening is not
+    removed: invariant 50 names it the one release valve for a reservation
+    kept open after an unknown outcome (D7, D8). It is bounded.
+
+    `TOKENFUSE_MAX_RUN_BUDGET_USD` is an additive operator setting.
+    `defaults::max_run_budget_from` reads unset or empty as `None` (no
+    ceiling, the behaviour of every earlier release), a positive decimal as
+    exact microdollars, and anything else as an `Err` carrying the value;
+    `max_run_budget_from_env` exits 2 naming the variable, as
+    `policy_mode_from_env` does. The value is parsed as integers, never
+    through `f64`: digits, optionally a point and one to six more digits.
+    Zero, a sign, an exponent (`1e9`), a second point, a seventh decimal,
+    words, and any figure past `i64` microdollars are refused. `proxy.rs`
+    clamps the budget `handle_call` resolved (the caller's header, the policy
+    default, or the built-in USD 5) to the ceiling before `open_run`, on
+    every call, so widening an open run reaches the ceiling and never past
+    it. A Cloud budget (`AppState::cloud_budget`) is the operator's own word
+    and is never clamped; a budget at or below the ceiling is untouched, so
+    a caller may always ask for less. A clamped call's response, a refusal
+    and a stream included, carries `x-fuse-budget-clamped: <ceiling>` in
+    exact dollars (stamped once, in the `handle` wrapper, so no return path
+    inside `handle_call` can omit it), and is absent on a call that was not
+    clamped. The clamp is logged once per run (`note_budget_clamp`, a set
+    capped at 8192 that starts over when full, since run ids are
+    caller-chosen). `serve` wires it; the MCP broker opens no run and has
+    nothing to clamp (`process-local:` comment at the call site).
+
+    `@decided 2026-10-04`: bound the widening rather than remove it, and
+    apply the ceiling to the policy default and the built-in default as well
+    as the header, leaving only a Cloud budget exempt.
+
+    **Where it says nothing.** It is one figure per RUN, not per agent: an
+    agent that opens a new run id gets a new ceiling's worth, so it bounds
+    each run and not an agent's total spend. The total is bounded by unit
+    caps (invariant 15, 52) and by binding a budget to an identity, which
+    needs client keys per agent (not built here). The launchers do not set
+    the variable yet (separate changes in stack-single, stack-k8s and
+    stack-up after a release), so until they do a launcher deployment still
+    lets the agent choose its own cap. A negative or NaN header value is not
+    a budget this clamp touches (it is below the ceiling). A restart forgets
+    which runs were logged and a run may log once more.
+    *(test: `proxy::tests::a_declared_budget_above_the_operators_ceiling_opens_the_run_at_the_ceiling`,
+    `widening_an_open_run_stops_at_the_ceiling`,
+    `a_cloud_budget_above_the_ceiling_is_honoured_unclamped`,
+    `with_no_ceiling_the_declared_budget_stands`,
+    `the_builtin_default_and_the_policy_default_are_clamped_too`,
+    `the_clamp_header_is_present_only_on_a_clamped_call`,
+    `the_clamp_header_rides_a_streamed_answer_and_a_refusal`,
+    `the_clamp_is_logged_once_per_run`,
+    `the_ceiling_only_ever_lowers_a_budget_the_operator_did_not_set`;
+    `defaults::tests::a_run_budget_ceiling_nobody_can_read_is_refused_not_ignored`,
+    `a_run_budget_ceiling_is_read_as_exact_microdollars`;
+    `tests/run_budget_ceiling_startup.rs` over the real binary;
+    `features/a-callers-budget-has-an-operator-ceiling.feature`. Red first
+    against the unfixed code: `left: 200 right: 402` (a declared USD 1000
+    admitted a USD 1.50 reservation under a USD 1.00 ceiling), `left: Ok(None)
+    right: Err("0")`, and the binary kept serving with `abc`. Ten mutants
+    planted in the product code, each caught by a named test: `>` to `>=`
+    at the ceiling, a Cloud budget clamped, widening not clamped, `serve`
+    never handing the ceiling to `AppState`, the parser reading through
+    `f64`, a refusal carrying no header, logging every call, zero accepted,
+    the defaults unclamped, the header naming a float. Not a script gate:
+    the rule is the clamp and the parser, held by `cargo test`.)*

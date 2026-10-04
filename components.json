@@ -154,6 +154,9 @@
           "TOKENFUSE_MAX_BODY_BYTES": {
             "required": false
           },
+          "TOKENFUSE_MAX_RUN_BUDGET_USD": {
+            "required": false
+          },
           "TOKENFUSE_MCP_ACCEPT_XAA": {
             "required": false,
             "default": "off"

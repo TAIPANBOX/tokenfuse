@@ -25,7 +25,7 @@
 //! the process environment, which also keeps these tests out of the
 //! env-var-mutation race that `events.rs`'s tests had to grow a mutex for.
 
-use tokenfuse_core::{DlpMode, Mode};
+use tokenfuse_core::{DlpMode, Microusd, Mode};
 
 /// Secret scanning (`TOKENFUSE_DLP`): `off | shadow | mask | block`.
 ///
@@ -196,6 +196,83 @@ pub fn policy_mode_from_env() -> Mode {
     }
 }
 
+/// The operator's ceiling on any run budget the caller or a default chose
+/// (`TOKENFUSE_MAX_RUN_BUDGET_USD`), invariant 73.
+///
+/// **Unset or empty is `Ok(None)`: no ceiling**, which is the behaviour every
+/// deployment had before the variable existed. The ceiling is an additive
+/// operator setting, so a gateway upgraded with nothing configured changes
+/// nothing.
+///
+/// Why it exists. A run's budget came from `x-fuse-budget-usd`, the header the
+/// AGENT sends, and `Ledger::open_run` rewrites an open run's budget on every
+/// call, so in a deployment with no client keys and no identity map the
+/// per-run ceiling was whatever the agent declared, widened again by its next
+/// call. Widening stays (it is the one release valve for a reservation kept
+/// open after an unknown outcome, invariant 50); this bounds it.
+///
+/// The value is a positive decimal number of dollars read as integers, never
+/// through `f64`: digits, optionally a point and one to six more digits.
+/// Anything else is an `Err` carrying the value: zero (a ceiling that refuses
+/// every call is a different setting and an easy typo), a sign, an exponent
+/// (`1e9` is a billion dollars, not a typo to guess at), a second point, a
+/// seventh decimal (it would silently round to a different ceiling), words,
+/// and any figure too large for the ledger's integer microdollars. The caller
+/// owns the exit, as with [`policy_mode_from`].
+pub fn max_run_budget_from(value: Option<&str>) -> Result<Option<Microusd>, String> {
+    let trimmed = value.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match usd_to_microusd(trimmed) {
+        Some(micro) if micro > 0 => Ok(Some(Microusd(micro))),
+        _ => Err(trimmed.to_string()),
+    }
+}
+
+/// Exact decimal dollars to integer microdollars, `None` for anything that is
+/// not `digits` or `digits.1-6digits`, or that overflows `i64`.
+fn usd_to_microusd(s: &str) -> Option<i64> {
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) if !f.is_empty() => (w, f),
+        Some(_) => return None,
+        None => (s, ""),
+    };
+    let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(frac) || frac.len() > 6 {
+        return None;
+    }
+    let whole: i64 = whole.parse().ok()?;
+    let frac_micro: i64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse::<i64>().ok()? * 10_i64.pow(6 - frac.len() as u32)
+    };
+    whole.checked_mul(1_000_000)?.checked_add(frac_micro)
+}
+
+/// [`max_run_budget_from`] against the process environment; exits 2 on a
+/// value it cannot read, naming the variable and the form it accepts.
+pub fn max_run_budget_from_env() -> Option<Microusd> {
+    match max_run_budget_from(
+        std::env::var("TOKENFUSE_MAX_RUN_BUDGET_USD")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(ceiling) => ceiling,
+        Err(raw) => {
+            // A hostile value can be any length; the operator needs to see
+            // which value, not all of it.
+            let shown: String = raw.chars().take(64).collect();
+            eprintln!(
+                "tokenfuse: TOKENFUSE_MAX_RUN_BUDGET_USD must be a positive number of US dollars \
+                 with at most six decimals (for example 25 or 2.50), got `{shown}`"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +412,71 @@ mod tests {
                 policy_mode_from(Some(typo)),
                 Err(typo.to_string()),
                 "{typo} must be refused, not started as shadow"
+            );
+        }
+    }
+
+    #[test]
+    fn no_run_budget_ceiling_is_set_when_nothing_is_configured() {
+        assert_eq!(max_run_budget_from(None), Ok(None));
+        assert_eq!(max_run_budget_from(Some("")), Ok(None));
+        assert_eq!(max_run_budget_from(Some("   ")), Ok(None));
+    }
+
+    #[test]
+    fn a_run_budget_ceiling_is_read_as_exact_microdollars() {
+        for (raw, micro) in [
+            ("1", 1_000_000),
+            ("1.00", 1_000_000),
+            ("0.5", 500_000),
+            ("25", 25_000_000),
+            (" 25 ", 25_000_000),
+            ("0.000001", 1),
+            ("12.345678", 12_345_678),
+            ("1000000", 1_000_000_000_000),
+            // 0.1 + 0.2 style values must not pick up float error.
+            ("0.3", 300_000),
+            ("4.35", 4_350_000),
+        ] {
+            assert_eq!(
+                max_run_budget_from(Some(raw)),
+                Ok(Some(Microusd(micro))),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_budget_ceiling_nobody_can_read_is_refused_not_ignored() {
+        let huge = "9".repeat(400);
+        let overflow = "9223372036855"; // one dollar past i64 microdollars
+        for bad in [
+            "0",
+            "0.0",
+            "0.000000",
+            "-1",
+            "+1",
+            "1e9",
+            "1E3",
+            "abc",
+            "1.2.3",
+            ".5",
+            "5.",
+            "0.0000001",
+            "1,5",
+            "NaN",
+            "inf",
+            "0x10",
+            "1 000",
+            "$5",
+            "--1",
+            overflow,
+            huge.as_str(),
+        ] {
+            assert_eq!(
+                max_run_budget_from(Some(bad)),
+                Err(bad.trim().to_string()),
+                "{bad:?} must be refused, never read as no ceiling"
             );
         }
     }
