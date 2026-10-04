@@ -228,6 +228,10 @@
           "TOKENFUSE_MCP_UPSTREAMS": {
             "required": false
           },
+          "TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS": {
+            "required": false,
+            "default": "<TOKENFUSE_WARDRYX_TIMEOUT_MS>"
+          },
           "TOKENFUSE_MODE": {
             "required": false
           },

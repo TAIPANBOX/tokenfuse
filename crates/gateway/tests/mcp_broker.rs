@@ -2645,3 +2645,355 @@ async fn a_brokered_call_that_names_nobody_is_counted_as_skipped_not_never_attem
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// The decide request for a tools/call carries the call itself.
+//
+// The broker asked the PDP per `tools/call` and told it the tool NAME only, so
+// a policy that needs to read what the call does had nothing to read. The
+// request now also carries `tool_call: {name, arguments, target}`: the
+// arguments exactly as the agent sent them, BEFORE any secret handle is
+// replaced, capped at 16 KiB, and the upstream server the broker routes to.
+// ---------------------------------------------------------------------------
+
+/// A stub PDP that keeps every decide body it receives.
+async fn recording_pdp(decision: &'static str) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(req): Json<Value>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(req);
+                Json(json!({ "decision": decision, "policy_version": "test-v1" }))
+            }
+        }),
+    );
+    (spawn_server(router).await, seen)
+}
+
+/// POST one JSON-RPC `tools/call` for `agent`, optionally to a named upstream.
+async fn tools_call(
+    broker_url: &str,
+    named_upstream: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot");
+    if let Some(n) = named_upstream {
+        req = req.header("x-fuse-mcp-upstream", n);
+    }
+    req.json(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    }))
+    .send()
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_decide_body_for_a_tools_call_carries_name_arguments_and_target() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream.clone(),
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let args = json!({ "repo": "acme/widgets", "n": 3, "nested": { "k": [1, null, "x"] } });
+    let resp: Value = tools_call(&broker_url, None, "gh_api", args.clone())
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        resp.get("error").is_none(),
+        "an allowed call is served: {resp}"
+    );
+
+    let asked = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the PDP was not asked");
+    let host = upstream.strip_prefix("http://").unwrap();
+    assert_eq!(
+        asked["tool_call"],
+        json!({ "name": "gh_api", "arguments": args, "target": host }),
+        "the decide body must name the call. What was asked: {asked}"
+    );
+    // The name list the PDP has always had is still there, unchanged.
+    assert_eq!(asked["tool_names"], json!(["gh_api"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_upstream_is_the_target_by_its_name() {
+    let default_up = spawn_server(Router::new().route("/", post(stub))).await;
+    let backup_up = spawn_server(Router::new().route("/", post(stub))).await;
+    let mut named = std::collections::BTreeMap::new();
+    named.insert("backup".to_string(), backup_up);
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        default_up,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        named,
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let _ = tools_call(&broker_url, Some("backup"), "t", json!({})).await;
+    let asked = seen.lock().unwrap().last().cloned().expect("asked");
+    assert_eq!(asked["tool_call"]["target"], json!("backup"), "{asked}");
+}
+
+/// The invariant that makes sending arguments to a PDP safe at all: the broker
+/// asks BEFORE it injects secrets, so the PDP sees `{{secret:gh}}` as text and
+/// the credential value never leaves the broker toward it. The upstream, in the
+/// same call, does receive the value, which proves the handle was a real one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_handle_reaches_the_pdp_as_the_handle_and_never_as_the_value() {
+    let (upstream_seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = tools_call(
+        &broker_url,
+        None,
+        "gh_api",
+        json!({ "auth": "Bearer {{secret:gh}}", "path": "/repos" }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    let asked = seen.lock().unwrap().last().cloned().expect("asked");
+    assert_eq!(
+        asked["tool_call"]["arguments"]["auth"],
+        json!("Bearer {{secret:gh}}"),
+        "the PDP must be shown the handle as the agent wrote it: {asked}"
+    );
+    assert!(
+        !asked.to_string().contains("ghp_REALSECRET"),
+        "the secret value reached the PDP: {asked}"
+    );
+
+    let forwarded = upstream_seen.lock().unwrap().clone();
+    assert_eq!(
+        forwarded[0]["params"]["arguments"]["auth"],
+        json!("Bearer ghp_REALSECRET"),
+        "the handle was real, so the upstream got the value: {forwarded:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_arguments_are_replaced_by_the_flag_and_still_forwarded_whole() {
+    let (upstream_seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let blob = "x".repeat(40_000);
+    let resp: Value = tools_call(&broker_url, None, "write", json!({ "blob": blob }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    let asked = seen.lock().unwrap().last().cloned().expect("asked");
+    let call = asked["tool_call"].as_object().expect("tool_call object");
+    assert!(
+        !call.contains_key("arguments"),
+        "an over-cap object is never sent, not even cut short: {asked}"
+    );
+    assert_eq!(call["arguments_truncated"], json!(true), "{asked}");
+    assert_eq!(call["name"], json!("write"));
+    assert!(
+        asked.to_string().len() < 4_000,
+        "{} bytes",
+        asked.to_string().len()
+    );
+
+    // The cap is on what the PDP is shown, not on what the tool receives.
+    let forwarded = upstream_seen.lock().unwrap().clone();
+    assert_eq!(
+        forwarded[0]["params"]["arguments"]["blob"]
+            .as_str()
+            .map(str::len),
+        Some(40_000),
+        "the upstream must still get the whole call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_truncation() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // `{"k":"` + 16_370 + `"}` is exactly 16 384 serialized bytes.
+    let exactly = json!({ "k": "y".repeat(16_384 - 8) });
+    assert_eq!(serde_json::to_vec(&exactly).unwrap().len(), 16_384);
+    let _ = tools_call(&broker_url, None, "t", exactly.clone()).await;
+    let asked = seen.lock().unwrap().last().cloned().expect("asked");
+    assert_eq!(asked["tool_call"]["arguments"], exactly);
+    assert!(asked["tool_call"].get("arguments_truncated").is_none());
+
+    // A call that names no arguments at all.
+    let _ = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "ping" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let asked = seen.lock().unwrap().last().cloned().expect("asked");
+    assert_eq!(asked["tool_call"]["name"], json!("ping"));
+    assert!(asked["tool_call"].get("arguments").is_none(), "{asked}");
+    assert!(
+        asked["tool_call"].get("arguments_truncated").is_none(),
+        "{asked}"
+    );
+}
+
+/// Hostile arguments never take the broker down or reach the PDP as anything
+/// but valid JSON. The transport's own limits (the JSON parser's depth limit,
+/// UTF-8 validation) refuse some of these before `process` runs; the point is
+/// that none of them panics, and that a normal call right afterwards is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_arguments_never_panic_and_the_broker_keeps_serving() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, seen) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let http = reqwest::Client::new();
+
+    // Deep nesting, inside and beyond the parser's recursion limit (128). The
+    // text is built by hand: nesting a `Value` that deep in the test would
+    // overflow the TEST's own stack, which is not what is being measured.
+    for depth in [10usize, 100, 120, 200, 5_000, 100_000] {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"t","arguments":{}"leaf"{}}}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let r = http
+            .post(&broker_url)
+            .header("x-fuse-agent-id", "agent://acme.example/bot")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().as_u16() < 500, "depth {depth}: {}", r.status());
+    }
+
+    // A huge string, a wide object, and non-object argument shapes.
+    let mut wide = serde_json::Map::new();
+    for i in 0..2_000 {
+        wide.insert(format!("k{i}"), json!(i));
+    }
+    for args in [
+        json!({ "s": "z".repeat(1_000_000) }),
+        Value::Object(wide),
+        json!("just a string"),
+        json!(42),
+        json!(null),
+        json!([1, 2, 3]),
+        json!({ "ünï": "çödé 🚀" }),
+    ] {
+        let r = tools_call(&broker_url, None, "t", args).await;
+        assert!(r.status().as_u16() < 500, "{}", r.status());
+    }
+
+    // Invalid UTF-8 in the transport: refused as a bad request, not a panic.
+    let mut bad =
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"a":""#
+            .to_vec();
+    bad.extend_from_slice(&[0xff, 0xfe, 0xc0, 0x80]);
+    bad.extend_from_slice(br#""}}}"#);
+    let r = http
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/bot")
+        .header("content-type", "application/json")
+        .body(bad)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.status().is_client_error(),
+        "invalid UTF-8 is a client error, got {}",
+        r.status()
+    );
+
+    // Every body that did reach the PDP was valid JSON with a tool_call whose
+    // arguments are either absent-and-flagged or under the cap.
+    for asked in seen.lock().unwrap().iter() {
+        let call = &asked["tool_call"];
+        if let Some(a) = call.get("arguments") {
+            assert!(serde_json::to_vec(a).unwrap().len() <= 16 * 1024);
+        }
+    }
+
+    // And the broker is still up and answering.
+    let ok: Value = tools_call(&broker_url, None, "t", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(ok.get("error").is_none(), "{ok}");
+}

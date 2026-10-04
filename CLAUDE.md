@@ -4920,3 +4920,136 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `f64`, a refusal carrying no header, logging every call, zero accepted,
     the defaults unclamped, the header naming a float. Not a script gate:
     the rule is the clamp and the parser, held by `cargo test`.)*
+
+74. **The policy plane is told which call the broker is about to make, what it
+    is shown is bounded, and it is shown before any secret is in it.** The MCP
+    broker put every `tools/call` to the PDP with the tool NAME only
+    (`tool_names: [name]`), so a policy that depends on what a call does, its
+    arguments or the server it goes to, had nothing to read. The decide request
+    now also carries an optional `tool_call` object, `{name, arguments,
+    target}`, built by the broker for a `tools/call` and by nothing else: the
+    LLM path's request has no such member at all, because a model call only
+    OFFERS tools and no call has been chosen yet, so there is nothing true to
+    put in it. Any argument-aware policy can use it; nothing in the shape is
+    specific to one.
+
+    **The order is the invariant.** `arguments` is `params.arguments` taken at
+    the policy gate, which runs BEFORE `inject_secrets`, so a
+    `{{secret:NAME}}` handle reaches the PDP as that text and the vault value
+    never does; the upstream, in the same call, receives the value. Moving the
+    injection above the gate would send every brokered credential to the PDP,
+    compiles, and fails nothing but the one test named below. The arguments are
+    taken after the DLP block and the PII mask, so a span those steps redact is
+    not sent to the PDP either.
+
+    **Whole or not at all.** The compact JSON of `arguments` is capped at 16 KiB
+    (`TOOL_CALL_ARGUMENTS_CAP_BYTES`, inclusive: 16384 bytes is sent, 16385 is
+    not). Over the cap the object is sent WITHOUT `arguments` and with
+    `arguments_truncated: true`, never a prefix, because a prefix of a JSON
+    document is not a document and a policy reading half an object decides on
+    something the agent never sent. The flag appears only when arguments
+    existed and were left out, so the PDP can tell "none" from "not shown". The
+    size is counted by a writer that refuses bytes past the cap, so a huge
+    value is never serialized in full to be measured, and a value that cannot
+    be serialized counts as over the cap rather than being unwrapped. The cap
+    bounds what the PDP is shown, never what the tool receives: the upstream
+    still gets the whole call.
+
+    `target` is the upstream server the broker routes the call to: the
+    `X-Fuse-Mcp-Upstream` name when the request chose one, else the host and
+    port of the default upstream's URL, never the URL itself (userinfo can sit
+    in it, and a path says nothing about which server).
+
+    **The tool path has its own deadline.** A decide that carries a `tool_call`
+    waits up to `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`; every other decide keeps
+    `TOKENFUSE_WARDRYX_TIMEOUT_MS`. Unset or blank, the tool path takes the
+    shared value, so a deployment that sets nothing new behaves as before. A
+    value that is set and unusable (not an integer, negative, zero) is the
+    shared value with one warn line naming it, not a guess. It is keyed on the
+    call being present, not on who asks, so the two budgets cannot be crossed
+    by a caller that forgets which it is. The name is declared in
+    `components.json` (additive; `compat/1.0.json` freezes nothing new).
+    `Wardryx::from_env` reads it in both processes because both build their
+    hook there, and only the broker's decide ever carries a `tool_call`, so
+    `serve` never uses it. That is a plain read inside an existing
+    `from_env`, not a new `<Type>::from_env(` call, so
+    `scripts/both-processes-configure-the-same-doors.sh` (invariant 34) has
+    nothing new to discover and passes unchanged, which is recorded here
+    rather than inferred from the exit code.
+
+    `@claude` 2026-10-04, choices the task did not fix, open to reversal: the
+    flag is omitted when false; `target` for the default upstream is its host
+    and port; the arguments are the parsed JSON, so object keys may arrive in a
+    different order than the agent wrote them and duplicate keys collapse;
+    wardryx's decide handler ignores unknown members (`json.NewDecoder` with no
+    `DisallowUnknownFields`, wardryx at `36df366`), so the two sides ship in
+    either order and an older wardryx ignores `tool_call`.
+    *(test: in `tests/mcp_broker.rs`,
+    `the_decide_body_for_a_tools_call_carries_name_arguments_and_target`,
+    `a_named_upstream_is_the_target_by_its_name`,
+    `a_secret_handle_reaches_the_pdp_as_the_handle_and_never_as_the_value`
+    (the ordering; it also asserts the upstream got the value, so the handle
+    was a real one),
+    `oversized_arguments_are_replaced_by_the_flag_and_still_forwarded_whole`,
+    `arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_truncation`
+    and `hostile_arguments_never_panic_and_the_broker_keeps_serving` (nesting
+    past the parser's limit, a million-character string, a wide object,
+    non-object shapes, invalid UTF-8, then a normal call still served); in
+    `tests/wardryx.rs`,
+    `the_llm_paths_decide_body_has_no_tool_call_even_with_tools_offered`; in
+    `gateway::wardryx`, `a_call_over_the_cap_loses_its_arguments_and_says_so`,
+    `the_cap_is_on_serialized_bytes_and_inclusive`,
+    `arguments_that_serialize_to_exactly_the_cap_in_many_shapes_never_panic`
+    (200 seeds), `an_oversized_call_goes_out_as_valid_json_without_arguments_and_flagged`,
+    `a_decide_with_no_call_has_no_tool_call_member_at_all`,
+    `a_tool_call_gets_the_tool_budget_and_a_model_call_keeps_the_shared_one`,
+    `the_environment_names_reach_the_tool_timeout`,
+    `the_tool_timeout_defaults_to_the_shared_budget` and
+    `a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget`.
+    Seven of the new tests in `gateway::wardryx` and five in
+    `tests/mcp_broker.rs` were red by assertion against the plumbing with the
+    broker passing `tool_call: None`, a naive `ToolCall::new` that never
+    truncates and a decide that ignored the tool timeout, verbatim
+    `left: Null right: String("Bearer {{secret:gh}}")`,
+    `left: Some(Object {"blob": ...}) right: None` and
+    `left: Deny right: Allow`; the LLM-path test and the hostile test were
+    green on both sides and are held by mutants. Twelve mutants planted in the
+    product code and reverted, each caught by a named test: the secret
+    injected before the gate (`a_secret_handle_reaches_the_pdp_as_the_handle_and_never_as_the_value`
+    alone); truncation cutting the JSON to its first 16 KiB with the flag set
+    (six tests, among them `oversized_arguments_are_replaced_by_the_flag_and_still_forwarded_whole`);
+    `tool_call` sent on the LLM path
+    (`the_llm_paths_decide_body_has_no_tool_call_even_with_tools_offered`); the
+    cap exclusive (`the_cap_is_on_serialized_bytes_and_inclusive`,
+    `arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_truncation`);
+    the tool timeout used for every decide, and never used
+    (`a_tool_call_gets_the_tool_budget_and_a_model_call_keeps_the_shared_one`,
+    both); the wrong variable name
+    (`the_environment_names_reach_the_tool_timeout`); zero accepted as a
+    timeout (`a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget`);
+    `target` the whole URL, and an unnamed upstream with no target
+    (`the_decide_body_for_a_tools_call_carries_name_arguments_and_target`); the
+    flag always sent
+    (`arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_truncation`,
+    `the_wire_body_for_a_call_names_the_call`); an oversized object sent
+    anyway (six tests). Scenarios: `features/the-broker-sends-the-tool-call.feature`,
+    nine, each bound. Not a script gate: the order of two statements in
+    `process` is held by the test, and a regex over the source for "the gate
+    sits above the injection" is the shape invariant 34 names and this
+    repository has found fail silently.)*
+
+    **Where it says nothing.** The decision cache key is unchanged and does not
+    include the arguments, so a PDP whose answer depends on them must answer
+    `cacheable: false`, as it already must for any per-request rule (the
+    module doc of `wardryx.rs` says why); one that answers `true` has its
+    verdict reused for other arguments of the same tool for the TTL. The
+    handle-versus-value guarantee is about vault secrets only: a raw secret the
+    agent typed into the arguments itself reaches the PDP when
+    `TOKENFUSE_MCP_DLP` is `shadow` or `off`, and PII does when
+    `TOKENFUSE_MCP_DLP_PII` is `shadow` or `off`. The PDP is told the arguments
+    and nothing here makes it use them; a deployment whose wardryx has no
+    argument-aware rule gains only a larger request (at most about 16 KiB). A
+    `tools/call` with no `params.name` sends `name: ""`. The stdio transport
+    reaches the same code and sends the same member, but has no agent id, so an
+    enforcing gate refuses it before asking, as invariant 36's neighbours
+    always did.
