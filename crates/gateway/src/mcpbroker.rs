@@ -64,7 +64,7 @@ use tokenfuse_core::mcp::{self, Lock};
 use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
 use crate::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
-use crate::wardryx::{DecideContext, Wardryx, WardryxDecision, WardryxMode};
+use crate::wardryx::{DecideContext, ToolCall, Wardryx, WardryxDecision, WardryxMode};
 use tokenfuse_core::agent_event::{
     dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
 };
@@ -1098,6 +1098,25 @@ fn resolve_upstream<'a>(
     }
 }
 
+/// The upstream server name the policy plane is told this call routes to: the
+/// name the request selected with `X-Fuse-Mcp-Upstream` when it selected one,
+/// else the host (and port) of the default upstream's URL. Never the whole URL:
+/// a URL can carry credentials in its userinfo and a path or query that says
+/// nothing about WHICH server it is.
+fn upstream_target(ctx: &CallContext, resolved_url: &str) -> String {
+    if let Some(name) = ctx.upstream.as_deref() {
+        return name.to_string();
+    }
+    match reqwest::Url::parse(resolved_url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    }
+}
+
 /// Ask the gateway's firewall whether this `tools/call` may proceed
 /// (docs/07 B.7 level 3).
 ///
@@ -1387,6 +1406,15 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
                         est_cost_usd: 0.0,
                         attestation_method: ctx.attestation_method.clone(),
                         approval_token: ctx.approval_token.clone(),
+                        // The call itself, as the agent sent it: this is the
+                        // site that runs BEFORE secret injection, so a
+                        // `{{secret:NAME}}` handle goes to the PDP as that
+                        // text and the value never does. See `ToolCall`.
+                        tool_call: Some(ToolCall::new(
+                            &tool,
+                            req.get("params").and_then(|p| p.get("arguments")),
+                            &upstream_target(ctx, &upstream_url),
+                        )),
                     };
                     let outcome = st.wardryx.decide(dctx).await;
                     emit_tool_call(

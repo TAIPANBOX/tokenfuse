@@ -1095,3 +1095,36 @@ async fn a_wrong_key_401_is_recorded_as_a_refusal_and_still_fails_closed() {
         "a PDP that answered 401 was reachable: {detail}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The LLM path has no pending tool call, so its decide body carries none.
+//
+// The MCP broker's decide request now carries `tool_call` (see
+// `tests/mcp_broker.rs`). A model call only OFFERS tools; no call has been
+// chosen yet, so there is nothing to name, and the body this path sends must be
+// exactly what it was before that member existed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_llm_paths_decide_body_has_no_tool_call_even_with_tools_offered() {
+    let stub = WardryxStub::new(json!({ "decision": "allow" }));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let app = tokenfuse_gateway::app(state(enforcing(url)));
+
+    let body = r#"{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"wire_transfer","description":"move money","input_schema":{"type":"object"}}]}"#;
+    let resp = app.oneshot(request(body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let sent = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("PDP received a decide request");
+    assert_eq!(sent["tool_names"], json!(["wire_transfer"]), "{sent}");
+    assert!(
+        !sent.as_object().unwrap().contains_key("tool_call"),
+        "the LLM path has no pending call and must not send one: {sent}"
+    );
+}

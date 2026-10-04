@@ -79,6 +79,30 @@ use std::time::{Duration, Instant};
 /// Default per-call timeout when `TOKENFUSE_WARDRYX_TIMEOUT_MS` is unset.
 const DEFAULT_TIMEOUT_MS: u64 = 50;
 
+/// The tool path's timeout in milliseconds: `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`
+/// when it is a positive integer, the shared budget (`shared_ms`) otherwise.
+/// Unset or blank is silently the shared value, which is the point of the
+/// default; a value that is set and unusable (not an integer, negative, or
+/// zero, a budget under which every call would fall back) is the shared value
+/// too, with one warn line naming it, rather than a guess in either direction.
+fn tool_timeout_ms_from(raw: Option<&str>, shared_ms: u64) -> u64 {
+    let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+        return shared_ms;
+    };
+    match text.parse::<u64>() {
+        Ok(ms) if ms > 0 => ms,
+        _ => {
+            tracing::warn!(
+                value = %text,
+                shared_ms,
+                "TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS is not a positive integer number of \
+                 milliseconds; the tool path uses the shared TOKENFUSE_WARDRYX_TIMEOUT_MS"
+            );
+            shared_ms
+        }
+    }
+}
+
 /// Wall clock in epoch millis, for stamping verdicts. The cache above uses
 /// `Instant` because it only measures elapsed time; a verdict has to be
 /// comparable against a window an operator asks about from outside.
@@ -254,6 +278,94 @@ pub struct DecideContext {
     /// the field exists to establish.
     pub chain_proven: bool,
     pub approval_token: Option<String>,
+    /// The concrete tool call this decision is about, when there is one: the
+    /// MCP broker sets it on every `tools/call`, the LLM path never does (a
+    /// model call has only OFFERED tools, no call has been chosen yet, so
+    /// there is nothing to put here and the field stays `None`). It is also
+    /// what picks the per-call timeout, see [`Wardryx::with_tool_timeout`].
+    pub tool_call: Option<ToolCall>,
+}
+
+/// The most serialized bytes of a call's `arguments` the PDP is sent: 16 KiB.
+/// Above it the object is sent WITHOUT `arguments` and with
+/// `arguments_truncated: true`, never with a cut-off copy of them.
+pub const TOOL_CALL_ARGUMENTS_CAP_BYTES: usize = 16 * 1024;
+
+/// A pending tool call as the policy plane is asked about it.
+///
+/// `arguments` is `params.arguments` of the JSON-RPC call exactly as the agent
+/// sent it, which for the MCP broker means BEFORE any `{{secret:NAME}}` handle
+/// is replaced: the PDP sees the handle text and the secret value never leaves
+/// the broker toward it. The size cap exists so a hostile or merely huge
+/// argument object cannot make every decide request a megabyte.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// The tool name (`params.name`).
+    pub name: String,
+    /// The arguments as sent, or `None` when the call carried none or when
+    /// they are over [`TOOL_CALL_ARGUMENTS_CAP_BYTES`] (then
+    /// `arguments_truncated` says which).
+    pub arguments: Option<serde_json::Value>,
+    /// True only when arguments existed and were left out for their size. The
+    /// PDP can tell "no arguments" from "arguments it was not shown".
+    pub arguments_truncated: bool,
+    /// The upstream MCP server this call is routed to.
+    pub target: String,
+}
+
+impl ToolCall {
+    /// Builds the call as the PDP will be shown it: `arguments` kept when their
+    /// compact JSON is at most [`TOOL_CALL_ARGUMENTS_CAP_BYTES`], otherwise
+    /// dropped whole with `arguments_truncated` set. Whole or not at all: a
+    /// prefix of a JSON document is not a document, and a policy reading half
+    /// of an object would be deciding on something the agent never sent.
+    ///
+    /// Bounded work however hostile the value: the size is counted by a writer
+    /// that stops accepting bytes at the cap, so nothing here allocates the
+    /// serialized form of a huge object, and a value that cannot be serialized
+    /// at all is treated as over the cap rather than as an error to unwrap.
+    pub fn new(name: &str, arguments: Option<&serde_json::Value>, target: &str) -> Self {
+        let (arguments, arguments_truncated) = match arguments {
+            None => (None, false),
+            Some(a) if fits_the_cap(a) => (Some(a.clone()), false),
+            Some(_) => (None, true),
+        };
+        ToolCall {
+            name: name.to_string(),
+            arguments,
+            arguments_truncated,
+            target: target.to_string(),
+        }
+    }
+}
+
+/// Whether `value`'s compact JSON is within [`TOOL_CALL_ARGUMENTS_CAP_BYTES`].
+fn fits_the_cap(value: &serde_json::Value) -> bool {
+    struct Counting(usize);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            if self.0 > TOOL_CALL_ARGUMENTS_CAP_BYTES {
+                // Stops serde_json at the first byte past the cap.
+                return Err(std::io::Error::other("over the cap"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counting(0), value).is_ok()
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallWire<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    arguments_truncated: bool,
+    target: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +381,8 @@ struct DecideWireRequest<'a> {
     attestation_method: Option<&'a str>,
     approval_token: Option<&'a str>,
     chain_proven: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call: Option<ToolCallWire<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,13 +534,14 @@ impl WardryxClient {
     async fn decide(
         &self,
         req: &DecideWireRequest<'_>,
+        timeout: Duration,
     ) -> Result<(WardryxOutcome, bool), WardryxError> {
         let endpoint = format!("{}/v1/decide", self.base_url.trim_end_matches('/'));
         let payload = serde_json::to_vec(req).map_err(|e| WardryxError::Decode(e.to_string()))?;
         let mut builder = self
             .http
             .post(&endpoint)
-            .timeout(self.timeout)
+            .timeout(timeout)
             .header("content-type", "application/json")
             .body(payload);
         if let Some(key) = &self.key {
@@ -772,6 +887,12 @@ pub struct Wardryx {
     /// other than 404). One line for the process lifetime, distinct from the
     /// 404 warning above.
     warned_filter_other: AtomicBool,
+    /// The per-call timeout for a decide that carries a [`ToolCall`], the MCP
+    /// broker's question. Equal to the shared `TOKENFUSE_WARDRYX_TIMEOUT_MS`
+    /// budget unless `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` says otherwise, so an
+    /// operator can give a tool call a longer deadline (an argument-aware
+    /// policy may need one) without slowing the LLM path.
+    tool_timeout: Duration,
 }
 
 impl Wardryx {
@@ -787,6 +908,7 @@ impl Wardryx {
             filter_cache: FilterCache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
             warned_filter_not_found: AtomicBool::new(false),
             warned_filter_other: AtomicBool::new(false),
+            tool_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
         }
     }
 
@@ -810,7 +932,20 @@ impl Wardryx {
             filter_cache: FilterCache::new(cache_ttl),
             warned_filter_not_found: AtomicBool::new(false),
             warned_filter_other: AtomicBool::new(false),
+            tool_timeout: timeout,
         }
+    }
+
+    /// The same hook with its own timeout for a decide that carries a
+    /// [`ToolCall`]. The shared timeout still governs every other decide.
+    pub fn with_tool_timeout(mut self, tool_timeout: Duration) -> Self {
+        self.tool_timeout = tool_timeout;
+        self
+    }
+
+    /// The timeout a decide carrying a [`ToolCall`] gets.
+    pub fn tool_timeout(&self) -> Duration {
+        self.tool_timeout
     }
 
     /// Build from `TOKENFUSE_WARDRYX_*` env (see the module doc for the
@@ -818,14 +953,19 @@ impl Wardryx {
     /// regardless of `TOKENFUSE_WARDRYX_MODE`: with nothing to call there is
     /// nothing to enforce or shadow.
     pub fn from_env() -> Self {
-        let requested_mode = match std::env::var("TOKENFUSE_WARDRYX_MODE").as_deref() {
-            Ok("shadow") => WardryxMode::Shadow,
-            Ok("enforce") => WardryxMode::Enforce,
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_env`] over any source of variables, so a test can state
+    /// the whole configuration without touching the process environment that
+    /// every other test in this binary shares.
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let requested_mode = match var("TOKENFUSE_WARDRYX_MODE").as_deref() {
+            Some("shadow") => WardryxMode::Shadow,
+            Some("enforce") => WardryxMode::Enforce,
             _ => WardryxMode::Off,
         };
-        let url = std::env::var("TOKENFUSE_WARDRYX_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let url = var("TOKENFUSE_WARDRYX_URL").filter(|s| !s.is_empty());
         let Some(url) = url else {
             if requested_mode != WardryxMode::Off {
                 tracing::warn!(
@@ -836,21 +976,24 @@ impl Wardryx {
             return Wardryx::disabled();
         };
 
-        let failmode = match std::env::var("TOKENFUSE_WARDRYX_FAILMODE").as_deref() {
-            Ok("closed") => FailMode::Closed,
+        let failmode = match var("TOKENFUSE_WARDRYX_FAILMODE").as_deref() {
+            Some("closed") => FailMode::Closed,
             _ => FailMode::Open,
         };
-        let key = std::env::var("TOKENFUSE_WARDRYX_KEY")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let timeout_ms: u64 = std::env::var("TOKENFUSE_WARDRYX_TIMEOUT_MS")
-            .ok()
+        let key = var("TOKENFUSE_WARDRYX_KEY").filter(|s| !s.is_empty());
+        let timeout_ms: u64 = var("TOKENFUSE_WARDRYX_TIMEOUT_MS")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_TIMEOUT_MS);
-        let cache_ttl_ms: u64 = std::env::var("TOKENFUSE_WARDRYX_CACHE_TTL_MS")
-            .ok()
+        let cache_ttl_ms: u64 = var("TOKENFUSE_WARDRYX_CACHE_TTL_MS")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_CACHE_TTL_MS);
+        // Read by both processes because both build their hook here, used by
+        // the MCP broker alone: the LLM proxy never sends a tool call, so its
+        // decide never reaches for this budget.
+        let tool_timeout_ms = tool_timeout_ms_from(
+            var("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS").as_deref(),
+            timeout_ms,
+        );
 
         Wardryx::new(
             requested_mode,
@@ -860,6 +1003,7 @@ impl Wardryx {
             Duration::from_millis(timeout_ms),
             Duration::from_millis(cache_ttl_ms),
         )
+        .with_tool_timeout(Duration::from_millis(tool_timeout_ms))
     }
 
     /// Ask the PDP (or the cache) what to do about this call. Always
@@ -895,8 +1039,23 @@ impl Wardryx {
             attestation_method: ctx.attestation_method.as_deref(),
             approval_token: ctx.approval_token.as_deref(),
             chain_proven: ctx.chain_proven,
+            tool_call: ctx.tool_call.as_ref().map(|t| ToolCallWire {
+                name: &t.name,
+                arguments: t.arguments.as_ref(),
+                arguments_truncated: t.arguments_truncated,
+                target: &t.target,
+            }),
         };
-        match client.decide(&wire).await {
+        // A decide that names a pending tool call gets the tool path's budget;
+        // every other decide keeps the shared one. Keyed on the call being
+        // there rather than on who asks, so the two budgets cannot be crossed
+        // by a caller that forgets which it is.
+        let timeout = if ctx.tool_call.is_some() {
+            self.tool_timeout
+        } else {
+            client.timeout
+        };
+        match client.decide(&wire, timeout).await {
             Ok((outcome, cacheable)) => {
                 self.record_verdict_at(outcome.decision, now_millis());
                 self.cache.put(
@@ -1243,6 +1402,7 @@ mod tests {
                 est_cost_usd: 0.0,
                 attestation_method: None,
                 approval_token: None,
+                tool_call: None,
             })
             .await;
         assert_eq!(outcome.decision, WardryxDecision::Allow);
@@ -1265,6 +1425,7 @@ mod tests {
                 est_cost_usd: 0.0,
                 attestation_method: None,
                 approval_token: None,
+                tool_call: None,
             })
             .await;
         assert_eq!(outcome.decision, WardryxDecision::Deny);
@@ -1291,6 +1452,7 @@ mod tests {
             est_cost_usd: 0.0,
             attestation_method: None,
             approval_token: None,
+            tool_call: None,
         }
     }
 
@@ -1632,5 +1794,261 @@ mod tests {
             );
             assert!(reason.contains("400"), "round {round}: {reason:?}");
         }
+    }
+    // -- the broker's decide request carries the concrete tool call --
+    //
+    // The MCP broker asks per `tools/call`, and until now it told the PDP only
+    // the tool NAME. An argument-aware policy needs the call itself. These
+    // tests hold the wire shape and its size cap; the broker's own wiring (the
+    // secret handle, the target) is in `tests/mcp_broker.rs`.
+
+    /// A stub PDP that keeps every request body it is sent, answers `allow`
+    /// after `delay`, and so lets a test read what was ASKED.
+    async fn capturing(delay: Duration) -> (String, std::sync::Arc<Mutex<Vec<serde_json::Value>>>) {
+        let bodies = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/decide",
+            axum::routing::post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(b);
+                    tokio::time::sleep(delay).await;
+                    axum::Json(serde_json::json!({ "decision": "allow" }))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l, app).await;
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    fn ctx_with_call(call: ToolCall) -> DecideContext {
+        DecideContext {
+            tool_names: vec![call.name.clone()],
+            tool_call: Some(call),
+            ..ctx_for("agent://t/a")
+        }
+    }
+
+    #[test]
+    fn a_call_under_the_cap_keeps_its_arguments_exactly() {
+        let args = serde_json::json!({"repo": "a/b", "n": 3, "nested": {"k": [1, 2, null]}});
+        let c = ToolCall::new("gh_api", Some(&args), "github");
+        assert_eq!(c.arguments.as_ref(), Some(&args));
+        assert!(!c.arguments_truncated);
+        assert_eq!((c.name.as_str(), c.target.as_str()), ("gh_api", "github"));
+    }
+
+    #[test]
+    fn a_call_over_the_cap_loses_its_arguments_and_says_so() {
+        let args = serde_json::json!({ "blob": "x".repeat(TOOL_CALL_ARGUMENTS_CAP_BYTES * 2) });
+        let c = ToolCall::new("t", Some(&args), "s");
+        assert_eq!(c.arguments, None, "an over-cap object must not be sent");
+        assert!(
+            c.arguments_truncated,
+            "the PDP must be told it was left out"
+        );
+    }
+
+    #[test]
+    fn the_cap_is_on_serialized_bytes_and_inclusive() {
+        // A JSON string serializes as its characters plus two quotes.
+        let exactly = serde_json::Value::String("a".repeat(TOOL_CALL_ARGUMENTS_CAP_BYTES - 2));
+        let c = ToolCall::new("t", Some(&exactly), "s");
+        assert_eq!(c.arguments.as_ref(), Some(&exactly), "16384 bytes fits");
+        assert!(!c.arguments_truncated);
+
+        let one_over = serde_json::Value::String("a".repeat(TOOL_CALL_ARGUMENTS_CAP_BYTES - 1));
+        let c = ToolCall::new("t", Some(&one_over), "s");
+        assert_eq!(c.arguments, None, "16385 bytes does not");
+        assert!(c.arguments_truncated);
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_is_not_called_truncated() {
+        let c = ToolCall::new("t", None, "s");
+        assert_eq!(c.arguments, None);
+        assert!(!c.arguments_truncated, "absent is not the same as cut");
+    }
+
+    #[test]
+    fn arguments_that_serialize_to_exactly_the_cap_in_many_shapes_never_panic() {
+        // A seeded sweep across the boundary with several value shapes: the
+        // answer must flip at one byte and nowhere else.
+        let mut seed: u64 = 0x2026_1004;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let n = (next() % 40) as usize;
+            let pad = (next() % 64) as usize;
+            let mut items = Vec::new();
+            for i in 0..n {
+                items.push(serde_json::json!({ "k": i, "s": "é".repeat((next() % 900) as usize) }));
+            }
+            let value = serde_json::json!({ "items": items, "pad": "p".repeat(pad) });
+            let len = serde_json::to_vec(&value).unwrap().len();
+            let c = ToolCall::new("t", Some(&value), "s");
+            if len <= TOOL_CALL_ARGUMENTS_CAP_BYTES {
+                assert_eq!(
+                    c.arguments.as_ref(),
+                    Some(&value),
+                    "round {round}, {len} bytes"
+                );
+                assert!(!c.arguments_truncated, "round {round}, {len} bytes");
+            } else {
+                assert_eq!(c.arguments, None, "round {round}, {len} bytes");
+                assert!(c.arguments_truncated, "round {round}, {len} bytes");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wire_body_for_a_call_names_the_call() {
+        let (url, bodies) = capturing(Duration::ZERO).await;
+        let w = hook(url, FailMode::Closed, Duration::from_secs(0));
+        let args = serde_json::json!({ "repo": "a/b" });
+        w.decide(ctx_with_call(ToolCall::new(
+            "gh_api",
+            Some(&args),
+            "github",
+        )))
+        .await;
+        let b = bodies.lock().unwrap().pop().expect("asked");
+        assert_eq!(
+            b["tool_call"],
+            serde_json::json!({ "name": "gh_api", "arguments": { "repo": "a/b" }, "target": "github" }),
+            "{b}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_call_goes_out_as_valid_json_without_arguments_and_flagged() {
+        let (url, bodies) = capturing(Duration::ZERO).await;
+        let w = hook(url, FailMode::Closed, Duration::from_secs(0));
+        let args = serde_json::json!({ "blob": "x".repeat(100_000) });
+        w.decide(ctx_with_call(ToolCall::new("t", Some(&args), "s")))
+            .await;
+        let b = bodies.lock().unwrap().pop().expect("asked");
+        let call = b["tool_call"].as_object().expect("tool_call object");
+        assert!(!call.contains_key("arguments"), "{b}");
+        assert_eq!(call["arguments_truncated"], serde_json::json!(true));
+        assert_eq!(call["name"], serde_json::json!("t"));
+        assert!(
+            b.to_string().len() < 2_000,
+            "the oversized object must not ride along in any other member: {} bytes",
+            b.to_string().len()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decide_with_no_call_has_no_tool_call_member_at_all() {
+        let (url, bodies) = capturing(Duration::ZERO).await;
+        let w = hook(url, FailMode::Closed, Duration::from_secs(0));
+        w.decide(ctx_for("agent://t/a")).await;
+        let b = bodies.lock().unwrap().pop().expect("asked");
+        assert!(
+            !b.as_object().unwrap().contains_key("tool_call"),
+            "the LLM path's body must be unchanged: {b}"
+        );
+    }
+
+    // -- the tool path's own timeout --
+
+    #[test]
+    fn the_tool_timeout_defaults_to_the_shared_budget() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(tool_timeout_ms_from(raw, 50), 50, "{raw:?}");
+            assert_eq!(tool_timeout_ms_from(raw, 1234), 1234, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget() {
+        assert_eq!(tool_timeout_ms_from(Some("2000"), 50), 2000);
+        assert_eq!(tool_timeout_ms_from(Some(" 750 "), 50), 750);
+        for junk in [
+            "abc",
+            "-5",
+            "0",
+            "1.5",
+            "1e3",
+            "5s",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(tool_timeout_ms_from(Some(junk), 50), 50, "{junk:?}");
+        }
+    }
+
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_environment_names_reach_the_tool_timeout() {
+        let w = Wardryx::from_vars(vars(&[
+            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
+            ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+            ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
+            ("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "900"),
+        ]));
+        assert_eq!(w.tool_timeout(), Duration::from_millis(900));
+        assert_eq!(
+            w.client.as_ref().unwrap().timeout,
+            Duration::from_millis(80)
+        );
+    }
+
+    #[test]
+    fn with_only_the_shared_timeout_set_the_tool_path_gets_it_too() {
+        let w = Wardryx::from_vars(vars(&[
+            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
+            ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+            ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
+        ]));
+        assert_eq!(w.tool_timeout(), Duration::from_millis(80));
+        let w = Wardryx::from_vars(vars(&[
+            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
+            ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+        ]));
+        assert_eq!(w.tool_timeout(), Duration::from_millis(DEFAULT_TIMEOUT_MS));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_call_gets_the_tool_budget_and_a_model_call_keeps_the_shared_one() {
+        // The PDP takes 300 ms. The shared budget is 80 ms, the tool budget 3 s.
+        let (url, _) = capturing(Duration::from_millis(300)).await;
+        let w = Wardryx::new(
+            WardryxMode::Enforce,
+            FailMode::Closed,
+            url,
+            None,
+            Duration::from_millis(80),
+            Duration::ZERO,
+        )
+        .with_tool_timeout(Duration::from_secs(3));
+
+        let call = w.decide(ctx_with_call(ToolCall::new("t", None, "s"))).await;
+        assert_eq!(call.decision, WardryxDecision::Allow, "{:?}", call.reason);
+        assert!(!call.unreachable, "the tool path waited and got a verdict");
+
+        let model = w.decide(ctx_for("agent://t/a")).await;
+        assert!(
+            model.unreachable,
+            "the LLM path must not inherit the longer budget"
+        );
+        assert_eq!(model.decision, WardryxDecision::Deny, "failmode closed");
     }
 }

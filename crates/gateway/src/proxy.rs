@@ -1538,6 +1538,9 @@ async fn handle_call(
                 est_cost_usd: estimate.as_usd(),
                 attestation_method,
                 approval_token,
+                // The LLM path has no pending call to name: the tools in the
+                // request are only OFFERED. See `DecideContext::tool_call`.
+                tool_call: None,
             })
             .await;
 

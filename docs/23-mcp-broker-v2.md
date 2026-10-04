@@ -61,6 +61,34 @@ The `DecideContext` for a `tools/call` sends `agent_id` (from
 value as "nothing to restrict", never as a denial, so tool and attestation
 rules still apply and the cost/step rules simply do not fire here.
 
+**The call itself.** The same request also carries
+`tool_call: {name, arguments, target}`, so a policy that depends on what a call
+does has something to read:
+
+- `name` is `params.name`; `target` is the upstream server the broker routes
+  this call to: the `X-Fuse-Mcp-Upstream` name when the request named one, else
+  the host (and port) of the default upstream's URL, never the whole URL
+  (userinfo and paths stay out).
+- `arguments` is `params.arguments` as the agent sent it, **before** secret
+  injection: a `{{secret:NAME}}` handle reaches the PDP as that text and the
+  value never does. It is taken after the DLP and PII-mask steps, so a span
+  those steps redact is not sent to the PDP either.
+- It is capped at 16 KiB of compact JSON. Over the cap the object is sent
+  without `arguments` and with `arguments_truncated: true`; never a prefix of
+  the JSON. The cap bounds what the PDP is shown, not what the tool receives:
+  the upstream still gets the whole call.
+- `arguments` is a parsed value, so the PDP sees the same JSON the broker
+  does, not the agent's original byte layout (object keys may come in a
+  different order).
+- The decision cache key is unchanged and does not include the arguments. A
+  PDP whose answer depends on arguments must say `cacheable: false`, as it
+  already must for any per-request rule; one that does not will have its
+  answer reused for other arguments of the same tool for the cache TTL.
+- A decide that carries a `tool_call` waits up to
+  `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` (default: the shared
+  `TOKENFUSE_WARDRYX_TIMEOUT_MS`); the LLM path never sends one and keeps the
+  shared budget.
+
 **No identity, no call (enforce mode).** Without an `X-Fuse-Agent-Id` (every
 stdio call, and any HTTP call that omits it) an enforcing gate **refuses** the
 `tools/call`. It does not fabricate an id, and it no longer skips.
