@@ -582,7 +582,59 @@ async fn credit_run_seed_if_any(st: &AppState, run_id: &str, generation: u64) {
     }
 }
 
-async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -> Response {
+/// The operator's ceiling on a run budget the caller or a default chose
+/// (invariant 73), applied to the budget `handle_call` resolved.
+///
+/// Returns the budget to open the run at and, when the ceiling bit, the
+/// ceiling itself. Only a budget the operator did not set is clamped: a Cloud
+/// budget (`cloud_set`) is the operator's own word and passes through. A
+/// budget at or below the ceiling is untouched, so a caller may always ask for
+/// LESS, and an unset ceiling is the identity.
+fn apply_run_budget_ceiling(
+    budget: Microusd,
+    cloud_set: bool,
+    ceiling: Option<Microusd>,
+) -> (Microusd, Option<Microusd>) {
+    match ceiling {
+        Some(c) if !cloud_set && budget > c => (c, Some(c)),
+        _ => (budget, None),
+    }
+}
+
+/// A ceiling as dollars for the `x-fuse-budget-clamped` header: exact integer
+/// arithmetic, at least two decimals, trailing zeros past the second trimmed
+/// (`1.00`, `0.50`, `2.345678`).
+fn ceiling_usd_string(ceiling: Microusd) -> String {
+    let micro = ceiling.0.max(0);
+    let frac = format!("{:06}", micro % 1_000_000);
+    let frac = frac.trim_end_matches('0');
+    format!("{}.{:0<2}", micro / 1_000_000, frac)
+}
+
+/// The shared handler. A thin wrapper: [`handle_call`] decides everything and
+/// reports through `clamped` when the operator's run-budget ceiling reduced
+/// the budget the caller (or a default) asked for, and this stamps
+/// `x-fuse-budget-clamped: <ceiling>` on whatever answer it produced, a
+/// refusal and a stream included, so no return path inside `handle_call`
+/// can forget it.
+async fn handle(wire: Wire, st: AppState, headers: HeaderMap, body: Bytes) -> Response {
+    let mut clamped: Option<Microusd> = None;
+    let mut resp = handle_call(wire, st, headers, body, &mut clamped).await;
+    if let Some(ceiling) = clamped {
+        if let Ok(v) = HeaderValue::from_str(&ceiling_usd_string(ceiling)) {
+            resp.headers_mut().insert("x-fuse-budget-clamped", v);
+        }
+    }
+    resp
+}
+
+async fn handle_call(
+    wire: Wire,
+    st: AppState,
+    headers: HeaderMap,
+    mut body: Bytes,
+    clamped: &mut Option<Microusd>,
+) -> Response {
     // A process forwards to one upstream endpoint, so it serves the door
     // matching that upstream's shape and refuses the other one loudly, before
     // anything is reserved: nothing is opened, no budget is checked, no key is
@@ -632,11 +684,28 @@ async fn handle(wire: Wire, st: AppState, headers: HeaderMap, mut body: Bytes) -
 
     // A Cloud-managed budget (set by an operator) overrides the client-supplied
     // header; otherwise use the header, then the policy default.
-    let budget = st
-        .cloud_budget(&run_id)
+    let cloud_budget = st.cloud_budget(&run_id);
+    let requested = cloud_budget
         .or_else(|| header_f64(&headers, "x-fuse-budget-usd").map(Microusd::from_usd))
         .or(st.policy.budget_per_run)
         .unwrap_or(DEFAULT_RUN_BUDGET);
+    // Invariant 73: whatever the caller or a default chose is bounded by the
+    // operator's ceiling, here, before `open_run` below can rewrite an open
+    // run's budget with it. A Cloud budget is not.
+    let (budget, ceiling_hit) =
+        apply_run_budget_ceiling(requested, cloud_budget.is_some(), st.max_run_budget);
+    if let Some(ceiling) = ceiling_hit {
+        *clamped = Some(ceiling);
+        if st.note_budget_clamp(&run_id) {
+            tracing::warn!(
+                run = %run_id,
+                requested_usd = requested.as_usd(),
+                ceiling_usd = ceiling.as_usd(),
+                "the run's budget was clamped to the operator's ceiling (TOKENFUSE_MAX_RUN_BUDGET_USD); \
+                 logged once per run"
+            );
+        }
+    }
     // The tool blocks this request carried, recorded before ANY refusal, so a
     // clearance that arrives afterwards can say which blocks were on the screen
     // the person read (docs/07 B.4 gate 1, `crate::declassify`).
@@ -3562,6 +3631,273 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "2");
         assert_eq!(ledger.snapshot("run-1").await.unwrap().steps, 2);
+    }
+
+    // --- invariant 73: the operator's ceiling on a caller-chosen run budget -
+
+    /// A gateway enforcing budgets, with the operator ceiling set (or not).
+    fn ceiling_state(ceiling_usd: Option<f64>) -> AppState {
+        state(Mode::Enforce, StubProvider::default())
+            .with_max_run_budget(ceiling_usd.map(Microusd::from_usd))
+    }
+
+    /// One call on `run`, declaring `budget` (or nothing) and reserving for
+    /// `max_tokens` output tokens. `test-model` prices output at USD 15 per
+    /// million, so 100_000 tokens reserve USD 1.50 and 1_000 reserve USD 0.015.
+    async fn call_on(
+        st: &AppState,
+        run: &str,
+        budget: Option<&str>,
+        max_tokens: u64,
+        stream: bool,
+    ) -> Response {
+        let mut req = Request::post("/v1/messages").header("x-fuse-run-id", run);
+        if let Some(b) = budget {
+            req = req.header("x-fuse-budget-usd", b);
+        }
+        let body = if stream {
+            body_stream(max_tokens)
+        } else {
+            body(max_tokens)
+        };
+        call(st.clone(), req.body(Body::from(body)).unwrap()).await
+    }
+
+    const BIG_CALL: u64 = 100_000; // reserves USD 1.50
+    const SMALL_CALL: u64 = 1_000; // reserves USD 0.015
+
+    /// The measured defect: in a deployment with no client keys the per-run
+    /// ceiling was whatever the agent declared. With the ceiling at USD 1.00,
+    /// a declared USD 1000 must open the run at 1.00, so a USD 1.50
+    /// reservation is a 402. On the unfixed code it is admitted.
+    #[tokio::test]
+    async fn a_declared_budget_above_the_operators_ceiling_opens_the_run_at_the_ceiling() {
+        let st = ceiling_state(Some(1.0));
+        let resp = call_on(&st, "ceil-open", Some("1000"), BIG_CALL, false).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "a USD 1.50 reservation must not fit a run the operator capped at USD 1.00"
+        );
+        let snap = st.ledger.snapshot("ceil-open").await.unwrap();
+        assert_eq!(
+            snap.budget,
+            Microusd(1_000_000),
+            "the run opened at the ceiling"
+        );
+        assert_eq!(resp.headers().get("x-fuse-budget-clamped").unwrap(), "1.00");
+    }
+
+    /// Widening is the one release valve for a retained reservation (D7/D8)
+    /// and stays: it just stops at the ceiling.
+    #[tokio::test]
+    async fn widening_an_open_run_stops_at_the_ceiling() {
+        let st = ceiling_state(Some(1.0));
+        let first = call_on(&st, "ceil-widen", Some("0.50"), SMALL_CALL, false).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(!first.headers().contains_key("x-fuse-budget-clamped"));
+        assert_eq!(
+            st.ledger.snapshot("ceil-widen").await.unwrap().budget,
+            Microusd(500_000)
+        );
+
+        // Widened to 1000 by the agent's next call: clamped, but still wider.
+        let second = call_on(&st, "ceil-widen", Some("1000"), SMALL_CALL, false).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second.headers().get("x-fuse-budget-clamped").unwrap(),
+            "1.00"
+        );
+        assert_eq!(
+            st.ledger.snapshot("ceil-widen").await.unwrap().budget,
+            Microusd(1_000_000),
+            "widening reached the ceiling and not the declared 1000"
+        );
+
+        let third = call_on(&st, "ceil-widen", Some("1000"), BIG_CALL, false).await;
+        assert_eq!(third.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    /// A Cloud budget is the operator's own word, set through the control
+    /// plane, and the ceiling does not reach it.
+    #[tokio::test]
+    async fn a_cloud_budget_above_the_ceiling_is_honoured_unclamped() {
+        let st = ceiling_state(Some(1.0));
+        st.set_cloud_budgets(HashMap::from([(
+            "ceil-cloud".to_string(),
+            Microusd::from_usd(1000.0),
+        )]));
+        let resp = call_on(&st, "ceil-cloud", Some("1000"), BIG_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key("x-fuse-budget-clamped"));
+        assert_eq!(
+            st.ledger.snapshot("ceil-cloud").await.unwrap().budget,
+            Microusd::from_usd(1000.0)
+        );
+    }
+
+    /// Unset is today's behaviour, byte for byte: the caller's declaration
+    /// stands and no clamp header appears.
+    #[tokio::test]
+    async fn with_no_ceiling_the_declared_budget_stands() {
+        let st = ceiling_state(None);
+        let resp = call_on(&st, "ceil-none", Some("1000"), BIG_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key("x-fuse-budget-clamped"));
+        assert_eq!(
+            st.ledger.snapshot("ceil-none").await.unwrap().budget,
+            Microusd::from_usd(1000.0)
+        );
+    }
+
+    /// The header says "clamped", so it exists only on a call that was.
+    /// Equal to the ceiling is not clamped; below it is not; above it is.
+    #[tokio::test]
+    async fn the_clamp_header_is_present_only_on_a_clamped_call() {
+        let st = ceiling_state(Some(1.0));
+        for (run, declared, clamped) in [
+            ("hdr-below", "0.25", false),
+            ("hdr-equal", "1.00", false),
+            ("hdr-above", "1.000001", true),
+            ("hdr-far-above", "1e9", true),
+        ] {
+            let resp = call_on(&st, run, Some(declared), SMALL_CALL, false).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{run}");
+            assert_eq!(
+                resp.headers().contains_key("x-fuse-budget-clamped"),
+                clamped,
+                "{run} declared {declared}"
+            );
+        }
+        // Below or equal opens at the declared figure, untouched.
+        assert_eq!(
+            st.ledger.snapshot("hdr-below").await.unwrap().budget,
+            Microusd(250_000)
+        );
+    }
+
+    /// The built-in USD 5 and a policy default are not the operator's
+    /// ceiling-exempt word either: only a Cloud budget is.
+    #[tokio::test]
+    async fn the_builtin_default_and_the_policy_default_are_clamped_too() {
+        let st = ceiling_state(Some(1.0));
+        let resp = call_on(&st, "ceil-default", None, SMALL_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-budget-clamped").unwrap(), "1.00");
+        assert_eq!(
+            st.ledger.snapshot("ceil-default").await.unwrap().budget,
+            Microusd(1_000_000),
+            "the USD 5 default opened at the ceiling"
+        );
+
+        let mut policy_state = state(Mode::Enforce, StubProvider::default());
+        policy_state.policy = Arc::new(Policy {
+            mode: Mode::Enforce,
+            budget_per_run: Some(Microusd::from_usd(50.0)),
+            ..Default::default()
+        });
+        let policy_state = policy_state.with_max_run_budget(Some(Microusd::from_usd(1.0)));
+        let resp = call_on(&policy_state, "ceil-policy", None, SMALL_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            policy_state
+                .ledger
+                .snapshot("ceil-policy")
+                .await
+                .unwrap()
+                .budget,
+            Microusd(1_000_000)
+        );
+    }
+
+    /// A streamed answer is built before its body flows, so the header must
+    /// be on it too, and a refusal carries it as well as an allow.
+    #[tokio::test]
+    async fn the_clamp_header_rides_a_streamed_answer_and_a_refusal() {
+        let st = ceiling_state(Some(1.0));
+        let streamed = call_on(&st, "ceil-stream", Some("1000"), SMALL_CALL, true).await;
+        assert_eq!(streamed.status(), StatusCode::OK);
+        assert_eq!(
+            streamed.headers().get("x-fuse-budget-clamped").unwrap(),
+            "1.00"
+        );
+        let refused = call_on(&st, "ceil-refused", Some("1000"), BIG_CALL, true).await;
+        assert_eq!(refused.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            refused.headers().get("x-fuse-budget-clamped").unwrap(),
+            "1.00"
+        );
+    }
+
+    /// Once per run, not once per call: an agent making a hundred calls must
+    /// not write a hundred lines, and a second run is a second line.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_clamp_is_logged_once_per_run() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        let st = ceiling_state(Some(1.0));
+        for _ in 0..4 {
+            call_on(&st, "once-a", Some("1000"), SMALL_CALL, false).await;
+        }
+        call_on(&st, "once-b", Some("1000"), SMALL_CALL, false).await;
+        // An unclamped call writes none.
+        call_on(&st, "once-c", Some("0.5"), SMALL_CALL, false).await;
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        let count = |run: &str| {
+            log.lines()
+                .filter(|l| l.contains("TOKENFUSE_MAX_RUN_BUDGET_USD") && l.contains(run))
+                .count()
+        };
+        assert_eq!(count("once-a"), 1, "{log}");
+        assert_eq!(count("once-b"), 1, "{log}");
+        assert_eq!(count("once-c"), 0, "{log}");
+    }
+
+    #[test]
+    fn the_ceiling_only_ever_lowers_a_budget_the_operator_did_not_set() {
+        let c = Some(Microusd(1_000_000));
+        let (b, hit) = apply_run_budget_ceiling(Microusd(1_000_001), false, c);
+        assert_eq!((b, hit), (Microusd(1_000_000), c));
+        // At or below: untouched, nothing reported.
+        assert_eq!(
+            apply_run_budget_ceiling(Microusd(1_000_000), false, c),
+            (Microusd(1_000_000), None)
+        );
+        assert_eq!(
+            apply_run_budget_ceiling(Microusd(5), false, c),
+            (Microusd(5), None)
+        );
+        // A Cloud budget is the operator's word.
+        assert_eq!(
+            apply_run_budget_ceiling(Microusd(9_000_000), true, c),
+            (Microusd(9_000_000), None)
+        );
+        // No ceiling is the identity, whatever the figure (i64::MAX is what
+        // `x-fuse-budget-usd: inf` parses to).
+        assert_eq!(
+            apply_run_budget_ceiling(Microusd(i64::MAX), false, None),
+            (Microusd(i64::MAX), None)
+        );
+        assert_eq!(
+            apply_run_budget_ceiling(Microusd(i64::MAX), false, c),
+            (Microusd(1_000_000), c)
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_named_in_exact_dollars() {
+        for (micro, want) in [
+            (1_000_000, "1.00"),
+            (500_000, "0.50"),
+            (25_100_000, "25.10"),
+            (2_345_678, "2.345678"),
+            (1, "0.000001"),
+            (1_000_000_000_000, "1000000.00"),
+        ] {
+            assert_eq!(ceiling_usd_string(Microusd(micro)), want, "{micro}");
+        }
     }
 
     // --- invariant 70: a restarted gateway enforces the Cloud's run spend --

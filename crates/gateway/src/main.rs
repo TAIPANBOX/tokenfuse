@@ -1112,6 +1112,22 @@ async fn serve() {
     tracing::info!(?tools_prune, "shadow tool-pruning measurement");
     state = state.with_tools_prune(tools_prune);
 
+    // The operator's ceiling on a run budget the caller or a default chose
+    // (`TOKENFUSE_MAX_RUN_BUDGET_USD`, invariant 73). Unset is no ceiling, the
+    // behaviour before the variable existed; a value that cannot be read exits
+    // 2 here instead of starting with no ceiling. process-local: the MCP
+    // broker holds no run budget (it brokers credentials, it never opens a
+    // run in the ledger), so there is nothing for it to clamp.
+    let max_run_budget = tokenfuse_gateway::defaults::max_run_budget_from_env();
+    match max_run_budget {
+        Some(ceiling) => tracing::info!(
+            ceiling_usd = ceiling.as_usd(),
+            "run budget ceiling: a caller-declared or default budget is clamped to it"
+        ),
+        None => tracing::info!("run budget ceiling: none (a caller may declare any run budget)"),
+    }
+    state = state.with_max_run_budget(max_run_budget);
+
     // The delegation door, and the revocation list behind it. The same two
     // calls `mcp_broker` makes, because this process runs the other door and
     // `chainproof::resolve` at proxy.rs reads exactly the same config. Measured

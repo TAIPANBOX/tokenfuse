@@ -150,6 +150,11 @@ run a **budget poller** (`cloudsink::spawn_budget_poller`) that fetches
 `GET /v1/budgets` and applies the overrides. So an operator can tighten (or
 raise) a runaway run's cap centrally without touching the agent.
 
+A Cloud budget is the operator's own word, so the gateway's
+`TOKENFUSE_MAX_RUN_BUDGET_USD` ceiling (which bounds what a caller may declare
+for itself) never clamps one: a run budgeted here above that ceiling keeps the
+budget set here.
+
 ## Two dashboards
 
 - **Embedded** (`GET /` on the control plane) — dependency-free vanilla JS, zero

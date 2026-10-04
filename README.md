@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.4.1-brightgreen)
-![tests](https://img.shields.io/badge/tests-1587-brightgreen)
+![tests](https://img.shields.io/badge/tests-1604-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -394,6 +394,16 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 ```
 
 `TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
+
+**Cap what an agent may declare.** The budget in `x-fuse-budget-usd` is whatever the calling agent sends, and an agent that sends a larger one on its next call widens its own run. With no client keys configured, that header is the only per-run ceiling there is. Set `TOKENFUSE_MAX_RUN_BUDGET_USD` to a positive decimal number of dollars (at most six decimals, for example `25` or `2.50`) and the gateway clamps every budget the caller declared, and the built-in USD 5 default used when it declared none, to that figure before the run is opened:
+
+```bash
+docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_USD=25 \
+  -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
+  ghcr.io/taipanbox/tokenfuse:v1.4.1
+```
+
+A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling, widening an open run still works up to the ceiling and never past it, and a budget an operator set in the Cloud is the operator's own word and is not clamped. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
 
 ---
 
