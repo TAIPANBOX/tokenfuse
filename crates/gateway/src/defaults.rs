@@ -25,7 +25,7 @@
 //! the process environment, which also keeps these tests out of the
 //! env-var-mutation race that `events.rs`'s tests had to grow a mutex for.
 
-use tokenfuse_core::DlpMode;
+use tokenfuse_core::{DlpMode, Mode};
 
 /// Secret scanning (`TOKENFUSE_DLP`): `off | shadow | mask | block`.
 ///
@@ -162,6 +162,40 @@ pub fn require_run_id_from_env() -> bool {
     require_run_id_from(std::env::var("TOKENFUSE_REQUIRE_RUN_ID").ok().as_deref())
 }
 
+/// The budget policy's rollout mode (`TOKENFUSE_MODE`): `shadow | warn | enforce`.
+///
+/// **Unset or empty is `shadow`**, unchanged: a gateway dropped in front of a
+/// running agent records what it would block before it blocks anything.
+///
+/// An unknown value is an `Err` carrying that value, never a reading of it.
+/// Until 2026-10-04 anything but the exact words `enforce` and `warn` fell
+/// through to `shadow`, so `TOKENFUSE_MODE=enfroce` or `=Enforce` started a
+/// gateway that enforced no budget while its operator believed it did, the
+/// one failure a budget control must never have. `TOKENFUSE_IDENTITY_STRICT`
+/// already refuses a mistyped mode for the same reason; this matches it,
+/// case-insensitively, and the caller owns the exit.
+pub fn policy_mode_from(value: Option<&str>) -> Result<Mode, String> {
+    let trimmed = value.unwrap_or_default().trim();
+    match trimmed.to_lowercase().as_str() {
+        "" | "shadow" => Ok(Mode::Shadow),
+        "warn" => Ok(Mode::Warn),
+        "enforce" => Ok(Mode::Enforce),
+        _ => Err(trimmed.to_string()),
+    }
+}
+
+/// [`policy_mode_from`] against the process environment; exits 2 on a value
+/// it cannot read, naming the value and the three it accepts.
+pub fn policy_mode_from_env() -> Mode {
+    match policy_mode_from(std::env::var("TOKENFUSE_MODE").ok().as_deref()) {
+        Ok(mode) => mode,
+        Err(raw) => {
+            eprintln!("tokenfuse: TOKENFUSE_MODE must be shadow|warn|enforce, got `{raw}`");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +304,38 @@ mod tests {
         use tokenfuse_core::cache::CacheMode;
         for typo in ["Shadow", "On", "enforce", "1", "true"] {
             assert_eq!(cache_mode_from(Some(typo)), CacheMode::Off, "{typo}");
+        }
+    }
+
+    #[test]
+    fn the_policy_mode_is_shadow_when_nothing_is_configured() {
+        assert_eq!(policy_mode_from(None), Ok(Mode::Shadow));
+        assert_eq!(policy_mode_from(Some("")), Ok(Mode::Shadow));
+        assert_eq!(policy_mode_from(Some("  ")), Ok(Mode::Shadow));
+    }
+
+    #[test]
+    fn every_named_policy_mode_is_honoured_in_any_case() {
+        for (raw, want) in [
+            ("shadow", Mode::Shadow),
+            ("warn", Mode::Warn),
+            ("enforce", Mode::Enforce),
+            ("Enforce", Mode::Enforce),
+            (" ENFORCE ", Mode::Enforce),
+            ("Warn", Mode::Warn),
+        ] {
+            assert_eq!(policy_mode_from(Some(raw)), Ok(want), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_mistyped_policy_mode_is_refused_not_read_as_shadow() {
+        for typo in ["enfroce", "enforced", "on", "1", "true", "block", "off"] {
+            assert_eq!(
+                policy_mode_from(Some(typo)),
+                Err(typo.to_string()),
+                "{typo} must be refused, not started as shadow"
+            );
         }
     }
 }
