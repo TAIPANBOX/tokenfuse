@@ -4829,3 +4829,25 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     itself run individually after the fix landed, none of them the
     once-per-many-runs failure CI happened to hit. Not a script gate: the
     rule is `CloudSink::ship`'s own condition, held by `cargo test`.)*
+
+72. **A budget mode the gateway cannot read stops it from starting.**
+    `TOKENFUSE_MODE` decides whether a budget stops a call at all. Until
+    2026-10-04 `main.rs` matched only the exact words `enforce` and `warn`
+    and read everything else as `shadow`, so `enfroce`, `Enforce` or
+    `ENFORCE` started a gateway that blocked nothing while its operator
+    believed it blocked. `defaults::policy_mode_from` now reads unset or
+    empty as `shadow` (the drop-in default is unchanged), the three names in
+    any case, and anything else as an `Err` carrying the value;
+    `policy_mode_from_env` exits 2 naming it, the same answer
+    `TOKENFUSE_IDENTITY_STRICT` (`StrictMode::from_env`) already gives.
+    Every launcher sets `enforce` explicitly, so none is affected; a
+    hand-written deployment with a typo now fails loudly at start instead
+    of silently at the first over-budget call.
+    *(test: `defaults::tests::a_mistyped_policy_mode_is_refused_not_read_as_shadow`,
+    `every_named_policy_mode_is_honoured_in_any_case`,
+    `the_policy_mode_is_shadow_when_nothing_is_configured`;
+    `features/a-mistyped-mode-refuses-to-start.feature`. Red first against
+    the old match: `left: Ok(Shadow) right: Err("enfroce")` and
+    `left: Ok(Shadow) right: Ok(Enforce)` for `"Enforce"`; the old match is
+    both mutants at once (no refusal arm, no case folding). Not a script
+    gate: the rule is the parser's own, held by `cargo test`.)*
