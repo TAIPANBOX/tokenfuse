@@ -83,12 +83,17 @@ pub enum McpClientError {
     BodyTooLarge { limit: usize },
 }
 
+/// The `Accept` an MCP client sends on every POST of the streamable HTTP
+/// transport: the spec requires both types, and a server may answer with
+/// either. The MCP broker's upstream leg sends the same value.
+pub(crate) const MCP_ACCEPT: &str = "application/json, text/event-stream";
+
 /// Does `content_type` (a raw `content-type` header value, possibly with a
 /// `; charset=...` parameter) name `expected` as its media type? Splits on
 /// `;` and trims before comparing, so e.g. `application/jsonx` or
 /// `application/json-patch` don't falsely match `application/json` the way a
 /// bare `starts_with` would.
-fn content_type_matches(content_type: &str, expected: &str) -> bool {
+pub(crate) fn content_type_matches(content_type: &str, expected: &str) -> bool {
     content_type
         .split(';')
         .next()
@@ -377,7 +382,7 @@ fn initialized_notification() -> Value {
 /// the two readers of SSE in this crate cannot disagree on a line end, a comment, the
 /// one-space rule or where an event ends. Frames whose data is not JSON (a keep-alive, a
 /// sentinel) are dropped rather than failing the stream, as before.
-fn parse_sse_frames(text: &str) -> Vec<Value> {
+pub(crate) fn parse_sse_frames(text: &str) -> Vec<Value> {
     crate::provider::split_sse_events(text)
         .events
         .iter()
@@ -420,7 +425,7 @@ async fn send(
     let mut builder = client
         .post(&cfg.url)
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream");
+        .header("accept", MCP_ACCEPT);
     if let Some(sid) = session_id {
         builder = builder.header("Mcp-Session-Id", sid);
     }
