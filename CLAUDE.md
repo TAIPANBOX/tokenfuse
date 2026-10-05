@@ -5211,20 +5211,159 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Not a script gate: the rule is `upstream_reply` and one header, held by
     `cargo test`.)*
 
-    **Where it says nothing.** The broker keeps no MCP session: it neither
-    sends `Mcp-Session-Id` nor relays the one an upstream returns, so a
-    server in the SDK's default stateful mode answers `initialize` and then
-    `400 Bad Request: Missing session ID` to every later call. @measured
-    2026-10-05 on both `mcp` 1.30.0 and 2.3.0 in their default mode, through
-    this change: `initialize` returned its result, `tools/list` and
-    `tools/call` returned that 400. A stateless server (`stateless_http=True`)
-    works end to end, in JSON mode or stream mode, measured the same day.
-    `MCP-Protocol-Version` is not sent either. The broker does not stream: it
+    **Where it says nothing.** Sessions, `MCP-Protocol-Version` and
+    notifications are invariant 77's. The broker does not stream: it
     buffers the whole body, unbounded as the JSON path always was, so a server
     that keeps a stream open after its response, or sends a server request
     and waits for an answer the broker never gives, holds the call until the
     upstream closes or the client gives up (the broker's client sets no
-    timeout, `main.rs`). A notification sent through the broker gets the same
-    error on the server's empty 202 it always did, @measured 2026-10-05 on
-    both SDKs through this change: `bad upstream json: EOF while parsing a
-    value at line 1 column 0`.
+    timeout, `main.rs`).
+
+77. **The broker carries the session a stateful MCP server opens, bound to the
+    server that opened it and the credential that asked.** A server on MCP's
+    streamable HTTP transport may open a session on `initialize`, name it in
+    an `Mcp-Session-Id` response header, and refuse any later message that
+    does not carry it; the official Python SDK does exactly that in its
+    default mode. The broker passed neither the id nor `MCP-Protocol-Version`
+    along. @measured 2026-10-05, a FastMCP server on `mcp` 1.30.0 and an
+    MCPServer on `mcp` 2.3.0, both stateful, behind `tokenfuse mcp-broker`
+    built from `2bd59cd` (scratch scripts `repro.sh` and `raw.sh`, the SDK's
+    own `streamablehttp_client` driving the first): `initialize` returned its
+    result with no session header, `notifications/initialized`, `tools/list`
+    and `tools/call` each came back `upstream error: HTTP status client error
+    (400 Bad Request)`, and the SDK client raised on its first call after
+    `initialize`. The stdio transport failed the same way, and answered the
+    notification with a line. A notification over HTTP got `200` and a
+    JSON-RPC error with `id: null`, where JSON-RPC answers a notification with
+    nothing; on a stateless server it got `bad upstream json: EOF while
+    parsing a value at line 1 column 0`, the server's empty 202 read as JSON.
+
+    **Over HTTP the client holds the session, and the broker binds it.** The
+    broker is where many callers become one: behind it the upstream sees the
+    broker and whatever it injected, never which caller opened a session, so
+    the upstream cannot bind a session to a caller and the broker has to
+    (`crate::mcpsession`). The id a client receives is the upstream's own id
+    behind a tag, `tf1.<tag>.<upstream id>`, the tag an HMAC-SHA-256 under a
+    key drawn once per process over the upstream's URL, the door credential
+    that admitted the call (`key:<key_id>`, `proof:<client_id>`,
+    `xaa:<client_id>`, empty when the door is open) and the upstream id,
+    length-prefixed so no two bindings serialise alike. A presented id is
+    unwrapped only when its tag matches the upstream the call is about to
+    reach and the credential it came with, checked right after the upstream
+    is resolved and before any secret is resolved or any policy asked; any
+    other id, the upstream's raw id included, is `404` with JSON-RPC
+    `-32010` and nothing is forwarded, which is the answer that sends an MCP
+    client back to `initialize`. So a session opened on one named upstream is
+    never sent to another (`X-Fuse-Mcp-Upstream`), and one caller cannot ride
+    a session another caller opened. The id is relayed whenever the upstream
+    names one, not only on `initialize`, and the same session is the same id
+    every time. An upstream id a header cannot carry (outside visible ASCII,
+    or over 512 bytes) is not relayed. Nothing is stored: the tag carries the
+    binding, so there is no table to grow or evict. The client's
+    `MCP-Protocol-Version` goes upstream as it came.
+
+    **Over stdio the broker holds the session itself**, because one process
+    is one client and there is no header to carry it (`run_lines`, which
+    `run_stdio` hands stdin and stdout). It keeps the upstream's id and the
+    `protocolVersion` the `initialize` result named, and sends both on every
+    later message; a new `initialize` goes out without the old session and
+    replaces both.
+
+    **A notification gets no JSON-RPC answer.** A message with a `method` and
+    no `id` is forwarded with the session like any other. Accepted, HTTP
+    answers `202` with no body and stdio writes nothing; the upstream's empty
+    body is never parsed. Refused, HTTP answers the upstream's own status (or
+    `502` when the upstream was not reached, `400` when the broker refused it
+    before forwarding) with a JSON-RPC error whose `id` is null, which the
+    specification allows, and stdio writes nothing and logs the refusal. An
+    upstream `404` to a call that carried a session is relayed as `404`
+    (`-32010`), so the client opens a new session rather than reading an
+    ordinary error.
+
+    `@claude` 2026-10-05, choices under delegated authority, open to reversal:
+    a bound pass-through rather than a session table, because it binds the
+    session without memory to bound and without state to lose more often than
+    the process; the credential in the binding, because the upstream cannot
+    tell callers apart and the specification asks a server to bind a session
+    to its user; stdio held by the broker rather than left broken; no
+    transparent re-`initialize` on stdio, because replaying a client's
+    `initialize` would invent a session the client never asked for.
+    *(test: in `tests/mcp_broker.rs`, against a stub that behaves as the SDK
+    does in stateful mode,
+    `a_stateful_server_keeps_its_session_through_the_broker`,
+    `the_protocol_version_reaches_the_upstream`,
+    `a_session_from_one_upstream_is_never_sent_to_another`,
+    `a_session_opened_by_one_credential_is_refused_to_another`,
+    `a_session_id_the_broker_did_not_issue_is_refused`,
+    `an_upstream_that_forgot_the_session_sends_the_agent_back_to_initialize`,
+    `a_notification_is_accepted_with_no_body`,
+    `a_refused_notification_is_an_error_status_without_an_id`,
+    `a_notification_the_broker_refuses_itself_is_an_error_status_too`,
+    `the_stdio_transport_holds_the_session_itself` and
+    `a_new_stdio_initialize_replaces_the_held_session`; in
+    `gateway::mcpsession`, `a_bound_session_survives_only_its_own_binding`,
+    `an_upstream_id_a_header_cannot_carry_is_not_relayed` and
+    `hostile_session_ids_never_panic_and_never_unwrap` (200 seeds). Red
+    first, @measured `cargo test -p tokenfuse-gateway --test mcp_broker`
+    2026-10-05 against `2bd59cd` with only `run_stdio` split into `run_lines`
+    (no behaviour change, so the stdio tests compile): all ten integration
+    tests failed, the HTTP ones on `the broker must hand the agent a session
+    id with initialize` or `a session id` (no header came back), the refused
+    notification `left: 200 right: 400`, the stdio ones `left: [1, null, 2, 3]
+    right: [1, 2, 3]` (a line answered the notification) and every later
+    call `400 Bad Request`. The three unit tests name an API this change adds
+    and are held by mutants. Sixteen mutants planted in the product code
+    2026-10-05 and reverted (scratch `mutants.py`, each run against `--lib
+    mcpsession` and `--test mcp_broker`), each caught by name: the binding
+    without the credential (`a_bound_session_survives_only_its_own_binding`,
+    `a_session_opened_by_one_credential_is_refused_to_another`), without the
+    upstream (the same unit test and
+    `a_session_from_one_upstream_is_never_sent_to_another`), without the
+    length prefixes (the unit test alone), the tag never compared (four
+    tests), a presented id forwarded as presented (six), the session not sent
+    upstream (six), the protocol version not sent
+    (`the_protocol_version_reaches_the_upstream`,
+    `the_stdio_transport_holds_the_session_itself`), the upstream's id never
+    relayed (nine), an accepted notification answered with a body
+    (`a_notification_is_accepted_with_no_body` and one more), an upstream
+    `404` not mapped (`an_upstream_that_forgot_the_session_sends_the_agent_back_to_initialize`),
+    stdio keeping the old session across `initialize`
+    (`a_new_stdio_initialize_replaces_the_held_session`), stdio answering a
+    notification (`the_stdio_transport_holds_the_session_itself`), any byte
+    allowed in a relayed id (`an_upstream_id_a_header_cannot_carry_is_not_relayed`),
+    a key's id left out of the binding
+    (`a_session_opened_by_one_credential_is_refused_to_another`), an
+    upstream's refusal of a notification answered `200`
+    (`a_refused_notification_is_an_error_status_without_an_id`). One survived
+    the first pass: a notification the broker refuses itself, before
+    forwarding, answered `200`; no test sent one.
+    `a_notification_the_broker_refuses_itself_is_an_error_status_too` was
+    added, red against that mutant (`left: 200 right: 400`, the answer
+    `2bd59cd` gave too), and catches it.
+    @measured end to end 2026-10-05 with the same two stateful servers and
+    the same scripts against the built binary: the SDK client initialized,
+    listed `['echo']` and got `echo1:hi` and `echo2:hi`; by hand,
+    `notifications/initialized` `202` with no body and every response
+    carrying the one `tf1.` id; over stdio, three lines for four messages, all
+    results; two stateless servers (`stateless_http=True`) still worked and
+    their notification became `202`. Scenarios:
+    `features/the-broker-keeps-the-mcp-session.feature`, seven, each bound.
+    Not a script gate: the rule is `mcpsession` and the forward in `process`,
+    held by `cargo test`.)*
+
+    **Where it says nothing.** The key lives in the process, so a restarted
+    broker, or a second replica behind a balancer that is not sticky, answers
+    `404` to every session the first one bound and the clients start over;
+    the stacks run one replica (`stack-k8s/manifests/52-tokenfuse-mcp-broker.yaml`).
+    With nothing on the door the binding is the upstream alone, and any
+    caller holding an id can use that session. The upstream's own id is
+    readable inside the bound one: it is the client's session, not a secret
+    from the client. Only `POST` is routed: `DELETE`, which a client sends to
+    end a session, and `GET`, which opens the server's own stream, are `405`,
+    which the specification allows, so a session ends when the upstream
+    expires it and nothing the server sends outside a response reaches the
+    client. On stdio an upstream that forgot the session is a JSON-RPC error
+    until the client sends `initialize` again; the broker does not
+    re-initialize for it. A client's JSON-RPC response (an answer to a server
+    request, `id` and no `method`) is not a notification here and goes the old
+    way, as before.

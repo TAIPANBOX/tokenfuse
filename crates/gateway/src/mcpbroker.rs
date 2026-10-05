@@ -236,7 +236,47 @@ pub struct CallContext {
     /// previously-held `tools/call` through, verified by the PDP exactly as on
     /// the LLM path.
     pub approval_token: Option<String>,
+    /// The MCP session this call belongs to, if any (invariant 77).
+    pub session: Option<SessionId>,
+    /// `MCP-Protocol-Version`, sent upstream as it came (HTTP) or as the
+    /// upstream's `initialize` result named it (stdio).
+    pub protocol_version: Option<String>,
+    /// The door credential this call was admitted by (`key:<key_id>`,
+    /// `proof:<client_id>`, `xaa:<client_id>`), empty when the door is open.
+    /// A session is bound to it, so one caller cannot ride another's session.
+    pub principal: String,
 }
+
+/// Where a call's session id came from, which decides whether it is trusted.
+#[derive(Clone, Debug)]
+pub enum SessionId {
+    /// From a client's `Mcp-Session-Id` header: an id this broker issued,
+    /// verified against the call's upstream and credential before any of it
+    /// is forwarded (`crate::mcpsession`).
+    Presented(String),
+    /// The upstream's own id, held by the broker itself on stdio.
+    Held(String),
+}
+
+/// What [`process_call`] did with one message, for a transport to answer with.
+#[derive(Debug)]
+pub struct Outcome {
+    /// The JSON-RPC answer. `Value::Null` when the message was a notification
+    /// the upstream accepted: a notification is never answered.
+    pub reply: Value,
+    /// The message was a notification (a request with no `id`).
+    pub notification: bool,
+    /// The HTTP status the HTTP transport answers with, `None` for 200 (or
+    /// 202 for an accepted notification).
+    pub status: Option<axum::http::StatusCode>,
+    /// The session id the upstream named on its response, as it sent it, with
+    /// the upstream URL that issued it.
+    pub upstream_session: Option<(String, String)>,
+}
+
+/// JSON-RPC code for a session this broker cannot carry: one it did not issue
+/// for this upstream and credential, or one the upstream no longer knows.
+const SESSION_RPC_CODE: i64 = -32010;
 
 pub fn app(state: Arc<BrokerState>) -> Router {
     // Bound the JSON-RPC body a client can force the broker to buffer.
@@ -886,7 +926,39 @@ async fn finish(st: &BrokerState, req: Value, ctx: CallContext) -> Response {
             ctx.proven_actor.as_deref().unwrap_or_default(),
         );
     }
-    Json(process(st, req, &ctx).await).into_response()
+    let out = process_call(st, req, &ctx).await;
+    http_answer(out, &ctx.principal)
+}
+
+/// The HTTP shape of an [`Outcome`] (invariant 77): an accepted notification
+/// is `202` with no body; any other notification is an error status, since it
+/// has no id to put an error under; a request is its JSON-RPC answer, `200`
+/// unless the outcome named a status. A session the upstream named goes back
+/// bound to that upstream and to `principal`.
+fn http_answer(out: Outcome, principal: &str) -> Response {
+    let mut resp = if out.notification && out.reply.is_null() {
+        axum::http::StatusCode::ACCEPTED.into_response()
+    } else {
+        let status = match out.status {
+            Some(s) => s,
+            None if out.notification => axum::http::StatusCode::BAD_REQUEST,
+            None => axum::http::StatusCode::OK,
+        };
+        (status, Json(out.reply)).into_response()
+    };
+    if let Some((upstream, sid)) = out.upstream_session {
+        let binding = crate::mcpsession::Binding {
+            upstream: &upstream,
+            principal,
+        };
+        if let Some(v) = crate::mcpsession::wrap(binding, &sid)
+            .and_then(|w| axum::http::HeaderValue::from_str(&w).ok())
+        {
+            resp.headers_mut()
+                .insert(crate::mcpsession::SESSION_HEADER, v);
+        }
+    }
+    resp
 }
 
 /// HTTP handler - delegates to the transport-agnostic [`process`]. Reads the
@@ -989,6 +1061,9 @@ async fn handle(
                 delegation_proof: None,
                 attestation_method: header("x-fuse-attestation-method"),
                 approval_token: header("x-fuse-approval-token"),
+                session: header(crate::mcpsession::SESSION_HEADER).map(SessionId::Presented),
+                protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
+                principal: format!("xaa:{}", verified.client_id),
             };
             return finish(&st, req, ctx).await;
         }
@@ -1003,7 +1078,7 @@ async fn handle(
     // `TOKENFUSE_MAX_BODY_BYTES` limit `app` puts on every route; the check
     // lives here rather than in a `route_layer` so a future route reaching
     // this handler cannot be added without it.
-    match crate::mcpdoor::admit(
+    let principal = match crate::mcpdoor::admit(
         crate::mcpdoor::Door {
             keys: &st.keys,
             clients: &st.clients,
@@ -1035,9 +1110,13 @@ async fn handle(
         }
         crate::mcpdoor::Admission::Proof(client_id) => {
             tracing::debug!(%client_id, "mcp broker: admitted by proof of possession");
+            format!("proof:{client_id}")
         }
-        crate::mcpdoor::Admission::Bearer(_) | crate::mcpdoor::Admission::Open => {}
-    }
+        // What a session is bound to (invariant 77): the key's id, never the
+        // secret that resolved to it.
+        crate::mcpdoor::Admission::Bearer(key_id) => format!("key:{key_id}"),
+        crate::mcpdoor::Admission::Open => String::new(),
+    };
     // The same parse and the same cap as the LLM door (tokenfuse#297): a
     // chain longer than SPEC 5.1 allows is refused here, before the chain is
     // resolved, the policy asked or the upstream reached, with the LLM path's
@@ -1096,6 +1175,9 @@ async fn handle(
         chain_proven,
         attestation_method: header("x-fuse-attestation-method"),
         approval_token: header("x-fuse-approval-token"),
+        session: header(crate::mcpsession::SESSION_HEADER).map(SessionId::Presented),
+        protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
+        principal,
     };
     finish(&st, req, ctx).await
 }
@@ -1265,7 +1347,33 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
 /// enforcing broker unusable over stdio, which is the honest consequence of
 /// a transport with no identity channel and a policy that keys on identity.
 /// Shadow mode and an unconfigured broker are unaffected.
-pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Value {
+pub async fn process(st: &BrokerState, req: Value, ctx: &CallContext) -> Value {
+    process_call(st, req, ctx).await.reply
+}
+
+/// [`process`], plus what a transport needs beyond the JSON-RPC answer: the
+/// HTTP status, whether the message was a notification, and the session id
+/// the upstream named (invariant 77).
+pub async fn process_call(st: &BrokerState, req: Value, ctx: &CallContext) -> Outcome {
+    // A notification is a request with no `id`; JSON-RPC answers it with
+    // nothing at all.
+    let notification = req.get("method").is_some() && req.get("id").is_none();
+    let mut out = Outcome {
+        reply: Value::Null,
+        notification,
+        status: None,
+        upstream_session: None,
+    };
+    out.reply = process_into(st, req, ctx, &mut out).await;
+    out
+}
+
+async fn process_into(
+    st: &BrokerState,
+    mut req: Value,
+    ctx: &CallContext,
+    out: &mut Outcome,
+) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req
         .get("method")
@@ -1307,6 +1415,37 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
     let upstream_url = match resolve_upstream(st, ctx, &id) {
         Ok(u) => u.to_string(),
         Err(e) => return e,
+    };
+
+    // The session this call rides in, checked against the upstream it is
+    // about to reach and the credential it came with, before any secret is
+    // resolved (invariant 77). A presented id this broker did not issue for
+    // exactly that pair is 404, the answer that sends an MCP client back to
+    // `initialize`, and nothing is forwarded.
+    let upstream_session = match &ctx.session {
+        None => None,
+        Some(SessionId::Held(s)) => Some(s.clone()),
+        Some(SessionId::Presented(p)) => {
+            let binding = crate::mcpsession::Binding {
+                upstream: &upstream_url,
+                principal: &ctx.principal,
+            };
+            match crate::mcpsession::unwrap(binding, p) {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    tracing::warn!(
+                        "mcp broker: refused an Mcp-Session-Id this broker did not issue for \
+                         this upstream and credential"
+                    );
+                    out.status = Some(axum::http::StatusCode::NOT_FOUND);
+                    return rpc_error(
+                        &id,
+                        SESSION_RPC_CODE,
+                        "unknown mcp session (Mcp-Session-Id): initialize a new one",
+                    );
+                }
+            }
+        }
     };
 
     // In shadow mode the Wardryx gate records what it WOULD have done and lets
@@ -1611,21 +1750,70 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         Ok(p) => p,
         Err(e) => return rpc_error(&id, -32000, &format!("encode error: {e}")),
     };
-    let upstream = match st
+    let mut forward = st
         .client
         .post(&upstream_url)
         .header("content-type", "application/json")
         // Named rather than left to reqwest's default `*/*`, which the MCP
         // Python SDK 1.x answers 406 (invariant 76).
-        .header("accept", crate::mcpclient::MCP_ACCEPT)
-        .body(payload)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
+        .header("accept", crate::mcpclient::MCP_ACCEPT);
+    // The session and the negotiated version, so a stateful server knows the
+    // call (invariant 77).
+    if let Some(s) = &upstream_session {
+        forward = forward.header(crate::mcpsession::SESSION_HEADER, s);
+    }
+    if let Some(v) = &ctx.protocol_version {
+        forward = forward.header(crate::mcpsession::PROTOCOL_VERSION_HEADER, v);
+    }
+    let upstream = match forward.body(payload).send().await {
         Ok(r) => r,
-        Err(e) => return rpc_error(&id, -32000, &format!("upstream error: {e}")),
+        Err(e) => {
+            if out.notification {
+                out.status = Some(axum::http::StatusCode::BAD_GATEWAY);
+            }
+            return rpc_error(&id, -32000, &format!("upstream error: {e}"));
+        }
     };
+    // Relayed whenever the upstream names one, which the SDK does on every
+    // response of a session, not only on `initialize`.
+    if let Some(sid) = upstream
+        .headers()
+        .get(crate::mcpsession::SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        if crate::mcpsession::is_valid_id(sid) {
+            out.upstream_session = Some((upstream_url.clone(), sid.to_string()));
+        } else {
+            tracing::warn!(
+                "mcp broker: the upstream named a session id a header cannot carry; not relayed"
+            );
+        }
+    }
+    if let Err(e) = upstream.error_for_status_ref() {
+        let status = upstream.status();
+        // The upstream no longer knows this session (it restarted, or the
+        // session expired): the client must open a new one, and 404 is how
+        // the protocol tells it to.
+        if status == reqwest::StatusCode::NOT_FOUND && upstream_session.is_some() {
+            out.status = Some(axum::http::StatusCode::NOT_FOUND);
+            return rpc_error(
+                &id,
+                SESSION_RPC_CODE,
+                "the upstream no longer knows this mcp session: initialize a new one",
+            );
+        }
+        // A notification gets no JSON-RPC answer, so its refusal is the
+        // status itself.
+        if out.notification {
+            out.status = axum::http::StatusCode::from_u16(status.as_u16()).ok();
+        }
+        return rpc_error(&id, -32000, &format!("upstream error: {e}"));
+    }
+    if out.notification {
+        // Accepted, and answered with nothing: the upstream's 202 has no body
+        // to read, and there is no tool list or result in it to check.
+        return Value::Null;
+    }
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1801,21 +1989,75 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
 /// via [`process`] and forwarded to the configured HTTP upstream. Logs must go to
 /// stderr (stdout is the protocol channel).
 pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    run_lines(
+        state,
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
+/// The stdio transport over any line source and sink: [`run_stdio`] hands it
+/// stdin and stdout, a test hands it bytes in memory.
+pub async fn run_lines<R, W>(
+    state: Arc<BrokerState>,
+    input: R,
+    mut stdout: W,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut lines = input.lines();
+    // One process is one client, so the broker holds the upstream's session
+    // itself (invariant 77): stdio has no header to carry it back and forth.
+    let mut session: Option<String> = None;
+    let mut protocol_version: Option<String> = None;
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let resp = match serde_json::from_str::<Value>(line) {
-            // stdio has no per-message header channel, so the CallContext is
-            // empty here: no agent_id (mcp_drift is skipped, and an ENFORCING
-            // Wardryx gate refuses the call outright rather than skipping,
-            // see `process`) and no named upstream (the default one is always
-            // used).
-            Ok(req) => process(&state, req, &CallContext::default()).await,
+            Ok(req) => {
+                let initialize = req.get("method").and_then(Value::as_str) == Some("initialize");
+                if initialize {
+                    // A new `initialize` opens a new session; the old one is
+                    // not sent with it.
+                    session = None;
+                    protocol_version = None;
+                }
+                // stdio has no per-message header channel, so the rest of the
+                // CallContext is empty here: no agent_id (mcp_drift is
+                // skipped, and an ENFORCING Wardryx gate refuses the call
+                // outright rather than skipping, see `process`) and no named
+                // upstream (the default one is always used).
+                let ctx = CallContext {
+                    session: session.clone().map(SessionId::Held),
+                    protocol_version: protocol_version.clone(),
+                    ..CallContext::default()
+                };
+                let out = process_call(&state, req, &ctx).await;
+                if let Some((_, sid)) = out.upstream_session {
+                    session = Some(sid);
+                }
+                if initialize {
+                    protocol_version = out.reply["result"]["protocolVersion"]
+                        .as_str()
+                        .filter(|v| crate::mcpsession::is_valid_id(v))
+                        .map(str::to_string);
+                }
+                if out.notification {
+                    // JSON-RPC answers a notification with nothing, so a
+                    // refusal of one can only be logged.
+                    if !out.reply.is_null() {
+                        tracing::warn!(reply = %out.reply, "mcp broker: a notification was not accepted");
+                    }
+                    continue;
+                }
+                out.reply
+            }
             Err(e) => rpc_error(&Value::Null, -32700, &format!("parse error: {e}")),
         };
         let mut buf = serde_json::to_vec(&resp).unwrap_or_default();

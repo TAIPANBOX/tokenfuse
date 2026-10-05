@@ -27,6 +27,7 @@ pub mod mcpcli;
 pub mod mcpclient;
 pub mod mcpdoor;
 pub mod mcpexposure_probe;
+pub mod mcpsession;
 pub mod obs;
 pub mod otel;
 pub mod outcomescli;
