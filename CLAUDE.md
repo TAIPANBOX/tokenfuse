@@ -5053,3 +5053,86 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     reaches the same code and sends the same member, but has no agent id, so an
     enforcing gate refuses it before asking, as invariant 36's neighbours
     always did.
+
+75. **A remote site seeds its runs' spend through a read that names only its
+    own runs.** Invariant 70 seeds a restarted gateway's run ledger with one
+    `GET /v1/runs`, which lists the whole org (agents, owners, units, every
+    site's runs). The hub's public entry (stack-k8s invariant 23) answers it
+    404 at the edge for exactly that reason, so a remote site's gateway
+    seeded nothing. Measured 2026-10-05 on a hub migration forge -> GCP ->
+    forge: run `mig-flint` had 2566 uUSD at the hub and a 4500 budget; the
+    site gateway behind the GCP hub's entry logged "pending run spend could
+    not be seeded" and admitted a call estimated at about 2550 (it counted
+    only the 1278 it had seen since its restart); at home, with an
+    in-cluster gateway that seeds, the same call at the same budget got 402.
+
+    `GET /v1/run-spend?since_millis=` (`http.rs::run_spend`,
+    `Store::run_spend_for_site`) answers an org key bound to a site
+    (invariant 65's 4th segment), of any role, with `{run_id,
+    spent_microusd, killed}` for the runs whose `RunAgg::site` is that site,
+    nothing else, in `/v1/runs`'s own window and kill overlay and with its
+    `x-fuse-runs-window` header. The org and the site both come from the
+    key. Any other credential this plane knows (an unbound org key of any
+    role, a paired device, an OIDC token) is `403`, never the org: the entry
+    cannot tell an admin key from a site key, so the route itself must not
+    answer more than one site whoever calls it. No key or an unknown key is
+    `401`.
+
+    The gateway asks `/v1/run-spend` first and falls back to `/v1/runs` ONLY
+    on 403 (a key bound to no site: the in-cluster gateway, which already
+    reads `/v1/runs`) or 404 (a Cloud older than the route, or an entry that
+    does not carry it). Every other answer is final: a 200, an empty one
+    included, is the site's whole truth, and falling back on it would hand a
+    site-bound key every other site's runs wherever `/v1/runs` is reachable;
+    a 401 or a 5xx is not fixed by another route with the same key. One
+    `SEED_TIMEOUT` covers both tries. The startup line names the URL that
+    answered. Everything else is invariant 70 unchanged: the 31-day window,
+    the 4 MiB body bound, the killed/blank/negative skips, the take-once
+    credit before the budget gate.
+
+    `@decided 2026-10-05`: the hub entry carries this one read, scoped to the
+    caller's own site, and nothing wider.
+
+    **Where it says nothing.** A run's site is "last non-empty wins"
+    (invariant 65), so a run pushed by two sites belongs to whichever pushed
+    last, and the other site is not told its spend after a restart. After a
+    hub migration the site's new key must carry the same site name the old
+    hub recorded, or its runs belong to a name nobody holds. The Cloud's
+    figure is still the hub's view: spend a site gateway queued and lost
+    before a restart (invariant 53) is in neither. Startup only, as
+    invariant 70.
+    *(test: `crates/cloud/tests/run_spend.rs`, nine, all red first against
+    the unfixed Cloud (the route answered 404, `left: 404 right: 200` or the
+    matching status): `a_site_key_reads_the_spend_of_its_own_sites_runs_only`
+    (the 2026-10-05 figures), `a_row_carries_exactly_run_id_spend_and_killed`,
+    `a_key_bound_to_no_site_is_refused_whatever_its_role`,
+    `no_key_or_an_unknown_key_is_unauthorized`,
+    `a_site_bound_key_of_any_role_is_scoped_to_its_site`,
+    `the_same_site_name_in_another_org_reads_nothing_of_this_one`,
+    `a_killed_run_says_so`,
+    `since_millis_selects_runs_and_the_window_header_names_it`,
+    `a_run_last_pushed_by_another_site_belongs_to_that_site`;
+    `cloudsink::tests::a_site_gateway_seeds_from_its_sites_route_when_the_org_list_is_closed`
+    (red: `Err(Status(404))`),
+    `an_empty_site_answer_never_falls_back_to_the_org_list` (red: seeded
+    `someone-elses`), `only_403_or_404_on_the_site_route_falls_back` (red:
+    a 401 seeded from `/v1/runs`), and the guard
+    `a_refused_or_absent_site_route_falls_back_to_the_org_list`, green on both
+    sides, which is what keeps every invariant-70 test unchanged.
+    `crates/cloud/tests/openapi.rs` lists the path. Seven mutants planted in
+    the product code 2026-10-05 and reverted, each caught by name: the site
+    filter removed (`a_site_key_reads_the_spend_of_its_own_sites_runs_only`,
+    `a_site_bound_key_of_any_role_is_scoped_to_its_site`,
+    `a_run_last_pushed_by_another_site_belongs_to_that_site`); an unbound
+    key answered for site `""` (`a_key_bound_to_no_site_is_refused_whatever_its_role`);
+    the kill overlay dropped (`a_killed_run_says_so`); the window dropped
+    (`since_millis_selects_runs_and_the_window_header_names_it`); the
+    fallback taken on any error (`only_403_or_404_on_the_site_route_falls_back`);
+    the site route never asked
+    (`a_site_gateway_seeds_from_its_sites_route_when_the_org_list_is_closed`,
+    `an_empty_site_answer_never_falls_back_to_the_org_list`); the fallback
+    taken on an empty 200 (`an_empty_site_answer_never_falls_back_to_the_org_list`).
+    Scenarios: `features/a-remote-site-remembers-run-spend.feature`, ten,
+    each bound. Not a script gate: the rule is the handler's credential
+    match, the store filter and the fallback condition, held by
+    `cargo test`; the entry's route set is stack-k8s's own gate.)*

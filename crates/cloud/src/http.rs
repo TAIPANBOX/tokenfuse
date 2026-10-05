@@ -40,7 +40,7 @@ use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
     AgentAgg, AgentWindowSpend, Alert, CallRecord, GatewayAgg, Incident, OwnerAgg, RunAgg,
-    SavingsSummary, SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
+    RunSpend, SavingsSummary, SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -53,7 +53,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, spend, agents, units, owners, gateways, savings, summary, alerts, series, kill, kills, set_budget,
+        ingest, runs, run_spend, spend, agents, units, owners, gateways, savings, summary, alerts, series, kill, kills, set_budget,
         budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
         compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
         register_apns, register_activity,
@@ -61,6 +61,7 @@ use crate::store::{
     components(schemas(
         CallRecord,
         RunAgg,
+        RunSpend,
         WindowSpend,
         AgentWindowSpend,
         AgentAgg,
@@ -388,6 +389,7 @@ pub fn app(state: AppState) -> Router {
         .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
         .route("/v1/runs", get(runs))
+        .route("/v1/run-spend", get(run_spend))
         .route("/v1/spend", get(spend))
         .route("/v1/agents", get(agents))
         .route("/v1/units", get(units))
@@ -775,6 +777,64 @@ async fn runs(
         Json(st.store.runs_since(&org, q.since_millis)),
     )
         .into_response()
+}
+
+/// Invariant 75: the spend of the caller SITE's own runs, three fields per
+/// run, for a remote gateway's startup run seed (invariant 70).
+///
+/// `/v1/runs` lists the whole org, so the hub's public entry (stack-k8s
+/// invariant 23) answers it 404 at the edge, and a site's gateway seeded
+/// nothing: measured 2026-10-05, a run with 2566 uUSD at the hub and a 4500
+/// budget admitted a ~2550 call after the site gateway restarted. This route
+/// is the narrow read the entry can carry instead.
+///
+/// Answered only to an ORG KEY BOUND TO A SITE (`keys.rs`'s 4th segment), of
+/// any role, and only about runs whose site is that site; the org and the
+/// site both come from the key, nothing from the request. Any other
+/// credential that this plane knows (an unbound org key of any role, a
+/// paired device, an OIDC token) is `403`, never the whole org: the entry
+/// cannot tell an admin key from a site key, so the route itself must not
+/// answer more than one site's runs whoever calls it. The in-cluster gateway
+/// with an unbound key keeps reading `/v1/runs`, which it already may.
+#[utoipa::path(
+    get, path = "/v1/run-spend",
+    params(RunsQuery),
+    responses(
+        (status = 200, description = "the caller site's runs: run_id, lifetime spend, killed", body = Vec<RunSpend>),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "the credential is not an org key bound to a site", body = ErrorResponse),
+    ),
+    tag = "reads"
+)]
+async fn run_spend(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<RunsQuery>,
+) -> Response {
+    let (org, site) = match st.principal_for(&headers) {
+        Some(Principal {
+            org,
+            site: Some(site),
+            ..
+        }) => (org.clone(), site.clone()),
+        Some(_) => return site_key_required(),
+        None if st.org_for(&headers).is_some() => return site_key_required(),
+        None => return unauthorized(),
+    };
+    let applied = match q.since_millis {
+        Some(ms) => ms.to_string(),
+        None => "none".to_string(),
+    };
+    (
+        StatusCode::OK,
+        [(RUNS_WINDOW_HEADER, applied)],
+        Json(st.store.run_spend_for_site(&org, &site, q.since_millis)),
+    )
+        .into_response()
+}
+
+fn site_key_required() -> Response {
+    error(StatusCode::FORBIDDEN, "a key bound to a site is required")
 }
 
 /// Names the window `/v1/runs` applied: the epoch-millisecond cutoff, or
