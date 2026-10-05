@@ -5136,3 +5136,95 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     each bound. Not a script gate: the rule is the handler's credential
     match, the store filter and the fallback condition, held by
     `cargo test`; the entry's route set is stack-k8s's own gate.)*
+
+76. **The broker speaks MCP's streamable HTTP to its upstream: it says what it
+    accepts, and it reads what it said it accepts.** The broker's forward to
+    the real MCP server set `content-type` and nothing else, so it went out
+    with reqwest's default `accept: */*`. The streamable HTTP transport
+    requires a client to list both `application/json` and
+    `text/event-stream`, and the official MCP Python SDK 1.x matches each
+    entry by prefix with no wildcard rule (`_check_accept_headers`, 1.30.0),
+    so it answered every broker request 406. @measured 2026-10-05, a FastMCP
+    server on `mcp` 1.30.0 behind `tokenfuse mcp-broker` built from
+    `a99a6a7`: `initialize`, `tools/list` and `tools/call` each came back
+    `upstream error: HTTP status client error (406 Not Acceptable)`, in JSON
+    mode and in the default stream mode alike. SDK 2.x reads `*/*` as both
+    types and was not refused, but it answers as `text/event-stream` by
+    default, and the broker parsed every body as one JSON document: `bad
+    upstream json: expected value at line 1 column 1` on `mcp` 2.3.0, same
+    date.
+
+    The broker now sends `crate::mcpclient::MCP_ACCEPT`, the one constant the
+    `mcp-scan` client already sent, and `upstream_reply` reads the answer by
+    its content type. `text/event-stream` goes through
+    `mcpclient::parse_sse_frames`, which is invariant 55's WHATWG splitter, so
+    this crate keeps one reading of an event stream; the reply is the first
+    event whose data is a JSON-RPC response, a `result` or an `error`, with
+    the request's own id. A server request or a notification on the same
+    stream is neither, even when it reuses the id: the broker answers with one
+    JSON document and relays neither. A stream with no such event is a
+    JSON-RPC error naming the request id, never a guess. Any other content
+    type, an absent one included, is read as one JSON document exactly as
+    before. The reply then goes through the same poisoning scan, rug-pull diff
+    and DLP redaction a JSON reply always did, which is the half that must not
+    move: an event stream is not a way around them.
+
+    `@claude` 2026-10-05: sending the Accept alone would have moved the
+    default-configured Python server from a 406 to a parse error, and
+    claiming to accept a type the broker cannot read is the same fault the
+    other way round, so the reading is in the same change.
+    *(test: in `tests/mcp_broker.rs`,
+    `a_server_that_refuses_a_wildcard_accept_answers_the_broker` and
+    `the_accept_header_names_json_and_event_stream` (a stub that judges
+    `Accept` as SDK 1.30 does),
+    `an_event_stream_reply_is_answered_with_its_response_frame`,
+    `an_event_stream_without_the_response_is_an_error_naming_the_request`,
+    `a_secret_in_an_event_stream_reply_is_redacted` and
+    `a_poisoned_tool_list_in_an_event_stream_is_blocked`; in
+    `gateway::mcpbroker`,
+    `an_event_stream_reply_yields_the_response_to_this_request`,
+    `an_error_frame_is_a_response_too`,
+    `a_response_to_another_request_is_not_this_ones`,
+    `a_json_reply_is_read_as_json_with_or_without_a_content_type` and
+    `hostile_reply_bodies_never_panic` (200 seeds). Red first, @measured
+    `cargo test -p tokenfuse-gateway --test mcp_broker` and `--lib
+    mcpbroker::tests` 2026-10-05 against the tree with `upstream_reply`
+    extracted and still JSON-only and no `accept` set: all six integration
+    tests failed, the two Accept tests on `406 Not Acceptable` (the second
+    `left: Null right: String("application/json, text/event-stream")`), the
+    four stream tests on `bad upstream json: expected value at line 1 column
+    1`; three of the five unit tests failed the same way; the JSON test and
+    the hostile sweep were green on both sides and are held by mutants.
+    Seven mutants planted in the product code 2026-10-05 and reverted, each
+    caught by name: the `accept` header removed
+    (`a_server_that_refuses_a_wildcard_accept_answers_the_broker`,
+    `the_accept_header_names_json_and_event_stream`); the content type
+    ignored (seven tests); any event carrying the id taken as the response
+    (`an_event_stream_reply_is_answered_with_its_response_frame` and four
+    more); the id not compared (`a_response_to_another_request_is_not_this_ones`);
+    an `error` event not taken as a response (`an_error_frame_is_a_response_too`);
+    the JSON reading limited to `application/json`
+    (`a_json_reply_is_read_as_json_with_or_without_a_content_type`); the
+    content type compared case-sensitively
+    (`an_event_stream_reply_yields_the_response_to_this_request`). Scenarios:
+    `features/the-broker-speaks-streamable-http.feature`, five, each bound.
+    Not a script gate: the rule is `upstream_reply` and one header, held by
+    `cargo test`.)*
+
+    **Where it says nothing.** The broker keeps no MCP session: it neither
+    sends `Mcp-Session-Id` nor relays the one an upstream returns, so a
+    server in the SDK's default stateful mode answers `initialize` and then
+    `400 Bad Request: Missing session ID` to every later call. @measured
+    2026-10-05 on both `mcp` 1.30.0 and 2.3.0 in their default mode, through
+    this change: `initialize` returned its result, `tools/list` and
+    `tools/call` returned that 400. A stateless server (`stateless_http=True`)
+    works end to end, in JSON mode or stream mode, measured the same day.
+    `MCP-Protocol-Version` is not sent either. The broker does not stream: it
+    buffers the whole body, unbounded as the JSON path always was, so a server
+    that keeps a stream open after its response, or sends a server request
+    and waits for an answer the broker never gives, holds the call until the
+    upstream closes or the client gives up (the broker's client sets no
+    timeout, `main.rs`). A notification sent through the broker gets the same
+    error on the server's empty 202 it always did, @measured 2026-10-05 on
+    both SDKs through this change: `bad upstream json: EOF while parsing a
+    value at line 1 column 0`.

@@ -532,6 +532,35 @@ pub fn refuse_proof_with_no_clients(
 }
 
 /// JSON-RPC error response with the same id as the request.
+/// Read an upstream MCP server's answer by its content type (invariant 76).
+///
+/// A streamable HTTP server may answer a POST as `text/event-stream`, which is
+/// the official Python SDK's default, so the reply to request `id` is the
+/// first event whose data is a JSON-RPC response (a `result` or an `error`)
+/// carrying that id. A server request or a notification on the same stream is
+/// not the response even when it reuses the id, and the broker, which answers
+/// with one JSON document, relays neither. Anything else is read as one JSON
+/// document, as it always was, whatever the content type says.
+pub(crate) fn upstream_reply(
+    content_type: &str,
+    bytes: &[u8],
+    id: &Value,
+) -> Result<Value, String> {
+    if crate::mcpclient::content_type_matches(content_type, "text/event-stream") {
+        let text = String::from_utf8_lossy(bytes);
+        return crate::mcpclient::parse_sse_frames(&text)
+            .into_iter()
+            .find(|frame| {
+                frame.get("id") == Some(id)
+                    && (frame.get("result").is_some() || frame.get("error").is_some())
+            })
+            .ok_or_else(|| {
+                format!("upstream event stream carried no response to request id {id}")
+            });
+    }
+    serde_json::from_slice(bytes).map_err(|e| format!("bad upstream json: {e}"))
+}
+
 fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -1586,6 +1615,9 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         .client
         .post(&upstream_url)
         .header("content-type", "application/json")
+        // Named rather than left to reqwest's default `*/*`, which the MCP
+        // Python SDK 1.x answers 406 (invariant 76).
+        .header("accept", crate::mcpclient::MCP_ACCEPT)
         .body(payload)
         .send()
         .await
@@ -1594,13 +1626,19 @@ pub async fn process(st: &BrokerState, mut req: Value, ctx: &CallContext) -> Val
         Ok(r) => r,
         Err(e) => return rpc_error(&id, -32000, &format!("upstream error: {e}")),
     };
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => return rpc_error(&id, -32000, &format!("upstream read: {e}")),
     };
-    let mut out: Value = match serde_json::from_slice(&bytes) {
+    let mut out: Value = match upstream_reply(&content_type, &bytes, &id) {
         Ok(v) => v,
-        Err(e) => return rpc_error(&id, -32000, &format!("bad upstream json: {e}")),
+        Err(e) => return rpc_error(&id, -32000, &e),
     };
 
     // 2. Poisoning + rug-pull checks on tool listings.
@@ -1791,6 +1829,76 @@ pub async fn run_stdio(state: Arc<BrokerState>) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Invariant 76: what an upstream answers is read by its content type.
+
+    #[test]
+    fn a_json_reply_is_read_as_json_with_or_without_a_content_type() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        for ct in ["application/json", "Application/JSON; charset=utf-8", ""] {
+            let v = upstream_reply(ct, body, &json!(1)).unwrap();
+            assert_eq!(v["result"]["ok"], json!(true), "content type {ct:?}");
+        }
+    }
+
+    #[test]
+    fn an_event_stream_reply_yields_the_response_to_this_request() {
+        let body = concat!(
+            ": keep-alive\r\n\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"sampling/createMessage\",\"params\":{}}\r\n\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"answer\":42}}\r\n\r\n",
+        );
+        for ct in ["text/event-stream", "Text/Event-Stream; charset=utf-8"] {
+            let v = upstream_reply(ct, body.as_bytes(), &json!(7)).unwrap();
+            assert_eq!(v["result"]["answer"], json!(42), "content type {ct:?}");
+            assert!(
+                v.get("method").is_none(),
+                "a server request is not the response: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_frame_is_a_response_too() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":\"a\",\"error\":{\"code\":-32601,\"message\":\"no\"}}\n\n";
+        let v = upstream_reply("text/event-stream", body.as_bytes(), &json!("a")).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32601));
+    }
+
+    #[test]
+    fn a_response_to_another_request_is_not_this_ones() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n";
+        let e = upstream_reply("text/event-stream", body.as_bytes(), &json!(1)).unwrap_err();
+        assert!(e.contains("no response to request id 1"), "{e}");
+    }
+
+    #[test]
+    fn hostile_reply_bodies_never_panic() {
+        let mut seed: u64 = 0x2026_1005;
+        for _ in 0..200 {
+            let mut body = Vec::new();
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (seed >> 33) % 512;
+            for _ in 0..len {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // Bias toward the bytes the SSE grammar and JSON care about.
+                let pick = (seed >> 40) as usize;
+                let alphabet = b"data: {}\"id:\r\n,[]1\x00\xff\xfe";
+                body.push(if pick.is_multiple_of(4) {
+                    (seed >> 24) as u8
+                } else {
+                    alphabet[pick % alphabet.len()]
+                });
+            }
+            for ct in ["text/event-stream", "application/json", ""] {
+                let _ = upstream_reply(ct, &body, &json!(1));
+            }
+        }
+    }
 
     #[test]
     fn a_loopback_bind_says_nothing() {

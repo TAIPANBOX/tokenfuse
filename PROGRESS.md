@@ -304,9 +304,12 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1637 passing** (core 372, dpop 21, delegation 60,
-gateway 926, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 4
+`cargo test --all` runs **1648 passing** (core 372, dpop 21, delegation 60,
+gateway 937, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 11
+with invariant 76 (the MCP broker sends the Accept streamable HTTP requires and
+reads an event-stream reply: 5 in `gateway::mcpbroker`, 6 in
+`tests/mcp_broker.rs`). Gateway grew by 4
 and cloud by 9 with invariant 75 (a remote site seeds its runs' spend through
 `GET /v1/run-spend`, scoped to the site its key names: 4 in
 `cloudsink::tests`, 9 in `crates/cloud/tests/run_spend.rs`). Gateway grew by 20
