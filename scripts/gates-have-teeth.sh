@@ -735,18 +735,29 @@ run_case "compat-surface: a file a where entry names is gone" fail \
 	"measured nothing"
 
 # D9: product mutations, the definite-unsent control, and empty-subject refusal.
+#
+# The D9 gate runs its suite with --nocapture, and its tests print while they
+# run in parallel. libtest writes "test <name> ... " and "FAILED" as two
+# separate writes, so another test's line can land between them and a needle of
+# the form "<name> ... FAILED" then misses a failure that happened. Seen once in
+# CI on tokenfuse#361 (WRONG REASON on the request-build case) and reproduced
+# once in 300 local runs of that mutant's test binary: "test
+# a_request_that_cannot_be_built_releases_both_ledgers ... upstream accepted 57
+# POST body bytes". So these needles name the test in libtest's "failures:"
+# list, indented by four spaces, which is printed after every test has
+# finished and so has nothing to interleave with.
 run_case "D9: all send errors release" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/proxy.rs", "if matches!(&e, ProviderError::NotSent(_))", "if true")')" \
     "an ambiguous send must keep its exposure"
 run_case "D9: a followed redirect" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", ".redirect(reqwest::redirect::Policy::none())", "")')" \
-    "a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home ... FAILED"
+    "    a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home"
 run_case "D9: a refused connection retained" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "if e.is_connect() {", "if false {")')" \
-    "a_refused_connection_on_the_only_hop_releases_both_ledgers ... FAILED"
+    "    a_refused_connection_on_the_only_hop_releases_both_ledgers"
 run_case "D9: request-build failure retained" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "ProviderError::NotSent(e.to_string())", "ProviderError::Upstream(e.to_string())")')" \
-    "a_request_that_cannot_be_built_releases_both_ledgers ... FAILED"
+    "    a_request_that_cannot_be_built_releases_both_ledgers"
 run_case "D9: harmless source comment" pass "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "pub enum ProviderError {", "pub enum ProviderError { // harmless comment")')"
 run_case "D9: suite removed" fail "./scripts/d9-send-retention.sh" \
