@@ -3178,3 +3178,484 @@ async fn a_poisoned_tool_list_in_an_event_stream_is_blocked() {
     assert_eq!(resp["error"]["code"], json!(-32001), "{resp}");
     assert_eq!(resp["id"], json!(4));
 }
+
+// Invariant 77: the broker keeps the session a stateful MCP server opens.
+
+/// What a [`stateful_upstream`] saw on one request: the JSON-RPC method (or
+/// `"-"` for a body with none), and the `Mcp-Session-Id` and
+/// `MCP-Protocol-Version` headers it arrived with.
+#[derive(Clone, Debug, PartialEq)]
+struct SeenCall {
+    method: String,
+    session: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct StatefulUpstream {
+    seen: Arc<std::sync::Mutex<Vec<SeenCall>>>,
+    issued: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Answer 404 to every session, as a server that restarted would.
+    forgets: bool,
+}
+
+/// An upstream that behaves like the MCP Python SDK in its default, stateful
+/// mode (`mcp/server/streamable_http_manager.py`, 1.30.0 and 2.3.0):
+/// `initialize` opens a session and names it in `Mcp-Session-Id`; any other
+/// message with no session id is `400 Bad Request: Missing session ID`, one
+/// with a session it never issued is `404`, and an accepted notification is
+/// `202` with no body.
+fn stateful_upstream(forgets: bool) -> (StatefulUpstream, Router) {
+    let s = StatefulUpstream {
+        forgets,
+        ..Default::default()
+    };
+    let st = s.clone();
+    let router = Router::new().route(
+        "/",
+        post(
+            move |headers: axum::http::HeaderMap, Json(req): Json<Value>| {
+                let st = st.clone();
+                async move {
+                    let get = |n: &str| {
+                        headers
+                            .get(n)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    };
+                    let method = req
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let session = get("mcp-session-id");
+                    st.seen.lock().unwrap().push(SeenCall {
+                        method: method.clone(),
+                        session: session.clone(),
+                        version: get("mcp-protocol-version"),
+                    });
+                    let id = req.get("id").cloned();
+                    if method == "initialize" {
+                        let mut issued = st.issued.lock().unwrap();
+                        let sid = format!("sid-{}", issued.len() + 1);
+                        issued.push(sid.clone());
+                        let body = json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "stateful", "version": "0" }
+                        }});
+                        return ([("mcp-session-id", sid)], Json(body)).into_response();
+                    }
+                    let known = session
+                        .as_ref()
+                        .is_some_and(|s| st.issued.lock().unwrap().contains(s));
+                    let refuse = |status: axum::http::StatusCode, message: &str| {
+                        (
+                            status,
+                            Json(json!({ "jsonrpc": "2.0", "id": "server-error",
+                                "error": { "code": -32600, "message": message } })),
+                        )
+                            .into_response()
+                    };
+                    match session {
+                        None => {
+                            return refuse(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "Bad Request: Missing session ID",
+                            )
+                        }
+                        Some(_) if st.forgets || !known => {
+                            return refuse(axum::http::StatusCode::NOT_FOUND, "Session not found")
+                        }
+                        Some(_) => {}
+                    }
+                    let Some(id) = id else {
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    };
+                    let result = if method == "tools/list" {
+                        json!({ "tools": [{ "name": "echo", "description": "Echo.", "inputSchema": {} }] })
+                    } else {
+                        json!({ "echo": req.get("params").cloned() })
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response()
+                }
+            },
+        ),
+    );
+    (s, router)
+}
+
+fn initialize_request(id: i64) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": { "name": "test", "version": "0" }
+    }})
+}
+
+fn initialized_notification() -> Value {
+    json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+}
+
+/// POST `body` to the broker with `headers`, returning the status, the
+/// `Mcp-Session-Id` the broker answered with, and the raw body.
+async fn post_with(
+    broker_url: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+) -> (reqwest::StatusCode, Option<String>, String) {
+    let mut rb = reqwest::Client::new().post(broker_url).json(body);
+    for (k, v) in headers {
+        rb = rb.header(*k, *v);
+    }
+    let resp = rb.send().await.unwrap();
+    let status = resp.status();
+    let sid = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    (status, sid, resp.text().await.unwrap())
+}
+
+fn as_json(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text:?}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stateful_server_keeps_its_session_through_the_broker() {
+    let (up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+
+    let (status, sid, body) = post_with(&broker_url, &[], &initialize_request(1)).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let sid = sid.expect("the broker must hand the agent a session id with initialize");
+    let session = [("mcp-session-id", sid.as_str())];
+
+    let (status, _, body) = post_with(&broker_url, &session, &initialized_notification()).await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{body}");
+    let (_, _, body) = post_with(
+        &broker_url,
+        &session,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    let list = as_json(&body);
+    assert_eq!(list["result"]["tools"][0]["name"], json!("echo"), "{list}");
+    let (_, _, body) = post_with(&broker_url, &session, &echo_call(3, "echo")).await;
+    let call = as_json(&body);
+    assert_eq!(
+        call["result"]["echo"]["arguments"]["text"],
+        json!("hi"),
+        "{call}"
+    );
+
+    let seen = up.seen.lock().unwrap().clone();
+    let sessions: Vec<_> = seen.iter().map(|c| c.session.as_deref()).collect();
+    assert_eq!(
+        sessions,
+        vec![None, Some("sid-1"), Some("sid-1"), Some("sid-1")],
+        "every call after initialize must reach the server inside the session it issued: {seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_protocol_version_reaches_the_upstream() {
+    let (up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    let (_, sid, _) = post_with(&broker_url, &[], &initialize_request(1)).await;
+    let sid = sid.expect("a session id");
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[
+            ("mcp-session-id", &sid),
+            ("mcp-protocol-version", "2025-06-18"),
+        ],
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let seen = up.seen.lock().unwrap().clone();
+    assert_eq!(seen[1].version.as_deref(), Some("2025-06-18"), "{seen:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_from_one_upstream_is_never_sent_to_another() {
+    let (_a, router_a) = stateful_upstream(false);
+    let (b, router_b) = stateful_upstream(false);
+    let mut named = std::collections::BTreeMap::new();
+    named.insert("a".to_string(), spawn_server(router_a).await);
+    named.insert("b".to_string(), spawn_server(router_b).await);
+    let broker_url = spawn_server(broker_cfg(
+        "http://127.0.0.1:9".into(),
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        named,
+        Wardryx::disabled(),
+    ))
+    .await;
+
+    let (_, sid, body) = post_with(
+        &broker_url,
+        &[("x-fuse-mcp-upstream", "a")],
+        &initialize_request(1),
+    )
+    .await;
+    let sid = sid.unwrap_or_else(|| panic!("upstream a issued no session: {body}"));
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[("x-fuse-mcp-upstream", "b"), ("mcp-session-id", &sid)],
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        b.seen.lock().unwrap().is_empty(),
+        "upstream b must receive nothing carrying upstream a's session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_opened_by_one_credential_is_refused_to_another() {
+    let (up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker_keyed(
+        spawn_server(router).await,
+        "sk-one:first,sk-two:second",
+    ))
+    .await;
+    let (_, sid, body) = post_with(
+        &broker_url,
+        &[(CLIENT_KEY_HEADER, "sk-one")],
+        &initialize_request(1),
+    )
+    .await;
+    let sid = sid.unwrap_or_else(|| panic!("no session: {body}"));
+    let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[(CLIENT_KEY_HEADER, "sk-two"), ("mcp-session-id", &sid)],
+        &list,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        up.seen.lock().unwrap().len(),
+        1,
+        "only the initialize may have reached the upstream"
+    );
+
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[(CLIENT_KEY_HEADER, "sk-one"), ("mcp-session-id", &sid)],
+        &list,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert!(as_json(&body)["result"]["tools"].is_array(), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_id_the_broker_did_not_issue_is_refused() {
+    let (up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    let (_, sid, _) = post_with(&broker_url, &[], &initialize_request(1)).await;
+    let sid = sid.expect("a session id");
+    // The last character of the bound id flipped: a tampered id.
+    let mut tampered = sid.clone();
+    let last = tampered.pop().unwrap();
+    tampered.push(if last == '1' { '2' } else { '1' });
+    let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    for presented in ["sid-1", tampered.as_str(), "", "tf1..sid-1"] {
+        let (status, _, body) =
+            post_with(&broker_url, &[("mcp-session-id", presented)], &list).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "presented {presented:?}: {body}"
+        );
+        let err = as_json(&body);
+        assert_eq!(err["id"], json!(2), "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("session"),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        up.seen.lock().unwrap().len(),
+        1,
+        "nothing but the initialize may have reached the upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upstream_that_forgot_the_session_sends_the_agent_back_to_initialize() {
+    let (_up, router) = stateful_upstream(true);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    let (_, sid, _) = post_with(&broker_url, &[], &initialize_request(1)).await;
+    let sid = sid.expect("a session id");
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[("mcp-session-id", &sid)],
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(as_json(&body)["id"], json!(2), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_is_accepted_with_no_body() {
+    let (_up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    let (_, sid, _) = post_with(&broker_url, &[], &initialize_request(1)).await;
+    let sid = sid.expect("a session id");
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[("mcp-session-id", &sid)],
+        &initialized_notification(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body, "", "a notification gets no JSON-RPC answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_notification_is_an_error_status_without_an_id() {
+    let (_up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    // No session: the stateful upstream refuses it with 400.
+    let (status, _, body) = post_with(&broker_url, &[], &initialized_notification()).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let err = as_json(&body);
+    assert!(err["error"].is_object(), "{err}");
+    assert_eq!(err["id"], Value::Null, "{err}");
+}
+
+/// Drive the stdio transport over in-memory lines and return what it wrote.
+async fn stdio_lines(state: Arc<BrokerState>, lines: &[Value]) -> Vec<Value> {
+    let mut input = Vec::new();
+    for l in lines {
+        input.extend_from_slice(l.to_string().as_bytes());
+        input.push(b'\n');
+    }
+    let mut output: Vec<u8> = Vec::new();
+    tokenfuse_gateway::mcpbroker::run_lines(state, &input[..], &mut output)
+        .await
+        .unwrap();
+    String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(as_json)
+        .collect()
+}
+
+fn plain_state(upstream: String) -> Arc<BrokerState> {
+    broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::disabled(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_transport_holds_the_session_itself() {
+    let (up, router) = stateful_upstream(false);
+    let state = plain_state(spawn_server(router).await);
+    let out = stdio_lines(
+        state,
+        &[
+            initialize_request(1),
+            initialized_notification(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            echo_call(3, "echo"),
+        ],
+    )
+    .await;
+    let ids: Vec<_> = out.iter().map(|v| v["id"].clone()).collect();
+    assert_eq!(
+        ids,
+        vec![json!(1), json!(2), json!(3)],
+        "one line per request and none for the notification: {out:?}"
+    );
+    assert!(out.iter().all(|v| v.get("error").is_none()), "{out:?}");
+    let seen = up.seen.lock().unwrap().clone();
+    let want = |method: &str, session: Option<&str>, version: Option<&str>| SeenCall {
+        method: method.into(),
+        session: session.map(str::to_string),
+        version: version.map(str::to_string),
+    };
+    assert_eq!(
+        seen,
+        vec![
+            want("initialize", None, None),
+            want(
+                "notifications/initialized",
+                Some("sid-1"),
+                Some("2025-06-18")
+            ),
+            want("tools/list", Some("sid-1"), Some("2025-06-18")),
+            want("tools/call", Some("sid-1"), Some("2025-06-18")),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_stdio_initialize_replaces_the_held_session() {
+    let (up, router) = stateful_upstream(false);
+    let state = plain_state(spawn_server(router).await);
+    let list = |id: i64| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" });
+    let out = stdio_lines(
+        state,
+        &[
+            initialize_request(1),
+            list(2),
+            initialize_request(3),
+            list(4),
+        ],
+    )
+    .await;
+    assert_eq!(out.len(), 4, "{out:?}");
+    assert!(out.iter().all(|v| v.get("error").is_none()), "{out:?}");
+    let sessions: Vec<_> = up
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.session.clone())
+        .collect();
+    assert_eq!(
+        sessions,
+        vec![
+            None,
+            Some("sid-1".to_string()),
+            None,
+            Some("sid-2".to_string())
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_the_broker_refuses_itself_is_an_error_status_too() {
+    let (up, router) = stateful_upstream(false);
+    let broker_url = spawn_server(broker(spawn_server(router).await, ScanMode::Off)).await;
+    // An upstream this broker was never configured with: refused before
+    // anything is forwarded, and a notification has no id to answer under.
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[("x-fuse-mcp-upstream", "nowhere")],
+        &initialized_notification(),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let err = as_json(&body);
+    assert!(err["error"].is_object(), "{err}");
+    assert_eq!(err["id"], Value::Null, "{err}");
+    assert!(up.seen.lock().unwrap().is_empty(), "nothing was forwarded");
+}
