@@ -173,6 +173,17 @@ pub struct CallRecord {
     pub owner: String,
 }
 
+/// One `/v1/run-spend` row (invariant 75): what a site's gateway needs to
+/// seed a run's spend after a restart, and nothing else from [`RunAgg`].
+/// The field names are the three `cloudsink::RunSpendRow` already reads off
+/// `/v1/runs`, so one parser serves both routes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunSpend {
+    pub run_id: String,
+    pub spent_microusd: i64,
+    pub killed: bool,
+}
+
 /// The aggregated state of one run within an organization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RunAgg {
@@ -2555,6 +2566,43 @@ impl Store {
                     .copied()
                     .unwrap_or(false);
                 out.push(a);
+            }
+        }
+        out
+    }
+
+    /// Invariant 75: the runs of `org` whose site is `site`, three fields
+    /// each, for a remote site's gateway to seed its run ledger with at
+    /// startup (invariant 70) through the hub's public entry. Same window
+    /// as [`Store::runs_since`] (runs last seen at or after the cutoff, each
+    /// with its lifetime spend) and the same killed overlay. A run belongs
+    /// to the site `RunAgg::site` names, "last non-empty wins" (invariant
+    /// 65), so a run another site pushed later is that site's, not this one's.
+    pub fn run_spend_for_site(
+        &self,
+        org: &str,
+        site: &str,
+        since_millis: Option<i64>,
+    ) -> Vec<RunSpend> {
+        let inner = self.inner.read().unwrap();
+        let killed = inner.killed.get(org);
+        let mut out = Vec::new();
+        if let Some(runs) = inner.orgs.get(org) {
+            for agg in runs.values() {
+                if agg.site != site {
+                    continue;
+                }
+                if since_millis.is_some_and(|cutoff| agg.last_seen < cutoff) {
+                    continue;
+                }
+                out.push(RunSpend {
+                    run_id: agg.run_id.clone(),
+                    spent_microusd: agg.spent_microusd,
+                    killed: killed
+                        .and_then(|k| k.get(&agg.run_id))
+                        .copied()
+                        .unwrap_or(false),
+                });
             }
         }
         out

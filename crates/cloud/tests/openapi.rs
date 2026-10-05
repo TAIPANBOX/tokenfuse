@@ -49,6 +49,8 @@ fn spec_covers_every_endpoint() {
         "/v1/unit-budgets",
         // invariant 65: per-site (gateway) ingest rollup.
         "/v1/gateways",
+        // invariant 75: a site's own run spend, for the startup run seed.
+        "/v1/run-spend",
         "/v1/incidents",
         "/v1/incidents/{id}/ack",
         "/v1/compliance",

@@ -917,23 +917,36 @@ pub struct RunSeedReport {
     pub skipped_killed: usize,
 }
 
-/// One `GET {base}/v1/runs?since_millis=...` with the org key, the body read
-/// chunk by chunk under `RUN_SEED_MAX_BODY_BYTES`. The same key that passes
-/// `/v1/units` passes this route (any org key; invariant 52's comment
-/// applies here unchanged).
-async fn fetch_run_spend(
-    client: &reqwest::Client,
-    base: &str,
-    key: &str,
-    since_millis: i64,
-) -> Result<Vec<u8>, SeedError> {
-    let url = format!(
-        "{}/v1/runs?since_millis={}",
+/// Invariant 75: the site-scoped run-spend read, tried first. A Cloud
+/// answers it only to a key bound to a site and only about that site's own
+/// runs, three fields each (`RunSpendRow` reads both shapes unchanged), so
+/// the hub's public entry can carry it while it keeps `/v1/runs`, which
+/// lists the whole org, closed (stack-k8s invariant 23).
+const RUN_SEED_SITE_ROUTE: &str = "/v1/run-spend";
+
+/// Invariant 70's original read, the fallback: the org-wide run list.
+const RUN_SEED_ORG_ROUTE: &str = "/v1/runs";
+
+fn run_seed_url(base: &str, route: &str, since_millis: i64) -> String {
+    format!(
+        "{}{}?since_millis={}",
         base.trim_end_matches('/'),
+        route,
         since_millis
-    );
+    )
+}
+
+/// One `GET {url}` with the org key, the body read chunk by chunk under
+/// `RUN_SEED_MAX_BODY_BYTES`. The same key that passes `/v1/units` passes
+/// `/v1/runs` (any org key; invariant 52's comment applies here unchanged);
+/// `/v1/run-spend` needs that key to be bound to a site.
+async fn fetch_run_spend_at(
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+) -> Result<Vec<u8>, SeedError> {
     let mut resp = client
-        .get(&url)
+        .get(url)
         .bearer_auth(key)
         .send()
         .await
@@ -953,6 +966,30 @@ async fn fetch_run_spend(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Invariant 75: the site route first, then `/v1/runs` ONLY when the site
+/// route said 403 (this key is bound to no site: the in-cluster gateway) or
+/// 404 (a Cloud older than the route, or an entry that does not carry it).
+/// Every other answer is final: a 200, even an empty one, is this site's
+/// whole truth, and falling back on it would hand a site-bound key every
+/// other site's runs wherever `/v1/runs` is reachable; a 401 or a 5xx says
+/// nothing another route with the same key would fix. Returns the body and
+/// the URL that produced it, for the one log line.
+async fn fetch_run_spend(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    since_millis: i64,
+) -> (String, Result<Vec<u8>, SeedError>) {
+    let site_url = run_seed_url(base, RUN_SEED_SITE_ROUTE, since_millis);
+    match fetch_run_spend_at(client, &site_url, key).await {
+        Err(SeedError::Status(403 | 404)) => {}
+        other => return (site_url, other),
+    }
+    let org_url = run_seed_url(base, RUN_SEED_ORG_ROUTE, since_millis);
+    let result = fetch_run_spend_at(client, &org_url, key).await;
+    (org_url, result)
 }
 
 /// Pure: bytes to rows, or why not.
@@ -1011,17 +1048,17 @@ async fn seed_run_ledger_within(
     within: Duration,
 ) -> Result<RunSeedReport, SeedError> {
     let since_millis = now_millis - RUN_SEED_WINDOW_MILLIS;
-    let url = format!(
-        "{}/v1/runs?since_millis={}",
-        base.trim_end_matches('/'),
-        since_millis
-    );
     let client = reqwest::Client::new();
-    let fetched =
+    // One timeout over both routes together: the fallback spends what the
+    // first try left, never a second full `within`.
+    let (url, fetched) =
         match tokio::time::timeout(within, fetch_run_spend(&client, base, key, since_millis)).await
         {
             Ok(r) => r,
-            Err(_) => Err(SeedError::TimedOut(within)),
+            Err(_) => (
+                run_seed_url(base, RUN_SEED_SITE_ROUTE, since_millis),
+                Err(SeedError::TimedOut(within)),
+            ),
         };
     let result = fetched.and_then(|body| parse_run_spend(&body)).map(|rows| {
         let (pending, report) = apply_run_spend(rows);
@@ -2348,6 +2385,141 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://{addr}")
+    }
+
+    /// Invariant 75: a control plane serving BOTH run-seed routes, each with
+    /// its own status and body, counting how often `/v1/runs` was asked, so a
+    /// test can prove the org-wide list was never consulted.
+    async fn stub_both(
+        site: (u16, &'static str),
+        org: (u16, &'static str),
+    ) -> (String, Arc<AtomicUsize>) {
+        use axum::{routing::get, Router};
+        let runs_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&runs_hits);
+        let reply = |(status, body): (u16, &'static str)| {
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+        };
+        let app = Router::new()
+            .route("/v1/run-spend", get(move || async move { reply(site) }))
+            .route(
+                "/v1/runs",
+                get(move || {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    async move { reply(org) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), runs_hits)
+    }
+
+    /// The 2026-10-05 defect: behind the hub entry `/v1/runs` is 404, and
+    /// the site's own route carries the run's Cloud-known spend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_site_gateway_seeds_from_its_sites_route_when_the_org_list_is_closed() {
+        let _g = log_lock();
+        clear_log();
+        let (base, runs_hits) = stub_both(
+            (
+                200,
+                r#"[{"run_id":"mig-flint","spent_microusd":2566,"killed":false}]"#,
+            ),
+            (404, "{}"),
+        )
+        .await;
+        let state = test_state();
+        let report = seed_run_ledger(&base, "k", &state, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(report.seeded, vec![("mig-flint".to_string(), 2566)]);
+        assert_eq!(state.take_run_seed("mig-flint"), Some(Microusd(2566)));
+        assert_eq!(runs_hits.load(Ordering::SeqCst), 0);
+        let log = log_text();
+        let line = log
+            .lines()
+            .find(|l| l.contains("seeded pending run spend"))
+            .unwrap_or_else(|| panic!("{log}"));
+        assert!(line.contains("/v1/run-spend?since_millis="), "{line}");
+    }
+
+    /// An in-cluster gateway's key is bound to no site (403), and a Cloud
+    /// older than invariant 75 has no such route (404): both fall back to
+    /// `/v1/runs`, which that key already reads today.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_or_absent_site_route_falls_back_to_the_org_list() {
+        for status in [403u16, 404] {
+            let _g = log_lock();
+            clear_log();
+            let (base, runs_hits) = stub_both(
+                (status, "{}"),
+                (200, r#"[{"run_id":"r-in","spent_microusd":700}]"#),
+            )
+            .await;
+            let state = test_state();
+            let report = seed_run_ledger(&base, "k", &state, now_millis())
+                .await
+                .unwrap();
+            assert_eq!(report.seeded, vec![("r-in".to_string(), 700)], "{status}");
+            assert_eq!(runs_hits.load(Ordering::SeqCst), 1);
+            let log = log_text();
+            let line = log
+                .lines()
+                .find(|l| l.contains("seeded pending run spend"))
+                .unwrap_or_else(|| panic!("{log}"));
+            assert!(line.contains("/v1/runs?since_millis="), "{line}");
+        }
+    }
+
+    /// A site with no runs yet is an answer, not a refusal: it must never
+    /// send the gateway to the org-wide list, which would hand a site-bound
+    /// key in-cluster every other site's runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_site_answer_never_falls_back_to_the_org_list() {
+        let _g = log_lock();
+        clear_log();
+        let (base, runs_hits) = stub_both(
+            (200, "[]"),
+            (200, r#"[{"run_id":"someone-elses","spent_microusd":9}]"#),
+        )
+        .await;
+        let state = test_state();
+        let report = seed_run_ledger(&base, "k", &state, now_millis())
+            .await
+            .unwrap();
+        assert!(report.seeded.is_empty(), "{report:?}");
+        assert_eq!(state.take_run_seed("someone-elses"), None);
+        assert_eq!(runs_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A key the Cloud does not know (401) or a Cloud failing (5xx) on the
+    /// site route is not a reason to try another route with the same key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_403_or_404_on_the_site_route_falls_back() {
+        for status in [401u16, 500, 502] {
+            let _g = log_lock();
+            clear_log();
+            let (base, runs_hits) = stub_both(
+                (status, "{}"),
+                (200, r#"[{"run_id":"r-in","spent_microusd":700}]"#),
+            )
+            .await;
+            let state = test_state();
+            let result = seed_run_ledger(&base, "k", &state, now_millis()).await;
+            assert!(
+                matches!(result, Err(SeedError::Status(s)) if s == status),
+                "{status}: {result:?}"
+            );
+            assert_eq!(state.take_run_seed("r-in"), None);
+            assert_eq!(runs_hits.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// A `/v1/runs` that never answers, for the seed's own timeout.
