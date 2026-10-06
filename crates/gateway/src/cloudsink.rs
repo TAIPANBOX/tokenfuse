@@ -41,7 +41,7 @@ const BATCH: usize = 20;
 /// mock, 100 s at 100 calls/s, 17 minutes at 10 calls/s, days at the
 /// appliance run's rate (272 calls in a day). The 40 s outage of
 /// tokenfuse#294 fits at up to 250 calls/s. A constant, not a variable: making
-/// it one is a `components.json`, `tests/manifest.rs` and `compat/1.0.json`
+/// it one is a `components.json`, `tests/it/manifest.rs` and `compat/1.0.json`
 /// decision that is not taken here.
 const QUEUE_CAP: usize = 10_000;
 

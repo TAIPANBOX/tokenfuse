@@ -1085,7 +1085,7 @@ impl Wardryx {
 
     /// Record a verdict the PDP itself returned, stamped by the caller.
     ///
-    /// Public so `tests/policy_plane.rs` can place a verdict at a chosen
+    /// Public so `tests/it/policy_plane.rs` can place a verdict at a chosen
     /// instant without a stub PDP and a sleep; `decide` is the only caller in
     /// production and passes `now_millis()`. Deliberately NOT called for a
     /// cache hit or for a failmode fallback, for the reasons in [`Verdicts`].
@@ -1800,7 +1800,7 @@ mod tests {
     // The MCP broker asks per `tools/call`, and until now it told the PDP only
     // the tool NAME. An argument-aware policy needs the call itself. These
     // tests hold the wire shape and its size cap; the broker's own wiring (the
-    // secret handle, the target) is in `tests/mcp_broker.rs`.
+    // secret handle, the target) is in `tests/it/mcp_broker.rs`.
 
     /// A stub PDP that keeps every request body it is sent, answers `allow`
     /// after `delay`, and so lets a test read what was ASKED.

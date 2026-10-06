@@ -96,7 +96,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     // binary could not persist at all, which made "budgets survive a node
     // crash" true only in the sense that a quorum of OTHER nodes still had
     // them. Found 2026-08-04 by killing the process instead of asking it to
-    // stop (`tests/kill_durability.rs`).
+    // stop (`tests/it/kill_durability.rs`).
     let node = match flags.get("dir") {
         Some(dir) if !dir.is_empty() => {
             println!("node {id} persisting to {dir}");

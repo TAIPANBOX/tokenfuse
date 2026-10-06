@@ -1,5 +1,5 @@
 //! HTTP-level tests for the tamper-evident audit trail (WS2), mirroring
-//! `tests/mutations.rs` and `tests/reads.rs`: control-plane mutations produce a
+//! `tests/it/mutations.rs` and `tests/it/reads.rs`: control-plane mutations produce a
 //! linked, verifiable chain; an org reads its own trail (viewer allowed, unauth
 //! rejected).
 

@@ -52,6 +52,15 @@ fastembed = { version = "4", optional = true }
 # excluded from the default workspace; this path dep builds it on demand.
 tokenfuse-cluster = { path = "../cluster", optional = true }
 
+# The raft-backed ledger test stays a binary of its own, outside the crate's
+# one integration-test binary (tests/it, invariant 78): it is the target CI's
+# `--features cluster --test cluster_backend` step names, and without the
+# feature there is nothing in it to build or link.
+[[test]]
+name = "cluster_backend"
+path = "tests/cluster_backend.rs"
+required-features = ["cluster"]
+
 [dev-dependencies]
 # The minting fixture, so the door tests present a token the ISSUER would mint
 # rather than one this repository invented for its own convenience.

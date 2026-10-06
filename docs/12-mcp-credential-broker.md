@@ -72,7 +72,7 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
 
 - `secretbroker` unit tests: nested handle injection, missing-handle reporting,
   plain values untouched.
-- `tests/mcp_broker.rs`: a `tools/call` with `{{secret:gh}}` reaches a stub
+- `tests/it/mcp_broker.rs`: a `tools/call` with `{{secret:gh}}` reaches a stub
   upstream as the **real** secret (the agent only ever sent the handle); a
   poisoned `tools/list` is **blocked**.
 

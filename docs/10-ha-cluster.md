@@ -154,7 +154,7 @@ The last two blocks are the proof: the over-budget reserve is denied by the
 committed state machine, and the resulting spend is read back from a **follower**
 — i.e. it really replicated, it wasn't just the leader's local memory.
 
-## Tested invariants (`tests/cluster.rs`)
+## Tested invariants (`tests/it/cluster.rs`)
 
 Real 3-node clusters with live election timers (multi-thread runtime):
 
@@ -165,7 +165,7 @@ Real 3-node clusters with live election timers (multi-thread runtime):
 - **`settle_moves_reserved_to_spent`** — settle converts a reservation to spend
   across the quorum.
 
-## Tested invariants — HTTP transport (`tests/http_cluster.rs`)
+## Tested invariants — HTTP transport (`tests/it/http_cluster.rs`)
 
 Real clusters formed over `127.0.0.1:0` sockets, driven entirely through the
 HTTP API:

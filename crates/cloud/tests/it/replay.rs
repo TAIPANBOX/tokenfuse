@@ -1,5 +1,5 @@
-//! HTTP-level tests for incident replay (wave 2), mirroring `tests/audit.rs`
-//! and `tests/reads.rs`: `GET /v1/replay/{run}` reads the agent-event NDJSON
+//! HTTP-level tests for incident replay (wave 2), mirroring `tests/it/audit.rs`
+//! and `tests/it/reads.rs`: `GET /v1/replay/{run}` reads the agent-event NDJSON
 //! export, scoped to one run and ts-ordered, joined with that run's incidents
 //! and audit-chain entries; cross-org run ids 404 rather than leak.
 

@@ -31,3 +31,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = "9"
 base64 = "0.22"
 sha2 = "0.10"
+
+# Debug info is most of what a debug build writes to disk: every test binary
+# carried its own full copy of DataFusion's. Line tables keep file:line in
+# panics and backtraces; dependencies carry none (invariant 78).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

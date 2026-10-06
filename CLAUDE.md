@@ -94,6 +94,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/audit.sh              # invariant 11; needs cargo-audit
 ./scripts/constants.sh          # builds, unlike the text gates; see invariant 14
 ./scripts/d9-send-retention.sh  # invariant 50 (D9); its suite also runs in cargo test --all
+./scripts/one-test-binary-per-crate.sh  # invariant 78
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -366,7 +367,7 @@ build)`, `cloud apns (feature build)`.
    `a_directory_as_the_events_path_is_also_fail_open`,
    `an_empty_path_is_treated_as_unset` and
    `a_missing_agent_id_is_skipped_and_counted_never_invented`; the startup
-   report by `crates/cloud/tests/events_export_startup.rs`, which runs the
+   report by `crates/cloud/tests/it/events_export_startup.rs`, which runs the
    real `tokenfuse-cloud` binary against a 0500 directory and reads its log
    (`a_control_plane_whose_events_file_cannot_be_created_says_so_at_warn_and_keeps_running`,
    red on the unfixed binary with the whole startup log quoted: the keys
@@ -381,7 +382,7 @@ build)`, `cloud apns (feature build)`.
    `from_env_reports_an_unopenable_path_at_warn_and_the_export_is_off`);
    the images by
    `every_image_that_creates_uid_10001_creates_group_10001_first_and_puts_the_user_in_it`
-   in `crates/gateway/tests/image_user_group.rs`, which walks the repository
+   in `crates/gateway/tests/it/image_user_group.rs`, which walks the repository
    for every `Dockerfile*` rather than naming two, panics as having measured
    nothing if it finds none creating uid 10001, and was red naming both files.
    Scenarios: `features/the-events-file-that-cannot-be-created.feature`, six,
@@ -825,8 +826,8 @@ build)`, `cloud apns (feature build)`.
    *(test: six in `gateway::policyplane` including
    `a_failmode_fallback_is_never_evidence_of_a_verdict`,
    `allows_alone_do_not_prove_the_plane_can_refuse` and
-   `a_zero_timestamp_is_never_read_as_recent`; three in `tests/policy_plane.rs`
-   for the endpoint; and two in `tests/wardryx.rs` for the wiring underneath,
+   `a_zero_timestamp_is_never_read_as_recent`; three in `tests/it/policy_plane.rs`
+   for the endpoint; and two in `tests/it/wardryx.rs` for the wiring underneath,
    which no unit test can see: `a_verdict_off_the_wire_is_recorded_as_one` and
    `an_unreachable_pdp_never_counts_as_an_allow`. Every one was checked against
    its own mutant)*
@@ -885,7 +886,7 @@ build)`, `cloud apns (feature build)`.
    `a_hostile_refusal_body_becomes_one_short_line` (40 seeded rounds),
    `a_refusal_whose_body_never_ends_is_reported_without_waiting_for_it` and
    `a_filter_tools_refusal_names_its_status_and_what_wardryx_said`; in
-   `tests/wardryx.rs`,
+   `tests/it/wardryx.rs`,
    `a_pdp_refusal_in_shadow_reaches_the_trail_by_its_status_not_as_bad_json` and
    `a_wrong_key_401_is_recorded_as_a_refusal_and_still_fails_closed`. Red first,
    @measured `cargo test -p tokenfuse-gateway` against 3fe4f6e with these tests
@@ -1120,7 +1121,7 @@ build)`, `cloud apns (feature build)`.
    covering `unscoped_secrets_warning` and `refuse_unscoped_secrets`,
    including `require_scopes_refuses_to_start_when_a_secret_is_unscoped` and
    `require_scopes_off_never_refuses_even_with_unscoped_secrets`; and six in
-   `tests/mcp_broker.rs` over the live HTTP path, asserting on what actually
+   `tests/it/mcp_broker.rs` over the live HTTP path, asserting on what actually
    reached the upstream the way
    `a_tool_call_with_no_agent_id_is_refused_and_no_secret_is_resolved` already
    does:
@@ -1184,7 +1185,7 @@ build)`, `cloud apns (feature build)`.
    `an_unreachable_policy_plane_is_recorded_when_it_fails_open`,
    `..._when_it_fails_closed` and
    `an_unreachable_policy_plane_in_shadow_mode_reports_what_actually_happened`
-   in `tests/wardryx.rs`, verified red by removing the emit block, same
+   in `tests/it/wardryx.rs`, verified red by removing the emit block, same
    verbatim failure. The two that must NOT fire carry the rule's other half and
    were verified against their own mutants: `a_healthy_call_reports_no_...` and
    `a_call_with_no_identity_reports_no_...` in `gateway::proxy`, and
@@ -1340,7 +1341,7 @@ build)`, `cloud apns (feature build)`.
    cycle; the seven in `gateway::toolcheck`, of which
    `the_two_doors_answer_the_same_way_about_one_run` is the one that makes
    level 2 worth having and `a_firewall_that_is_off_says_allow_and_ungoverned_not_just_allow`
-   the one that keeps its answer honest; five in `tests/mcp_broker.rs` for
+   the one that keeps its answer honest; five in `tests/it/mcp_broker.rs` for
    level 3, including
    `a_gateway_that_cannot_be_reached_does_not_silently_become_permission`;
    `the_default_is_shadow_so_a_box_that_asked_for_nothing_still_measures`,
@@ -1656,7 +1657,7 @@ build)`, `cloud apns (feature build)`.
    `cargo test -p tokenfuse-dpop --release` 2026-09-16, four tests, each
    printing one `verify_proof` call's elapsed time: a real, accepted
    2048-bit signature (`a_2048_bit_rsa_proof_is_accepted_and_verifies`, the
-   fixture key `crates/cloud/tests/oidc.rs` also signs OIDC bearer tokens
+   fixture key `crates/cloud/tests/it/oidc.rs` also signs OIDC bearer tokens
    with) verifies in about 51-59us; a real, accepted 8192-bit signature at
    ring's own ceiling (`an_8192_bit_rsa_modulus_at_the_ceiling_is_accepted_and_verifies`,
    signed offline with a freshly generated 8192-bit key via `openssl dgst
@@ -1823,14 +1824,14 @@ build)`, `cloud apns (feature build)`.
    answer it differently and an operator who configured only the STRONGER
    credential is not refused for want of the weaker one.
    *(scenarios: `features/mcp-proof-door.feature`, thirteen, each bound to a
-   named test. Test: twenty in `tests/mcp_door.rs`, of which
+   named test. Test: twenty in `tests/it/mcp_door.rs`, of which
    `a_replayed_proof_is_refused_though_it_verifies_perfectly` is the one this is
    worth having for on a single-URL endpoint,
    `a_broken_proof_is_never_downgraded_to_the_bearer_door` holds the composition
    rule, and `two_proofs_from_one_client_are_both_admitted` is its negative
    control, since a door that refused every second call would pass the replay
    test. Six in `gateway::mcpbroker` for the startup conditions. Three in
-   `tests/mcp_broker.rs` over the live HTTP path asserting on what reached the
+   `tests/it/mcp_broker.rs` over the live HTTP path asserting on what reached the
    upstream, including
    `a_captured_proof_replayed_at_the_live_door_reaches_nothing_the_second_time`.
    Sixteen in `tokenfuse-dpop` for the verifier and the cache. All were run
@@ -2087,8 +2088,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(test: `a_chain_nobody_proved_is_asked_about_as_unproven`,
     `a_proven_chain_comes_from_the_token_and_not_from_the_header`,
     `a_token_and_a_header_that_disagree_are_refused_rather_than_reconciled`
-    in `tests/mcp_broker.rs`; `a_chain_nobody_proved_reaches_the_pdp_marked_unproven`
-    and `a_proven_chain_reaches_the_pdp_from_the_token` in `tests/wardryx.rs`.
+    in `tests/it/mcp_broker.rs`; `a_chain_nobody_proved_reaches_the_pdp_marked_unproven`
+    and `a_proven_chain_reaches_the_pdp_from_the_token` in `tests/it/wardryx.rs`.
     Not a script gate: nothing STOPS a third `DecideContext` being built
     somewhere without going through `chainproof`, and the compiler naming both
     existing sites when the field was added is what found them this time.)*
@@ -2374,7 +2375,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Guarding the call site instead would make the same gap a branch that never
     runs, and an operator can read a counter where they cannot read an unentered
     `if let`.
-    *(test: five in `tests/mcp_broker.rs`, of which
+    *(test: five in `tests/it/mcp_broker.rs`, of which
     `a_brokered_tool_call_is_recorded_when_no_policy_gate_is_configured` and
     `a_brokered_call_that_names_nobody_is_counted_as_skipped_not_never_attempted`
     were verified red against the unfixed tree, verbatim `left: 0 right: 1` for
@@ -2620,13 +2621,13 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     Both new names are declared in `components.json`
     (`every_environment_variable_this_repository_reads_is_declared_and_the_reverse`,
-    `tests/manifest.rs`) even though neither is read by the running PROCESS
+    `tests/it/manifest.rs`) even though neither is read by the running PROCESS
     the way every other entry there is - `option_env!` is a compiler-time
     substitution, not a `std::env::var` call - because that gate scans
     non-test source for the literal `TOKENFUSE_` text and does not
     distinguish the two, and a name it finds undeclared fails it regardless of
     which kind of read introduced it.
-    *(test: `crates/gateway/tests/version_and_help.rs`, six, run against the
+    *(test: `crates/gateway/tests/it/version_and_help.rs`, six, run against the
     real built binary with `TOKENFUSE_UPSTREAM`/`TOKENFUSE_ALLOW_STUB`
     explicitly removed from its environment, so a pass means "answered before
     the precondition check" and not "happened to pass it";
@@ -2635,7 +2636,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     asserted, stderr the `TOKENFUSE_UPSTREAM` refusal in full;
     `a_plain_start_with_no_upstream_still_refuses_exactly_as_before` pins the
     unmoved regression case and was already green before this change existed.
-    Four in `tests/manifest.rs`, of which
+    Four in `tests/it/manifest.rs`, of which
     `every_declared_subcommand_is_one_the_binary_dispatches_on` is the guard
     against `--help`'s list drifting from what `main.rs` actually runs.)*
 
@@ -2691,7 +2692,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_configured_admin_key_opens_the_routes_and_a_wrong_one_does_not`,
     `the_allow_open_obs_opt_out_is_honoured_and_logged` and
     `healthz_and_messages_are_never_behind_the_admin_gate` in
-    `crates/gateway/tests/admin_gate.rs`, run against the real router
+    `crates/gateway/tests/it/admin_gate.rs`, run against the real router
     `tokenfuse_gateway::app` builds; thirteen unit tests in
     `gateway::adminkeys` for `AdminKeys::from_spec`, `AdminKeys::matches` and
     `AdminGate::resolve`. All five integration tests were run against the
@@ -2812,7 +2813,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(tests: `settle::tests::settle_amount_treats_zero_tokens_beside_a_tool_call_count_as_no_usage`,
     `settle_amount_on_an_unknown_model_with_no_tokens_is_still_the_estimate`,
     `settle_amount_prices_a_cache_read_only_response_as_parsed`, and through
-    the router with the REAL `UsageParser`, `tests/no_usage_stream_settles_on_the_estimate.rs`:
+    the router with the REAL `UsageParser`, `tests/it/no_usage_stream_settles_on_the_estimate.rs`:
     `a_stream_with_no_usage_block_settles_on_the_estimate_not_zero` (the
     fixture is Ollama's `include_usage: false` stream, byte shape for byte
     shape), `a_stream_with_usage_null_on_every_chunk_settles_on_the_estimate_not_zero`,
@@ -2830,7 +2831,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `features/a-stream-without-usage-settles-on-the-estimate.feature`, five,
     each bound.)*
 
-44. **The surface `compat/1.0.json` promises is present in the code, and `COMPATIBILITY.md` is rendered from it, never typed.** SemVer's item 5: version 1.0.0 defines the public API, so a 1.0 is a promise about a surface, and a promise nobody can point at is a mood. This repository already published the strings another repository must agree with (`contracts/tokenfuse-constants.json`, invariant 14) and gated its environment names both ways (`crates/gateway/tests/manifest.rs`); the manifest is their union with everything else an operator or an agent depends on without reading the code, written in the 1.0.0 release commit (2026-09-14) and held from it on. From 1.0.0, removing or renaming a frozen name is a new major.
+44. **The surface `compat/1.0.json` promises is present in the code, and `COMPATIBILITY.md` is rendered from it, never typed.** SemVer's item 5: version 1.0.0 defines the public API, so a 1.0 is a promise about a surface, and a promise nobody can point at is a mood. This repository already published the strings another repository must agree with (`contracts/tokenfuse-constants.json`, invariant 14) and gated its environment names both ways (`crates/gateway/tests/it/manifest.rs`); the manifest is their union with everything else an operator or an agent depends on without reading the code, written in the 1.0.0 release commit (2026-09-14) and held from it on. From 1.0.0, removing or renaming a frozen name is a new major.
 
     What is frozen, in the manifest's fifteen kinds: the two shipped binaries (`cli.binaries`) and the gateway's fifteen subcommands and flags plus the Cloud's `--openapi` (`cli.subcommands`); the two listen defaults (`listen.defaults`); 83 environment names, 62 of the gateway's and all 21 of the Cloud's (`env`); the gateway's ten routes (`http.routes`), thirteen request headers (`http.request_headers`) and sixteen response headers (`http.response_headers`); the Cloud's 33 routes and five headers (`http.cloud_routes`, `http.cloud_headers`); the nine BreakerReason wire strings (`breaker.reasons`); the nineteen agent-event types this emitter writes (`agentevent.types`); the sixteen trace Parquet columns (`formats.trace_parquet`) and the constants file's own schema id (`formats.constants`); the three image names (`images`); and the Python SDK's fifteen public names from its `__all__` (`sdk.python`). The status word on a 402/403 and the severity of each event type are not in the manifest because the constants file already carries them, generated, and invariant 14's gate holds that file against the source.
 
@@ -2914,7 +2915,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     unit monthly cap in shadow is still uncovered, as invariant 42 says. Opening a parent from
     its Cloud budget writes a log line and no agent-event: no existing type describes it and a
     new one is a cross-repository change (the sibling changes invariant 42 records).
-    *(tests: `crates/core/tests/codex_money_review.rs` and `crates/core/tests/fable_missed.rs`,
+    *(tests: `crates/core/tests/it/codex_money_review.rs` and `crates/core/tests/it/fable_missed.rs`,
     the review's probes moved into the suite, seven red at 80e0d42 by the review's own runs and
     @measured `cargo test -p tokenfuse-core --test codex_money_review --test fable_missed
     --no-fail-fast` 2026-09-17 at 6fdef03 (before this change, re-run by the implementer, on the
@@ -3112,7 +3113,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     anything, as before. The unit half of a retained reservation cannot be settled after the
     month rolls (`UnitLedger::settle` drops a stale window), which any D8 must say.
 
-    *(tests: `crates/gateway/tests/codex_money_review.rs`, the review's F03 and F04 probes and
+    *(tests: `crates/gateway/tests/it/codex_money_review.rs`, the review's F03 and F04 probes and
     three held controls moved into the suite, the send-cancel probe renamed to
     `codex_f03_cancel_during_provider_send_is_retained_not_released` with its assertion moved to
     retention; `settle::tests`: `a_guard_dropped_while_the_provider_holds_the_request_retains_and_warns`,
@@ -3223,7 +3224,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `run.step`, stays right): SURVIVED the suite as first written, no test asserted the
     header's value; caught since by `managed_request_within_budget_settles_cost` (`x-fuse-step`
     left `"0"` right `"1"`, and `"2"` on a second call of the same run) and
-    `tests/router.rs::streaming_request_carries_the_router_header_too` (the streaming site,
+    `tests/it/router.rs::streaming_request_carries_the_router_header_too` (the streaming site,
     same left/right), @measured `cargo test -p tokenfuse-gateway` with the line removed
     2026-09-18.
 
@@ -3245,7 +3246,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `Retained::push` past its 8192-entry cap (never reached by a test; section 12's own
     NOT-proven list says so). `settle.rs:495-500`'s router-savings arithmetic inside
     `record_row` reads uncovered by this `--lib`-only command but is exercised by
-    `tests/router.rs::on_mode_rewrites_the_forwarded_body_and_prices_the_chosen_model`, which runs
+    `tests/it/router.rs::on_mode_rewrites_the_forwarded_body_and_prices_the_chosen_model`, which runs
     in a separate binary `cargo llvm-cov -p tokenfuse-gateway --lib` does not link.
 
     Scenarios: `features/settlement-owns-the-call.feature`, twelve, each bound
@@ -3302,7 +3303,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(tests: `proxy::tests::a_chain_of_forty_entries_is_refused_before_anything_is_forwarded`,
     red on the unfixed tree verbatim `left: 200 right: 400` with the chain forwarded and the
     bus empty; `a_chain_at_exactly_the_cap_is_forwarded_and_recorded_unchanged`, the guard,
-    green on both sides; `tests/mcp_broker.rs::a_chain_over_the_cap_is_refused_at_the_mcp_door_too`,
+    green on both sides; `tests/it/mcp_broker.rs::a_chain_over_the_cap_is_refused_at_the_mcp_door_too`,
     red the same way with the upstream having seen the call;
     `chainproof::tests::the_header_cap_is_the_delegation_crates_cap_and_not_a_second_number`
     (the 32 written out independently, invariant 14's lesson) and
@@ -3449,7 +3450,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     fast path never promised; the drain is single file, so a slow plane bounds replay at `BATCH`
     per round trip; a chunk refused during replay is counted in neither figure, invariant 13's
     line is its report; the cap and both timeouts are constants, and making any of them a
-    variable is a `components.json`, `tests/manifest.rs` and `compat/1.0.json` decision not
+    variable is a `components.json`, `tests/it/manifest.rs` and `compat/1.0.json` decision not
     taken here.
     *(tests: `cloudsink::tests`: `records_pushed_during_an_outage_arrive_in_order_after_recovery`,
     `one_transition_line_per_outage`, `the_cap_drops_the_oldest_and_says_so_once` (10 025 records
@@ -3543,7 +3544,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 55. **Usage is read from SSE events, not from lines.** (Numbered 55 because two sibling changes in flight from the same base on 2026-09-18 take 52 to 54 and 60; the number is the only thing the three share.) An SSE event's data is its `data` fields' values joined with LF, and no rule says any one line is a JSON document on its own; `UsageParser::finish` parsed each `data:` line as one, so an event carrying its usage object across two lines lost the object while the lines that did parse kept their figures, and the settlement was `Parsed` rather than the estimate (F06 of the 2026-09-18 money-path review, @measured by the review at 80e0d42 and again here at `da0fa34`: the Anthropic door on `claude-sonnet` consuming a `message_delta` split across two `data:` lines settled 30 micro-USD against 15030, the whole output cost gone with nothing to say so). Since 2026-09-18 `finish` reads the buffered body as an event stream first, by the WHATWG event-stream grammar (`split_sse_events`, `provider.rs`): a line ends at CRLF, LF or CR; a line starting with `:` is a comment; the field is the text before the first colon and the value the text after it with exactly one leading space removed; a `data` field appends its value and an LF to the data buffer; `event`, `id`, `retry` and every other field leave the buffer alone; a blank line dispatches the buffer less its trailing LF, and a buffer that is then empty dispatches nothing. Each dispatched event is one JSON document, handed once to `merge_usage` and once to `ToolCallCounter::observe_streaming`; an event whose whole data is `[DONE]` is OpenAI's sentinel and is skipped; an event that does not parse is skipped, its siblings are not. A body in which no `data` field appears is one JSON document, as before. Two departures from the browser algorithm, `@fable` 2026-09-18, both in the direction of not losing an event: a final event the body ends without a blank line for IS dispatched, because at end of body nothing can follow it, a provider that omits the last blank line is a shape the line parser accepted, and on the Anthropic wire that last event is the `message_delta` carrying the cumulative `output_tokens`, exactly the figure F06 loses; and a `data:` line whose JSON does not parse is skipped rather than failing the body, because the events that did parse are real money and settlement already has its own rule for a body that reported nothing (invariant 43). A body cut by the cap is `truncated` and nothing parsed from it is priced or recorded, whatever the splitter made of the cut event (invariant 38: `settle_amount`'s first branch runs before it looks at the usage). The MCP live-scan client's own frame reader (`mcpclient::parse_sse_frames`) calls the same splitter rather than keeping its copy of the rules. The OpenAI netting state the same review found broken in one order (F05) is invariant 45's text, amended the same day.
 
     **Where it says nothing.** No real Anthropic or OpenAI stream has been observed carrying a multi-line `data` event; both emit one compact line per event as far as anyone here has measured, so this closes a contract, not a reproduced loss. An event whose JSON fails to parse is skipped silently, with no counter and no log line; a stream whose usage event an intermediary broke into non-JSON pieces settles on whatever else parsed, or on the estimate. The parser is still buffered (`CAP`, invariant 38); an incremental SSE parser is out of scope. `event:` names are read by nobody, so a provider that put usage under an event type with an empty `data` is one nothing here can price. Leading whitespace before a field name is stripped before the name is compared, as the line parser always did (no provider is known to indent, and a test pins the tolerance); a whitespace-only line is a field line with an empty name, not a blank line, so it never dispatches or splits an event.
-    *(tests: `crates/gateway/tests/codex_money_review.rs::codex_f06_multiline_sse_usage_is_not_silently_partial`, the review's probe verbatim, and its two F05 siblings beside it; `provider::tests`: `a_multi_line_data_event_is_one_document`, `a_multi_line_openai_usage_event_is_one_document`, `crlf_endings_frame_events_like_lf`, `a_cr_only_body_frames_events`, `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data`, `data_with_no_space_after_the_colon_is_data`, `data_with_two_spaces_keeps_the_second_space`, `event_id_and_retry_lines_do_not_touch_the_data`, `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse`, `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event`, `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not`, `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced`, `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` (200 seeds, three line endings, random chunking), `hostile_sse_bodies_never_panic` (200 seeds, a 1 MiB comment line and a 1 MiB unterminated data line among them), `an_indented_data_line_is_still_a_data_field`, `a_whitespace_only_line_is_a_field_line_not_a_blank_line`. Red first, @measured `cargo test -p tokenfuse-gateway --test codex_money_review codex_f0` and a temporary integration test file exercising the public `UsageParser` API against `da0fa34` (the splitter is `pub(crate)`, so the struct-level assertions below are compile-red there and are named as such), 2026-09-18 at `da0fa34`: `codex_f06_multiline_sse_usage_is_not_silently_partial` panicked `left: Microusd(30) right: Microusd(15030)`; `a_multi_line_data_event_is_one_document` `left: 0 right: 1000`; `a_multi_line_openai_usage_event_is_one_document` `left: 0 right: 822`; `crlf_endings_frame_events_like_lf` `left: 0 right: 1000`; `a_cr_only_body_frames_events` `left: 0 right: 10`; `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` `left: 0 right: 1000` (its guard half green both sides); `data_with_no_space_after_the_colon_is_data` `left: 0 right: 10`; `data_with_two_spaces_keeps_the_second_space`'s `UsageParser` half is a held control (green already: the old `.trim()` swallowed any number of leading spaces), its `split_sse_events` half compile-red; `event_id_and_retry_lines_do_not_touch_the_data` `left: 0 right: 1000`; `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` `left: 0 right: 1000`; `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not` `left: 0 right: 5`; `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else` `left: 0 right: 1000` on the first `[DONE]` form; `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced` `left: 0 right: 10` (the multi-line head); `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` failed at its first seed, `ParsedUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, .. }, .. }` against the expected 10/1000/300, seed=1265663257694863673 ending="\r"; `an_indented_data_line_is_still_a_data_field`'s `UsageParser` half is a held control (green already), its `saw_data_field` half compile-red; `a_whitespace_only_line_is_a_field_line_not_a_blank_line` `left: 0 right: 10`; `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` and `hostile_sse_bodies_never_panic` name `split_sse_events`/`SseEvents`, absent at `da0fa34`, and are red by compile, the weaker form invariant 46 already accepts. Mutants, @measured 2026-09-18, each planted after the fix and reverted: M1 the LF join replaced by a buffer reset, caught by `codex_f06_multiline_sse_usage_is_not_silently_partial` (`left: Microusd(30) right: Microusd(15030)`, also the teeth case below); M2 `prompt_tokens_details`/`completion_tokens_details` dropped from the shape test, caught by `codex_f05_inv45_details_only_chunk_is_not_discarded` (`left: Microusd(2375) right: Microusd(2215)`); M3 the gross prompt written from the current object instead of the state, caught by `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once` (`left: Microusd(2535) right: Microusd(2215)`); M4 a comment line dispatches, caught by `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` (`left: 0 right: 1000`; the plain deletion of that arm is EQUIVALENT under `split_once`, an empty field name being read by nothing, and is recorded as such rather than claimed caught); M5 `\r` no longer a line end, caught by `a_cr_only_body_frames_events` (`left: 0 right: 10`); M6 the one-space rule widened to `trim_start`, caught by `data_with_two_spaces_keeps_the_second_space` (`left: ["...prompt_tokens...10}}"] right: [" ...10}}"]`); M7 `[DONE]` made a parse failure that drops every event before it, caught by `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `parses_anthropic_sse_usage`, `parses_openai_sse_usage` and one of the four router tests in `tests/no_usage_stream_settles_on_the_estimate.rs`; M8 the unterminated-final-event dispatch deleted, caught by `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` (`left: 0 right: 1000`); M9 `saturating_sub` replaced by `wrapping_sub`, caught by the existing `an_openai_cached_count_past_the_prompt_count_nets_to_zero_not_wraps` (`left: 18446744073709551566 right: 0`); M10 the empty-after-pop guard dropped from `dispatch`, caught by `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` (`left: SseEvents { events: ["", ""], .. } right: SseEvents { events: [], .. }`); M16 (A1) the field-name trim removed, caught by `an_indented_data_line_is_still_a_data_field` (`left: 0 right: 10`); M17 (A1) the whole line trimmed before the blank-line check, caught by `a_whitespace_only_line_is_a_field_line_not_a_blank_line` (`left: 0 right: 10`). Scenarios: `features/usage-is-read-from-events-not-lines.feature`, 9, each bound (`features-are-bound.sh`: 258 scenarios / 301 bindings, 0 broken). Not a script gate: the rule is the splitter under `cargo test`; one case in `scripts/gates-have-teeth.sh` plants a `data` field that replaces the buffer instead of appending to it and requires the review's probe to go red.)*
+    *(tests: `crates/gateway/tests/it/codex_money_review.rs::codex_f06_multiline_sse_usage_is_not_silently_partial`, the review's probe verbatim, and its two F05 siblings beside it; `provider::tests`: `a_multi_line_data_event_is_one_document`, `a_multi_line_openai_usage_event_is_one_document`, `crlf_endings_frame_events_like_lf`, `a_cr_only_body_frames_events`, `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data`, `data_with_no_space_after_the_colon_is_data`, `data_with_two_spaces_keeps_the_second_space`, `event_id_and_retry_lines_do_not_touch_the_data`, `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse`, `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event`, `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not`, `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced`, `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` (200 seeds, three line endings, random chunking), `hostile_sse_bodies_never_panic` (200 seeds, a 1 MiB comment line and a 1 MiB unterminated data line among them), `an_indented_data_line_is_still_a_data_field`, `a_whitespace_only_line_is_a_field_line_not_a_blank_line`. Red first, @measured `cargo test -p tokenfuse-gateway --test codex_money_review codex_f0` and a temporary integration test file exercising the public `UsageParser` API against `da0fa34` (the splitter is `pub(crate)`, so the struct-level assertions below are compile-red there and are named as such), 2026-09-18 at `da0fa34`: `codex_f06_multiline_sse_usage_is_not_silently_partial` panicked `left: Microusd(30) right: Microusd(15030)`; `a_multi_line_data_event_is_one_document` `left: 0 right: 1000`; `a_multi_line_openai_usage_event_is_one_document` `left: 0 right: 822`; `crlf_endings_frame_events_like_lf` `left: 0 right: 1000`; `a_cr_only_body_frames_events` `left: 0 right: 10`; `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` `left: 0 right: 1000` (its guard half green both sides); `data_with_no_space_after_the_colon_is_data` `left: 0 right: 10`; `data_with_two_spaces_keeps_the_second_space`'s `UsageParser` half is a held control (green already: the old `.trim()` swallowed any number of leading spaces), its `split_sse_events` half compile-red; `event_id_and_retry_lines_do_not_touch_the_data` `left: 0 right: 1000`; `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` `left: 0 right: 1000`; `an_event_whose_joined_json_fails_is_skipped_and_its_siblings_are_not` `left: 0 right: 5`; `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else` `left: 0 right: 1000` on the first `[DONE]` form; `an_event_cut_by_the_cap_is_truncated_and_nothing_parsed_from_it_is_priced` `left: 0 right: 10` (the multi-line head); `a_body_split_at_random_offsets_with_any_line_ending_parses_identically` failed at its first seed, `ParsedUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, .. }, .. }` against the expected 10/1000/300, seed=1265663257694863673 ending="\r"; `an_indented_data_line_is_still_a_data_field`'s `UsageParser` half is a held control (green already), its `saw_data_field` half compile-red; `a_whitespace_only_line_is_a_field_line_not_a_blank_line` `left: 0 right: 10`; `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` and `hostile_sse_bodies_never_panic` name `split_sse_events`/`SseEvents`, absent at `da0fa34`, and are red by compile, the weaker form invariant 46 already accepts. Mutants, @measured 2026-09-18, each planted after the fix and reverted: M1 the LF join replaced by a buffer reset, caught by `codex_f06_multiline_sse_usage_is_not_silently_partial` (`left: Microusd(30) right: Microusd(15030)`, also the teeth case below); M2 `prompt_tokens_details`/`completion_tokens_details` dropped from the shape test, caught by `codex_f05_inv45_details_only_chunk_is_not_discarded` (`left: Microusd(2375) right: Microusd(2215)`); M3 the gross prompt written from the current object instead of the state, caught by `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once` (`left: Microusd(2535) right: Microusd(2215)`); M4 a comment line dispatches, caught by `a_comment_line_inside_an_event_does_not_split_it_and_one_between_events_is_not_data` (`left: 0 right: 1000`; the plain deletion of that arm is EQUIVALENT under `split_once`, an empty field name being read by nothing, and is recorded as such rather than claimed caught); M5 `\r` no longer a line end, caught by `a_cr_only_body_frames_events` (`left: 0 right: 10`); M6 the one-space rule widened to `trim_start`, caught by `data_with_two_spaces_keeps_the_second_space` (`left: ["...prompt_tokens...10}}"] right: [" ...10}}"]`); M7 `[DONE]` made a parse failure that drops every event before it, caught by `done_as_the_whole_data_of_an_event_is_the_sentinel_and_drops_nothing_else`, `parses_anthropic_sse_usage`, `parses_openai_sse_usage` and one of the four router tests in `tests/it/no_usage_stream_settles_on_the_estimate.rs`; M8 the unterminated-final-event dispatch deleted, caught by `a_body_ending_without_the_final_blank_line_still_dispatches_its_last_event` (`left: 0 right: 1000`); M9 `saturating_sub` replaced by `wrapping_sub`, caught by the existing `an_openai_cached_count_past_the_prompt_count_nets_to_zero_not_wraps` (`left: 18446744073709551566 right: 0`); M10 the empty-after-pop guard dropped from `dispatch`, caught by `an_empty_data_event_is_not_dispatched_but_marks_the_body_sse` (`left: SseEvents { events: ["", ""], .. } right: SseEvents { events: [], .. }`); M16 (A1) the field-name trim removed, caught by `an_indented_data_line_is_still_a_data_field` (`left: 0 right: 10`); M17 (A1) the whole line trimmed before the blank-line check, caught by `a_whitespace_only_line_is_a_field_line_not_a_blank_line` (`left: 0 right: 10`). Scenarios: `features/usage-is-read-from-events-not-lines.feature`, 9, each bound (`features-are-bound.sh`: 258 scenarios / 301 bindings, 0 broken). Not a script gate: the rule is the splitter under `cargo test`; one case in `scripts/gates-have-teeth.sh` plants a `data` field that replaces the buffer instead of appending to it and requires the review's probe to go red.)*
 60. **A run that goes quiet is an incident, once, and the floor is the run's own cadence.**
     (Numbered 60 because two sibling changes in flight from the same base on 2026-09-18 take 52 to
     59; the number is the only thing they share.) Every detector in `crates/cloud/src/store.rs`
@@ -3616,7 +3617,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `stall_minutes_env_zero_is_off_blank_is_default_and_junk_is_refused`,
     `the_sweep_task_is_spawned_only_when_the_detector_is_on`;
     `push::tests::a_stalled_run_pushes_went_quiet_not_running_hot`;
-    `tests/run_stalled.rs::a_stalled_run_is_listed_on_the_incidents_endpoint_for_a_viewer`,
+    `tests/it/run_stalled.rs::a_stalled_run_is_listed_on_the_incidents_endpoint_for_a_viewer`,
     `a_stalled_run_reaches_the_sse_stream`; `agent_event::tests::run_stalled_is_on_the_wire_at_medium`.
     Red first, @measured `cargo test -p tokenfuse-cloud`
     2026-09-18 against the tree with the sweep and the fold stubbed to no-ops:
@@ -3736,7 +3737,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     tool-declaration shapes); `gateway::defaults::tools_prune_is_off_when_nothing_is_configured`,
     `tools_prune_shadow_is_the_one_word_that_turns_it_on`,
     `an_unrecognised_tools_prune_value_is_off_not_a_guess`; nine in
-    `crates/gateway/tests/shadow_tool_pruning.rs`: `off_makes_no_filter_call`,
+    `crates/gateway/tests/it/shadow_tool_pruning.rs`: `off_makes_no_filter_call`,
     `shadow_pruning_never_changes_the_forwarded_body_anthropic` and `..._openai`,
     `shadow_records_the_tools_the_policy_would_remove`,
     `a_wardryx_without_the_route_is_named_once_and_measures_nothing`,
@@ -3873,7 +3874,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(test: `crates/delegation/src/lib.rs`'s `verify_access_token` suite
     (`an_access_token_verifies_and_names_its_agent` and eighteen refusal/shape
     tests, including a 200-case revocation sweep and a 200-case hostile-bearer-string
-    sweep); `crates/gateway/tests/mcp_xaa.rs` (22 tests over the live HTTP
+    sweep); `crates/gateway/tests/it/mcp_xaa.rs` (22 tests over the live HTTP
     door, including `the_resource_metadata_names_vouchryx`,
     `a_401_points_at_the_resource_metadata`,
     `a_vouchryx_token_is_attributed_to_its_agent`,
@@ -3884,7 +3885,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     own suite (fourteen, every startup refusal as a pure-function test);
     `crates/gateway/src/chainproof.rs`'s `base_config_from_values` tests
     (seven); `mcpbroker.rs`'s own `something_on_the_door_counts_the_xaa_door`;
-    `crates/gateway/tests/xaa_startup.rs` (two, the real binary, proving
+    `crates/gateway/tests/it/xaa_startup.rs` (two, the real binary, proving
     `main.rs` is actually wired to the checks above, the one thing none of
     the unit tests can see). Scenarios: `features/xaa-bearer-door.feature`,
     bound by `scripts/features-are-bound.sh`. Mutants, nine, each planted in
@@ -3969,9 +3970,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     prove `main.rs` actually CALLS it.** Reverting `serve()` to the old
     inline match (`_ => CacheMode::Shadow` for the unset case) would leave
     every one of them green, since they test the pure function directly.
-    `crates/gateway/tests/cache_default_startup.rs` closes that seam by
+    `crates/gateway/tests/it/cache_default_startup.rs` closes that seam by
     running the real built binary (same technique as
-    `tests/stub_wire_mismatch.rs`) and reading the one piece of evidence
+    `tests/it/stub_wire_mismatch.rs`) and reading the one piece of evidence
     `main.rs` exposes for this decision, the startup line
     `tracing::info!(?cache_mode, "semantic cache")`:
     `unset_cache_resolves_to_off_in_the_real_binary` (TOKENFUSE_CACHE
@@ -4467,8 +4468,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     header" in full; `a_revoked_token_and_a_forged_one_are_logged_by_their_own_cause`
     found every one of three captured log lines reading
     `reason=BadToken`, none naming `Revoked` or `BadSignature`.
-    `tests/mcp_broker.rs::a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential`
-    is the same test at the MCP door, red the same way. `tests/delegation_htu_matches_wire.rs`
+    `tests/it/mcp_broker.rs::a_refused_delegation_token_at_the_mcp_door_is_not_told_to_fix_a_client_credential`
+    is the same test at the MCP door, red the same way. `tests/it/delegation_htu_matches_wire.rs`
     holds the third finding: `a_proof_naming_the_real_openai_path_is_accepted_on_the_openai_door`
     was red `left: 401 right: 200` and `a_proof_naming_the_anthropic_path_is_refused_on_the_openai_door`
     was red the other way, `left: 200 right: 401`, against the unfixed literal;
@@ -4560,9 +4561,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `proxy::tests::a_dpop_authorization_the_gateway_never_resolved_still_does_not_reach_the_provider`
     (no delegation issuer configured at all), also red first
     (`left: String("DPoP not-a-real-vouchryx-token") right: ""`). The OpenAI
-    door: `tests/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`,
+    door: `tests/it/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`,
     driven through the real router. The MCP broker's own guard:
-    `tests/mcp_broker.rs::a_resolved_delegation_credential_never_reaches_the_mcp_upstream`.
+    `tests/it/mcp_broker.rs::a_resolved_delegation_credential_never_reaches_the_mcp_upstream`.
     Mutants planted in the product code and reverted, byte for byte
     (`diff` against the pre-mutant tree confirmed clean after each restore):
     M1, the whole `if *name == "authorization" && is_dpop_scheme(v) {
@@ -4581,7 +4582,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     fix gives; caught by
     `provider::tests::a_dpop_scheme_authorization_is_never_forwarded_to_upstream`
     (calls `HttpProvider::send` directly, bypassing `messages` entirely) and
-    by `tests/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`
+    by `tests/it/wire_door.rs::a_dpop_authorization_never_reaches_the_provider_on_the_openai_door_either`
     (`left: String("DPoP not-a-real-vouchryx-token") right: ""`), which is
     the test this invariant's "both doors, one fix" claim rests on. The
     mcp_broker guard test stayed green under both mutants, correctly: it
@@ -4909,7 +4910,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_ceiling_only_ever_lowers_a_budget_the_operator_did_not_set`;
     `defaults::tests::a_run_budget_ceiling_nobody_can_read_is_refused_not_ignored`,
     `a_run_budget_ceiling_is_read_as_exact_microdollars`;
-    `tests/run_budget_ceiling_startup.rs` over the real binary;
+    `tests/it/run_budget_ceiling_startup.rs` over the real binary;
     `features/a-callers-budget-has-an-operator-ceiling.feature`. Red first
     against the unfixed code: `left: 200 right: 402` (a declared USD 1000
     admitted a USD 1.50 reservation under a USD 1.00 ceiling), `left: Ok(None)
@@ -4984,7 +4985,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     wardryx's decide handler ignores unknown members (`json.NewDecoder` with no
     `DisallowUnknownFields`, wardryx at `36df366`), so the two sides ship in
     either order and an older wardryx ignores `tool_call`.
-    *(test: in `tests/mcp_broker.rs`,
+    *(test: in `tests/it/mcp_broker.rs`,
     `the_decide_body_for_a_tools_call_carries_name_arguments_and_target`,
     `a_named_upstream_is_the_target_by_its_name`,
     `a_secret_handle_reaches_the_pdp_as_the_handle_and_never_as_the_value`
@@ -4995,7 +4996,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     and `hostile_arguments_never_panic_and_the_broker_keeps_serving` (nesting
     past the parser's limit, a million-character string, a wide object,
     non-object shapes, invalid UTF-8, then a normal call still served); in
-    `tests/wardryx.rs`,
+    `tests/it/wardryx.rs`,
     `the_llm_paths_decide_body_has_no_tool_call_even_with_tools_offered`; in
     `gateway::wardryx`, `a_call_over_the_cap_loses_its_arguments_and_says_so`,
     `the_cap_is_on_serialized_bytes_and_inclusive`,
@@ -5007,7 +5008,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_tool_timeout_defaults_to_the_shared_budget` and
     `a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget`.
     Seven of the new tests in `gateway::wardryx` and five in
-    `tests/mcp_broker.rs` were red by assertion against the plumbing with the
+    `tests/it/mcp_broker.rs` were red by assertion against the plumbing with the
     broker passing `tool_call: None`, a naive `ToolCall::new` that never
     truncates and a decide that ignored the tool timeout, verbatim
     `left: Null right: String("Bearer {{secret:gh}}")`,
@@ -5101,7 +5102,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     figure is still the hub's view: spend a site gateway queued and lost
     before a restart (invariant 53) is in neither. Startup only, as
     invariant 70.
-    *(test: `crates/cloud/tests/run_spend.rs`, nine, all red first against
+    *(test: `crates/cloud/tests/it/run_spend.rs`, nine, all red first against
     the unfixed Cloud (the route answered 404, `left: 404 right: 200` or the
     matching status): `a_site_key_reads_the_spend_of_its_own_sites_runs_only`
     (the 2026-10-05 figures), `a_row_carries_exactly_run_id_spend_and_killed`,
@@ -5119,7 +5120,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     a 401 seeded from `/v1/runs`), and the guard
     `a_refused_or_absent_site_route_falls_back_to_the_org_list`, green on both
     sides, which is what keeps every invariant-70 test unchanged.
-    `crates/cloud/tests/openapi.rs` lists the path. Seven mutants planted in
+    `crates/cloud/tests/it/openapi.rs` lists the path. Seven mutants planted in
     the product code 2026-10-05 and reverted, each caught by name: the site
     filter removed (`a_site_key_reads_the_spend_of_its_own_sites_runs_only`,
     `a_site_bound_key_of_any_role_is_scoped_to_its_site`,
@@ -5173,7 +5174,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     default-configured Python server from a 406 to a parse error, and
     claiming to accept a type the broker cannot read is the same fault the
     other way round, so the reading is in the same change.
-    *(test: in `tests/mcp_broker.rs`,
+    *(test: in `tests/it/mcp_broker.rs`,
     `a_server_that_refuses_a_wildcard_accept_answers_the_broker` and
     `the_accept_header_names_json_and_event_stream` (a stub that judges
     `Accept` as SDK 1.30 does),
@@ -5288,7 +5289,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     to its user; stdio held by the broker rather than left broken; no
     transparent re-`initialize` on stdio, because replaying a client's
     `initialize` would invent a session the client never asked for.
-    *(test: in `tests/mcp_broker.rs`, against a stub that behaves as the SDK
+    *(test: in `tests/it/mcp_broker.rs`, against a stub that behaves as the SDK
     does in stateful mode,
     `a_stateful_server_keeps_its_session_through_the_broker`,
     `the_protocol_version_reaches_the_upstream`,
@@ -5367,3 +5368,87 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     re-initialize for it. A client's JSON-RPC response (an answer to a server
     request, `id` and no `method`) is not a notification here and goes the old
     way, as before.
+
+78. **A crate has one integration-test binary, and a debug build carries line
+    tables, not full debug info.** Every file directly under a crate's `tests/`
+    is a binary of its own, and each links the crate's whole dependency graph.
+    In the gateway that was 28 binaries of roughly 200 to 230 MB each, all of
+    DataFusion inside every one with full debug info, so one `cargo test` after
+    a one-line change relinked about forty binaries across the workspace and
+    wrote about 8 GB. Reported 2026-10-06: Rust builds of this estate wrote
+    about 3.9 TB to a laptop SSD in under seven days.
+
+    A crate's integration tests are modules of `tests/it/main.rs` now
+    (gateway, cloud, core, and the separate `crates/cluster` workspace), with
+    the gateway's shared helpers at `tests/it/common/`, declared once. Every
+    test function kept its name, so `scripts/features-are-bound.sh` still binds
+    every scenario; the full name a filter sees gains the module path, so one
+    file's tests run as `cargo test -p <crate> --test it <module>::`, and a
+    needle that reads libtest's `failures:` list carries the module path too
+    (the D9 cases in `gates-have-teeth.sh`). Dated `@measured` commands
+    elsewhere in this file name the old targets on purpose: they record what
+    was run then, and this file does not rewrite its own measurements.
+
+    **One process is the price, and it was audited before the merge, not
+    after.** Nothing in any moved file sets or removes an environment variable,
+    changes the working directory, or installs a signal handler; scratch paths
+    keyed on the process id carry a per-file prefix, so sharing one pid makes
+    no two of them collide; the fixed ports are inside single files. The one
+    real hazard was `shadow_tool_pruning`: it installed a process-wide DEBUG
+    `tracing` subscriber and counted every WARN line in it, which was safe only
+    while it was alone in its process. Inside the shared binary every other
+    module's warnings would have landed in that buffer and been counted, and
+    the test would have failed or passed on scheduling. Its capture is now a
+    `Dispatch` of its own attached to its own request futures with
+    `WithSubscriber`, which sees exactly the lines the gateway writes while
+    answering those requests (the filter-tools warning is emitted inline in
+    that future, not in a spawned task), and the serialising lock it needed is
+    gone with the global buffer.
+
+    **One binary is allowed apart, and says why in the gate.**
+    `crates/gateway/tests/cluster_backend.rs` is `#![cfg(feature = "cluster")]`
+    and has its own CI step, `cargo test -p tokenfuse-gateway --features
+    cluster --test cluster_backend`, unchanged. It is now a `[[test]]` with
+    `required-features = ["cluster"]`, so a plain `cargo test --all` no longer
+    builds and links an empty binary for it. `crates/delegation` keeps its one
+    file, which is already one binary.
+
+    `[profile.dev]` is `debug = "line-tables-only"` and every dependency is
+    `debug = false`, in the root workspace and in `crates/cluster`. A panic and
+    a backtrace keep file and line; a debugger loses local variables, which is
+    one line to set back locally (`CARGO_PROFILE_DEV_DEBUG=true`). Release
+    builds are untouched. `crates/radar` is not changed: its eBPF half is built
+    by `aya-build` and BTF comes from debug info, and nothing in this
+    environment can build it to check what a profile change would do there.
+    *(gate: `scripts/one-test-binary-per-crate.sh`, which discovers every
+    `[package]` under `crates/` rather than listing them and counts the two
+    shapes cargo turns into a test binary, `tests/<name>.rs` and
+    `tests/<name>/main.rs`. Four cases in `gates-have-teeth.sh`: a second
+    `tests/*.rs` planted (must fail naming the crate), a module file under
+    `tests/it/` (must NOT fire), an allow-list entry whose file is gone (must
+    fail as STALE), and every crate manifest removed (must fail as measured
+    nothing). The harness's `restore` now also runs a scoped `git clean`,
+    because a planted file is untracked and `git checkout` cannot remove it.
+    It does not read a `[[test]]` entry whose `path` points outside `tests/`;
+    nothing here has one.)*
+
+    **Measured, both changes together, on the same 4-vCPU VM.** `@measured`
+    2026-10-06, `main` at `9178df2` against this branch, `cargo clean` before
+    each side, the same commands; bytes written are the `write_bytes` the
+    kernel counted for cargo and every process under it, so they include
+    binaries rewritten in place that `du` cannot see. Root workspace: `cargo
+    test --all --no-run` from clean produced 56 test executables (17.8 GB of
+    them) and now 12 (0.64 GB), wrote 26.9 GB and now 4.3 GB, left 25.0 GB in
+    `target/` and now 3.4 GB, in 215 s and now 151 s. After `touch
+    crates/gateway/src/lib.rs` the same command wrote 18.8 GB in 43 s and now
+    1.3 GB in 6.5 s. `crates/cluster`: 6 executables to 3, 3.4 GB written from
+    clean to 1.5 GB, 1.1 GB after touching its `lib.rs` to 0.35 GB. `cargo
+    test --all --no-fail-fast` passed the same 1660 tests by name on both
+    sides (the integration tests compared with their new module prefix
+    removed), and the cluster workspace 13 and 13. Both sides failed the same
+    two, `events_export_startup::a_control_plane_whose_events_file_cannot_be_created_says_so_at_warn_and_keeps_running`
+    and `events::tests::an_unwritable_directory_is_named_at_warn_and_the_export_is_off`,
+    because that VM runs as root and both refuse to measure a 0500 directory
+    as root; run as `nobody` on the branch, both pass. The split between the
+    two changes was not measured: each figure is the binaries and the profile
+    together.

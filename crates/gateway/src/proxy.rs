@@ -561,7 +561,7 @@ pub async fn chat_completions(
 ///
 /// Crate-private: both doors are registered on the router (`lib.rs`), so
 /// tests reach either one through real HTTP on `tokenfuse_gateway::app`
-/// rather than calling this directly - see `tests/wire_door.rs`.
+/// rather than calling this directly - see `tests/it/wire_door.rs`.
 /// Invariant 70: credit a run's Cloud-known spend the moment it is opened
 /// fresh in this process, before anything else touches its ledger state.
 /// Called only where the caller has already established the run had no

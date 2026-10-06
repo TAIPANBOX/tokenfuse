@@ -8,8 +8,8 @@
 //! with nothing else in the gateway's own health signals saying so. `main.rs`
 //! refuses to start in that combination rather than let it run quietly.
 //!
-//! Runs the real built binary (same technique as `tests/version_and_help.rs`
-//! and `tests/mcp_scan_exit_code.rs`), because the decision lives in `main.rs`
+//! Runs the real built binary (same technique as `tests/it/version_and_help.rs`
+//! and `tests/it/mcp_scan_exit_code.rs`), because the decision lives in `main.rs`
 //! itself and nothing in the library crate observes it.
 
 use std::io::{BufRead, BufReader};

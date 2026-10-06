@@ -121,7 +121,7 @@ async fn raft_backend_enforces_parent_budget() {
 /// `snapshot()` only ever reads this node's local copy (`sm.read_run`), so a
 /// burst of fresh runs hitting the follower can race its own replication
 /// catch-up even though every `open_run` already succeeded from the caller's
-/// point of view. `crates/cluster/tests/http_cluster.rs
+/// point of view. `crates/cluster/tests/it/http_cluster.rs
 /// ::http_cluster_replicates_and_enforces` shows the same follower-lag window
 /// (it polls up to 100×20ms for a follower to catch up) — this test drives
 /// the real gateway handler through that exact window instead of polling

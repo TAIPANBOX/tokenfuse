@@ -15,7 +15,7 @@
 #
 # This repository already publishes the wire strings another repository must
 # agree with (contracts/tokenfuse-constants.json, invariant 14) and gates the
-# environment names both ways (crates/gateway/tests/manifest.rs). The manifest
+# environment names both ways (crates/gateway/tests/it/manifest.rs). The manifest
 # is their union with the routes, the headers, the subcommands, the Parquet
 # columns, the image names and the Python SDK's public names: one file a
 # stranger reads instead of five, and one check that says which name left.

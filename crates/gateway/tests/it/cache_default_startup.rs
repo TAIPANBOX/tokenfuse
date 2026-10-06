@@ -5,8 +5,8 @@
 //! leave every unit test in `gateway::defaults` green, since those test the
 //! pure function directly and never touch the binary's own wiring.
 //!
-//! Runs the real built binary (same technique as `tests/stub_wire_mismatch.rs`
-//! and `tests/xaa_startup.rs`), because the decision under test - what
+//! Runs the real built binary (same technique as `tests/it/stub_wire_mismatch.rs`
+//! and `tests/it/xaa_startup.rs`), because the decision under test - what
 //! `serve()` actually resolves `TOKENFUSE_CACHE` to - lives in `main.rs`
 //! itself and nothing in the library crate observes it. The startup line
 //! `tracing::info!(?cache_mode, "semantic cache")` is the one piece of
@@ -51,7 +51,7 @@ fn strip_ansi(s: &str) -> String {
 /// (`main.rs`, `tracing::info!(?cache_mode, "semantic cache")`).
 const CACHE_LINE_NEEDLE: &str = "semantic cache";
 
-/// Same ceiling and reasoning as `tests/stub_wire_mismatch.rs`'s
+/// Same ceiling and reasoning as `tests/it/stub_wire_mismatch.rs`'s
 /// `POSITIVE_CEILING`: generous enough to clear this sandbox's process
 /// supervision latency without turning a genuine hang into a slow pass.
 const POSITIVE_CEILING: Duration = Duration::from_secs(10);
@@ -140,7 +140,7 @@ fn run_and_capture_cache_line(cache_value: Option<&str>) -> StdoutWait {
 }
 
 /// RED-FIRST (recorded in CLAUDE.md invariant 63 rather than re-run here on
-/// every CI pass, per the same convention `tests/stub_wire_mismatch.rs`
+/// every CI pass, per the same convention `tests/it/stub_wire_mismatch.rs`
 /// follows): against `main.rs` reverted to the OLD inline match (`_ =>
 /// CacheMode::Shadow` for the unset case, the pre-#319-fix default), this
 /// test's assertion fails, `left: "... cache_mode=Shadow" ... right pattern

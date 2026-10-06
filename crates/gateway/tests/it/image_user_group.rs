@@ -8,7 +8,7 @@
 //! `uid=10001 gid=999`. The launchers share their events directory as
 //! `root:10001 2775`, so a process in gid 999 cannot create a file in it, and
 //! the Cloud's export silently did nothing (the other half of that issue is
-//! the silence, held by `crates/cloud/tests/events_export_startup.rs`).
+//! the silence, held by `crates/cloud/tests/it/events_export_startup.rs`).
 //!
 //! Text, not a build: CI's `fmt · clippy · test` job builds no image, and the
 //! image job runs on tags only. What can be held here is that every

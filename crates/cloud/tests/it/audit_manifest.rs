@@ -1,5 +1,5 @@
 //! HTTP-level tests for the signed audit manifest (P3 WS2 follow-up), mirroring
-//! `tests/audit.rs`: with a signing key configured, `GET /v1/audit/manifest`
+//! `tests/it/audit.rs`: with a signing key configured, `GET /v1/audit/manifest`
 //! returns a manifest whose ES256 signature verifies (independently, with
 //! `p256`) against the embedded public key over the canonical bytes; the tip
 //! moves when the chain grows; an empty chain still signs a zero-tip manifest;

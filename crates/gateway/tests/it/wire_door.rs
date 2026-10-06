@@ -9,7 +9,7 @@
 //! were always meant to exercise, and it is also what makes going through
 //! `handle` directly for either door no longer necessary as a workaround.
 
-mod common;
+use crate::common;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};

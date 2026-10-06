@@ -23,7 +23,7 @@
 //! stream, so it also fails if a settle path stops calling `settle_amount`, or
 //! if the guard's `unmeasured` is ever zero on a 2xx.
 
-mod common;
+use crate::common;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};

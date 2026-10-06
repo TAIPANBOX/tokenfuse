@@ -58,11 +58,14 @@
 #
 # WHAT THE THIRD PROPERTY IS FOR
 #
-# A gate whose subject has been renamed, emptied or deleted must say so. Ten
-# cases below take a subject away: cargo off PATH, a renamed type, a catalog
-# whose shape stopped parsing, a renamed image, the ignore list deleted, the
-# badge deleted, the published artifact deleted, features/ removed, every
-# install command neutralised, and the relevant-not-enforced category emptied.
+# A gate whose subject has been renamed, emptied or deleted must say so. Cases
+# below that take a subject away include: cargo off PATH, a renamed type, a
+# catalog whose shape stopped parsing, a renamed image, the ignore list
+# deleted, the badge deleted, the published artifact deleted, features/
+# removed, every install command neutralised, the relevant-not-enforced
+# category emptied, and every crate manifest removed. (This said "Ten cases"
+# until 2026-10-06 while more had arrived; the list names examples now rather
+# than carrying a count nothing checks.)
 # Each must fail as "measured nothing" rather than pass on an empty read. This
 # is the estate's most expensive recurring mistake and it lives in tooling
 # rather than product code, because tooling is where a silent pass looks like a
@@ -83,7 +86,15 @@ if [ -n "$(git status --porcelain)" ]; then
 	exit 1
 fi
 
-restore() { git checkout -- . 2>/dev/null; }
+# `git clean` as well as `git checkout`, because a case that PLANTS a file
+# (invariant 78's second test binary) leaves an untracked file `checkout`
+# cannot see. It is safe only because of the clean-tree refusal above: nothing
+# untracked existed before this script started, so nothing of anybody's can be
+# removed. Ignored files (target/) are not touched, since there is no `-x`.
+restore() {
+	git checkout -- . 2>/dev/null
+	git clean -fdq -- crates scripts 2>/dev/null
+}
 baseline_dir="$(mktemp -d)"
 
 # One trap for both, because a second `trap ... EXIT` REPLACES the first
@@ -602,9 +613,9 @@ run_case "same-doors: an explained one-sided door, reworded" pass \
 # mechanism (mutate, run a command, expect a status) does not care which kind
 # of command it runs, so the "gate" here is the exact test named in
 # docs/26-the-openai-door.md's mutation table for this fault
-# (crates/gateway/tests/wire_door.rs).
+# (crates/gateway/tests/it/wire_door.rs).
 run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
-	"cargo test -p tokenfuse-gateway --test wire_door -- --exact a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything" \
+	"cargo test -p tokenfuse-gateway --test it -- --exact wire_door::a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything" \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "    if wire != st.wire {", "    if false && wire != st.wire {")')" \
 	"a_gateway_pointed_at_anthropic_refuses_the_openai_door_before_it_reserves_anything ... FAILED"
 
@@ -618,7 +629,7 @@ run_case "the-openai-door: serve the mismatched door instead of refusing" fail \
 # is a dead_code error there, and a mutant that does not compile is WRONG REASON,
 # not a caught fault).
 run_case "hierarchical-budgets: an unknown parent walked past silently" fail \
-	"cargo test -p tokenfuse-core --test fable_missed -- --exact missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing" \
+	"cargo test -p tokenfuse-core --test it -- --exact fable_missed::missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing" \
 	"$(py 'edit("crates/core/src/ledger.rs", "return (links, Some(Stop::UnknownParent(id)));", "let _ = Stop::UnknownParent(id); break;")')" \
 	"missed1_a_child_naming_an_unopened_parent_is_checked_against_nothing ... FAILED"
 
@@ -645,7 +656,7 @@ run_case "settlement-owns-the-call: a retained reservation released instead" fai
 # usage object split across two lines never parses and the review's own probe
 # must go red with the output cost gone (30 for 15030).
 run_case "usage-is-read-from-events: a data field replaces the buffer instead of appending" fail \
-	"cargo test -p tokenfuse-gateway --test codex_money_review -- --exact codex_f06_multiline_sse_usage_is_not_silently_partial" \
+	"cargo test -p tokenfuse-gateway --test it -- --exact codex_money_review::codex_f06_multiline_sse_usage_is_not_silently_partial" \
 	"$(py 'edit("crates/gateway/src/provider.rs", "data.push_str(value);", "data.clear(); data.push_str(value);")')" \
 	"codex_f06_multiline_sse_usage_is_not_silently_partial ... FAILED"
 
@@ -745,24 +756,57 @@ run_case "compat-surface: a file a where entry names is gone" fail \
 # a_request_that_cannot_be_built_releases_both_ledgers ... upstream accepted 57
 # POST body bytes". So these needles name the test in libtest's "failures:"
 # list, indented by four spaces, which is printed after every test has
-# finished and so has nothing to interleave with.
+# finished and so has nothing to interleave with. Since the suite became a
+# module of the gateway's one test binary (invariant 78) that list names it by
+# its module path, so the needles carry `send_failure_retention::`.
 run_case "D9: all send errors release" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/proxy.rs", "if matches!(&e, ProviderError::NotSent(_))", "if true")')" \
     "an ambiguous send must keep its exposure"
 run_case "D9: a followed redirect" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", ".redirect(reqwest::redirect::Policy::none())", "")')" \
-    "    a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home"
+    "    send_failure_retention::a_redirect_from_the_provider_is_not_followed_and_the_key_stays_home"
 run_case "D9: a refused connection retained" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "if e.is_connect() {", "if false {")')" \
-    "    a_refused_connection_on_the_only_hop_releases_both_ledgers"
+    "    send_failure_retention::a_refused_connection_on_the_only_hop_releases_both_ledgers"
 run_case "D9: request-build failure retained" fail "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "ProviderError::NotSent(e.to_string())", "ProviderError::Upstream(e.to_string())")')" \
-    "    a_request_that_cannot_be_built_releases_both_ledgers"
+    "    send_failure_retention::a_request_that_cannot_be_built_releases_both_ledgers"
 run_case "D9: harmless source comment" pass "./scripts/d9-send-retention.sh" \
     "$(py 'edit("crates/gateway/src/provider.rs", "pub enum ProviderError {", "pub enum ProviderError { // harmless comment")')"
 run_case "D9: suite removed" fail "./scripts/d9-send-retention.sh" \
-    "$(py 'import os; os.remove("crates/gateway/tests/send_failure_retention.rs")')" \
+    "$(py 'import os; os.remove("crates/gateway/tests/it/send_failure_retention.rs")')" \
     "measured nothing"
+
+# --- invariant 78: one integration-test binary per crate ---------------------
+#
+# A second file directly under a crate's tests/ is a second binary that links
+# the whole dependency graph again on every test run. It compiles and passes,
+# so nothing but this gate notices it. Four cases: the planted binary, a
+# module file under tests/it/ that must NOT fire, an allow-list entry whose
+# file is gone, and every crate manifest taken away, which must read as
+# measured nothing rather than as zero crates with zero problems.
+run_case "one-test-binary: a second tests/*.rs planted" fail \
+	"./scripts/one-test-binary-per-crate.sh" \
+	"$(py 'open("crates/cloud/tests/planted.rs", "w").write("#[test]\nfn planted() {}\n")')" \
+	"crates/cloud has 2 integration-test binaries"
+
+run_case "one-test-binary: a module file under tests/it is not a binary" pass \
+	"./scripts/one-test-binary-per-crate.sh" \
+	"$(py 'open("crates/cloud/tests/it/planted.rs", "w").write("#[test]\nfn planted() {}\n")')"
+
+run_case "one-test-binary: an allowed binary that no longer exists" fail \
+	"./scripts/one-test-binary-per-crate.sh" \
+	"$(py 'import os; os.remove("crates/gateway/tests/cluster_backend.rs")')" \
+	"STALE  crates/gateway/tests/cluster_backend.rs"
+
+run_case "one-test-binary: no crates at all, so it measured nothing" fail \
+	"./scripts/one-test-binary-per-crate.sh" \
+	"$(py 'import glob, os
+paths = glob.glob("crates/**/Cargo.toml", recursive=True)
+assert paths, "no manifests to remove"
+for p in paths:
+    os.remove(p)')" \
+	"measured nothing"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #

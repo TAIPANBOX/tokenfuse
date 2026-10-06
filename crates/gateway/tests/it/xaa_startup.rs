@@ -4,7 +4,7 @@
 //! pure-function unit tests (`crates/gateway/src/xaadoor.rs`'s `mod tests`),
 //! which need no process spawn; this file exists only to prove the wiring
 //! itself, the one thing a unit test cannot see (same reason
-//! `tests/version_and_help.rs` and `tests/admin_gate.rs` run the real
+//! `tests/it/version_and_help.rs` and `tests/it/admin_gate.rs` run the real
 //! binary rather than calling a function).
 
 use std::process::Command;

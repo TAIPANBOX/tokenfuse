@@ -432,7 +432,7 @@ mod tests {
     }
 
     /// Fixture RSA-2048 key and matching JWK, borrowed rather than
-    /// duplicated: this is `crates/cloud/tests/oidc.rs`'s `KEY1_PEM` and its
+    /// duplicated: this is `crates/cloud/tests/it/oidc.rs`'s `KEY1_PEM` and its
     /// JWKS entry (kid `test-key-1`), the same key that crate's own `sign()`
     /// helper uses to sign real OIDC bearer tokens. It is a REAL RSA key
     /// pair a signature can be checked against, not merely a shape.

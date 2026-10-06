@@ -233,7 +233,7 @@ async fn incident_ack_flow_and_rbac() {
 }
 
 /// Invariant 65: `ingest` is narrow on purpose. It may push telemetry
-/// (covered in `crates/cloud/tests/ingest.rs`), but every other mutation
+/// (covered in `crates/cloud/tests/it/ingest.rs`), but every other mutation
 /// here - kill, a run budget, a unit budget, and pairing - must refuse it
 /// exactly like a viewer (403, never a silent 200 and never a 401 that would
 /// suggest the key itself is unknown).

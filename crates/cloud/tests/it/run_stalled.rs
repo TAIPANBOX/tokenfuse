@@ -1,7 +1,7 @@
 //! HTTP-level tests for `run_stalled` (invariant 60): the incidents endpoint
 //! and the SSE stream see a stall the same way they see any other incident.
-//! Keys and the `get` helper are the `tests/reads.rs:14-60` shape; the SSE
-//! draining loop is the `tests/streaming.rs:101-155` shape.
+//! Keys and the `get` helper are the `tests/it/reads.rs:14-60` shape; the SSE
+//! draining loop is the `tests/it/streaming.rs:101-155` shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;

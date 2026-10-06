@@ -130,5 +130,5 @@ doesn't have to match a known-bad phrase to be a rug pull; it only has to
 - `crates/core/src/mcp.rs` — `Lock::from_tools`, `diff`, `Drift`.
 - `crates/core/src/mcpreport.rs` — `Severity`, `ScanReport::max_severity`.
 - `crates/gateway/src/mcpcli.rs` — `run_live`, shared by the CLI and this demo.
-- `crates/gateway/tests/mcp_scan_live.rs` — the hermetic integration tests
+- `crates/gateway/tests/it/mcp_scan_live.rs` — the hermetic integration tests
   this demo's stub-server pattern is drawn from.
