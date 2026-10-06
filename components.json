@@ -2,7 +2,7 @@
   "$comment": [
     "What this repository contributes to a running stack, and what a check may",
     "believe about it. `checked` is proved against this repository by",
-    "crates/gateway/tests/manifest.rs in this repository's own CI; `declared` is a",
+    "crates/gateway/tests/it/manifest.rs in this repository's own CI; `declared` is a",
     "statement nobody can verify and carries its own `why`.",
     "",
     "THIS IS THE ONE THE WHOLE MECHANISM WAS BUILT FOR. estate.json says this",

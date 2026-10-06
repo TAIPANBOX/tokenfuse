@@ -646,7 +646,7 @@ async fn the_stdio_path_refuses_an_unattributed_call_in_json_rpc() {
 /// mode blocks nothing by definition, so a missing agent identity must not
 /// become a refusal there. Same posture the LLM path holds
 /// (`shadow_without_an_agent_id_still_observes_and_never_blocks` in
-/// `tests/wardryx.rs`), so the two enforcement points now agree in both
+/// `tests/it/wardryx.rs`), so the two enforcement points now agree in both
 /// directions rather than only in one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shadow_without_an_agent_id_still_forwards() {
@@ -1465,7 +1465,7 @@ async fn a_gateway_that_cannot_be_reached_does_not_silently_become_permission() 
 
 // --- the proof door on the live HTTP path ---------------------------------
 //
-// `tests/mcp_door.rs` drives `mcpdoor::admit` as a pure function. These three
+// `tests/it/mcp_door.rs` drives `mcpdoor::admit` as a pure function. These three
 // assert the thing that function cannot: that the decision is actually wired
 // into the transport, and that a refusal reaches no upstream and resolves no
 // handle. The MCP broker's own history is why: `a_tool_call_with_no_agent_id_is

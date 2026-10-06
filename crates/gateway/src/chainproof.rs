@@ -332,7 +332,7 @@ pub(crate) fn same_chain(a: &[String], b: &[String]) -> bool {
 /// to read the file `jwks_path` names. Injected rather than read directly so
 /// every refusal message is a unit test rather than a startup-only path: a
 /// process-exiting function can only be proven by running the real binary
-/// (`tests/xaa_startup.rs` does that once, for the wiring), and every OTHER
+/// (`tests/it/xaa_startup.rs` does that once, for the wiring), and every OTHER
 /// case belongs here instead.
 ///
 /// `Ok(None)`: neither `issuer` nor `jwks_path` is set. `Ok(Some(cfg))`: both

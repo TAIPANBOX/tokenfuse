@@ -1,13 +1,12 @@
 //! Shared construction helpers for gateway integration tests.
 //!
-//! Not `tests/common.rs`: a file directly under `tests/` compiles as its own
-//! test binary, and this one has no tests of its own to run - only helpers
-//! other test files pull in with `mod common;`.
+//! Declared once in `tests/it/main.rs`, the one integration-test binary of
+//! this crate, and reached from a test module as `crate::common`. It has no
+//! tests of its own to run.
 //!
-//! Every test binary that pulls this in compiles all of it and uses a subset,
-//! so `dead_code` is allowed here and in no other test file: a helper no binary uses
-//! is found by reading this file, not by a lint that would otherwise fail the
-//! first binary to need only one of them.
+//! Not every helper here is used by every module, and a helper nothing uses
+//! is found by reading this file rather than by a lint, so `dead_code` is
+//! allowed here and in no other test file.
 #![allow(dead_code)]
 
 use async_trait::async_trait;

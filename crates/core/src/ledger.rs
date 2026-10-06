@@ -1122,7 +1122,7 @@ mod tests {
     /// against, not the live tree at settle time, so a parent that appears
     /// (or reopens) between a child's reserve and its settle cannot lose
     /// another call's reservation. `codex_f02` (moved into
-    /// `tests/codex_money_review.rs`) is the review's own probe for the same
+    /// `tests/it/codex_money_review.rs`) is the review's own probe for the same
     /// fault; this is its shape plus the tail proving the chain keeps
     /// growing correctly once the parent exists.
     #[test]
@@ -1193,7 +1193,7 @@ mod tests {
     /// `close_run` keeps a run's counters rather than deleting them, because
     /// a reservation still in flight settles after the run closes and its
     /// ancestors still need the release and the charge (`missed6`, moved
-    /// into `tests/fable_missed.rs`). A second settlement of the same
+    /// into `tests/it/fable_missed.rs`). A second settlement of the same
     /// reservation is still a no-op after the run is closed.
     #[test]
     fn a_closed_run_keeps_the_counters_a_late_settlement_needs() {
@@ -1284,7 +1284,7 @@ mod tests {
     /// A second settlement of one reservation is an observable no-op: the
     /// run is charged once, and a sibling reservation on the same run is
     /// never touched by someone else's replay (`codex_f10`, moved into
-    /// `tests/codex_money_review.rs`).
+    /// `tests/it/codex_money_review.rs`).
     #[test]
     fn a_second_settlement_of_one_reservation_is_an_observable_no_op() {
         let l = Ledger::new();

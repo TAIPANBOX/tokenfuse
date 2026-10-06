@@ -129,7 +129,7 @@ async fn main() {
         let _ = axum::serve(listener, router).await;
     });
     // Give the server a moment to start accepting connections (same pattern
-    // as the hermetic tests in tests/mcp_scan_live.rs).
+    // as the hermetic tests in tests/it/mcp_scan_live.rs).
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let url = format!("http://{addr}");
     println!("stub MCP server listening at {url} (loopback, this process only)\n");

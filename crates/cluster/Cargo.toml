@@ -28,3 +28,13 @@ async-trait = "0.1.89"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rcgen = "0.13"
+
+# Debug info is most of what a debug build writes to disk, once per test
+# binary. Same settings as the root workspace, which this one is not part of:
+# line tables keep file:line in panics and backtraces, dependencies carry none
+# (invariant 78).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -3,7 +3,7 @@
 //! `crates/core/src/pricing.rs`, `output_tokens = 1e18` priced negative, and a
 //! negative estimate passed every budget check the gateway has.
 //!
-//! Harness copied from `crates/gateway/tests/require_run_id.rs`: same
+//! Harness copied from `crates/gateway/tests/it/require_run_id.rs`: same
 //! `CountingProvider`, same `state()`/`Request::post` shape. The counter is
 //! half the assertion here too - a 402 with the call still forwarded would be
 //! the worst of both.

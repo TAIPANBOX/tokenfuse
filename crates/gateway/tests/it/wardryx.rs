@@ -6,7 +6,7 @@
 //! wiring end to end: a tiny stub Wardryx server stands in for the PDP, and
 //! a real (offline) gateway request is driven through `tokenfuse_gateway::app`
 //! against the in-process `StubProvider` upstream, mirroring the pattern
-//! `tests/router.rs` and `tests/mcp_broker.rs` already use.
+//! `tests/it/router.rs` and `tests/it/mcp_broker.rs` already use.
 
 use axum::body::Body;
 use axum::extract::State;
@@ -1100,7 +1100,7 @@ async fn a_wrong_key_401_is_recorded_as_a_refusal_and_still_fails_closed() {
 // The LLM path has no pending tool call, so its decide body carries none.
 //
 // The MCP broker's decide request now carries `tool_call` (see
-// `tests/mcp_broker.rs`). A model call only OFFERS tools; no call has been
+// `tests/it/mcp_broker.rs`). A model call only OFFERS tools; no call has been
 // chosen yet, so there is nothing to name, and the body this path sends must be
 // exactly what it was before that member existed.
 // ---------------------------------------------------------------------------

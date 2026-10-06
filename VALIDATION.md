@@ -30,7 +30,7 @@ budget and every reservation, silently. Restarting the whole cluster would have 
 `--dir <path>` now wires the binary to the redb-backed store, and the in-memory case says so at
 startup in words rather than by the absence of a flag. The test is
 `a_budget_survives_a_process_that_was_killed_rather_than_stopped`
-(`crates/cluster/tests/kill_durability.rs`): it spawns the real binary, `SIGKILL`s it so nothing
+(`crates/cluster/tests/it/kill_durability.rs`): it spawns the real binary, `SIGKILL`s it so nothing
 gets a chance to flush or tidy up, and starts it again on the same directory. The budget and the
 reservation are both there afterwards.
 

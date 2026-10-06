@@ -15,7 +15,7 @@
 //! same router `main.rs` serves - the same style `wire_door.rs` already
 //! uses for this pair of doors.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

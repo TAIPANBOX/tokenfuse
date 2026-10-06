@@ -118,6 +118,14 @@ jobs:
       - name: every tool CI installs is pinned
         run: ./scripts/pinned-installs.sh
 
+      # Every file directly under a crate's tests/ is a test binary that links
+      # the whole dependency graph, DataFusion included, so one test run after a
+      # change relinked about forty of them. A crate's integration tests are
+      # modules of tests/it/main.rs instead; this keeps a second binary from
+      # arriving quietly (invariant 78).
+      - name: one integration-test binary per crate
+        run: ./scripts/one-test-binary-per-crate.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04

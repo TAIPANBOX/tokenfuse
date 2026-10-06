@@ -9,7 +9,7 @@
 //! `budget_exhausted` incidents existed and none reached the bus.
 //!
 //! These tests run the real `tokenfuse-cloud` binary (the technique
-//! `crates/gateway/tests/version_and_help.rs` uses) with the variable pointed
+//! `crates/gateway/tests/it/version_and_help.rs` uses) with the variable pointed
 //! at a file inside a directory the test makes unwritable, read its log until
 //! it reports that it is listening, and then stop it. The unit under test is
 //! exactly what an operator reads: the line, its level, and the words in it.

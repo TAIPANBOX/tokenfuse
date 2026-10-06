@@ -1,7 +1,7 @@
 //! Integration test for shadow tool-pruning measurement (W2a, invariant 61).
 //!
-//! Follows the pattern `tests/wardryx.rs` already uses for a fake wardryx PDP
-//! (a tiny stub axum server) and `tests/router.rs`'s `CapturingProvider` for a
+//! Follows the pattern `tests/it/wardryx.rs` already uses for a fake wardryx PDP
+//! (a tiny stub axum server) and `tests/it/router.rs`'s `CapturingProvider` for a
 //! fake upstream that records the exact bytes it was asked to forward, so
 //! this file can assert the forwarded body is byte-identical to what the
 //! client sent.
@@ -10,13 +10,19 @@
 //! worked around: the brief asks for the captured-tracing helper in
 //! `testlog.rs` for the two tests that assert on a warn line. That module is
 //! `pub(crate)` inside `tokenfuse-gateway` and is therefore invisible to this
-//! file, which is compiled as its own crate against the already-built
-//! library the way every file under `tests/` is. This file carries its own
-//! copy of the same capture (`Captured`/`captured_log`/`log_lock`), the
+//! file, which is compiled against the already-built library the way every
+//! integration test is. This file carries its own capture (`LogCapture`), the
 //! minimum needed to read a `tracing::warn!` line back, rather than widening
 //! `testlog`'s visibility for one caller outside the crate.
-
-#![allow(clippy::await_holding_lock)]
+//!
+//! The capture is scoped to the request futures of the test that reads it,
+//! never installed as the process-wide default. This file used to install a
+//! global subscriber and count every WARN line in it, which was safe only
+//! while it was a binary of its own: inside the crate's one test binary
+//! (invariant 78) every other module's warnings would have landed in the same
+//! buffer and been counted. The warn lines these tests read are emitted while
+//! the gateway answers the request, inline in the `oneshot` future, so a
+//! dispatcher attached to that future sees all of them and nothing else.
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
@@ -26,7 +32,7 @@ use axum::routing::post;
 use axum::{Json, Router as AxumRouter};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokenfuse_core::{Ledger, Mode, ModelPrice, Policy, PriceBook};
 use tokenfuse_gateway::defaults::ToolsPruneMode;
@@ -37,6 +43,7 @@ use tokenfuse_gateway::sink::{CallRecord, EventSink};
 use tokenfuse_gateway::state::AppState;
 use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
 use tower::ServiceExt;
+use tracing::instrument::WithSubscriber;
 
 // --- local tracing capture (see this file's module doc for why it is not `crate::testlog`) ---
 
@@ -60,35 +67,34 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-fn captured_log() -> &'static Arc<Mutex<Vec<u8>>> {
-    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    BUF.get_or_init(|| {
+/// A tracing capture of one test's own. Attach it to a future with
+/// `.with_subscriber(log.dispatch())`; nothing outside that future writes here.
+struct LogCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    dispatch: tracing::Dispatch,
+}
+
+impl LogCapture {
+    fn new() -> Self {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(Captured(Arc::clone(&buf)))
             .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
             .finish();
-        // Best-effort: another test binary module may already have installed
-        // the process default. Either way `buf` below is what this file reads.
-        let _ = tracing::subscriber::set_global_default(subscriber);
-        buf
-    })
-}
+        LogCapture {
+            buf,
+            dispatch: tracing::Dispatch::new(subscriber),
+        }
+    }
 
-fn log_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
+    fn dispatch(&self) -> tracing::Dispatch {
+        self.dispatch.clone()
+    }
 
-fn clear_log() {
-    captured_log().lock().unwrap().clear();
-}
-
-fn log_text() -> String {
-    String::from_utf8_lossy(&captured_log().lock().unwrap()).to_string()
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).to_string()
+    }
 }
 
 // --- fake wardryx PDP: /v1/decide (always allow) + /v1/filter-tools ---
@@ -151,7 +157,7 @@ async fn spawn_server(router: AxumRouter) -> String {
     format!("http://{addr}")
 }
 
-// --- fake upstream: captures the exact bytes it was asked to forward (tests/router.rs's pattern) ---
+// --- fake upstream: captures the exact bytes it was asked to forward (tests/it/router.rs's pattern) ---
 
 #[derive(Clone, Default)]
 struct CapturedBody(Arc<Mutex<Option<Bytes>>>);
@@ -421,8 +427,7 @@ async fn shadow_records_the_tools_the_policy_would_remove() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
-    let _serial = log_lock();
-    clear_log();
+    let log = LogCapture::new();
 
     let stub = WardryxStub::with_status(404);
     let url = spawn_server(wardryx_router(stub.clone())).await;
@@ -449,6 +454,7 @@ async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
     let resp1 = app
         .clone()
         .oneshot(request(&anthropic_body()))
+        .with_subscriber(log.dispatch())
         .await
         .unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
@@ -461,7 +467,11 @@ async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
     // Second call, a fresh run id so nothing about the ledger interferes.
     let mut req2 = request(&anthropic_body());
     *req2.headers_mut().get_mut("x-fuse-run-id").unwrap() = "shadow-prune-run-2".parse().unwrap();
-    let resp2 = app.oneshot(req2).await.unwrap();
+    let resp2 = app
+        .oneshot(req2)
+        .with_subscriber(log.dispatch())
+        .await
+        .unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let rec2 = sink.last();
     assert_eq!(rec2.tools_offered, None);
@@ -475,7 +485,7 @@ async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
         "both calls reached the wire"
     );
 
-    let log = log_text();
+    let log = log.text();
     let warn_lines: Vec<&str> = log
         .lines()
         .filter(|l| l.contains("WARN") && l.contains("/v1/filter-tools"))
@@ -497,8 +507,7 @@ async fn a_wardryx_without_the_route_is_named_once_and_measures_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_filter_outage_in_shadow_costs_only_a_warn_line() {
-    let _serial = log_lock();
-    clear_log();
+    let log = LogCapture::new();
 
     let stub = WardryxStub::with_status(500);
     let url = spawn_server(wardryx_router(stub.clone())).await;
@@ -521,7 +530,11 @@ async fn a_filter_outage_in_shadow_costs_only_a_warn_line() {
     );
     let app = tokenfuse_gateway::app(st);
 
-    let resp = app.oneshot(request(&anthropic_body())).await.unwrap();
+    let resp = app
+        .oneshot(request(&anthropic_body()))
+        .with_subscriber(log.dispatch())
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
@@ -534,7 +547,7 @@ async fn a_filter_outage_in_shadow_costs_only_a_warn_line() {
     assert_eq!(rec.pruned_schema_tokens_est, None);
     assert!(resp.headers().get("x-fuse-tools-would-prune").is_none());
 
-    let log = log_text();
+    let log = log.text();
     let warn_lines: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
     assert_eq!(
         warn_lines.len(),

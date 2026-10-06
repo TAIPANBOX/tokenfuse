@@ -9,7 +9,7 @@
 //! hands anyone who can reach it every run's budget and spend, every key id,
 //! every agent identity, and a kill switch for any run. These tests hit the
 //! real router `tokenfuse_gateway::app` builds, the same way
-//! `tests/keys_endpoint.rs` and `tests/policy_plane.rs` do, rather than
+//! `tests/it/keys_endpoint.rs` and `tests/it/policy_plane.rs` do, rather than
 //! calling `adminkeys` functions directly, because the HTTP wiring (which
 //! routes are covered, which are not, the exact response bodies) is what a
 //! caller on the wire actually sees.

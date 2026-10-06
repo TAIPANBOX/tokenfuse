@@ -1,5 +1,5 @@
 //! HTTP-level tests for the regulator evidence pack (wave 2),
-//! `GET /v1/compliance/evidence`, mirroring `tests/audit.rs` / `tests/reads.rs`:
+//! `GET /v1/compliance/evidence`, mirroring `tests/it/audit.rs` / `tests/it/reads.rs`:
 //! the three framework sections are present, a control with a real backing
 //! signal in this org's data reads `Enforced`, an unbacked one reads
 //! `Documented`.

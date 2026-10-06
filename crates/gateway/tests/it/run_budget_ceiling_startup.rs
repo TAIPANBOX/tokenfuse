@@ -3,7 +3,7 @@
 //! `main.rs`'s `serve()` READS `TOKENFUSE_MAX_RUN_BUDGET_USD` and hands it to
 //! `AppState`. Deleting that one line leaves every unit test green, since
 //! they build `AppState` by hand. This file runs the real binary, as
-//! `tests/cache_default_startup.rs` and `tests/xaa_startup.rs` do, for the
+//! `tests/it/cache_default_startup.rs` and `tests/it/xaa_startup.rs` do, for the
 //! two things only the binary can show: a value nobody can read exits 2
 //! naming the variable, and a configured ceiling actually caps a declared
 //! budget over real HTTP.
