@@ -304,9 +304,14 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1679 passing** (core 372, dpop 21, delegation 60,
-gateway 968, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 17
+`cargo test --all` runs **1689 passing** (core 372, dpop 21, delegation 60,
+gateway 978, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 10
+with invariant 80 (an OpenAI-shaped usage is charged the gap between
+`total_tokens` and `prompt_tokens` when it exceeds `completion_tokens`, so a
+Gemini thinking call's reasoning tokens are billed output: 8 in
+`gateway::provider`, 2 in `tests/it/reasoning_tokens_are_output.rs`;
+2026-10-07, counted by hand and checked by CI's `stated-numbers.sh`). Gateway grew by 17
 with invariant 79 (the price book: 4 in `gateway::pricebook`, 4 in
 `gateway::proxy`, 7 in `gateway::pricefile`, 2 in
 `tests/it/price_book_startup.rs`; 2026-10-07). Gateway grew by 14

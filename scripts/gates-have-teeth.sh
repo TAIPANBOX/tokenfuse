@@ -824,6 +824,31 @@ run_case "price-book: the operator file's rate cap is gone" fail \
 	"$(py 'edit("crates/gateway/src/pricefile.rs", "                if v > MAX_RATE_MICROUSD {", "                if v > MAX_RATE_MICROUSD.saturating_mul(u64::MAX) {")')" \
 	"hostile_files_are_refused_and_say_why ... FAILED"
 
+# --- invariant 80: a total above prompt + completion is billed output -------
+#
+# Not a scripts/*.sh gate: the rule is the OpenAI usage parser, held by cargo
+# test. The first mutant is the defect itself, the output read from
+# completion_tokens alone, so Google's reasoning tokens go unpriced; the second
+# is the tempting wrong fix, the reasoning detail added on top, which counts
+# OpenAI's reasoning twice; the third takes the gap against the prompt with the
+# cached subset already netted out, which charges the cached tokens again as
+# output. Each planted text still uses `gap`, so it compiles under CI's
+# `RUSTFLAGS=-D warnings`.
+run_case "reasoning-is-output: the output read from completion_tokens alone" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact provider::tests::a_vertex_reasoning_usage_is_charged_its_reasoning_as_output" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "    let output = net.completion.max(gap);", "    let output = { let _ = gap; net.completion };")')" \
+	"a_vertex_reasoning_usage_is_charged_its_reasoning_as_output ... FAILED"
+
+run_case "reasoning-is-output: the reasoning detail added on top of completion" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact provider::tests::an_openai_reasoning_usage_is_not_counted_twice" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "    let output = net.completion.max(gap);", "    let output = net.completion.max(gap).saturating_add(u[\"completion_tokens_details\"][\"reasoning_tokens\"].as_u64().unwrap_or(0));")')" \
+	"an_openai_reasoning_usage_is_not_counted_twice ... FAILED"
+
+run_case "reasoning-is-output: the gap taken against the prompt net of the cache" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact provider::tests::a_vertex_usage_with_cached_tokens_nets_the_cache_and_keeps_the_reasoning" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "    let gap = net.total.saturating_sub(net.gross_prompt);", "    let gap = net.total.saturating_sub(net.gross_prompt.saturating_sub(net.cached));")')" \
+	"a_vertex_usage_with_cached_tokens_nets_the_cache_and_keeps_the_reasoning ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
