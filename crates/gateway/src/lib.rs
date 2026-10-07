@@ -33,6 +33,7 @@ pub mod otel;
 pub mod outcomescli;
 pub mod policyplane;
 pub mod pricebook;
+pub mod pricefile;
 pub mod provider;
 pub mod proxy;
 #[cfg(feature = "cluster")]

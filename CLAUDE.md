@@ -5452,3 +5452,63 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     as root; run as `nobody` on the branch, both pass. The split between the
     two changes was not measured: each figure is the binaries and the profile
     together.
+
+79. **A price-book row is a dated reading of a vendor's page, and a call the
+    book cannot price says so.** Measured 2026-09-17 on the appliance proving
+    run (tokenfuse#305): a `claude-sonnet-5` call of 2874 input and 200 output
+    tokens settled at 0.05811, the 15/75 fallback, because the book had no row;
+    the list rate is 2/10 (the vendor's footnote: the 3/15 increase scheduled
+    for 2026-09-01 "will not occur"), so the right figure was 0.007748. Every
+    Bedrock and Google Cloud id was in the same place (tokenfuse#313). The book
+    now carries a row for every Claude id Anthropic lists under the Claude API,
+    Bedrock (`anthropic.*`, `-v1:0` base ids, `global.`/`us.`/`eu.`/`jp.`/`apac.`
+    profiles as the vendor's table marks them), Google Cloud (`@`-dated) and
+    OpenRouter (`anthropic/claude-*`, only the ids whose page showed all five
+    rates), one list rate per model in `pricebook.rs::CLAUDE` with the URL and
+    the read date (2026-10-07) beside it. A rate in that table is true on its
+    date and on no other; re-read the page before trusting one.
+
+    `@claude` 2026-10-07, choices under delegated authority: both clouds bill a
+    regional endpoint 10 percent above a global one (Anthropic's Bedrock and
+    Google Cloud pages), and an id that does not say which endpoint served it
+    (a bare `anthropic.*` id, a geo profile, a `@`-dated id) is priced with the
+    premium, the ADR-8 side; a Google dateless id is the Claude API's id and is
+    priced at list, under-charging a regional Google call by 10 percent, which
+    is what `TOKENFUSE_PRICE_BOOK` is for. AWS's and Google's own price pages
+    could not be opened from the machine that wrote the rows (egress policy),
+    nor could openrouter.ai, whose rates were read from its pages through the
+    search index; that is recorded in the module doc rather than implied away.
+
+    Every metered answer, streamed or not, carries `x-fuse-price: known` or
+    `fallback` (the streamed one carried nothing until this change), decided by
+    one function (`proxy::price_basis`) that also warns once per model id the
+    fallback prices, bounded like the clamp log (invariant 73). The fallback
+    itself is unchanged and stays at least every row in input and output; one
+    pre-existing column breaks it, `o1`'s cached input (7.50 against the
+    fallback's 1.50), named in the test as the only exception rather than fixed
+    here, because raising the fallback moves the price of every unknown model.
+
+    `TOKENFUSE_PRICE_BOOK` (`crate::pricefile`) is an operator file of rows in
+    the published book's own shape, read once at startup, replacing a built-in
+    row of the same id or adding one; the fallback is not settable from it. It
+    is hostile input: unknown keys refused at both levels, every field required,
+    rates whole non-negative micro-USD at most USD 1,000 per Mtok, model ids 1
+    to 256 visible ASCII bytes and unique, at most 1 MiB and 4,096 rows, and a
+    set but unusable file exits 2 naming the variable. Additive: not in
+    `compat/1.0.json`.
+    *(test: `pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate`
+    (expectations written by hand, red first with 52 ids at the fallback),
+    `the_measured_sonnet_5_call_settles_at_list_not_the_fallback` (red: `left:
+    Some(Microusd(58110)) right: Some(Microusd(7748))`),
+    `a_truly_unknown_id_still_falls_back`,
+    `the_fallback_is_at_least_every_row_in_every_column`; `proxy::tests::`
+    `a_listed_model_is_priced_known_at_its_list_rate` (red: `left: "fallback"
+    right: "known"`), `a_model_nobody_priced_still_says_fallback`,
+    `a_streamed_answer_says_which_price_it_was_reserved_at` (red: `left: None`),
+    `the_fallback_is_logged_once_per_model` (red: `left: 0 right: 1`); seven in
+    `pricefile::tests` including `hostile_bytes_never_panic_and_never_slip_a_bound`
+    (200 seeds); `tests/it/price_book_startup.rs`, two, over the real binary.
+    Ten mutants planted 2026-10-07, all caught by name in the pull request; two
+    are cases in `gates-have-teeth.sh`. Scenarios:
+    `features/the-price-book-prices-every-listed-model.feature`, eight, each
+    bound. Not a script gate)*

@@ -238,6 +238,9 @@
           "TOKENFUSE_OTLP_ENDPOINT": {
             "required": false
           },
+          "TOKENFUSE_PRICE_BOOK": {
+            "required": false
+          },
           "TOKENFUSE_REQUIRE_RUN_ID": {
             "required": false
           },

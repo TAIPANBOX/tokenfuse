@@ -107,6 +107,11 @@ pub struct AppState {
     /// is cleared and a run may log once more, which costs a repeated line
     /// and never memory.
     budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
+    /// Model ids the fallback rate has priced and that have been logged, so
+    /// the warning is once per model id and not once per call (tokenfuse#305).
+    /// Bounded the same way as `budget_clamp_logged`: model ids are
+    /// caller-chosen too.
+    fallback_price_logged: Arc<Mutex<HashSet<String>>>,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
@@ -577,6 +582,7 @@ impl AppState {
             run_seed: Arc::new(Mutex::new(HashMap::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
+            fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             events: Arc::new(EventExporter::disabled()),
             agent_id_mode: crate::agentids::AgentIdMode::default(),
             client_keys: Arc::new(ClientKeys::default()),
@@ -631,6 +637,17 @@ impl AppState {
     pub fn with_max_run_budget(mut self, ceiling: Option<Microusd>) -> Self {
         self.max_run_budget = ceiling;
         self
+    }
+
+    /// Record that the fallback rate priced `model` and say whether this is
+    /// the first time this process has noted it, so the caller warns once per
+    /// model id rather than once per call.
+    pub fn note_fallback_price(&self, model: &str) -> bool {
+        let mut seen = self.fallback_price_logged.lock().unwrap();
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains(model) {
+            seen.clear();
+        }
+        seen.insert(model.to_string())
     }
 
     /// Record that `run_id`'s budget was clamped to the ceiling and say

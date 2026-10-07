@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.6.1-brightgreen)
-![tests](https://img.shields.io/badge/tests-1662-brightgreen)
+![tests](https://img.shields.io/badge/tests-1679-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -404,6 +404,21 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_US
 ```
 
 A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling, widening an open run still works up to the ceiling and never past it, and a budget an operator set in the Cloud is the operator's own word and is not clamped. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
+
+**Which price a call is charged at.** Every metered answer, streamed or not, carries `x-fuse-price`: `known` when the built-in price book has a row for the model id, `fallback` when it did not and the call was priced at the conservative fallback of USD 15 / 75 per million tokens (the safe direction for a cap, and up to five times a model's list price). The first fallback-priced call of each model id is also logged at warn. `x-fuse-cost-usd` is this call's settled cost and `x-fuse-spent-usd` the run's running total, so a reader recording per-call charges wants the first.
+
+The book has a row for every Claude model id Anthropic lists, under the Claude API, Amazon Bedrock, Google Cloud and OpenRouter, each rate read from the vendor's page on a date named beside it in [`pricebook.rs`](crates/gateway/src/pricebook.rs), plus a few OpenAI models. Bedrock and Google Cloud bill a regional endpoint 10 percent above a global one, and the model id does not always say which endpoint served the call: an id that may be regional (a bare Bedrock `anthropic.*` id, a `us.`/`eu.`/`jp.`/`apac.` profile, a Google `@`-dated id) is priced with the premium, which over-charges a global call by 10 percent, and a Google Cloud dateless id is the Claude API's id and is priced at list, which under-charges a regional Google call by 10 percent. Rates move; a row is right on the date it was read.
+
+For anything the book does not know, or a rate that differs for you (a regional endpoint, a negotiated discount, a local model that costs nothing), set `TOKENFUSE_PRICE_BOOK` to a JSON file of rows in the published book's own shape ([`contracts/tokenfuse-constants.json`](contracts/tokenfuse-constants.json), `price_book.models`), read once at startup. A row replaces the built-in row of the same id or adds a new one; the fallback cannot be changed:
+
+```json
+{"models": [{"model": "claude-sonnet-5",
+             "input_per_mtok_microusd": 2200000, "output_per_mtok_microusd": 11000000,
+             "cache_read_per_mtok_microusd": 220000, "cache_write_per_mtok_microusd": 2750000,
+             "cache_write_1h_per_mtok_microusd": 4400000}]}
+```
+
+Rates are whole micro-USD per million tokens, every field is required and no other key is accepted. A file that is missing, not JSON, misspells a key, carries a negative, fractional or absurd rate (over USD 1,000 per million tokens), repeats a model id, has no rows, or is over 1 MiB or 4,096 rows makes the gateway exit 2 naming the variable, rather than start on the built-in book while you believe your rates are live.
 
 ---
 
