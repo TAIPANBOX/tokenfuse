@@ -857,6 +857,183 @@ mod tests {
         assert_eq!(u.output_tokens, 120);
     }
 
+    // -- invariant 80: a total above prompt + completion is output ----------
+    //
+    // Measured 2026-10-07 against Vertex AI's OpenAI-compatible endpoint,
+    // google/gemini-2.5-flash, one non-streamed answer. Google's
+    // `completion_tokens` EXCLUDES the reasoning tokens (14 + 59 + 560 = 633),
+    // while OpenAI's INCLUDES them and lists `reasoning_tokens` only as a
+    // detail of it (total = prompt + completion). Google bills reasoning at the
+    // output rate, so the gap between `total_tokens` and `prompt_tokens` is the
+    // output the provider bills.
+
+    /// The Vertex AI rates this module prices the measured call at: $0.30
+    /// input, $2.50 output (response and reasoning) per Mtok for
+    /// gemini-2.5-flash. Only input and output are priced by these tests, so
+    /// the cache columns are placeholders.
+    fn gemini_2_5_flash() -> ModelPrice {
+        ModelPrice::per_mtok_usd(0.30, 2.50, 0.03, 0.30)
+    }
+
+    const VERTEX_REASONING_USAGE: &[u8] = br#"{"id":"vertex-1","usage":{"completion_tokens":59,"completion_tokens_details":{"reasoning_tokens":560},"prompt_tokens":14,"total_tokens":633}}"#;
+
+    #[test]
+    fn a_vertex_reasoning_usage_is_charged_its_reasoning_as_output() {
+        let mut p = UsageParser::new();
+        p.feed(VERTEX_REASONING_USAGE);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 14);
+        assert_eq!(
+            u.output_tokens, 619,
+            "633 total less 14 prompt is 619 billed output (59 visible + 560 reasoning), not the 59 completion_tokens names"
+        );
+        assert_eq!(u.cache_read_tokens, 0);
+        // 14 x 0.30 + 619 x 2.50 = 4.2 + 1547.5 = 1551.7 micro-USD, ceiled
+        // once to 1552 (invariant 67). Reading completion_tokens alone priced
+        // it at 152, about a tenth.
+        assert_eq!(
+            gemini_2_5_flash().cost(&u),
+            Microusd(1552),
+            "the reasoning tokens are billed at the output rate; 152 would be the visible answer alone"
+        );
+    }
+
+    /// OpenAI's own shape: `completion_tokens` already includes the reasoning
+    /// and `total_tokens` is exactly prompt + completion, so the gap adds
+    /// nothing and the reasoning detail is never added a second time.
+    #[test]
+    fn an_openai_reasoning_usage_is_not_counted_twice() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-r","usage":{"prompt_tokens":14,"completion_tokens":619,"completion_tokens_details":{"reasoning_tokens":560},"total_tokens":633}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 14);
+        assert_eq!(
+            u.output_tokens, 619,
+            "OpenAI's completion_tokens already includes reasoning_tokens; 1179 would be the reasoning counted twice"
+        );
+    }
+
+    /// No `total_tokens` at all: the output is `completion_tokens`, exactly as
+    /// before, whatever the details say.
+    #[test]
+    fn a_usage_without_total_tokens_keeps_the_completion_count() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-n","usage":{"prompt_tokens":14,"completion_tokens":59,"completion_tokens_details":{"reasoning_tokens":560}}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 14);
+        assert_eq!(u.output_tokens, 59);
+    }
+
+    /// A total smaller than prompt + completion, or smaller than the prompt
+    /// alone, is a provider's bug: it never lowers the output below
+    /// `completion_tokens` and never wraps.
+    #[test]
+    fn a_total_below_prompt_plus_completion_never_lowers_the_output() {
+        for (total, label) in [
+            (120u64, "below prompt + completion"),
+            (10, "below the prompt alone"),
+            (0, "zero"),
+        ] {
+            let mut p = UsageParser::new();
+            p.feed(
+                format!(
+                    r#"{{"usage":{{"prompt_tokens":100,"completion_tokens":50,"total_tokens":{total}}}}}"#
+                )
+                .as_bytes(),
+            );
+            let u = p.finish().usage;
+            assert_eq!(u.input_tokens, 100, "{label}");
+            assert_eq!(
+                u.output_tokens, 50,
+                "{label}: the output stays the completion count"
+            );
+        }
+        // The largest total a u64 holds: the gap is huge and is charged, the
+        // over-charging side (ADR-8), and nothing wraps or panics.
+        let mut p = UsageParser::new();
+        p.feed(
+            format!(
+                r#"{{"usage":{{"prompt_tokens":100,"completion_tokens":50,"total_tokens":{}}}}}"#,
+                u64::MAX
+            )
+            .as_bytes(),
+        );
+        let u = p.finish().usage;
+        assert_eq!(u.output_tokens, u64::MAX - 100);
+    }
+
+    /// The same Vertex usage on the final chunk of a stream (the chunk
+    /// `stream_options.include_usage` asks for), with the content chunks
+    /// before it carrying `"usage": null`.
+    #[test]
+    fn a_streamed_vertex_final_chunk_is_charged_its_reasoning() {
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n");
+        p.feed(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":59,\"completion_tokens_details\":{\"reasoning_tokens\":560},\"prompt_tokens\":14,\"total_tokens\":633}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 14);
+        assert_eq!(u.output_tokens, 619);
+        assert_eq!(gemini_2_5_flash().cost(&u), Microusd(1552));
+    }
+
+    /// The three figures split across chunks, in either order: the gap is
+    /// computed from the figures seen across the whole parse, never from
+    /// whichever object is current, the same rule invariant 45 holds for the
+    /// cached subset.
+    #[test]
+    fn the_total_and_the_prompt_count_on_separate_chunks_still_give_the_gap() {
+        for chunks in [
+            [
+                "{\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":59}}",
+                "{\"usage\":{\"total_tokens\":633}}",
+            ],
+            [
+                "{\"usage\":{\"total_tokens\":633}}",
+                "{\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":59}}",
+            ],
+        ] {
+            let mut p = UsageParser::new();
+            for c in chunks {
+                p.feed(format!("data: {c}\n\n").as_bytes());
+            }
+            p.feed(b"data: [DONE]\n\n");
+            let u = p.finish().usage;
+            assert_eq!(u.input_tokens, 14, "{chunks:?}");
+            assert_eq!(u.output_tokens, 619, "{chunks:?}");
+        }
+    }
+
+    /// A total with no prompt count anywhere in the body: the prompt the total
+    /// contains is unpriced on the input side, so the whole total is charged
+    /// as output, the over-charging side (ADR-8) rather than an input nobody
+    /// pays for.
+    #[test]
+    fn a_total_with_no_prompt_count_is_charged_whole_as_output() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"completion_tokens":5,"total_tokens":73}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 73);
+    }
+
+    /// Cached tokens beside the Vertex shape. `prompt_tokens` is the GROSS
+    /// prompt, cached subset included, and so is the prompt inside
+    /// `total_tokens`: the gap is taken against the gross figure, and the
+    /// cached subset is netted out of the input exactly as invariant 45 says.
+    #[test]
+    fn a_vertex_usage_with_cached_tokens_nets_the_cache_and_keeps_the_reasoning() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"completion_tokens":59,"completion_tokens_details":{"reasoning_tokens":560},"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800},"total_tokens":1619}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.cache_read_tokens, 800);
+        assert_eq!(
+            u.output_tokens, 619,
+            "1619 total less the 1000 gross prompt is 619; netting the cache before the gap would charge 1419"
+        );
+    }
+
     #[test]
     fn parses_non_streaming_json_usage() {
         let mut p = UsageParser::new();

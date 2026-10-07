@@ -34,6 +34,7 @@ mod mcp_xaa;
 mod no_usage_stream_settles_on_the_estimate;
 mod policy_plane;
 mod price_book_startup;
+mod reasoning_tokens_are_output;
 mod require_run_id;
 mod router;
 mod run_budget_ceiling_startup;
