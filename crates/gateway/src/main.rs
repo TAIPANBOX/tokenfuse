@@ -679,8 +679,26 @@ async fn serve() {
 
     // Default price book: illustrative generic entries plus exact entries for
     // the current Anthropic/OpenAI lineup. See pricebook.rs for the per-model
-    // rates and units notes. Real prices ship as a versioned price book.
-    let prices = default_price_book();
+    // rates and units notes, and where each was read.
+    let mut prices = default_price_book();
+    // process-local: the MCP broker prices nothing; only the LLM proxy meters
+    // a call against the book. An operator's file overrides built-in rows;
+    // a set but unusable one stops the process (pricefile.rs).
+    match tokenfuse_gateway::pricefile::from_env() {
+        Ok(None) => {}
+        Ok(Some(file)) => {
+            let applied = file.apply(&mut prices);
+            tracing::info!(
+                overridden = applied.overridden,
+                added = applied.added,
+                "price book: rows from TOKENFUSE_PRICE_BOOK are in effect"
+            );
+        }
+        Err(e) => {
+            eprintln!("tokenfuse: {e}");
+            std::process::exit(2);
+        }
+    }
 
     // Provider selection, and the one place this binary refuses to start.
     //

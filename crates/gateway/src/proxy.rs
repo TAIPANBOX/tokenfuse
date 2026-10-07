@@ -2101,6 +2101,28 @@ fn set_header_checked(builder: Builder, name: &'static str, value: &str) -> Buil
     }
 }
 
+/// `x-fuse-price` for a call on `model`: `known` when the price book has a
+/// row for it, `fallback` when the conservative fallback rate priced it.
+/// The first fallback for each model id is also said at warn, because a
+/// fallback-priced call is a guess presented as a charge (tokenfuse#305:
+/// a claude-sonnet-5 call settled at five times its list rate and nothing
+/// said so). One function for both the buffered and the streamed answer, so
+/// the header and the log line cannot disagree about one model.
+fn price_basis(st: &AppState, model: &str) -> &'static str {
+    if st.prices.is_known(model) {
+        return "known";
+    }
+    if st.note_fallback_price(model) {
+        tracing::warn!(
+            model = %model,
+            "no price-book row for this model: calls are charged at the fallback price \
+             (the most expensive rate the book knows); add a row with TOKENFUSE_PRICE_BOOK. \
+             Logged once per model"
+        );
+    }
+    "fallback"
+}
+
 /// Streaming managed response: pass chunks through and settle at end-of-stream.
 /// Cost headers are omitted because headers are sent before the body — the
 /// settled figures go to the ledger (and, later, the event sink).
@@ -2221,7 +2243,8 @@ fn stream_managed(
         .header("x-fuse-stream", "passthrough")
         .header("x-fuse-run-id", run_id)
         .header("x-fuse-step", step.to_string())
-        .header("x-fuse-mode", mode_str(st.policy.mode));
+        .header("x-fuse-mode", mode_str(st.policy.mode))
+        .header("x-fuse-price", price_basis(st, model));
     if let Some(reason) = would_block {
         builder = builder.header("x-fuse-would-block", reason);
     }
@@ -2460,14 +2483,7 @@ async fn buffered_managed(
         .header("x-fuse-mode", mode_str(st.policy.mode))
         .header("x-fuse-cost-usd", format!("{:.6}", actual.as_usd()))
         .header("x-fuse-spent-usd", format!("{:.6}", spent.as_usd()))
-        .header(
-            "x-fuse-price",
-            if st.prices.is_known(model) {
-                "known"
-            } else {
-                "fallback"
-            },
-        );
+        .header("x-fuse-price", price_basis(st, model));
     if let Some(reason) = would_block {
         builder = builder.header("x-fuse-would-block", reason);
     }
@@ -3634,6 +3650,127 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-fuse-step").unwrap(), "2");
         assert_eq!(ledger.snapshot("run-1").await.unwrap().steps, 2);
+    }
+
+    // --- tokenfuse#305/#313: the shipped price book, end to end ----------
+
+    /// A gateway pricing with the book `tokenfuse serve` ships.
+    fn shipped_book_state() -> AppState {
+        AppState::new(
+            Arc::new(Ledger::new()),
+            Arc::new(crate::pricebook::default_price_book()),
+            Arc::new(Policy {
+                mode: Mode::Enforce,
+                ..Default::default()
+            }),
+            Arc::new(StubProvider::default()),
+            "test-policy",
+        )
+    }
+
+    async fn priced_call(st: &AppState, run: &str, model: &str, stream: bool) -> Response {
+        let body = if stream {
+            format!(r#"{{"model":"{model}","max_tokens":10,"stream":true}}"#)
+        } else {
+            format!(r#"{{"model":"{model}","max_tokens":10}}"#)
+        };
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", run)
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body))
+            .unwrap();
+        call(st.clone(), req).await
+    }
+
+    /// Every id #305 and #313 are about answers `x-fuse-price: known` and
+    /// settles at its list rate. The stub reports 1000 input and 500 output
+    /// tokens, so claude-sonnet-5 (2/10 per Mtok) costs 2000 + 5000 = 7000
+    /// micro-USD, where the 15/75 fallback charged 52500.
+    #[tokio::test]
+    async fn a_listed_model_is_priced_known_at_its_list_rate() {
+        let st = shipped_book_state();
+        for (i, (model, cost)) in [
+            ("claude-sonnet-5", "0.007000"),
+            ("anthropic/claude-sonnet-5", "0.007000"),
+            ("claude-opus-5-5", "0.014000"),
+            ("global.anthropic.claude-sonnet-4-6", "0.010500"),
+            ("anthropic.claude-sonnet-5", "0.007700"),
+            ("claude-haiku-4-5@20251001", "0.003850"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resp = priced_call(&st, &format!("listed-{i}"), model, false).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                resp.headers().get("x-fuse-price").unwrap(),
+                "known",
+                "{model}"
+            );
+            assert_eq!(
+                resp.headers().get("x-fuse-cost-usd").unwrap(),
+                cost,
+                "{model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_nobody_priced_still_says_fallback() {
+        let st = shipped_book_state();
+        let resp = priced_call(&st, "unpriced", "claude-sonnet-6", false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-fuse-price").unwrap(), "fallback");
+        // 1000 at 15 plus 500 at 75 per Mtok.
+        assert_eq!(resp.headers().get("x-fuse-cost-usd").unwrap(), "0.052500");
+    }
+
+    /// A streamed answer carries the price basis too; before, only the
+    /// buffered path said whether the fallback priced the call.
+    #[tokio::test]
+    async fn a_streamed_answer_says_which_price_it_was_reserved_at() {
+        let st = shipped_book_state();
+        let known = priced_call(&st, "stream-known", "claude-sonnet-5", true).await;
+        assert_eq!(
+            known
+                .headers()
+                .get("x-fuse-price")
+                .map(|v| v.to_str().unwrap()),
+            Some("known")
+        );
+        let unknown = priced_call(&st, "stream-unknown", "claude-sonnet-6", true).await;
+        assert_eq!(
+            unknown
+                .headers()
+                .get("x-fuse-price")
+                .map(|v| v.to_str().unwrap()),
+            Some("fallback")
+        );
+    }
+
+    /// #305 ask 2: the fallback pricing a call is said at warn, once per
+    /// model id, not once per call, and never for a priced model.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_fallback_is_logged_once_per_model() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        let st = shipped_book_state();
+        for i in 0..3 {
+            priced_call(&st, &format!("fb-a-{i}"), "fb-model-a", false).await;
+        }
+        priced_call(&st, "fb-b", "fb-model-b", true).await;
+        priced_call(&st, "fb-c", "claude-sonnet-5", false).await;
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        let count = |model: &str| {
+            log.lines()
+                .filter(|l| l.contains("fallback price") && l.contains(model))
+                .count()
+        };
+        assert_eq!(count("fb-model-a"), 1, "{log}");
+        assert_eq!(count("fb-model-b"), 1, "{log}");
+        assert_eq!(count("claude-sonnet-5"), 0, "{log}");
     }
 
     // --- invariant 73: the operator's ceiling on a caller-chosen run budget -

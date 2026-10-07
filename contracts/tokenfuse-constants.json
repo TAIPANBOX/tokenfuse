@@ -154,6 +154,190 @@
     },
     "models": [
       {
+        "cache_read_per_mtok_microusd": 1100000,
+        "cache_write_1h_per_mtok_microusd": 22000000,
+        "cache_write_per_mtok_microusd": 13750000,
+        "input_per_mtok_microusd": 11000000,
+        "model": "anthropic.claude-fable-5",
+        "output_per_mtok_microusd": 55000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 275000,
+        "cache_write_1h_per_mtok_microusd": 22000000,
+        "cache_write_per_mtok_microusd": 13750000,
+        "input_per_mtok_microusd": 11000000,
+        "model": "anthropic.claude-fable-5-1",
+        "output_per_mtok_microusd": 55000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 110000,
+        "cache_write_1h_per_mtok_microusd": 2200000,
+        "cache_write_per_mtok_microusd": 1375000,
+        "input_per_mtok_microusd": 1100000,
+        "model": "anthropic.claude-haiku-4-5",
+        "output_per_mtok_microusd": 5500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 110000,
+        "cache_write_1h_per_mtok_microusd": 2200000,
+        "cache_write_per_mtok_microusd": 1375000,
+        "input_per_mtok_microusd": 1100000,
+        "model": "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "output_per_mtok_microusd": 5500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "anthropic.claude-opus-4-5-20251101-v1:0",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "anthropic.claude-opus-4-7",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "anthropic.claude-opus-4-8",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "anthropic.claude-opus-5",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 220000,
+        "cache_write_1h_per_mtok_microusd": 8800000,
+        "cache_write_per_mtok_microusd": 5500000,
+        "input_per_mtok_microusd": 4400000,
+        "model": "anthropic.claude-opus-5-5",
+        "output_per_mtok_microusd": 22000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "anthropic.claude-sonnet-4-6",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 220000,
+        "cache_write_1h_per_mtok_microusd": 4400000,
+        "cache_write_per_mtok_microusd": 2750000,
+        "input_per_mtok_microusd": 2200000,
+        "model": "anthropic.claude-sonnet-5",
+        "output_per_mtok_microusd": 11000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 220000,
+        "cache_write_1h_per_mtok_microusd": 4400000,
+        "cache_write_per_mtok_microusd": 2750000,
+        "input_per_mtok_microusd": 2200000,
+        "model": "anthropic.claude-sonnet-5-5",
+        "output_per_mtok_microusd": 11000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "anthropic/claude-opus-4.8",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "anthropic/claude-opus-5",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 8000000,
+        "cache_write_per_mtok_microusd": 5000000,
+        "input_per_mtok_microusd": 4000000,
+        "model": "anthropic/claude-opus-5.5",
+        "output_per_mtok_microusd": 20000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "anthropic/claude-sonnet-4.6",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 4000000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "anthropic/claude-sonnet-5",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 4000000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "anthropic/claude-sonnet-5.5",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "apac.anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 1000000,
+        "cache_write_1h_per_mtok_microusd": 20000000,
+        "cache_write_per_mtok_microusd": 12500000,
+        "input_per_mtok_microusd": 10000000,
+        "model": "claude-fable-5",
+        "output_per_mtok_microusd": 50000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 250000,
+        "cache_write_1h_per_mtok_microusd": 20000000,
+        "cache_write_per_mtok_microusd": 12500000,
+        "input_per_mtok_microusd": 10000000,
+        "model": "claude-fable-5-1",
+        "output_per_mtok_microusd": 50000000
+      },
+      {
         "cache_read_per_mtok_microusd": 80000,
         "cache_write_1h_per_mtok_microusd": 1600000,
         "cache_write_per_mtok_microusd": 1000000,
@@ -178,6 +362,14 @@
         "output_per_mtok_microusd": 5000000
       },
       {
+        "cache_read_per_mtok_microusd": 110000,
+        "cache_write_1h_per_mtok_microusd": 2200000,
+        "cache_write_per_mtok_microusd": 1375000,
+        "input_per_mtok_microusd": 1100000,
+        "model": "claude-haiku-4-5@20251001",
+        "output_per_mtok_microusd": 5500000
+      },
+      {
         "cache_read_per_mtok_microusd": 500000,
         "cache_write_1h_per_mtok_microusd": 10000000,
         "cache_write_per_mtok_microusd": 6250000,
@@ -192,6 +384,54 @@
         "input_per_mtok_microusd": 5000000,
         "model": "claude-opus-4-5-20251101",
         "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "claude-opus-4-5@20251101",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-4-6",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-4-7",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-4-8",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "claude-opus-5",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 8000000,
+        "cache_write_per_mtok_microusd": 5000000,
+        "input_per_mtok_microusd": 4000000,
+        "model": "claude-opus-5-5",
+        "output_per_mtok_microusd": 20000000
       },
       {
         "cache_read_per_mtok_microusd": 300000,
@@ -215,6 +455,118 @@
         "cache_write_per_mtok_microusd": 3750000,
         "input_per_mtok_microusd": 3000000,
         "model": "claude-sonnet-4-5-20250929",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "claude-sonnet-4-5@20250929",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "claude-sonnet-4-6",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 4000000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "claude-sonnet-5",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 4000000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "claude-sonnet-5-5",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 110000,
+        "cache_write_1h_per_mtok_microusd": 2200000,
+        "cache_write_per_mtok_microusd": 1375000,
+        "input_per_mtok_microusd": 1100000,
+        "model": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "output_per_mtok_microusd": 5500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "eu.anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "eu.anthropic.claude-sonnet-4-6",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2000000,
+        "cache_write_per_mtok_microusd": 1250000,
+        "input_per_mtok_microusd": 1000000,
+        "model": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "output_per_mtok_microusd": 5000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "global.anthropic.claude-opus-4-5-20251101-v1:0",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 500000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 6250000,
+        "input_per_mtok_microusd": 5000000,
+        "model": "global.anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 25000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 300000,
+        "cache_write_1h_per_mtok_microusd": 6000000,
+        "cache_write_per_mtok_microusd": 3750000,
+        "input_per_mtok_microusd": 3000000,
+        "model": "global.anthropic.claude-sonnet-4-6",
         "output_per_mtok_microusd": 15000000
       },
       {
@@ -242,12 +594,76 @@
         "output_per_mtok_microusd": 600000
       },
       {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "jp.anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "jp.anthropic.claude-sonnet-4-6",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
         "cache_read_per_mtok_microusd": 7500000,
         "cache_write_1h_per_mtok_microusd": 15000000,
         "cache_write_per_mtok_microusd": 15000000,
         "input_per_mtok_microusd": 15000000,
         "model": "o1",
         "output_per_mtok_microusd": 60000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 110000,
+        "cache_write_1h_per_mtok_microusd": 2200000,
+        "cache_write_per_mtok_microusd": 1375000,
+        "input_per_mtok_microusd": 1100000,
+        "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "output_per_mtok_microusd": 5500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 550000,
+        "cache_write_1h_per_mtok_microusd": 11000000,
+        "cache_write_per_mtok_microusd": 6875000,
+        "input_per_mtok_microusd": 5500000,
+        "model": "us.anthropic.claude-opus-4-6-v1",
+        "output_per_mtok_microusd": 27500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "output_per_mtok_microusd": 16500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 330000,
+        "cache_write_1h_per_mtok_microusd": 6600000,
+        "cache_write_per_mtok_microusd": 4125000,
+        "input_per_mtok_microusd": 3300000,
+        "model": "us.anthropic.claude-sonnet-4-6",
+        "output_per_mtok_microusd": 16500000
       }
     ],
     "units": "microusd_per_mtok"

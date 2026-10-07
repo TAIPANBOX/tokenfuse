@@ -808,6 +808,22 @@ for p in paths:
     os.remove(p)')" \
 	"measured nothing"
 
+# --- the price book: every listed id at its vendor's rate (#305, #313) -------
+#
+# Not a scripts/*.sh gate: the rows are held by a test whose expectations are
+# written out by hand. The first mutant is #305's own fault, a listed id with
+# no row, so the fallback prices it; the second lets an absurd rate through the
+# operator's file, which is a wrong bill nobody would see.
+run_case "price-book: claude-sonnet-5 loses its row and falls back" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "list: &[\"claude-sonnet-5\", \"anthropic/claude-sonnet-5\"],", "list: &[\"anthropic/claude-sonnet-5\"],")')" \
+	"every_vendor_listed_id_prices_at_its_list_rate ... FAILED"
+
+run_case "price-book: the operator file's rate cap is gone" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricefile::tests::hostile_files_are_refused_and_say_why" \
+	"$(py 'edit("crates/gateway/src/pricefile.rs", "                if v > MAX_RATE_MICROUSD {", "                if v > MAX_RATE_MICROUSD.saturating_mul(u64::MAX) {")')" \
+	"hostile_files_are_refused_and_say_why ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

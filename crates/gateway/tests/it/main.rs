@@ -33,6 +33,7 @@ mod mcp_scan_report;
 mod mcp_xaa;
 mod no_usage_stream_settles_on_the_estimate;
 mod policy_plane;
+mod price_book_startup;
 mod require_run_id;
 mod router;
 mod run_budget_ceiling_startup;
