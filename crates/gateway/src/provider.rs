@@ -343,22 +343,29 @@ impl ToolCallCounter {
     }
 }
 
-/// The two OpenAI prompt figures seen so far in ONE parse, kept apart until each object is
-/// applied so that `Usage.input_tokens` is always `gross_prompt.saturating_sub(cached)`
-/// whichever order they arrive in (invariant 45; F05 of the 2026-09-18 money-path review).
-/// Both follow `set_if_positive`'s rule: the last non-zero value wins, because streamed
-/// events arrive oldest first.
+/// The OpenAI figures seen so far in ONE parse, kept apart until each object is applied so
+/// that `Usage.input_tokens` is always `gross_prompt.saturating_sub(cached)` (invariant 45;
+/// F05 of the 2026-09-18 money-path review) and `Usage.output_tokens` is always
+/// `completion.max(total.saturating_sub(gross_prompt))` (invariant 80), whichever order the
+/// figures arrive in. All four follow `set_if_positive`'s rule: the last non-zero value wins,
+/// because streamed events arrive oldest first.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct OpenAiNetting {
     /// The provider's `prompt_tokens`, which INCLUDES the cached subset.
     gross_prompt: u64,
     /// `prompt_tokens_details.cached_tokens`.
     cached: u64,
+    /// `completion_tokens`. OpenAI's INCLUDES its reasoning tokens; Google's (Vertex AI's
+    /// OpenAI-compatible endpoint) does not.
+    completion: u64,
+    /// `total_tokens`. Read only for the gap above `gross_prompt` (invariant 80).
+    total: u64,
 }
 
 /// OpenAI's usage object, by its own fields: any one of these makes it OpenAI's shape,
 /// including `prompt_tokens_details` on its own, which until 2026-09-18 was read as
-/// Anthropic's and ignored (F05). `total_tokens` marks the shape and is never priced.
+/// Anthropic's and ignored (F05). `total_tokens` marks the shape; it is priced only as the
+/// gap above `prompt_tokens` that `completion_tokens` does not cover (invariant 80).
 fn is_openai_shape(u: &serde_json::Value) -> bool {
     [
         "prompt_tokens",
@@ -455,7 +462,35 @@ fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Valu
             net.cached = c;
         }
     }
-    set_if_positive(&mut usage.output_tokens, u, "completion_tokens");
+    if let Some(c) = u.get("completion_tokens").and_then(|x| x.as_u64()) {
+        if c > 0 {
+            net.completion = c;
+        }
+    }
+    if let Some(t) = u.get("total_tokens").and_then(|x| x.as_u64()) {
+        if t > 0 {
+            net.total = t;
+        }
+    }
+    // The output the provider bills is whatever the total holds beyond the prompt, when that
+    // is more than `completion_tokens` says (invariant 80). OpenAI's total is prompt +
+    // completion, so the gap equals the completion count and nothing changes; Google's
+    // completion count leaves out the reasoning it bills at the output rate (633 = 14 + 59 +
+    // 560, measured 2026-10-07), so the gap is the 619 it bills. Never `completion +
+    // reasoning_tokens`: for OpenAI that counts the reasoning twice. `saturating_sub` and
+    // `max`: a total below the prompt, or below prompt + completion, is the provider's bug and
+    // never lowers the output below the completion count. Written from the state, not from
+    // this object, for the same reason as the input below, but only by an object that carries
+    // one of the three figures the rule reads, so a details-only object does not rewrite an
+    // output count, as it did not before.
+    let gap = net.total.saturating_sub(net.gross_prompt);
+    let output = net.completion.max(gap);
+    let carries_a_figure = ["prompt_tokens", "completion_tokens", "total_tokens"]
+        .iter()
+        .any(|k| u.get(*k).is_some());
+    if carries_a_figure && output > 0 {
+        usage.output_tokens = output;
+    }
     // Written from the state, not from this object, so the order the two figures arrived in
     // cannot matter. `saturating_sub`: a cached count past the prompt count is the provider's
     // bug, and an input count that wraps is the ADR-8 direction reversed.
@@ -991,6 +1026,13 @@ mod tests {
             [
                 "{\"usage\":{\"total_tokens\":633}}",
                 "{\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":59}}",
+            ],
+            // The prompt count last: until it arrives the whole total reads
+            // as output, and the object carrying it must take the prompt back
+            // out rather than leave 633.
+            [
+                "{\"usage\":{\"completion_tokens\":59,\"total_tokens\":633}}",
+                "{\"usage\":{\"prompt_tokens\":14}}",
             ],
         ] {
             let mut p = UsageParser::new();

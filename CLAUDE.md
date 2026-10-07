@@ -2840,7 +2840,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     The check is textual by design and says so: a plain name must appear as a quoted literal (`"name"`, `'name'` or `` `name` ``) in a file the manifest says holds it, so a comment mentioning it does not count. It does not prove a route still answers, a header still means the same thing or a column kept its type; invariants 2, 6 and 14 hold those. It does not prove a name absent from the manifest is not part of the surface.
     *(gate: `scripts/compat-surface.sh`; seven cases in `gates-have-teeth.sh`: a frozen route renamed in `lib.rs`, an env name gone from `components.json`, a subcommand renamed in `main.rs`, `COMPATIBILITY.md` edited by hand, an additive name added that must PASS, the manifest removed, and the constants file a `where` entry names removed, the last two both read as measured nothing rather than as a pass)*
 
-45. **An OpenAI cached token is priced once.** OpenAI's `prompt_tokens` INCLUDES `prompt_tokens_details.cached_tokens`; Anthropic's `input_tokens` excludes `cache_read_input_tokens`. `Usage` keeps the disjoint shape, because that is what `ModelPrice::cost` prices, so the OpenAI parser nets the cached subset out of the prompt count (`apply_openai`, `provider.rs`). Until 2026-09-14 it copied both whole and every cached token was priced at the full input rate and again at the cache-read rate: +14.5 % on a 950/128 `gpt-4o` call (2535 against the provider's 2215 micro-USD), more with a higher hit ratio, in the run's budget as spend nobody was billed (tokenfuse#267, found by a reader of the code; the two tests that pinned the old figures were pinning the defect). A cached count past the prompt count nets to zero rather than wrapping (the ADR-8 direction: a wrapped input would under-charge, never over-charge). The prompt count and the cached subset are kept apart across the events of one body (`OpenAiNetting`, one per parse, `provider.rs`) and `input_tokens` is always the last non-zero `prompt_tokens` less the last non-zero `cached_tokens`, whichever order the two arrive in: `prompt_tokens_details` once and a bare `prompt_tokens` later (`a_later_chunk_without_the_cached_subset_still_nets_it`), or a bare `prompt_tokens` first and the details later, alone or beside a zero completion count. Until 2026-09-18 the netting ran only when the current object carried `prompt_tokens`, and an object carrying only `prompt_tokens_details` was read as Anthropic's shape and ignored, so the second order priced the cached subset twice again: 2535 and 2375 micro-USD against the provider's 2215 on the review's two fixtures (F05 of the 2026-09-18 money-path review, `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once`, `codex_f05_inv45_details_only_chunk_is_not_discarded`, both red by assertion at `da0fa34` with those figures). An object is OpenAI's shape when it carries any of `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details`, `completion_tokens_details`; `total_tokens` is never priced; a body that mixes both vendors' shapes is read object by object, the last writer of a field winning as everywhere else in the parser.
+45. **An OpenAI cached token is priced once.** OpenAI's `prompt_tokens` INCLUDES `prompt_tokens_details.cached_tokens`; Anthropic's `input_tokens` excludes `cache_read_input_tokens`. `Usage` keeps the disjoint shape, because that is what `ModelPrice::cost` prices, so the OpenAI parser nets the cached subset out of the prompt count (`apply_openai`, `provider.rs`). Until 2026-09-14 it copied both whole and every cached token was priced at the full input rate and again at the cache-read rate: +14.5 % on a 950/128 `gpt-4o` call (2535 against the provider's 2215 micro-USD), more with a higher hit ratio, in the run's budget as spend nobody was billed (tokenfuse#267, found by a reader of the code; the two tests that pinned the old figures were pinning the defect). A cached count past the prompt count nets to zero rather than wrapping (the ADR-8 direction: a wrapped input would under-charge, never over-charge). The prompt count and the cached subset are kept apart across the events of one body (`OpenAiNetting`, one per parse, `provider.rs`) and `input_tokens` is always the last non-zero `prompt_tokens` less the last non-zero `cached_tokens`, whichever order the two arrive in: `prompt_tokens_details` once and a bare `prompt_tokens` later (`a_later_chunk_without_the_cached_subset_still_nets_it`), or a bare `prompt_tokens` first and the details later, alone or beside a zero completion count. Until 2026-09-18 the netting ran only when the current object carried `prompt_tokens`, and an object carrying only `prompt_tokens_details` was read as Anthropic's shape and ignored, so the second order priced the cached subset twice again: 2535 and 2375 micro-USD against the provider's 2215 on the review's two fixtures (F05 of the 2026-09-18 money-path review, `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once`, `codex_f05_inv45_details_only_chunk_is_not_discarded`, both red by assertion at `da0fa34` with those figures). An object is OpenAI's shape when it carries any of `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details`, `completion_tokens_details`; `total_tokens` is priced only as the gap above `prompt_tokens` that `completion_tokens` leaves out (invariant 80, 2026-10-07; this sentence said it was never priced until then); a body that mixes both vendors' shapes is read object by object, the last writer of a field winning as everywhere else in the parser.
 
     Where it says nothing: the pre-flight estimate does not know the hit ratio and still reserves at the full input rate, which is the safe direction; the streaming and buffered OpenAI paths share `apply_openai`, so one fix covers both.
     *(tests: `provider::tests::parses_openai_sse_usage` (its expectation moved from 950 to 822), `an_openai_cached_token_is_priced_once_not_twice`, `an_openai_cached_count_past_the_prompt_count_nets_to_zero_not_wraps`, `an_openai_usage_without_cached_tokens_is_unchanged`, `a_later_chunk_without_the_cached_subset_still_nets_it`; three red on the unfixed parser (`left: 950 right: 822`, `left: 100 right: 0`, `Microusd(2535)` against `Microusd(2215)`); mutants: the netting removed (three tests red) and `saturating_sub` replaced by a wrapping subtraction (the past-the-prompt test red); since 2026-09-18 the two review probes above and `a_cached_subset_arriving_after_the_prompt_count_is_netted`, `a_details_only_object_is_openai_shaped_not_anthropic`, `the_netting_holds_across_three_events_whatever_the_final_event_carries`, `a_details_only_event_before_any_prompt_count_waits_for_the_prompt`, `a_later_zero_completion_count_keeps_the_earlier_positive_one`, `a_body_mixing_both_vendors_shapes_is_read_per_object` (red first @measured `cargo test -p tokenfuse-gateway --test codex_money_review codex_f05` and a temporary integration test exercising the same fixtures through `UsageParser`'s public API, 2026-09-18 at `da0fa34`: `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once` `left: Microusd(2535) right: Microusd(2215)`, `codex_f05_inv45_details_only_chunk_is_not_discarded` `left: Microusd(2375) right: Microusd(2215)`, `a_cached_subset_arriving_after_the_prompt_count_is_netted` `left: 950 right: 822`, `a_details_only_object_is_openai_shaped_not_anthropic` `left: 950 right: 822`, `the_netting_holds_across_three_events_whatever_the_final_event_carries` order 1 `left: 950 right: 822` (order 0 green, a guard), `a_details_only_event_before_any_prompt_count_waits_for_the_prompt` `left: 950 right: 822`, `a_later_zero_completion_count_keeps_the_earlier_positive_one` `left: 950 right: 822`, `a_body_mixing_both_vendors_shapes_is_read_per_object` `left: 950 right: 822`); mutants: the details-only shape routed to Anthropic again (three red: `codex_f05_inv45_details_only_chunk_is_not_discarded`, `a_details_only_object_is_openai_shaped_not_anthropic`, `a_details_only_event_before_any_prompt_count_waits_for_the_prompt`), the gross prompt not kept (three red: `codex_f05_inv45_cached_details_in_a_later_chunk_are_netted_once`, `a_cached_subset_arriving_after_the_prompt_count_is_netted`, `the_netting_holds_across_three_events_whatever_the_final_event_carries`). Scenarios: `features/an-openai-cached-token-is-priced-once.feature`, nine, each bound.)*
@@ -5512,3 +5512,67 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     are cases in `gates-have-teeth.sh`. Scenarios:
     `features/the-price-book-prices-every-listed-model.feature`, eight, each
     bound. Not a script gate)*
+
+80. **An OpenAI-shaped usage is charged the output its provider bills: the
+    larger of `completion_tokens` and `total_tokens` less `prompt_tokens`.**
+    Measured 2026-10-07 against Vertex AI's OpenAI-compatible endpoint
+    (`.../endpoints/openapi/chat/completions`, `google/gemini-2.5-flash`, one
+    non-streamed answer): `completion_tokens 59`,
+    `completion_tokens_details.reasoning_tokens 560`, `prompt_tokens 14`,
+    `total_tokens 633`. Google's completion count leaves the reasoning out
+    (633 = 14 + 59 + 560) and Google bills reasoning at the output rate;
+    OpenAI's completion count already holds it, `reasoning_tokens` being a
+    detail of it (total = prompt + completion). `apply_openai` read
+    `completion_tokens` alone, so every Gemini thinking call through the
+    OpenAI door settled about a tenth of its output: 152 micro-USD for a call
+    the provider bills at 1552 at Vertex's gemini-2.5-flash rates, the ADR-8
+    direction reversed.
+
+    The rule (`apply_openai`, `provider.rs`): output is
+    `completion.max(total.saturating_sub(gross_prompt))`. `gross_prompt` is
+    `prompt_tokens` as the provider reports it, cached subset included, since
+    that is what the total contains; the cached subset is netted out of the
+    INPUT only, as invariant 45 says. For OpenAI the gap equals the
+    completion count and nothing changes. The reasoning detail is never added
+    to the completion count, which for OpenAI would count it twice. A total
+    below the prompt, or below prompt + completion, never lowers the output
+    below the completion count and never wraps. The four figures are kept in
+    `OpenAiNetting` across every event of one body, last non-zero wins, and
+    the output is written from that state by any object carrying
+    `prompt_tokens`, `completion_tokens` or `total_tokens`, so the order a
+    stream delivers them in cannot change the result; a details-only object
+    writes no output, as before. A usage with no `total_tokens` is read
+    exactly as before. A total with no prompt count anywhere is charged whole
+    as output (the unreported prompt priced at the output rate rather than not
+    at all), `@claude` 2026-10-07 under delegated authority.
+
+    What this does not cover: a Google-shaped usage with no `total_tokens`
+    still settles on the completion count alone, since nothing in the body
+    says what the reasoning was; no row in the built-in price book prices a
+    Gemini id (invariant 79's rows are Claude's), so a Gemini call settles at
+    the fallback rates unless `TOKENFUSE_PRICE_BOOK` names it; and the
+    pre-flight estimate (`estimate.rs`) never read `completion_tokens` and is
+    unchanged: it reserves `max_completion_tokens` (or `max_tokens`, or 1024)
+    of output, and whether Google counts reasoning inside that cap was not
+    measured, so a thinking call can reserve less than it settles.
+    *(test: `provider::tests::` `a_vertex_reasoning_usage_is_charged_its_reasoning_as_output`
+    (red in CI on the test-only commit: `left: 59 right: 619`; five more of
+    the eight below were red there too, the hostile one on its `u64::MAX`
+    total, `left: 50`; the double-count and no-total tests are controls and
+    passed on the old code by design), `an_openai_reasoning_usage_is_not_counted_twice`,
+    `a_usage_without_total_tokens_keeps_the_completion_count`,
+    `a_total_below_prompt_plus_completion_never_lowers_the_output`,
+    `a_streamed_vertex_final_chunk_is_charged_its_reasoning`,
+    `the_total_and_the_prompt_count_on_separate_chunks_still_give_the_gap`,
+    `a_total_with_no_prompt_count_is_charged_whole_as_output`,
+    `a_vertex_usage_with_cached_tokens_nets_the_cache_and_keeps_the_reasoning`;
+    `tests/it/reasoning_tokens_are_output.rs`, two, through `app()` and the
+    real `HttpProvider` against a local upstream, buffered and streamed (not
+    run red: cargo stopped at the failing lib binary first; on the old rule
+    they settle 59 output tokens, 152 micro-USD against the 1552 asserted, by
+    reasoning). Three mutants are cases in
+    `gates-have-teeth.sh`: the output read from `completion_tokens` alone,
+    the reasoning detail added on top, and the gap taken against the prompt
+    net of the cache. Scenarios:
+    `features/a-thinking-models-reasoning-is-billed-as-output.feature`, eight,
+    each bound. Not a script gate)*
