@@ -200,3 +200,78 @@ async fn the_binary_prices_with_the_operators_rows() {
         (200, "fallback".to_string(), "0.052500".to_string())
     );
 }
+
+/// A control plane that keeps every record pushed to `/v1/ingest` and answers
+/// every other route with an empty list.
+async fn capture_cloud() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) {
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let g = std::sync::Arc::clone(&got);
+    let app = axum::Router::new()
+        .route(
+            "/v1/ingest",
+            axum::routing::post(move |body: String| {
+                let g = std::sync::Arc::clone(&g);
+                async move {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(rs) = v["records"].as_array() {
+                            g.lock().unwrap().extend(rs.iter().cloned());
+                        }
+                    }
+                    "{}"
+                }
+            }),
+        )
+        .fallback(|| async { "[]" });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    (format!("http://{addr}"), got)
+}
+
+/// Invariant 86: the basis a call was charged at reaches the control plane
+/// with the call, so a fleet view can see fallback-priced spend. The real
+/// binary, the real CloudSink, a capturing control plane: a listed model is
+/// pushed as `known`, an unlisted one as `fallback`.
+#[tokio::test]
+async fn the_basis_each_call_was_charged_at_reaches_the_cloud() {
+    let (cloud, got) = capture_cloud().await;
+    let addr = free_addr();
+    let mut child = base_cmd(&addr)
+        .env("TOKENFUSE_CLOUD_URL", &cloud)
+        .env("TOKENFUSE_CLOUD_KEY", "k")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the tokenfuse binary");
+    let up = wait_for_listening(&mut child);
+    let mut pushed: Vec<serde_json::Value> = Vec::new();
+    if up {
+        priced(&addr, "basis-known", "claude-sonnet-5").await;
+        priced(&addr, "basis-fallback", "claude-sonnet-6").await;
+        let deadline = Instant::now() + CEILING;
+        while Instant::now() < deadline {
+            pushed = got.lock().unwrap().clone();
+            if pushed.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+    assert!(up, "the gateway never reported listening");
+    let basis = |run: &str| {
+        pushed
+            .iter()
+            .find(|r| r["run_id"] == run)
+            .map(|r| r["price_basis"].clone())
+            .unwrap_or_else(|| panic!("{run} was never pushed: {pushed:?}"))
+    };
+    assert_eq!(basis("basis-known"), "known");
+    assert_eq!(basis("basis-fallback"), "fallback");
+}
