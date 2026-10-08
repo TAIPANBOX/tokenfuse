@@ -78,7 +78,7 @@ pub struct PriceFile {
 }
 
 /// What applying a file did to a book, for the startup line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     /// Rows that replaced a built-in row.
     pub overridden: usize,
