@@ -25,7 +25,8 @@
 //! from [`BreakerReason::as_wire_str`], the blocked-decision set from
 //! [`tokenfuse_core::outcomes::is_blocked_decision`], the severities from
 //! [`EventType::severity`], the columns from [`ParquetSink`]'s own two schemas,
-//! and the prices from [`crate::pricebook::default_price_book`]. A hand-written
+//! the FOCUS export's columns from [`crate::focusexport`]'s own header, and
+//! the prices from [`crate::pricebook::default_price_book`]. A hand-written
 //! constants file is the original defect one level up: a file that can disagree
 //! with the constants it names.
 //!
@@ -263,6 +264,18 @@ fn price_book() -> serde_json::Value {
     })
 }
 
+/// The FOCUS export's columns, in the order `tokenfuse focus-export` writes
+/// them. A FinOps console reads this file by name, so the names are what a
+/// consumer needs, and they were retyped by value (CostCrew's
+/// `tokenfuse-focus` reader) until invariant 81 published them here. Columns
+/// are appended, never reordered or renamed, so a reader that knows an older
+/// prefix keeps reading it.
+fn focus_export() -> serde_json::Value {
+    json!({
+        "columns": crate::focusexport::columns(),
+    })
+}
+
 /// The whole published document.
 pub fn document() -> serde_json::Value {
     json!({
@@ -276,6 +289,7 @@ pub fn document() -> serde_json::Value {
         "agent_events": agent_events(),
         "trace_parquet": trace_parquet(),
         "price_book": price_book(),
+        "focus_export": focus_export(),
     })
 }
 
@@ -487,6 +501,58 @@ mod tests {
             75_000_000
         );
         assert_eq!(doc["price_book"]["units"], "microusd_per_mtok");
+    }
+
+    /// The FOCUS export's columns are what a FinOps console reads (CostCrew's
+    /// `tokenfuse-focus` connector retyped them by value), so they are
+    /// published here in export order, the same remedy invariant 14 applied
+    /// to the Breaker strings. The list is WRITTEN OUT, not read off the
+    /// export's own header, for the reason `every_breaker_reason_reaches_the_artifact`
+    /// gives: an expectation taken from the thing under test cannot fail.
+    /// The two columns invariant 81 appends are last, so a reader that
+    /// addresses the first 26 by position keeps reading them.
+    #[test]
+    fn the_focus_export_columns_are_published_in_export_order() {
+        let doc = document();
+        let published: Vec<&str> = doc["focus_export"]["columns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ARTIFACT_PATH} publishes no focus_export.columns"))
+            .iter()
+            .map(|c| c.as_str().expect("a column name is a string"))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                "BilledCost",
+                "EffectiveCost",
+                "BillingCurrency",
+                "ChargePeriodStart",
+                "ChargePeriodEnd",
+                "ChargeDescription",
+                "ProviderName",
+                "PublisherName",
+                "InvoiceIssuerName",
+                "ServiceName",
+                "ServiceCategory",
+                "ResourceId",
+                "ResourceName",
+                "SubAccountId",
+                "SubAccountName",
+                "x_run_id",
+                "x_parent_run_id",
+                "x_agent_id",
+                "x_model",
+                "x_tokens_in",
+                "x_tokens_out",
+                "x_blocked",
+                "x_cost_basis",
+                "x_outcome",
+                "x_unit",
+                "x_tool_calls",
+                "x_key_id",
+                "x_block_reason",
+            ]
+        );
     }
 
     /// Rendering is deterministic, or the gate is a coin toss.

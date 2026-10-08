@@ -37,6 +37,15 @@
 //!     file (schema evolution) as well as for a call whose response body
 //!     never parsed; a real, observed zero renders as `"0"`, distinguishable
 //!     from the blank "we don't know" case.
+//!   - `x_key_id`: sourced from `CallRecord.key_id` (invariant 81) - the
+//!     client credential the call was made with, resolved server-side from
+//!     `x-fuse-key`, never written by the caller. `""` when client keys are
+//!     off, and for a row from a trace file written before the column
+//!     existed (schema evolution, same `COALESCE` pattern).
+//!   - `x_block_reason`: the Breaker reason's wire string on a blocked row
+//!     (invariant 81), so non-empty exactly when `x_blocked` is `true`;
+//!     `""` on every other row, including a policy plane's own refusal
+//!     (`wardryx_deny`/`wardryx_hold`), which is not a Breaker block.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -49,10 +58,18 @@
 //! invention, but it is a heuristic — an unrecognized model name falls back to
 //! `"Unknown"`.
 //!
+//! ## Who a row is filed under
+//!
+//! `ResourceId`, `ResourceName` and `x_agent_id` carry the call's
+//! `x-fuse-agent-id`, except on a row refused for identity
+//! (`identity_mismatch`), where that id is the one the gateway refused as
+//! unauthenticated: such a row is filed under `key:<key_id>` with an empty
+//! `x_agent_id` (invariant 81, see [`filed_under`]).
+//!
 //! ## Cost basis and `x_blocked`
 //!
 //! A call's `decision` column already tells us whether the Breaker tripped
-//! (the seven reasons in [`tokenfuse_core::BreakerReason`]) — see
+//! (the nine reasons in [`tokenfuse_core::BreakerReason`]) — see
 //! [`is_blocked_decision`]. For a blocked row `cost_microusd` holds the
 //! *reserved estimate* that was never actually charged (see `proxy.rs`), so
 //! `BilledCost`/`EffectiveCost` are forced to `0` and `x_cost_basis` is
@@ -118,10 +135,14 @@ struct FocusRecord {
     /// call's response. `None` for a pre-I1 trace row or an unparseable
     /// response body - see `x_tool_calls`'s sourcing note above.
     tool_calls: Option<u32>,
+    /// The client credential the call was made with (`CallRecord::key_id`,
+    /// resolved server-side, never a header). `""` when client keys are off
+    /// and for a row written before the trace carried the column.
+    key_id: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 26] = [
+const HEADER: [&str; 28] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -148,7 +169,22 @@ const HEADER: [&str; 26] = [
     "x_outcome",
     "x_unit",
     "x_tool_calls",
+    // Invariant 81: appended LAST, so a reader that addresses the 26
+    // columns above by position keeps reading them.
+    "x_key_id",
+    "x_block_reason",
 ];
+
+/// The prefix a row refused for identity is filed under, ahead of the key id
+/// (invariant 81). It cannot be mistaken for an agent id, so a key named like
+/// an agent never lands in that agent's figures.
+pub(crate) const KEY_RESOURCE_PREFIX: &str = "key:";
+
+/// The header, for the constants contract (`crate::constants`), which
+/// publishes it so a consumer reads the columns instead of retyping them.
+pub(crate) fn columns() -> &'static [&'static str] {
+    &HEADER
+}
 
 /// Load, project, and write the FOCUS CSV. Returns `Err` with a clear message
 /// on bad flags, a missing/unreadable trace, or an empty result set — the
@@ -213,7 +249,8 @@ async fn load_records(
          coalesce(parent_run_id, '') as parent_run_id, \
          coalesce(outcome, '') as outcome, \
          coalesce(unit, '') as unit, \
-         cast(tool_calls as bigint) as tool_calls \
+         cast(tool_calls as bigint) as tool_calls, \
+         coalesce(key_id, '') as key_id \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -279,6 +316,7 @@ async fn load_records(
                 } else {
                     Some(tool_calls.value(i).max(0) as u32)
                 },
+                key_id: str_at(b.column(12).as_ref(), i),
             });
         }
     }
@@ -338,9 +376,48 @@ fn usd_string(microusd: i64) -> String {
     format!("{:.6}", Microusd(microusd).as_usd())
 }
 
-/// Project one trace row into the 26 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 26] {
+/// Who a row is filed under: `(ResourceId and ResourceName, x_agent_id)`.
+///
+/// Invariant 81. `agent_id` is the `x-fuse-agent-id` header, which the caller
+/// writes. On every row but one kind that is all the trace knows, and the
+/// export reports it as it always has. The exception is a row refused for
+/// identity (`identity_mismatch`): the gateway refused that call precisely
+/// because the credential presented may not speak as that agent, so the
+/// header names somebody who did NOT make the call. Filing it there put an
+/// impersonation's refusals on its victim's figures (the R6 run, 2026-10-07).
+///
+/// Such a row is filed under the credential that did make it,
+/// [`KEY_RESOURCE_PREFIX`] plus the key id, and reports no agent id, because
+/// a consumer reads `x_agent_id` first and `ResourceId` second (CostCrew's
+/// `tokenfuse-focus` reader does exactly that). With client keys off there is
+/// no credential on the row and both are empty: filed under nobody, which a
+/// reader can see, rather than under somebody, which it cannot tell from the
+/// truth. The claimed id is still in the Parquet trace and in the
+/// `identity_mismatch` agent event.
+fn filed_under(rec: &FocusRecord) -> (String, String) {
+    if rec.decision == BreakerReason::IdentityMismatch.as_wire_str() {
+        let resource = if rec.key_id.is_empty() {
+            String::new()
+        } else {
+            format!("{KEY_RESOURCE_PREFIX}{}", rec.key_id)
+        };
+        (resource, String::new())
+    } else {
+        (rec.agent_id.clone(), rec.agent_id.clone())
+    }
+}
+
+/// Project one trace row into the 28 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 28] {
     let blocked = is_blocked_decision(&rec.decision);
+    // Non-empty exactly when `x_blocked` is true: the Breaker reason's own
+    // wire string, which is what `decision` holds on a blocked row.
+    let block_reason = if blocked {
+        rec.decision.clone()
+    } else {
+        String::new()
+    };
+    let (resource, agent) = filed_under(rec);
     let (cost_microusd, cost_basis) = if blocked {
         (0i64, "blocked")
     } else if rec.input_tokens == 0 && rec.output_tokens == 0 && rec.cost_microusd != 0 {
@@ -364,13 +441,13 @@ fn to_row(rec: &FocusRecord) -> [String; 26] {
         provider,                                                  // InvoiceIssuerName
         "LLM inference".to_string(),                               // ServiceName
         "AI and Machine Learning".to_string(),                     // ServiceCategory
-        rec.agent_id.clone(),                                      // ResourceId
-        rec.agent_id.clone(),                                      // ResourceName
+        resource.clone(),                                          // ResourceId
+        resource,                                                  // ResourceName
         rec.run_id.clone(),                                        // SubAccountId
         rec.run_id.clone(),                                        // SubAccountName
         rec.run_id.clone(),                                        // x_run_id
         rec.parent_run_id.clone(),                                 // x_parent_run_id
-        rec.agent_id.clone(),                                      // x_agent_id
+        agent,                                                     // x_agent_id
         rec.model.clone(),                                         // x_model
         rec.input_tokens.to_string(),                              // x_tokens_in
         rec.output_tokens.to_string(),                             // x_tokens_out
@@ -379,6 +456,8 @@ fn to_row(rec: &FocusRecord) -> [String; 26] {
         rec.outcome.clone(),                                       // x_outcome
         rec.unit.clone(),                                          // x_unit
         rec.tool_calls.map(|n| n.to_string()).unwrap_or_default(), // x_tool_calls
+        rec.key_id.clone(),                                        // x_key_id
+        block_reason,                                              // x_block_reason
     ]
 }
 
@@ -449,6 +528,76 @@ pub(crate) fn parse_rfc3339_millis(s: &str) -> Result<i64, String> {
 
     let days = days_from_civil(y, m, d);
     Ok(days * 86_400_000 + hh * 3_600_000 + mm * 60_000 + ss * 1000)
+}
+
+/// One exported row, keyed by header name. Test-only: a consumer reads the
+/// CSV by name, so the tests do too, and a column that does not exist is a
+/// test failure naming it rather than an index out of range.
+#[cfg(test)]
+pub(crate) type ExportRow = std::collections::BTreeMap<String, String>;
+
+/// The value of column `name` in `row`, failing the test by name when the
+/// export has no such column.
+#[cfg(test)]
+pub(crate) fn col<'a>(row: &'a ExportRow, name: &str) -> &'a str {
+    row.get(name)
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("the export has no {name} column"))
+}
+
+/// Read an export back: RFC 4180, the exact dialect [`csv_quote`] writes
+/// (a field is quoted when it holds a comma, a quote, CR or LF; a quote
+/// inside is doubled; each record ends in LF). Written out rather than taken
+/// from a crate so that the reader is independent of the writer it checks.
+#[cfg(test)]
+pub(crate) fn parse_export_csv(text: &str) -> Vec<ExportRow> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' if field.is_empty() => quoted = true,
+            ',' => record.push(std::mem::take(&mut field)),
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            _ => field.push(c),
+        }
+    }
+    assert!(!quoted, "the export ends inside a quoted field");
+    assert!(
+        field.is_empty() && record.is_empty(),
+        "the export's last record is not terminated by a newline"
+    );
+    let mut it = records.into_iter();
+    let header = it.next().expect("the export has a header line");
+    it.map(|values| {
+        assert_eq!(
+            values.len(),
+            header.len(),
+            "a record has {} fields and the header {}: {values:?}",
+            values.len(),
+            header.len()
+        );
+        header.iter().cloned().zip(values).collect()
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -706,23 +855,23 @@ mod tests {
             "ChargeDescription,ProviderName,PublisherName,InvoiceIssuerName,ServiceName,",
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
-            "x_outcome,x_unit,x_tool_calls\n",
+            "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2\n",
+            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled,,,\n",
+            "0,0,false,settled,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked,,,\n",
+            "blocked,,,,,budget_exceeded\n",
         );
         assert_eq!(got, want);
 
@@ -767,6 +916,380 @@ mod tests {
         };
         let err = run(&args).await.unwrap_err();
         assert!(err.contains("nonexistent"), "{err}");
+    }
+
+    // -- who a row is filed under (invariant 81) ------------------------------
+
+    /// A trace row as the gateway writes it, with the credential it was made
+    /// with. `step`, `saved_microusd` and the shadow-pruning columns do not
+    /// reach the export and are left at their defaults.
+    fn keyed(
+        ts_millis: i64,
+        run_id: &str,
+        decision: &str,
+        agent_id: &str,
+        key_id: &str,
+        unit: &str,
+    ) -> CallRecord {
+        let mut r = rec_with_parent_and_outcome(
+            ts_millis,
+            run_id,
+            "gpt-4o-mini",
+            decision,
+            0,
+            0,
+            0,
+            agent_id,
+            "",
+            "",
+            unit,
+            None,
+        );
+        r.key_id = key_id.into();
+        r
+    }
+
+    /// Write `records` to a fresh trace directory, export it, and read the
+    /// CSV back as rows keyed by header name, in export order.
+    async fn export_rows(tag: &str, records: Vec<CallRecord>) -> Vec<ExportRow> {
+        let dir =
+            std::env::temp_dir().join(format!("tf-focus-export-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("focus.csv");
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            for r in records {
+                sink.record(r);
+            }
+        }
+        let args = Args {
+            traces: Some(dir.to_str().unwrap().to_string()),
+            out: Some(out.to_str().unwrap().to_string()),
+            from: None,
+            to: None,
+        };
+        run(&args).await.expect("export should succeed");
+        let text = std::fs::read_to_string(&out).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        parse_export_csv(&text)
+    }
+
+    /// The R6 run of 2026-10-07, reduced to its two rows: a key bound to its
+    /// own agent presents another agent's id, strict identity refuses it,
+    /// and the trace row carries the CLAIMED id in `agent_id` (the header)
+    /// beside the credential that really called in `key_id`. The export
+    /// used to file the refusal under the claimed agent, so a downstream
+    /// console showed the victim with blocked calls it never made.
+    #[tokio::test]
+    async fn an_identity_refused_row_is_filed_under_the_credential_not_the_claim() {
+        let rows = export_rows(
+            "identity-refused",
+            vec![
+                keyed(
+                    0,
+                    "run-flint",
+                    "allow",
+                    "agent://taipanbox.dev/routers/flint",
+                    "flint-key",
+                    "routers",
+                ),
+                keyed(
+                    1_000,
+                    "run-imposter",
+                    "identity_mismatch",
+                    "agent://taipanbox.dev/routers/flint",
+                    "forge-imposter",
+                    "forge",
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+
+        let refused = &rows[1];
+        assert_eq!(col(refused, "x_run_id"), "run-imposter");
+        assert_eq!(col(refused, "ResourceId"), "key:forge-imposter");
+        assert_eq!(col(refused, "ResourceName"), "key:forge-imposter");
+        assert_eq!(
+            col(refused, "x_agent_id"),
+            "",
+            "an agent id the gateway refused as unauthenticated is not reported as the caller"
+        );
+        assert_eq!(col(refused, "x_key_id"), "forge-imposter");
+        assert_eq!(col(refused, "x_block_reason"), "identity_mismatch");
+        assert_eq!(col(refused, "x_blocked"), "true");
+        assert_eq!(col(refused, "BilledCost"), "0.000000");
+        for (name, value) in refused {
+            assert!(
+                !value.contains("routers/flint"),
+                "the refused row still names the agent it claimed to be, in {name}: {value}"
+            );
+        }
+
+        // The honest call by the real agent is untouched.
+        let honest = &rows[0];
+        assert_eq!(
+            col(honest, "ResourceId"),
+            "agent://taipanbox.dev/routers/flint"
+        );
+        assert_eq!(
+            col(honest, "x_agent_id"),
+            "agent://taipanbox.dev/routers/flint"
+        );
+        assert_eq!(col(honest, "x_key_id"), "flint-key");
+        assert_eq!(col(honest, "x_block_reason"), "");
+    }
+
+    /// A gateway with no client keys has no credential to name: `key_id` is
+    /// empty on every row. A refusal for identity there (a header that
+    /// contradicts a proven delegation chain) is still not filed under the
+    /// claimed agent; it is filed under nobody, which a consumer can see,
+    /// rather than under somebody, which it cannot tell from the truth.
+    #[tokio::test]
+    async fn an_identity_refused_row_with_no_credential_names_no_resource() {
+        let rows = export_rows(
+            "identity-refused-keyless",
+            vec![keyed(
+                0,
+                "run-x",
+                "identity_mismatch",
+                "agent://acme/victim",
+                "",
+                "",
+            )],
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(col(&rows[0], "ResourceId"), "");
+        assert_eq!(col(&rows[0], "ResourceName"), "");
+        assert_eq!(col(&rows[0], "x_agent_id"), "");
+        assert_eq!(col(&rows[0], "x_key_id"), "");
+        assert_eq!(col(&rows[0], "x_block_reason"), "identity_mismatch");
+    }
+
+    #[tokio::test]
+    async fn every_row_carries_the_key_it_was_made_with() {
+        let rows = export_rows(
+            "key-id",
+            vec![
+                keyed(0, "run-1", "allow", "agent://acme/a", "key-a", "u"),
+                keyed(1_000, "run-2", "cache_hit", "agent://acme/b", "key-b", "u"),
+                keyed(
+                    2_000,
+                    "run-3",
+                    "budget_exceeded",
+                    "agent://acme/c",
+                    "key-c",
+                    "u",
+                ),
+                keyed(3_000, "run-4", "allow", "agent://acme/d", "", ""),
+            ],
+        )
+        .await;
+        let keys: Vec<&str> = rows.iter().map(|r| col(r, "x_key_id")).collect();
+        assert_eq!(keys, ["key-a", "key-b", "key-c", ""]);
+        // Only an identity refusal moves the resource; a budget block by an
+        // authenticated caller stays filed under its agent.
+        assert_eq!(col(&rows[2], "ResourceId"), "agent://acme/c");
+        assert_eq!(col(&rows[2], "x_agent_id"), "agent://acme/c");
+    }
+
+    /// Every one of the nine Breaker reasons is named on its row; an allowed
+    /// call, a cache hit and a policy plane's own refusal (which is not a
+    /// Breaker block, `x_blocked` false) name none, so the column is
+    /// non-empty exactly when `x_blocked` is true.
+    #[tokio::test]
+    async fn a_blocked_row_names_its_reason_and_any_other_row_names_none() {
+        let reasons = [
+            "budget_exceeded",
+            "policy_violation",
+            "loop_detected",
+            "killed",
+            "wasm_policy",
+            "taint_blocked",
+            "dlp_blocked",
+            "unit_budget_exceeded",
+            "identity_mismatch",
+        ];
+        let others = ["allow", "cache_hit", "wardryx_deny", "wardryx_hold"];
+        let mut records = Vec::new();
+        for (i, d) in reasons.iter().chain(others.iter()).enumerate() {
+            records.push(keyed(
+                i as i64 * 1_000,
+                &format!("run-{i:02}"),
+                d,
+                "agent://acme/a",
+                "key-a",
+                "u",
+            ));
+        }
+        let rows = export_rows("block-reason", records).await;
+        assert_eq!(rows.len(), reasons.len() + others.len());
+        for (i, d) in reasons.iter().enumerate() {
+            assert_eq!(col(&rows[i], "x_block_reason"), *d, "row for {d}");
+            assert_eq!(col(&rows[i], "x_blocked"), "true", "row for {d}");
+        }
+        for (j, d) in others.iter().enumerate() {
+            let row = &rows[reasons.len() + j];
+            assert_eq!(col(row, "x_block_reason"), "", "row for {d}");
+            assert_eq!(col(row, "x_blocked"), "false", "row for {d}");
+        }
+    }
+
+    /// A control, not a red-first test: a trace segment written before the
+    /// gateway recorded `key_id` (12 columns) still exports beside a current
+    /// one, with the key empty and every row present. The column is read
+    /// through `COALESCE`, the rule every appended column already follows
+    /// (invariant 6).
+    #[tokio::test]
+    async fn a_trace_written_before_key_id_existed_still_exports() {
+        use datafusion::arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir =
+            std::env::temp_dir().join(format!("tf-focus-export-pre-key-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("focus.csv");
+
+        let old = Arc::new(Schema::new(vec![
+            Field::new("ts_millis", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("decision", DataType::Utf8, false),
+            Field::new("input_tokens", DataType::UInt64, false),
+            Field::new("output_tokens", DataType::UInt64, false),
+            Field::new("cost_microusd", DataType::Int64, false),
+            Field::new("step", DataType::UInt32, false),
+            Field::new("agent_id", DataType::Utf8, false),
+            Field::new("saved_microusd", DataType::Int64, false),
+            Field::new("parent_run_id", DataType::Utf8, false),
+            Field::new("on_behalf_of", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            old.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec!["run-old"])),
+                Arc::new(StringArray::from(vec!["claude-sonnet"])),
+                Arc::new(StringArray::from(vec!["allow"])),
+                Arc::new(UInt64Array::from(vec![10u64])),
+                Arc::new(UInt64Array::from(vec![5u64])),
+                Arc::new(Int64Array::from(vec![105i64])),
+                Arc::new(UInt32Array::from(vec![1u32])),
+                Arc::new(StringArray::from(vec!["agent://acme/old"])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec![""])),
+                Arc::new(StringArray::from(vec![""])),
+            ],
+        )
+        .unwrap();
+        {
+            let file = std::fs::File::create(dir.join("calls-pre-key-id.parquet")).unwrap();
+            let mut w = ArrowWriter::try_new(file, old, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            sink.record(keyed(
+                1_000,
+                "run-new",
+                "allow",
+                "agent://acme/new",
+                "key-n",
+                "u",
+            ));
+        }
+
+        let args = Args {
+            traces: Some(dir.to_str().unwrap().to_string()),
+            out: Some(out.to_str().unwrap().to_string()),
+            from: None,
+            to: None,
+        };
+        run(&args)
+            .await
+            .expect("a directory mixing pre-key_id and current segments must export");
+        let rows = parse_export_csv(&std::fs::read_to_string(&out).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(col(&rows[0], "x_run_id"), "run-old");
+        assert_eq!(col(&rows[0], "ResourceId"), "agent://acme/old");
+        assert_eq!(
+            rows[0].get("x_key_id").map(String::as_str).unwrap_or(""),
+            ""
+        );
+        assert_eq!(col(&rows[1], "x_run_id"), "run-new");
+    }
+
+    /// 200 seeded rows refused for identity, each with a claimed agent id
+    /// and a key id drawn from an alphabet of CSV-hostile characters (comma,
+    /// quote, CR, LF, a non-ASCII letter). Every row must round-trip through
+    /// the CSV, carry its own key in `x_key_id`, and never put the claim in
+    /// `ResourceId`, `ResourceName` or `x_agent_id`.
+    #[tokio::test]
+    async fn hostile_claims_and_keys_never_reach_the_resource_columns() {
+        const ALPHABET: &[&str] = &[
+            "a", "Z", "0", ",", "\"", "\n", "\r", " ", "\u{e9}", "/", ":", "-",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 33
+        };
+        let mut want = Vec::new();
+        let mut records = Vec::new();
+        for seed in 0..200usize {
+            let claim_len = 1 + next() % 12;
+            let claim_tail: String = (0..claim_len)
+                .map(|_| ALPHABET[(next() as usize) % ALPHABET.len()])
+                .collect();
+            let claim = format!("agent://victim/{claim_tail}");
+            // Every fourth row has no credential at all.
+            let key = if seed % 4 == 0 {
+                String::new()
+            } else {
+                let key_len = next() % 10;
+                let tail: String = (0..key_len)
+                    .map(|_| ALPHABET[(next() as usize) % ALPHABET.len()])
+                    .collect();
+                format!("k{tail}")
+            };
+            let run_id = format!("run-{seed:03}");
+            records.push(keyed(
+                seed as i64,
+                &run_id,
+                "identity_mismatch",
+                &claim,
+                &key,
+                "",
+            ));
+            want.push((run_id, claim, key));
+        }
+        let rows = export_rows("hostile", records).await;
+        assert_eq!(rows.len(), want.len());
+        for (row, (run_id, claim, key)) in rows.iter().zip(&want) {
+            assert_eq!(col(row, "x_run_id"), run_id.as_str());
+            assert_eq!(col(row, "x_key_id"), key.as_str(), "{run_id}");
+            let resource = if key.is_empty() {
+                String::new()
+            } else {
+                format!("key:{key}")
+            };
+            assert_eq!(col(row, "ResourceId"), resource, "{run_id}");
+            assert_eq!(col(row, "ResourceName"), resource, "{run_id}");
+            assert_eq!(col(row, "x_agent_id"), "", "{run_id}");
+            for name in ["ResourceId", "ResourceName", "x_agent_id"] {
+                assert_ne!(col(row, name), claim.as_str(), "{run_id}: {name}");
+            }
+        }
     }
 
     #[test]

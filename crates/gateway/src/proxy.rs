@@ -7306,6 +7306,87 @@ pub(crate) mod tests {
         assert_eq!(records[0].unit, "treasury");
     }
 
+    /// Invariant 81, end to end: the R6 impersonation of 2026-10-07 through
+    /// the real handler, the real Parquet sink and the real export. One key,
+    /// `treasury-bots`, makes an honest call as one of its own agents and
+    /// then presents an agent id it is not bound to; strict identity refuses
+    /// the second. In the export the refusal is filed under the credential
+    /// that made it, names its reason, and the agent it claimed appears in
+    /// no row at all.
+    #[tokio::test]
+    async fn an_impersonation_refused_at_the_door_exports_under_the_credential_that_made_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-proxy-impersonation-export-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(crate::sink::ParquetSink::new(&dir, 1).unwrap()));
+
+        let honest = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "r6-honest")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/payments")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(call(st.clone(), honest).await.status(), StatusCode::OK);
+
+        let impersonation = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "r6-imposter")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(
+            call(st.clone(), impersonation).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(st);
+
+        let out = dir.join("focus.csv");
+        crate::focusexport::run(&crate::focusexport::Args {
+            traces: Some(dir.to_str().unwrap().to_string()),
+            out: Some(out.to_str().unwrap().to_string()),
+            from: None,
+            to: None,
+        })
+        .await
+        .expect("the trace the gateway wrote exports");
+        let text = std::fs::read_to_string(&out).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let rows = crate::focusexport::parse_export_csv(&text);
+        use crate::focusexport::col;
+
+        let refused = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "r6-imposter")
+            .expect("the refused call has a row");
+        assert_eq!(col(refused, "ResourceId"), "key:treasury-bots");
+        assert_eq!(col(refused, "x_agent_id"), "");
+        assert_eq!(col(refused, "x_key_id"), "treasury-bots");
+        assert_eq!(col(refused, "x_block_reason"), "identity_mismatch");
+        assert_eq!(col(refused, "x_blocked"), "true");
+        assert_eq!(col(refused, "x_unit"), "treasury");
+
+        let allowed = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "r6-honest")
+            .expect("the honest call has a row");
+        assert_eq!(
+            col(allowed, "ResourceId"),
+            "agent://bank.example/treasury/payments"
+        );
+        assert_eq!(col(allowed, "x_key_id"), "treasury-bots");
+        assert_eq!(col(allowed, "x_block_reason"), "");
+
+        assert!(
+            !text.contains("fraud/bot1"),
+            "the agent id the gateway refused still reaches the export:\n{text}"
+        );
+    }
+
     #[tokio::test]
     async fn identity_warn_allows_and_sets_the_would_block_header() {
         let sink = RecordingSink::default();

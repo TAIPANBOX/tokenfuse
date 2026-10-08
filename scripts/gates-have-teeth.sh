@@ -849,6 +849,28 @@ run_case "reasoning-is-output: the gap taken against the prompt net of the cache
 	"$(py 'edit("crates/gateway/src/provider.rs", "    let gap = net.total.saturating_sub(net.gross_prompt);", "    let gap = net.total.saturating_sub(net.gross_prompt.saturating_sub(net.cached));")')" \
 	"a_vertex_usage_with_cached_tokens_nets_the_cache_and_keeps_the_reasoning ... FAILED"
 
+# --- invariant 81: a call refused for identity is filed under its key -------
+#
+# Not a scripts/*.sh gate: the rule is focusexport's projection, held by cargo
+# test. The first mutant is the R6 defect itself, a row refused for identity
+# filed under the agent id it claimed; the second names a block reason on rows
+# the Breaker did not block; the third drops the key from the export. Each
+# planted text compiles under CI's `RUSTFLAGS=-D warnings`.
+run_case "focus-export: an identity refusal filed under the claimed agent" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::an_identity_refused_row_is_filed_under_the_credential_not_the_claim" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "    if rec.decision == BreakerReason::IdentityMismatch.as_wire_str() {", "    if false && rec.decision == BreakerReason::IdentityMismatch.as_wire_str() {")')" \
+	"an_identity_refused_row_is_filed_under_the_credential_not_the_claim ... FAILED"
+
+run_case "focus-export: a block reason on a row the Breaker did not block" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::a_blocked_row_names_its_reason_and_any_other_row_names_none" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "    let block_reason = if blocked {", "    let block_reason = if blocked || !rec.decision.is_empty() {")')" \
+	"a_blocked_row_names_its_reason_and_any_other_row_names_none ... FAILED"
+
+run_case "focus-export: the key dropped from the export" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::every_row_carries_the_key_it_was_made_with" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "        rec.key_id.clone(),                                        // x_key_id", "        String::new(),                                             // x_key_id")')" \
+	"every_row_carries_the_key_it_was_made_with ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
