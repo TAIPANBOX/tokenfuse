@@ -489,6 +489,58 @@ mod tests {
         assert_eq!(doc["price_book"]["units"], "microusd_per_mtok");
     }
 
+    /// The FOCUS export's columns are what a FinOps console reads (CostCrew's
+    /// `tokenfuse-focus` connector retyped them by value), so they are
+    /// published here in export order, the same remedy invariant 14 applied
+    /// to the Breaker strings. The list is WRITTEN OUT, not read off the
+    /// export's own header, for the reason `every_breaker_reason_reaches_the_artifact`
+    /// gives: an expectation taken from the thing under test cannot fail.
+    /// The two columns invariant 81 appends are last, so a reader that
+    /// addresses the first 26 by position keeps reading them.
+    #[test]
+    fn the_focus_export_columns_are_published_in_export_order() {
+        let doc = document();
+        let published: Vec<&str> = doc["focus_export"]["columns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ARTIFACT_PATH} publishes no focus_export.columns"))
+            .iter()
+            .map(|c| c.as_str().expect("a column name is a string"))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                "BilledCost",
+                "EffectiveCost",
+                "BillingCurrency",
+                "ChargePeriodStart",
+                "ChargePeriodEnd",
+                "ChargeDescription",
+                "ProviderName",
+                "PublisherName",
+                "InvoiceIssuerName",
+                "ServiceName",
+                "ServiceCategory",
+                "ResourceId",
+                "ResourceName",
+                "SubAccountId",
+                "SubAccountName",
+                "x_run_id",
+                "x_parent_run_id",
+                "x_agent_id",
+                "x_model",
+                "x_tokens_in",
+                "x_tokens_out",
+                "x_blocked",
+                "x_cost_basis",
+                "x_outcome",
+                "x_unit",
+                "x_tool_calls",
+                "x_key_id",
+                "x_block_reason",
+            ]
+        );
+    }
+
     /// Rendering is deterministic, or the gate is a coin toss.
     #[test]
     fn rendering_is_stable_across_calls() {
