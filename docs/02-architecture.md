@@ -124,8 +124,11 @@ Tool-call signature: `hash(tool_name + canonicalized args)` (sorted keys, normal
 ## 8. Money: accounting and pricing
 
 - Cost = input×p_in + output×p_out + cache_read×p_cr + cache_write×p_cw. Cache must be priced separately (read ~10% of input, write ~125% — otherwise the error is off by a large multiple).
-- `model_prices` is versioned (`effective_from`); historical reports use the price in effect at call time.
-- Unknown model → fallback: warn + price at the most expensive known model, or block.
+- What ships (this section's first plan, a versioned `model_prices` table with `effective_from` and a choice between pricing an unknown model at the most expensive known one or blocking it, was not built):
+  - The price book is one table compiled into the gateway (`crates/gateway/src/pricebook.rs`), one rate per model id, with the vendor page and the date each rate was read beside it. It is not versioned: a call is priced at the rate the running binary holds, and a report over older calls reads the cost each call was settled at, which the trace already carries, rather than re-pricing it.
+  - An operator can replace a built-in row or add one with `TOKENFUSE_PRICE_BOOK`, a JSON file of rows in the published book's own shape (`contracts/tokenfuse-constants.json`, `price_book.models`), read once at startup. A set but unusable file stops the gateway (exit 2).
+  - A model id the book (built-in rows plus the operator's file) has no row for is priced at a fixed fallback of USD 15 input / 75 output per million tokens (1.50 cache read, 18.75 cache write), the conservative direction for a cap (ADR-8). The fallback cannot be changed from the operator's file. The call is never blocked for being unknown.
+  - Every metered answer, streamed or not, carries `x-fuse-price: known` or `fallback`, and the first fallback-priced call of each model id is logged once at warn.
 
 ## 9. Failure modes
 
