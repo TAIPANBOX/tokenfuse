@@ -35,6 +35,13 @@ type Run = {
   // price basis at all (older than v1.8.0, so possibly the fallback too).
   fallback_calls?: number;
   basis_unreported_calls?: number;
+  // Invariant 87. Calls the gateway forwarded although its identity check
+  // would have refused them (TOKENFUSE_IDENTITY_STRICT=warn): spent, and
+  // filed under the agent id they claimed, so without this the run reads as
+  // an honest one. last_identity_reason is the gateway's own word for why
+  // ("agent_id_not_allowed", ...), or "" when the Cloud did not recognise it.
+  identity_warned?: number;
+  last_identity_reason?: string;
 };
 type ModelCalls = { model: string; calls: number };
 type Summary = {
@@ -748,7 +755,12 @@ export default function Page() {
                             ) : isRefusal(r.last_decision) ? (
                               <span
                                 className="pill crit"
-                                title={`latest call refused: ${r.last_decision}`}
+                                title={
+                                  `latest call refused: ${r.last_decision}` +
+                                  (r.last_decision === "identity_mismatch" && r.last_identity_reason
+                                    ? ` (${r.last_identity_reason})`
+                                    : "")
+                                }
                               >
                                 refused · {refusalLabel(r.last_decision!)}
                               </span>
@@ -758,6 +770,17 @@ export default function Page() {
                               <span className="pill near">near cap</span>
                             ) : (
                               <span className="pill live">live</span>
+                            )}
+                            {(r.identity_warned || 0) > 0 && (
+                              <>
+                                {" "}
+                                <span
+                                  className="pill near"
+                                  title={`${r.identity_warned} call(s) forwarded although the identity check would have refused them (warn mode)${r.last_identity_reason ? ": " + r.last_identity_reason : ""}`}
+                                >
+                                  identity · warn
+                                </span>
+                              </>
                             )}
                           </td>
                           <td>
