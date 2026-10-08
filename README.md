@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.7.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1725-brightgreen)
+![tests](https://img.shields.io/badge/tests-1731-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -284,7 +284,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 🧩 **Policies as code (WASM)**: custom rules in any language, sandboxed.
 - 🕰️ **Backtesting**: replay a candidate budget/step policy over past (Parquet) traffic to see what it would have blocked and saved, before enforcing it.
 - ⚡ **Semantic cache**: repeated questions served for **$0**.
-- 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call - blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend. Every row carries `x_key_id`, the client credential the call was made with, and a blocked row names its Breaker reason in `x_block_reason`; a call refused for identity (`identity_mismatch`) is filed under `key:<key_id>`, never under the agent id it claimed, so an impersonation's refusals never land on its victim. The Cloud files the same refusals the same way, in `/v1/agents`, `/v1/spend` and `/v1/owners`, and never names the victim on an incident for them. The column list is published in `contracts/tokenfuse-constants.json` (`focus_export.columns`).
+- 🧾 **FOCUS export**: `tokenfuse focus-export --traces <dir> --out focus.csv` turns the Parquet trace into a FinOps [FOCUS](https://focus.finops.org/)-format CSV, one row per call - blocked calls stay in as `BilledCost=0` / `x_blocked=true` rows rather than being dropped, so the enforcement savings show up in the same FinOps tooling a bank already points at its cloud spend. Every row carries `x_key_id`, the client credential the call was made with, and a blocked row names its Breaker reason in `x_block_reason`; a call refused for identity (`identity_mismatch`) is filed under `key:<key_id>`, never under the agent id it claimed, so an impersonation's refusals never land on its victim. The Cloud files the same refusals the same way, in `/v1/agents`, `/v1/spend` and `/v1/owners`, and never names the victim on an incident for them. A call the identity check would refuse but `TOKENFUSE_IDENTITY_STRICT=warn` forwarded stays an ordinary spent row under the id it claimed, and says so: its `x_identity_reason` names the check that failed (also set on a refusal for identity), the Cloud counts it on the run and the fleet, and the dashboard marks the run `identity · warn`. The column list is published in `contracts/tokenfuse-constants.json` (`focus_export.columns`).
 - 🛠️ **Tool-run metric**: counts the tool calls (`tool_use` blocks / `tool_calls` arrays) the model emits per LLM call, for both Anthropic and OpenAI shapes, streaming and non-streaming alike. Rides the trace as a new nullable `tool_calls` column (schema-evolution safe, like every prior addition), as `x_tool_calls` in FOCUS export, and rolls up into the Cloud dashboard's Runs table and summary tile. Observed only in this release: no budget, no enforcement, just a count (see [docs/21](docs/21-tool-runs.md)).
 
 **Also hardens your agents**
@@ -763,7 +763,7 @@ These routes list every run's budget and spend, list key ids, enumerate agent id
 | Env var | Default | Meaning |
 |---|---|---|
 | `TOKENFUSE_IDENTITY_MAP` | unset ⇒ **off** | Path to a JSON map with three sections: `units` (each optionally carrying `budget_usd_month`), `keys` (which `key_id` belongs to which unit, and which `agent://` ids it may present), `prefixes` (attribution fallback for unkeyed traffic; a caller that DID present a known key with no `keys` entry also lands here, and under strict that is refused rather than letting it pick its own unit by header). Set-but-unusable refuses to start, same posture as `TOKENFUSE_CLIENT_KEYS`. |
-| `TOKENFUSE_IDENTITY_STRICT` | `enforce` | `off \| warn \| enforce`, governing the key↔agent binding check AND whether a header may contradict a chain a delegation token proved: `warn` lets the call through with `x-fuse-identity: would-block=<reason>`; `enforce` returns `403` with `"type": "identity_mismatch"`. Unit budgets follow `TOKENFUSE_MODE` like every other budget. |
+| `TOKENFUSE_IDENTITY_STRICT` | `enforce` | `off \| warn \| enforce`, governing the key↔agent binding check AND whether a header may contradict a chain a delegation token proved: `warn` lets the call through with `x-fuse-identity: would-block=<reason>` and the same reason on its trace row (`identity_reason`), its FOCUS row (`x_identity_reason`) and in the Cloud; `enforce` returns `403` with `"type": "identity_mismatch"`. Unit budgets follow `TOKENFUSE_MODE` like every other budget. |
 
 ```json
 {

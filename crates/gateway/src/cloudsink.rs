@@ -1411,6 +1411,7 @@ mod tests {
             tools_offered: None,
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
+            identity_reason: None,
         }
     }
 
@@ -1450,6 +1451,25 @@ mod tests {
         for (k, val) in plain {
             assert_eq!(&rec[k], val, "field {k} must survive the flatten unchanged");
         }
+    }
+
+    /// Invariant 87: a record carrying the identity check's finding puts it
+    /// on the wire as `identity_reason`; a record without one sends nothing,
+    /// so the wire of every other call is byte for byte what it was.
+    #[test]
+    fn the_wire_carries_an_identity_finding_only_when_there_is_one() {
+        let owners = HashMap::new();
+        let mut warned = one_record();
+        warned.identity_reason = Some("agent_id_not_allowed".into());
+        let plain = one_record();
+        let v = serde_json::to_value(Batch {
+            records: wire(&[warned, plain], &owners, None),
+        })
+        .unwrap();
+        assert_eq!(v["records"][0]["identity_reason"], "agent_id_not_allowed");
+        assert_eq!(v["records"][0].as_object().unwrap().len(), 18);
+        assert!(v["records"][1].get("identity_reason").is_none());
+        assert_eq!(v["records"][1].as_object().unwrap().len(), 17);
     }
 
     /// Invariant 86: an admitted call's record names the basis it was charged

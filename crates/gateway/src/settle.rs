@@ -198,6 +198,10 @@ pub struct CallAttribution {
     pub tools_offered: Option<u32>,
     pub tools_would_prune: Option<u32>,
     pub pruned_schema_tokens_est: Option<u64>,
+    /// The reason the identity check would have refused this call, when
+    /// `TOKENFUSE_IDENTITY_STRICT=warn` forwarded it anyway (invariant 87).
+    /// `None` for every call the check passed or did not run on.
+    pub identity_reason: Option<String>,
 }
 
 /// A reservation kept outstanding on purpose (D7): the request was handed to the provider and
@@ -377,6 +381,11 @@ impl SettleGuard {
     pub fn step(&self) -> u32 {
         self.step
     }
+    /// The call's warn-mode identity finding (invariant 87), for a row the
+    /// handler writes beside the guard's own `allow` row.
+    pub fn identity_reason(&self) -> Option<String> {
+        self.attribution.identity_reason.clone()
+    }
     pub fn state(&self) -> CallOutcome {
         self.state
     }
@@ -537,6 +546,7 @@ impl SettleGuard {
             tools_offered: a.tools_offered,
             tools_would_prune: a.tools_would_prune,
             pruned_schema_tokens_est: a.pruned_schema_tokens_est,
+            identity_reason: a.identity_reason.clone(),
         });
     }
 }

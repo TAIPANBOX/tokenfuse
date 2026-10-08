@@ -46,6 +46,15 @@
 //!     (invariant 81), so non-empty exactly when `x_blocked` is `true`;
 //!     `""` on every other row, including a policy plane's own refusal
 //!     (`wardryx_deny`/`wardryx_hold`), which is not a Breaker block.
+//!   - `x_identity_reason`: the identity check's finding (invariant 87),
+//!     `CallRecord.identity_reason`: on a row refused for identity, which
+//!     check refused it (`x_block_reason` says only `identity_mismatch`); on
+//!     a row `TOKENFUSE_IDENTITY_STRICT=warn` forwarded anyway, the reason it
+//!     would have been refused. Such a forwarded row is still an admitted,
+//!     spent call filed under the agent id it claimed, as warn mode records
+//!     what it would do without doing it; this column is how a reader tells
+//!     it from an honest one. `""` on every other row, and for a row from a
+//!     trace file written before the column existed.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -139,10 +148,13 @@ struct FocusRecord {
     /// resolved server-side, never a header). `""` when client keys are off
     /// and for a row written before the trace carried the column.
     key_id: String,
+    /// The identity check's finding (`CallRecord::identity_reason`,
+    /// invariant 87); `""` when it found nothing or the row predates it.
+    identity_reason: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 28] = [
+const HEADER: [&str; 29] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -173,6 +185,8 @@ const HEADER: [&str; 28] = [
     // columns above by position keeps reading them.
     "x_key_id",
     "x_block_reason",
+    // Invariant 87: appended after them, same rule.
+    "x_identity_reason",
 ];
 
 /// The prefix a row refused for identity is filed under, ahead of the key id
@@ -250,7 +264,8 @@ async fn load_records(
          coalesce(outcome, '') as outcome, \
          coalesce(unit, '') as unit, \
          cast(tool_calls as bigint) as tool_calls, \
-         coalesce(key_id, '') as key_id \
+         coalesce(key_id, '') as key_id, \
+         coalesce(identity_reason, '') as identity_reason \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -317,6 +332,7 @@ async fn load_records(
                     Some(tool_calls.value(i).max(0) as u32)
                 },
                 key_id: str_at(b.column(12).as_ref(), i),
+                identity_reason: str_at(b.column(13).as_ref(), i),
             });
         }
     }
@@ -407,8 +423,8 @@ fn filed_under(rec: &FocusRecord) -> (String, String) {
     }
 }
 
-/// Project one trace row into the 28 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 28] {
+/// Project one trace row into the 29 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 29] {
     let blocked = is_blocked_decision(&rec.decision);
     // Non-empty exactly when `x_blocked` is true: the Breaker reason's own
     // wire string, which is what `decision` holds on a blocked row.
@@ -458,6 +474,7 @@ fn to_row(rec: &FocusRecord) -> [String; 28] {
         rec.tool_calls.map(|n| n.to_string()).unwrap_or_default(), // x_tool_calls
         rec.key_id.clone(),                                        // x_key_id
         block_reason,                                              // x_block_reason
+        rec.identity_reason.clone(),                               // x_identity_reason
     ]
 }
 
@@ -783,6 +800,7 @@ mod tests {
             tools_offered: None,
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
+            identity_reason: None,
         }
     }
 
@@ -855,23 +873,23 @@ mod tests {
             "ChargeDescription,ProviderName,PublisherName,InvoiceIssuerName,ServiceName,",
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
-            "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason\n",
+            "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason,x_identity_reason\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,\n",
+            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,,\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled,,,,,\n",
+            "0,0,false,settled,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked,,,,,budget_exceeded\n",
+            "blocked,,,,,budget_exceeded,\n",
         );
         assert_eq!(got, want);
 

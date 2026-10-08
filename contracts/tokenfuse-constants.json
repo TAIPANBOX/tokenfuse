@@ -172,7 +172,8 @@
       "x_unit",
       "x_tool_calls",
       "x_key_id",
-      "x_block_reason"
+      "x_block_reason",
+      "x_identity_reason"
     ]
   },
   "generated_by": "tokenfuse constants (crates/gateway/src/constants.rs)",
@@ -880,6 +881,11 @@
         "name": "pruned_schema_tokens_est",
         "nullable": true,
         "type": "UInt64"
+      },
+      {
+        "name": "identity_reason",
+        "nullable": true,
+        "type": "Utf8"
       }
     ],
     "write_schema": [
@@ -977,6 +983,11 @@
         "name": "pruned_schema_tokens_est",
         "nullable": true,
         "type": "UInt64"
+      },
+      {
+        "name": "identity_reason",
+        "nullable": true,
+        "type": "Utf8"
       }
     ]
   }

@@ -304,9 +304,14 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1725 passing** (core 372, dpop 21, delegation 60,
-gateway 996, cloud 275, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Cloud grew by 8
+`cargo test --all` runs **1731 passing** (core 372, dpop 21, delegation 60,
+gateway 999, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 3
+and cloud by 3 with invariant 87 (a call forwarded under identity warn mode is
+marked in the trace, the export and the Cloud: 2 in `gateway::proxy`, 1 in
+`gateway::cloudsink`, 2 in `cloud::store`, 1 in
+`crates/cloud/tests/it/ingest.rs`; 2026-10-08, counted by hand and checked by
+CI's `stated-numbers.sh`). Cloud grew by 8
 and gateway by 2 with invariant 86 (a refused run and a fallback-priced call
 are visible in the fleet view: 7 in `cloud::store`, 1 in
 `crates/cloud/tests/it/ingest.rs`, 1 in `gateway::cloudsink`, 1 in

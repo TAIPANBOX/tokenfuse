@@ -939,6 +939,27 @@ run_case "price-book-route: no bound on the caller-chosen ids listed" fail \
 	"$(py 'edit("crates/gateway/src/pricebookreport.rs", ".take(MAX_FALLBACK_MODELS_SHOWN)", ".take(usize::MAX)")')" \
 	"caller_chosen_ids_are_bounded_in_count_and_length ... FAILED"
 
+# --- invariant 87: a warn-mode identity mismatch is marked -----------------
+#
+# Not a scripts/*.sh gate: held by cargo test. The first mutant loses the
+# reason between the forwarded call's attribution and its allow row; the
+# second drops the export column's value; the third lets the Cloud show a
+# reason that is not one of the gateway's own words.
+run_case "warn-identity: the forwarded call's row loses the reason" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_warn_mode_identity_mismatch_is_marked_in_the_trace_and_the_export" \
+	"$(py 'edit("crates/gateway/src/settle.rs", "identity_reason: a.identity_reason.clone(),", "identity_reason: None,")')" \
+	"a_warn_mode_identity_mismatch_is_marked_in_the_trace_and_the_export ... FAILED"
+
+run_case "warn-identity: the export drops the reason" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_refusal_for_identity_names_its_reason_in_the_export" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "        rec.identity_reason.clone(),                               // x_identity_reason", "        String::new(),                                             // x_identity_reason")')" \
+	"a_refusal_for_identity_names_its_reason_in_the_export ... FAILED"
+
+run_case "warn-identity: the Cloud shows a reason outside the vocabulary" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::an_identity_reason_outside_the_vocabulary_is_never_shown" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if IDENTITY_REASONS.contains(&reason) {", "if true || IDENTITY_REASONS.contains(&reason) {")')" \
+	"an_identity_reason_outside_the_vocabulary_is_never_shown ... FAILED"
+
 # --- invariant 86: a refused run and a fallback price are visible ----------
 #
 # Not a scripts/*.sh gate: the folds are held by cargo test. The first mutant

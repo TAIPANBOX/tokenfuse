@@ -915,6 +915,11 @@ async fn handle_call(
         )
     };
     let mut identity_header: Option<String> = None;
+    // Invariant 87: the reason the identity check would refuse this call,
+    // set only when warn mode forwards it anyway, and written onto every
+    // trace row this call produces, so the trace, the FOCUS export and the
+    // Cloud can tell it from an honest call (the response header alone could).
+    let mut identity_reason: Option<String> = None;
     // A PROVEN chain names an actor, and a header naming a different one is a
     // contradiction the caller chose. `chainproof::resolve` already refuses the
     // same contradiction for the declared CHAIN; this is that rule one field
@@ -945,6 +950,7 @@ async fn handle_call(
                 // allowed through.
                 st.keystats.record_identity_mismatch(&key_id);
                 identity_header = Some(format!("would-block={}", mismatch.reason));
+                identity_reason = Some(mismatch.reason.to_string());
             }
             StrictMode::Enforce => {
                 st.keystats.record_identity_mismatch(&key_id);
@@ -978,6 +984,7 @@ async fn handle_call(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: Some(mismatch.reason.to_string()),
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -1083,6 +1090,7 @@ async fn handle_call(
             tools_offered: None,
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
+            identity_reason: identity_reason.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1149,6 +1157,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1278,6 +1287,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1365,6 +1375,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1405,6 +1416,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1472,6 +1484,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1612,6 +1625,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1641,6 +1655,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -1720,6 +1735,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -1773,6 +1789,7 @@ async fn handle_call(
             tools_offered,
             tools_would_prune,
             pruned_schema_tokens_est,
+            identity_reason: identity_reason.clone(),
         },
         unit_reservation,
     );
@@ -1812,6 +1829,7 @@ async fn handle_call(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: identity_reason.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -2412,6 +2430,7 @@ async fn buffered_managed(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: guard.identity_reason(),
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
@@ -7417,6 +7436,106 @@ pub(crate) mod tests {
             !text.contains("fraud/bot1"),
             "the agent id the gateway refused still reaches the export:\n{text}"
         );
+    }
+
+    /// Export the trace `st` wrote into `dir` and read it back.
+    async fn export_rows(dir: &std::path::Path) -> Vec<crate::focusexport::ExportRow> {
+        let out = dir.join("focus.csv");
+        crate::focusexport::run(&crate::focusexport::Args {
+            traces: Some(dir.to_str().unwrap().to_string()),
+            out: Some(out.to_str().unwrap().to_string()),
+            from: None,
+            to: None,
+        })
+        .await
+        .expect("the trace the gateway wrote exports");
+        let text = std::fs::read_to_string(&out).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        crate::focusexport::parse_export_csv(&text)
+    }
+
+    /// Invariant 87. `TOKENFUSE_IDENTITY_STRICT=warn` forwards a call whose
+    /// credential may not speak as the agent it named, and until now its
+    /// trace row and export row read exactly like an honest allowed call:
+    /// only the response's `x-fuse-identity` said otherwise. The row now
+    /// carries the reason the check would have refused it.
+    #[tokio::test]
+    async fn a_warn_mode_identity_mismatch_is_marked_in_the_trace_and_the_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-proxy-warn-identity-export-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Warn)
+            .with_sink(Arc::new(crate::sink::ParquetSink::new(&dir, 1).unwrap()));
+        let honest = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "warn-honest")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/payments")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(call(st.clone(), honest).await.status(), StatusCode::OK);
+        let mismatched = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "warn-mismatch")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(call(st.clone(), mismatched).await.status(), StatusCode::OK);
+        drop(st);
+
+        let rows = export_rows(&dir).await;
+        use crate::focusexport::col;
+        let warned = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "warn-mismatch")
+            .expect("the forwarded call has a row");
+        assert_eq!(col(warned, "x_identity_reason"), "agent_id_not_allowed");
+        assert_eq!(col(warned, "x_blocked"), "false", "warn forwards the call");
+        assert_eq!(col(warned, "x_block_reason"), "");
+        assert_eq!(col(warned, "x_key_id"), "treasury-bots");
+        let honest = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "warn-honest")
+            .expect("the honest call has a row");
+        assert_eq!(col(honest, "x_identity_reason"), "");
+    }
+
+    /// The same column on a refusal: `x_block_reason` says
+    /// `identity_mismatch`, and `x_identity_reason` now says which check
+    /// refused it, the finer reason invariant 81 left in the 403 alone.
+    #[tokio::test]
+    async fn a_refusal_for_identity_names_its_reason_in_the_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-proxy-enforce-identity-reason-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(crate::sink::ParquetSink::new(&dir, 1).unwrap()));
+        let refused = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "enforce-reason")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(
+            call(st.clone(), refused).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(st);
+        let rows = export_rows(&dir).await;
+        use crate::focusexport::col;
+        let row = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "enforce-reason")
+            .expect("the refusal has a row");
+        assert_eq!(col(row, "x_block_reason"), "identity_mismatch");
+        assert_eq!(col(row, "x_identity_reason"), "agent_id_not_allowed");
+        assert_eq!(col(row, "ResourceId"), "key:treasury-bots");
     }
 
     #[tokio::test]

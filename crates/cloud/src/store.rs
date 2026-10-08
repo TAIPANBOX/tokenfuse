@@ -246,7 +246,27 @@ pub struct CallRecord {
     /// guessed. Additive: `#[serde(default)]`.
     #[serde(default)]
     pub price_basis: String,
+    /// The gateway's identity finding on this call (invariant 87,
+    /// `crates/gateway/src/sink.rs::CallRecord::identity_reason`): on an
+    /// admitted call, the reason `TOKENFUSE_IDENTITY_STRICT=warn` would have
+    /// refused it; on a refusal for identity, which check refused it. Absent
+    /// on every other call and from an older gateway. Untrusted like every
+    /// field here: counted when present, shown only when it is a word of the
+    /// gateway's vocabulary ([`IDENTITY_REASONS`]).
+    #[serde(default)]
+    pub identity_reason: Option<String>,
 }
+
+/// The reasons the gateway's identity check gives (`identitymap.rs` and the
+/// proven-chain check in `proxy.rs`), the only strings the Cloud shows as a
+/// run's identity reason (invariant 87).
+const IDENTITY_REASONS: [&str; 5] = [
+    "agent_id_missing",
+    "agent_id_not_allowed",
+    "unit_chosen_by_agent_id",
+    "key_has_no_unit_binding",
+    "agent_id_contradicts_proven_chain",
+];
 
 /// One `/v1/run-spend` row (invariant 75): what a site's gateway needs to
 /// seed a run's spend after a restart, and nothing else from [`RunAgg`].
@@ -347,6 +367,17 @@ pub struct RunAgg {
     /// v1.7.0 the book had no row for most current model ids).
     #[serde(default)]
     pub basis_unreported_calls: u64,
+    /// Admitted calls the gateway forwarded although its identity check
+    /// would have refused them (`TOKENFUSE_IDENTITY_STRICT=warn`), invariant
+    /// 87. Such a call is spent and filed under the agent id it claimed, as
+    /// the gateway's own trace and export file it; this count is what tells
+    /// it from an honest call.
+    #[serde(default)]
+    pub identity_warned: u64,
+    /// The identity reason of the most recent such record pushed, warned or
+    /// refused, when it is a word of the gateway's vocabulary; `""` otherwise.
+    #[serde(default)]
+    pub last_identity_reason: String,
 }
 
 /// One model id and how many admitted calls were charged at the fallback
@@ -387,6 +418,9 @@ pub struct Summary {
     /// `fallback_calls` per model id, most calls first, then by id; bounded
     /// at 256 ids plus the `(other models)` bucket.
     pub fallback_models: Vec<ModelCalls>,
+    /// Admitted calls forwarded under identity warn mode (invariant 87),
+    /// exact over the org's whole ingest history.
+    pub identity_warned_calls: u64,
 }
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
@@ -774,6 +808,9 @@ struct OrgTotals {
     basis_unreported_calls: u64,
     #[serde(default)]
     fallback_models: HashMap<String, u64>,
+    /// Invariant 87, exact like `calls`.
+    #[serde(default)]
+    identity_warned_calls: u64,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -1791,6 +1828,21 @@ impl Store {
                             agg.last_decision = r.decision.clone();
                             agg.last_decision_millis = r.ts_millis;
                         }
+                    }
+                    // Invariant 87: a call the identity check would have
+                    // refused, forwarded by warn mode, is counted on its run
+                    // and the fleet; its reason is shown only when it is the
+                    // gateway's own word.
+                    if let Some(reason) = r.identity_reason.as_deref().filter(|s| !s.is_empty()) {
+                        if matches!(r.decision.as_str(), "allow" | "cache_hit") {
+                            agg.identity_warned += 1;
+                            totals.identity_warned_calls += 1;
+                        }
+                        agg.last_identity_reason = if IDENTITY_REASONS.contains(&reason) {
+                            reason.to_string()
+                        } else {
+                            String::new()
+                        };
                     }
                     if r.decision == "allow" {
                         match r.price_basis.as_str() {
@@ -2851,6 +2903,7 @@ impl Store {
                 .collect();
             models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)));
             sum.fallback_models = models;
+            sum.identity_warned_calls = totals.identity_warned_calls;
         }
         sum
     }
@@ -5664,6 +5717,64 @@ mod tests {
             Some(&1),
             "a unit's cap firing is evidence: {dc:?}"
         );
+    }
+
+    // --- invariant 87: a warn-mode identity mismatch is marked ------------
+
+    /// A call the gateway forwarded although its identity check would have
+    /// refused it (`TOKENFUSE_IDENTITY_STRICT=warn`), as the gateway pushes
+    /// it: `allow`, the claimed agent id, the credential, and the reason.
+    fn warned(run: &str, reason: &str, ts: i64) -> CallRecord {
+        serde_json::from_value(serde_json::json!({
+            "ts_millis": ts,
+            "run_id": run,
+            "model": "claude-sonnet-5",
+            "decision": "allow",
+            "cost_microusd": 7_000,
+            "step": 1,
+            "agent_id": VICTIM,
+            "key_id": IMPOSTER_KEY,
+            "identity_reason": reason,
+        }))
+        .expect("the gateway's wire record deserializes")
+    }
+
+    /// The run says how many of its calls the identity check would have
+    /// refused, and the latest reason, so a warn-mode mismatch no longer
+    /// reads as an honest call; the fleet total counts them too.
+    #[test]
+    fn a_warn_mode_identity_mismatch_is_counted_on_the_run_and_the_fleet() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed("r1", "claude-sonnet-5", "allow", 7_000, 1, Some("known")),
+                warned("r1", "agent_id_not_allowed", 2),
+                warned("r1", "agent_id_contradicts_proven_chain", 3),
+            ],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["identity_warned"], 2, "{v}");
+        assert_eq!(
+            v["last_identity_reason"], "agent_id_contradicts_proven_chain",
+            "{v}"
+        );
+        assert_eq!(v["blocked"], 0, "warn forwarded them: {v}");
+        assert_eq!(v["spent_microusd"], 21_000, "and they were spent: {v}");
+        let sum = serde_json::to_value(s.summary("acme")).unwrap();
+        assert_eq!(sum["identity_warned_calls"], 2, "{sum}");
+    }
+
+    /// The reason is a word from the gateway's own fixed vocabulary; any other
+    /// string an ingest credential sends is counted as a mismatch and never
+    /// shown as its reason.
+    #[test]
+    fn an_identity_reason_outside_the_vocabulary_is_never_shown() {
+        let s = Store::new();
+        s.ingest("acme", &[warned("r1", "<img src=x onerror=alert(1)>", 1)]);
+        let v = run_json(&s, "r1");
+        assert_eq!(v["identity_warned"], 1, "{v}");
+        assert_eq!(v["last_identity_reason"], "", "{v}");
     }
 
     // --- invariant 86: a refused run and a fallback price are visible -----

@@ -509,8 +509,9 @@ mod tests {
     /// to the Breaker strings. The list is WRITTEN OUT, not read off the
     /// export's own header, for the reason `every_breaker_reason_reaches_the_artifact`
     /// gives: an expectation taken from the thing under test cannot fail.
-    /// The two columns invariant 81 appends are last, so a reader that
-    /// addresses the first 26 by position keeps reading them.
+    /// The two columns invariant 81 appends follow the first 26, and the one
+    /// invariant 87 appends follows them, so a reader that addresses the
+    /// earlier columns by position keeps reading them.
     #[test]
     fn the_focus_export_columns_are_published_in_export_order() {
         let doc = document();
@@ -551,6 +552,7 @@ mod tests {
                 "x_tool_calls",
                 "x_key_id",
                 "x_block_reason",
+                "x_identity_reason",
             ]
         );
     }
