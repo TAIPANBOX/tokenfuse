@@ -486,3 +486,45 @@ async fn an_identity_refusal_pushed_by_a_gateway_is_filed_under_its_key() {
         "the run is the credential's: {fleet}"
     );
 }
+
+/// Invariant 86, end to end: the gateway names the basis each admitted call
+/// was charged at (`price_basis`, wire-only, beside `owner`), and a run whose
+/// calls were refused says so. `/v1/runs` and `/v1/summary` serve both, which
+/// is what the dashboard's Runs table and fleet tile read.
+#[tokio::test]
+async fn refusals_and_fallback_prices_reach_the_runs_and_summary_reads() {
+    let store = Arc::new(Store::new());
+    let state = state_with(Arc::clone(&store));
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"r1","model":"claude-sonnet-6","decision":"allow","cost_microusd":52500,"step":1,"agent_id":"agent://acme/a","key_id":"k1","owner":"","price_basis":"fallback"},
+        {"ts_millis":200,"run_id":"r1","model":"claude-sonnet-6","decision":"identity_mismatch","cost_microusd":0,"step":2,"agent_id":"agent://acme/b","key_id":"k1","owner":""}
+    ]}"#;
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let runs = read(&state, "/v1/runs").await;
+    let r1 = runs
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["run_id"] == "r1"))
+        .unwrap_or_else(|| panic!("r1 in /v1/runs: {runs}"));
+    assert_eq!(r1["blocked"], 1, "{r1}");
+    assert_eq!(r1["last_decision"], "identity_mismatch", "{r1}");
+    assert_eq!(r1["fallback_calls"], 1, "{r1}");
+
+    let sum = read(&state, "/v1/summary").await;
+    assert_eq!(sum["fallback_calls"], 1, "{sum}");
+    assert_eq!(
+        sum["fallback_models"],
+        serde_json::json!([{"model": "claude-sonnet-6", "calls": 1}]),
+        "{sum}"
+    );
+}

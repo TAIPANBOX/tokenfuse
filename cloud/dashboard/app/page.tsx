@@ -24,8 +24,30 @@ type Run = {
   // claim. "" is the ordinary case, a run pushed by an unbound key. Optional
   // because a Cloud older than invariant 65 omits the key entirely.
   site?: string;
+  // Invariant 86. Calls the gateway refused on this run, and the decision of
+  // its latest call ("allow", "cache_hit" or a Breaker reason such as
+  // "identity_mismatch"). Optional: a Cloud older than v1.8.0 omits them,
+  // and the Status column then falls back to what it always showed.
+  blocked?: number;
+  last_decision?: string;
+  // Admitted calls the gateway charged at the fallback rate (the price book
+  // had no row for the model id), and admitted calls whose gateway named no
+  // price basis at all (older than v1.8.0, so possibly the fallback too).
+  fallback_calls?: number;
+  basis_unreported_calls?: number;
 };
-type Summary = { runs: number; calls: number; spent_microusd: number; tool_calls: number };
+type ModelCalls = { model: string; calls: number };
+type Summary = {
+  runs: number;
+  calls: number;
+  spent_microusd: number;
+  tool_calls: number;
+  // Invariant 86, exact over the org's whole ingest history. Absent on a
+  // Cloud older than v1.8.0, where the fallback tile then says so.
+  fallback_calls?: number;
+  basis_unreported_calls?: number;
+  fallback_models?: ModelCalls[];
+};
 type Bucket = { t: number; cost_microusd: number; calls: number; blocked: number };
 type Alert = {
   run_id: string;
@@ -107,6 +129,27 @@ type Incident = {
 
 const usd = (micro: number) => "$" + (micro / 1e6).toFixed(2);
 
+// A run's latest call was refused when its decision is anything but the two
+// admitted outcomes. The Cloud only reports decisions it trusts (invariant
+// 83), so this never shows a string a caller made up.
+const isRefusal = (d?: string) => !!d && d !== "allow" && d !== "cache_hit";
+
+// Breaker reason -> a short label for the Status pill; the raw wire string
+// stays in the tooltip. A reason this dashboard does not know the words for
+// shows as itself, which is honest rather than a guess.
+const REFUSAL_LABELS: Record<string, string> = {
+  budget_exceeded: "budget",
+  policy_violation: "policy",
+  loop_detected: "loop",
+  killed: "killed",
+  wasm_policy: "policy",
+  taint_blocked: "taint",
+  dlp_blocked: "dlp",
+  unit_budget_exceeded: "unit cap",
+  identity_mismatch: "identity",
+};
+const refusalLabel = (d: string) => REFUSAL_LABELS[d] || d;
+
 // Detector kind -> a readable label. Falls back to the raw wire string for a
 // kind this dashboard does not yet know the words for, which is honest
 // (the Cloud's own wording) rather than a guess.
@@ -162,6 +205,12 @@ function Sparkline({ buckets }: { buckets: Bucket[] }) {
   const max = Math.max(1, ...vals);
   const W = 600;
   const H = 100;
+  // Refused calls per bucket (Bucket.blocked, which /v1/series has always
+  // served and this chart never drew), as bars along the floor in the
+  // refusal colour, scaled on their own so one refusal is still visible
+  // beside a large spend line. Invariant 86.
+  const maxBlocked = Math.max(0, ...buckets.map((b) => b.blocked || 0));
+  const barW = Math.max(2, W / buckets.length - 2);
   const pts = vals
     .map((v, i) => {
       const x = (i / (vals.length - 1)) * W;
@@ -176,6 +225,21 @@ function Sparkline({ buckets }: { buckets: Bucket[] }) {
       <polygon points={`0,${H} ${pts} ${W},${H}`} fill="rgba(244,178,62,0.22)" />
       <polyline points={pts} fill="none" stroke="#f4b23e" strokeWidth="2.5" vectorEffect="non-scaling-stroke" />
       <circle cx={lastX} cy={lastY} r="3.5" fill="#ff574b" />
+      {maxBlocked > 0 &&
+        buckets.map((b, i) =>
+          b.blocked > 0 ? (
+            <rect
+              key={i}
+              x={(i / (buckets.length - 1)) * W - barW / 2}
+              y={H - (b.blocked / maxBlocked) * 28}
+              width={barW}
+              height={(b.blocked / maxBlocked) * 28}
+              fill="rgba(255,87,75,0.55)"
+            >
+              <title>{b.blocked} refused</title>
+            </rect>
+          ) : null,
+        )}
     </svg>
   );
 }
@@ -472,6 +536,12 @@ export default function Page() {
                 <span className="spent">spent {usd(summary.spent_microusd)}</span>
               </div>
               <Sparkline buckets={series} />
+              {series.some((b) => b.blocked > 0) && (
+                <div className="refusedlegend">
+                  <i /> refused calls ·{" "}
+                  {series.reduce((a, b) => a + (b.blocked || 0), 0)} in the last 15 min
+                </div>
+              )}
               {caps > 0 && (
                 <>
                   <div className={"fuse " + heatClass(fleetFrac, false)}>
@@ -532,6 +602,34 @@ export default function Page() {
                 <div className="n">{summary.tool_calls}</div>
                 <div className="s">all time - observed only</div>
               </div>
+              {/* Invariant 86: spend charged at the fallback rate, the
+                  conservative 15 / 75 USD per million tokens a gateway
+                  charges a model id its price book has no row for (up to
+                  five times a list price). All time, like the tiles above.
+                  A Cloud older than v1.8.0 does not report it, and the tile
+                  then says nothing rather than a zero that reads as clean. */}
+              {summary.fallback_calls !== undefined && (
+                <div className="card tile" style={{ gridColumn: "1 / -1" }}>
+                  <div className="k">Fallback-priced</div>
+                  <div
+                    className="n"
+                    style={summary.fallback_calls ? { color: "var(--amber)" } : undefined}
+                  >
+                    {summary.fallback_calls}
+                  </div>
+                  <div className="s">
+                    {summary.fallback_calls === 0
+                      ? "calls charged at the fallback rate · all time"
+                      : "calls charged at the fallback rate · " +
+                        (summary.fallback_models || [])
+                          .slice(0, 3)
+                          .map((m) => `${m.model} ×${m.calls}`)
+                          .join(" · ")}
+                    {(summary.basis_unreported_calls || 0) > 0 &&
+                      ` · ${summary.basis_unreported_calls} from gateways that name no basis`}
+                  </div>
+                </div>
+              )}
               {savings && (
                 <div className="card tile" style={{ gridColumn: "1 / -1" }}>
                   {/* SavingsAcc is the same all-time shape: a persisted,
@@ -588,6 +686,17 @@ export default function Page() {
                           </td>
                           <td>
                             <span className="rmodel">{r.model || "—"}</span>
+                            {(r.fallback_calls || 0) > 0 && (
+                              <>
+                                {" "}
+                                <span
+                                  className="pill near"
+                                  title={`${r.fallback_calls} call(s) charged at the fallback rate: the price book has no row for this model id`}
+                                >
+                                  fallback
+                                </span>
+                              </>
+                            )}
                           </td>
                           <td>
                             <span
@@ -625,12 +734,24 @@ export default function Page() {
                               </>
                             )}
                           </td>
-                          <td className="num">{r.calls}</td>
+                          <td className="num">
+                            {r.calls}
+                            {(r.blocked || 0) > 0 && (
+                              <div className="refused">{r.blocked} refused</div>
+                            )}
+                          </td>
                           <td className="num">{r.steps}</td>
                           <td className="num">{r.tool_calls}</td>
                           <td>
                             {r.killed ? (
                               <span className="pill dead">killed</span>
+                            ) : isRefusal(r.last_decision) ? (
+                              <span
+                                className="pill crit"
+                                title={`latest call refused: ${r.last_decision}`}
+                              >
+                                refused · {refusalLabel(r.last_decision!)}
+                              </span>
                             ) : budget > 0 && frac >= 1 ? (
                               <span className="pill crit">over cap</span>
                             ) : budget > 0 && frac >= 0.8 ? (

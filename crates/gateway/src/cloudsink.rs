@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::sink::{CallRecord, EventSink};
 use crate::state::AppState;
 use crate::unitledger::{month_key, SeedOutcome, UnitLedger};
-use tokenfuse_core::Microusd;
+use tokenfuse_core::{Microusd, PriceBook};
 
 /// How many records to buffer before an automatic flush.
 const BATCH: usize = 20;
@@ -193,6 +193,10 @@ pub struct CloudSink {
     buf: Mutex<Vec<CallRecord>>,
     queue: Arc<Queue>,
     unit_owners: Arc<HashMap<String, String>>,
+    /// The book this gateway prices calls with, to name each admitted call's
+    /// price basis on the wire (invariant 86). `None` names none, which the
+    /// Cloud reads as "not reported", the same as an older gateway.
+    prices: Option<Arc<PriceBook>>,
 }
 
 /// What one push needs, shared by the fast path, the drainer and the heartbeat.
@@ -263,6 +267,14 @@ struct WireRecord<'a> {
     /// `units[].owner` for `rec.unit` from the identity map, `""` when the
     /// map is off, the call resolved to no unit, or the unit names nobody.
     owner: &'a str,
+    /// Invariant 86: `known` or `fallback` for an admitted (`allow`) call,
+    /// the basis it was charged at, decided by the same book and the same
+    /// function as the answer's `x-fuse-price` (`pricebook::basis`); omitted
+    /// for every other decision (a refusal's figure is an avoided estimate,
+    /// not a charge) and when the sink holds no book. Wire-only, like `owner`:
+    /// the trace's sixteen columns do not change.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    price_basis: &'static str,
 }
 
 #[derive(Serialize)]
@@ -272,12 +284,20 @@ struct Batch<'a> {
 
 /// Every unit that names an owner, `unit -> owner`, taken from the identity
 /// map once at startup (`IdentityMap::unit_owners`).
-fn wire<'a>(records: &'a [CallRecord], owners: &'a HashMap<String, String>) -> Vec<WireRecord<'a>> {
+fn wire<'a>(
+    records: &'a [CallRecord],
+    owners: &'a HashMap<String, String>,
+    prices: Option<&PriceBook>,
+) -> Vec<WireRecord<'a>> {
     records
         .iter()
         .map(|rec| WireRecord {
             rec,
             owner: owners.get(&rec.unit).map(String::as_str).unwrap_or(""),
+            price_basis: match prices {
+                Some(book) if rec.decision == "allow" => crate::pricebook::basis(book, &rec.model),
+                _ => "",
+            },
         })
         .collect()
 }
@@ -314,6 +334,7 @@ impl CloudSink {
             buf: Mutex::new(Vec::new()),
             queue: Arc::new(Queue::default()),
             unit_owners: Arc::new(HashMap::new()),
+            prices: None,
         }
     }
 
@@ -323,6 +344,16 @@ impl CloudSink {
     /// than this field's reader is taken to mean.
     pub fn with_unit_owners(mut self, owners: HashMap<String, String>) -> Self {
         self.unit_owners = Arc::new(owners);
+        self
+    }
+
+    /// Hand the sink the price book calls are charged with, so each admitted
+    /// call's record names the basis it was charged at (invariant 86).
+    /// Chainable, called once in `main.rs` with the same book `AppState`
+    /// prices with; the book is fixed at startup, so the basis named at push
+    /// time is the basis the call was charged at.
+    pub fn with_price_book(mut self, prices: Arc<PriceBook>) -> Self {
+        self.prices = Some(prices);
         self
     }
 
@@ -356,13 +387,14 @@ impl CloudSink {
             self.drain();
             return;
         }
-        let (push, queue, owners) = (
+        let (push, queue, owners, prices) = (
             Arc::clone(&self.push),
             Arc::clone(&self.queue),
             Arc::clone(&self.unit_owners),
+            self.prices.clone(),
         );
         tokio::spawn(async move {
-            match push.post(&records, &owners).await {
+            match push.post(&records, &owners, prices.as_deref()).await {
                 PushOutcome::Accepted => {}
                 PushOutcome::Unencodable(e) => {
                     tracing::debug!("cloud telemetry encode failed: {e}")
@@ -393,10 +425,11 @@ impl CloudSink {
         {
             return;
         }
-        let (push, queue, owners) = (
+        let (push, queue, owners, prices) = (
             Arc::clone(&self.push),
             Arc::clone(&self.queue),
             Arc::clone(&self.unit_owners),
+            self.prices.clone(),
         );
         tokio::spawn(async move {
             loop {
@@ -404,7 +437,7 @@ impl CloudSink {
                 if chunk.is_empty() {
                     break;
                 }
-                match push.post(&chunk, &owners).await {
+                match push.post(&chunk, &owners, prices.as_deref()).await {
                     PushOutcome::Accepted => {
                         queue.replayed.fetch_add(chunk.len(), Ordering::SeqCst);
                     }
@@ -505,7 +538,7 @@ impl CloudSink {
         if !self.heartbeat_wait(interval).is_zero() {
             return true;
         }
-        match self.push.post(&[], &self.unit_owners).await {
+        match self.push.post(&[], &self.unit_owners, None).await {
             PushOutcome::Accepted => true,
             PushOutcome::Refused(status) => {
                 report_refusal(&self.push.reported, status, &self.push.url);
@@ -537,9 +570,14 @@ impl Pusher {
     /// both as "reached the Cloud" - `last_reached_millis` is updated here,
     /// once, so `ship`, `drain` and the heartbeat all share one definition of
     /// "reached" without each remembering to mark it.
-    async fn post(&self, records: &[CallRecord], owners: &HashMap<String, String>) -> PushOutcome {
+    async fn post(
+        &self,
+        records: &[CallRecord],
+        owners: &HashMap<String, String>,
+        prices: Option<&PriceBook>,
+    ) -> PushOutcome {
         let payload = match serde_json::to_vec(&Batch {
-            records: wire(records, owners),
+            records: wire(records, owners, prices),
         }) {
             Ok(p) => p,
             Err(e) => return PushOutcome::Unencodable(e),
@@ -1397,7 +1435,7 @@ mod tests {
             "user://bank.example/olena".to_string(),
         )]);
         let v = serde_json::to_value(Batch {
-            records: wire(&[r.clone()], &owners),
+            records: wire(&[r.clone()], &owners, None),
         })
         .unwrap();
         let rec = v["records"][0].as_object().unwrap();
@@ -1414,6 +1452,42 @@ mod tests {
         }
     }
 
+    /// Invariant 86: an admitted call's record names the basis it was charged
+    /// at, by the same rule as `x-fuse-price`; a refused call's names none,
+    /// since its figure is an avoided estimate, not a charge.
+    #[test]
+    fn the_wire_record_names_the_basis_an_admitted_call_was_charged_at() {
+        let book = PriceBook::new().with(
+            "listed",
+            tokenfuse_core::ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75),
+        );
+        let owners = HashMap::new();
+        let mut known = one_record();
+        known.model = "listed".into();
+        let mut fallback = one_record();
+        fallback.model = "unlisted".into();
+        let mut refused = one_record();
+        refused.model = "unlisted".into();
+        refused.decision = "budget_exceeded".into();
+        let v = serde_json::to_value(Batch {
+            records: wire(&[known, fallback, refused], &owners, Some(&book)),
+        })
+        .unwrap();
+        assert_eq!(v["records"][0]["price_basis"], "known");
+        assert_eq!(v["records"][1]["price_basis"], "fallback");
+        assert!(
+            v["records"][2].get("price_basis").is_none(),
+            "a refusal is not a charge: {}",
+            v["records"][2]
+        );
+        let rec = v["records"][0].as_object().unwrap();
+        assert_eq!(
+            rec.len(),
+            18,
+            "sixteen record fields, owner, price_basis: {rec:?}"
+        );
+    }
+
     #[test]
     fn a_unit_without_an_owner_and_a_record_without_a_unit_carry_an_empty_owner() {
         let owners = HashMap::from([(
@@ -1425,7 +1499,7 @@ mod tests {
         let mut lending = one_record();
         lending.unit = "lending".into();
         let v = serde_json::to_value(Batch {
-            records: wire(&[lending], &owners),
+            records: wire(&[lending], &owners, None),
         })
         .unwrap();
         let rec = v["records"][0].as_object().unwrap();
@@ -1436,7 +1510,7 @@ mod tests {
         let mut no_unit = one_record();
         no_unit.unit = String::new();
         let v = serde_json::to_value(Batch {
-            records: wire(&[no_unit], &owners),
+            records: wire(&[no_unit], &owners, None),
         })
         .unwrap();
         let rec = v["records"][0].as_object().unwrap();

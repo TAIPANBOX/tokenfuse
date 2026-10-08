@@ -939,6 +939,27 @@ run_case "price-book-route: no bound on the caller-chosen ids listed" fail \
 	"$(py 'edit("crates/gateway/src/pricebookreport.rs", ".take(MAX_FALLBACK_MODELS_SHOWN)", ".take(usize::MAX)")')" \
 	"caller_chosen_ids_are_bounded_in_count_and_length ... FAILED"
 
+# --- invariant 86: a refused run and a fallback price are visible ----------
+#
+# Not a scripts/*.sh gate: the folds are held by cargo test. The first mutant
+# lets a late record replace a later call's decision; the second counts a
+# refused call as a fallback charge; the third has the gateway name a basis on
+# a refusal, whose figure is an avoided estimate and not a charge.
+run_case "visible: a late record replaces a later call's decision" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::the_latest_decision_is_the_latest_call_not_the_last_pushed" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if r.ts_millis >= agg.last_decision_millis {", "if true || r.ts_millis >= agg.last_decision_millis {")')" \
+	"the_latest_decision_is_the_latest_call_not_the_last_pushed ... FAILED"
+
+run_case "visible: a refused call counted as a fallback charge" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::a_refused_call_or_an_unknown_basis_is_never_a_fallback_charge" \
+	"$(py 'edit("crates/cloud/src/store.rs", "                    if r.decision == \"allow\" {\n", "                    if !r.decision.is_empty() {\n")')" \
+	"a_refused_call_or_an_unknown_basis_is_never_a_fallback_charge ... FAILED"
+
+run_case "visible: the gateway names a basis on a refusal" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact cloudsink::tests::the_wire_record_names_the_basis_an_admitted_call_was_charged_at" \
+	"$(py 'edit("crates/gateway/src/cloudsink.rs", "Some(book) if rec.decision == \"allow\" =>", "Some(book) =>")')" \
+	"the_wire_record_names_the_basis_an_admitted_call_was_charged_at ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

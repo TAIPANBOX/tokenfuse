@@ -236,6 +236,16 @@ pub struct CallRecord {
     /// so an older gateway still ingests.
     #[serde(default)]
     pub key_id: String,
+    /// The basis the gateway charged this call at, `"known"` (a row in the
+    /// price book) or `"fallback"` (the conservative fallback rate), the
+    /// same word as the answer's `x-fuse-price` (invariant 79). A wire-only
+    /// key the gateway's `CloudSink` puts beside `owner`, never a trace
+    /// column; set only on an admitted (`allow`) call, the one kind whose
+    /// cost is a charge. Invariant 86. `""`, absent, or any other word: not
+    /// reported (a gateway older than this field), counted as such and never
+    /// guessed. Additive: `#[serde(default)]`.
+    #[serde(default)]
+    pub price_basis: String,
 }
 
 /// One `/v1/run-spend` row (invariant 75): what a site's gateway needs to
@@ -312,7 +322,50 @@ pub struct RunAgg {
     /// pre-I1 snapshots still load.
     #[serde(default)]
     pub tool_calls: u64,
+    /// Calls the gateway refused on this run, by a reason the Cloud trusts
+    /// (invariant 83). Invariant 86: the dashboard showed a run whose every
+    /// call was refused as "live", with nothing spent; this and
+    /// `last_decision` are what let it say refused instead. `serde(default)`
+    /// so an older snapshot loads with zero.
+    #[serde(default)]
+    pub blocked: u64,
+    /// The decision of this run's latest call by its own timestamp, `allow`,
+    /// `cache_hit` or a Breaker reason; a record pushed late never replaces
+    /// a later call's decision, and a decision the Cloud does not trust is
+    /// never shown here. `""` until a trusted decision is seen.
+    #[serde(default)]
+    pub last_decision: String,
+    /// The timestamp `last_decision` was taken at.
+    #[serde(default)]
+    pub last_decision_millis: i64,
+    /// Admitted calls the gateway charged at the fallback rate (no row for
+    /// the model id), invariant 86.
+    #[serde(default)]
+    pub fallback_calls: u64,
+    /// Admitted calls whose gateway named no price basis (one older than
+    /// v1.8.0, which may well have charged them at the fallback: before
+    /// v1.7.0 the book had no row for most current model ids).
+    #[serde(default)]
+    pub basis_unreported_calls: u64,
 }
+
+/// One model id and how many admitted calls were charged at the fallback
+/// rate for it (invariant 86).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ModelCalls {
+    /// The model id as the gateway recorded it, or [`OTHER_FALLBACK_MODELS`]
+    /// for the ids past the per-org bound.
+    pub model: String,
+    pub calls: u64,
+}
+
+/// How many distinct model ids the per-org fallback fold keeps. Model ids
+/// are caller-chosen, so the fold is bounded; past it, calls are counted
+/// under [`OTHER_FALLBACK_MODELS`], never dropped.
+const MAX_FALLBACK_MODEL_KEYS: usize = 256;
+
+/// The bucket for fallback-priced calls past [`MAX_FALLBACK_MODEL_KEYS`].
+pub const OTHER_FALLBACK_MODELS: &str = "(other models)";
 
 /// Org-wide totals. `calls`/`spent_microusd` are exact across the org's
 /// entire ingest history; `runs` is the currently-retained distinct run
@@ -326,6 +379,14 @@ pub struct Summary {
     /// docs/21-tool-runs.md), mirroring `calls`/`spent_microusd` above -
     /// exact, unaffected by `MAX_RUNS_PER_ORG` eviction.
     pub tool_calls: u64,
+    /// Admitted calls charged at the fallback rate across the org's whole
+    /// ingest history (invariant 86), exact like `calls`.
+    pub fallback_calls: u64,
+    /// Admitted calls whose gateway named no price basis, exact.
+    pub basis_unreported_calls: u64,
+    /// `fallback_calls` per model id, most calls first, then by id; bounded
+    /// at 256 ids plus the `(other models)` bucket.
+    pub fallback_models: Vec<ModelCalls>,
 }
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
@@ -702,6 +763,17 @@ struct OrgTotals {
     /// per-run source to recompute this dimension from for old snapshots.
     #[serde(default)]
     tool_calls: u64,
+    /// Invariant 86, exact like `calls`: admitted calls charged at the
+    /// fallback rate, admitted calls with no basis reported, and the first
+    /// per model (bounded, see [`MAX_FALLBACK_MODEL_KEYS`]). `serde(default)`
+    /// so an older snapshot loads with zeros: there is no earlier record of
+    /// the basis to backfill from.
+    #[serde(default)]
+    fallback_calls: u64,
+    #[serde(default)]
+    basis_unreported_calls: u64,
+    #[serde(default)]
+    fallback_models: HashMap<String, u64>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -1705,6 +1777,41 @@ impl Store {
                     }
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
+                    }
+                    // Invariant 86: what the dashboard needs to say a run
+                    // was refused, and which admitted calls were charged at
+                    // the fallback rate. Both read only what the Cloud trusts:
+                    // a known decision (invariant 83), and a basis that is one
+                    // of the gateway's two words on an admitted call.
+                    if is_known_decision(&r.decision) {
+                        if is_blocked(&r.decision) {
+                            agg.blocked += 1;
+                        }
+                        if r.ts_millis >= agg.last_decision_millis {
+                            agg.last_decision = r.decision.clone();
+                            agg.last_decision_millis = r.ts_millis;
+                        }
+                    }
+                    if r.decision == "allow" {
+                        match r.price_basis.as_str() {
+                            "known" => {}
+                            "fallback" => {
+                                agg.fallback_calls += 1;
+                                totals.fallback_calls += 1;
+                                let key = if totals.fallback_models.contains_key(&r.model)
+                                    || totals.fallback_models.len() < MAX_FALLBACK_MODEL_KEYS
+                                {
+                                    r.model.clone()
+                                } else {
+                                    OTHER_FALLBACK_MODELS.to_string()
+                                };
+                                *totals.fallback_models.entry(key).or_insert(0) += 1;
+                            }
+                            _ => {
+                                agg.basis_unreported_calls += 1;
+                                totals.basis_unreported_calls += 1;
+                            }
+                        }
                     }
                     if !r.model.is_empty() {
                         agg.model = r.model.clone();
@@ -2732,6 +2839,18 @@ impl Store {
             sum.calls = totals.calls;
             sum.spent_microusd = totals.spent_microusd;
             sum.tool_calls = totals.tool_calls;
+            sum.fallback_calls = totals.fallback_calls;
+            sum.basis_unreported_calls = totals.basis_unreported_calls;
+            let mut models: Vec<ModelCalls> = totals
+                .fallback_models
+                .iter()
+                .map(|(model, calls)| ModelCalls {
+                    model: model.clone(),
+                    calls: *calls,
+                })
+                .collect();
+            models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)));
+            sum.fallback_models = models;
         }
         sum
     }
@@ -5545,6 +5664,256 @@ mod tests {
             Some(&1),
             "a unit's cap firing is evidence: {dc:?}"
         );
+    }
+
+    // --- invariant 86: a refused run and a fallback price are visible -----
+    //
+    // Read through `serde_json::to_value`, the shape `/v1/runs` and
+    // `/v1/summary` serve, so these tests read exactly what the dashboard does.
+
+    /// One record as the gateway pushes it, with an optional `price_basis`
+    /// (the wire-only key beside `owner`), built from JSON like `/v1/ingest`.
+    fn pushed(
+        run: &str,
+        model: &str,
+        decision: &str,
+        cost: i64,
+        ts: i64,
+        basis: Option<&str>,
+    ) -> CallRecord {
+        let mut v = serde_json::json!({
+            "ts_millis": ts,
+            "run_id": run,
+            "model": model,
+            "decision": decision,
+            "cost_microusd": cost,
+            "step": 1,
+            "agent_id": PLANNER,
+        });
+        if let Some(b) = basis {
+            v["price_basis"] = serde_json::json!(b);
+        }
+        serde_json::from_value(v).expect("the gateway's wire record deserializes")
+    }
+
+    fn run_json(s: &Store, run: &str) -> serde_json::Value {
+        let r = s
+            .runs("acme")
+            .into_iter()
+            .find(|r| r.run_id == run)
+            .expect("the run is retained");
+        serde_json::to_value(&r).unwrap()
+    }
+
+    /// The Runs table showed a run whose every call was refused 403 as
+    /// "live", $0, N calls. The run says how many of its calls were refused,
+    /// and what its latest call's decision was.
+    #[test]
+    fn a_run_reports_its_refused_calls_and_its_latest_decision() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed("r1", "claude-sonnet-5", "allow", 10, 1, Some("known")),
+                refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 2),
+                refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 3),
+            ],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["blocked"], 2, "{v}");
+        assert_eq!(v["last_decision"], "identity_mismatch", "{v}");
+        s.ingest(
+            "acme",
+            &[pushed(
+                "r1",
+                "claude-sonnet-5",
+                "allow",
+                10,
+                4,
+                Some("known"),
+            )],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["blocked"], 2, "{v}");
+        assert_eq!(
+            v["last_decision"], "allow",
+            "an admitted retry is the latest: {v}"
+        );
+    }
+
+    /// A batch can arrive late (the gateway's retry queue): the latest
+    /// decision is the latest CALL's, not the last record pushed.
+    #[test]
+    fn the_latest_decision_is_the_latest_call_not_the_last_pushed() {
+        let s = Store::new();
+        s.ingest("acme", &[pushed("r1", "m", "budget_exceeded", 0, 10, None)]);
+        s.ingest("acme", &[pushed("r1", "m", "allow", 5, 5, Some("known"))]);
+        let v = run_json(&s, "r1");
+        assert_eq!(v["last_decision"], "budget_exceeded", "{v}");
+        assert_eq!(v["blocked"], 1, "{v}");
+    }
+
+    /// A decision the Cloud does not trust (invariant 83) is never shown as
+    /// the run's decision and never counted as a refusal.
+    #[test]
+    fn an_unrecognised_decision_is_never_the_runs_decision_or_a_refusal() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed("r1", "m", "allow", 5, 1, Some("known")),
+                pushed("r1", "m", "<b>pwned</b>", 0, 2, None),
+            ],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["last_decision"], "allow", "{v}");
+        assert_eq!(v["blocked"], 0, "{v}");
+        assert_eq!(v["calls"], 2, "still counted as a call, as before: {v}");
+    }
+
+    /// The gateway names the basis each admitted call was charged at. The
+    /// Cloud counts the fallback-priced ones per run and per model, and the
+    /// admitted calls whose gateway named no basis (older than this field),
+    /// whose charge may be at the fallback with no way to tell here.
+    #[test]
+    fn fallback_priced_calls_are_counted_per_run_and_per_model() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed(
+                    "r1",
+                    "claude-sonnet-6",
+                    "allow",
+                    52_500,
+                    1,
+                    Some("fallback"),
+                ),
+                pushed(
+                    "r1",
+                    "claude-sonnet-6",
+                    "allow",
+                    52_500,
+                    2,
+                    Some("fallback"),
+                ),
+                pushed("r1", "claude-sonnet-5", "allow", 7_000, 3, Some("known")),
+                pushed("r2", "claude-sonnet-5", "allow", 7_000, 4, None),
+            ],
+        );
+        let r1 = run_json(&s, "r1");
+        assert_eq!(r1["fallback_calls"], 2, "{r1}");
+        assert_eq!(r1["basis_unreported_calls"], 0, "{r1}");
+        let r2 = run_json(&s, "r2");
+        assert_eq!(r2["fallback_calls"], 0, "{r2}");
+        assert_eq!(r2["basis_unreported_calls"], 1, "{r2}");
+        let sum = serde_json::to_value(s.summary("acme")).unwrap();
+        assert_eq!(sum["fallback_calls"], 2, "{sum}");
+        assert_eq!(sum["basis_unreported_calls"], 1, "{sum}");
+        assert_eq!(
+            sum["fallback_models"],
+            serde_json::json!([{"model": "claude-sonnet-6", "calls": 2}]),
+            "{sum}"
+        );
+    }
+
+    /// Only an admitted call is charged at a basis: a refused one's figure is
+    /// an avoided estimate. A basis that is neither word is not believed.
+    #[test]
+    fn a_refused_call_or_an_unknown_basis_is_never_a_fallback_charge() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed(
+                    "r1",
+                    "claude-sonnet-6",
+                    "budget_exceeded",
+                    52_500,
+                    1,
+                    Some("fallback"),
+                ),
+                pushed(
+                    "r1",
+                    "claude-sonnet-6",
+                    "allow",
+                    52_500,
+                    2,
+                    Some("<script>"),
+                ),
+            ],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["fallback_calls"], 0, "{v}");
+        assert_eq!(
+            v["basis_unreported_calls"], 1,
+            "a basis that is neither known nor fallback is unreported: {v}"
+        );
+        let sum = serde_json::to_value(s.summary("acme")).unwrap();
+        assert_eq!(sum["fallback_models"], serde_json::json!([]), "{sum}");
+    }
+
+    /// Model ids are caller-chosen: the per-model fold is bounded, and the
+    /// calls past the bound are still counted.
+    #[test]
+    fn the_fallback_model_fold_is_bounded_and_loses_no_call() {
+        let s = Store::new();
+        let records: Vec<CallRecord> = (0..300)
+            .map(|i| {
+                pushed(
+                    "r1",
+                    &format!("model-{i:03}"),
+                    "allow",
+                    1,
+                    i,
+                    Some("fallback"),
+                )
+            })
+            .collect();
+        s.ingest("acme", &records);
+        let sum = serde_json::to_value(s.summary("acme")).unwrap();
+        let models = sum["fallback_models"].as_array().expect("a list");
+        assert!(models.len() <= 257, "{} model rows", models.len());
+        let total: u64 = models.iter().map(|m| m["calls"].as_u64().unwrap()).sum();
+        assert_eq!(total, 300, "every call is counted somewhere");
+        assert_eq!(sum["fallback_calls"], 300);
+    }
+
+    /// The fleet counts persist like every other org total.
+    #[test]
+    fn fallback_counts_survive_a_snapshot_round_trip() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed(
+                    "r1",
+                    "claude-sonnet-6",
+                    "allow",
+                    52_500,
+                    1,
+                    Some("fallback"),
+                ),
+                pushed("r1", "claude-sonnet-5", "allow", 7_000, 2, None),
+            ],
+        );
+        let dir = std::env::temp_dir().join(format!("tf-basis-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snap.json");
+        s.save(&path).unwrap();
+        let s2 = Store::new();
+        s2.load(&path).unwrap();
+        let sum = serde_json::to_value(s2.summary("acme")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sum["fallback_calls"], 1, "{sum}");
+        assert_eq!(sum["basis_unreported_calls"], 1, "{sum}");
+        assert_eq!(
+            sum["fallback_models"],
+            serde_json::json!([{"model": "claude-sonnet-6", "calls": 1}]),
+            "{sum}"
+        );
+        let r = serde_json::to_value(&s2.runs("acme")[0]).unwrap();
+        assert_eq!(r["fallback_calls"], 1, "{r}");
     }
 
     // --- invariant 84: a refusal for identity is the credential's ---------
