@@ -681,6 +681,12 @@ async fn serve() {
     // the current Anthropic/OpenAI lineup. See pricebook.rs for the per-model
     // rates and units notes, and where each was read.
     let mut prices = default_price_book();
+    // Invariant 85: what the operator's file did, kept for GET /v1/price-book
+    // rather than only logged once.
+    let mut price_book_source = tokenfuse_gateway::pricebookreport::PriceBookSource {
+        built_in_rows: prices.entries().len(),
+        operator: None,
+    };
     // process-local: the MCP broker prices nothing; only the LLM proxy meters
     // a call against the book. An operator's file overrides built-in rows;
     // a set but unusable one stops the process (pricefile.rs).
@@ -693,6 +699,10 @@ async fn serve() {
                 added = applied.added,
                 "price book: rows from TOKENFUSE_PRICE_BOOK are in effect"
             );
+            price_book_source.operator = Some(tokenfuse_gateway::pricebookreport::OperatorRows {
+                overridden: applied.overridden_models,
+                added: applied.added_models,
+            });
         }
         Err(e) => {
             eprintln!("tokenfuse: {e}");
@@ -979,6 +989,7 @@ async fn serve() {
         "default",
     )
     .with_client_keys(Arc::new(client_keys))
+    .with_price_book_source(price_book_source)
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
     .with_agent_id_mode(agent_id_mode)
     .with_wire(wire);

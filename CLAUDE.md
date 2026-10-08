@@ -5816,6 +5816,49 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     among an owner's agents. Scenarios:
     `features/the-cloud-files-a-refused-impersonation-under-the-credential.feature`,
     seven, each bound. Not a script gate)*
+85. **The price book a gateway charges with is readable from the gateway.**
+    `TOKENFUSE_PRICE_BOOK` (invariant 79) replaces built-in rows or adds rows
+    at startup, and the only record of what it did was one `info` line naming
+    two counts; a model id the book has no row for is charged at the fallback,
+    up to five times a list price, and the only trace of that was each
+    answer's `x-fuse-price` and one warn line per model. `GET /v1/price-book`
+    (`crate::pricebookreport`) answers from the process: `rows` (the merged
+    book), `built_in_rows`, `operator_file`, the counts and sorted ids the
+    operator's file replaced (`overridden_models`) and added
+    (`added_models`), the `fallback` rates in the published book's column
+    names, and the model ids charged at the fallback since the process
+    started (`fallback_models_seen`, with `fallback_models_seen_total`). The
+    source is fixed at startup (`PriceBookSource`, kept on `AppState` by
+    `with_price_book_source`; `AppState::new` reads the book it is handed as
+    the whole built-in book), and `pricefile::Applied` now carries the ids as
+    well as the counts.
+
+    `@claude` 2026-10-08, choices under delegated authority: a route of its
+    own rather than a field on `/v1/policy-plane`, which reports on the
+    policy PDP and nothing else; behind the admin gate (invariant 41) like
+    the other observability routes, because the fallback list is model ids
+    callers chose; that list bounded at 100 ids of at most 256 bytes each
+    (cut at a character boundary and marked with the full length), the total
+    beside it. Additive: a new gateway route, a minor under `compat/1.0.json`.
+
+    What this does not cover: the fallback list is the once-per-model
+    warning's memory, emptied past 8,192 ids (`state::CLAMP_LOG_CAP`), so its
+    total counts since that last happened; it is process-local and gone on
+    restart; it does not list every row's rates, which the release's
+    `contracts/tokenfuse-constants.json` (`price_book`) and the operator's own
+    file already hold.
+    *(test: `tests/it/price_book_startup.rs::the_price_book_route_names_the_operators_rows_and_the_fallback`
+    (the real binary, with and without a file, before and after a call on an
+    unlisted id) and `tests/it/admin_gate.rs::the_price_book_route_is_behind_the_admin_gate`,
+    both red in CI on the test-only commit, run 37739021532 (`left: 404`
+    where 200 and 403 are right); `a_loopback_bind_with_no_admin_keys_keeps_the_routes_open`
+    extended to the route; `pricebookreport::tests::caller_chosen_ids_are_bounded_in_count_and_length`,
+    added with the module and red only by compile. Three mutants are cases in
+    `gates-have-teeth.sh`: the route served outside the admin gate, the
+    operator's replaced rows lost between startup and the route, and no bound
+    on the ids listed. Scenarios:
+    `features/the-price-book-a-gateway-uses-is-readable.feature`, five, each
+    bound. Not a script gate)*
 
 86. **A refused run and a fallback-priced call are visible in the fleet
     view.** The dashboard's Runs table showed a run whose every call was

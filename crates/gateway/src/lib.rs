@@ -33,6 +33,7 @@ pub mod otel;
 pub mod outcomescli;
 pub mod policyplane;
 pub mod pricebook;
+pub mod pricebookreport;
 pub mod pricefile;
 pub mod provider;
 pub mod proxy;
@@ -72,7 +73,7 @@ pub fn app(state: AppState) -> Router {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MAX_BODY_BYTES);
-    // The five observability/kill routes (CLAUDE.md invariant, see
+    // The observability/kill routes (CLAUDE.md invariant, see
     // `adminkeys`): everything an operator needs to list every run's budget
     // and spend, list key ids, enumerate agent identities, or kill a run.
     // Gated by `state.admin_gate`, never by anything the caller can choose.
@@ -84,6 +85,9 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/keys", get(keysreport::list_keys))
         .route("/v1/policy-plane", get(policyplane::policy_plane))
         .route("/v1/agent-ids", get(agentids::agent_ids))
+        // Invariant 85: which book calls are priced with, and which model
+        // ids the fallback has priced (caller-chosen, so behind this gate).
+        .route("/v1/price-book", get(pricebookreport::price_book))
         .route_layer(from_fn_with_state(state.clone(), adminkeys::admin_gate));
     Router::new()
         .route("/healthz", get(proxy::healthz))
