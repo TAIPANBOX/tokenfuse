@@ -90,7 +90,13 @@ async fn an_open_bind_with_no_admin_keys_refuses_kill_and_runs() {
 async fn a_loopback_bind_with_no_admin_keys_keeps_the_routes_open() {
     let gate = AdminGate::resolve(AdminKeys::default(), true, false);
 
-    for path in ["/v1/runs", "/v1/keys", "/v1/policy-plane", "/v1/agent-ids"] {
+    for path in [
+        "/v1/runs",
+        "/v1/keys",
+        "/v1/policy-plane",
+        "/v1/agent-ids",
+        "/v1/price-book",
+    ] {
         let app = tokenfuse_gateway::app(state(gate.clone()));
         let resp = app.oneshot(get(path)).await.unwrap();
         assert_eq!(
@@ -188,4 +194,40 @@ async fn healthz_and_messages_are_never_behind_the_admin_gate() {
         StatusCode::OK,
         "the LLM proxy must be unaffected by the observability gate being closed"
     );
+}
+
+/// Invariant 86: `GET /v1/price-book` names which model ids an operator's
+/// file replaced or added and which model ids callers sent that the book has
+/// no row for, so it sits behind the same gate as the other observability
+/// routes: refused on an open bind with no keys, refused without the key once
+/// keys are configured, answered with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_price_book_route_is_behind_the_admin_gate() {
+    let open = AdminGate::resolve(AdminKeys::default(), false, false);
+    let resp = tokenfuse_gateway::app(state(open))
+        .oneshot(get("/v1/price-book"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_field(resp).await, "admin_keys_required");
+
+    let keyed = AdminGate::resolve(
+        AdminKeys::from_spec("sk-admin-correct").unwrap(),
+        true,
+        false,
+    );
+    let resp = tokenfuse_gateway::app(state(keyed.clone()))
+        .oneshot(get("/v1/price-book"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = tokenfuse_gateway::app(state(keyed))
+        .oneshot(get_with_bearer("/v1/price-book", "sk-admin-correct"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["rows"], 1, "the one row this state's book holds: {v}");
+    assert_eq!(v["operator_file"], false, "{v}");
 }
