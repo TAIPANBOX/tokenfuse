@@ -5723,3 +5723,96 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     measured model's row removed, and 2.5 Pro at its short-context tier.
     Scenarios: `features/gemini-on-vertex-is-priced-at-its-list-rate.feature`,
     four, each bound. Not a script gate)*
+
+83. **Every Breaker reason the gateway publishes is evidence in the Cloud, and
+    the list that says so is read from the contract, not retyped.** The Cloud's
+    `is_known_decision` (`crates/cloud/src/store.rs`), the allow-list a
+    recorded `decision` must pass before it counts in `/v1/compliance`'s
+    `decision_counts` or tells the stall detector a run ended, held seven of
+    the nine `BreakerReason` wire strings: `unit_budget_exceeded` and
+    `identity_mismatch`, the identity-map pair, were never added. So
+    `/v1/compliance` counted no refusal for identity and no unit's cap, and a
+    run refused on every call for identity went quiet and was reported
+    `run_stalled` (invariant 60), naming the agent it claimed. Its test
+    carried the same seven as a hand-typed array beside a comment saying a
+    reviewer would catch a new variant; none did. It is invariant 14's fault
+    again, in the one reader of the reasons inside this repository that
+    never read the contract.
+
+    `KNOWN_DECISIONS` now holds the two admitted outcomes and all nine
+    reasons, and `known_decisions_cover_every_breaker_reason` reads
+    `breaker_reasons` from `contracts/tokenfuse-constants.json` as committed
+    (`include_str!`, test-only) and requires the two sets equal both ways: a
+    published reason missing here fails, and so does a decision here the
+    gateway does not publish. The contract is held to `BreakerReason` by
+    `constants::exhaustiveness_guard` at compile time and to the generator by
+    `scripts/constants.sh`, so a tenth reason reaches this check without
+    anybody remembering it. `decision_counts` is bounded at 11 keys per org.
+    What this does not cover: `tokenfuse_core::compliance`'s own
+    `ALL_REASONS` test array still lists seven, and that catalog names no
+    control whose evidence is an identity refusal, so nothing there is wrong
+    today; it is a second hand-typed copy, not fixed here.
+    *(test: `store::tests::known_decisions_cover_every_breaker_reason` (red
+    in CI on the test-only commit, run 37738449981: `["unit_budget_exceeded",
+    "identity_mismatch"]` named as missing),
+    `store::tests::refusals_for_identity_and_a_units_cap_are_compliance_evidence`,
+    `store::tests::a_run_refused_for_identity_is_stopped_not_stalled`. One
+    mutant is a case in `gates-have-teeth.sh`: the list cut back to the
+    first seven reasons. Scenarios:
+    `features/the-cloud-files-a-refused-impersonation-under-the-credential.feature`,
+    the first two. Not a script gate)*
+
+84. **The Cloud files a call refused for identity under the credential that
+    made it, never under the agent id it claimed.** The Cloud side of
+    invariant 81. The gateway's `CloudSink` has always flattened the trace's
+    `key_id` onto every record it pushes; the Cloud's `CallRecord` had no
+    such field and dropped it, and folded a record refused `identity_mismatch`
+    by its `agent_id`, the header the caller wrote. An impersonation's
+    refusals therefore landed on its victim: `/v1/agents` gave the victim the
+    impersonation's run, `/v1/spend` counted the refusals as the victim's
+    blocked calls, the dashboard's Owners card (`/v1/owners`) counted the
+    victim among the key owner's agents, and `fanout_explosion` could raise a
+    High incident, and its agent event, naming the victim for runs it never
+    made.
+
+    The Cloud's `CallRecord` now reads `key_id` (`#[serde(default)]`, so an
+    older gateway still ingests). `filed_under` decides the agent column, one
+    function for `RunAgg::agent_id` (so `/v1/agents` and `/v1/runs`) and for
+    the per-day bucket behind `/v1/spend`, so the two reads agree: a record
+    refused for identity is filed under `key:<key_id>`, the prefix the FOCUS
+    export writes into `ResourceId` for the same row, and under nobody (`""`)
+    when client keys are off and the record names no key; every other record
+    is filed under its `agent_id` exactly as before. `@claude` 2026-10-08,
+    choices under delegated authority: a refusal names a run only when no
+    admitted call has, because a run id is the caller's choice and an
+    impersonation must not take over a run its victim really made; a
+    credential is not an agent, so a `key:` bucket is never counted among an
+    owner's `agents` and never becomes the subject of an incident or agent
+    event (`agent_for_run`, and every detector sees no agent on a refusal for
+    identity), which also keeps an impersonation's runs out of its victim's
+    `fanout_explosion` count. The claimed id stays in the gateway's trace and
+    in its `identity_mismatch` agent event, which names the key.
+
+    What this does not cover: in `TOKENFUSE_IDENTITY_STRICT=warn` the call is
+    forwarded and its record says `allow` with the claimed id, as invariant
+    81 says of the export; an `agent_id` header that itself begins `key:` is
+    read as a credential's bucket by the two credential checks (no agent
+    URI does); and `RunAgg`s already in a snapshot keep the attribution they
+    were folded with.
+    *(test: `store::tests::an_identity_refusal_is_not_filed_under_the_agent_it_claimed`,
+    `an_identity_refusal_is_the_credentials_blocked_call_in_spend`,
+    `an_identity_refusal_with_no_credential_is_filed_under_nobody`,
+    `a_refusal_for_identity_never_overwrites_the_agent_an_admitted_call_named`,
+    `a_key_owners_agents_never_include_the_agent_her_key_impersonated`,
+    `an_impersonation_never_raises_a_fanout_explosion_naming_its_victim`,
+    `a_run_filed_under_a_credential_names_no_agent_for_its_events`, all red in
+    CI on the test-only commit, run 37738449981 (the spend test: the victim
+    at `(3, 2, 700)` calls, blocked, spent where `(1, 0, 700)` is right; the
+    fan-out test: `fanout_explosion:agent://acme.example/payments` raised); `tests/it/ingest.rs::an_identity_refusal_pushed_by_a_gateway_is_filed_under_its_key`,
+    the R6 refusal in the gateway's exact wire shape through `/v1/ingest`,
+    `/v1/spend` and `/v1/agents`. Three mutants are cases in
+    `gates-have-teeth.sh`: the refusal filed under the claim again, the
+    claimed id handed to the incident detectors, and a credential counted
+    among an owner's agents. Scenarios:
+    `features/the-cloud-files-a-refused-impersonation-under-the-credential.feature`,
+    seven, each bound. Not a script gate)*

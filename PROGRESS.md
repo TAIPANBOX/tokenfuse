@@ -304,9 +304,14 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1702 passing** (core 372, dpop 21, delegation 60,
-gateway 991, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 5
+`cargo test --all` runs **1712 passing** (core 372, dpop 21, delegation 60,
+gateway 991, cloud 267, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Cloud grew by 10
+with invariants 83 and 84 (every published Breaker reason is Cloud evidence,
+read from the contract; a call refused for identity is filed under the
+credential in `/v1/agents`, `/v1/spend` and `/v1/owners` and names no agent
+on an incident: 9 in `cloud::store`, 1 in `tests/it/ingest.rs`; 2026-10-08,
+counted by hand and checked by CI's `stated-numbers.sh`). Gateway grew by 5
 with invariant 82 (Gemini on Vertex AI priced at Google's listed rate: 3 in
 `gateway::pricebook`, 1 in `gateway::proxy`, 1 in
 `tests/it/reasoning_tokens_are_output.rs`; 2026-10-08, counted by hand and
