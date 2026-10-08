@@ -78,12 +78,17 @@ pub struct PriceFile {
 }
 
 /// What applying a file did to a book, for the startup line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     /// Rows that replaced a built-in row.
     pub overridden: usize,
     /// Rows for a model the built-in book had no row for.
     pub added: usize,
+    /// The model ids of `overridden`, sorted (invariant 85: what
+    /// `GET /v1/price-book` names).
+    pub overridden_models: Vec<String>,
+    /// The model ids of `added`, sorted.
+    pub added_models: Vec<String>,
 }
 
 impl PriceFile {
@@ -185,15 +190,21 @@ impl PriceFile {
         let mut applied = Applied {
             overridden: 0,
             added: 0,
+            overridden_models: Vec::new(),
+            added_models: Vec::new(),
         };
         for (model, price) in &self.rows {
             if book.is_known(model) {
                 applied.overridden += 1;
+                applied.overridden_models.push(model.clone());
             } else {
                 applied.added += 1;
+                applied.added_models.push(model.clone());
             }
             book.insert(model.clone(), *price);
         }
+        applied.overridden_models.sort();
+        applied.added_models.sort();
         applied
     }
 }
@@ -260,7 +271,9 @@ mod tests {
             f.apply(&mut book),
             Applied {
                 overridden: 1,
-                added: 1
+                added: 1,
+                overridden_models: vec!["claude-sonnet-5".to_string()],
+                added_models: vec!["my-local-model".to_string()],
             }
         );
         let p = book.price("claude-sonnet-5").unwrap();

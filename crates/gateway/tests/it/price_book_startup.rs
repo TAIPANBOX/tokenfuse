@@ -200,3 +200,105 @@ async fn the_binary_prices_with_the_operators_rows() {
         (200, "fallback".to_string(), "0.052500".to_string())
     );
 }
+
+/// `GET /v1/price-book` on the real binary.
+async fn price_book(addr: &str) -> (u16, serde_json::Value) {
+    let r = reqwest::Client::new()
+        .get(format!("http://{addr}/v1/price-book"))
+        .send()
+        .await
+        .expect("the gateway must answer");
+    let status = r.status().as_u16();
+    let body = r.json::<serde_json::Value>().await.unwrap_or_default();
+    (status, body)
+}
+
+/// Invariant 85: which book a gateway prices with is readable from the
+/// gateway, not only from its startup log. With the operator's file the
+/// route names the row it replaced and the row it added; without one it says
+/// the built-in book is the whole book; and a model the book has no row for
+/// is named once a call has been priced at the fallback.
+#[tokio::test]
+async fn the_price_book_route_names_the_operators_rows_and_the_fallback() {
+    let built_in = tokenfuse_gateway::pricebook::default_price_book()
+        .entries()
+        .len() as u64;
+
+    let addr = free_addr();
+    let mut child = spawn_serving(&addr, None);
+    let up = wait_for_listening(&mut child);
+    let plain = if up {
+        Some(price_book(&addr).await)
+    } else {
+        None
+    };
+    child.kill().ok();
+    child.wait().ok();
+    assert!(up, "the gateway never reported listening");
+    let (status, plain) = plain.unwrap();
+    assert_eq!(status, 200, "GET /v1/price-book: {plain}");
+    assert_eq!(plain["rows"], built_in, "{plain}");
+    assert_eq!(plain["built_in_rows"], built_in, "{plain}");
+    assert_eq!(plain["operator_file"], false, "{plain}");
+    assert_eq!(plain["overridden"], 0, "{plain}");
+    assert_eq!(plain["added"], 0, "{plain}");
+
+    let book = scratch(
+        "report.json",
+        &format!(r#"{{"models": [{SONNET_5_REGIONAL}, {LOCAL_FREE}]}}"#),
+    );
+    let addr = free_addr();
+    let mut child = spawn_serving(&addr, Some(&book));
+    let up = wait_for_listening(&mut child);
+    let (before, after) = if up {
+        let before = price_book(&addr).await;
+        priced(&addr, "pb-report", "claude-sonnet-6").await;
+        (Some(before), Some(price_book(&addr).await))
+    } else {
+        (None, None)
+    };
+    child.kill().ok();
+    child.wait().ok();
+    assert!(up, "the gateway never reported listening with a valid book");
+    let (status, before) = before.unwrap();
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(
+        before["rows"],
+        built_in + 1,
+        "one row replaced, one added: {before}"
+    );
+    assert_eq!(before["built_in_rows"], built_in, "{before}");
+    assert_eq!(before["operator_file"], true, "{before}");
+    assert_eq!(before["overridden"], 1, "{before}");
+    assert_eq!(before["added"], 1, "{before}");
+    assert_eq!(
+        before["overridden_models"],
+        serde_json::json!(["claude-sonnet-5"]),
+        "{before}"
+    );
+    assert_eq!(
+        before["added_models"],
+        serde_json::json!(["my-local-model"]),
+        "{before}"
+    );
+    assert_eq!(
+        before["fallback"]["input_per_mtok_microusd"], 15_000_000,
+        "{before}"
+    );
+    assert_eq!(
+        before["fallback"]["output_per_mtok_microusd"], 75_000_000,
+        "{before}"
+    );
+    assert_eq!(
+        before["fallback_models_seen"],
+        serde_json::json!([]),
+        "nothing priced at the fallback yet: {before}"
+    );
+    let (_, after) = after.unwrap();
+    assert_eq!(
+        after["fallback_models_seen"],
+        serde_json::json!(["claude-sonnet-6"]),
+        "the model the book has no row for is named: {after}"
+    );
+    assert_eq!(after["fallback_models_seen_total"], 1, "{after}");
+}

@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.7.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1712-brightgreen)
+![tests](https://img.shields.io/badge/tests-1715-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -422,6 +422,16 @@ For anything the book does not know, or a rate that differs for you (a regional 
 
 Rates are whole micro-USD per million tokens, every field is required and no other key is accepted. A file that is missing, not JSON, misspells a key, carries a negative, fractional or absurd rate (over USD 1,000 per million tokens), repeats a model id, has no rows, or is over 1 MiB or 4,096 rows makes the gateway exit 2 naming the variable, rather than start on the built-in book while you believe your rates are live.
 
+`GET /v1/price-book` (behind the admin keys below) says which book the running gateway prices with: the rows in all and in the built-in book, whether a `TOKENFUSE_PRICE_BOOK` file is in effect and which model ids it replaced and added, the fallback rates, and the model ids callers have sent that the book has no row for and that were therefore charged at the fallback since the process started (at most 100 listed, each cut at 256 bytes, with the total beside them):
+
+```bash
+curl -s localhost:4100/v1/price-book
+# {"rows":..,"built_in_rows":..,"operator_file":true,"overridden":1,"added":1,
+#  "overridden_models":["claude-sonnet-5"],"added_models":["my-local-model"],
+#  "fallback":{"input_per_mtok_microusd":15000000,"output_per_mtok_microusd":75000000,...},
+#  "fallback_models_seen":["claude-sonnet-6"],"fallback_models_seen_total":1,"detail":"..."}
+```
+
 ---
 
 ### Verify what you downloaded
@@ -739,14 +749,14 @@ Notes, because the details matter more than the flag:
 - **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
 - **Scope, stated plainly:** this is `/v1/messages` only. This adds identity; the budget enforced against it is the identity map, next.
 
-**Admin keys: `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`, `/v1/agent-ids`** (loopback-safe by default; a wide bind needs a key):
+**Admin keys: `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`, `/v1/agent-ids`, `/v1/price-book`** (loopback-safe by default; a wide bind needs a key):
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `TOKENFUSE_ADMIN_KEYS` | unset ⇒ **off on loopback** | Comma-separated bearer keys, same trimming rules as `TOKENFUSE_CLIENT_KEYS`. Set it and every one of the five routes above needs `Authorization: Bearer <key>` matching one, or `401`. |
-| `TOKENFUSE_ALLOW_OPEN_OBS` | unset ⇒ **off** | Set to `1` to keep the five routes open on a non-loopback bind with no `TOKENFUSE_ADMIN_KEYS` configured (see below). Logged as a warning either way. |
+| `TOKENFUSE_ADMIN_KEYS` | unset ⇒ **off on loopback** | Comma-separated bearer keys, same trimming rules as `TOKENFUSE_CLIENT_KEYS`. Set it and every one of the six routes above needs `Authorization: Bearer <key>` matching one, or `401`. |
+| `TOKENFUSE_ALLOW_OPEN_OBS` | unset ⇒ **off** | Set to `1` to keep the six routes open on a non-loopback bind with no `TOKENFUSE_ADMIN_KEYS` configured (see below). Logged as a warning either way. |
 
-These five routes list every run's budget and spend, list key ids, enumerate agent identities, and kill any run, and until now they carried no authentication at all: the comment beside them said the gateway binds loopback by default, which is true and was not the whole picture, because `TOKENFUSE_ADDR=0.0.0.0:...` (the shipped Docker image's default) makes them reachable from the network. The posture now mirrors the MCP broker's door: nothing configured on a loopback bind changes nothing; nothing configured on a wide bind refuses every request to these five with `403 admin_keys_required` until `TOKENFUSE_ADMIN_KEYS` is set or `TOKENFUSE_ALLOW_OPEN_OBS=1` opts back into the old behaviour; a configured key is required regardless of the bind. `/healthz` and `/v1/messages` are never behind this gate.
+These routes list every run's budget and spend, list key ids, enumerate agent identities, name the model ids callers sent, and kill any run, and until now they carried no authentication at all: the comment beside them said the gateway binds loopback by default, which is true and was not the whole picture, because `TOKENFUSE_ADDR=0.0.0.0:...` (the shipped Docker image's default) makes them reachable from the network. The posture now mirrors the MCP broker's door: nothing configured on a loopback bind changes nothing; nothing configured on a wide bind refuses every request to these six with `403 admin_keys_required` until `TOKENFUSE_ADMIN_KEYS` is set or `TOKENFUSE_ALLOW_OPEN_OBS=1` opts back into the old behaviour; a configured key is required regardless of the bind. `/healthz` and `/v1/messages` are never behind this gate.
 
 **Identity map: key ↔ agent ↔ business unit, plus monthly unit budgets** (opt-in, off by default; design notes in [docs/20](docs/20-identity-map.md)):
 
