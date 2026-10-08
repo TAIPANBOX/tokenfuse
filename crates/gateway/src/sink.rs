@@ -124,6 +124,17 @@ pub struct CallRecord {
     /// above whenever nothing was measured.
     #[serde(skip_serializing)]
     pub pruned_schema_tokens_est: Option<u64>,
+    /// The identity check's finding on this call (invariant 87): the reason
+    /// the presented credential may not speak as the agent id it named
+    /// (`agent_id_not_allowed`, `agent_id_missing`, `unit_chosen_by_agent_id`,
+    /// `key_has_no_unit_binding`, `agent_id_contradicts_proven_chain`). Set on
+    /// a refusal for identity (`decision: identity_mismatch`) and on every row
+    /// of a call `TOKENFUSE_IDENTITY_STRICT=warn` forwarded anyway, which is
+    /// otherwise an ordinary `allow` row filed under the id it claimed.
+    /// `None` on every other row. Appended last as a nullable column, and on
+    /// the Cloud wire only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_reason: Option<String>,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -250,6 +261,10 @@ impl ParquetSink {
             Field::new("tools_offered", DataType::UInt32, true),
             Field::new("tools_would_prune", DataType::UInt32, true),
             Field::new("pruned_schema_tokens_est", DataType::UInt64, true),
+            // Invariant 87: the identity check's finding, appended LAST and
+            // genuinely nullable in the write schema: NULL is "the check
+            // found nothing", which no string default may stand in for.
+            Field::new("identity_reason", DataType::Utf8, true),
         ]))
     }
 
@@ -307,6 +322,9 @@ impl ParquetSink {
             Field::new("tools_offered", DataType::UInt32, true),
             Field::new("tools_would_prune", DataType::UInt32, true),
             Field::new("pruned_schema_tokens_est", DataType::UInt64, true),
+            // Invariant 87: same treatment, so a trace written before the
+            // column existed reads back with it NULL.
+            Field::new("identity_reason", DataType::Utf8, true),
         ]))
     }
 
@@ -400,6 +418,13 @@ impl ParquetSink {
                         .iter()
                         .map(|r| r.pruned_schema_tokens_est)
                         .collect::<Vec<_>>(),
+                )),
+                // Invariant 87: a real NULL for `None`.
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.identity_reason.clone())
+                        .collect::<Vec<Option<String>>>(),
                 )),
             ],
         )?;
@@ -500,6 +525,7 @@ mod tests {
             tools_offered: None,
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
+            identity_reason: None,
         }
     }
 

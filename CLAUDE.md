@@ -5922,3 +5922,63 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     on a refusal. Scenarios:
     `features/a-refused-run-and-a-fallback-price-are-visible.feature`, eight,
     each bound. Not a script gate)*
+
+87. **A call forwarded under identity warn mode is marked in the trace, the
+    export and the Cloud, and a refusal for identity names its reason.** With
+    `TOKENFUSE_IDENTITY_STRICT=warn` the gateway forwards a call whose
+    credential may not speak as the agent id it named, and said so only in
+    the answer's `x-fuse-identity: would-block=<reason>`. Its trace row was an
+    ordinary `allow` row under the claimed id, so the FOCUS export, the Cloud,
+    genaryx and CostCrew could not tell it from an honest call (invariant 81
+    and 84 both named this as what they did not cover). The finer reason for
+    a refusal in enforce mode was likewise only in the 403 and the agent
+    event.
+
+    The trace gains one column, appended last and nullable in both schemas,
+    `identity_reason` (`sink::CallRecord`): the identity check's own word
+    (`agent_id_not_allowed`, `agent_id_missing`, `unit_chosen_by_agent_id`,
+    `key_has_no_unit_binding`, `agent_id_contradicts_proven_chain`), set on
+    the refusal row in enforce mode and, through `CallAttribution`, on every
+    row of a call warn mode forwarded (the `allow` row, a cache hit, a Breaker
+    block after it, a response taint verdict), and `None` everywhere else.
+    The Cloud wire carries it only when set (`skip_serializing_if`), so every
+    other record's wire is unchanged. The FOCUS export appends
+    `x_identity_reason` after `x_block_reason`, by `compat/1.0.json`'s
+    append-only rule; `contracts/tokenfuse-constants.json` publishes the
+    column in both places (`focus_export.columns`, `trace_parquet`). The
+    Cloud reads it, counts admitted calls carrying it per run
+    (`identity_warned`) and per org (`/v1/summary`'s `identity_warned_calls`),
+    and keeps the latest reason (`last_identity_reason`) only when it is one
+    of those five words. The dashboard shows `identity · warn` beside the
+    run's status and names the reason in a refusal's tooltip.
+
+    `@claude` 2026-10-08, choices under delegated authority: a forwarded call
+    stays an admitted, spent row filed under the agent id it claimed, in the
+    export (`ResourceId`, `x_agent_id`) and in the Cloud, because warn mode
+    records what it would do without doing it, as the Breaker's would-block
+    does in shadow; refiling real spend under the key is what enforce does,
+    and an operator who wants that sets enforce. The marker is the reason
+    word and not a boolean, since a reader acting on it needs to know which
+    check failed; the key was already on every row (`x_key_id`).
+
+    What this does not cover: the Cloud's vocabulary of five words is a copy
+    of the gateway's, held by no test across the two crates, so a reason the
+    gateway adds later is counted but shown as `""` until the Cloud learns
+    it; trace segments written before this change read the column as NULL
+    and export it empty; `StrictMode::Off` runs no check and marks nothing.
+    *(test: `proxy::tests::a_warn_mode_identity_mismatch_is_marked_in_the_trace_and_the_export`
+    and `a_refusal_for_identity_names_its_reason_in_the_export`, through the
+    real handler, Parquet sink and export, red in CI on the commit that
+    carried them and the Cloud fix only, run 37746142201 (`the export has no
+    x_identity_reason column`); `store::tests::a_warn_mode_identity_mismatch_is_counted_on_the_run_and_the_fleet`
+    and `an_identity_reason_outside_the_vocabulary_is_never_shown`, red on
+    the test-only commit, run 37745583791 (`identity_warned` read back
+    `Null`); `tests/it/ingest.rs::a_warn_mode_identity_mismatch_reaches_the_runs_and_summary_reads`;
+    `cloudsink::tests::the_wire_carries_an_identity_finding_only_when_there_is_one`,
+    added with the fix and red only by compile; the golden
+    `exports_a_fixture_trace_to_the_exact_expected_csv` gained the column.
+    Three mutants are cases in `gates-have-teeth.sh`: the forwarded call's
+    row losing the reason, the export dropping the column's value, and the
+    Cloud showing a reason outside the vocabulary. Scenarios:
+    `features/a-warn-mode-identity-mismatch-is-marked.feature`, five, each
+    bound. Not a script gate)*

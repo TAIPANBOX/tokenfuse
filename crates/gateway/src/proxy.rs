@@ -915,6 +915,11 @@ async fn handle_call(
         )
     };
     let mut identity_header: Option<String> = None;
+    // Invariant 87: the reason the identity check would refuse this call,
+    // set only when warn mode forwards it anyway, and written onto every
+    // trace row this call produces, so the trace, the FOCUS export and the
+    // Cloud can tell it from an honest call (the response header alone could).
+    let mut identity_reason: Option<String> = None;
     // A PROVEN chain names an actor, and a header naming a different one is a
     // contradiction the caller chose. `chainproof::resolve` already refuses the
     // same contradiction for the declared CHAIN; this is that rule one field
@@ -945,6 +950,7 @@ async fn handle_call(
                 // allowed through.
                 st.keystats.record_identity_mismatch(&key_id);
                 identity_header = Some(format!("would-block={}", mismatch.reason));
+                identity_reason = Some(mismatch.reason.to_string());
             }
             StrictMode::Enforce => {
                 st.keystats.record_identity_mismatch(&key_id);
@@ -978,6 +984,7 @@ async fn handle_call(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: Some(mismatch.reason.to_string()),
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -1083,6 +1090,7 @@ async fn handle_call(
             tools_offered: None,
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
+            identity_reason: identity_reason.clone(),
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1149,6 +1157,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1278,6 +1287,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1365,6 +1375,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1405,6 +1416,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1472,6 +1484,7 @@ async fn handle_call(
                 tools_offered: None,
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1612,6 +1625,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1641,6 +1655,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -1720,6 +1735,7 @@ async fn handle_call(
                         tools_offered: None,
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
+                        identity_reason: identity_reason.clone(),
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -1773,6 +1789,7 @@ async fn handle_call(
             tools_offered,
             tools_would_prune,
             pruned_schema_tokens_est,
+            identity_reason: identity_reason.clone(),
         },
         unit_reservation,
     );
@@ -1812,6 +1829,7 @@ async fn handle_call(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: identity_reason.clone(),
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -2412,6 +2430,7 @@ async fn buffered_managed(
                     tools_offered: None,
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
+                    identity_reason: guard.identity_reason(),
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
