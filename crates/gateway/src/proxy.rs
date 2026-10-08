@@ -3715,6 +3715,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// Invariant 82: a Gemini id as Vertex AI's OpenAI-compatible endpoint
+    /// names it answers `x-fuse-price: known` at the rate read off Google's
+    /// page on 2026-10-08. The stub reports 1000 input and 500 output tokens:
+    /// gemini-2.5-flash (0.30 / 2.50) is 300 + 1250 = 1550 micro-USD, where
+    /// the 15 / 75 fallback charged 52500.
+    #[tokio::test]
+    async fn a_gemini_id_on_vertex_is_priced_known_at_its_list_rate() {
+        let st = shipped_book_state();
+        for (i, (model, cost)) in [
+            ("google/gemini-2.5-flash", "0.001550"),
+            ("google/gemini-2.5-pro", "0.010000"),
+            ("google/gemini-3.5-flash", "0.006600"),
+            ("google/gemini-3.1-flash-lite", "0.001100"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resp = priced_call(&st, &format!("gemini-{i}"), model, false).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                resp.headers().get("x-fuse-price").unwrap(),
+                "known",
+                "{model}"
+            );
+            assert_eq!(
+                resp.headers().get("x-fuse-cost-usd").unwrap(),
+                cost,
+                "{model}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_model_nobody_priced_still_says_fallback() {
         let st = shipped_book_state();

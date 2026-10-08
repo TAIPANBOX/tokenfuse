@@ -134,3 +134,42 @@ async fn a_streamed_vertex_thinking_call_settles_its_reasoning() {
         "the streamed final usage chunk must settle the reasoning too"
     );
 }
+
+/// Invariant 82: the same measured call priced by the book the binary ships,
+/// not a book the test wrote. Until the Gemini rows existed it settled at
+/// the 15 / 75 fallback, 46635 micro-USD, and said `x-fuse-price: fallback`.
+#[tokio::test]
+async fn the_shipped_book_prices_the_measured_vertex_call_at_its_list_rate() {
+    let body = format!(
+        r#"{{"id":"vertex-2","object":"chat.completion","model":"{MODEL}","choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}},"finish_reason":"stop"}}],"usage":{USAGE}}}"#
+    );
+    let address = upstream("application/json", body).await;
+    let ledger = Arc::new(Ledger::new());
+    let st = AppState::new(
+        ledger.clone(),
+        Arc::new(tokenfuse_gateway::pricebook::default_price_book()),
+        Arc::new(Policy {
+            mode: Mode::Enforce,
+            ..Default::default()
+        }),
+        Arc::new(HttpProvider::new(format!("http://{address}"))),
+        "shipped-book",
+    )
+    .with_wire(Wire::OpenAi);
+    let response = tokenfuse_gateway::app(st)
+        .oneshot(request("vertex-shipped-book", false))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let price = response
+        .headers()
+        .get("x-fuse-price")
+        .map(|v| v.to_str().unwrap().to_string());
+    let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let snapshot = ledger.snapshot("vertex-shipped-book").unwrap();
+    assert_eq!(price.as_deref(), Some("known"));
+    assert_eq!(
+        snapshot.spent, BILLED,
+        "the shipped book must price google/gemini-2.5-flash at 0.30 / 2.50, not the fallback"
+    );
+}
