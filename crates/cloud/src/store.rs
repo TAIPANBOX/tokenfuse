@@ -5361,37 +5361,335 @@ mod tests {
         let _ = std::fs::remove_file(&old);
     }
 
+    /// The constants contract the gateway generates (`scripts/constants.sh`),
+    /// read as committed. Its `breaker_reasons` are written from the gateway's
+    /// `ALL_BREAKER_REASONS`, which `constants::exhaustiveness_guard` holds to
+    /// `BreakerReason` at compile time, and `constants.sh` holds the committed
+    /// file to the generator. Reading it here rather than retyping the reasons
+    /// is the point: the list below this test used to be typed out by hand
+    /// and said seven of nine for as long as the identity-map pair existed.
+    const CONSTANTS_CONTRACT: &str = include_str!("../../../contracts/tokenfuse-constants.json");
+
+    /// Every Breaker reason's wire string, from the contract.
+    fn published_breaker_reasons() -> Vec<String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(CONSTANTS_CONTRACT).expect("the contract is JSON");
+        doc["breaker_reasons"]
+            .as_array()
+            .expect("the contract publishes breaker_reasons")
+            .iter()
+            .map(|r| {
+                r["wire"]
+                    .as_str()
+                    .expect("each reason carries its wire string")
+                    .to_string()
+            })
+            .collect()
+    }
+
     /// `is_known_decision` must accept every real `BreakerReason` wire string
-    /// plus `allow`/`cache_hit`, and reject the rest — the exact list a
+    /// plus `allow`/`cache_hit`, and reject the rest: the exact list a
     /// fabricated `decision` (see `ingest_ignores_fabricated_decisions` below)
-    /// must fail to join.
+    /// must fail to join. Invariant 83: the reasons are read from the
+    /// published contract, so a reason the gateway adds reaches this check
+    /// without anybody remembering to retype it.
     #[test]
     fn known_decisions_cover_every_breaker_reason() {
-        use tokenfuse_core::BreakerReason;
-        // Mirrors `compliance.rs::ALL_REASONS` in `tokenfuse-core`: hardcoded
-        // so a new `BreakerReason` variant doesn't silently slip past this
-        // list unnoticed (it still compiles either way, but a reviewer diffing
-        // this array against the enum will catch it).
-        const ALL: [BreakerReason; 7] = [
-            BreakerReason::BudgetExceeded,
-            BreakerReason::PolicyViolation,
-            BreakerReason::LoopDetected,
-            BreakerReason::Killed,
-            BreakerReason::WasmPolicy,
-            BreakerReason::TaintBlocked,
-            BreakerReason::DlpBlocked,
-        ];
-        for r in ALL {
-            assert!(
-                is_known_decision(r.as_wire_str()),
-                "{} missing from the allow-list",
-                r.as_wire_str()
-            );
-        }
+        let published = published_breaker_reasons();
+        assert!(
+            !published.is_empty(),
+            "the contract published no Breaker reasons, so this measured nothing"
+        );
+        let missing: Vec<&str> = published
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !is_known_decision(r))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Breaker reasons the gateway publishes and the Cloud does not trust as \
+             evidence: {missing:?}"
+        );
         assert!(is_known_decision("allow"));
         assert!(is_known_decision("cache_hit"));
         assert!(!is_known_decision("pwned"));
         assert!(!is_known_decision(""));
+    }
+
+    /// Both reasons the hand-typed list left out, identity and a unit's cap,
+    /// are compliance evidence like the other seven: counted in
+    /// `/v1/compliance`'s `decision_counts`.
+    #[test]
+    fn refusals_for_identity_and_a_units_cap_are_compliance_evidence() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 1),
+                refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 2),
+                block_at("r2", "unit_budget_exceeded", 0, 3),
+            ],
+        );
+        let dc = s.decision_counts("acme");
+        assert_eq!(
+            dc.get("identity_mismatch"),
+            Some(&2),
+            "refusals for identity are evidence: {dc:?}"
+        );
+        assert_eq!(
+            dc.get("unit_budget_exceeded"),
+            Some(&1),
+            "a unit's cap firing is evidence: {dc:?}"
+        );
+    }
+
+    // --- invariant 84: a refusal for identity is the credential's ---------
+    //
+    // The Cloud side of invariant 81. A call refused `identity_mismatch` was
+    // refused because the credential may not speak as the agent id it claimed,
+    // so that id names somebody who did not make the call.
+
+    /// The agent an impersonation claims.
+    const VICTIM: &str = "agent://acme.example/payments";
+    /// The credential that made the impersonation.
+    const IMPOSTER_KEY: &str = "forge-imposter";
+    /// Where the Cloud files the impersonation's refusals.
+    const IMPOSTER_BUCKET: &str = "key:forge-imposter";
+
+    /// A call refused for identity, as the gateway's `CloudSink` pushes it:
+    /// the header's claimed `agent_id`, the credential's `key_id`, nothing
+    /// spent. Built from JSON, the way `/v1/ingest` reads a record, so it
+    /// carries `key_id` exactly as the wire does.
+    fn refused_for_identity(run: &str, claimed: &str, key: &str, ts: i64) -> CallRecord {
+        serde_json::from_value(serde_json::json!({
+            "ts_millis": ts,
+            "run_id": run,
+            "model": "claude-sonnet-5",
+            "decision": "identity_mismatch",
+            "cost_microusd": 0,
+            "step": 1,
+            "agent_id": claimed,
+            "key_id": key,
+        }))
+        .expect("the gateway's wire record deserializes")
+    }
+
+    fn admitted(run: &str, agent: &str, cost: i64, ts: i64) -> CallRecord {
+        CallRecord {
+            ts_millis: ts,
+            run_id: run.into(),
+            decision: "allow".into(),
+            cost_microusd: cost,
+            step: 1,
+            agent_id: agent.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `/v1/agents` and `/v1/runs`: the impersonation's run is the
+    /// credential's, and the victim keeps exactly the run it made.
+    #[test]
+    fn an_identity_refusal_is_not_filed_under_the_agent_it_claimed() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                admitted("victim-run", VICTIM, 700, 10),
+                refused_for_identity("imposter-run", VICTIM, IMPOSTER_KEY, 20),
+                refused_for_identity("imposter-run", VICTIM, IMPOSTER_KEY, 21),
+            ],
+        );
+        let agents = s.agents("acme");
+        let victim = agents
+            .iter()
+            .find(|a| a.agent_id == VICTIM)
+            .expect("the victim's own run is still its own");
+        assert_eq!(
+            (victim.runs, victim.calls, victim.spent_microusd),
+            (1, 1, 700),
+            "the victim made one run of one call; the refusals are not its: {agents:?}"
+        );
+        let key = agents
+            .iter()
+            .find(|a| a.agent_id == IMPOSTER_BUCKET)
+            .unwrap_or_else(|| panic!("the refusals are filed under the credential: {agents:?}"));
+        assert_eq!((key.runs, key.calls, key.spent_microusd), (1, 2, 0));
+        let run = s
+            .runs("acme")
+            .into_iter()
+            .find(|r| r.run_id == "imposter-run")
+            .expect("the refused run is still a run");
+        assert_eq!(run.agent_id, IMPOSTER_BUCKET);
+    }
+
+    /// `/v1/spend`: the refusal is the credential's blocked call, never the
+    /// victim's, as in the FOCUS export.
+    #[test]
+    fn an_identity_refusal_is_the_credentials_blocked_call_in_spend() {
+        let s = Store::new();
+        let now = 20_000 * DAY_MILLIS + 3_600_000;
+        s.ingest_at(
+            "acme",
+            &[
+                admitted("victim-run", VICTIM, 700, now),
+                refused_for_identity("imposter-run", VICTIM, IMPOSTER_KEY, now),
+                refused_for_identity("imposter-run", VICTIM, IMPOSTER_KEY, now),
+            ],
+            now,
+        );
+        let w = s.spend_window("acme", 1, now);
+        let victim = w
+            .agents
+            .iter()
+            .find(|a| a.agent_id == VICTIM)
+            .expect("the victim spent");
+        assert_eq!(
+            (victim.calls, victim.blocked, victim.spent_microusd),
+            (1, 0, 700),
+            "nothing of the victim's was blocked: {:?}",
+            w.agents
+        );
+        let key = w
+            .agents
+            .iter()
+            .find(|a| a.agent_id == IMPOSTER_BUCKET)
+            .unwrap_or_else(|| panic!("filed under the credential: {:?}", w.agents));
+        assert_eq!((key.calls, key.blocked, key.spent_microusd), (2, 2, 0));
+        assert_eq!((w.calls, w.blocked, w.spent_microusd), (3, 2, 700));
+    }
+
+    /// With client keys off the record names no credential: the refusal is
+    /// filed under nobody, which a reader can see, rather than under the
+    /// claimed id, which it cannot tell from the truth.
+    #[test]
+    fn an_identity_refusal_with_no_credential_is_filed_under_nobody() {
+        let s = Store::new();
+        let now = 20_000 * DAY_MILLIS + 3_600_000;
+        s.ingest_at("acme", &[refused_for_identity("r1", VICTIM, "", now)], now);
+        let w = s.spend_window("acme", 1, now);
+        assert!(
+            w.agents.iter().all(|a| a.agent_id != VICTIM),
+            "never under the claim: {:?}",
+            w.agents
+        );
+        assert_eq!(w.agents.len(), 1);
+        assert_eq!(
+            (w.agents[0].agent_id.as_str(), w.agents[0].blocked),
+            ("", 1)
+        );
+        assert_eq!(s.runs("acme")[0].agent_id, "");
+        assert!(s.agents("acme").iter().all(|a| a.agent_id != VICTIM));
+    }
+
+    /// A run id is the caller's choice, so an impersonation can name a run
+    /// the victim really made. Its refusal must not take the run over.
+    #[test]
+    fn a_refusal_for_identity_never_overwrites_the_agent_an_admitted_call_named() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                admitted("r1", PLANNER, 10, 10),
+                refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 20),
+            ],
+        );
+        assert_eq!(s.runs("acme")[0].agent_id, PLANNER);
+    }
+
+    /// The dashboard's Owners card reads `/v1/owners`: the key's owner runs
+    /// her own agent, and her key's impersonation does not add its victim to
+    /// the agents she is running. A credential is not an agent either.
+    #[test]
+    fn a_key_owners_agents_never_include_the_agent_her_key_impersonated() {
+        let s = Store::new();
+        let alice = "user://acme/alice";
+        let mut own = admitted("a1", "agent://acme.example/alice-bot", 100, 10);
+        own.owner = alice.into();
+        let mut refused = refused_for_identity("i1", VICTIM, IMPOSTER_KEY, 20);
+        refused.owner = alice.into();
+        s.ingest("acme", &[own, refused]);
+        let owners = s.owners("acme");
+        let o = owners
+            .iter()
+            .find(|o| o.owner == alice)
+            .expect("alice owns both runs");
+        assert_eq!(o.runs, 2, "both runs are hers");
+        assert_eq!(
+            o.agents, 1,
+            "she runs one agent; the victim her key claimed is not one of hers: {owners:?}"
+        );
+    }
+
+    /// `fanout_explosion` names an agent driving many runs. Runs an
+    /// impersonation opened under the victim's id are not the victim's.
+    #[test]
+    fn an_impersonation_never_raises_a_fanout_explosion_naming_its_victim() {
+        let cfg = IncidentConfig {
+            fanout_runs: 4,
+            ..Default::default()
+        };
+        let w = cfg.fanout_window_ms;
+        let s = Store::with_incident_config(cfg);
+        let now = 100_000_000;
+        fan_history(&s, VICTIM, 2, 5, now, w); // the victim's own habit: two runs
+        for i in 0..12 {
+            s.ingest_at(
+                "acme",
+                &[refused_for_identity(
+                    &format!("imp-r{i}"),
+                    VICTIM,
+                    IMPOSTER_KEY,
+                    now + i,
+                )],
+                now + i,
+            );
+        }
+        let named: Vec<Incident> = s
+            .incidents("acme")
+            .into_iter()
+            .filter(|i| i.agent_id.as_deref() == Some(VICTIM))
+            .collect();
+        assert!(
+            named.is_empty(),
+            "an incident names the victim for runs it never made: {named:?}"
+        );
+    }
+
+    /// The agent-event a run's incident or kill carries is the run's agent,
+    /// and a run filed under a credential has none: a key is not an agent id
+    /// (agent-passport SPEC 6.1) and the claimed id is not the caller's.
+    #[test]
+    fn a_run_filed_under_a_credential_names_no_agent_for_its_events() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[refused_for_identity("r1", VICTIM, IMPOSTER_KEY, 10)],
+        );
+        let inner = s.inner.read().unwrap();
+        assert_eq!(agent_for_run(&inner, "acme", "r1"), None);
+    }
+
+    /// A caller refused for identity was stopped by the gateway, on every
+    /// call; it did not go quiet. `run_stalled` must not report it, and
+    /// before invariant 83 it did, naming the claimed agent.
+    #[test]
+    fn a_run_refused_for_identity_is_stopped_not_stalled() {
+        let s = Store::new();
+        s.ingest_at(
+            "acme",
+            &[refused_for_identity("r1", VICTIM, IMPOSTER_KEY, T0)],
+            T0,
+        );
+        s.ingest_at(
+            "acme",
+            &[refused_for_identity("r1", VICTIM, IMPOSTER_KEY, T0 + 1_000)],
+            T0 + 1_000,
+        );
+        assert_eq!(
+            s.sweep_stalled_at(T0 + 1_000 + 3_600_000).len(),
+            0,
+            "a run refused on every call was stopped, not stalled"
+        );
     }
 
     /// A holder of an ingest credential POSTing a fabricated `decision`
