@@ -399,3 +399,90 @@ async fn healthz_is_ok() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// GET a read route with the admin key, through the same router a gateway
+/// pushes to.
+async fn read(state: &AppState, path: &str) -> serde_json::Value {
+    let resp = app(state.clone())
+        .oneshot(
+            Request::get(path)
+                .header("authorization", "Bearer k")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Invariant 84, end to end: a gateway's `CloudSink` puts the trace's
+/// `key_id` beside every record it pushes, and a call it refused for identity
+/// lands in `/v1/spend` and `/v1/agents` under that credential, never under
+/// the agent id the caller claimed. The record below is the R6 refusal of
+/// 2026-10-07 in the exact wire shape (every trace field, flattened, plus
+/// `owner`).
+#[tokio::test]
+async fn an_identity_refusal_pushed_by_a_gateway_is_filed_under_its_key() {
+    let store = Arc::new(Store::new());
+    let state = state_with(Arc::clone(&store));
+    // The real clock: `/v1/spend` prunes days past retention against it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let claimed = "agent://taipanbox.dev/routers/flint";
+    let payload = serde_json::json!({"records": [
+        {"ts_millis": now, "run_id": "imp", "model": "claude-sonnet-5",
+         "decision": "identity_mismatch", "input_tokens": 0, "output_tokens": 0,
+         "cost_microusd": 0, "step": 1, "agent_id": claimed, "saved_microusd": 0,
+         "parent_run_id": "", "on_behalf_of": "", "outcome": "",
+         "key_id": "forge-imposter", "unit": "", "tool_calls": null,
+         "tools_offered": null, "tools_would_prune": null,
+         "pruned_schema_tokens_est": null, "owner": ""},
+        {"ts_millis": now, "run_id": "imp", "model": "claude-sonnet-5",
+         "decision": "identity_mismatch", "input_tokens": 0, "output_tokens": 0,
+         "cost_microusd": 0, "step": 1, "agent_id": claimed, "saved_microusd": 0,
+         "parent_run_id": "", "on_behalf_of": "", "outcome": "",
+         "key_id": "forge-imposter", "unit": "", "tool_calls": null,
+         "tools_offered": null, "tools_would_prune": null,
+         "pruned_schema_tokens_est": null, "owner": ""}
+    ]});
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let spend = read(&state, "/v1/spend?days=1").await;
+    let agents = spend["agents"].as_array().expect("agents");
+    assert!(
+        agents.iter().all(|a| a["agent_id"] != claimed),
+        "the claimed agent made none of these calls: {spend}"
+    );
+    let key = agents
+        .iter()
+        .find(|a| a["agent_id"] == "key:forge-imposter")
+        .unwrap_or_else(|| panic!("filed under the credential: {spend}"));
+    assert_eq!(key["blocked"], 2);
+    assert_eq!(key["calls"], 2);
+    assert_eq!(key["spent_microusd"], 0);
+
+    let fleet = read(&state, "/v1/agents").await;
+    let rows = fleet.as_array().expect("an array of agents");
+    assert!(
+        rows.iter().all(|a| a["agent_id"] != claimed),
+        "the claimed agent ran nothing: {fleet}"
+    );
+    assert!(
+        rows.iter().any(|a| a["agent_id"] == "key:forge-imposter"),
+        "the run is the credential's: {fleet}"
+    );
+}
