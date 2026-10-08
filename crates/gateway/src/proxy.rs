@@ -7419,6 +7419,106 @@ pub(crate) mod tests {
         );
     }
 
+    /// Export the trace `st` wrote into `dir` and read it back.
+    async fn export_rows(dir: &std::path::Path) -> Vec<crate::focusexport::ExportRow> {
+        let out = dir.join("focus.csv");
+        crate::focusexport::run(&crate::focusexport::Args {
+            traces: Some(dir.to_str().unwrap().to_string()),
+            out: Some(out.to_str().unwrap().to_string()),
+            from: None,
+            to: None,
+        })
+        .await
+        .expect("the trace the gateway wrote exports");
+        let text = std::fs::read_to_string(&out).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        crate::focusexport::parse_export_csv(&text)
+    }
+
+    /// Invariant 87. `TOKENFUSE_IDENTITY_STRICT=warn` forwards a call whose
+    /// credential may not speak as the agent it named, and until now its
+    /// trace row and export row read exactly like an honest allowed call:
+    /// only the response's `x-fuse-identity` said otherwise. The row now
+    /// carries the reason the check would have refused it.
+    #[tokio::test]
+    async fn a_warn_mode_identity_mismatch_is_marked_in_the_trace_and_the_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-proxy-warn-identity-export-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Warn)
+            .with_sink(Arc::new(crate::sink::ParquetSink::new(&dir, 1).unwrap()));
+        let honest = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "warn-honest")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/payments")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(call(st.clone(), honest).await.status(), StatusCode::OK);
+        let mismatched = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "warn-mismatch")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(call(st.clone(), mismatched).await.status(), StatusCode::OK);
+        drop(st);
+
+        let rows = export_rows(&dir).await;
+        use crate::focusexport::col;
+        let warned = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "warn-mismatch")
+            .expect("the forwarded call has a row");
+        assert_eq!(col(warned, "x_identity_reason"), "agent_id_not_allowed");
+        assert_eq!(col(warned, "x_blocked"), "false", "warn forwards the call");
+        assert_eq!(col(warned, "x_block_reason"), "");
+        assert_eq!(col(warned, "x_key_id"), "treasury-bots");
+        let honest = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "warn-honest")
+            .expect("the honest call has a row");
+        assert_eq!(col(honest, "x_identity_reason"), "");
+    }
+
+    /// The same column on a refusal: `x_block_reason` says
+    /// `identity_mismatch`, and `x_identity_reason` now says which check
+    /// refused it, the finer reason invariant 81 left in the 403 alone.
+    #[tokio::test]
+    async fn a_refusal_for_identity_names_its_reason_in_the_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "tf-proxy-enforce-identity-reason-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_sink(Arc::new(crate::sink::ParquetSink::new(&dir, 1).unwrap()));
+        let refused = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "enforce-reason")
+            .header("x-fuse-budget-usd", "0.5")
+            .header("x-fuse-agent-id", "agent://bank.example/fraud/bot1")
+            .body(Body::from(body(10)))
+            .unwrap();
+        assert_eq!(
+            call(st.clone(), refused).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        drop(st);
+        let rows = export_rows(&dir).await;
+        use crate::focusexport::col;
+        let row = rows
+            .iter()
+            .find(|r| col(r, "x_run_id") == "enforce-reason")
+            .expect("the refusal has a row");
+        assert_eq!(col(row, "x_block_reason"), "identity_mismatch");
+        assert_eq!(col(row, "x_identity_reason"), "agent_id_not_allowed");
+        assert_eq!(col(row, "ResourceId"), "key:treasury-bots");
+    }
+
     #[tokio::test]
     async fn identity_warn_allows_and_sets_the_would_block_header() {
         let sink = RecordingSink::default();

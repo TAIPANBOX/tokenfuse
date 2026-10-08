@@ -5666,6 +5666,64 @@ mod tests {
         );
     }
 
+    // --- invariant 87: a warn-mode identity mismatch is marked ------------
+
+    /// A call the gateway forwarded although its identity check would have
+    /// refused it (`TOKENFUSE_IDENTITY_STRICT=warn`), as the gateway pushes
+    /// it: `allow`, the claimed agent id, the credential, and the reason.
+    fn warned(run: &str, reason: &str, ts: i64) -> CallRecord {
+        serde_json::from_value(serde_json::json!({
+            "ts_millis": ts,
+            "run_id": run,
+            "model": "claude-sonnet-5",
+            "decision": "allow",
+            "cost_microusd": 7_000,
+            "step": 1,
+            "agent_id": VICTIM,
+            "key_id": IMPOSTER_KEY,
+            "identity_reason": reason,
+        }))
+        .expect("the gateway's wire record deserializes")
+    }
+
+    /// The run says how many of its calls the identity check would have
+    /// refused, and the latest reason, so a warn-mode mismatch no longer
+    /// reads as an honest call; the fleet total counts them too.
+    #[test]
+    fn a_warn_mode_identity_mismatch_is_counted_on_the_run_and_the_fleet() {
+        let s = Store::new();
+        s.ingest(
+            "acme",
+            &[
+                pushed("r1", "claude-sonnet-5", "allow", 7_000, 1, Some("known")),
+                warned("r1", "agent_id_not_allowed", 2),
+                warned("r1", "agent_id_contradicts_proven_chain", 3),
+            ],
+        );
+        let v = run_json(&s, "r1");
+        assert_eq!(v["identity_warned"], 2, "{v}");
+        assert_eq!(
+            v["last_identity_reason"], "agent_id_contradicts_proven_chain",
+            "{v}"
+        );
+        assert_eq!(v["blocked"], 0, "warn forwarded them: {v}");
+        assert_eq!(v["spent_microusd"], 21_000, "and they were spent: {v}");
+        let sum = serde_json::to_value(s.summary("acme")).unwrap();
+        assert_eq!(sum["identity_warned_calls"], 2, "{sum}");
+    }
+
+    /// The reason is a word from the gateway's own fixed vocabulary; any other
+    /// string an ingest credential sends is counted as a mismatch and never
+    /// shown as its reason.
+    #[test]
+    fn an_identity_reason_outside_the_vocabulary_is_never_shown() {
+        let s = Store::new();
+        s.ingest("acme", &[warned("r1", "<img src=x onerror=alert(1)>", 1)]);
+        let v = run_json(&s, "r1");
+        assert_eq!(v["identity_warned"], 1, "{v}");
+        assert_eq!(v["last_identity_reason"], "", "{v}");
+    }
+
     // --- invariant 86: a refused run and a fallback price are visible -----
     //
     // Read through `serde_json::to_value`, the shape `/v1/runs` and

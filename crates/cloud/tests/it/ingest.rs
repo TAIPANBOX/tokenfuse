@@ -528,3 +528,35 @@ async fn refusals_and_fallback_prices_reach_the_runs_and_summary_reads() {
         "{sum}"
     );
 }
+
+/// Invariant 87, end to end: a call forwarded under
+/// `TOKENFUSE_IDENTITY_STRICT=warn` arrives with its `identity_reason`, and
+/// `/v1/runs` and `/v1/summary` say the identity check would have refused it.
+#[tokio::test]
+async fn a_warn_mode_identity_mismatch_reaches_the_runs_and_summary_reads() {
+    let store = Arc::new(Store::new());
+    let state = state_with(Arc::clone(&store));
+    let payload = r#"{"records":[
+        {"ts_millis":100,"run_id":"w1","model":"claude-sonnet-5","decision":"allow","cost_microusd":7000,"step":1,"agent_id":"agent://acme/victim","key_id":"k1","owner":"","price_basis":"known","identity_reason":"agent_id_not_allowed"}
+    ]}"#;
+    let resp = app(state.clone())
+        .oneshot(
+            Request::post("/v1/ingest")
+                .header("authorization", "Bearer k")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let runs = read(&state, "/v1/runs").await;
+    let w1 = runs
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["run_id"] == "w1"))
+        .unwrap_or_else(|| panic!("w1 in /v1/runs: {runs}"));
+    assert_eq!(w1["identity_warned"], 1, "{w1}");
+    assert_eq!(w1["last_identity_reason"], "agent_id_not_allowed", "{w1}");
+    let sum = read(&state, "/v1/summary").await;
+    assert_eq!(sum["identity_warned_calls"], 1, "{sum}");
+}
