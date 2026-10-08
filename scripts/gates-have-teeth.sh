@@ -886,6 +886,37 @@ run_case "gemini-price-book: gemini-2.5-pro at its short-context tier" fail \
 	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-pro\", (2_500_000, 15_000_000, 250_000)),", "    (\"google/gemini-2.5-pro\", (1_250_000, 10_000_000, 125_000)),")')" \
 	"gemini_2_5_pro_is_priced_at_its_long_context_rate ... FAILED"
 
+# --- invariant 83: every published Breaker reason is Cloud evidence ---------
+#
+# Not a scripts/*.sh gate: the list is held by a test that reads the published
+# contract. The mutant is the defect itself, the list cut back to the seven
+# reasons it held before the identity-map pair, which still compiles.
+run_case "cloud-evidence: the known decisions cut back to the first seven reasons" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::known_decisions_cover_every_breaker_reason" \
+	"$(py 'edit("crates/cloud/src/store.rs", "    KNOWN_DECISIONS.contains(&decision)", "    KNOWN_DECISIONS[..9].contains(&decision)")')" \
+	"known_decisions_cover_every_breaker_reason ... FAILED"
+
+# --- invariant 84: the Cloud files an identity refusal under its key --------
+#
+# Not a scripts/*.sh gate: the rule is the store's fold, held by cargo test.
+# The first mutant is the defect itself, the refusal filed under the agent id
+# it claimed; the second lets the claimed id reach the incident detectors; the
+# third counts a credential among an owner's agents.
+run_case "cloud-identity: a refusal filed under the claimed agent" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::an_identity_refusal_is_the_credentials_blocked_call_in_spend" \
+	"$(py 'edit("crates/cloud/src/store.rs", "    if r.decision == IDENTITY_REFUSAL {\n        if r.key_id.is_empty() {", "    if false && r.decision == IDENTITY_REFUSAL {\n        if r.key_id.is_empty() {")')" \
+	"an_identity_refusal_is_the_credentials_blocked_call_in_spend ... FAILED"
+
+run_case "cloud-identity: the claimed agent reaches the incident detectors" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::an_impersonation_never_raises_a_fanout_explosion_naming_its_victim" \
+	"$(py 'edit("crates/cloud/src/store.rs", "let agent = (r.decision != IDENTITY_REFUSAL && !r.agent_id.is_empty())", "let agent = (!r.agent_id.is_empty())")')" \
+	"an_impersonation_never_raises_a_fanout_explosion_naming_its_victim ... FAILED"
+
+run_case "cloud-identity: a credential counted among an owner's agents" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::a_key_owners_agents_never_include_the_agent_her_key_impersonated" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if !agg.agent_id.is_empty() && !is_credential_bucket(&agg.agent_id) {", "if !agg.agent_id.is_empty() {")')" \
+	"a_key_owners_agents_never_include_the_agent_her_key_impersonated ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
