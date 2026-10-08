@@ -143,6 +143,38 @@
       "wire": "identity_mismatch"
     }
   ],
+  "focus_export": {
+    "columns": [
+      "BilledCost",
+      "EffectiveCost",
+      "BillingCurrency",
+      "ChargePeriodStart",
+      "ChargePeriodEnd",
+      "ChargeDescription",
+      "ProviderName",
+      "PublisherName",
+      "InvoiceIssuerName",
+      "ServiceName",
+      "ServiceCategory",
+      "ResourceId",
+      "ResourceName",
+      "SubAccountId",
+      "SubAccountName",
+      "x_run_id",
+      "x_parent_run_id",
+      "x_agent_id",
+      "x_model",
+      "x_tokens_in",
+      "x_tokens_out",
+      "x_blocked",
+      "x_cost_basis",
+      "x_outcome",
+      "x_unit",
+      "x_tool_calls",
+      "x_key_id",
+      "x_block_reason"
+    ]
+  },
   "generated_by": "tokenfuse constants (crates/gateway/src/constants.rs)",
   "price_book": {
     "fallback": {

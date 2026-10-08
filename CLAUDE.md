@@ -5576,3 +5576,85 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     net of the cache. Scenarios:
     `features/a-thinking-models-reasoning-is-billed-as-output.feature`, eight,
     each bound. Not a script gate)*
+
+81. **A call refused for identity is exported under the credential that made
+    it, never under the agent id it claimed; every FOCUS row carries its key
+    and a blocked row its reason.** Measured 2026-10-07 on a home-lab run with
+    `TOKENFUSE_CLIENT_KEYS`, `TOKENFUSE_IDENTITY_MAP` and strict identity in
+    enforce: a caller presenting the key `forge-imposter` and the agent id
+    `agent://taipanbox.dev/routers/flint` got `403 identity_mismatch`, which is
+    right, and the agent event named the key. `tokenfuse focus-export` wrote
+    the refused row with `ResourceId` and `x_agent_id` set to the CLAIMED id
+    and carried neither the key nor the reason, so CostCrew showed "flint: 2
+    blocked" for calls flint never made. The trace row was never wrong: it
+    holds the header in `agent_id` and the resolved credential in `key_id`;
+    the export threw the second away.
+
+    Two columns are appended LAST, after `x_tool_calls`, so a reader that
+    addresses the 26 older columns by position keeps reading them:
+    `x_key_id` (`CallRecord::key_id`, read through `COALESCE(key_id, '')`, so
+    a trace segment written before the column existed still exports, with
+    the key empty) and `x_block_reason` (the Breaker reason's wire string,
+    non-empty exactly when `x_blocked` is `true`; a policy plane's own
+    `wardryx_deny`/`wardryx_hold` is not a Breaker block and stays empty, as
+    `x_blocked` already is). The export's header is now published in
+    `contracts/tokenfuse-constants.json` as `focus_export.columns`, generated
+    from `focusexport`'s own `HEADER`, because CostCrew's reader retyped the
+    names by value (invariant 14's remedy, one more section); additive, so
+    `schema_version` stays 1, and `compat/1.0.json` names the rule
+    (appended, never reordered or renamed within the major).
+
+    `@claude` 2026-10-08, the `ResourceId` decision, under delegated
+    authority: on a row whose `decision` is `identity_mismatch`,
+    `ResourceId` and `ResourceName` are `key:<key_id>` and `x_agent_id` is
+    empty (`focusexport::filed_under`). The gateway refused that call
+    precisely because the credential may not speak as the agent it named,
+    so the header names somebody who did not make the call; the key is the
+    only identity on the row the caller did not choose. `x_agent_id` is
+    emptied too, not left as the claim, because a consumer reads it first
+    and `ResourceId` second (CostCrew's `tokenfuse-focus` reader does), so
+    changing `ResourceId` alone would have changed nothing a person sees.
+    The `key:` prefix keeps a key named like an agent out of that agent's
+    figures. With client keys off, `key_id` is empty on every row and the
+    refusal (a header contradicting a proven delegation chain) is filed
+    under nobody: both columns empty, which a reader can see, rather than
+    under somebody, which it cannot tell from the truth; CostCrew then
+    refuses that row by name ("no agent") instead of misattributing it. The
+    claimed id stays in the Parquet trace and in the `identity_mismatch`
+    agent event, where an investigation of the attempt starts. Every other
+    row is filed under its `agent_id` exactly as before, a budget block by
+    an authenticated caller included.
+
+    What this does not cover: in `TOKENFUSE_IDENTITY_STRICT=warn` a
+    mismatched call is forwarded and its row says `allow` with the claimed
+    id, because the trace records no mismatch on an allowed call, so the
+    export cannot tell; the identity reason (`agent_id_not_allowed`,
+    `agent_id_contradicts_proven_chain`, ...) is in the 403 and the agent
+    event but not in the trace, so `x_block_reason` says `identity_mismatch`
+    and nothing finer; a `wardryx_deny` row still exports as a $0 `settled`
+    row with no reason, as before; and the Cloud's own aggregation of
+    refused rows is not changed by this.
+    *(test: `focusexport::tests::` `an_identity_refused_row_is_filed_under_the_credential_not_the_claim`
+    (red in CI on the test-only commit, run 37720477052: `left:
+    "agent://taipanbox.dev/routers/flint" right: "key:forge-imposter"`),
+    `an_identity_refused_row_with_no_credential_names_no_resource` (red:
+    `left: "agent://acme/victim" right: ""`),
+    `every_row_carries_the_key_it_was_made_with` and
+    `a_blocked_row_names_its_reason_and_any_other_row_names_none` (red: "the
+    export has no x_key_id column", "... no x_block_reason column"),
+    `hostile_claims_and_keys_never_reach_the_resource_columns` (200 seeded
+    rows whose claims and keys hold commas, quotes, CR, LF and a non-ASCII
+    letter, read back by a parser written independently of the writer; red
+    on the missing column), `a_trace_written_before_key_id_existed_still_exports`
+    (a control, green on both sides by design);
+    `constants::tests::the_focus_export_columns_are_published_in_export_order`
+    (red: the artifact publishes no `focus_export.columns`);
+    `proxy::tests::an_impersonation_refused_at_the_door_exports_under_the_credential_that_made_it`,
+    the R6 call through the real handler, Parquet sink and export (red:
+    `left: "agent://bank.example/fraud/bot1" right: "key:treasury-bots"`).
+    The golden `exports_a_fixture_trace_to_the_exact_expected_csv` gained the
+    two columns and went red with them. Three mutants are cases in
+    `gates-have-teeth.sh`: the refusal filed under the claim again, a block
+    reason named on rows the Breaker did not block, and the key dropped.
+    Scenarios: `features/a-refused-impersonation-is-filed-under-the-credential.feature`,
+    seven, each bound. Not a script gate)*

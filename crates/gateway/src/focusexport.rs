@@ -37,6 +37,15 @@
 //!     file (schema evolution) as well as for a call whose response body
 //!     never parsed; a real, observed zero renders as `"0"`, distinguishable
 //!     from the blank "we don't know" case.
+//!   - `x_key_id`: sourced from `CallRecord.key_id` (invariant 81) - the
+//!     client credential the call was made with, resolved server-side from
+//!     `x-fuse-key`, never written by the caller. `""` when client keys are
+//!     off, and for a row from a trace file written before the column
+//!     existed (schema evolution, same `COALESCE` pattern).
+//!   - `x_block_reason`: the Breaker reason's wire string on a blocked row
+//!     (invariant 81), so non-empty exactly when `x_blocked` is `true`;
+//!     `""` on every other row, including a policy plane's own refusal
+//!     (`wardryx_deny`/`wardryx_hold`), which is not a Breaker block.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -49,10 +58,18 @@
 //! invention, but it is a heuristic — an unrecognized model name falls back to
 //! `"Unknown"`.
 //!
+//! ## Who a row is filed under
+//!
+//! `ResourceId`, `ResourceName` and `x_agent_id` carry the call's
+//! `x-fuse-agent-id`, except on a row refused for identity
+//! (`identity_mismatch`), where that id is the one the gateway refused as
+//! unauthenticated: such a row is filed under `key:<key_id>` with an empty
+//! `x_agent_id` (invariant 81, see [`filed_under`]).
+//!
 //! ## Cost basis and `x_blocked`
 //!
 //! A call's `decision` column already tells us whether the Breaker tripped
-//! (the seven reasons in [`tokenfuse_core::BreakerReason`]) — see
+//! (the nine reasons in [`tokenfuse_core::BreakerReason`]) — see
 //! [`is_blocked_decision`]. For a blocked row `cost_microusd` holds the
 //! *reserved estimate* that was never actually charged (see `proxy.rs`), so
 //! `BilledCost`/`EffectiveCost` are forced to `0` and `x_cost_basis` is
@@ -118,10 +135,14 @@ struct FocusRecord {
     /// call's response. `None` for a pre-I1 trace row or an unparseable
     /// response body - see `x_tool_calls`'s sourcing note above.
     tool_calls: Option<u32>,
+    /// The client credential the call was made with (`CallRecord::key_id`,
+    /// resolved server-side, never a header). `""` when client keys are off
+    /// and for a row written before the trace carried the column.
+    key_id: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 26] = [
+const HEADER: [&str; 28] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -148,7 +169,22 @@ const HEADER: [&str; 26] = [
     "x_outcome",
     "x_unit",
     "x_tool_calls",
+    // Invariant 81: appended LAST, so a reader that addresses the 26
+    // columns above by position keeps reading them.
+    "x_key_id",
+    "x_block_reason",
 ];
+
+/// The prefix a row refused for identity is filed under, ahead of the key id
+/// (invariant 81). It cannot be mistaken for an agent id, so a key named like
+/// an agent never lands in that agent's figures.
+pub(crate) const KEY_RESOURCE_PREFIX: &str = "key:";
+
+/// The header, for the constants contract (`crate::constants`), which
+/// publishes it so a consumer reads the columns instead of retyping them.
+pub(crate) fn columns() -> &'static [&'static str] {
+    &HEADER
+}
 
 /// Load, project, and write the FOCUS CSV. Returns `Err` with a clear message
 /// on bad flags, a missing/unreadable trace, or an empty result set — the
@@ -213,7 +249,8 @@ async fn load_records(
          coalesce(parent_run_id, '') as parent_run_id, \
          coalesce(outcome, '') as outcome, \
          coalesce(unit, '') as unit, \
-         cast(tool_calls as bigint) as tool_calls \
+         cast(tool_calls as bigint) as tool_calls, \
+         coalesce(key_id, '') as key_id \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -279,6 +316,7 @@ async fn load_records(
                 } else {
                     Some(tool_calls.value(i).max(0) as u32)
                 },
+                key_id: str_at(b.column(12).as_ref(), i),
             });
         }
     }
@@ -338,9 +376,48 @@ fn usd_string(microusd: i64) -> String {
     format!("{:.6}", Microusd(microusd).as_usd())
 }
 
-/// Project one trace row into the 26 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 26] {
+/// Who a row is filed under: `(ResourceId and ResourceName, x_agent_id)`.
+///
+/// Invariant 81. `agent_id` is the `x-fuse-agent-id` header, which the caller
+/// writes. On every row but one kind that is all the trace knows, and the
+/// export reports it as it always has. The exception is a row refused for
+/// identity (`identity_mismatch`): the gateway refused that call precisely
+/// because the credential presented may not speak as that agent, so the
+/// header names somebody who did NOT make the call. Filing it there put an
+/// impersonation's refusals on its victim's figures (the R6 run, 2026-10-07).
+///
+/// Such a row is filed under the credential that did make it,
+/// [`KEY_RESOURCE_PREFIX`] plus the key id, and reports no agent id, because
+/// a consumer reads `x_agent_id` first and `ResourceId` second (CostCrew's
+/// `tokenfuse-focus` reader does exactly that). With client keys off there is
+/// no credential on the row and both are empty: filed under nobody, which a
+/// reader can see, rather than under somebody, which it cannot tell from the
+/// truth. The claimed id is still in the Parquet trace and in the
+/// `identity_mismatch` agent event.
+fn filed_under(rec: &FocusRecord) -> (String, String) {
+    if rec.decision == BreakerReason::IdentityMismatch.as_wire_str() {
+        let resource = if rec.key_id.is_empty() {
+            String::new()
+        } else {
+            format!("{KEY_RESOURCE_PREFIX}{}", rec.key_id)
+        };
+        (resource, String::new())
+    } else {
+        (rec.agent_id.clone(), rec.agent_id.clone())
+    }
+}
+
+/// Project one trace row into the 28 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 28] {
     let blocked = is_blocked_decision(&rec.decision);
+    // Non-empty exactly when `x_blocked` is true: the Breaker reason's own
+    // wire string, which is what `decision` holds on a blocked row.
+    let block_reason = if blocked {
+        rec.decision.clone()
+    } else {
+        String::new()
+    };
+    let (resource, agent) = filed_under(rec);
     let (cost_microusd, cost_basis) = if blocked {
         (0i64, "blocked")
     } else if rec.input_tokens == 0 && rec.output_tokens == 0 && rec.cost_microusd != 0 {
@@ -364,13 +441,13 @@ fn to_row(rec: &FocusRecord) -> [String; 26] {
         provider,                                                  // InvoiceIssuerName
         "LLM inference".to_string(),                               // ServiceName
         "AI and Machine Learning".to_string(),                     // ServiceCategory
-        rec.agent_id.clone(),                                      // ResourceId
-        rec.agent_id.clone(),                                      // ResourceName
+        resource.clone(),                                          // ResourceId
+        resource,                                                  // ResourceName
         rec.run_id.clone(),                                        // SubAccountId
         rec.run_id.clone(),                                        // SubAccountName
         rec.run_id.clone(),                                        // x_run_id
         rec.parent_run_id.clone(),                                 // x_parent_run_id
-        rec.agent_id.clone(),                                      // x_agent_id
+        agent,                                                     // x_agent_id
         rec.model.clone(),                                         // x_model
         rec.input_tokens.to_string(),                              // x_tokens_in
         rec.output_tokens.to_string(),                             // x_tokens_out
@@ -379,6 +456,8 @@ fn to_row(rec: &FocusRecord) -> [String; 26] {
         rec.outcome.clone(),                                       // x_outcome
         rec.unit.clone(),                                          // x_unit
         rec.tool_calls.map(|n| n.to_string()).unwrap_or_default(), // x_tool_calls
+        rec.key_id.clone(),                                        // x_key_id
+        block_reason,                                              // x_block_reason
     ]
 }
 

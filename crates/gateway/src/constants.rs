@@ -25,7 +25,8 @@
 //! from [`BreakerReason::as_wire_str`], the blocked-decision set from
 //! [`tokenfuse_core::outcomes::is_blocked_decision`], the severities from
 //! [`EventType::severity`], the columns from [`ParquetSink`]'s own two schemas,
-//! and the prices from [`crate::pricebook::default_price_book`]. A hand-written
+//! the FOCUS export's columns from [`crate::focusexport`]'s own header, and
+//! the prices from [`crate::pricebook::default_price_book`]. A hand-written
 //! constants file is the original defect one level up: a file that can disagree
 //! with the constants it names.
 //!
@@ -263,6 +264,18 @@ fn price_book() -> serde_json::Value {
     })
 }
 
+/// The FOCUS export's columns, in the order `tokenfuse focus-export` writes
+/// them. A FinOps console reads this file by name, so the names are what a
+/// consumer needs, and they were retyped by value (CostCrew's
+/// `tokenfuse-focus` reader) until invariant 81 published them here. Columns
+/// are appended, never reordered or renamed, so a reader that knows an older
+/// prefix keeps reading it.
+fn focus_export() -> serde_json::Value {
+    json!({
+        "columns": crate::focusexport::columns(),
+    })
+}
+
 /// The whole published document.
 pub fn document() -> serde_json::Value {
     json!({
@@ -276,6 +289,7 @@ pub fn document() -> serde_json::Value {
         "agent_events": agent_events(),
         "trace_parquet": trace_parquet(),
         "price_book": price_book(),
+        "focus_export": focus_export(),
     })
 }
 
