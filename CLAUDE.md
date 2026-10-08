@@ -5816,3 +5816,66 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     among an owner's agents. Scenarios:
     `features/the-cloud-files-a-refused-impersonation-under-the-credential.feature`,
     seven, each bound. Not a script gate)*
+
+86. **A refused run and a fallback-priced call are visible in the fleet
+    view.** The dashboard's Runs table showed a run whose every call was
+    refused 403 as `live`, with $0 spent and N calls: the Cloud's `RunAgg`
+    kept no count of refusals and no latest decision, so the page had
+    nothing to say "refused" from. The refused calls per minute `/v1/series`
+    has always served (`Bucket.blocked`) were fetched and never drawn. And
+    the basis a call was charged at (`x-fuse-price: known | fallback`,
+    invariant 79) reached only the caller, so a fleet view could not see
+    spend charged at the fallback rate, up to five times a list price, for a
+    model id the book has no row for, nor how much of its history came from
+    gateways old enough to have charged most current ids that way.
+
+    The gateway's `CloudSink` now puts a wire-only `price_basis` beside
+    `owner` on each admitted (`allow`) record, `known` or `fallback`, decided
+    by `pricebook::basis`, the one function behind `x-fuse-price` too, over
+    the same book `AppState` prices with (`with_price_book`; the book is
+    fixed at startup, so the basis named at push time is the one charged).
+    The trace's sixteen columns do not change. The Cloud reads it
+    (`CallRecord::price_basis`) and folds, per run, `blocked` (refusals by a
+    reason it trusts, invariant 83), `last_decision` with its timestamp (the
+    latest CALL's, so a late batch never replaces a later call's decision; a
+    decision it does not trust is never shown), `fallback_calls` and
+    `basis_unreported_calls`; and per org, exactly like `calls`,
+    `fallback_calls`, `basis_unreported_calls` and the fallback calls per
+    model, served on `/v1/summary` as `fallback_models` (most calls first).
+    The dashboard shows `refused · <reason>` in Status for a run whose latest
+    call was refused, `N refused` under its Calls, a `fallback` pill on the
+    Model cell, a Fallback-priced fleet tile naming the top models and the
+    calls from gateways that name no basis, and the refused calls as bars
+    under the burn-rate line.
+
+    `@claude` 2026-10-08, choices under delegated authority: only an admitted
+    call has a basis, because a refusal's figure is an avoided estimate and
+    not a charge; a basis that is neither word is counted as not reported,
+    with every call from an older gateway, and the tile names that count
+    rather than read it as clean; the per-model fold is bounded at 256 ids
+    with an `(other models)` bucket, because model ids are caller-chosen.
+
+    What this does not cover: history ingested before this change carries
+    no basis and no refusal count (the Cloud cannot re-price a call it did
+    not see priced, and an older snapshot loads these figures as zero);
+    `tokenfuse top` (the terminal view) is unchanged; the dashboard has no
+    test harness, so its rendering was checked by eye against a mock Cloud
+    serving these shapes (recorded in the pull request), not by a test.
+    *(test: `store::tests::a_run_reports_its_refused_calls_and_its_latest_decision`,
+    `the_latest_decision_is_the_latest_call_not_the_last_pushed`,
+    `an_unrecognised_decision_is_never_the_runs_decision_or_a_refusal`,
+    `fallback_priced_calls_are_counted_per_run_and_per_model`,
+    `a_refused_call_or_an_unknown_basis_is_never_a_fallback_charge`,
+    `the_fallback_model_fold_is_bounded_and_loses_no_call`,
+    `fallback_counts_survive_a_snapshot_round_trip`, all red in CI on the
+    test-only commit, run 37740695011 (each new field read back `Null`); `crates/cloud/tests/it/ingest.rs::refusals_and_fallback_prices_reach_the_runs_and_summary_reads`
+    and `crates/gateway/tests/it/price_book_startup.rs::the_basis_each_call_was_charged_at_reaches_the_cloud`
+    (the real binary pushing to a capturing control plane), not run red
+    where cargo stopped at a failing lib binary first;
+    `cloudsink::tests::the_wire_record_names_the_basis_an_admitted_call_was_charged_at`,
+    added with the change and red only by compile. Three mutants are cases in
+    `gates-have-teeth.sh`: a late record replacing a later call's decision, a
+    refused call counted as a fallback charge, and the gateway naming a basis
+    on a refusal. Scenarios:
+    `features/a-refused-run-and-a-fallback-price-are-visible.feature`, eight,
+    each bound. Not a script gate)*

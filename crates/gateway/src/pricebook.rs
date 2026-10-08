@@ -372,6 +372,19 @@ pub fn default_price_book() -> PriceBook {
     book
 }
 
+/// The word a call's price basis is named by, `known` when `book` has a row
+/// for `model` and `fallback` when it was charged at the fallback rate.
+/// The one definition behind the answer's `x-fuse-price` (invariant 79) and
+/// the `price_basis` the Cloud is told (invariant 86), so the two cannot
+/// disagree about the same call.
+pub fn basis(book: &PriceBook, model: &str) -> &'static str {
+    if book.is_known(model) {
+        "known"
+    } else {
+        "fallback"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

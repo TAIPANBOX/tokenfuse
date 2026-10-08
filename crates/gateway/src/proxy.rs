@@ -2109,7 +2109,7 @@ fn set_header_checked(builder: Builder, name: &'static str, value: &str) -> Buil
 /// said so). One function for both the buffered and the streamed answer, so
 /// the header and the log line cannot disagree about one model.
 fn price_basis(st: &AppState, model: &str) -> &'static str {
-    if st.prices.is_known(model) {
+    if crate::pricebook::basis(&st.prices, model) == "known" {
         return "known";
     }
     if st.note_fallback_price(model) {

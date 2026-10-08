@@ -1275,7 +1275,8 @@ async fn serve() {
             }
             let cloud = Arc::new(
                 tokenfuse_gateway::cloudsink::CloudSink::new(base, key)
-                    .with_unit_owners(state.identity.unit_owners()),
+                    .with_unit_owners(state.identity.unit_owners())
+                    .with_price_book(Arc::clone(&state.prices)),
             );
             // A gateway with nothing to say still says it is alive (invariant
             // 66): otherwise an idle but healthy site and a dead one both go

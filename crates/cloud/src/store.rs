@@ -236,6 +236,16 @@ pub struct CallRecord {
     /// so an older gateway still ingests.
     #[serde(default)]
     pub key_id: String,
+    /// The basis the gateway charged this call at, `"known"` (a row in the
+    /// price book) or `"fallback"` (the conservative fallback rate), the
+    /// same word as the answer's `x-fuse-price` (invariant 79). A wire-only
+    /// key the gateway's `CloudSink` puts beside `owner`, never a trace
+    /// column; set only on an admitted (`allow`) call, the one kind whose
+    /// cost is a charge. Invariant 86. `""`, absent, or any other word: not
+    /// reported (a gateway older than this field), counted as such and never
+    /// guessed. Additive: `#[serde(default)]`.
+    #[serde(default)]
+    pub price_basis: String,
 }
 
 /// One `/v1/run-spend` row (invariant 75): what a site's gateway needs to
@@ -312,7 +322,50 @@ pub struct RunAgg {
     /// pre-I1 snapshots still load.
     #[serde(default)]
     pub tool_calls: u64,
+    /// Calls the gateway refused on this run, by a reason the Cloud trusts
+    /// (invariant 83). Invariant 86: the dashboard showed a run whose every
+    /// call was refused as "live", with nothing spent; this and
+    /// `last_decision` are what let it say refused instead. `serde(default)`
+    /// so an older snapshot loads with zero.
+    #[serde(default)]
+    pub blocked: u64,
+    /// The decision of this run's latest call by its own timestamp, `allow`,
+    /// `cache_hit` or a Breaker reason; a record pushed late never replaces
+    /// a later call's decision, and a decision the Cloud does not trust is
+    /// never shown here. `""` until a trusted decision is seen.
+    #[serde(default)]
+    pub last_decision: String,
+    /// The timestamp `last_decision` was taken at.
+    #[serde(default)]
+    pub last_decision_millis: i64,
+    /// Admitted calls the gateway charged at the fallback rate (no row for
+    /// the model id), invariant 86.
+    #[serde(default)]
+    pub fallback_calls: u64,
+    /// Admitted calls whose gateway named no price basis (one older than
+    /// v1.8.0, which may well have charged them at the fallback: before
+    /// v1.7.0 the book had no row for most current model ids).
+    #[serde(default)]
+    pub basis_unreported_calls: u64,
 }
+
+/// One model id and how many admitted calls were charged at the fallback
+/// rate for it (invariant 86).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ModelCalls {
+    /// The model id as the gateway recorded it, or [`OTHER_FALLBACK_MODELS`]
+    /// for the ids past the per-org bound.
+    pub model: String,
+    pub calls: u64,
+}
+
+/// How many distinct model ids the per-org fallback fold keeps. Model ids
+/// are caller-chosen, so the fold is bounded; past it, calls are counted
+/// under [`OTHER_FALLBACK_MODELS`], never dropped.
+const MAX_FALLBACK_MODEL_KEYS: usize = 256;
+
+/// The bucket for fallback-priced calls past [`MAX_FALLBACK_MODEL_KEYS`].
+pub const OTHER_FALLBACK_MODELS: &str = "(other models)";
 
 /// Org-wide totals. `calls`/`spent_microusd` are exact across the org's
 /// entire ingest history; `runs` is the currently-retained distinct run
@@ -326,6 +379,14 @@ pub struct Summary {
     /// docs/21-tool-runs.md), mirroring `calls`/`spent_microusd` above -
     /// exact, unaffected by `MAX_RUNS_PER_ORG` eviction.
     pub tool_calls: u64,
+    /// Admitted calls charged at the fallback rate across the org's whole
+    /// ingest history (invariant 86), exact like `calls`.
+    pub fallback_calls: u64,
+    /// Admitted calls whose gateway named no price basis, exact.
+    pub basis_unreported_calls: u64,
+    /// `fallback_calls` per model id, most calls first, then by id; bounded
+    /// at 256 ids plus the `(other models)` bucket.
+    pub fallback_models: Vec<ModelCalls>,
 }
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
@@ -702,6 +763,17 @@ struct OrgTotals {
     /// per-run source to recompute this dimension from for old snapshots.
     #[serde(default)]
     tool_calls: u64,
+    /// Invariant 86, exact like `calls`: admitted calls charged at the
+    /// fallback rate, admitted calls with no basis reported, and the first
+    /// per model (bounded, see [`MAX_FALLBACK_MODEL_KEYS`]). `serde(default)`
+    /// so an older snapshot loads with zeros: there is no earlier record of
+    /// the basis to backfill from.
+    #[serde(default)]
+    fallback_calls: u64,
+    #[serde(default)]
+    basis_unreported_calls: u64,
+    #[serde(default)]
+    fallback_models: HashMap<String, u64>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -1705,6 +1777,41 @@ impl Store {
                     }
                     if r.decision == "cache_hit" {
                         agg.cache_hits += 1;
+                    }
+                    // Invariant 86: what the dashboard needs to say a run
+                    // was refused, and which admitted calls were charged at
+                    // the fallback rate. Both read only what the Cloud trusts:
+                    // a known decision (invariant 83), and a basis that is one
+                    // of the gateway's two words on an admitted call.
+                    if is_known_decision(&r.decision) {
+                        if is_blocked(&r.decision) {
+                            agg.blocked += 1;
+                        }
+                        if r.ts_millis >= agg.last_decision_millis {
+                            agg.last_decision = r.decision.clone();
+                            agg.last_decision_millis = r.ts_millis;
+                        }
+                    }
+                    if r.decision == "allow" {
+                        match r.price_basis.as_str() {
+                            "known" => {}
+                            "fallback" => {
+                                agg.fallback_calls += 1;
+                                totals.fallback_calls += 1;
+                                let key = if totals.fallback_models.contains_key(&r.model)
+                                    || totals.fallback_models.len() < MAX_FALLBACK_MODEL_KEYS
+                                {
+                                    r.model.clone()
+                                } else {
+                                    OTHER_FALLBACK_MODELS.to_string()
+                                };
+                                *totals.fallback_models.entry(key).or_insert(0) += 1;
+                            }
+                            _ => {
+                                agg.basis_unreported_calls += 1;
+                                totals.basis_unreported_calls += 1;
+                            }
+                        }
                     }
                     if !r.model.is_empty() {
                         agg.model = r.model.clone();
@@ -2732,6 +2839,18 @@ impl Store {
             sum.calls = totals.calls;
             sum.spent_microusd = totals.spent_microusd;
             sum.tool_calls = totals.tool_calls;
+            sum.fallback_calls = totals.fallback_calls;
+            sum.basis_unreported_calls = totals.basis_unreported_calls;
+            let mut models: Vec<ModelCalls> = totals
+                .fallback_models
+                .iter()
+                .map(|(model, calls)| ModelCalls {
+                    model: model.clone(),
+                    calls: *calls,
+                })
+                .collect();
+            models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)));
+            sum.fallback_models = models;
         }
         sum
     }

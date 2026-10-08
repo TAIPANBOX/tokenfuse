@@ -427,6 +427,25 @@ td.num {
   border-color: rgba(255, 87, 75, 0.38);
   background: rgba(255, 87, 75, 0.1);
 }
+td.num .refused {
+  font-size: 10px;
+  color: var(--ember);
+  margin-top: 2px;
+}
+.hero .refusedlegend {
+  font-family: var(--fm);
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: -2px;
+}
+.hero .refusedlegend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 4px;
+  background: rgba(255, 87, 75, 0.55);
+  border-radius: 2px;
+}
 .pill.dead {
   color: var(--faint);
   border-color: var(--line);
