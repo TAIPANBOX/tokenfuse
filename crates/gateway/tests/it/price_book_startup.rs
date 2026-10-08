@@ -213,7 +213,7 @@ async fn price_book(addr: &str) -> (u16, serde_json::Value) {
     (status, body)
 }
 
-/// Invariant 86: which book a gateway prices with is readable from the
+/// Invariant 85: which book a gateway prices with is readable from the
 /// gateway, not only from its startup log. With the operator's file the
 /// route names the row it replaced and the row it added; without one it says
 /// the built-in book is the whole book; and a model the book has no row for

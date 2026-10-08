@@ -196,7 +196,7 @@ async fn healthz_and_messages_are_never_behind_the_admin_gate() {
     );
 }
 
-/// Invariant 86: `GET /v1/price-book` names which model ids an operator's
+/// Invariant 85: `GET /v1/price-book` names which model ids an operator's
 /// file replaced or added and which model ids callers sent that the book has
 /// no row for, so it sits behind the same gate as the other observability
 /// routes: refused on an open bind with no keys, refused without the key once

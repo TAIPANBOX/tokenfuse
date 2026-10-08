@@ -112,6 +112,12 @@ pub struct AppState {
     /// Bounded the same way as `budget_clamp_logged`: model ids are
     /// caller-chosen too.
     fallback_price_logged: Arc<Mutex<HashSet<String>>>,
+    /// Where `prices` came from, fixed at startup (invariant 85): the
+    /// built-in book's size and what `TOKENFUSE_PRICE_BOOK` replaced or
+    /// added. `GET /v1/price-book` reads it. `new` sets the book it is
+    /// handed as the whole built-in book; `serve` names the operator's rows
+    /// with [`AppState::with_price_book_source`].
+    pub price_book_source: Arc<crate::pricebookreport::PriceBookSource>,
     /// Agent-event NDJSON exporter (agent-passport SPEC.md §6). Disabled
     /// (zero per-request cost) unless `TOKENFUSE_EVENTS_PATH` is set at
     /// startup — see `crate::events`.
@@ -545,6 +551,7 @@ impl AppState {
         provider: Arc<dyn Provider>,
         policy_id: impl Into<Arc<str>>,
     ) -> Self {
+        let built_in_rows = prices.entries().len();
         AppState {
             // No delegation issuer until `main` configures one, so every chain
             // is a claim and every existing deployment is unchanged.
@@ -583,6 +590,10 @@ impl AppState {
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
+            price_book_source: Arc::new(crate::pricebookreport::PriceBookSource {
+                built_in_rows,
+                operator: None,
+            }),
             events: Arc::new(EventExporter::disabled()),
             agent_id_mode: crate::agentids::AgentIdMode::default(),
             client_keys: Arc::new(ClientKeys::default()),
@@ -637,6 +648,26 @@ impl AppState {
     pub fn with_max_run_budget(mut self, ceiling: Option<Microusd>) -> Self {
         self.max_run_budget = ceiling;
         self
+    }
+
+    /// Name where the price book came from (invariant 85). Chainable.
+    pub fn with_price_book_source(
+        mut self,
+        source: crate::pricebookreport::PriceBookSource,
+    ) -> Self {
+        self.price_book_source = Arc::new(source);
+        self
+    }
+
+    /// The model ids the fallback rate has priced since this process started
+    /// (or since the set was last emptied at `CLAMP_LOG_CAP`), unsorted.
+    pub fn fallback_models_seen(&self) -> Vec<String> {
+        self.fallback_price_logged
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Record that the fallback rate priced `model` and say whether this is

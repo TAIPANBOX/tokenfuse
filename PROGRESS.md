@@ -304,9 +304,13 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1702 passing** (core 372, dpop 21, delegation 60,
-gateway 991, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 5
+`cargo test --all` runs **1705 passing** (core 372, dpop 21, delegation 60,
+gateway 994, cloud 257, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 3
+with invariant 85 (`GET /v1/price-book` shows the book a gateway charges with:
+1 in `gateway::pricebookreport`, 1 in `tests/it/admin_gate.rs`, 1 in
+`tests/it/price_book_startup.rs`; 2026-10-08, counted by hand and checked by
+CI's `stated-numbers.sh`). Gateway grew by 5
 with invariant 82 (Gemini on Vertex AI priced at Google's listed rate: 3 in
 `gateway::pricebook`, 1 in `gateway::proxy`, 1 in
 `tests/it/reasoning_tokens_are_output.rs`; 2026-10-08, counted by hand and

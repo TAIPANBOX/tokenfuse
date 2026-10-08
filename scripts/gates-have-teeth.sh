@@ -886,6 +886,29 @@ run_case "gemini-price-book: gemini-2.5-pro at its short-context tier" fail \
 	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-pro\", (2_500_000, 15_000_000, 250_000)),", "    (\"google/gemini-2.5-pro\", (1_250_000, 10_000_000, 125_000)),")')" \
 	"gemini_2_5_pro_is_priced_at_its_long_context_rate ... FAILED"
 
+# --- invariant 85: the price book a gateway uses is readable from it -------
+#
+# Not a scripts/*.sh gate: the route is held by cargo test. The first mutant
+# serves it outside the admin gate, which publishes caller-chosen model ids to
+# anyone who can reach the port; the second loses the operator's replaced rows
+# between startup and the route; the third drops the bound on how many
+# caller-chosen ids the report lists.
+run_case "price-book-route: served outside the admin gate" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact admin_gate::the_price_book_route_is_behind_the_admin_gate" \
+	"$(py 'edit("crates/gateway/src/lib.rs", "        .route(\"/v1/price-book\", get(pricebookreport::price_book))\n", "")
+edit("crates/gateway/src/lib.rs", "        .route(\"/healthz\", get(proxy::healthz))\n", "        .route(\"/healthz\", get(proxy::healthz))\n        .route(\"/v1/price-book\", get(pricebookreport::price_book))\n")')" \
+	"the_price_book_route_is_behind_the_admin_gate ... FAILED"
+
+run_case "price-book-route: the operator's replaced rows lost after startup" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact price_book_startup::the_price_book_route_names_the_operators_rows_and_the_fallback" \
+	"$(py 'edit("crates/gateway/src/main.rs", "overridden: applied.overridden_models,", "overridden: Vec::new(),")')" \
+	"the_price_book_route_names_the_operators_rows_and_the_fallback ... FAILED"
+
+run_case "price-book-route: no bound on the caller-chosen ids listed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebookreport::tests::caller_chosen_ids_are_bounded_in_count_and_length" \
+	"$(py 'edit("crates/gateway/src/pricebookreport.rs", ".take(MAX_FALLBACK_MODELS_SHOWN)", ".take(usize::MAX)")')" \
+	"caller_chosen_ids_are_bounded_in_count_and_length ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
