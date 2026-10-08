@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.6.1-brightgreen)
-![tests](https://img.shields.io/badge/tests-1697-brightgreen)
+![tests](https://img.shields.io/badge/tests-1702-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -408,6 +408,8 @@ A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent whe
 **Which price a call is charged at.** Every metered answer, streamed or not, carries `x-fuse-price`: `known` when the built-in price book has a row for the model id, `fallback` when it did not and the call was priced at the conservative fallback of USD 15 / 75 per million tokens (the safe direction for a cap, and up to five times a model's list price). The first fallback-priced call of each model id is also logged at warn. `x-fuse-cost-usd` is this call's settled cost and `x-fuse-spent-usd` the run's running total, so a reader recording per-call charges wants the first.
 
 The book has a row for every Claude model id Anthropic lists, under the Claude API, Amazon Bedrock, Google Cloud and OpenRouter, each rate read from the vendor's page on a date named beside it in [`pricebook.rs`](crates/gateway/src/pricebook.rs), plus a few OpenAI models. Bedrock and Google Cloud bill a regional endpoint 10 percent above a global one, and the model id does not always say which endpoint served the call: an id that may be regional (a bare Bedrock `anthropic.*` id, a `us.`/`eu.`/`jp.`/`apac.` profile, a Google `@`-dated id) is priced with the premium, which over-charges a global call by 10 percent, and a Google Cloud dateless id is the Claude API's id and is priced at list, which under-charges a regional Google call by 10 percent. Rates move; a row is right on the date it was read.
+
+Gemini on Vertex AI's OpenAI-compatible endpoint has a row for each current text model under the id that endpoint takes (`google/gemini-2.5-flash`, `google/gemini-3.5-flash`, ...), read from Google's Vertex AI pricing page on 2026-10-08. The output rate is the one Google bills for the response and the reasoning together. Each row errs toward over-charging where the page leaves a choice: the Gemini 3 family at the non-global rate (the id does not say which endpoint served the call), Gemini 2.5 Pro at its rate above 200K input tokens, and Gemini 3.6, 3.7 and 3.8 Flash at the standard rate rather than the introductory one Google pays back as a credit until the end of 2026. Rows price text input; an audio prompt on a model that lists a higher audio rate is under-charged, which `TOKENFUSE_PRICE_BOOK` corrects.
 
 For anything the book does not know, or a rate that differs for you (a regional endpoint, a negotiated discount, a local model that costs nothing), set `TOKENFUSE_PRICE_BOOK` to a JSON file of rows in the published book's own shape ([`contracts/tokenfuse-constants.json`](contracts/tokenfuse-constants.json), `price_book.models`), read once at startup. A row replaces the built-in row of the same id or adds a new one; the fallback cannot be changed:
 

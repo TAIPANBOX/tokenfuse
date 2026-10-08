@@ -6,8 +6,8 @@
 //! resolve via an exact price-book entry vs. the conservative fallback
 //! (`x-fuse-price: known` vs `fallback`, see `proxy.rs`).
 //!
-//! Every Anthropic row below names the page its rate was read from and the
-//! date it was read. A rate in this file is a claim about somebody else's
+//! Every Anthropic and Google row below names the page its rate was read
+//! from and the date it was read. A rate in this file is a claim about somebody else's
 //! price list, true on that date: when a vendor moves a price, the row is
 //! wrong until somebody reads the page again. An operator who cannot wait
 //! for a release overrides any row with `TOKENFUSE_PRICE_BOOK`
@@ -194,6 +194,93 @@ const CLAUDE: &[Claude] = &[
     },
 ];
 
+/// Gemini on Vertex AI, by the id Vertex AI's OpenAI-compatible endpoint
+/// takes (`model: "google/<model id>"` on `.../endpoints/openapi/chat/completions`):
+/// micro-USD per Mtok, `(input, output, cached input)`.
+///
+/// Rates: <https://cloud.google.com/vertex-ai/generative-ai/pricing>, which
+/// redirects to
+/// <https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing>,
+/// tables "Gemini 3" and "Gemini 2.5", the Standard tab, read 2026-10-08.
+/// Which models are current: the "Model versions" page
+/// (<https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions>,
+/// read 2026-10-08), its stable and shorter-term tables; the `google/` id
+/// form: "Access Gemini models using OpenAI libraries"
+/// (<https://cloud.google.com/vertex-ai/generative-ai/docs/start/openai>),
+/// read the same day. Gemini 2.5 Flash at 0.30 / 2.50 / 0.03 agrees with the
+/// reading of 2026-10-07 that invariant 80 measured against.
+///
+/// How each row was chosen, all on the over-charging side (ADR-8):
+/// - **Output** is the page's "Text output (response and reasoning)": Google
+///   bills a thinking model's reasoning at the output rate (invariant 80).
+/// - **Context-length tier.** Only Gemini 2.5 Pro has one on these tables
+///   (1.25 / 10.00 / 0.125 up to 200K input tokens; 2.50 / 15.00 / 0.25
+///   above, and the page says a query over 200K bills every token, output
+///   included, at the higher rate). The book holds one rate per model and
+///   prices without seeing the prompt size, so the row is the higher tier: a
+///   short Pro call is over-charged twofold in input and 1.5x in output.
+/// - **Global and non-global.** The Gemini 3 rows list a "Global" rate and a
+///   "Non-global" one 10 percent above it, in effect since 2026-07-01. The id
+///   does not say which served the call (the location is in the URL), so the
+///   row is the non-global rate, the rule invariant 79 applies to Claude on
+///   the clouds. The Gemini 2.5 tables list one rate.
+/// - **Introductory pricing.** Gemini 3.6, 3.7 and 3.8 Flash are "offered with
+///   introductory pricing" of 0.75 / 3.75 through 2026-12-31, "provided
+///   through 50% credits back on net spend"; the standard 1.50 / 7.50 (1.65 /
+///   8.25 non-global) is the rate billed before the credit and the only one
+///   from 2027-01-01. The row is the standard rate, so until the year ends it
+///   is twice what the credit leaves.
+/// - **Modality.** Rows price text input. Where a model lists audio input
+///   above text (2.5 Flash 1.00, 2.5 Flash-Lite 0.30, 3.1 Flash-Lite 0.55
+///   non-global) an audio prompt is under-charged; that operator sets the rate
+///   in `TOKENFUSE_PRICE_BOOK`.
+/// - **Cache.** Google charges no cache-write fee (a cache is created at the
+///   input rate, then stored by the hour, which the book cannot price), so
+///   both write columns are the input rate, as the OpenAI rows do.
+///
+/// Not here: the preview models (Gemini 3.1 Pro Preview, whose id the model
+/// pages do not give, and Gemini 3 Flash Preview, whose output rate the page
+/// does not show), the Live, image, text-to-speech and embedding models, the
+/// retired Gemini 2.0 and 1.x models, and the bare ids the Gemini API takes,
+/// whose own price list was not read.
+const GEMINI: &[(&str, (i64, i64, i64))] = &[
+    // Gemini 3.8 Flash: standard 1.50 / 7.50, cached 0.15 global;
+    // 1.65 / 8.25, cached 0.165 non-global.
+    ("google/gemini-3.8-flash", (1_650_000, 8_250_000, 165_000)),
+    // Gemini 3.8 Flash Cyber: as 3.8 Flash's standard rate.
+    (
+        "google/gemini-3.8-flash-cyber",
+        (1_650_000, 8_250_000, 165_000),
+    ),
+    // Gemini 3.7 Flash, 3.6 Flash: as 3.8 Flash.
+    ("google/gemini-3.7-flash", (1_650_000, 8_250_000, 165_000)),
+    ("google/gemini-3.6-flash", (1_650_000, 8_250_000, 165_000)),
+    // Gemini 3.5 Flash: 1.50 / 9.00, cached 0.15 global; 1.65 / 9.90 / 0.165.
+    ("google/gemini-3.5-flash", (1_650_000, 9_900_000, 165_000)),
+    // Gemini 3.5 Flash-Lite: 0.30 / 2.50 / 0.03 global; 0.33 / 2.75 / 0.033.
+    ("google/gemini-3.5-flash-lite", (330_000, 2_750_000, 33_000)),
+    // Gemini 3.1 Flash-Lite, text input: 0.25 / 1.50 / 0.025 global;
+    // 0.275 / 1.65 / 0.0275 non-global.
+    ("google/gemini-3.1-flash-lite", (275_000, 1_650_000, 27_500)),
+    // Gemini 2.5 Pro, the "> 200K" tier: 2.50 / 15.00, cached 0.25.
+    ("google/gemini-2.5-pro", (2_500_000, 15_000_000, 250_000)),
+    // Gemini 2.5 Flash, text input: 0.30 / 2.50, cached 0.03 (one tier).
+    ("google/gemini-2.5-flash", (300_000, 2_500_000, 30_000)),
+    // Gemini 2.5 Flash-Lite, text input: 0.10 / 0.40, cached 0.01.
+    ("google/gemini-2.5-flash-lite", (100_000, 400_000, 10_000)),
+];
+
+/// A Gemini row: the two cache-write columns are the input rate (no write fee).
+fn gemini(input: i64, output: i64, cached: i64) -> ModelPrice {
+    ModelPrice {
+        input_per_mtok: Microusd(input),
+        output_per_mtok: Microusd(output),
+        cache_read_per_mtok: Microusd(cached),
+        cache_write_per_mtok: Microusd(input),
+        cache_write_1h_per_mtok: Microusd(input),
+    }
+}
+
 /// A regional or multi-region endpoint's rate: list plus 10 percent, in
 /// integer micro-USD. Every list rate above is a whole multiple of 10
 /// micro-USD, so `* 11 / 10` is exact; the test that writes each figure out
@@ -211,7 +298,8 @@ fn regional(p: ModelPrice) -> ModelPrice {
 
 /// The price book used by `tokenfuse serve`, before any `TOKENFUSE_PRICE_BOOK`
 /// override. Illustrative generic entries, every Claude id in [`CLAUDE`],
-/// and exact entries for three OpenAI models, so common calls price exactly
+/// every Gemini id in [`GEMINI`], and exact entries for three OpenAI models,
+/// so common calls price exactly
 /// instead of falling back to the conservative generic rate.
 pub fn default_price_book() -> PriceBook {
     let mut book = PriceBook::new()
@@ -276,6 +364,10 @@ pub fn default_price_book() -> PriceBook {
         for id in m.regional {
             book.insert(*id, regional(list));
         }
+    }
+    // Google, on Vertex AI's OpenAI-compatible endpoint (see `GEMINI`).
+    for (id, (i, o, r)) in GEMINI {
+        book.insert(*id, gemini(*i, *o, *r));
     }
     book
 }
@@ -463,6 +555,121 @@ mod tests {
             wrong.len(),
             wrong.join("\n")
         );
+    }
+
+    /// Gemini on Vertex AI's OpenAI-compatible endpoint, by the ids that
+    /// endpoint takes (`google/<model id>`), micro-USD per Mtok, written out
+    /// by hand from <https://cloud.google.com/vertex-ai/generative-ai/pricing>
+    /// (which redirected to `.../gemini-enterprise-agent-platform/generative-ai/pricing`),
+    /// read 2026-10-08. Google has no cache-write fee (a cache is created at
+    /// the input rate and stored by the hour), so both write columns are the
+    /// input rate. The Gemini 3 family is priced at its "Non-global" rate,
+    /// because the id does not say which endpoint served it (the location is
+    /// in the URL); Gemini 2.5 Pro at its "> 200K" long-context rate, the
+    /// higher tier; Gemini 3.6, 3.7 and 3.8 Flash at the standard rate, not
+    /// the introductory one paid back as a credit.
+    fn expected_gemini_rows() -> Vec<(&'static str, Rates)> {
+        // (input, output, cached input, cache write, 1-hour cache write)
+        let flash_3_8: Rates = (1_650_000, 8_250_000, 165_000, 1_650_000, 1_650_000);
+        vec![
+            ("google/gemini-3.8-flash", flash_3_8),
+            ("google/gemini-3.8-flash-cyber", flash_3_8),
+            ("google/gemini-3.7-flash", flash_3_8),
+            ("google/gemini-3.6-flash", flash_3_8),
+            (
+                "google/gemini-3.5-flash",
+                (1_650_000, 9_900_000, 165_000, 1_650_000, 1_650_000),
+            ),
+            (
+                "google/gemini-3.5-flash-lite",
+                (330_000, 2_750_000, 33_000, 330_000, 330_000),
+            ),
+            (
+                "google/gemini-3.1-flash-lite",
+                (275_000, 1_650_000, 27_500, 275_000, 275_000),
+            ),
+            (
+                "google/gemini-2.5-pro",
+                (2_500_000, 15_000_000, 250_000, 2_500_000, 2_500_000),
+            ),
+            (
+                "google/gemini-2.5-flash",
+                (300_000, 2_500_000, 30_000, 300_000, 300_000),
+            ),
+            (
+                "google/gemini-2.5-flash-lite",
+                (100_000, 400_000, 10_000, 100_000, 100_000),
+            ),
+        ]
+    }
+
+    /// Every current Gemini text model sold on Vertex AI resolves by an exact
+    /// row at its rate. Before this, each one settled at the 15 / 75
+    /// fallback unless an operator file named it (invariant 80's note).
+    #[test]
+    fn every_gemini_id_on_vertex_prices_at_its_list_rate() {
+        let book = default_price_book();
+        let mut wrong = Vec::new();
+        for (id, want) in expected_gemini_rows() {
+            if !book.is_known(id) {
+                wrong.push(format!("{id}: no row, priced at the fallback"));
+                continue;
+            }
+            let p = book.price(id).unwrap();
+            let got = (
+                p.input_per_mtok.0,
+                p.output_per_mtok.0,
+                p.cache_read_per_mtok.0,
+                p.cache_write_per_mtok.0,
+                p.cache_write_1h_per_mtok.0,
+            );
+            if got != want {
+                wrong.push(format!("{id}: got {got:?}, list is {want:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} ids wrong:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The call invariant 80 measured on 2026-10-07 through Vertex AI's
+    /// OpenAI-compatible endpoint: google/gemini-2.5-flash, 14 input tokens
+    /// and 619 output (59 visible, 560 reasoning). At 0.30 / 2.50 per Mtok
+    /// that is 4.2 + 1547.5 = 1551.7 micro-USD, rounded up once to 1552
+    /// (invariant 67). At the 15 / 75 fallback it was 210 + 46425 = 46635.
+    #[test]
+    fn the_measured_vertex_gemini_call_settles_at_list_not_the_fallback() {
+        let usage = Usage {
+            input_tokens: 14,
+            output_tokens: 619,
+            ..Default::default()
+        };
+        let book = default_price_book();
+        assert_eq!(
+            book.cost("google/gemini-2.5-flash", &usage),
+            Some(Microusd(1552))
+        );
+    }
+
+    /// The page prices Gemini 2.5 Pro in two tiers by prompt size, and when a
+    /// query is longer than 200K tokens every token of it, output included,
+    /// is billed at the higher one. The book holds one rate per model and
+    /// does not see the prompt size when it prices, so it holds the higher
+    /// tier: 2.50 / 15.00, cached 0.25, never the 1.25 / 10.00 a short
+    /// prompt pays. A short call is over-charged, never a long one under.
+    #[test]
+    fn gemini_2_5_pro_is_priced_at_its_long_context_rate() {
+        let book = default_price_book();
+        let p = book
+            .price("google/gemini-2.5-pro")
+            .expect("the book always prices");
+        assert!(book.is_known("google/gemini-2.5-pro"), "no row: fallback");
+        assert_eq!(p.input_per_mtok, Microusd(2_500_000));
+        assert_eq!(p.output_per_mtok, Microusd(15_000_000));
+        assert_eq!(p.cache_read_per_mtok, Microusd(250_000));
     }
 
     /// The call #305 measured: 2874 input and 200 output tokens on

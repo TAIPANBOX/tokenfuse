@@ -5550,7 +5550,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     still settles on the completion count alone, since nothing in the body
     says what the reasoning was; no row in the built-in price book prices a
     Gemini id (invariant 79's rows are Claude's), so a Gemini call settles at
-    the fallback rates unless `TOKENFUSE_PRICE_BOOK` names it; and the
+    the fallback rates unless `TOKENFUSE_PRICE_BOOK` names it (closed for the
+    current Gemini text models on Vertex AI by invariant 82, 2026-10-08); and the
     pre-flight estimate (`estimate.rs`) never read `completion_tokens` and is
     unchanged: it reserves `max_completion_tokens` (or `max_tokens`, or 1024)
     of output, and whether Google counts reasoning inside that cap was not
@@ -5658,3 +5659,67 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     reason named on rows the Breaker did not block, and the key dropped.
     Scenarios: `features/a-refused-impersonation-is-filed-under-the-credential.feature`,
     seven, each bound. Not a script gate)*
+82. **A Gemini model sold on Vertex AI is priced at the rate Google lists,
+    under the id Vertex AI's OpenAI-compatible endpoint takes, and every
+    choice the page leaves open is taken on the over-charging side.** Until
+    this change the built-in book had no Gemini row, so every Gemini call
+    through the OpenAI door settled at the 15 / 75 fallback unless an
+    operator file named it: the call invariant 80 measured on 2026-10-07
+    (`google/gemini-2.5-flash`, 14 input and 619 output tokens) costs 1552
+    micro-USD at Google's rate and settled at 46635, thirty times over.
+
+    `pricebook.rs::GEMINI` holds ten rows, `google/gemini-3.8-flash`,
+    `-3.8-flash-cyber`, `-3.7-flash`, `-3.6-flash`, `-3.5-flash`,
+    `-3.5-flash-lite`, `-3.1-flash-lite`, `-2.5-pro`, `-2.5-flash` and
+    `-2.5-flash-lite`, read on 2026-10-08 from
+    <https://cloud.google.com/vertex-ai/generative-ai/pricing> (which now
+    redirects to `.../gemini-enterprise-agent-platform/generative-ai/pricing`),
+    the current set from the "Model versions" page and the `google/` id form
+    from Google's OpenAI-libraries page, all three cited with their date in
+    the module. Gemini 2.5 Flash's 0.30 / 2.50 / 0.03 agrees with the reading
+    of 2026-10-07. The output rate is the page's "Text output (response and
+    reasoning)", which is what invariant 80 settles reasoning tokens at. Google
+    charges no cache-write fee, so both write columns are the input rate.
+
+    `@claude` 2026-10-08, choices under delegated authority, each toward
+    over-charging (ADR-8): Gemini 2.5 Pro is priced at its rate above 200K
+    input tokens (2.50 / 15.00 / 0.25, against 1.25 / 10.00 / 0.125 below),
+    because the book holds one rate per model and prices without seeing the
+    prompt size, and the page bills every token of a long query at the high
+    tier; the Gemini 3 family at its "Non-global" rate, 10 percent above
+    "Global", because the id does not say which endpoint served the call (the
+    location is in the URL), the rule invariant 79 applies to Claude on the
+    clouds; Gemini 3.6, 3.7 and 3.8 Flash at their standard rate (1.65 / 8.25
+    non-global), not the introductory 0.75 / 3.75 Google gives back as a 50
+    percent credit until 2026-12-31, so until the year ends those rows are
+    twice what the credit leaves. Rows price text input: an audio prompt on a
+    model that lists a dearer audio rate (2.5 Flash 1.00, 2.5 Flash-Lite 0.30,
+    3.1 Flash-Lite 0.55 non-global) is under-charged, the one direction this
+    takes the other way, because pricing every text call at the audio rate
+    would over-charge the common case up to 3.3x; `TOKENFUSE_PRICE_BOOK` is
+    the operator's correction.
+
+    What this does not cover: the preview models (Gemini 3.1 Pro Preview,
+    whose id the model pages do not give, and Gemini 3 Flash Preview, whose
+    output rate the page does not show), the Live, image, speech and
+    embedding models, the retired 2.0 and 1.x ids, and the bare ids the
+    Gemini API takes, whose own price list was not read; the hourly cache
+    storage fee, which no usage object reports; and, as invariant 79 says of
+    every row, a rate in this table is true on its date and on no other.
+    verdryx's mirror of the book (`verdryx/pricing.py`) is a separate change
+    in that repository.
+    *(test: `pricebook::tests::every_gemini_id_on_vertex_prices_at_its_list_rate`
+    (expectations written by hand; red in CI on the test-only commit, run 37721111871, with
+    all ten ids at the fallback), `the_measured_vertex_gemini_call_settles_at_list_not_the_fallback`
+    (red: `left: Some(Microusd(46635)) right: Some(Microusd(1552))`),
+    `gemini_2_5_pro_is_priced_at_its_long_context_rate`;
+    `proxy::tests::a_gemini_id_on_vertex_is_priced_known_at_its_list_rate`
+    (red: `left: "fallback" right: "known"`);
+    `tests/it/reasoning_tokens_are_output.rs::the_shipped_book_prices_the_measured_vertex_call_at_its_list_rate`,
+    the measured call through `app()`, the real `HttpProvider` and the book the
+    binary ships (not run red: cargo stopped at the failing lib binary first);
+    `the_fallback_is_at_least_every_row_in_every_column` holds the new rows
+    under the fallback. Two mutants are cases in `gates-have-teeth.sh`: the
+    measured model's row removed, and 2.5 Pro at its short-context tier.
+    Scenarios: `features/gemini-on-vertex-is-priced-at-its-list-rate.feature`,
+    four, each bound. Not a script gate)*

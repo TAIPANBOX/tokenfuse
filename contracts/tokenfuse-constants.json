@@ -602,6 +602,86 @@
         "output_per_mtok_microusd": 15000000
       },
       {
+        "cache_read_per_mtok_microusd": 30000,
+        "cache_write_1h_per_mtok_microusd": 300000,
+        "cache_write_per_mtok_microusd": 300000,
+        "input_per_mtok_microusd": 300000,
+        "model": "google/gemini-2.5-flash",
+        "output_per_mtok_microusd": 2500000
+      },
+      {
+        "cache_read_per_mtok_microusd": 10000,
+        "cache_write_1h_per_mtok_microusd": 100000,
+        "cache_write_per_mtok_microusd": 100000,
+        "input_per_mtok_microusd": 100000,
+        "model": "google/gemini-2.5-flash-lite",
+        "output_per_mtok_microusd": 400000
+      },
+      {
+        "cache_read_per_mtok_microusd": 250000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2500000,
+        "model": "google/gemini-2.5-pro",
+        "output_per_mtok_microusd": 15000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 27500,
+        "cache_write_1h_per_mtok_microusd": 275000,
+        "cache_write_per_mtok_microusd": 275000,
+        "input_per_mtok_microusd": 275000,
+        "model": "google/gemini-3.1-flash-lite",
+        "output_per_mtok_microusd": 1650000
+      },
+      {
+        "cache_read_per_mtok_microusd": 165000,
+        "cache_write_1h_per_mtok_microusd": 1650000,
+        "cache_write_per_mtok_microusd": 1650000,
+        "input_per_mtok_microusd": 1650000,
+        "model": "google/gemini-3.5-flash",
+        "output_per_mtok_microusd": 9900000
+      },
+      {
+        "cache_read_per_mtok_microusd": 33000,
+        "cache_write_1h_per_mtok_microusd": 330000,
+        "cache_write_per_mtok_microusd": 330000,
+        "input_per_mtok_microusd": 330000,
+        "model": "google/gemini-3.5-flash-lite",
+        "output_per_mtok_microusd": 2750000
+      },
+      {
+        "cache_read_per_mtok_microusd": 165000,
+        "cache_write_1h_per_mtok_microusd": 1650000,
+        "cache_write_per_mtok_microusd": 1650000,
+        "input_per_mtok_microusd": 1650000,
+        "model": "google/gemini-3.6-flash",
+        "output_per_mtok_microusd": 8250000
+      },
+      {
+        "cache_read_per_mtok_microusd": 165000,
+        "cache_write_1h_per_mtok_microusd": 1650000,
+        "cache_write_per_mtok_microusd": 1650000,
+        "input_per_mtok_microusd": 1650000,
+        "model": "google/gemini-3.7-flash",
+        "output_per_mtok_microusd": 8250000
+      },
+      {
+        "cache_read_per_mtok_microusd": 165000,
+        "cache_write_1h_per_mtok_microusd": 1650000,
+        "cache_write_per_mtok_microusd": 1650000,
+        "input_per_mtok_microusd": 1650000,
+        "model": "google/gemini-3.8-flash",
+        "output_per_mtok_microusd": 8250000
+      },
+      {
+        "cache_read_per_mtok_microusd": 165000,
+        "cache_write_1h_per_mtok_microusd": 1650000,
+        "cache_write_per_mtok_microusd": 1650000,
+        "input_per_mtok_microusd": 1650000,
+        "model": "google/gemini-3.8-flash-cyber",
+        "output_per_mtok_microusd": 8250000
+      },
+      {
         "cache_read_per_mtok_microusd": 250000,
         "cache_write_1h_per_mtok_microusd": 3125000,
         "cache_write_per_mtok_microusd": 3125000,

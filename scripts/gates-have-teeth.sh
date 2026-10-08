@@ -870,6 +870,21 @@ run_case "focus-export: the key dropped from the export" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::every_row_carries_the_key_it_was_made_with" \
 	"$(py 'edit("crates/gateway/src/focusexport.rs", "        rec.key_id.clone(),                                        // x_key_id", "        String::new(),                                             // x_key_id")')" \
 	"every_row_carries_the_key_it_was_made_with ... FAILED"
+# --- invariant 82: Gemini on Vertex at Google's listed rate -----------------
+#
+# Not a scripts/*.sh gate: the rows are held by a test whose expectations are
+# written out by hand. The first mutant is the defect itself, the measured
+# model with no row, so the fallback prices it; the second prices Gemini 2.5
+# Pro at its short-context tier, which under-charges every long prompt.
+run_case "gemini-price-book: gemini-2.5-flash loses its row and falls back" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_gemini_id_on_vertex_prices_at_its_list_rate" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-flash\", (300_000, 2_500_000, 30_000)),", "")')" \
+	"every_gemini_id_on_vertex_prices_at_its_list_rate ... FAILED"
+
+run_case "gemini-price-book: gemini-2.5-pro at its short-context tier" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::gemini_2_5_pro_is_priced_at_its_long_context_rate" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-pro\", (2_500_000, 15_000_000, 250_000)),", "    (\"google/gemini-2.5-pro\", (1_250_000, 10_000_000, 125_000)),")')" \
+	"gemini_2_5_pro_is_priced_at_its_long_context_rate ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #
