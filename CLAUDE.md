@@ -738,11 +738,21 @@ build)`, `cloud apns (feature build)`.
    at startup. It deliberately ignores subcommand invocations (`… -- constants`,
    `tokenfuse top`), which share the binary and need no provider, because a gate
    that fires on a correct command gets deleted by whoever is unblocking CI.
-   *(gate: `scripts/runnable-quickstart.sh`; verified against four mutants: the
+   The control plane got the same kind of precondition on 2026-07-22 (c5deb17:
+   loopback unless `TOKENFUSE_CLOUD_HOST` says otherwise) and the compose stack
+   kept its old shape until 2026-10-09: inside a container that loopback is the
+   container's own, so neither the gateway nor the published port could reach
+   the plane, and the file also carried a literal key. The gate now holds the
+   compose control plane to three things: a non-loopback `TOKENFUSE_CLOUD_HOST`,
+   every published port on `127.0.0.1`, and keys taken from `${...}` rather than
+   written into the file (the gateway's `TOKENFUSE_CLOUD_KEY` too).
+   *(gate: `scripts/runnable-quickstart.sh`; verified against eight mutants: the
    flag removed from the README quickstart, the flag removed from the compose
-   gateway service, a subcommand invocation which must NOT fail it, and the
+   gateway service, a subcommand invocation which must NOT fail it, the
    compose image renamed, which fails as "measured nothing" rather than passing
-   because it found nothing to check)*
+   because it found nothing to check, and for the control plane its host
+   removed, its port published on every interface, a key written into the
+   file, and its image renamed, again "measured nothing")*
 
 17. **A guarantee that is off until somebody sets a variable is not a
    guarantee.** Established on a live cloud range 2026-08-04, where three
