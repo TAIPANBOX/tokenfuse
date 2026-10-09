@@ -28,7 +28,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pinned once here rather than per crate, because two crates in one process
 # verifying JWS with two versions of this is how a shared rule stops being
 # shared (CLAUDE.md invariant 29).
-jsonwebtoken = "9"
+#
+# 10.3.0 is the first release that rejects a string `exp`/`nbf` instead of
+# skipping the check (GHSA-h395-gr6q-cpjc). From 10.0.0 the crypto backend is a
+# FEATURE and exactly one of `rust_crypto` / `aws_lc_rs` must be on: none or both
+# compiles and then panics on first use. `rust_crypto` would pull the `rsa` crate
+# (RUSTSEC-2023-0071, no patched release) into every build, so `aws_lc_rs` it is.
+# That replaces `ring` as the backend under every JWS verify here: it is a C
+# dependency (`aws-lc-sys`) the release workflow's musl legs have not carried
+# before, and the RSA bounds invariant 30 reads off `ring` (2048-bit floor,
+# 8192-bit ceiling, refused before the exponentiation) have to be re-derived
+# against aws-lc-rs. Default features (`use_pem`) are kept.
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 base64 = "0.22"
 sha2 = "0.10"
 
