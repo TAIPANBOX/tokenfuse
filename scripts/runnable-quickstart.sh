@@ -285,6 +285,31 @@ for b in gateway_blocks:
             "from the environment with ${...} instead."
         )
 
+# --- the compose images name a release that exists ---------------------------
+#
+# Since #273 the release workflow publishes version tags only: no `:latest`, no
+# moving tag. The compose file kept `:latest` on all three images for four
+# weeks after that, so `docker compose up` asked the registry for three tags it
+# had never been given (@measured `docker buildx imagetools inspect` 2026-10-09:
+# `:latest` not found, `:v1.8.0` found, for each of the three). The README's
+# release badge is the version `stated-numbers.sh` holds against the newest
+# tag, so the compose pins are held against the badge: one bump, two files,
+# and this says which one was forgotten.
+badge = re.search(r"badge/release-(v\d+\.\d+\.\d+)-", Path("README.md").read_text())
+if not badge:
+    measured_nothing("README.md carries no release badge, so the compose pins were not compared with anything.")
+FAMILY = re.compile(r"image:\s*ghcr\.io/taipanbox/(tokenfuse(?:-control-plane|-dashboard)?)(?::([A-Za-z0-9._-]+))?\s*$", re.M)
+pins = FAMILY.findall("\n".join(line.split("#", 1)[0] for line in compose.read_text().splitlines()))
+if not pins:
+    measured_nothing(f"no image in {compose} is one of the three this repository publishes.")
+for image, tag in pins:
+    checked += 1
+    if tag != badge.group(1):
+        note(
+            f"{compose}: `{image}:{tag or '(no tag)'}` is a tag no release publishes "
+            f"as the current one; the README badge says {badge.group(1)}, so pin `{image}:{badge.group(1)}`."
+        )
+
 if checked == 0:
     measured_nothing(
         "no gateway invocation was found in any tracked file, which means the "

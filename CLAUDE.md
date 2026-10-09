@@ -745,14 +745,18 @@ build)`, `cloud apns (feature build)`.
    the plane, and the file also carried a literal key. The gate now holds the
    compose control plane to three things: a non-loopback `TOKENFUSE_CLOUD_HOST`,
    every published port on `127.0.0.1`, and keys taken from `${...}` rather than
-   written into the file (the gateway's `TOKENFUSE_CLOUD_KEY` too).
-   *(gate: `scripts/runnable-quickstart.sh`; verified against eight mutants: the
+   written into the file (the gateway's `TOKENFUSE_CLOUD_KEY` too). And the
+   compose images name the release the README badge names: since #273 the
+   release workflow publishes version tags only, and the file asked for
+   `:latest` on all three images, a tag the registry has never held.
+   *(gate: `scripts/runnable-quickstart.sh`; verified against nine mutants: the
    flag removed from the README quickstart, the flag removed from the compose
    gateway service, a subcommand invocation which must NOT fail it, the
    compose image renamed, which fails as "measured nothing" rather than passing
    because it found nothing to check, and for the control plane its host
    removed, its port published on every interface, a key written into the
-   file, and its image renamed, again "measured nothing")*
+   file, and its image renamed, again "measured nothing"; and a compose image
+   back on a tag other than the badge's)*
 
 17. **A guarantee that is off until somebody sets a variable is not a
    guarantee.** Established on a live cloud range 2026-08-04, where three

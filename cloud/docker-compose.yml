@@ -26,7 +26,7 @@
 # is also the id every row on the dashboard is keyed by.
 services:
   control-plane:
-    image: ghcr.io/taipanbox/tokenfuse-control-plane:latest
+    image: ghcr.io/taipanbox/tokenfuse-control-plane:v1.8.0
     # Or build locally instead of pulling: `docker compose build`
     # build:
     #   context: ..
@@ -50,7 +50,7 @@ services:
       - "127.0.0.1:8080:8080"
 
   dashboard:
-    image: ghcr.io/taipanbox/tokenfuse-dashboard:latest
+    image: ghcr.io/taipanbox/tokenfuse-dashboard:v1.8.0
     # Or build locally: `docker compose build`
     # build: ./dashboard
     ports:
@@ -59,7 +59,7 @@ services:
       - control-plane
 
   gateway:
-    image: ghcr.io/taipanbox/tokenfuse:latest
+    image: ghcr.io/taipanbox/tokenfuse:v1.8.0
     environment:
       TOKENFUSE_ADDR: "0.0.0.0:4100"
       # This stack is a demo, so it runs offline against the built-in stub.

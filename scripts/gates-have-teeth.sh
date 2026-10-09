@@ -350,7 +350,7 @@ run_case "runnable-quickstart: a subcommand and a prose ellipsis" pass \
 
 run_case "runnable-quickstart: the compose image renamed, so it measured nothing" fail \
 	"./scripts/runnable-quickstart.sh" \
-	"$(py 'edit("cloud/docker-compose.yml", "image: ghcr.io/taipanbox/tokenfuse:latest", "image: ghcr.io/taipanbox/tokenfuse-gw:latest")')" \
+	"$(py 'edit("cloud/docker-compose.yml", "image: ghcr.io/taipanbox/tokenfuse:", "image: ghcr.io/taipanbox/tokenfuse-gw:")')" \
 	"measured nothing"
 
 # The control plane in the same stack, which binds loopback unless told
@@ -374,8 +374,16 @@ run_case "runnable-quickstart: a key written into the compose file" fail \
 
 run_case "runnable-quickstart: the control-plane image renamed, so it measured nothing" fail \
 	"./scripts/runnable-quickstart.sh" \
-	"$(py 'edit("cloud/docker-compose.yml", "tokenfuse-control-plane:latest", "tokenfuse-cp:latest")')" \
+	"$(py 'edit("cloud/docker-compose.yml", "tokenfuse-control-plane:", "tokenfuse-cp:")')" \
 	"measured nothing"
+
+# The compose images name the release the README badge names, because the
+# release workflow publishes version tags only (since #273, no `:latest`): a
+# stack pinned to `:latest` asks for an image that does not exist.
+run_case "runnable-quickstart: a compose image back on latest" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "image: ghcr.io/taipanbox/tokenfuse-dashboard:v", "image: ghcr.io/taipanbox/tokenfuse-dashboard:latest-was-v")')" \
+	"no release publishes"
 
 # --- the published stack constants match the Rust --------------------------
 #
