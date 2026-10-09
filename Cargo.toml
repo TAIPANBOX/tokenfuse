@@ -36,9 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (RUSTSEC-2023-0071, no patched release) into every build, so `aws_lc_rs` it is.
 # That replaces `ring` as the backend under every JWS verify here: it is a C
 # dependency (`aws-lc-sys`) the release workflow's musl legs have not carried
-# before, and the RSA bounds invariant 30 reads off `ring` (2048-bit floor,
-# 8192-bit ceiling, refused before the exponentiation) have to be re-derived
-# against aws-lc-rs. Default features (`use_pem`) are kept.
+# before. The RSA bounds (2048-bit floor, 8192-bit ceiling, refused before the
+# exponentiation) now come from aws-lc-rs: the five bound tests in
+# `crates/dpop` passed unchanged on it in #382's CI. Default features
+# (`use_pem`) are kept.
 jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 base64 = "0.22"
 sha2 = "0.10"
