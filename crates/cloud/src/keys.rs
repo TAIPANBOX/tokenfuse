@@ -6,12 +6,9 @@
 //! without trusting anything in the request body. Ported from the Go plane's
 //! `parseKeys`.
 //!
-//! **Fails closed by default.** An unset/empty/all-malformed spec yields an
-//! *empty* map: every request then gets `401`, nobody authenticates. The
-//! insecure `devkey → default/admin` convenience credential exists only for
-//! local dev and is inserted **only** when the caller explicitly opts in (see
-//! [`parse_keys`]'s `allow_devkey` parameter). It is never a silent default.
-//! See `TOKENFUSE_CLOUD_ALLOW_DEVKEY` in `main.rs`.
+//! **Fails closed.** An unset/empty/all-malformed spec yields an *empty* map:
+//! every request then gets `401`, nobody authenticates. There is no fallback
+//! credential: no spec value ever grants access on its own.
 
 use std::collections::HashMap;
 
@@ -58,15 +55,8 @@ fn is_valid_site_name(s: &str) -> bool {
 /// (`k:o:admin:`) means no site, same as the segment being absent.
 ///
 /// With no valid entries, this **fails closed**: an empty map is returned, so
-/// every request gets `401` (nobody authenticates) instead of silently
-/// granting admin. Passing `allow_devkey = true` opts into the old
-/// dev-convenience fallback instead: a single `devkey → default/admin` entry
-/// with no site, so a local/demo deployment is usable without minting a real
-/// key. Callers must only ever set `allow_devkey` from an explicit operator
-/// opt-in (an env var, a CLI flag), never as a silent default: an empty
-/// `TOKENFUSE_CLOUD_KEYS` in production must not quietly authenticate anyone
-/// who sends `Authorization: Bearer devkey` as an admin.
-pub fn parse_keys(spec: &str, allow_devkey: bool) -> HashMap<String, Principal> {
+/// every request gets `401`. There is no fallback credential.
+pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     for pair in spec.split(',') {
         let pair = pair.trim();
@@ -100,16 +90,6 @@ pub fn parse_keys(spec: &str, allow_devkey: bool) -> HashMap<String, Principal> 
             },
         );
     }
-    if keys.is_empty() && allow_devkey {
-        keys.insert(
-            "devkey".to_string(),
-            Principal {
-                org: "default".into(),
-                role: "admin".into(),
-                site: None,
-            },
-        );
-    }
     keys
 }
 
@@ -119,7 +99,7 @@ mod tests {
 
     #[test]
     fn parses_org_and_role() {
-        let k = parse_keys("a:acme,b:globex:viewer", false);
+        let k = parse_keys("a:acme,b:globex:viewer");
         assert_eq!(
             k["a"],
             Principal {
@@ -140,52 +120,39 @@ mod tests {
 
     #[test]
     fn skips_malformed_entries() {
-        let k = parse_keys("nokey, :noorg , good:org", false);
+        let k = parse_keys("nokey, :noorg , good:org");
         assert_eq!(k.len(), 1);
         assert!(k.contains_key("good"));
     }
 
-    // -- devkey fallback: fails closed unless explicitly opted in ----------
+    // -- fails closed: there is no fallback credential ---------------------
 
     #[test]
-    fn empty_spec_fails_closed_without_opt_in() {
+    fn empty_spec_fails_closed() {
         // The security-critical case: an unset/empty TOKENFUSE_CLOUD_KEYS
-        // must NOT silently grant a hardcoded admin credential. With
-        // allow_devkey=false the map must be empty, so every request gets
-        // 401 (nobody authenticates).
-        let k = parse_keys("", false);
+        // must NOT grant anything. The map must be empty, so every request
+        // gets 401 (nobody authenticates).
+        let k = parse_keys("");
         assert!(
             k.is_empty(),
-            "expected no keys when devkey is not explicitly allowed, got {k:?}"
+            "expected no keys for an empty spec, got {k:?}"
         );
         assert!(!k.contains_key("devkey"));
     }
 
     #[test]
-    fn all_malformed_spec_fails_closed_without_opt_in() {
+    fn all_malformed_spec_fails_closed() {
         // Same fail-closed guarantee when every entry is malformed (missing
         // key or org) rather than the spec being literally empty.
-        let k = parse_keys("nokey, :noorg ,   ", false);
+        let k = parse_keys("nokey, :noorg ,   ");
         assert!(k.is_empty());
     }
 
     #[test]
-    fn empty_spec_with_explicit_opt_in_yields_dev_key() {
-        // Only when the caller explicitly opts in does the dev fallback
-        // appear.
-        let k = parse_keys("", true);
-        assert_eq!(k.len(), 1);
-        assert_eq!(k["devkey"].org, "default");
-        assert_eq!(k["devkey"].role, "admin");
-        assert_eq!(k["devkey"].site, None);
-    }
-
-    #[test]
-    fn normal_spec_unaffected_by_allow_devkey_flag() {
-        // A real, non-empty spec parses identically regardless of
-        // allow_devkey: the flag must only ever affect the empty case, and
-        // must never inject an extra "devkey" entry alongside real keys.
-        let k = parse_keys("a:acme", true);
+    fn normal_spec_never_adds_devkey() {
+        // A real, non-empty spec parses to exactly its own keys, and never
+        // injects an extra "devkey" entry.
+        let k = parse_keys("a:acme");
         assert_eq!(k.len(), 1);
         assert!(!k.contains_key("devkey"));
         assert_eq!(k["a"].org, "acme");
@@ -195,7 +162,7 @@ mod tests {
 
     #[test]
     fn a_fourth_segment_is_parsed_as_the_site() {
-        let k = parse_keys("s:acme:ingest:site-a", false);
+        let k = parse_keys("s:acme:ingest:site-a");
         assert_eq!(k["s"].org, "acme");
         assert_eq!(k["s"].role, "ingest");
         assert_eq!(k["s"].site.as_deref(), Some("site-a"));
@@ -203,7 +170,7 @@ mod tests {
 
     #[test]
     fn an_empty_fourth_segment_means_no_site() {
-        let k = parse_keys("s:acme:admin:", false);
+        let k = parse_keys("s:acme:admin:");
         assert_eq!(k["s"].site, None);
     }
 
@@ -218,20 +185,20 @@ mod tests {
             "s3:acme:admin:has/slash",                    // '/' not allowed
             &format!("s4:acme:admin:{}", "a".repeat(64)), // over 63 chars
         ] {
-            let k = parse_keys(bad, false);
+            let k = parse_keys(bad);
             assert!(k.is_empty(), "expected {bad:?} to be skipped, got {k:?}");
         }
     }
 
     #[test]
     fn five_segments_are_malformed_and_skipped() {
-        let k = parse_keys("s:acme:admin:site-a:extra", false);
+        let k = parse_keys("s:acme:admin:site-a:extra");
         assert!(k.is_empty());
     }
 
     #[test]
     fn three_segment_specs_parse_exactly_as_before() {
-        let k = parse_keys("a:acme:viewer", false);
+        let k = parse_keys("a:acme:viewer");
         assert_eq!(k["a"].role, "viewer");
         assert_eq!(k["a"].site, None);
     }
