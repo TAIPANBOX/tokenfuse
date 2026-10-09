@@ -69,8 +69,10 @@ input (see the `DISCLAIMER` in `tokenfuse_core::compliance`).
 **Fails closed when unconfigured.** If `TOKENFUSE_CLOUD_KEYS` is unset, empty,
 or every entry is malformed, the control plane starts with **no valid keys**,
 so every request gets `401`. It does **not** fall back to a default credential.
-For local dev/demo only, set `TOKENFUSE_CLOUD_ALLOW_DEVKEY=1` to opt into a
-single insecure `devkey → default/admin` key; never set that in production.
+There is no dev fallback credential any more: `TOKENFUSE_CLOUD_ALLOW_DEVKEY`
+is still a recognised name, but a control plane started with it set refuses
+to start and says why. Configure `TOKENFUSE_CLOUD_KEYS` instead, also for
+local dev.
 
 - **`GET /v1/alerts`** — runs that have spent ≥ a fraction of their central
   budget. Threshold defaults to `0.8`, overridable per-deploy with
