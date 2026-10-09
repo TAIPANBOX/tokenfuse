@@ -1,10 +1,19 @@
-# TokenFuse Cloud — the whole stack in one command:
+# TokenFuse Cloud: the whole stack in one command, after two keys of your own:
 #
+#   export TOKENFUSE_DEMO_ADMIN_KEY=$(openssl rand -hex 24)
+#   export TOKENFUSE_DEMO_INGEST_KEY=$(openssl rand -hex 24)
 #   cd cloud && docker compose up
 #
+# There is no built-in key. The admin key is the one you type into the
+# dashboard; the ingest key is the gateway's, and it can push telemetry and read
+# like a viewer but cannot kill runs or set budgets (invariant 65). Compose
+# refuses to start if either is unset.
+#
 # Then open the dashboard on http://localhost:3000 (control-plane URL
-# http://localhost:8080, org key `devkey`) and send traffic through the gateway
-# on :4100 - runs and spend show up live. Runs anywhere Docker runs.
+# http://localhost:8080, org key: your TOKENFUSE_DEMO_ADMIN_KEY) and send
+# traffic through the gateway on :4100 - runs and spend show up live. Every
+# port is published on 127.0.0.1 only, so the stack is reachable from this
+# machine and not from the network it sits on. Runs anywhere Docker runs.
 #
 #   curl http://localhost:4100/v1/messages \
 #     -H 'content-type: application/json' \
@@ -24,19 +33,28 @@ services:
     #   dockerfile: crates/cloud/Dockerfile
     environment:
       PORT: "8080"
-      TOKENFUSE_CLOUD_KEYS: "devkey:demo"
+      # The control plane binds 127.0.0.1 unless told otherwise, and inside a
+      # container that is the container's own loopback: the gateway on the
+      # compose network and the published port below would both find nothing
+      # listening. 0.0.0.0 here means every interface of this container, and the
+      # port mapping below is what keeps it off the host's network. The plane
+      # logs a warning about the wider bind; in this stack that is expected.
+      TOKENFUSE_CLOUD_HOST: "0.0.0.0"
+      # key:org:role[:site]. Roles are written out rather than left to the
+      # default, and the gateway's key is bound to its site.
+      TOKENFUSE_CLOUD_KEYS: "${TOKENFUSE_DEMO_ADMIN_KEY:?set TOKENFUSE_DEMO_ADMIN_KEY (see the top of this file)}:demo:admin,${TOKENFUSE_DEMO_INGEST_KEY:?set TOKENFUSE_DEMO_INGEST_KEY (see the top of this file)}:demo:ingest:demo-gateway"
       TOKENFUSE_CLOUD_DATA: "/data/state.json"   # durable across restarts
     volumes:
       - cloud-data:/data
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   dashboard:
     image: ghcr.io/taipanbox/tokenfuse-dashboard:latest
     # Or build locally: `docker compose build`
     # build: ./dashboard
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     depends_on:
       - control-plane
 
@@ -55,9 +73,9 @@ services:
       # TOKENFUSE_UPSTREAM: "https://api.anthropic.com/v1/messages"
       TOKENFUSE_MODE: "enforce"
       TOKENFUSE_CLOUD_URL: "http://control-plane:8080"
-      TOKENFUSE_CLOUD_KEY: "devkey"
+      TOKENFUSE_CLOUD_KEY: "${TOKENFUSE_DEMO_INGEST_KEY:?set TOKENFUSE_DEMO_INGEST_KEY (see the top of this file)}"
     ports:
-      - "4100:4100"
+      - "127.0.0.1:4100:4100"
     depends_on:
       - control-plane
 

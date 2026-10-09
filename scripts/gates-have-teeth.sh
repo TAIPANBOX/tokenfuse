@@ -353,6 +353,30 @@ run_case "runnable-quickstart: the compose image renamed, so it measured nothing
 	"$(py 'edit("cloud/docker-compose.yml", "image: ghcr.io/taipanbox/tokenfuse:latest", "image: ghcr.io/taipanbox/tokenfuse-gw:latest")')" \
 	"measured nothing"
 
+# The control plane in the same stack, which binds loopback unless told
+# otherwise: without the host variable nothing outside its container reaches it,
+# published on every interface it is on the host's network, and a key written
+# into this public file is everybody's key.
+run_case "runnable-quickstart: the compose control plane loses its host" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "      TOKENFUSE_CLOUD_HOST: \"0.0.0.0\"\n", "")')" \
+	"nothing outside the container can reach it"
+
+run_case "runnable-quickstart: the control plane published on every interface" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "\"127.0.0.1:8080:8080\"", "\"8080:8080\"")')" \
+	"on every interface"
+
+run_case "runnable-quickstart: a key written into the compose file" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "TOKENFUSE_CLOUD_KEYS: \"${TOKENFUSE_DEMO_ADMIN_KEY", "TOKENFUSE_CLOUD_KEYS: \"devkey:demo:admin,${TOKENFUSE_DEMO_ADMIN_KEY")')" \
+	"written into the file"
+
+run_case "runnable-quickstart: the control-plane image renamed, so it measured nothing" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "tokenfuse-control-plane:latest", "tokenfuse-cp:latest")')" \
+	"measured nothing"
+
 # --- the published stack constants match the Rust --------------------------
 #
 # The odd one out among the gates: it BUILDS instead of parsing text, so this

@@ -188,6 +188,103 @@ for b in gateway_blocks:
             "the stack crash-loops."
         )
 
+# --- the compose control plane, which binds loopback unless told otherwise ----
+#
+# The same failure one service over, found on 2026-10-09 by reading the file
+# rather than by a stranger running it. Since 22 July 2026 (c5deb17) the
+# control plane binds 127.0.0.1 unless `TOKENFUSE_CLOUD_HOST` says otherwise,
+# and inside a container that loopback is the container's own: the gateway on
+# the compose network and the published port both find nothing listening. The
+# stack kept its old shape for eleven weeks, because a precondition that lands
+# in `main.rs` opens no YAML. Three things are held for every service that runs
+# the control-plane image:
+#
+#   1. a live, non-loopback `TOKENFUSE_CLOUD_HOST`, or nothing can reach it;
+#   2. every published port bound to 127.0.0.1 on the host, because the wider
+#      bind inside the container is safe only behind that mapping, and the
+#      plane's own rule is loopback unless somebody chose otherwise;
+#   3. no key written into the file. `TOKENFUSE_CLOUD_KEYS` and the gateway's
+#      `TOKENFUSE_CLOUD_KEY` take their secrets from `${...}` interpolation, so
+#      a key in this public file cannot become everybody's key.
+PLANE = re.compile(r"ghcr\.io/taipanbox/tokenfuse-control-plane(:[A-Za-z0-9._-]+)?(?![\w./-])")
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def live_lines(block):
+    return "\n".join(line.split("#", 1)[0] for line in block.splitlines())
+
+
+def published_ports(live):
+    """The `ports:` list of one service, as written."""
+    out, inside, indent = [], False, 0
+    for line in live.splitlines():
+        if re.match(r"^\s+ports:\s*$", line):
+            inside, indent = True, len(line) - len(line.lstrip())
+            continue
+        if inside:
+            if not line.strip():
+                continue
+            if len(line) - len(line.lstrip()) <= indent:
+                inside = False
+                continue
+            m = re.match(r"^\s+-\s*[\"']?([^\"'\s]+)", line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def literal_keys(value):
+    """Entries of a key spec whose secret is written out rather than interpolated."""
+    value = value.strip().strip("\"'")
+    without = re.sub(r"\$\{[^}]*\}", "", value)
+    return [e for e in without.split(",") if e.strip() and e.split(":", 1)[0].strip()]
+
+
+plane_blocks = [b for b in blocks if PLANE.search(b) and "image:" in b]
+if not plane_blocks:
+    measured_nothing(
+        f"no service in {compose} names the control-plane image, so the plane "
+        "this stack runs was not checked at all."
+    )
+for b in plane_blocks:
+    checked += 1
+    live = live_lines(b)
+    name = b.strip().split(":", 1)[0]
+    host = re.search(r"^\s+TOKENFUSE_CLOUD_HOST:\s*[\"']?([^\"'\s]+)", live, re.M)
+    if not host or host.group(1) in LOOPBACK:
+        note(
+            f"{compose}: service `{name}` runs the control plane without a wider "
+            "TOKENFUSE_CLOUD_HOST, so it binds the container's own loopback and "
+            "nothing outside the container can reach it."
+        )
+    ports = published_ports(live)
+    if not ports:
+        note(f"{compose}: service `{name}` publishes no port, so the dashboard has nothing to call.")
+    for port in ports:
+        if not port.startswith("127.0.0.1:"):
+            note(
+                f"{compose}: service `{name}` publishes `{port}` on every interface, "
+                "which puts the money plane on the host's network; publish it as "
+                "127.0.0.1:<host>:<container>."
+            )
+    keys = re.search(r"^\s+TOKENFUSE_CLOUD_KEYS:\s*(.+)$", live, re.M)
+    if not keys:
+        note(f"{compose}: service `{name}` sets no TOKENFUSE_CLOUD_KEYS, so every request gets 401.")
+    elif literal_keys(keys.group(1)):
+        note(
+            f"{compose}: service `{name}` has a key written into the file; take it "
+            "from the environment with ${...} instead."
+        )
+
+for b in gateway_blocks:
+    key = re.search(r"^\s+TOKENFUSE_CLOUD_KEY:\s*(.+)$", live_lines(b), re.M)
+    if key and literal_keys(key.group(1)):
+        name = b.strip().split(":", 1)[0]
+        note(
+            f"{compose}: service `{name}` has a key written into the file; take it "
+            "from the environment with ${...} instead."
+        )
+
 if checked == 0:
     measured_nothing(
         "no gateway invocation was found in any tracked file, which means the "

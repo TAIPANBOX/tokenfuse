@@ -100,11 +100,12 @@ against the month rather than against the tally since the last restart
 (invariant 52). A control plane it cannot reach costs one warning and a month
 that starts at zero.
 
-Enable it on any gateway:
+Enable it on any gateway, with a key the control plane lists for that gateway
+(`secret:org:ingest:site-name` in `TOKENFUSE_CLOUD_KEYS`; there is no built-in key):
 
 ```bash
 TOKENFUSE_CLOUD_URL=http://control-plane:8080 \
-TOKENFUSE_CLOUD_KEY=devkey \
+TOKENFUSE_CLOUD_KEY="$INGEST_KEY" \
   tokenfuse
 ```
 
@@ -113,20 +114,30 @@ TOKENFUSE_CLOUD_KEY=devkey \
 Both images are published to GHCR, so nothing builds locally:
 
 ```bash
+export TOKENFUSE_DEMO_ADMIN_KEY=$(openssl rand -hex 24)
+export TOKENFUSE_DEMO_INGEST_KEY=$(openssl rand -hex 24)
 cd cloud
 docker compose up          # pulls ghcr.io/taipanbox/tokenfuse{,-control-plane}
 ```
 
 Brings up the control plane (`:8080`, with the dashboard) and a gateway (`:4100`)
-already wired to it. Open **http://localhost:8080**, enter `devkey`, send traffic
-through `:4100`, and watch runs + spend appear live.
+already wired to it, every port published on `127.0.0.1` only. Open
+**http://localhost:8080**, enter your `TOKENFUSE_DEMO_ADMIN_KEY`, send traffic
+through `:4100`, and watch runs + spend appear live. The gateway holds the ingest
+key, which can push telemetry but cannot kill runs or set budgets.
 
 Run the control plane on its own anywhere:
 
 ```bash
-docker run -p 8080:8080 -e TOKENFUSE_CLOUD_KEYS=devkey:acme \
+docker run -p 127.0.0.1:8080:8080 \
+  -e TOKENFUSE_CLOUD_HOST=0.0.0.0 \
+  -e TOKENFUSE_CLOUD_KEYS="$ADMIN_KEY:acme:admin" \
   ghcr.io/taipanbox/tokenfuse-control-plane
 ```
+
+`TOKENFUSE_CLOUD_HOST=0.0.0.0` is needed in a container, where the default
+loopback bind is the container's own and a published port finds nothing behind
+it; publishing on `127.0.0.1` keeps the plane off the host's network.
 
 ## Verified end-to-end
 
