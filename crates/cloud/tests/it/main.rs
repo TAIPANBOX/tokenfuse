@@ -15,6 +15,7 @@
 mod audit;
 mod audit_manifest;
 mod compliance_evidence;
+mod devkey_refused;
 mod events_export_startup;
 mod findings;
 mod ingest;

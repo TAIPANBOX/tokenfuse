@@ -30,33 +30,30 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
-    // Auth keys. Fails CLOSED by default: an unset/empty/all-malformed
-    // TOKENFUSE_CLOUD_KEYS yields an EMPTY key map (every request gets `401`,
-    // nobody authenticates), rather than silently granting the hardcoded
-    // `devkey` admin credential. That dev-convenience fallback exists only
-    // for local/demo use and requires an explicit operator opt-in via
-    // TOKENFUSE_CLOUD_ALLOW_DEVKEY=1 (see keys::parse_keys and
-    // docs/13-security-hardening.md).
+    // TOKENFUSE_CLOUD_ALLOW_DEVKEY stays a frozen name (compat/1.0.json), but
+    // the devkey fallback it used to enable is gone. Setting it now refuses to
+    // start, so an operator who relied on it is told why instead of getting a
+    // control plane that answers every request with 401.
+    if env_flag("TOKENFUSE_CLOUD_ALLOW_DEVKEY") {
+        tracing::error!(
+            "TOKENFUSE_CLOUD_ALLOW_DEVKEY is set, but the devkey fallback credential was \
+             removed: refusing to start. Unset it and set TOKENFUSE_CLOUD_KEYS to a real \
+             key spec"
+        );
+        std::process::exit(2);
+    }
+
+    // Auth keys. Fails CLOSED: an unset, empty or all-malformed
+    // TOKENFUSE_CLOUD_KEYS yields an EMPTY key map, so every request gets
+    // `401` and nobody authenticates. There is no fallback credential.
     let keys_spec = std::env::var("TOKENFUSE_CLOUD_KEYS").unwrap_or_default();
-    let allow_devkey = env_flag("TOKENFUSE_CLOUD_ALLOW_DEVKEY");
-    let keys = parse_keys(&keys_spec, allow_devkey);
+    let keys = parse_keys(&keys_spec);
     let key_count = keys.len();
     if key_count == 0 {
         tracing::error!(
-            "no valid TOKENFUSE_CLOUD_KEYS configured and TOKENFUSE_CLOUD_ALLOW_DEVKEY not set: \
-             the control plane will authenticate no one (every request gets 401). Set \
-             TOKENFUSE_CLOUD_KEYS to a real key spec, or TOKENFUSE_CLOUD_ALLOW_DEVKEY=1 for \
-             local dev only"
-        );
-    } else if allow_devkey && parse_keys(&keys_spec, false).is_empty() {
-        // The insecure fallback only actually fired when the spec itself had
-        // no valid entries: this check (re-parsed with the flag forced off)
-        // distinguishes that from an operator who happens to have a real key
-        // literally named "devkey" configured alongside the opt-in flag.
-        tracing::warn!(
-            "TOKENFUSE_CLOUD_ALLOW_DEVKEY is set and TOKENFUSE_CLOUD_KEYS has no valid entries: \
-             the insecure `devkey` credential (org=default, role=admin) is ACTIVE. This must \
-             never be used outside local dev"
+            "no valid TOKENFUSE_CLOUD_KEYS configured: the control plane will \
+             authenticate no one (every request gets 401). Set TOKENFUSE_CLOUD_KEYS \
+             to a real key spec"
         );
     }
 
@@ -267,10 +264,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Truthy env-var opt-in check: only `"1"` or `"true"` (case-insensitive)
-/// count. Unset, empty, `"0"`, `"false"`, or a typo all fail closed (`false`):
-/// a malformed opt-in must never silently enable the insecure `devkey`
-/// fallback.
+/// Truthy env-var check: only `"1"` or `"true"` (case-insensitive) count.
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
 }
