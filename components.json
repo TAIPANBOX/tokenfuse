@@ -331,6 +331,9 @@
           "TOKENFUSE_CLOUD_ALERT_PCT": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_ALLOW_DEVKEY": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY": {
             "required": false
           },

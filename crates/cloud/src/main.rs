@@ -30,6 +30,19 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
+    // TOKENFUSE_CLOUD_ALLOW_DEVKEY stays a frozen name (compat/1.0.json), but
+    // the devkey fallback it used to enable is gone. Setting it now refuses to
+    // start, so an operator who relied on it is told why instead of getting a
+    // control plane that answers every request with 401.
+    if env_flag("TOKENFUSE_CLOUD_ALLOW_DEVKEY") {
+        tracing::error!(
+            "TOKENFUSE_CLOUD_ALLOW_DEVKEY is set, but the devkey fallback credential was \
+             removed: refusing to start. Unset it and set TOKENFUSE_CLOUD_KEYS to a real \
+             key spec"
+        );
+        std::process::exit(2);
+    }
+
     // Auth keys. Fails CLOSED: an unset, empty or all-malformed
     // TOKENFUSE_CLOUD_KEYS yields an EMPTY key map, so every request gets
     // `401` and nobody authenticates. There is no fallback credential.
@@ -249,6 +262,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// Truthy env-var check: only `"1"` or `"true"` (case-insensitive) count.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
 }
 
 /// The APNs sender, if the `apns` feature is built and the environment is
