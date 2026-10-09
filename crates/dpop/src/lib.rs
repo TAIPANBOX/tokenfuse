@@ -781,7 +781,10 @@ yyuNSwNVs/LTnw7nI9Ius8M=
     /// proof carry its OWN public key in the header, by design, so this JWK
     /// comes from the presenter, not from an operator's configured JWKS.
     ///
-    /// This crate's RSA path goes through `jsonwebtoken` 9 to `ring` 0.17,
+    /// Since tokenfuse#382 this crate's RSA path goes through `jsonwebtoken` 10
+    /// on its `aws_lc_rs` backend, and this test and its four siblings (the
+    /// 2048-bit floor, the 8192-bit ceiling, 8200 bits refused) passed unchanged
+    /// on it. Before that it went through `jsonwebtoken` 9 to `ring` 0.17,
     /// and `ring::rsa::verification::verify_rsa_` parses the modulus through
     /// `PublicModulus::from_be_bytes` BEFORE calling `key.exponentiate(..)`:
     /// that parse checks `bits > max_bits` and returns `KeyRejected::too_large()`
