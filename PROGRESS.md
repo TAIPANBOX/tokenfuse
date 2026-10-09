@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1731 passing** (core 372, dpop 21, delegation 60,
-gateway 999, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1730 passing** (core 372, dpop 21, delegation 60,
+gateway 999, cloud 277, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 3
 and cloud by 3 with invariant 87 (a call forwarded under identity warn mode is
 marked in the trace, the export and the Cloud: 2 in `gateway::proxy`, 1 in
