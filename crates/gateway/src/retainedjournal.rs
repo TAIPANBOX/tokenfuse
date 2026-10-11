@@ -368,7 +368,7 @@ pub async fn replay_at_startup(
 /// read: the path, the operating system's error, and why the gateway does not serve without it.
 pub fn startup_refusal(path: &Path, error: &io::Error) -> String {
     format!(
-        "the retained-reservation journal {} exists and cannot be read ({error}); refusing to start, because serving without it would admit calls against liability it holds and could later drop its records as duplicate. Fix or move the file; a missing journal starts empty",
+        "the retained-reservation journal {} exists and cannot be read ({error}); refusing to start, because serving without it would admit calls against liability it holds and could later drop its records as duplicate. Fix the file so it can be read. Moving it away is not a fix: the gateway then starts with none of the retained liability it holds",
         path.display()
     )
 }
