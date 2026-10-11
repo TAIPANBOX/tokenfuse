@@ -3088,6 +3088,14 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     that covers it. The path's exact shape (endpoint, keys, audit record) is still open; this decision
     fixes who may close a reservation and what must back the closure.
 
+    `@decided 2026-10-11`: the shape of that path. The operator console mints a short-lived token, bound
+    to one reservation id and its revision, only after a passkey assertion; the gateway verifies the token
+    with a secret it shares with the console, and refuses a stale revision. A closure takes one of two
+    forms: observed (the usage the provider returned, or the covering invoice line) or no-charge (the
+    provider confirms nothing was billed). A closure with no evidence and an administrative adjustment
+    are not accepted. The closure is one event on the existing event stream, not a new store. Retained
+    reservations must survive a restart before this path is built, so persistence comes first.
+
     **Where it says nothing.** A cancel during `Provider::send` is read as unknown from the
     line before the await, because `HttpProvider::send` is one `reqwest` future with no point
     the caller can observe between "connecting" and "the head is written"; nothing measured
