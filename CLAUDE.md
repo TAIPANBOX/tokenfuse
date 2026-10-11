@@ -3080,6 +3080,14 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     admin-keyed `POST /v1/runs/{id}/reconcile` settling or releasing by reservation id, or a
     bounded retention) is an open decision, D8.
 
+    `@decided 2026-10-11`: closing a retained reservation is a person's act, taken with a passkey
+    signature of the kind the operator console already requires for its sensitive commands. A language
+    model may propose a closure with its evidence attached; it never closes one. Without evidence from
+    the provider the reservation stays open: no time-based release, and no default settlement at the
+    estimate. The accepted evidence is the usage the provider returned for the call, or the invoice line
+    that covers it. The path's exact shape (endpoint, keys, audit record) is still open; this decision
+    fixes who may close a reservation and what must back the closure.
+
     **Where it says nothing.** A cancel during `Provider::send` is read as unknown from the
     line before the await, because `HttpProvider::send` is one `reqwest` future with no point
     the caller can observe between "connecting" and "the head is written"; nothing measured
