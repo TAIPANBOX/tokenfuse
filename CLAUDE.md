@@ -6041,8 +6041,14 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     lists them for `GET /v1/runs`. A Cloud run seed staged for a run the replay recreated
     (invariant 70) is credited by the replay itself, since the run is no longer fresh when its
     first request arrives. Liability is rebuilt from the journal alone, never from settled
-    spend. A journal that cannot be opened or read, or a write that fails, is one error line
-    naming the path; the gateway still serves, as every gateway did before. A torn final line is
+    spend. A journal that exists and cannot be opened or read refuses to start: `serve` exits 2
+    before the listener binds, naming the path and the operating system's error
+    (`retainedjournal::startup_refusal`). Serving without it would admit calls against the
+    liability it holds, start the id and generation counters from zero while new retains keep
+    being appended, and let a later restart drop records as duplicate or superseded
+    (`@decided 2026-10-11`: fail closed). A missing or empty journal starts cleanly; a journal
+    that does not exist and cannot be created, and a write that fails, are one error line naming
+    the path and the gateway still serves. A torn final line is
     skipped and terminated on the next open, so it never fuses with a later record; lines over
     16 MiB are refused by the writer and skipped unread by the reader; a record of an unknown
     `kind` is counted, never read as a closure. The raft backend answers `None` and nothing is
@@ -6068,6 +6074,13 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     eight in `core::ledger` for `restore_outstanding`, including a 200-seed hostile sweep; three
     in `unitledger`; nine in `retainedjournal`, including a 200-seed sweep over hostile bytes and
     the torn-line and over-long-line cases; three in `settle`. Eleven mutants planted in the
-    product code 2026-10-11, each caught by a named test in the pull request. Scenarios:
-    `features/a-retained-reservation-survives-a-restart.feature`, nine, each bound. Not a
+    product code 2026-10-11, each caught by a named test in the pull request. The refusal:
+    `tests/it/retained_journal_unreadable.rs::an_unreadable_journal_refuses_to_start_before_the_listener_binds`
+    (the real binary, the journal path made a directory so the read fails as root too), red on
+    `a25f91b` (the gateway logged `Is a directory (os error 21)` and then `tokenfuse gateway
+    listening`), with `a_missing_or_empty_journal_still_starts` beside it, and
+    `retainedjournal::tests::an_unreadable_journal_is_an_error_and_a_missing_one_is_empty`; two
+    mutants, the exists arm removed from `serve` and the read error replayed as empty, each
+    caught by one of those. Scenarios:
+    `features/a-retained-reservation-survives-a-restart.feature`, eleven, each bound. Not a
     script gate)*
