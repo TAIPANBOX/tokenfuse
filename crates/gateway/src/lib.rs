@@ -39,6 +39,7 @@ pub mod provider;
 pub mod proxy;
 #[cfg(feature = "cluster")]
 pub mod raft_ledger;
+pub mod retainedjournal;
 pub mod revocations;
 pub mod router;
 pub mod savingscli;

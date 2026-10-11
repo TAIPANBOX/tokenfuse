@@ -43,7 +43,7 @@ pub fn month_key(ts_millis: i64) -> String {
 
 /// A granted unit reservation. Hand it back to [`UnitLedger::settle`] with
 /// the real cost once the call completes (or with zero to release it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnitReservation {
     pub unit: String,
     pub amount: Microusd,
@@ -73,6 +73,18 @@ pub enum SeedOutcome {
     /// skipped, nothing touched. Cannot happen at startup; a guard, not a path.
     AlreadyCounting,
     /// A negative figure names no spend and is refused (hostile input).
+    Negative,
+}
+
+/// What [`UnitLedger::restore`] did with one retained unit reservation from a previous process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The amount is outstanding again in the unit's current window.
+    Applied,
+    /// The reservation was taken in a window that is no longer current: the counters it
+    /// belonged to rolled over, and `settle` would drop it too. Nothing touched.
+    OtherMonth,
+    /// A negative amount names no liability (hostile input). Nothing touched.
     Negative,
 }
 
@@ -139,6 +151,33 @@ impl UnitLedger {
         }
         s.spent = spent;
         SeedOutcome::Applied
+    }
+
+    /// Put a reservation a previous process retained (invariant 50) back on this unit, in the
+    /// window it was taken in and only there: outstanding again if that window is the current
+    /// month, and nothing at all if it is not, which is what [`UnitLedger::settle`] already
+    /// does with a reservation from a rolled-over window. Applied whether or not the unit has
+    /// a cap in effect now, because a cap set later (an override) must see the liability too.
+    /// Adds to whatever the unit already counts, so it composes with [`Self::seed_month`] run
+    /// first; seeding after a restore is refused as `AlreadyCounting`, which is why startup
+    /// seeds first.
+    pub fn restore(&self, reservation: &UnitReservation, now_millis: i64) -> RestoreOutcome {
+        if reservation.amount < Microusd::ZERO {
+            return RestoreOutcome::Negative;
+        }
+        let now_window = month_key(now_millis);
+        if reservation.window != now_window {
+            return RestoreOutcome::OtherMonth;
+        }
+        let mut state = self.state.lock().unwrap();
+        let s = Self::rolled(&mut state, &reservation.unit, &now_window);
+        s.reserved = s.reserved.saturating_add(reservation.amount);
+        RestoreOutcome::Applied
+    }
+
+    /// The window a reservation was taken in, `YYYY-MM`.
+    pub fn window_of(reservation: &UnitReservation) -> &str {
+        &reservation.window
     }
 
     /// The cap in effect for a unit: central override first, file cap second.
@@ -623,5 +662,55 @@ mod tests {
             .filter(|&ok| ok)
             .count();
         assert_eq!(granted, 10);
+    }
+
+    #[test]
+    fn a_restored_reservation_is_outstanding_again_in_its_own_window_only() {
+        let units = UnitLedger::new(HashMap::from([("ops".to_string(), usd(10.0))]));
+        let r = units.try_reserve("ops", usd(1.0), JULY).unwrap().unwrap();
+        let fresh = UnitLedger::new(HashMap::from([("ops".to_string(), usd(10.0))]));
+        assert_eq!(fresh.restore(&r, JULY), RestoreOutcome::Applied);
+        assert_eq!(fresh.reserved("ops", JULY), usd(1.0));
+        assert_eq!(fresh.spent("ops", JULY), Microusd::ZERO);
+        // The same handle settles it, exactly as it would have in the old process.
+        fresh.settle(&r, Microusd::ZERO, JULY);
+        assert_eq!(fresh.reserved("ops", JULY), Microusd::ZERO);
+
+        let later = UnitLedger::new(HashMap::from([("ops".to_string(), usd(10.0))]));
+        assert_eq!(later.restore(&r, AUGUST), RestoreOutcome::OtherMonth);
+        assert_eq!(later.reserved("ops", AUGUST), Microusd::ZERO);
+        assert_eq!(UnitLedger::window_of(&r), "2026-07");
+    }
+
+    #[test]
+    fn a_restore_adds_to_a_seeded_month_and_counts_against_the_cap() {
+        let units = UnitLedger::new(HashMap::from([("ops".to_string(), usd(2.0))]));
+        let r = units.try_reserve("ops", usd(1.0), JULY).unwrap().unwrap();
+        let fresh = UnitLedger::new(HashMap::from([("ops".to_string(), usd(2.0))]));
+        assert_eq!(
+            fresh.seed_month("ops", usd(0.5), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        assert_eq!(fresh.restore(&r, JULY), RestoreOutcome::Applied);
+        assert!(fresh.try_reserve("ops", usd(0.6), JULY).is_err());
+        assert!(fresh.try_reserve("ops", usd(0.5), JULY).is_ok());
+    }
+
+    #[test]
+    fn a_negative_restore_is_refused_and_an_uncapped_unit_still_holds_the_liability() {
+        let fresh = UnitLedger::default();
+        let neg = UnitReservation {
+            unit: "ops".into(),
+            amount: Microusd(-5),
+            window: "2026-07".into(),
+        };
+        assert_eq!(fresh.restore(&neg, JULY), RestoreOutcome::Negative);
+        let ok = UnitReservation {
+            amount: usd(1.0),
+            ..neg
+        };
+        assert_eq!(fresh.restore(&ok, JULY), RestoreOutcome::Applied);
+        fresh.set_overrides(HashMap::from([("ops".to_string(), usd(1.5))]));
+        assert!(fresh.try_reserve("ops", usd(1.0), JULY).is_err());
     }
 }

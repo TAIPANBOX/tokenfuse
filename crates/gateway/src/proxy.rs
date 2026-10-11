@@ -3539,6 +3539,17 @@ pub(crate) mod tests {
         async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
             self.0.seed_spend(run_id, amount, generation).await
         }
+
+        fn restore_outstanding(
+            &self,
+            entries: &[tokenfuse_core::Outstanding],
+        ) -> Option<tokenfuse_core::Restored> {
+            self.0.restore_outstanding(entries)
+        }
+
+        fn tail_parent(&self, reservation: &Reservation) -> Option<String> {
+            self.0.tail_parent(reservation)
+        }
     }
 
     fn state(mode: Mode, provider: StubProvider) -> AppState {

@@ -712,6 +712,13 @@ impl AppState {
         self
     }
 
+    /// Replace the retained-reservation registry, to give it a journal (W03). Chainable;
+    /// before serving, since every guard clones the registry it finds here.
+    pub fn with_retained(mut self, retained: Arc<crate::settle::Retained>) -> Self {
+        self.retained = retained;
+        self
+    }
+
     /// Set the DLP (secret-scanning) mode. Chainable.
     pub fn with_dlp(mut self, dlp: DlpMode) -> Self {
         self.dlp = dlp;

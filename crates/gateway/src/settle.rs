@@ -228,14 +228,64 @@ struct RetainedInner {
     total: usize,
 }
 
-/// The process-local registry of retained reservations, one per `AppState`.
+/// The registry of retained reservations, one per `AppState`. Process-local by itself; with a
+/// journal (`TOKENFUSE_DATA_DIR` set) every retained reservation is also appended to
+/// `crate::retainedjournal` and put back at the next startup (W03).
 #[derive(Debug, Default)]
 pub struct Retained {
     inner: Mutex<RetainedInner>,
     unlisted: AtomicU64,
+    journal: Option<crate::retainedjournal::Journal>,
+    journal_failures: AtomicU64,
 }
 
 impl Retained {
+    /// A registry that also appends every retained reservation to `journal`.
+    pub fn with_journal(journal: crate::retainedjournal::Journal) -> Self {
+        Retained {
+            journal: Some(journal),
+            ..Default::default()
+        }
+    }
+
+    /// Append one retained reservation to the journal, synced before this returns. `None`
+    /// when there is no journal (no data dir: the reservation lives only in this process, as
+    /// it always did); `Some(false)` when the write failed, which is logged at error with the
+    /// path, because that reservation will not survive a restart.
+    pub fn journal(
+        &self,
+        entry: &RetainedReservation,
+        tail_parent: Option<String>,
+    ) -> Option<bool> {
+        let journal = self.journal.as_ref()?;
+        let record = crate::retainedjournal::Record::retained(entry, tail_parent);
+        match journal.append(&record) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                self.journal_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    path = %journal.path().display(),
+                    run = %entry.run.run_id,
+                    reservation = entry.run.id,
+                    amount_microusd = entry.run.amount.0,
+                    error = %e,
+                    "retained reservation could not be written to the journal; it is held in this process and will NOT survive a restart"
+                );
+                Some(false)
+            }
+        }
+    }
+
+    /// Journal writes that failed since startup.
+    pub fn journal_failures(&self) -> u64 {
+        self.journal_failures.load(Ordering::Relaxed)
+    }
+
+    /// The journal's path, when there is one.
+    pub fn journal_path(&self) -> Option<&std::path::Path> {
+        self.journal.as_ref().map(|j| j.path())
+    }
+
     /// `false` when the cap refused the entry (counted).
     pub fn push(&self, entry: RetainedReservation) -> bool {
         let mut inner = self.inner.lock().unwrap();
@@ -445,12 +495,17 @@ impl SettleGuard {
         };
         let (id, step, amount) = (run.id, run.step, run.amount);
         let unit_name = unit.as_ref().map(|u| u.unit.clone()).unwrap_or_default();
-        let listed = self.retained.push(RetainedReservation {
+        let tail_parent = self.ledger.tail_parent(&run);
+        let entry = RetainedReservation {
             run,
             unit,
             model: self.attribution.model.clone(),
             retained_at_millis: now,
-        });
+        };
+        // Journaled before it is listed, and whether or not the registry has room: the
+        // liability is real either way, and a restart must find it (W03).
+        let journaled = self.retained.journal(&entry, tail_parent);
+        let listed = self.retained.push(entry);
         tracing::warn!(
             run = %self.run_id,
             reservation = id,
@@ -459,6 +514,7 @@ impl SettleGuard {
             unit = %unit_name,
             model = %self.attribution.model,
             listed,
+            journaled = ?journaled,
             "retained: the request was handed to the provider and the call ended before any answer came back, so its outcome is unknown; the reservation stays outstanding on the run and on the unit until it is reconciled (invariant 50), never settled at zero"
         );
         Terminal::Retained { amount, listed }
@@ -1252,6 +1308,134 @@ mod tests {
         assert!(text.contains("amount_microusd=1000000"), "{text}");
         assert!(text.contains("unit=treasury"), "{text}");
         assert!(text.contains("listed=true"), "{text}");
+    }
+
+    fn journal_dir(name: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("tf-settle-journal-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// W03. A retained reservation is appended to the journal before the guard returns, with
+    /// the handle a restart needs, and a fresh process reading that journal holds the same
+    /// liability on the run and on the unit.
+    #[test]
+    fn a_retained_reservation_is_journaled_and_a_fresh_process_holds_it_again() {
+        let _serial = crate::testlog::log_lock();
+        let buf = crate::testlog::captured_log();
+        let start = buf.lock().unwrap().len();
+        let dir = journal_dir("retain");
+        let mut r = rig();
+        r.retained = Arc::new(Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        {
+            let mut g = rig_guard(&r);
+            g.dispatching();
+        }
+        let held = r.retained.for_run("r")[0].clone();
+        let read = crate::retainedjournal::read(&dir).unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].run, held.run);
+        assert_eq!(read.records[0].unit, held.unit);
+        assert_eq!(read.records[0].retained_at_millis, held.retained_at_millis);
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()[start..]).into_owned();
+        assert!(text.contains("journaled=Some(true)"), "{text}");
+
+        let ledger = Arc::new(Ledger::new());
+        let units = Arc::new(UnitLedger::new(std::collections::HashMap::from([(
+            "treasury".to_string(),
+            Microusd::from_usd(10.0),
+        )])));
+        let fresh = Retained::default();
+        crate::retainedjournal::replay(
+            read,
+            &crate::ledger_backend::LocalLedger(ledger.clone()),
+            &units,
+            &fresh,
+            now_millis(),
+        );
+        assert_eq!(
+            ledger.snapshot("r").unwrap().reserved,
+            Microusd::from_usd(1.0)
+        );
+        assert_eq!(
+            units.reserved("treasury", now_millis()),
+            Microusd::from_usd(1.0)
+        );
+        assert_eq!(fresh.for_run("r")[0].run, held.run);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// W03. The registry's cap bounds what is LISTED, never what is held or journaled: a
+    /// reservation retained past the cap is still written, so a restart still counts it.
+    #[test]
+    fn a_reservation_retained_past_the_registry_cap_is_still_journaled() {
+        let _serial = crate::testlog::log_lock();
+        let dir = journal_dir("cap");
+        let mut r = rig();
+        r.retained = Arc::new(Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        let filler = RetainedReservation {
+            run: r.ledger.reserve("r", Microusd(1)).unwrap(),
+            unit: None,
+            model: "m".into(),
+            retained_at_millis: 0,
+        };
+        for _ in 0..MAX_RETAINED {
+            assert!(r.retained.push(filler.clone()));
+        }
+        let terminal = {
+            let mut g = rig_guard(&r);
+            g.dispatching();
+            g.settle_now()
+        };
+        assert!(matches!(
+            terminal,
+            Some(Terminal::Retained { listed: false, .. })
+        ));
+        let read = crate::retainedjournal::read(&dir).unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].run.amount, Microusd::from_usd(1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// W03. A journal write that fails keeps the reservation outstanding in this process and
+    /// says, at error, naming the path, that it will not survive a restart.
+    #[test]
+    fn a_journal_write_that_fails_is_an_error_and_the_liability_is_still_held() {
+        let _serial = crate::testlog::log_lock();
+        let buf = crate::testlog::captured_log();
+        let start = buf.lock().unwrap().len();
+        let dir = journal_dir("fails");
+        let mut r = rig();
+        r.retained = Arc::new(Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        {
+            let mut g = rig_guard(&r);
+            // A record over the line bound is the one write failure a test can force as root.
+            g.attribution.model = "m".repeat(crate::retainedjournal::MAX_LINE_BYTES);
+            g.dispatching();
+        }
+        assert_eq!(r.retained.journal_failures(), 1);
+        assert_eq!(r.retained.len(), 1);
+        assert_eq!(
+            r.ledger.snapshot("r").unwrap().reserved,
+            Microusd::from_usd(1.0)
+        );
+        assert!(crate::retainedjournal::read(&dir)
+            .unwrap()
+            .records
+            .is_empty());
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()[start..]).into_owned();
+        assert!(text.contains("ERROR"), "{}", &text[..text.len().min(2000)]);
+        assert!(text.contains("will NOT survive a restart"));
+        assert!(text.contains(crate::retainedjournal::FILE_NAME));
+        assert!(text.contains("journaled=Some(false)"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// E14. A guard dropped before dispatch releases both halves at zero and
