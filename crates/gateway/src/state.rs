@@ -95,6 +95,12 @@ pub struct AppState {
     /// entry and the caller credits it via `LedgerBackend::seed_spend`.
     /// Empty unless cloud mode is on; never repopulated after startup.
     run_seed: Arc<Mutex<HashMap<String, Microusd>>>,
+    /// Runs the retained-reservation replay recreated at startup (W03), whose
+    /// budget it left at zero because nothing in the journal carries one. A
+    /// declared parent among them is given its Cloud budget on a child's call
+    /// exactly as an unopened one is (D1's exception, invariant 49); the entry
+    /// is removed the first time anything opens the run with a budget.
+    restored_unbudgeted: Arc<Mutex<HashSet<String>>>,
     /// The operator's ceiling on any run budget the CALLER or a default
     /// chose (`TOKENFUSE_MAX_RUN_BUDGET_USD`, invariant 73). `None` (unset)
     /// is the historical behaviour: a run's budget is whatever the caller's
@@ -587,6 +593,7 @@ impl AppState {
             taint: Arc::new(TaintStore::default()),
             cloud_budgets: Arc::new(Mutex::new(HashMap::new())),
             run_seed: Arc::new(Mutex::new(HashMap::new())),
+            restored_unbudgeted: Arc::new(Mutex::new(HashSet::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
@@ -704,6 +711,22 @@ impl AppState {
     /// finds nothing left to apply.
     pub fn take_run_seed(&self, run_id: &str) -> Option<Microusd> {
         self.run_seed.lock().unwrap().remove(run_id)
+    }
+
+    /// Note runs the startup replay recreated with no budget (W03).
+    pub fn note_restored_unbudgeted(&self, runs: impl IntoIterator<Item = String>) {
+        self.restored_unbudgeted.lock().unwrap().extend(runs);
+    }
+
+    /// Whether `run_id` was recreated by the replay and has not been opened
+    /// with a budget since.
+    pub fn is_restored_unbudgeted(&self, run_id: &str) -> bool {
+        self.restored_unbudgeted.lock().unwrap().contains(run_id)
+    }
+
+    /// The run has been opened with a budget; it is no longer awaiting one.
+    pub fn clear_restored_unbudgeted(&self, run_id: &str) {
+        self.restored_unbudgeted.lock().unwrap().remove(run_id);
     }
 
     /// Replace the ledger backend (e.g. a raft-replicated one). Chainable.

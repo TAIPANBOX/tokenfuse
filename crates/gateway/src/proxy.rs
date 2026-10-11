@@ -731,6 +731,9 @@ async fn handle_call(
     // D1's one exception: a parent this gateway has not opened, for which an operator set a budget
     // in the Cloud, is opened at that budget on first sight, as a root (the Cloud budget map has no
     // hierarchy). The policy default is never used to open a parent.
+    // A parent the retained-reservation replay recreated at startup (W03) has a snapshot but no
+    // budget, so it is given its Cloud budget the same way, once: opening an open run with no
+    // declared parent keeps the parent it holds and sets only the budget.
     if let Some(p) = parent.as_deref().filter(|p| *p != run_id) {
         if st.ledger.snapshot(p).await.is_none() {
             if let Some(b) = st.cloud_budget(p) {
@@ -742,6 +745,18 @@ async fn handle_call(
                     }
                     Err(e) => tracing::warn!(parent = %p, child = %run_id, error = %e,
                         "could not open the parent at its Cloud-managed budget"),
+                }
+            }
+        } else if st.is_restored_unbudgeted(p) {
+            if let Some(b) = st.cloud_budget(p) {
+                match st.ledger.open_run(p, b, None).await {
+                    Ok(_) => {
+                        st.clear_restored_unbudgeted(p);
+                        tracing::info!(parent = %p, child = %run_id, budget_usd = b.as_usd(),
+                            "gave a parent restored from the retained-reservation journal its Cloud-managed budget, declared by a child");
+                    }
+                    Err(e) => tracing::warn!(parent = %p, child = %run_id, error = %e,
+                        "could not give the restored parent its Cloud-managed budget"),
                 }
             }
         }
@@ -762,6 +777,8 @@ async fn handle_call(
     if run_is_fresh {
         credit_run_seed_if_any(&st, &run_id, opened.generation).await;
     }
+    // The run now holds the budget this call opened it at, so a restored entry is settled.
+    st.clear_restored_unbudgeted(&run_id);
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
     let parent_run_id = opened.parent.clone().unwrap_or_default();
