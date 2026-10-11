@@ -6012,3 +6012,58 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Cloud showing a reason outside the vocabulary. Scenarios:
     `features/a-warn-mode-identity-mismatch-is-marked.feature`, five, each
     bound. Not a script gate)*
+
+88. **A retained reservation survives a restart: it is journaled before the guard returns and
+    put back at startup with the handle it was admitted under.** Invariant 50 keeps a call whose
+    outcome is unknown outstanding on the run chain and on the unit; until 2026-10-11 that lived
+    only in this process, so a gateway that restarted forgot the exposure and admitted the next
+    call against room the provider may already have billed. Measured on `a2b1e94` by
+    `tests/it/retained_survives_restart.rs` (the real binary, SIGKILLed, started again on the
+    same data dir): the first process listed the child at `retained: 1`; the second listed
+    `runs=[]` and admitted with `200` the call the restored unit reservation must refuse.
+
+    With `TOKENFUSE_DATA_DIR` set, `SettleGuard::retain` appends one NDJSON line to
+    `<dir>/retained-reservations.ndjson` (`crate::retainedjournal`) and `sync_data`s it before
+    the guard returns, whether or not the registry has room (`MAX_RETAINED` bounds what is
+    listed, never what is held). The line carries the reservation exactly as admitted (id, leaf,
+    amount, step, generation, every chain link with its generation), the parent the ledger held
+    for the chain's last link (`Outstanding::tail_parent`: every other link's parent is the next
+    link, and a dropped tail parent would refuse the run's next call as adopted too late), the
+    unit reservation with its `YYYY-MM` window, the model and the time. `serve` replays the file
+    after the Cloud seeds and after the ledger backend is final, before the listener binds:
+    `Ledger::restore_outstanding` recreates each run absent from the fresh ledger at the highest
+    generation its links name (a lower one was superseded by a reopen, and the old process had
+    already lost that share), with the restored liability as `reserved` and nothing as `spent`,
+    marks the ids outstanding so a later settlement by the same handle applies exactly once
+    (invariant 49), and moves the id and generation counters past everything restored;
+    `UnitLedger::restore` puts the unit half back only in the window it was taken in, and only
+    if that is the current month (what `settle` already does with a stale window); the registry
+    lists them for `GET /v1/runs`. A Cloud run seed staged for a run the replay recreated
+    (invariant 70) is credited by the replay itself, since the run is no longer fresh when its
+    first request arrives. Liability is rebuilt from the journal alone, never from settled
+    spend. A journal that cannot be opened or read, or a write that fails, is one error line
+    naming the path; the gateway still serves, as every gateway did before. A torn final line is
+    skipped and terminated on the next open, so it never fuses with a later record; lines over
+    16 MiB are refused by the writer and skipped unread by the reader; a record of an unknown
+    `kind` is counted, never read as a closure. The raft backend answers `None` and nothing is
+    restored (a `Request` variant is invariant 5's decision); the replay says so.
+
+    **Where it says nothing.** No line is ever removed: closing a retained reservation is D8,
+    decided and not built, so the file only grows (one line per retained call, the rare
+    cancel-during-send case). A restored run's budget reads zero on `GET /v1/runs` until its next
+    request opens it, and its settled spend and steps before the restart are not restored (that
+    is invariant 70's Cloud seed, or nothing). `sync_data` makes a line durable against a
+    process crash, which the test exercises; durability against a power loss depends on the
+    filesystem and was not measured. Two gateways sharing one data dir each append to the file
+    and each restore the other's lines on restart, and their ids can collide, so one line can
+    be dropped as a duplicate; one data dir per gateway is assumed, as the Parquet sink already assumes for its own segment names. A
+    journal written by a gateway with no unit cap restores the unit half anyway, so a cap set
+    later sees it.
+    *(test: `tests/it/retained_survives_restart.rs::a_retained_reservation_survives_a_gateway_restart`,
+    red on `a2b1e94` (`the restarted gateway forgot the retained run: []`, the unit call `200`);
+    eight in `core::ledger` for `restore_outstanding`, including a 200-seed hostile sweep; three
+    in `unitledger`; nine in `retainedjournal`, including a 200-seed sweep over hostile bytes and
+    the torn-line and over-long-line cases; three in `settle`. Eleven mutants planted in the
+    product code 2026-10-11, each caught by a named test in the pull request. Scenarios:
+    `features/a-retained-reservation-survives-a-restart.feature`, nine, each bound. Not a
+    script gate)*

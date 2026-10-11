@@ -83,6 +83,20 @@ pub trait LedgerBackend: Send + Sync {
     /// backend ("compiled out of every shipped image"; `stack-k8s` and
     /// `stack-single` never build the `cluster` feature in).
     async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool;
+
+    /// Put reservations a previous process retained (invariant 50) back on this ledger with
+    /// their original ids, chains and generations, from the retained-reservation journal
+    /// (`crate::retainedjournal`). Synchronous: called once at startup, before the listener
+    /// binds. `None` when the backend does not support it (raft: see its impl).
+    fn restore_outstanding(
+        &self,
+        entries: &[tokenfuse_core::Outstanding],
+    ) -> Option<tokenfuse_core::Restored>;
+
+    /// The parent the ledger holds for the last link of a reservation's chain, which the
+    /// journal records beside the reservation (`tokenfuse_core::Outstanding::tail_parent`).
+    /// Synchronous and local: called from `SettleGuard::drop`.
+    fn tail_parent(&self, reservation: &Reservation) -> Option<String>;
 }
 
 /// The default in-process backend: a thin async wrapper over the sync `Ledger`.
@@ -131,5 +145,16 @@ impl LedgerBackend for LocalLedger {
 
     async fn seed_spend(&self, run_id: &str, amount: Microusd, generation: u64) -> bool {
         self.0.seed_spend(run_id, amount, generation)
+    }
+
+    fn restore_outstanding(
+        &self,
+        entries: &[tokenfuse_core::Outstanding],
+    ) -> Option<tokenfuse_core::Restored> {
+        Some(self.0.restore_outstanding(entries))
+    }
+
+    fn tail_parent(&self, reservation: &Reservation) -> Option<String> {
+        self.0.tail_parent(reservation)
     }
 }

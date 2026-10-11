@@ -1325,6 +1325,37 @@ async fn serve() {
         state = state.with_ledger(rl);
     }
 
+    // W03: retained reservations (invariant 50) survive a restart. With a data dir, every
+    // retain is appended to its journal, and what the journal holds is put back here, after
+    // the Cloud seeds (a unit seed is refused once anything is outstanding on the unit) and
+    // after the ledger backend is final, before the first request can be admitted.
+    match std::env::var("TOKENFUSE_DATA_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let dir = std::path::PathBuf::from(dir);
+            match tokenfuse_gateway::retainedjournal::Journal::open(&dir) {
+                Ok(journal) => {
+                    state = state.with_retained(Arc::new(
+                        tokenfuse_gateway::settle::Retained::with_journal(journal),
+                    ));
+                    tokenfuse_gateway::retainedjournal::replay_at_startup(
+                        &state,
+                        &dir,
+                        tokenfuse_gateway::sink::now_millis(),
+                    )
+                    .await;
+                }
+                Err(e) => tracing::error!(
+                    path = %dir.join(tokenfuse_gateway::retainedjournal::FILE_NAME).display(),
+                    error = %e,
+                    "the retained-reservation journal could not be opened; retained reservations will not survive a restart and none were restored"
+                ),
+            }
+        }
+        _ => tracing::info!(
+            "retained-reservation journal off: TOKENFUSE_DATA_DIR is not set, so a retained reservation lives only in this process"
+        ),
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");

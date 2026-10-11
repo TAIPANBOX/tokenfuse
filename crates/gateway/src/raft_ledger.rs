@@ -349,4 +349,19 @@ impl LedgerBackend for RaftLedger {
     async fn seed_spend(&self, _run_id: &str, _amount: Microusd, _generation: u64) -> bool {
         false
     }
+
+    /// Not implemented for the raft backend: putting reservations back on a replicated state
+    /// machine is a `Request` variant, a raft schema decision (invariant 5), not one the
+    /// retained-reservation journal makes. Startup reads `None` and restores nothing, names
+    /// the count it left, and lists nothing it does not hold.
+    fn restore_outstanding(
+        &self,
+        _entries: &[tokenfuse_core::Outstanding],
+    ) -> Option<tokenfuse_core::Restored> {
+        None
+    }
+
+    fn tail_parent(&self, _reservation: &Reservation) -> Option<String> {
+        None
+    }
 }

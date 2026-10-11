@@ -150,6 +150,36 @@ pub enum Settlement {
     NotOutstanding,
 }
 
+/// One reservation to put back on a fresh ledger after a restart: the reservation exactly as
+/// it was admitted, plus the parent the ledger held for the LAST link of its chain at the time.
+/// Every other link's parent is the next link by construction (`walk` follows `parent`); the
+/// last link's is not on the chain (an unknown parent, a closed ancestor, the depth cap, or a
+/// cycle back into the chain), and dropping it would make the restored run read as parentless
+/// and refuse its own next call as `AdoptedTooLate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outstanding {
+    pub reservation: Reservation,
+    pub tail_parent: Option<String>,
+}
+
+/// What [`Ledger::restore_outstanding`] did, every skip counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restored {
+    /// Reservations now outstanding again, by id.
+    pub restored: Vec<u64>,
+    /// Reservations whose id was already outstanding here, or repeated in the batch.
+    pub duplicate: usize,
+    /// Reservations refused as malformed: an empty chain, a leaf that is not `chain[0]`, a
+    /// generation that disagrees with `chain[0]`, a zero id or generation, a negative amount.
+    pub invalid: usize,
+    /// Chain links not credited: the run was closed and reopened under a later generation in
+    /// the process that wrote them (that process had already lost the link's share on the
+    /// reopen), or the run already exists in this ledger and was not created by this restore.
+    pub links_dropped: usize,
+    /// Runs this restore created, with the generation each was created at.
+    pub runs_created: Vec<(String, u64)>,
+}
+
 /// Facts `RunSnapshot` does not carry, for tests and operators. Read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunInfo {
@@ -560,6 +590,126 @@ impl Ledger {
         }
         s.spent = Microusd(s.spent.0.saturating_add(amount.0));
         true
+    }
+
+    /// Put reservations that were outstanding in a previous process back on this ledger, with
+    /// their original ids, chains and generations, so the liability they carry counts against
+    /// every run they were admitted against and a later settlement by the same handle applies
+    /// to exactly those links (invariant 49), never a second time.
+    ///
+    /// Meant for a ledger nothing has opened a run on yet (startup). A run is created only if
+    /// absent, at the HIGHEST generation any link names for it (generations are monotonic, so
+    /// a lower one was superseded by a reopen and its share was already gone in the old
+    /// process), parentless until a link names its parent, `admitted_ever` (a reservation was
+    /// admitted against it), budget zero until the next `open_run` sets one, and with the
+    /// leaf's step at the highest restored step. A run that already exists here is never
+    /// touched: its generation numbers belong to this process, not the old one. Liability is
+    /// rebuilt only from reservations, never from settled spend.
+    ///
+    /// The id and generation counters move past everything restored, so nothing issued here
+    /// afterwards can collide with a restored handle. Idempotent: an id already outstanding is
+    /// counted as a duplicate and changes nothing.
+    pub fn restore_outstanding(&self, entries: &[Outstanding]) -> Restored {
+        let mut inner = self.inner.lock().unwrap();
+        let mut report = Restored::default();
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut valid: Vec<&Outstanding> = Vec::new();
+        for e in entries {
+            let r = &e.reservation;
+            let well_formed = r.id != 0
+                && r.generation != 0
+                && r.amount >= Microusd::ZERO
+                && r.chain
+                    .first()
+                    .is_some_and(|l| l.run_id == r.run_id && l.generation == r.generation)
+                && r.chain.iter().all(|l| l.generation != 0);
+            if !well_formed {
+                report.invalid += 1;
+                continue;
+            }
+            if inner.outstanding.contains(&r.id) || !seen.insert(r.id) {
+                report.duplicate += 1;
+                continue;
+            }
+            valid.push(e);
+        }
+
+        // The generation each run comes back at: the highest any link names.
+        let mut generation_of: HashMap<String, u64> = HashMap::new();
+        for e in &valid {
+            for l in &e.reservation.chain {
+                let g = generation_of.entry(l.run_id.clone()).or_insert(0);
+                *g = (*g).max(l.generation);
+            }
+        }
+        let mut created: HashSet<String> = HashSet::new();
+        let mut names: Vec<&String> = generation_of.keys().collect();
+        names.sort();
+        for run_id in names {
+            if inner.runs.contains_key(run_id) {
+                continue;
+            }
+            let generation = generation_of[run_id];
+            inner.runs.insert(
+                run_id.clone(),
+                RunState {
+                    budget: Microusd::ZERO,
+                    reserved: Microusd::ZERO,
+                    spent: Microusd::ZERO,
+                    steps: 0,
+                    parent: None,
+                    generation,
+                    admitted_ever: true,
+                    closed: false,
+                },
+            );
+            created.insert(run_id.clone());
+            report.runs_created.push((run_id.clone(), generation));
+        }
+
+        for e in &valid {
+            let r = &e.reservation;
+            for (i, link) in r.chain.iter().enumerate() {
+                let live = created.contains(&link.run_id)
+                    && inner.runs[&link.run_id].generation == link.generation;
+                if !live {
+                    report.links_dropped += 1;
+                    continue;
+                }
+                let parent = match r.chain.get(i + 1) {
+                    Some(next) => Some(next.run_id.clone()),
+                    None => e.tail_parent.clone(),
+                };
+                let s = inner.runs.get_mut(&link.run_id).expect("checked live");
+                s.reserved = s.reserved.saturating_add(r.amount);
+                if s.parent.is_none() {
+                    // Never the run itself: `open_run` refuses a self-parent and a restored
+                    // one would be read back as a cycle of length one.
+                    s.parent = parent.filter(|p| p != &link.run_id);
+                }
+                if i == 0 {
+                    s.steps = s.steps.max(r.step);
+                }
+            }
+            inner.outstanding.insert(r.id);
+            inner.next_reservation = inner.next_reservation.max(r.id);
+            report.restored.push(r.id);
+        }
+        let top = generation_of.values().copied().max().unwrap_or(0);
+        inner.next_generation = inner.next_generation.max(top);
+        report
+    }
+
+    /// The parent this ledger holds for the last link of `reservation`'s chain, if that run
+    /// is still in the generation the link names. What [`Outstanding::tail_parent`] records.
+    pub fn tail_parent(&self, reservation: &Reservation) -> Option<String> {
+        let last = reservation.chain.last()?;
+        let inner = self.inner.lock().unwrap();
+        let s = inner.runs.get(&last.run_id)?;
+        (s.generation == last.generation)
+            .then(|| s.parent.clone())
+            .flatten()
     }
 
     /// Snapshot a run's accounting state. Closed runs are included, with
@@ -1713,5 +1863,237 @@ mod tests {
             snapshot.spent.0,
             BUDGET
         );
+    }
+
+    // -- W03: retained reservations restored after a restart --------------
+
+    fn outstanding(l: &Ledger, r: &Reservation) -> Outstanding {
+        Outstanding {
+            reservation: r.clone(),
+            tail_parent: l.tail_parent(r),
+        }
+    }
+
+    #[test]
+    fn a_restored_reservation_holds_every_link_and_settles_by_its_own_handle() {
+        let old = Ledger::new();
+        old.open_run("parent", usd(5.0), None).expect("opens");
+        old.open_run("child", usd(5.0), Some("parent"))
+            .expect("opens");
+        let r = old.reserve("child", usd(0.25)).unwrap();
+        let fresh = Ledger::new();
+        let report = fresh.restore_outstanding(&[outstanding(&old, &r)]);
+        assert_eq!(report.restored, vec![r.id]);
+        assert_eq!(report.links_dropped, 0);
+        for run in ["child", "parent"] {
+            let s = fresh.snapshot(run).unwrap();
+            assert_eq!(s.reserved, usd(0.25), "{run}");
+            assert_eq!(s.spent, Microusd::ZERO, "{run}: liability, never spend");
+        }
+        let info = fresh.run_info("child").unwrap();
+        assert_eq!(info.generation, r.generation);
+        assert_eq!(info.parent.as_deref(), Some("parent"));
+        assert!(info.admitted_ever);
+        assert_eq!(fresh.snapshot("child").unwrap().steps, r.step);
+        assert_eq!(
+            fresh.run_info("parent").unwrap().generation,
+            r.chain[1].generation
+        );
+        assert_eq!(
+            fresh.settle(&r, Microusd::ZERO),
+            Settlement::Applied {
+                links: 2,
+                dropped: 0
+            }
+        );
+        assert_eq!(fresh.snapshot("parent").unwrap().reserved, Microusd::ZERO);
+        assert_eq!(fresh.settle(&r, Microusd::ZERO), Settlement::NotOutstanding);
+    }
+
+    #[test]
+    fn nothing_issued_after_a_restore_collides_with_a_restored_handle() {
+        let old = Ledger::new();
+        for i in 0..5 {
+            old.open_run(format!("r{i}"), usd(5.0), None)
+                .expect("opens");
+        }
+        let r = old.reserve("r4", usd(0.1)).unwrap();
+        let fresh = Ledger::new();
+        fresh.restore_outstanding(&[outstanding(&old, &r)]);
+        let opened = fresh.open_run("new", usd(5.0), None).expect("opens");
+        assert!(opened.generation > r.generation);
+        let n = fresh.reserve("new", usd(0.1)).unwrap();
+        assert!(n.id > r.id);
+    }
+
+    #[test]
+    fn the_restored_liability_counts_against_the_next_budget() {
+        let old = Ledger::new();
+        old.open_run("run", usd(5.0), None).expect("opens");
+        let r = old.reserve("run", usd(1.0)).unwrap();
+        let fresh = Ledger::new();
+        fresh.restore_outstanding(&[outstanding(&old, &r)]);
+        fresh
+            .open_run("run", usd(1.5), None)
+            .expect("an open run takes a budget");
+        assert!(matches!(
+            fresh.reserve("run", usd(1.0)),
+            Err(BudgetError::Exceeded { .. })
+        ));
+        assert!(fresh.reserve("run", usd(0.5)).is_ok());
+    }
+
+    /// A child whose parent this ledger never opened (shadow's truncated chain) keeps that
+    /// parent across the restore, so its next call declaring the same parent is not refused
+    /// as a late adoption.
+    #[test]
+    fn a_parent_off_the_chain_is_kept_across_the_restore() {
+        let old = Ledger::new();
+        old.open_run("child", usd(5.0), Some("never-opened"))
+            .expect("opens");
+        let r = old.reserve_unchecked("child", usd(0.1));
+        assert_eq!(r.chain.len(), 1);
+        let fresh = Ledger::new();
+        fresh.restore_outstanding(&[outstanding(&old, &r)]);
+        let opened = fresh
+            .open_run("child", usd(5.0), Some("never-opened"))
+            .expect("the same parent is kept, not adopted too late");
+        assert_eq!(opened.parent_disposition, ParentDisposition::Kept);
+        assert_eq!(opened.generation, r.generation);
+    }
+
+    #[test]
+    fn a_superseded_generation_is_dropped_not_credited() {
+        let old = Ledger::new();
+        old.open_run("r", usd(5.0), None).expect("opens");
+        let early = old.reserve("r", usd(0.3)).unwrap();
+        old.close_run("r");
+        old.open_run("r", usd(5.0), None).expect("reopens");
+        let late = old.reserve("r", usd(0.2)).unwrap();
+        assert!(late.generation > early.generation);
+        let fresh = Ledger::new();
+        // Order must not matter.
+        let report =
+            fresh.restore_outstanding(&[outstanding(&old, &late), outstanding(&old, &early)]);
+        assert_eq!(report.restored.len(), 2);
+        assert_eq!(report.links_dropped, 1);
+        assert_eq!(fresh.snapshot("r").unwrap().reserved, usd(0.2));
+        assert_eq!(fresh.run_info("r").unwrap().generation, late.generation);
+    }
+
+    #[test]
+    fn a_restore_is_idempotent_and_refuses_what_is_malformed() {
+        let old = Ledger::new();
+        old.open_run("r", usd(5.0), None).expect("opens");
+        let r = old.reserve("r", usd(0.3)).unwrap();
+        let fresh = Ledger::new();
+        let one = outstanding(&old, &r);
+        let first = fresh.restore_outstanding(&[one.clone(), one.clone()]);
+        assert_eq!((first.restored.len(), first.duplicate), (1, 1));
+        let again = fresh.restore_outstanding(std::slice::from_ref(&one));
+        assert_eq!((again.restored.len(), again.duplicate), (0, 1));
+        assert_eq!(fresh.snapshot("r").unwrap().reserved, usd(0.3));
+
+        let mut bad = Vec::new();
+        for f in [
+            |r: &mut Reservation| r.chain.clear(),
+            |r: &mut Reservation| r.run_id = "elsewhere".into(),
+            |r: &mut Reservation| r.generation += 1,
+            |r: &mut Reservation| r.id = 0,
+            |r: &mut Reservation| r.amount = Microusd(-1),
+        ] {
+            let mut m = r.clone();
+            m.id += 100;
+            f(&mut m);
+            bad.push(Outstanding {
+                reservation: m,
+                tail_parent: None,
+            });
+        }
+        let report = Ledger::new().restore_outstanding(&bad);
+        assert_eq!(report.invalid, 5);
+        assert!(report.restored.is_empty() && report.runs_created.is_empty());
+    }
+
+    #[test]
+    fn a_run_already_in_this_ledger_is_never_touched_by_a_restore() {
+        let old = Ledger::new();
+        old.open_run("r", usd(5.0), None).expect("opens");
+        let r = old.reserve("r", usd(0.3)).unwrap();
+        let fresh = Ledger::new();
+        fresh.open_run("r", usd(9.0), None).expect("opens");
+        let report = fresh.restore_outstanding(&[outstanding(&old, &r)]);
+        assert_eq!(report.links_dropped, 1);
+        assert!(report.runs_created.is_empty());
+        assert_eq!(fresh.snapshot("r").unwrap().reserved, Microusd::ZERO);
+    }
+
+    /// Seeded sweep over arbitrary chains (cycles, repeats, generations out of order, zero
+    /// and huge amounts): never panics, and every run's restored `reserved` is exactly the sum
+    /// of the amounts credited to it.
+    #[test]
+    fn hostile_restores_never_panic_and_credit_exactly_what_they_report() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _seed in 0..200 {
+            let mut entries = Vec::new();
+            for n in 0..(next() % 12) {
+                let len = (next() % 5) as usize;
+                let chain: Vec<ChainLink> = (0..len)
+                    .map(|_| ChainLink {
+                        run_id: format!("r{}", next() % 4),
+                        generation: next() % 4,
+                    })
+                    .collect();
+                let amount = match next() % 4 {
+                    0 => Microusd(i64::MAX),
+                    1 => Microusd(-((next() % 10) as i64)),
+                    _ => Microusd((next() % 1_000_000) as i64),
+                };
+                let (run_id, generation) = chain
+                    .first()
+                    .map(|l| (l.run_id.clone(), l.generation))
+                    .unwrap_or_default();
+                entries.push(Outstanding {
+                    reservation: Reservation {
+                        // Unique per batch (duplicates have their own test), zero now and then.
+                        id: if next() % 8 == 0 { 0 } else { n + 1 },
+                        run_id,
+                        amount,
+                        step: (next() % 10) as u32,
+                        generation,
+                        chain,
+                    },
+                    tail_parent: (next() % 2 == 0).then(|| format!("r{}", next() % 6)),
+                });
+            }
+            let l = Ledger::new();
+            let report = l.restore_outstanding(&entries);
+            let mut expect: HashMap<String, Microusd> = HashMap::new();
+            for id in &report.restored {
+                let e = entries
+                    .iter()
+                    .find(|e| e.reservation.id == *id)
+                    .expect("restored ids come from the batch");
+                for link in &e.reservation.chain {
+                    if l.run_info(&link.run_id).map(|i| i.generation) == Some(link.generation) {
+                        let v = expect.entry(link.run_id.clone()).or_insert(Microusd::ZERO);
+                        *v = v.saturating_add(e.reservation.amount);
+                    }
+                }
+            }
+            for (run, _) in &report.runs_created {
+                assert_eq!(
+                    l.snapshot(run).unwrap().reserved,
+                    expect.get(run).copied().unwrap_or(Microusd::ZERO),
+                    "{run}"
+                );
+            }
+        }
     }
 }
