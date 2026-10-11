@@ -6051,7 +6051,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     **Where it says nothing.** No line is ever removed: closing a retained reservation is D8,
     decided and not built, so the file only grows (one line per retained call, the rare
     cancel-during-send case). A restored run's budget reads zero on `GET /v1/runs` until its next
-    request opens it, and its settled spend and steps before the restart are not restored (that
+    request opens it; a restored PARENT with a Cloud budget gets that budget on its next child's
+    call instead, the way an unopened parent does (`AppState::is_restored_unbudgeted`; until
+    2026-10-11 every child was refused 402 naming the parent until the parent itself called,
+    `a_restored_parent_gets_its_cloud_budget_back_after_a_restart`, red on `ba2089b` with
+    `left: 402 right: 200`). Its settled spend and steps before the restart are not restored (that
     is invariant 70's Cloud seed, or nothing). `sync_data` makes a line durable against a
     process crash, which the test exercises; durability against a power loss depends on the
     filesystem and was not measured. Two gateways sharing one data dir each append to the file

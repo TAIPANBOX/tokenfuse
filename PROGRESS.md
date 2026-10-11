@@ -304,9 +304,11 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1755 passing** (core 380, dpop 21, delegation 60,
-gateway 1015, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by 8 and
+`cargo test --all` runs **1756 passing** (core 380, dpop 21, delegation 60,
+gateway 1016, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 1
+with the W03 restored-parent fix (`tests/it/retained_survives_restart.rs`, a
+restored parent gets its Cloud budget back; 2026-10-11, counted by hand). Core grew by 8 and
 gateway by 16 with invariant 88 (a retained reservation survives a restart: 8 in
 `core::ledger`, 3 in `gateway::unitledger`, 9 in `gateway::retainedjournal`, 3 in
 `gateway::settle`, 1 in `tests/it/retained_survives_restart.rs`; 2026-10-11,

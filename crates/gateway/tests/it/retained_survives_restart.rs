@@ -15,7 +15,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -261,4 +261,138 @@ async fn a_retained_reservation_survives_a_gateway_restart() {
         "the restored unit reservation must fill the cap: {other_body}"
     );
     assert_eq!(other_body["error"]["type"], "unit_budget_exceeded");
+}
+
+/// A control plane that serves one Cloud-managed budget, for `parent`, on
+/// `/v1/budgets` and answers 404 to everything else (the seeds and the ingest
+/// then fail on their own, which nothing here depends on). Returns its base URL
+/// and a counter of budget polls, so a test can wait until the gateway has the
+/// budget instead of sleeping on a guess.
+async fn cloud_with_parent_budget(parent_budget_micros: i64) -> (String, Arc<AtomicUsize>) {
+    use axum::routing::get;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let seen = polls.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/budgets",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({ "parent": parent_budget_micros }))
+                }
+            }),
+        )
+        .fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, polls)
+}
+
+fn spawn_with_cloud(addr: &str, upstream: &str, data_dir: &str, cloud: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env_remove("TOKENFUSE_ALLOW_STUB")
+        .env_remove("TOKENFUSE_CLIENT_KEYS")
+        .env_remove("TOKENFUSE_IDENTITY_MAP")
+        .env_remove("TOKENFUSE_MAX_RUN_BUDGET_USD")
+        .env_remove("TOKENFUSE_ADMIN_KEYS")
+        .env("TOKENFUSE_UPSTREAM", upstream)
+        .env("TOKENFUSE_MODE", "enforce")
+        .env("TOKENFUSE_ADDR", addr)
+        .env("TOKENFUSE_DATA_DIR", data_dir)
+        .env("TOKENFUSE_CLOUD_URL", cloud)
+        .env("TOKENFUSE_CLOUD_KEY", "test-org-key")
+        .env("TOKENFUSE_CLOUD_HEARTBEAT_SECONDS", "0")
+        .env("TOKENFUSE_IDENTITY_STRICT", "off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the tokenfuse binary")
+}
+
+/// Wait until the gateway has polled `/v1/budgets` at least `n` times in total,
+/// then a moment more so the poller has applied what it read.
+async fn wait_for_budget_polls(polls: &AtomicUsize, n: usize) {
+    for _ in 0..200 {
+        if polls.load(Ordering::SeqCst) >= n {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the gateway never polled the Cloud's budgets");
+}
+
+/// A parent whose budget lives in the Cloud is never opened by a call of its
+/// own: the first child call opens it at that budget on first sight (D1's
+/// exception, invariant 49). After a restart the journal recreates that parent
+/// (it carries the retained child's share), and the replay leaves its budget at
+/// zero until something opens it. Since the parent now HAS a snapshot, the
+/// first-sight path never fired again, so every child call was refused 402
+/// naming the parent until the parent itself called. The restored parent must
+/// get its Cloud budget the same way a declared parent does.
+#[tokio::test]
+async fn a_restored_parent_gets_its_cloud_budget_back_after_a_restart() {
+    let dir = std::env::temp_dir().join(format!("tf-retained-cloud-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let data_dir = data_dir.to_string_lossy().into_owned();
+    let hold = Arc::new(AtomicBool::new(true));
+    let upstream = provider(hold.clone()).await;
+    let (cloud, polls) = cloud_with_parent_budget(5_000_000).await;
+
+    // Process one: the parent never calls. The child's call opens it at its
+    // Cloud budget and is held by the provider, so it is retained.
+    let addr = free_addr();
+    let mut first = spawn_with_cloud(&addr, &upstream, &data_dir, &cloud);
+    assert!(
+        wait_for_listening(&mut first),
+        "the first gateway never listened"
+    );
+    wait_for_budget_polls(&polls, 1).await;
+    let child = call(&addr, "child", Some("parent")).await;
+    let child_status = child.status().as_u16();
+    let before = runs(&addr).await;
+    stop(first);
+    assert_eq!(
+        child_status, 502,
+        "the first child call is admitted against the Cloud-budgeted parent and retained: {before:?}"
+    );
+    assert_eq!(
+        row(&before, "child").expect("the child is listed")["retained"],
+        1
+    );
+
+    // Process two, same data dir and the same Cloud.
+    hold.store(false, Ordering::SeqCst);
+    let addr = free_addr();
+    let polled = polls.load(Ordering::SeqCst);
+    let mut second = spawn_with_cloud(&addr, &upstream, &data_dir, &cloud);
+    assert!(
+        wait_for_listening(&mut second),
+        "the second gateway never listened"
+    );
+    wait_for_budget_polls(&polls, polled + 1).await;
+    let next = call(&addr, "child-2", Some("parent")).await;
+    let status = next.status().as_u16();
+    let body: serde_json::Value = next.json().await.unwrap_or_default();
+    let after = runs(&addr).await;
+    stop(second);
+    std::fs::remove_dir_all(&dir).ok();
+    println!("after restart: child-2={status} {body} runs={after:?}");
+
+    assert_eq!(
+        status, 200,
+        "a new child of a restored, Cloud-budgeted parent must be admitted: {body}"
+    );
+    let parent = row(&after, "parent").expect("the parent is listed");
+    assert!(
+        (parent["budget_usd"].as_f64().unwrap() - 5.0).abs() < 1e-9,
+        "the restored parent carries its Cloud budget: {parent}"
+    );
 }

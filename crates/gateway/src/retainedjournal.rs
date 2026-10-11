@@ -335,6 +335,10 @@ pub async fn replay_at_startup(
         }
         return Some(report);
     };
+    // The restore leaves each recreated run's budget at zero. A run that later calls opens
+    // itself with a budget, but a parent whose budget lives in the Cloud may never call, so
+    // the proxy gives it that budget on a child's call, as it does for an unopened parent.
+    state.note_restored_unbudgeted(runs.runs_created.iter().map(|(run, _)| run.clone()));
     let mut seeded = 0;
     for (run, generation) in &runs.runs_created {
         if let Some(seed) = state.take_run_seed(run) {
