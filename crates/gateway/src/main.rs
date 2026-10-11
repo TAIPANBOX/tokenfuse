@@ -1332,22 +1332,37 @@ async fn serve() {
     match std::env::var("TOKENFUSE_DATA_DIR") {
         Ok(dir) if !dir.is_empty() => {
             let dir = std::path::PathBuf::from(dir);
+            let path = dir.join(tokenfuse_gateway::retainedjournal::FILE_NAME);
+            // A journal that exists and cannot be opened or read stops the gateway here, before
+            // the listener binds (invariant 88). One that does not exist and cannot be created
+            // holds nothing to restore, so that case still serves with an error line.
+            let refuse = |e: &std::io::Error| -> ! {
+                eprintln!(
+                    "tokenfuse: {}",
+                    tokenfuse_gateway::retainedjournal::startup_refusal(&path, e)
+                );
+                std::process::exit(2);
+            };
             match tokenfuse_gateway::retainedjournal::Journal::open(&dir) {
                 Ok(journal) => {
                     state = state.with_retained(Arc::new(
                         tokenfuse_gateway::settle::Retained::with_journal(journal),
                     ));
-                    tokenfuse_gateway::retainedjournal::replay_at_startup(
+                    if let Err(e) = tokenfuse_gateway::retainedjournal::replay_at_startup(
                         &state,
                         &dir,
                         tokenfuse_gateway::sink::now_millis(),
                     )
-                    .await;
+                    .await
+                    {
+                        refuse(&e);
+                    }
                 }
+                Err(e) if std::fs::symlink_metadata(&path).is_ok() => refuse(&e),
                 Err(e) => tracing::error!(
-                    path = %dir.join(tokenfuse_gateway::retainedjournal::FILE_NAME).display(),
+                    path = %path.display(),
                     error = %e,
-                    "the retained-reservation journal could not be opened; retained reservations will not survive a restart and none were restored"
+                    "the retained-reservation journal could not be created; retained reservations will not survive a restart"
                 ),
             }
         }

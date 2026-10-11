@@ -300,24 +300,16 @@ pub fn replay(
 /// back on `state`'s ledgers and registry, credit a staged Cloud run seed (invariant 70) to
 /// every run the restore created (the restore makes those runs exist, so the first request
 /// would no longer see them as fresh and the seed would never land), and say what happened in
-/// one line. Nothing here refuses to start: an unreadable journal is an error line naming the
-/// path, and the gateway serves without the restored liability, as every gateway did before.
+/// one line. A journal that exists and cannot be read is returned as the error, and the caller
+/// refuses to start ([`startup_refusal`]): serving without the restored liability, with the id
+/// and generation counters starting from zero while new retains keep being appended, would let
+/// a later restart drop records as duplicate or superseded. A missing journal reads as empty.
 pub async fn replay_at_startup(
     state: &crate::state::AppState,
     dir: &Path,
     now_millis: i64,
-) -> Option<ReplayReport> {
-    let read = match read(dir) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(
-                path = %dir.join(FILE_NAME).display(),
-                error = %e,
-                "the retained-reservation journal could not be read; no retained reservation was restored, so their liability is not counted by this process"
-            );
-            return None;
-        }
-    };
+) -> io::Result<ReplayReport> {
+    let read = read(dir)?;
     let records = read.records.len();
     let report = replay(
         read,
@@ -333,7 +325,7 @@ pub async fn replay_at_startup(
                 "this ledger backend cannot restore retained reservations (raft); the journal's records were left unrestored"
             );
         }
-        return Some(report);
+        return Ok(report);
     };
     // The restore leaves each recreated run's budget at zero. A run that later calls opens
     // itself with a budget, but a parent whose budget lives in the Cloud may never call, so
@@ -369,7 +361,16 @@ pub async fn replay_at_startup(
     } else {
         tracing::info!(path = %dir.join(FILE_NAME).display(), "{line}");
     }
-    Some(report)
+    Ok(report)
+}
+
+/// The line `serve` prints before it exits 2 on a journal that exists and cannot be opened or
+/// read: the path, the operating system's error, and why the gateway does not serve without it.
+pub fn startup_refusal(path: &Path, error: &io::Error) -> String {
+    format!(
+        "the retained-reservation journal {} exists and cannot be read ({error}); refusing to start, because serving without it would admit calls against liability it holds and could later drop its records as duplicate. Fix or move the file; a missing journal starts empty",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -682,5 +683,33 @@ mod tests {
         assert_eq!(state.take_run_seed("child"), None, "taken, at most once");
         assert_eq!(state.take_run_seed("elsewhere"), Some(Microusd(7)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-2: a journal that exists and cannot be read is the caller's error to refuse on, never
+    /// an empty restore; a missing journal is an empty one.
+    #[tokio::test]
+    async fn an_unreadable_journal_is_an_error_and_a_missing_one_is_empty() {
+        let state = crate::state::AppState::new(
+            Arc::new(Ledger::new()),
+            Arc::new(tokenfuse_core::PriceBook::new()),
+            Arc::new(tokenfuse_core::Policy::default()),
+            Arc::new(crate::provider::StubProvider::default()),
+            "t",
+        );
+        let missing = scratch("missing");
+        std::fs::create_dir_all(&missing).unwrap();
+        let report = replay_at_startup(&state, &missing, 0).await.unwrap();
+        assert!(report.read.records.is_empty());
+
+        let unreadable = scratch("unreadable");
+        std::fs::create_dir_all(unreadable.join(FILE_NAME)).unwrap();
+        let err = replay_at_startup(&state, &unreadable, 0)
+            .await
+            .expect_err("a journal that cannot be read must not replay as empty");
+        let line = startup_refusal(&unreadable.join(FILE_NAME), &err);
+        assert!(line.contains(&unreadable.join(FILE_NAME).display().to_string()));
+        assert!(line.contains(&err.to_string()));
+        std::fs::remove_dir_all(&missing).ok();
+        std::fs::remove_dir_all(&unreadable).ok();
     }
 }

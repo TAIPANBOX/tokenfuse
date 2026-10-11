@@ -69,3 +69,15 @@ Feature: A retained reservation survives a gateway restart
     Given a registry already listing its maximum
     When another reservation is retained
     Then it is not listed and it is in the journal
+
+  # @test:an_unreadable_journal_refuses_to_start_before_the_listener_binds
+  Scenario: A journal that exists and cannot be read stops the gateway
+    Given a data dir whose retained-reservation journal cannot be read
+    When the gateway starts
+    Then it exits non-zero before the listener binds, naming the journal's path and the error
+
+  # @test:a_missing_or_empty_journal_still_starts
+  Scenario: A missing or empty journal still starts
+    Given a data dir with no journal, or an empty one
+    When the gateway starts
+    Then it serves
