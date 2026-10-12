@@ -110,6 +110,9 @@ pub struct BrokerState {
     /// Baseline of pinned tool fingerprints; a changed description on
     /// `tools/list` is a rug-pull. `None` disables the check.
     pub lock: Option<Lock>,
+    /// Tools this process has seen drift from [`lock`](Self::lock), per
+    /// upstream (invariant 91). Process-local and empty at start.
+    pub drifted: DriftedTools,
     /// The second Policy Enforcement Point (docs/23): every `tools/call` is
     /// put to Wardryx's `decide()`, the same PDP the LLM path uses, so a
     /// `deny_tool` policy now enforces at the MCP layer too. `Wardryx::disabled`
@@ -616,6 +619,79 @@ fn reason_suffix(reason: &Option<String>) -> String {
         Some(r) if !r.is_empty() => format!(" ({r})"),
         _ => String::new(),
     }
+}
+
+/// RPC code for a refused call to a tool whose definition changed after it
+/// was pinned: the rug-pull code `tools/list` already answers with.
+const DRIFT_RPC_CODE: i64 = -32003;
+
+/// The `data.decision` a refused drifted-tool call is recorded with. Not a
+/// PDP word (`allow|deny|hold`): no policy judged this call, the broker's own
+/// lock did.
+const DRIFT_DECISION: &str = "refused-tool-changed";
+
+/// Tools whose definition this process has seen differ from the pinned lock,
+/// keyed by (upstream URL, tool name) (invariant 91). The value is whether the
+/// warn-mode log line for the pair has been written.
+#[derive(Default)]
+pub struct DriftedTools(std::sync::Mutex<std::collections::HashMap<(String, String), bool>>);
+
+impl DriftedTools {
+    /// Fold one `tools/list` answer from `upstream` into the state: a listed
+    /// tool that changed is marked, a listed tool that matches the lock is
+    /// cleared, a tool the listing does not mention keeps what it had (a
+    /// paginated listing must not clear its other pages).
+    fn observe(&self, upstream: &str, listed: &[String], changed: &[String]) {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for name in listed {
+            let key = (upstream.to_string(), name.clone());
+            if changed.contains(name) {
+                m.entry(key).or_insert(false);
+            } else {
+                m.remove(&key);
+            }
+        }
+    }
+
+    /// Whether `tool` on `upstream` is marked. With `first_warn`, also reports
+    /// (once per pair) that this is the first time it is asked about.
+    fn is_drifted(&self, upstream: &str, tool: &str) -> bool {
+        let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        m.contains_key(&(upstream.to_string(), tool.to_string()))
+    }
+
+    /// True the first time it is called for the pair, false afterwards.
+    fn first_warning(&self, upstream: &str, tool: &str) -> bool {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get_mut(&(upstream.to_string(), tool.to_string())) {
+            Some(warned) if !*warned => {
+                *warned = true;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The `tool_call` record of a call refused because its tool changed since it
+/// was pinned. One record, and the decision is the broker's own word rather
+/// than a PDP's.
+fn emit_tool_call_refused(
+    st: &BrokerState,
+    agent_id: Option<&str>,
+    chain: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+    tool: &str,
+    upstream: &str,
+) {
+    let outcome = st.events.emit(
+        EventType::ToolCall,
+        crate::sink::now_millis(),
+        agent_id,
+        None,
+        chain,
+        json!({ "tool": tool, "upstream": upstream, "decision": DRIFT_DECISION }),
+    );
+    crate::events::log_outcome(EventType::ToolCall, outcome);
 }
 
 /// Emit one `tool_call` audit event for a `tools/call` this broker acted on,
@@ -1454,6 +1530,34 @@ async fn process_into(
 
     // 1. Credential brokering + the Wardryx policy gate on tool calls.
     if method == "tools/call" {
+        // A tool this process has seen change since it was pinned (invariant
+        // 91). First, before any argument is read or any secret resolved: the
+        // cheapest refusal is the one that happens first. Block refuses, warn
+        // says so once and forwards, and with scan off or no lock nothing is
+        // ever marked.
+        if st.lock.is_some() && st.drifted.is_drifted(&upstream_url, &tool) {
+            if st.scan == ScanMode::Block {
+                tracing::warn!(tool = %tool, "mcp broker: refused a call to a tool whose definition changed since it was pinned");
+                emit_tool_call_refused(
+                    st,
+                    record_agent_id,
+                    chain_on_record(ctx),
+                    &tool,
+                    &upstream_url,
+                );
+                return rpc_error(
+                    &id,
+                    DRIFT_RPC_CODE,
+                    &format!(
+                        "blocked: tool {tool:?} changed since it was pinned (rug-pull); \
+                         re-pin the lock to approve the new definition"
+                    ),
+                );
+            }
+            if st.drifted.first_warning(&upstream_url, &tool) {
+                tracing::warn!(tool = %tool, "mcp broker: forwarding a call to a tool whose definition changed since it was pinned (scan is not block)");
+            }
+        }
         // DLP: catch raw secrets the agent pasted directly into the args (before
         // injection, so vault-injected secrets aren't flagged).
         // Kept for the pii section below (secrets win on overlap); empty
@@ -1857,6 +1961,10 @@ async fn process_into(
                     _ => None,
                 })
                 .collect();
+            // Recorded before the listing is judged: block mode returns just
+            // below, and the next `tools/call` must still see it (invariant 91).
+            let listed: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            st.drifted.observe(&upstream_url, &listed, &changed);
             if !changed.is_empty() {
                 tracing::warn!(tools = ?changed, "mcp broker: rug-pull (tool definition changed)");
                 let outcome = st.events.emit(

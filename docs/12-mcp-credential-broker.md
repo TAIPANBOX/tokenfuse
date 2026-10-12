@@ -85,7 +85,7 @@ Point the agent's MCP client at `http://127.0.0.1:4200`, and have it pass
   separate, opt-in extension of the same scan (email/card/phone, regex-only,
   off unless set) - see [13](13-security-hardening.md) for the full writeup.
 - **Rug-pull lockfile** (`TOKENFUSE_MCP_LOCK=<file>`) — pins tool fingerprints;
-  a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`).
+  a changed tool definition on `tools/list` is flagged/blocked (`mcp::diff`). In block mode a later `tools/call` of a tool the broker saw change is refused too (docs/23 section 5).
 
 ### What the poisoning scan reads, and what it chooses to ignore
 

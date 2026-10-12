@@ -144,6 +144,11 @@ unjudged call records a governance gap as a permission, which is the same
 mistake `dependency_failed.effect` and `/v1/fuse/check-tool-call`'s
 `governed: false` both exist to refuse.
 
+A call refused because its tool changed since it was pinned (invariant 91) is the
+second exception: it writes one `tool_call` with `decision: "refused-tool-changed"`,
+the broker's own word rather than a PDP's, because the lock judged it and a
+refusal is the row worth having.
+
 One record per call, and only for a call that was brokered. A refusal that
 returns before the upstream is contacted (the DLP block, the taint gate, the
 identity refusals, an unknown named upstream, a scope-denied secret) writes no
@@ -220,11 +225,32 @@ This is a separate axis from the door (`TOKENFUSE_MCP_KEYS`,
 decides whether a caller can reach the broker at all, scoping decides which
 secrets that caller may pull once inside. Neither substitutes for the other.
 
+## 5. A tool that changed after it was pinned cannot be called
+
+With `TOKENFUSE_MCP_SCAN=block` and a `TOKENFUSE_MCP_LOCK`, a `tools/list` that
+shows a pinned tool's definition changed is refused (-32003), as before. Clients
+cache listings, so the broker also remembers, per upstream and tool name, that
+it saw the change, and refuses a later `tools/call` for that tool with the same
+code (`blocked: tool "x" changed since it was pinned (rug-pull); ...`) before
+any argument is read, any secret resolved or anything forwarded. One
+`tool_call` record is written for the refusal (section 3). Other tools on that
+upstream, and the same tool name on another upstream, are unaffected. The mark
+clears when a later `tools/list` for that upstream shows the tool matching the
+lock again. In `warn` mode the call is forwarded and the first one per tool is
+logged; with scan `off` or no lock nothing changes. The stdio transport behaves
+the same.
+
+Limits: the state is in memory, so a restart forgets it (re-pinning the lock
+does too); the broker does not fetch listings itself, so a change no client
+re-listed is not seen; only a changed definition counts, not an added or
+removed tool; and a server that changes behaviour without changing its listing
+is not detected.
+
 ## Wire error codes (broker JSON-RPC)
 
 - `-32001` poisoned tool description (existing)
 - `-32002` raw secret in tool arguments (existing)
-- `-32003` rug-pull: tool definition changed (existing)
+- `-32003` rug-pull: tool definition changed (existing); also a `tools/call` of a tool seen to have changed (section 5)
 - `-32004` Wardryx denied or held the tool call (new)
 - `-32005` unknown named upstream (new)
 - `-32006` pii in tool arguments or response (`TOKENFUSE_MCP_DLP_PII=block`)

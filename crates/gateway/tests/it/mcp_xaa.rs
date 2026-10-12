@@ -68,6 +68,7 @@ fn state_with_keys(
         dlp: tokenfuse_core::DlpMode::Off,
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock: None,
+        drifted: Default::default(),
         wardryx: Arc::new(Wardryx::disabled()),
         keys: tokenfuse_gateway::clientkeys::ClientKeys::from_spec(keys_spec)
             .expect("a usable key spec"),

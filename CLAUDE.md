@@ -6399,6 +6399,60 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     script gate: the rule is two emit sites, held by `cargo test`; the published bands are held
     by `scripts/constants.sh`)*
 
+
+91. **A tool the broker saw change since it was pinned cannot be called while scan is
+    block.** The listing refusal (-32003, `mcp::diff`) protected `tools/list` only; clients cache
+    listings, so the agent could still call the changed tool by name and the broker forwarded
+    it. Measured 2026-10-12 against the v1.10.0 release binary: scan block, a lock pinned from an
+    approved listing, `get_order_status`'s description changed upstream; the listing was refused
+    and the next `tools/call` of that tool was forwarded and answered.
+
+    `BrokerState::drifted` (`DriftedTools`) holds the (upstream URL, tool name) pairs whose
+    definition `Drift::Changed` reported on a `tools/list` this process handled. It is written
+    before the listing is judged (block returns just after), a listed tool that matches the lock
+    clears its mark, and a tool the listing does not mention keeps what it had, so one page of a
+    paginated listing cannot clear another's. A `tools/call` whose pair is marked is refused
+    first in the tools/call block, before DLP, the taint gate, the PDP and secret injection:
+    block answers -32003 naming the tool and saying it changed since it was pinned, and writes
+    one `tool_call` with `decision: "refused-tool-changed"`; warn forwards, logs once per pair,
+    and is recorded by the ordinary path; scan off or no lock never marks anything, so those are
+    byte for byte unchanged. Same code on stdio, which shares `process`. No new env name, route,
+    header or event type, so `compat/1.0.json` is untouched.
+
+    `@claude` 2026-10-12, a choice the brief left open, open to reversal: `data.decision` carries
+    the broker's own word `refused-tool-changed`, not `deny`, because `deny` says a policy
+    decided it.
+
+    **Where it says nothing.** The state is process-local: a restart, and a restart with a
+    re-pinned lock, forget it. The broker fetches no listing of its own, so a change no client
+    re-listed is not seen (`a_change_the_client_never_re_listed_is_not_seen` holds that as a
+    named limit). `Drift::Added` and `Removed` are not acted on, and a server that changes
+    behaviour without changing its listing is not detected. A refusal needs the call to name
+    the tool in `params.name`; a call naming none is not matched. The mark is keyed by upstream
+    URL, so two names for one URL share it.
+    *(test: `mcp_broker::a_drifted_tool_is_refused_before_anything_is_forwarded`,
+    `warn_mode_forwards_a_drifted_tool_call_and_records_it_once`,
+    `a_tool_that_matches_the_lock_again_can_be_called_again`,
+    `another_tool_on_the_same_upstream_is_not_refused`,
+    `a_second_upstream_with_the_same_tool_name_is_not_refused`,
+    `scan_off_or_no_lock_leaves_a_changed_tool_callable`,
+    `the_stdio_transport_refuses_a_drifted_tool_call_too` and
+    `a_change_the_client_never_re_listed_is_not_seen`. Red first, @measured `cargo test -p
+    tokenfuse-gateway --test it mcp_broker::` on origin/main plus the tests only, 2026-10-12:
+    five failed with `left: Null right: Number(-32003)` and the call answered
+    (`{"result":{"answered":"get_order_status"}}`); the warn, off/no-lock and unseen tests are
+    guards, green on both sides. Six mutants planted in the product code and reverted, each
+    caught by name: state keyed by tool name only
+    (`a_second_upstream_with_the_same_tool_name_is_not_refused`), never cleared
+    (`a_tool_that_matches_the_lock_again_can_be_called_again`), warn refusing
+    (`warn_mode_forwards_a_drifted_tool_call_and_records_it_once`), scan off refusing
+    (`scan_off_or_no_lock_leaves_a_changed_tool_callable`), the listing never recorded (five
+    tests), a mark cleared only while nothing else changed
+    (`a_tool_that_matches_the_lock_again_can_be_called_again`). Refusal with no lock has no
+    reachable mutant: nothing is marked without a lock diff, so removing the guard is
+    equivalent. Four are cases in `gates-have-teeth.sh`. Scenarios:
+    `features/a-drifted-tool-cannot-be-called.feature`, eight, each bound. Not a script gate)*
+
 92. **The scan reads what a tool's metadata says, in every text the model reads, and
     it reports the shape rather than the secret.** Measured 2026-10-12 against the
     v1.10.0 binary: `tokenfuse mcp-scan --fail-on high` over eight hostile listings
