@@ -42,6 +42,20 @@ Cargo workspace: `crates/core` (interception, ledger, policies, traits) + `crate
 
 The one scenario: if the MCP Credential Broker (S5) takes off enough that people want it WITHOUT the rest — then a separate, free OSS utility as a top-of-funnel entry point into the platform. A data-driven decision, a year out, not decided in advance.
 
+## What `tokenfuse mcp-scan` checks
+
+Deterministic, offline, no model. Every tool description and every parameter description of the listing goes through the same detectors, and the live broker's `tools/list` uses the same function. Each signal is its own finding kind:
+
+- `poisoning` (high): stock injection phrases, credential words inside an instruction, zero-width characters, very long descriptions.
+- `secret_in_metadata` (critical): a credential in a description, found by the DLP patterns. The kind is reported, never the value.
+- `cross_tool_reference` (high when the text orders the model to run another tool of the listing and carry the result, medium when it only names one). Only tool names with a separator (`_`, `-`, `.`) or camelCase count; one-word names such as `search` or `list` are ordinary prose and never do.
+- `local_secret_path` (high when something reads or sends it, medium alone): `~/.ssh`, `id_rsa`, `~/.aws`, `/etc/passwd`, `.env` and similar.
+- `model_addressed_text` (high): "note to the assistant", or a role prefix such as `Assistant:` followed by an order.
+- `hidden_text` (high): Unicode tag characters, bidirectional controls, HTML comments.
+- Rug pulls (critical) and tool-set drift, against a pinned lock.
+
+What it cannot see: meaning. A description that tells the model, in calm plain prose, to make up an answer carries none of these shapes and passes. Tools with one-word names chained by a description are not recognised either.
+
 ## In One Sentence
 
 Build a platform whose parts don't make sense apart — their inseparability IS the moat. Split it into separate products now, and you lose the one thing competitors can't copy.
