@@ -6087,3 +6087,86 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     caught by one of those. Scenarios:
     `features/a-retained-reservation-survives-a-restart.feature`, eleven, each bound. Not a
     script gate)*
+
+89. **A retained reservation is closed by a person, with evidence, exactly once, and a restart
+    never brings a closed one back.** Invariant 50 retains a call whose outcome is unknown and
+    invariant 88 makes that survive a restart; until 2026-10-12 nothing could close one, so the
+    liability stayed outstanding for good. This is the gateway side of D8 under the two
+    `@decided 2026-10-11` entries in invariant 50: who may close (a person, through a console
+    token minted after a passkey assertion), what backs it (observed usage or invoice line, or a
+    provider's confirmation of no charge), and the path's shape (a token bound to one id and
+    revision, verified with a shared secret, a stale revision refused, one closure record, and
+    persistence before the path).
+
+    `POST /v1/retained/close` (`crate::closure`) takes `reservation_id`, `expected_revision`,
+    `operation_id`, `evidence_kind` (`observed` or `no_charge`), `observed_microusd` (required
+    for `observed`, refused for `no_charge`, never negative) and `evidence_ref`; unknown fields
+    are refused. `GET /v1/retained` lists each retained reservation's id, revision, run, chain,
+    amount and unit, which is what a console mints from. Both are behind the admin gate
+    (invariant 41) and registered only when `TOKENFUSE_CLOSURE_SECRET` is set; unset, both are
+    404. A secret shorter than 32 bytes exits 2 naming the variable. The token rides in
+    `x-fuse-closure-token`, because the admin gate already reads `Authorization`:
+    `v1.<id>.<revision>.<expiry millis>.<hex HMAC-SHA256 of "tokenfuse-closure-v1\n<id>\n<revision>\n<expiry>">`,
+    checked with `hmac` 0.12 (already a gateway dependency, `mcpsession.rs`) in constant time,
+    signature before expiry. Missing is `401 closure_token_required`, expired `401
+    closure_token_expired`, a bad signature or format or a lifetime over 300 s `401
+    closure_token_invalid`, a token for another id or revision `403 closure_token_mismatch`, a
+    revision the reservation does not have `409 stale_revision`. A revision is the first 8 bytes
+    of SHA-256 over the journal record's canonical bytes (`Record::revision`), so it is the same
+    after a restart and a token for one record never closes another that reuses its id (ids are
+    unique only within one lineage of the journal).
+
+    Under one lock: an operation id already recorded answers its recorded result with
+    `replayed: true` when the content matches, and `409 closure_conflict` when it does not; a
+    reservation already closed by another operation is `409 already_closed`; then the closure
+    record is appended to the retained journal and synced, and only after that the entry is
+    taken from the registry and the run half settled on the chain it was admitted against and
+    the unit half in its window, at the observed cost or at zero. A write that fails closes
+    nothing (`500 journal_write_failed`). At startup the journal's closures exclude the records
+    they name (by id AND revision) from the restore and load into the door's books, and the
+    journal is rewritten with only the still-open records, each once, plus every record of a
+    kind this version does not know, verbatim (D-3): temp file, `sync_all`, rename, directory
+    sync, append handle reopened, all under the append lock. A failed rewrite leaves the old
+    file, which reads the same way, and logs an error.
+
+    `@claude 2026-10-12`, choices under delegated authority, open to reversal: the token header,
+    the 32-byte floor and the 300 s cap; the revision as a content hash rather than a counter;
+    closures serialised under one process-wide lock (they are rare and human-driven); a closure
+    writes no Parquet row.
+
+    **Where it says nothing.** No agent-event is emitted. No existing type describes a closure,
+    and a retained record carries no `agent_id`, so the exporter would skip one (SPEC 6.1); a
+    `retained_closed` type, and an `agent_id` on the retained record for it to be filed under,
+    is D10, a cross-repository change through agent-passport's SPEC 6.2. The audit record until
+    then is the journal's closure line and one info log line naming the reservation, run,
+    operation, evidence kind and reference, and the settled amount. The observed cost reaches the
+    in-process run and unit ledgers only: no trace row, no Cloud ingest, so `/v1/units` and a
+    later run seed (invariant 70) do not see it. Idempotency spans one restart: the rewrite drops
+    the closure with the record it closed, so a retry after a second restart answers `404
+    not_retained`, never a second charge. A reservation past the registry's cap (`MAX_RETAINED`,
+    listed=false) cannot be closed here, because it is not listed. A unit half whose month has
+    rolled over is not settled (`UnitLedger::settle` drops a stale window, as invariant 50
+    says). The raft backend restores nothing, so after a restart there is nothing to close; in a
+    live process the closure settles through `LedgerBackend::settle` as any settlement does. The
+    shared secret is the whole of the gateway's check: the passkey assertion is the console's,
+    and a party holding the secret can mint tokens without one. The journal write and its fsync
+    run on a runtime worker thread inside the request.
+    *(test: `tests/it/retained_closure.rs`, seven over the real binary, of which six were red
+    against 0fa44b2 (`left: 404 right: 200` or `right: 401`, the route absent; `left: None
+    right: Some(2)` for the short secret, the gateway served) and
+    `with_no_closure_secret_the_route_is_off` is the guard, green on both sides; ten in
+    `closure::tests`, including a sixteen-thread race (`racing_closures_of_one_reservation_apply_exactly_once`)
+    and a 200-seed hostile-token sweep; three new in `retainedjournal::tests` for the rewrite.
+    Twelve mutants planted in the product code 2026-10-12 and reverted, eleven caught by a named
+    test: the stale-revision check and the token binding (the end-to-end refusal test), expiry
+    and the lifetime cap (the token boundary test and the end-to-end refusal test), a replay that
+    ignores content (the replay unit test and the end-to-end idempotency test), the unit half
+    unsettled (four unit tests), the closure not journaled and the replay ignoring closures (the
+    restart unit test and the end-to-end restart test), no startup rewrite (the end-to-end
+    restart test), the rewrite dropping unknown kinds (the rewrite test), no_charge settling at
+    a cost (the no-charge unit test). The twelfth, `Retained::take` ignoring the revision,
+    survived and is equivalent: `apply` checks the revision of the entry `find` returned under
+    the same lock, and `restore_outstanding` refuses a second outstanding entry with one id, so
+    the registry never holds two entries with one id. Scenarios:
+    `features/a-retained-reservation-is-closed-with-evidence.feature`, ten, each bound. Not a
+    script gate: the rule is the handler and the journal, held by `cargo test`)*
