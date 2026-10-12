@@ -6350,3 +6350,51 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     and counted. A line the exporter fails to write is counted (`write_error_count`) and not
     retried, as for every other type. The exporter's write runs inside the guard's `Drop` and
     inside the closure's lock, on a runtime worker, as the journal's fsync already does.
+    *(test: in `proxy::tests`,
+    `a_call_the_provider_held_when_the_caller_left_writes_one_call_retained`,
+    `a_retained_call_that_names_no_agent_is_skipped_and_counted_never_invented`,
+    `a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed` and
+    `a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof`; in `closure::tests`,
+    `an_applied_closure_writes_one_retained_closed_with_its_evidence`,
+    `a_no_charge_closure_writes_one_retained_closed_settled_at_zero`,
+    `a_replay_a_conflict_and_a_second_operation_write_no_second_retained_closed`,
+    `a_stale_revision_or_an_unwritable_journal_writes_no_retained_closed`,
+    `a_closure_answered_again_after_a_restart_writes_no_second_retained_closed` and
+    `a_closure_of_a_record_that_names_no_agent_is_skipped_and_counted`; in `settle::tests`,
+    `only_an_unknown_outcome_writes_a_call_retained` and
+    `a_retained_call_whose_journal_write_failed_says_it_was_not_journaled`; over the real binary,
+    `tests/it/retained_on_the_bus.rs`'s two (once each, no event for a forged token or a stale
+    revision, none added by the restart's replay; the no-agent skip counted in the log); three in
+    `core::agent_event`; and the written-out list in
+    `constants::tests::every_event_type_reaches_the_artifact_with_its_own_severity`. Red first in
+    CI on the test-only commit 3a0498d, against main's code (run 38241231894, and run
+    38241721751 with every test binary run): the ten library tests and both real-binary tests
+    failed by assertion, verbatim among them `one call_retained per retained call: []` with
+    `left: 0 right: 2`, `one closure, one event: []` with `left: 0 right: 1`, `the call_retained
+    with no subject is skipped AND counted` with `left: 0 right: 1`, and `no skip line names
+    call_retained`. The proven-chain test and the core and guard tests came with the
+    implementation, and each went red under a planted fault below. Ten mutants planted in the
+    product code 2026-10-12 as three throwaway commits on the pull request's branch (CI runs
+    38242854682, 38243248766 and 38245983010), each caught by a named test: `journaled` read as
+    `is_some()` (`a_retained_call_whose_journal_write_failed_says_it_was_not_journaled`, `left:
+    Bool(true) right: false`); the proof dropped from the chain
+    (`a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof`); an agent invented for
+    a call that named none
+    (`a_retained_call_that_names_no_agent_is_skipped_and_counted_never_invented`);
+    `retained_closed` also written for a replay
+    (`a_replay_a_conflict_and_a_second_operation_write_no_second_retained_closed`, `left: 2
+    right: 1`, and `a_closure_answered_again_after_a_restart_writes_no_second_retained_closed`);
+    the wiring in `proxy::handle` removed (the four proxy tests and both real-binary tests);
+    `call_retained` also written for a settled call (`only_an_unknown_outcome_writes_a_call_retained`,
+    `left: 3 right: 1`); `retained_closed` written before the journal append
+    (`a_stale_revision_or_an_unwritable_journal_writes_no_retained_closed`); `listed` hard-coded
+    true (`a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed`);
+    `call_retained` at `high` (the core band test, both constants tests, the first proxy test and
+    the first real-binary test); `unit` dropped from `retained_closed`
+    (`an_applied_closure_writes_one_retained_closed_with_its_evidence`). The first run of that
+    last group stalled the CI job for twenty minutes: the unwritable-journal case's 16 MiB
+    evidence reached the bus under the mutant and the assertion printed it, so the assertion now
+    prints operation ids only (e01bfd3). Scenarios:
+    `features/a-retained-call-and-its-closure-reach-the-bus.feature`, nine, each bound. Not a
+    script gate: the rule is two emit sites, held by `cargo test`; the published bands are held
+    by `scripts/constants.sh`)*
