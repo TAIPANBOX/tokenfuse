@@ -6,7 +6,7 @@ Feature: A mistyped firewall mode refuses to start instead of enforcing nothing
   believing it refused. A value nobody can read is now a refusal to start, the
   same answer TOKENFUSE_MODE already gives (CLAUDE.md invariant 72).
 
-  # @test:unset_or_empty_firewall_mode_is_no_override
+  # @test:the_firewall_mode_is_left_alone_when_nothing_is_configured
   Scenario: Nothing configured leaves the mode to the policy file or the default
     Given TOKENFUSE_FIREWALL is unset, empty or only spaces
     When the gateway reads its firewall mode
@@ -18,7 +18,7 @@ Feature: A mistyped firewall mode refuses to start instead of enforcing nothing
     When the gateway reads its firewall mode
     Then the firewall mode is enforce
 
-  # @test:a_mistyped_firewall_mode_is_refused_not_read_as_a_default
+  # @test:a_mistyped_firewall_mode_is_refused_not_ignored
   Scenario: A mistyped mode is refused and the value is named
     Given TOKENFUSE_FIREWALL is "enfroce"
     When the gateway reads its firewall mode
@@ -37,7 +37,7 @@ Feature: A mistyped firewall mode refuses to start instead of enforcing nothing
     Then it exits with status 2 without listening
     And the message names TOKENFUSE_FIREWALL, the value, and the three words it accepts
 
-  # @test:an_empty_firewall_mode_still_starts_the_real_gateway
+  # @test:an_empty_firewall_mode_still_starts_the_gateway
   Scenario: An empty mode starts the real gateway as before
     Given TOKENFUSE_FIREWALL is set to an empty string
     When the gateway starts
