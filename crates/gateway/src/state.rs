@@ -165,6 +165,9 @@ pub struct AppState {
     /// test already gets; `main.rs` sets it from `TOKENFUSE_ADMIN_KEYS`, the
     /// bind address and `TOKENFUSE_ALLOW_OPEN_OBS`.
     pub admin_gate: AdminGate,
+    /// D8: the closure route's secret and books, `None` (route off) unless
+    /// `TOKENFUSE_CLOSURE_SECRET` is set (`crate::closure`).
+    pub closure: Option<Arc<crate::closure::ClosureDoor>>,
     /// Which front door this process serves, from `TOKENFUSE_WIRE` or inferred
     /// from the upstream URL. The other door refuses rather than forwarding a
     /// body the upstream cannot read.
@@ -610,6 +613,7 @@ impl AppState {
             retained: Arc::new(crate::settle::Retained::default()),
             keystats: Arc::new(KeyStats::default()),
             admin_gate: AdminGate::default(),
+            closure: None,
             // Every deployment that predates this field is Anthropic-only, so
             // that is the default until `main.rs` (or a test) sets otherwise.
             wire: crate::wire::Wire::Anthropic,
@@ -864,6 +868,11 @@ impl AppState {
     /// which is what every existing deployment and test gets on upgrade.
     pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
         self.admin_gate = gate;
+        self
+    }
+
+    pub fn with_closure(mut self, door: Arc<crate::closure::ClosureDoor>) -> Self {
+        self.closure = Some(door);
         self
     }
 

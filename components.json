@@ -86,6 +86,9 @@
           "TOKENFUSE_CLIENT_KEYS": {
             "required": false
           },
+          "TOKENFUSE_CLOSURE_SECRET": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_HEARTBEAT_SECONDS": {
             "required": false,
             "default": "30"

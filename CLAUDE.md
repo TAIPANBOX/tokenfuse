@@ -3073,7 +3073,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     priced usage, release as before; a 2xx that then breaks settles at the estimate; parsed usage
     settles as parsed.
 
-    Reconciling a retained reservation is not built. What exists: the caller's next call on the
+    Reconciling a retained reservation was not built when this was written; since 2026-10-12
+    the gateway side of D8 is (invariant 89), and the rest of this paragraph describes the
+    other ways room comes back. What exists: the caller's next call on the
     run may widen `x-fuse-budget-usd` (`open_run` updates an open run's budget), a Cloud budget
     or a unit cap override widens the room the same way, the unit half expires with the UTC
     month, and a restart forgets everything (issue #293). The shape of a real path (an
@@ -6054,9 +6056,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `kind` is counted, never read as a closure. The raft backend answers `None` and nothing is
     restored (a `Request` variant is invariant 5's decision); the replay says so.
 
-    **Where it says nothing.** No line is ever removed: closing a retained reservation is D8,
-    decided and not built, so the file only grows (one line per retained call, the rare
-    cancel-during-send case). A restored run's budget reads zero on `GET /v1/runs` until its next
+    **Where it says nothing.** No line is removed while the process runs. Since 2026-10-12 a
+    closure (D8, invariant 89) appends a `closure` record, and startup rewrites the file with
+    only the records still open (D-3), so the file grows by one line per retained call and per
+    closure until the next start. A restored run's budget reads zero on `GET /v1/runs` until its next
     request opens it; a restored PARENT with a Cloud budget gets that budget on its next child's
     call instead, the way an unopened parent does (`AppState::is_restored_unbudgeted`; until
     2026-10-11 every child was refused 402 naming the parent until the parent itself called,

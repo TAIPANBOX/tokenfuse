@@ -206,14 +206,17 @@ pub struct CallAttribution {
 
 /// A reservation kept outstanding on purpose (D7): the request was handed to the provider and
 /// the call ended before any status line came back. Neither settled nor released; listed so an
-/// operator can see it and a reconciliation (D8, not built) can settle or release it with the
-/// handle it needs. Process-local, like the ledger it describes.
+/// operator can see it and a closure (D8, `crate::closure`) can settle or release it with the
+/// handle it needs.
 #[derive(Debug, Clone)]
 pub struct RetainedReservation {
     pub run: Reservation,
     pub unit: Option<UnitReservation>,
     pub model: String,
     pub retained_at_millis: i64,
+    /// The journal record's revision (`retainedjournal::Record::revision`), which a closure
+    /// token binds. Computed whether or not a journal is configured.
+    pub revision: String,
 }
 
 /// How many retained reservations are listed. Past this the ledger still holds the
@@ -248,18 +251,22 @@ impl Retained {
         }
     }
 
-    /// Append one retained reservation to the journal, synced before this returns. `None`
-    /// when there is no journal (no data dir: the reservation lives only in this process, as
-    /// it always did); `Some(false)` when the write failed, which is logged at error with the
-    /// path, because that reservation will not survive a restart.
-    pub fn journal(
+    /// The journal, when there is one.
+    pub fn journal(&self) -> Option<&crate::retainedjournal::Journal> {
+        self.journal.as_ref()
+    }
+
+    /// Append one retained reservation's record to the journal, synced before this returns.
+    /// `None` when there is no journal (no data dir: the reservation lives only in this
+    /// process, as it always did); `Some(false)` when the write failed, which is logged at
+    /// error with the path, because that reservation will not survive a restart.
+    pub fn journal_retained(
         &self,
         entry: &RetainedReservation,
-        tail_parent: Option<String>,
+        record: &crate::retainedjournal::Record,
     ) -> Option<bool> {
         let journal = self.journal.as_ref()?;
-        let record = crate::retainedjournal::Record::retained(entry, tail_parent);
-        match journal.append(&record) {
+        match journal.append(record) {
             Ok(()) => Some(true),
             Err(e) => {
                 self.journal_failures.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +308,36 @@ impl Retained {
             .push(entry);
         true
     }
+    /// The listed entry with this reservation id, if any.
+    pub fn find(&self, id: u64) -> Option<RetainedReservation> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .by_run
+            .values()
+            .flatten()
+            .find(|e| e.run.id == id)
+            .cloned()
+    }
+
+    /// Remove and return the listed entry with this id and revision. `None` when there is none,
+    /// so two closures of one entry cannot both take it.
+    pub fn take(&self, id: u64, revision: &str) -> Option<RetainedReservation> {
+        let mut inner = self.inner.lock().unwrap();
+        let (run, pos) = inner.by_run.iter().find_map(|(run, entries)| {
+            entries
+                .iter()
+                .position(|e| e.run.id == id && e.revision == revision)
+                .map(|pos| (run.clone(), pos))
+        })?;
+        let entries = inner.by_run.get_mut(&run).expect("found above");
+        let entry = entries.remove(pos);
+        if entries.is_empty() {
+            inner.by_run.remove(&run);
+        }
+        inner.total -= 1;
+        Some(entry)
+    }
+
     pub fn for_run(&self, run_id: &str) -> Vec<RetainedReservation> {
         self.inner
             .lock()
@@ -496,15 +533,18 @@ impl SettleGuard {
         let (id, step, amount) = (run.id, run.step, run.amount);
         let unit_name = unit.as_ref().map(|u| u.unit.clone()).unwrap_or_default();
         let tail_parent = self.ledger.tail_parent(&run);
-        let entry = RetainedReservation {
+        let mut entry = RetainedReservation {
             run,
             unit,
             model: self.attribution.model.clone(),
             retained_at_millis: now,
+            revision: String::new(),
         };
+        let record = crate::retainedjournal::Record::retained(&entry, tail_parent);
+        entry.revision = record.revision();
         // Journaled before it is listed, and whether or not the registry has room: the
         // liability is real either way, and a restart must find it (W03).
-        let journaled = self.retained.journal(&entry, tail_parent);
+        let journaled = self.retained.journal_retained(&entry, &record);
         let listed = self.retained.push(entry);
         tracing::warn!(
             run = %self.run_id,
@@ -1383,6 +1423,7 @@ mod tests {
             unit: None,
             model: "m".into(),
             retained_at_millis: 0,
+            revision: String::new(),
         };
         for _ in 0..MAX_RETAINED {
             assert!(r.retained.push(filler.clone()));
