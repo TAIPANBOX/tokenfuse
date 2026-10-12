@@ -3137,8 +3137,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     (retained instead of released) against this branch's own unfixed tree.)
     Whether axum drops the
     handler future on a client disconnect in every phase is not measured here (the live test is
-    named in the PR's NOT proven list and was not run). No agent-event type describes a retained
-    call; a new type is a cross-repository change (D10). The registry is process-local and
+    named in the PR's NOT proven list and was not run). Since 2026-10-12 a retained call is on
+    the agent-event bus as one `call_retained` at `medium` (D10, invariant 90). The registry is process-local and
     capped at 8192 entries; past the cap the ledger still holds the reservation and only the
     handle is not kept (`listed=false` on the warn, `Retained::unlisted`). On the raft backend a
     reservation committed while the future is dropped between commit and return is not held by
@@ -6231,13 +6231,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     when it has one. Nothing crosses a repository here: the trace and wire shape of `CallRecord`
     are unchanged.
 
-    **Where it says nothing.** No agent-event is emitted. No existing type describes a closure,
-    so an event here is a `retained_closed` type, D10, a cross-repository change through
-    agent-passport's SPEC 6.2; the retained record now carries the call's `agent_id` (D8.1) for
-    such an event to be filed under, and a record journaled before that carries none. The audit
-    record until then is the journal's closure line, one info log line naming the reservation,
-    run, operation, evidence kind and reference, and the settled amount, and for an observed
-    closure the `allow` row. That row is indistinguishable from a settled call's: it counts as
+    **Where it says nothing.** Since 2026-10-12 an applied closure is on the agent-event bus as
+    one `retained_closed` at `high` (D10, invariant 90), filed under the `agent_id` the retained
+    record carries (D8.1); a record journaled before that carries none and its event is skipped
+    and counted. Beside it the audit record is the journal's closure line, one info log line
+    naming the reservation, run, operation, evidence kind and reference, and the settled amount,
+    and for an observed closure the `allow` row. That row is indistinguishable from a settled call's: it counts as
     one more call on the run in the trace and the Cloud, its zero tokens beside a nonzero cost
     make the FOCUS export label it `estimated` (invariant 43's note), and the cloud sink names a
     price basis from the model although the cost came from the evidence. The row reaches the
@@ -6294,3 +6293,108 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     (`a_record_from_before_the_attribution_field_files_its_unit_from_the_unit_half`), the
     attribution not journaled (`a_retained_reservation_journals_the_calls_attribution`).
     Scenarios: `features/an-observed-closure-reaches-the-cloud.feature`, five, each bound)*
+
+90. **A retained call and its closure are on the agent-event bus, once each, and a restart
+    reports neither again.** Invariant 50 retains a call whose outcome is unknown, invariant 88
+    keeps it across a restart, and invariant 89 lets a person close it; until 2026-10-12 the
+    only record of the first was a warn line and a count on `GET /v1/runs`, and the second
+    wrote nothing to the bus at all, so nobody was told that money was waiting for a person or
+    that a person had released it. agent-passport SPEC 6.2 registers both types under source
+    `tokenfuse` (agent-passport#74, merged as f3a9d70); trailryx#94 maps them and heraldyx#95
+    renders them. `@decided 2026-10-12`, paraphrased: a retained call and its closure both go
+    on the bus, and the closure is `high`.
+
+    `call_retained` (`medium`) is written by `SettleGuard::retain` through `report_retained`,
+    once per reservation the guard retains, after the journal append and the registry push, so
+    `journaled` (the record reached the journal; false with no journal or a failed write) and
+    `listed` (the registry kept it; false past `MAX_RETAINED`) are facts rather than
+    intentions. `proxy::handle` hands the guard the exporter and the chain the door resolved,
+    with its proof when a token proved it, through `reporting_retained_to` beside
+    `SettleGuard::new`; the guard keeps them only while the exporter is on. Envelope:
+    `agent_id` is the call's own (`CallAttribution::agent_id`, the `x-fuse-agent-id` header),
+    `run_id`, and `on_behalf_of` with `delegation_proof` exactly as the request's other events
+    carry them. `data` is `tokenfuse_core::agent_event::call_retained_data`: `reservation_id`,
+    `amount_microusd`, `unit` (the unit half's, absent when the call held none), `model`,
+    `journaled`, `listed`. The journal's startup replay (invariant 88) restores reservations
+    without a guard, so a restart writes none.
+
+    `retained_closed` (`high`) is written by `closure::apply`, once per closure applied: after
+    the closure record is synced, the ledgers settled and the D8.1 row written, inside the
+    books' lock and before the books note the operation. Every refusal (token, mismatch, stale
+    revision, a journal that cannot take the record) returns before that line, and a replay of
+    an applied operation, in this process or after a restart, is answered from the books before
+    it, so none of them is on the bus. Envelope: `agent_id` is the one the journaled record
+    carries (D8.1), and `run_id`; no chain. `data` is `retained_closed_data`: `reservation_id`,
+    `revision`, `operation_id`, `evidence_kind`, `settled_microusd` (`0` for `no_charge`),
+    `evidence_ref`, `unit`. Who closed it is not on the event, by SPEC 6.2: the gateway
+    verifies a token, not a person, and the console's own record names the person.
+
+    Both bands are fixed per type in `EventType::severity`, and both types are appended after
+    `run_stalled`, so no published position moves; `contracts/tokenfuse-constants.json` carries
+    22 types. `compat/1.0.json` is unchanged, as it was for `run_stalled`: its additive list
+    already covers a new agent-event type.
+
+    `@claude 2026-10-12`, choices under delegated authority, open to reversal: the subject of
+    both events is the call's own `agent_id`, not the proven actor a request's other records
+    fall back to when no header names an agent (invariant 6, `proxy::handle`'s `event_agent_id`), because the
+    journaled record carries only the former and the two events must name the same agent for a
+    consumer to join them by `reservation_id`; `unit` is the unit half (what holds the money),
+    the same field the closure record and the retain warn line use; each event's `ts` is the
+    retain or the closure time.
+
+    **Where it says nothing.** A call that sent no `x-fuse-agent-id` is skipped and counted for
+    both events even when a token proved its chain, while that request's other events are
+    filed under the proven actor. A reservation retained while the exporter was off, or by a
+    version before this one, is never reported: the replay reports nothing, by design, and so
+    backfills nothing. A record journaled before D8.1 names no agent, so its closure is skipped
+    and counted. A line the exporter fails to write is counted (`write_error_count`) and not
+    retried, as for every other type. The exporter's write runs inside the guard's `Drop` and
+    inside the closure's lock, on a runtime worker, as the journal's fsync already does.
+    *(test: in `proxy::tests`,
+    `a_call_the_provider_held_when_the_caller_left_writes_one_call_retained`,
+    `a_retained_call_that_names_no_agent_is_skipped_and_counted_never_invented`,
+    `a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed` and
+    `a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof`; in `closure::tests`,
+    `an_applied_closure_writes_one_retained_closed_with_its_evidence`,
+    `a_no_charge_closure_writes_one_retained_closed_settled_at_zero`,
+    `a_replay_a_conflict_and_a_second_operation_write_no_second_retained_closed`,
+    `a_stale_revision_or_an_unwritable_journal_writes_no_retained_closed`,
+    `a_closure_answered_again_after_a_restart_writes_no_second_retained_closed` and
+    `a_closure_of_a_record_that_names_no_agent_is_skipped_and_counted`; in `settle::tests`,
+    `only_an_unknown_outcome_writes_a_call_retained` and
+    `a_retained_call_whose_journal_write_failed_says_it_was_not_journaled`; over the real binary,
+    `tests/it/retained_on_the_bus.rs`'s two (once each, no event for a forged token or a stale
+    revision, none added by the restart's replay; the no-agent skip counted in the log); three in
+    `core::agent_event`; and the written-out list in
+    `constants::tests::every_event_type_reaches_the_artifact_with_its_own_severity`. Red first in
+    CI on the test-only commit 3a0498d, against main's code (run 38241231894, and run
+    38241721751 with every test binary run): the ten library tests and both real-binary tests
+    failed by assertion, verbatim among them `one call_retained per retained call: []` with
+    `left: 0 right: 2`, `one closure, one event: []` with `left: 0 right: 1`, `the call_retained
+    with no subject is skipped AND counted` with `left: 0 right: 1`, and `no skip line names
+    call_retained`. The proven-chain test and the core and guard tests came with the
+    implementation, and each went red under a planted fault below. Ten mutants planted in the
+    product code 2026-10-12 as three throwaway commits on the pull request's branch (CI runs
+    38242854682, 38243248766 and 38245983010), each caught by a named test: `journaled` read as
+    `is_some()` (`a_retained_call_whose_journal_write_failed_says_it_was_not_journaled`, `left:
+    Bool(true) right: false`); the proof dropped from the chain
+    (`a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof`); an agent invented for
+    a call that named none
+    (`a_retained_call_that_names_no_agent_is_skipped_and_counted_never_invented`);
+    `retained_closed` also written for a replay
+    (`a_replay_a_conflict_and_a_second_operation_write_no_second_retained_closed`, `left: 2
+    right: 1`, and `a_closure_answered_again_after_a_restart_writes_no_second_retained_closed`);
+    the wiring in `proxy::handle` removed (the four proxy tests and both real-binary tests);
+    `call_retained` also written for a settled call (`only_an_unknown_outcome_writes_a_call_retained`,
+    `left: 3 right: 1`); `retained_closed` written before the journal append
+    (`a_stale_revision_or_an_unwritable_journal_writes_no_retained_closed`); `listed` hard-coded
+    true (`a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed`);
+    `call_retained` at `high` (the core band test, both constants tests, the first proxy test and
+    the first real-binary test); `unit` dropped from `retained_closed`
+    (`an_applied_closure_writes_one_retained_closed_with_its_evidence`). The first run of that
+    last group stalled the CI job for twenty minutes: the unwritable-journal case's 16 MiB
+    evidence reached the bus under the mutant and the assertion printed it, so the assertion now
+    prints operation ids only (e01bfd3). Scenarios:
+    `features/a-retained-call-and-its-closure-reach-the-bus.feature`, nine, each bound. Not a
+    script gate: the rule is two emit sites, held by `cargo test`; the published bands are held
+    by `scripts/constants.sh`)*

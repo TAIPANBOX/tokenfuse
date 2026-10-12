@@ -1809,7 +1809,10 @@ async fn handle_call(
             identity_reason: identity_reason.clone(),
         },
         unit_reservation,
-    );
+    )
+    // D10, invariant 90: if this call is retained, one `call_retained` names it on the bus,
+    // with the chain (and proof) every other event of this request carries.
+    .reporting_retained_to(&st.events, &on_behalf_of_chain, delegation_proof.as_ref());
 
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
@@ -8522,6 +8525,280 @@ pub(crate) mod tests {
         assert_eq!(plain_row["retained"], 0);
         assert_eq!(plain_row["retained_usd"], 0.0);
         assert_eq!(plain_row["reserved_usd"], 0.0);
+    }
+
+    // -- D10: a retained call reaches the bus (invariant 90) -----------------
+    //
+    // agent-passport SPEC 6.2 registers `call_retained` (medium): a call handed
+    // to the provider that ended before any answer came back keeps both its
+    // reservations outstanding until a person closes them, and until this
+    // type existed the only record of that was a warn line and a count on
+    // `GET /v1/runs`. Nobody was told that money was waiting for a person.
+
+    /// One call the provider holds and never answers, cancelled by its caller:
+    /// the shape E8 above retains.
+    async fn retain_one_call(
+        st: AppState,
+        key: Option<&str>,
+        agent: Option<&str>,
+        on_behalf_of: Option<&str>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut st = st;
+        st.provider = Arc::new(PendingProvider {
+            body_pending: false,
+            entered: entered.clone(),
+        });
+        let mut req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "worker")
+            .header("x-fuse-budget-usd", "5.0");
+        if let Some(k) = key {
+            req = req.header("x-fuse-key", k);
+        }
+        if let Some(a) = agent {
+            req = req.header("x-fuse-agent-id", a);
+        }
+        if let Some(chain) = on_behalf_of {
+            req = req.header("x-fuse-on-behalf-of", chain);
+        }
+        let req = req.body(Body::from(body(500))).unwrap();
+        let task = tokio::spawn(crate::app(st).oneshot(req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    fn call_retained_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+        events_at(path)
+            .into_iter()
+            .filter(|e| e["type"] == "call_retained")
+            .collect()
+    }
+
+    /// D10. A call the provider held when its caller left is retained, and the
+    /// bus gets exactly one `call_retained` for it: the call's agent, run and
+    /// declared chain on the envelope, the reservation, the amount held, the
+    /// unit, the model, and whether it reached the journal and the list a
+    /// closure is made from. The ordinary call before it is settled and is not
+    /// reported as retained.
+    #[tokio::test]
+    // Same `retained:` warn, same lock, same reason as E8 above.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_call_the_provider_held_when_the_caller_left_writes_one_call_retained() {
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = recording_exporter("call-retained-once");
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_events(events);
+        let retained = Arc::clone(&st.retained);
+        let settled = Request::post("/v1/messages")
+            .header("x-fuse-key", "sk-t")
+            .header("x-fuse-run-id", "settled")
+            .header("x-fuse-budget-usd", "5.0")
+            .header("x-fuse-agent-id", "agent://bank.example/treasury/recon")
+            .body(Body::from(body(500)))
+            .unwrap();
+        assert_eq!(call(st.clone(), settled).await.status(), StatusCode::OK);
+
+        retain_one_call(
+            st,
+            Some("sk-t"),
+            Some("agent://bank.example/treasury/recon"),
+            Some("user://bank.example/j.doe"),
+        )
+        .await;
+
+        let held = retained.for_run("worker");
+        let on_bus = call_retained_events(&path);
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+        assert_eq!(held.len(), 1, "the call is retained");
+        assert_eq!(
+            on_bus.len(),
+            1,
+            "one retained call, one call_retained, and none for the settled call: {on_bus:?}"
+        );
+        let e = &on_bus[0];
+        assert_eq!(e["schema"], "taipanbox.dev/agent-event/v0.2", "{e}");
+        assert_eq!(e["source"], "tokenfuse", "{e}");
+        assert_eq!(e["severity"], "medium", "{e}");
+        assert_eq!(e["agent_id"], "agent://bank.example/treasury/recon", "{e}");
+        assert_eq!(e["run_id"], "worker", "{e}");
+        assert_eq!(
+            e["on_behalf_of"],
+            serde_json::json!(["user://bank.example/j.doe"]),
+            "the chain the request's other events carry: {e}"
+        );
+        assert!(
+            e.get("delegation_proof").is_none(),
+            "a chain nobody proved carries no proof: {e}"
+        );
+        assert_eq!(
+            e["data"],
+            serde_json::json!({
+                "reservation_id": held[0].run.id,
+                "amount_microusd": 8_657,
+                "unit": "treasury",
+                "model": "test-model",
+                "journaled": false,
+                "listed": true,
+            }),
+            "no journal is configured here, so it does not survive a restart: {e}"
+        );
+    }
+
+    /// D10, SPEC 6.1. A retained call whose request named no agent is still
+    /// retained, and its `call_retained` is skipped and counted rather than
+    /// filed under an invented subject.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retained_call_that_names_no_agent_is_skipped_and_counted_never_invented() {
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = recording_exporter("call-retained-no-agent");
+        let exporter = Arc::clone(&events);
+        let st = state(Mode::Enforce, StubProvider::default()).with_events(events);
+        let retained = Arc::clone(&st.retained);
+
+        retain_one_call(st, None, None, None).await;
+
+        let on_bus = call_retained_events(&path);
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+        assert_eq!(
+            retained.len(),
+            1,
+            "retained whether or not it names an agent"
+        );
+        assert!(on_bus.is_empty(), "{on_bus:?}");
+        assert_eq!(
+            exporter.skipped_count(),
+            1,
+            "the call_retained with no subject is skipped AND counted"
+        );
+    }
+
+    /// D10. The two booleans say the other way round from the test above: a
+    /// retained call past the registry's cap is held and journaled but cannot
+    /// be closed from the list, and the event says `listed: false`,
+    /// `journaled: true`. A request with no declared chain carries none.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed() {
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = recording_exporter("call-retained-unlisted");
+        let dir =
+            std::env::temp_dir().join(format!("tf-call-retained-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = Arc::new(crate::settle::Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        let filler_ledger = Ledger::new();
+        filler_ledger
+            .open_run("filler", Microusd::from_usd(1.0), None)
+            .unwrap();
+        let filler = crate::settle::RetainedReservation {
+            run: filler_ledger.reserve("filler", Microusd(1)).unwrap(),
+            unit: None,
+            model: "m".into(),
+            retained_at_millis: 0,
+            revision: String::new(),
+            attribution: None,
+        };
+        for _ in 0..crate::settle::MAX_RETAINED {
+            assert!(registry.push(filler.clone()));
+        }
+        let st = identity_state(Mode::Enforce, crate::identitymap::StrictMode::Enforce)
+            .with_events(events)
+            .with_retained(Arc::clone(&registry));
+
+        retain_one_call(
+            st,
+            Some("sk-t"),
+            Some("agent://bank.example/treasury/recon"),
+            None,
+        )
+        .await;
+
+        let on_bus = call_retained_events(&path);
+        let journaled = crate::retainedjournal::read(&dir).unwrap().records.len();
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(registry.unlisted(), 1, "past the cap");
+        assert_eq!(journaled, 1, "held and journaled all the same");
+        assert_eq!(on_bus.len(), 1, "{on_bus:?}");
+        let e = &on_bus[0];
+        assert_eq!(e["data"]["listed"], false, "{e}");
+        assert_eq!(e["data"]["journaled"], true, "{e}");
+        assert!(
+            e.get("on_behalf_of").is_none(),
+            "no chain declared, none recorded: {e}"
+        );
+    }
+
+    /// D10. On a chain a delegation token PROVED, the `call_retained` carries
+    /// the chain and the proof exactly as the request's other events do (SPEC
+    /// 5.2: a chain with no proof beside it reads as unproven, so dropping the
+    /// proof here would downgrade the record).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof() {
+        use tokenfuse_delegation::testing::{proof_at, token};
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = recording_exporter("call-retained-proven");
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let mut st = st.with_events(events);
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-retained-1",
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        st.provider = Arc::new(PendingProvider {
+            body_pending: false,
+            entered: entered.clone(),
+        });
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-proven-retained")
+            .header("x-fuse-agent-id", "agent://acme/triage")
+            .header("authorization", format!("DPoP {tok}"))
+            .header(crate::mcpdoor::PROOF_HEADER, dpop)
+            .body(Body::from(body(500)))
+            .unwrap();
+        let task = tokio::spawn(crate::app(st).oneshot(req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let on_bus = call_retained_events(&path);
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+        assert_eq!(on_bus.len(), 1, "{on_bus:?}");
+        let e = &on_bus[0];
+        let chain: Vec<&str> = e["on_behalf_of"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|m| m.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            chain.contains(&"user://acme/alice") && chain.contains(&"agent://acme/triage"),
+            "the proven chain: {e}"
+        );
+        assert!(
+            e["delegation_proof"]["jti"].is_string() && e["delegation_proof"]["iss"].is_string(),
+            "the proof that proved it, beside the chain: {e}"
+        );
     }
 
     // -- a call the provider refused is not spend ---------------------------
