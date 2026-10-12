@@ -1809,7 +1809,10 @@ async fn handle_call(
             identity_reason: identity_reason.clone(),
         },
         unit_reservation,
-    );
+    )
+    // D10, invariant 90: if this call is retained, one `call_retained` names it on the bus,
+    // with the chain (and proof) every other event of this request carries.
+    .reporting_retained_to(&st.events, &on_behalf_of_chain, delegation_proof.as_ref());
 
     // Budget gate: enforce uses the atomic checked reserve; shadow/warn record
     // the reservation without blocking.
@@ -8728,6 +8731,73 @@ pub(crate) mod tests {
         assert!(
             e.get("on_behalf_of").is_none(),
             "no chain declared, none recorded: {e}"
+        );
+    }
+
+    /// D10. On a chain a delegation token PROVED, the `call_retained` carries
+    /// the chain and the proof exactly as the request's other events do (SPEC
+    /// 5.2: a chain with no proof beside it reads as unproven, so dropping the
+    /// proof here would downgrade the record).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof() {
+        use tokenfuse_delegation::testing::{proof_at, token};
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = recording_exporter("call-retained-proven");
+        let (st, issuer, holder) = firewall_state_proving(FirewallMode::Off, WANTS_EXEC);
+        let mut st = st.with_events(events);
+        let now = crate::sink::now_millis() / 1000;
+        let tok = token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({
+                "sub": "user://acme/alice",
+                "act": {"sub": "agent://acme/triage"},
+                "exp": now + 300
+            }),
+        );
+        let dpop = proof_at(
+            &holder,
+            now,
+            "POST",
+            &format!("{PROVING_ORIGIN}/v1/messages"),
+            "p-retained-1",
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        st.provider = Arc::new(PendingProvider {
+            body_pending: false,
+            entered: entered.clone(),
+        });
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-proven-retained")
+            .header("x-fuse-agent-id", "agent://acme/triage")
+            .header("authorization", format!("DPoP {tok}"))
+            .header(crate::mcpdoor::PROOF_HEADER, dpop)
+            .body(Body::from(body(500)))
+            .unwrap();
+        let task = tokio::spawn(crate::app(st).oneshot(req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let on_bus = call_retained_events(&path);
+        std::fs::remove_dir_all(path.parent().expect("a temp dir")).ok();
+        assert_eq!(on_bus.len(), 1, "{on_bus:?}");
+        let e = &on_bus[0];
+        let chain: Vec<&str> = e["on_behalf_of"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|m| m.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            chain.contains(&"user://acme/alice") && chain.contains(&"agent://acme/triage"),
+            "the proven chain: {e}"
+        );
+        assert!(
+            e["delegation_proof"]["jti"].is_string() && e["delegation_proof"]["iss"].is_string(),
+            "the proof that proved it, beside the chain: {e}"
         );
     }
 

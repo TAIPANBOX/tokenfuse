@@ -305,6 +305,98 @@ pub enum EventType {
     /// is the run's attributed agent; an unattributed run is skipped and
     /// counted, never invented (invariant 6).
     RunStalled,
+
+    /// A call's outcome became unknown and its money stays reserved: the
+    /// gateway handed the request to the provider and the call ended before
+    /// any answer came back (the caller left, or the connection broke after
+    /// the request was sent), so `SettleGuard` neither settled nor released it
+    /// (invariant 50) and it stays outstanding on the run and the unit until a
+    /// person closes it with evidence (invariant 89). Raised by the gateway,
+    /// once per reservation, when it is retained; the startup replay that
+    /// restores one from the journal (invariant 88) does not raise it again
+    /// (invariant 90, D10).
+    ///
+    /// `medium`, fixed: it asks a person to act soon rather than now, and
+    /// `high` would page on every client that gave up mid-call.
+    ///
+    /// `data` is [`call_retained_data`]: `{reservation_id, amount_microusd,
+    /// unit, model, journaled, listed}`, `unit` absent when the call held no
+    /// unit half. Envelope `agent_id` is the call's own; a call that named
+    /// none is skipped and counted, never invented.
+    CallRetained,
+
+    /// A person closed a retained reservation with evidence, through the
+    /// console's token (invariant 89): observed (settled at the evidence's
+    /// cost) or no charge (released at zero). Raised by the gateway once per
+    /// closure it applies, after the closure record is synced and the money
+    /// settled; never for a refused attempt and never for a retry of an
+    /// operation already applied (invariant 90, D10).
+    ///
+    /// `high`, fixed, by [`TaintCleared`](Self::TaintCleared)'s argument: a
+    /// control is being lifted on a person's word, and an estate that pages
+    /// when money is held and stays quiet when it is released has its weights
+    /// backwards. Rare by construction, so the band costs no noise.
+    ///
+    /// `data` is [`retained_closed_data`]: `{reservation_id, revision,
+    /// operation_id, evidence_kind, settled_microusd, evidence_ref, unit}`.
+    /// Who closed it is not here: the gateway verifies a token, not a person,
+    /// and the console's own record names the person. Envelope `agent_id` is
+    /// the agent the journal recorded for the call; a record that names none
+    /// is skipped and counted.
+    RetainedClosed,
+}
+
+/// `data` for [`EventType::CallRetained`] (agent-passport SPEC 6.2), in one
+/// place so the gateway's one emit site cannot spell a member differently from
+/// what three other repositories parse. `unit` is left out, not `null`, when
+/// the call held no unit half, as the registry entry says.
+pub fn call_retained_data(
+    reservation_id: u64,
+    amount_microusd: i64,
+    unit: Option<&str>,
+    model: &str,
+    journaled: bool,
+    listed: bool,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "reservation_id": reservation_id,
+        "amount_microusd": amount_microusd,
+        "model": model,
+        "journaled": journaled,
+        "listed": listed,
+    });
+    if let Some(unit) = unit.filter(|u| !u.is_empty()) {
+        data["unit"] = serde_json::Value::from(unit);
+    }
+    data
+}
+
+/// `data` for [`EventType::RetainedClosed`] (agent-passport SPEC 6.2).
+/// `settled_microusd` is what the closure charged, `0` for `no_charge`;
+/// `evidence_ref` is a person's free text, bounded by the closure route, and
+/// a consumer is not to treat it as a contract. `unit` is left out when the
+/// reservation held no unit half.
+pub fn retained_closed_data(
+    reservation_id: u64,
+    revision: &str,
+    operation_id: &str,
+    evidence_kind: &str,
+    settled_microusd: i64,
+    evidence_ref: &str,
+    unit: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "reservation_id": reservation_id,
+        "revision": revision,
+        "operation_id": operation_id,
+        "evidence_kind": evidence_kind,
+        "settled_microusd": settled_microusd,
+        "evidence_ref": evidence_ref,
+    });
+    if let Some(unit) = unit.filter(|u| !u.is_empty()) {
+        data["unit"] = serde_json::Value::from(unit);
+    }
+    data
 }
 
 /// How much of a transport error's text travels in `data.detail`.
@@ -801,6 +893,8 @@ impl EventType {
             EventType::TaintRaised => "taint_raised",
             EventType::TaintCleared => "taint_cleared",
             EventType::RunStalled => "run_stalled",
+            EventType::CallRetained => "call_retained",
+            EventType::RetainedClosed => "retained_closed",
         }
     }
 
@@ -810,8 +904,9 @@ impl EventType {
     /// `sustained_loop` / `spend_spike` / `fanout_explosion` / `dlp_block` /
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
-    /// `budget_threshold` / `breaker_tripped` / `taint_shadow` / `run_stalled` = `medium`;
-    /// `taint_cleared` = `high`;
+    /// `budget_threshold` / `breaker_tripped` / `taint_shadow` / `run_stalled` /
+    /// `call_retained` = `medium`;
+    /// `taint_cleared` / `retained_closed` = `high`;
     /// `tool_call` / `taint_raised` = `low`.
     ///
     /// `breaker_tripped` was `critical` until 2026-08-03, which meant every
@@ -849,7 +944,10 @@ impl EventType {
             | EventType::UnitCapExceeded
             | EventType::PolicyDeny
             | EventType::TaintCleared
-            | EventType::DependencyFailed => Severity::High,
+            | EventType::DependencyFailed
+            // A person released money a retained call held: a control lifted,
+            // at taint_cleared's band for taint_cleared's reason.
+            | EventType::RetainedClosed => Severity::High,
             // An early warning, on purpose one band below the incident it
             // warns about: the run is still inside its budget. Beside it, the
             // per-call record of a refusal that already happened, which is the
@@ -864,7 +962,10 @@ impl EventType {
             // Beside them, a run that went quiet: the Cloud cannot tell a
             // dead node from a run that ended without saying so, so it asks
             // a person to look.
-            | EventType::RunStalled => Severity::Medium,
+            | EventType::RunStalled
+            // And a call whose money stays held until a person closes it: act
+            // soon, not now.
+            | EventType::CallRetained => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             // Taint acquisition sits here for the same reason: a run reading
@@ -1543,10 +1644,76 @@ mod tests {
             (EventType::BudgetThreshold, "budget_threshold"),
             (EventType::RunKilled, "run_killed"),
             (EventType::RunStalled, "run_stalled"),
+            (EventType::CallRetained, "call_retained"),
+            (EventType::RetainedClosed, "retained_closed"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
         }
+    }
+
+    /// D10, agent-passport SPEC 6.2: the two bands are fixed per type and
+    /// differ on purpose. The held money asks a person to act soon; releasing
+    /// it lifts a control, at `taint_cleared`'s band.
+    #[test]
+    fn call_retained_and_retained_closed_are_on_the_wire_at_their_fixed_bands() {
+        assert_eq!(EventType::CallRetained.as_wire_str(), "call_retained");
+        assert_eq!(EventType::CallRetained.severity(), Severity::Medium);
+        assert_eq!(EventType::RetainedClosed.as_wire_str(), "retained_closed");
+        assert_eq!(EventType::RetainedClosed.severity(), Severity::High);
+        assert_eq!(
+            EventType::RetainedClosed.severity(),
+            EventType::TaintCleared.severity()
+        );
+    }
+
+    #[test]
+    fn call_retained_data_names_the_reservation_and_leaves_out_an_absent_unit() {
+        assert_eq!(
+            call_retained_data(42, 8_657, Some("treasury"), "m", true, false),
+            serde_json::json!({
+                "reservation_id": 42,
+                "amount_microusd": 8_657,
+                "unit": "treasury",
+                "model": "m",
+                "journaled": true,
+                "listed": false,
+            })
+        );
+        for unit in [None, Some("")] {
+            let data = call_retained_data(42, 1, unit, "m", false, true);
+            assert!(
+                data.get("unit").is_none(),
+                "absent, not null or empty: {data}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_closed_data_carries_the_evidence_and_what_was_settled() {
+        assert_eq!(
+            retained_closed_data(
+                7,
+                "0123456789abcdef",
+                "op-1",
+                "observed",
+                4_321,
+                "invoice 14",
+                Some("ops"),
+            ),
+            serde_json::json!({
+                "reservation_id": 7,
+                "revision": "0123456789abcdef",
+                "operation_id": "op-1",
+                "evidence_kind": "observed",
+                "settled_microusd": 4_321,
+                "evidence_ref": "invoice 14",
+                "unit": "ops",
+            })
+        );
+        let data = retained_closed_data(7, "r", "op", "no_charge", 0, "e", None);
+        assert_eq!(data["settled_microusd"], 0);
+        assert!(data.get("unit").is_none(), "{data}");
     }
 
     #[test]

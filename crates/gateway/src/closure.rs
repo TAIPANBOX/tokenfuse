@@ -40,12 +40,14 @@
 //! gateway takes from the Cloud (invariants 70 and 52) include it. One row per closure: it is
 //! written on the first application only, never on a replay. A no-charge closure writes none.
 //!
-//! **Not on the event stream.** No agent-event type describes a closure, so an event here is
-//! a new type and a cross-repository change (D10). The retained record carries the call's
-//! `agent_id` since D8.1, which such an event would be filed under; a record journaled before
-//! that carries none (SPEC 6.1 forbids inventing one). The journal's closure record, one log
-//! line and, for an observed closure, the `allow` row are the audit record until then.
+//! **On the event stream (D10, invariant 90).** One `retained_closed` (high) per closure
+//! applied, written after the closure record is synced and the money settled, under the
+//! `agent_id` the journal recorded for the call (D8.1); a record journaled before that carries
+//! none, and its event is skipped and counted (SPEC 6.1 forbids inventing one). A refusal and a
+//! replay of an applied operation write none. Who closed it is not on the event: the gateway
+//! verifies a token, not a person, and the console's own record names the person.
 
+use crate::events::EventType;
 use crate::retainedjournal::{ClosureRecord, KIND_CLOSURE};
 use crate::state::AppState;
 use axum::body::Bytes;
@@ -531,6 +533,28 @@ pub fn apply(
     if req.evidence_kind == EvidenceKind::Observed {
         st.sink.record(closure_row(&entry, settled, now));
     }
+    // D10, invariant 90: one `retained_closed` per closure applied, from here and nowhere else.
+    // Every refusal above has already returned, and a replay of the same operation is answered
+    // from the books before this point, so neither reaches the bus. The subject is the agent
+    // the journal recorded for the call; a record with none is skipped and counted by the
+    // exporter, never given one.
+    let outcome = st.events.emit(
+        EventType::RetainedClosed,
+        now,
+        entry.attribution.as_ref().map(|a| a.agent_id.as_str()),
+        Some(record.run_id.as_str()),
+        None,
+        tokenfuse_core::agent_event::retained_closed_data(
+            record.reservation_id,
+            &record.revision,
+            &record.operation_id,
+            &record.evidence_kind,
+            record.settled_microusd,
+            &record.evidence_ref,
+            record.unit.as_deref(),
+        ),
+    );
+    crate::events::log_outcome(EventType::RetainedClosed, outcome);
     books.note(&record);
     tracing::info!(
         reservation = record.reservation_id,

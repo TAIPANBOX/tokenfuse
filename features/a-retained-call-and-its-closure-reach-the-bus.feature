@@ -11,6 +11,8 @@ Feature: A retained call and its closure reach the bus
 
   # @test:a_call_the_provider_held_when_the_caller_left_writes_one_call_retained
   # @test:a_retained_call_and_its_closure_each_reach_the_bus_once_and_a_restart_adds_neither
+  # @test:only_an_unknown_outcome_writes_a_call_retained
+  # @test:call_retained_data_names_the_reservation_and_leaves_out_an_absent_unit
   Scenario: A retained call is reported once, with what a person needs to close it
     Given a gateway writing agent-events
     When a call by an agent, on behalf of a user, is handed to the provider and ends before any answer
@@ -19,10 +21,18 @@ Feature: A retained call and its closure reach the bus
     And the settled call before it is not reported as retained
 
   # @test:a_retained_call_past_the_registry_cap_is_journaled_and_says_it_is_not_listed
+  # @test:a_retained_call_whose_journal_write_failed_says_it_was_not_journaled
   Scenario: A retained call says whether it survives a restart and whether it can be closed from the list
     Given the list of retained reservations is full and a journal is configured
     When one more call is retained
     Then its call_retained says it was journaled and is not listed
+    And a call whose journal write failed says it was not journaled
+
+  # @test:a_retained_call_on_a_proven_chain_carries_the_chain_and_its_proof
+  Scenario: A chain a token proved keeps its proof on the record
+    Given a call on a delegation chain a token proved
+    When the call is retained
+    Then its call_retained carries the chain and the proof beside it, as the request's other events do
 
   # @test:a_retained_call_and_its_closure_each_reach_the_bus_once_and_a_restart_adds_neither
   Scenario: A restart that restores a retained reservation reports nothing new
@@ -41,6 +51,7 @@ Feature: A retained call and its closure reach the bus
   # @test:an_applied_closure_writes_one_retained_closed_with_its_evidence
   # @test:a_no_charge_closure_writes_one_retained_closed_settled_at_zero
   # @test:a_retained_call_and_its_closure_each_reach_the_bus_once_and_a_restart_adds_neither
+  # @test:retained_closed_data_carries_the_evidence_and_what_was_settled
   Scenario: A closure is reported once, at high, with its evidence
     Given a retained reservation
     When a person closes it with observed evidence, or with the provider's confirmation of no charge
@@ -63,5 +74,6 @@ Feature: A retained call and its closure reach the bus
     Then no retained_closed is written
 
   # @test:every_event_type_reaches_the_artifact_with_its_own_severity
+  # @test:call_retained_and_retained_closed_are_on_the_wire_at_their_fixed_bands
   Scenario: The bands are fixed per type
     Then call_retained is medium and retained_closed is high, in the code and in the published constants

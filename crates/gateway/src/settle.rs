@@ -18,6 +18,7 @@
 //! neither settled nor released: it is RETAINED, listed in [`Retained`], and stays outstanding
 //! until somebody reconciles it (D7, `@decided 2026-09-18`).
 
+use crate::events::EventExporter;
 use crate::keystats::KeyStats;
 use crate::ledger_backend::LedgerBackend;
 use crate::provider::{ParsedUsage, UsageSlot};
@@ -27,6 +28,7 @@ use axum::http::StatusCode;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokenfuse_core::agent_event::{call_retained_data, ChainOnRecord, DelegationProof, EventType};
 use tokenfuse_core::{Microusd, PriceBook, Reservation, Usage};
 
 /// The basis a settlement's charged amount rests on. Not a Parquet column
@@ -372,6 +374,16 @@ impl Retained {
     }
 }
 
+/// Where a guard reports a retained call (D10, invariant 90): the process's agent-event
+/// exporter, and the delegation chain the request's other events carry (the chain the door
+/// resolved, with its proof when a token proved it). Held only while the exporter is on, so a
+/// gateway with no `TOKENFUSE_EVENTS_PATH` clones nothing for it per request.
+struct RetainedReport {
+    events: Arc<EventExporter>,
+    on_behalf_of: Vec<String>,
+    delegation_proof: Option<DelegationProof>,
+}
+
 pub struct SettleGuard {
     ledger: Arc<dyn LedgerBackend>,
     units: Arc<UnitLedger>,
@@ -391,6 +403,8 @@ pub struct SettleGuard {
     unit_reservation: Option<UnitReservation>,
     /// The provider's usage slot, attached by `answered`. `None` until then.
     usage: Option<UsageSlot>,
+    /// Where a retention is reported (D10). `None` reports nothing.
+    report: Option<RetainedReport>,
 }
 
 impl SettleGuard {
@@ -422,7 +436,28 @@ impl SettleGuard {
             run: None,
             unit_reservation,
             usage: None,
+            report: None,
         }
+    }
+
+    /// Report this call on the agent-event bus as one `call_retained` if it is retained (D10,
+    /// invariant 90): filed under the call's own `agent_id` and carrying the chain the
+    /// request's other events carry. `proxy::handle` calls it once, beside `new`. A guard never
+    /// told, or told with the exporter off, reports nothing.
+    pub fn reporting_retained_to(
+        mut self,
+        events: &Arc<EventExporter>,
+        on_behalf_of: &[String],
+        delegation_proof: Option<&DelegationProof>,
+    ) -> Self {
+        if events.is_enabled() {
+            self.report = Some(RetainedReport {
+                events: Arc::clone(events),
+                on_behalf_of: on_behalf_of.to_vec(),
+                delegation_proof: delegation_proof.cloned(),
+            });
+        }
+        self
     }
 
     /// The run half, from `reserve` or `reserve_unchecked`. Once per guard, before dispatch.
@@ -564,7 +599,50 @@ impl SettleGuard {
             journaled = ?journaled,
             "retained: the request was handed to the provider and the call ended before any answer came back, so its outcome is unknown; the reservation stays outstanding on the run and on the unit until it is reconciled (invariant 50), never settled at zero"
         );
+        self.report_retained(id, amount, &unit_name, journaled == Some(true), listed, now);
         Terminal::Retained { amount, listed }
+    }
+
+    /// One `call_retained` for the reservation `retain` just kept (D10, invariant 90). Only
+    /// `retain` calls this and a guard retains at most once (`settle_now` takes both halves),
+    /// so one retained call is one event; the journal's startup replay restores reservations
+    /// without a guard, so a restart reports none. `journaled` is true only when the record
+    /// reached the journal: no journal, or a failed write, means it does not survive a restart.
+    fn report_retained(
+        &self,
+        reservation_id: u64,
+        amount: Microusd,
+        unit: &str,
+        journaled: bool,
+        listed: bool,
+        now: i64,
+    ) {
+        let Some(report) = &self.report else {
+            return;
+        };
+        let chain =
+            (!report.on_behalf_of.is_empty()).then(|| match report.delegation_proof.as_ref() {
+                Some(proof) => ChainOnRecord::proven(&report.on_behalf_of, proof),
+                None => ChainOnRecord::claimed(&report.on_behalf_of),
+            });
+        // `agent_id` is the call's own; an empty one is skipped and counted by the exporter
+        // (SPEC 6.1), never replaced.
+        let outcome = report.events.emit(
+            EventType::CallRetained,
+            now,
+            Some(self.attribution.agent_id.as_str()),
+            Some(self.run_id.as_str()),
+            chain,
+            call_retained_data(
+                reservation_id,
+                amount.0,
+                Some(unit),
+                &self.attribution.model,
+                journaled,
+                listed,
+            ),
+        );
+        crate::events::log_outcome(EventType::CallRetained, outcome);
     }
 
     fn charge(
@@ -1529,6 +1607,91 @@ mod tests {
         assert!(text.contains(crate::retainedjournal::FILE_NAME));
         assert!(text.contains("journaled=Some(false)"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A real exporter on a private file, and the `call_retained` lines it holds.
+    fn bus(name: &str) -> (Arc<EventExporter>, std::path::PathBuf) {
+        let dir = journal_dir(&format!("bus-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = EventExporter::open(path.to_str().unwrap()).unwrap();
+        (Arc::new(exporter), path)
+    }
+
+    fn call_retained_on(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["type"] == "call_retained")
+            .collect()
+    }
+
+    /// D10. Of the five states a guard can end in, only `Unknown` retains, and only a retained
+    /// call is on the bus as `call_retained`: a release, a refusal and a settled answer write
+    /// none, through one exporter, so the one line there is the unknown one.
+    #[test]
+    fn only_an_unknown_outcome_writes_a_call_retained() {
+        let _serial = crate::testlog::log_lock();
+        let (events, path) = bus("five-states");
+        for state in ["NotDispatched", "NotSent", "Refused", "Started", "Unknown"] {
+            let r = rig();
+            let mut g = rig_guard(&r);
+            g.attribution.agent_id = "agent://acme/bot".into();
+            let mut g = g.reporting_retained_to(&events, &[], None);
+            match state {
+                "NotDispatched" => {}
+                "NotSent" => {
+                    g.dispatching();
+                    g.not_sent();
+                }
+                "Refused" | "Started" => {
+                    g.dispatching();
+                    let status = if state == "Refused" { 429 } else { 200 };
+                    g.answered(status, r.slot.clone());
+                }
+                _ => g.dispatching(),
+            }
+            g.settle_now();
+            drop(g);
+        }
+        let on_bus = call_retained_on(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(on_bus.len(), 1, "{on_bus:?}");
+        assert_eq!(on_bus[0]["run_id"], "r");
+        assert_eq!(on_bus[0]["agent_id"], "agent://acme/bot");
+        assert_eq!(on_bus[0]["data"]["amount_microusd"], 1_000_000);
+        assert_eq!(on_bus[0]["data"]["unit"], "treasury");
+    }
+
+    /// D10. `journaled` is whether the record reached the journal: a configured journal whose
+    /// write failed is `false`, the same answer as no journal at all, because either way the
+    /// reservation does not survive a restart.
+    #[test]
+    fn a_retained_call_whose_journal_write_failed_says_it_was_not_journaled() {
+        let _serial = crate::testlog::log_lock();
+        let dir = journal_dir("write-fails-journal");
+        let (events, path) = bus("write-fails");
+        let mut r = rig();
+        r.retained = Arc::new(Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        {
+            let mut g = rig_guard(&r);
+            g.attribution.agent_id = "agent://acme/bot".into();
+            // Over the journal's line bound: the one write failure a test can force as root.
+            g.attribution.model = "m".repeat(crate::retainedjournal::MAX_LINE_BYTES);
+            let mut g = g.reporting_retained_to(&events, &[], None);
+            g.dispatching();
+        }
+        let on_bus = call_retained_on(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(r.retained.journal_failures(), 1);
+        assert_eq!(on_bus.len(), 1);
+        assert_eq!(on_bus[0]["data"]["journaled"], false);
+        assert_eq!(on_bus[0]["data"]["listed"], true);
     }
 
     /// E14. A guard dropped before dispatch releases both halves at zero and

@@ -97,7 +97,7 @@ const ALL_BREAKER_REASONS: [BreakerReason; 9] = [
 /// Every [`EventType`] this repository can emit, same discipline as
 /// [`ALL_BREAKER_REASONS`]: [`exhaustiveness_guard`] fails to compile when a
 /// variant is added.
-const ALL_EVENT_TYPES: [EventType; 20] = [
+const ALL_EVENT_TYPES: [EventType; 22] = [
     EventType::BudgetExhausted,
     EventType::SustainedLoop,
     EventType::SpendSpike,
@@ -118,6 +118,8 @@ const ALL_EVENT_TYPES: [EventType; 20] = [
     EventType::TaintCleared,
     EventType::BreakerShadow,
     EventType::RunStalled,
+    EventType::CallRetained,
+    EventType::RetainedClosed,
 ];
 
 /// The half of the two lists above that the compiler holds.
@@ -164,6 +166,8 @@ fn exhaustiveness_guard(reason: BreakerReason, event: EventType) -> (usize, usiz
         EventType::TaintCleared => 17,
         EventType::BreakerShadow => 18,
         EventType::RunStalled => 19,
+        EventType::CallRetained => 20,
+        EventType::RetainedClosed => 21,
     };
     (r, e)
 }

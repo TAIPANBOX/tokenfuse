@@ -82,6 +82,14 @@
       {
         "severity": "medium",
         "type": "run_stalled"
+      },
+      {
+        "severity": "medium",
+        "type": "call_retained"
+      },
+      {
+        "severity": "high",
+        "type": "retained_closed"
       }
     ]
   },
