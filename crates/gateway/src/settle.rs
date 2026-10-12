@@ -217,6 +217,10 @@ pub struct RetainedReservation {
     /// The journal record's revision (`retainedjournal::Record::revision`), which a closure
     /// token binds. Computed whether or not a journal is configured.
     pub revision: String,
+    /// The call's attribution, journaled with the record, so an observed closure's `allow`
+    /// row (D8.1) names the same agent, key and unit a settled call would. `None` for a
+    /// record read from a journal line written before the field existed.
+    pub attribution: Option<crate::retainedjournal::RowAttribution>,
 }
 
 /// How many retained reservations are listed. Past this the ledger still holds the
@@ -539,6 +543,9 @@ impl SettleGuard {
             model: self.attribution.model.clone(),
             retained_at_millis: now,
             revision: String::new(),
+            attribution: Some(crate::retainedjournal::RowAttribution::of(
+                &self.attribution,
+            )),
         };
         let record = crate::retainedjournal::Record::retained(&entry, tail_parent);
         entry.revision = record.revision();
@@ -622,28 +629,43 @@ impl SettleGuard {
             },
             None => Microusd::ZERO,
         };
-        self.sink.record(CallRecord {
-            ts_millis: now_millis(),
-            run_id: run.run_id.clone(),
-            model: a.model.clone(),
-            decision: "allow".into(),
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cost_microusd: actual.0,
-            step: run.step,
-            agent_id: a.agent_id.clone(),
-            saved_microusd: saved.0,
-            parent_run_id: a.parent_run_id.clone(),
-            on_behalf_of: a.on_behalf_of.clone(),
-            outcome: a.outcome.clone(),
-            key_id: a.key_id.clone(),
-            unit: a.unit.clone(),
-            tool_calls: usage.tool_calls,
-            tools_offered: a.tools_offered,
-            tools_would_prune: a.tools_would_prune,
-            pruned_schema_tokens_est: a.pruned_schema_tokens_est,
-            identity_reason: a.identity_reason.clone(),
-        });
+        self.sink
+            .record(allow_record(run, a, actual, usage, saved, now_millis()));
+    }
+}
+
+/// The `allow` row for a settled call: the one shape both `SettleGuard::record_row` and an
+/// observed closure (D8.1, `crate::closure`) hand to the sink, so a closed retained call
+/// reaches the Parquet trace and the Cloud by exactly the path a settled call takes.
+pub fn allow_record(
+    run: &Reservation,
+    a: &CallAttribution,
+    actual: Microusd,
+    usage: &Usage,
+    saved: Microusd,
+    ts_millis: i64,
+) -> CallRecord {
+    CallRecord {
+        ts_millis,
+        run_id: run.run_id.clone(),
+        model: a.model.clone(),
+        decision: "allow".into(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cost_microusd: actual.0,
+        step: run.step,
+        agent_id: a.agent_id.clone(),
+        saved_microusd: saved.0,
+        parent_run_id: a.parent_run_id.clone(),
+        on_behalf_of: a.on_behalf_of.clone(),
+        outcome: a.outcome.clone(),
+        key_id: a.key_id.clone(),
+        unit: a.unit.clone(),
+        tool_calls: usage.tool_calls,
+        tools_offered: a.tools_offered,
+        tools_would_prune: a.tools_would_prune,
+        pruned_schema_tokens_est: a.pruned_schema_tokens_est,
+        identity_reason: a.identity_reason.clone(),
     }
 }
 
@@ -1357,6 +1379,35 @@ mod tests {
         d
     }
 
+    /// D8.1. The retained record carries the call's attribution, on disk and in the registry,
+    /// so an observed closure's `allow` row names the agent, key and unit the call had.
+    #[test]
+    fn a_retained_reservation_journals_the_calls_attribution() {
+        let dir = journal_dir("attribution");
+        let mut r = rig();
+        r.retained = Arc::new(Retained::with_journal(
+            crate::retainedjournal::Journal::open(&dir).unwrap(),
+        ));
+        {
+            let mut g = rig_guard(&r);
+            g.attribution.agent_id = "agent://acme/bot".into();
+            g.attribution.key_id = "k-ops".into();
+            g.dispatching();
+        }
+        let expected = crate::retainedjournal::RowAttribution {
+            agent_id: "agent://acme/bot".into(),
+            key_id: "k-ops".into(),
+            unit: "treasury".into(),
+            ..Default::default()
+        };
+        let held = r.retained.for_run("r")[0].clone();
+        assert_eq!(held.attribution.as_ref(), Some(&expected));
+        let read = crate::retainedjournal::read(&dir).unwrap();
+        assert_eq!(read.records[0].attribution.as_ref(), Some(&expected));
+        assert_eq!(read.records[0].revision(), held.revision);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// W03. A retained reservation is appended to the journal before the guard returns, with
     /// the handle a restart needs, and a fresh process reading that journal holds the same
     /// liability on the run and on the unit.
@@ -1424,6 +1475,7 @@ mod tests {
             model: "m".into(),
             retained_at_millis: 0,
             revision: String::new(),
+            attribution: None,
         };
         for _ in 0..MAX_RETAINED {
             assert!(r.retained.push(filler.clone()));

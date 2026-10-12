@@ -21,20 +21,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const LISTENING_NEEDLE: &str = "tokenfuse gateway listening";
-const AGENT: &str = "agent://test/bot";
+pub(super) const AGENT: &str = "agent://test/bot";
 const CALL: &str = r#"{"model":"claude-sonnet","max_tokens":1000,"messages":[{"role":"user","content":"hello there"}]}"#;
-const SECRET: &str = "closure-test-secret-0123456789abcdef0123456789";
+pub(super) const SECRET: &str = "closure-test-secret-0123456789abcdef0123456789";
 const TOKEN_HEADER: &str = "x-fuse-closure-token";
 const JOURNAL: &str = "retained-reservations.ndjson";
 
-fn free_addr() -> String {
+pub(super) fn free_addr() -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
     a.to_string()
 }
 
-fn now_millis() -> i64 {
+pub(super) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -44,7 +44,7 @@ fn now_millis() -> i64 {
 /// The token the operator console mints after a passkey assertion:
 /// `v1.<reservation id>.<revision>.<expiry, unix millis>.<hex HMAC-SHA256>`,
 /// the MAC over `tokenfuse-closure-v1\n<id>\n<revision>\n<expiry>`.
-fn mint(secret: &str, id: u64, revision: &str, exp_millis: i64) -> String {
+pub(super) fn mint(secret: &str, id: u64, revision: &str, exp_millis: i64) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(format!("tokenfuse-closure-v1\n{id}\n{revision}\n{exp_millis}").as_bytes());
     let sig: String = mac
@@ -56,7 +56,7 @@ fn mint(secret: &str, id: u64, revision: &str, exp_millis: i64) -> String {
     format!("v1.{id}.{revision}.{exp_millis}.{sig}")
 }
 
-async fn provider(hold: Arc<AtomicBool>) -> String {
+pub(super) async fn provider(hold: Arc<AtomicBool>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -114,7 +114,7 @@ async fn read_post(socket: &mut tokio::net::TcpStream) -> bool {
     }
 }
 
-fn identity_map(dir: &std::path::Path, name: &str, cap_usd: f64) -> String {
+pub(super) fn identity_map(dir: &std::path::Path, name: &str, cap_usd: f64) -> String {
     let p = dir.join(name);
     std::fs::write(
         &p,
@@ -168,12 +168,12 @@ fn wait_for_listening(child: &mut Child) -> bool {
     rx.recv_timeout(Duration::from_secs(15)).is_ok()
 }
 
-fn stop(mut child: Child) {
+pub(super) fn stop(mut child: Child) {
     child.kill().ok();
     child.wait().ok();
 }
 
-async fn call(addr: &str, run: &str, parent: Option<&str>) -> reqwest::Response {
+pub(super) async fn call(addr: &str, run: &str, parent: Option<&str>) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .header("x-fuse-run-id", run)
@@ -187,7 +187,7 @@ async fn call(addr: &str, run: &str, parent: Option<&str>) -> reqwest::Response 
     req.send().await.expect("the gateway must answer")
 }
 
-async fn runs(addr: &str) -> Vec<serde_json::Value> {
+pub(super) async fn runs(addr: &str) -> Vec<serde_json::Value> {
     reqwest::get(format!("http://{addr}/v1/runs"))
         .await
         .unwrap()
@@ -196,12 +196,12 @@ async fn runs(addr: &str) -> Vec<serde_json::Value> {
         .unwrap()
 }
 
-fn row<'a>(rows: &'a [serde_json::Value], run: &str) -> Option<&'a serde_json::Value> {
+pub(super) fn row<'a>(rows: &'a [serde_json::Value], run: &str) -> Option<&'a serde_json::Value> {
     rows.iter().find(|r| r["run_id"] == run)
 }
 
 /// `GET /v1/retained`: the id and revision a console needs to mint a token.
-async fn retained(addr: &str) -> (u16, serde_json::Value) {
+pub(super) async fn retained(addr: &str) -> (u16, serde_json::Value) {
     let r = reqwest::get(format!("http://{addr}/v1/retained"))
         .await
         .unwrap();
@@ -209,7 +209,7 @@ async fn retained(addr: &str) -> (u16, serde_json::Value) {
     (status, r.json().await.unwrap_or_default())
 }
 
-async fn close(
+pub(super) async fn close(
     addr: &str,
     token: Option<&str>,
     body: serde_json::Value,
@@ -226,7 +226,7 @@ async fn close(
     (status, r.json().await.unwrap_or_default())
 }
 
-fn observed(id: u64, revision: &str, op: &str, cost: i64) -> serde_json::Value {
+pub(super) fn observed(id: u64, revision: &str, op: &str, cost: i64) -> serde_json::Value {
     serde_json::json!({
         "reservation_id": id,
         "expected_revision": revision,
@@ -237,7 +237,7 @@ fn observed(id: u64, revision: &str, op: &str, cost: i64) -> serde_json::Value {
     })
 }
 
-fn no_charge(id: u64, revision: &str, op: &str) -> serde_json::Value {
+pub(super) fn no_charge(id: u64, revision: &str, op: &str) -> serde_json::Value {
     serde_json::json!({
         "reservation_id": id,
         "expected_revision": revision,

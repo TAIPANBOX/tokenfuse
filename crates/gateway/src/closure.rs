@@ -34,10 +34,17 @@
 //! them with the records they closed (D-3), and a retry across a second restart answers
 //! `404 not_retained`, never a second charge.
 //!
-//! **Not on the event stream.** No agent-event type describes a closure, and a retained
-//! record carries no `agent_id` for an event to be filed under (SPEC 6.1 forbids inventing
-//! one), so an event here is a new type and a cross-repository change (D10). The journal's
-//! closure record and one log line are the audit record until then.
+//! **Spend reaches the Cloud (D8.1).** An observed closure writes the `allow` row a settled
+//! call writes (`settle::allow_record`), through the same sink, so the Parquet trace and, in
+//! Cloud mode, the control plane see the observed cost, and the run and unit seeds a restarted
+//! gateway takes from the Cloud (invariants 70 and 52) include it. One row per closure: it is
+//! written on the first application only, never on a replay. A no-charge closure writes none.
+//!
+//! **Not on the event stream.** No agent-event type describes a closure, so an event here is
+//! a new type and a cross-repository change (D10). The retained record carries the call's
+//! `agent_id` since D8.1, which such an event would be filed under; a record journaled before
+//! that carries none (SPEC 6.1 forbids inventing one). The journal's closure record, one log
+//! line and, for an observed closure, the `allow` row are the audit record until then.
 
 use crate::retainedjournal::{ClosureRecord, KIND_CLOSURE};
 use crate::state::AppState;
@@ -515,6 +522,15 @@ pub fn apply(
     if let Some(u) = &entry.unit {
         st.units.settle(u, settled, now);
     }
+    // D8.1: an observed cost is spend, so it takes the path a settled call's spend takes, the
+    // `allow` row through the sink (the Parquet trace and, in Cloud mode, the cloud sink), and
+    // a restarted gateway's run and unit seeds (invariants 70 and 52) count it. Written here,
+    // once, after the closure is durable and before the books note it, so a replay of the
+    // same operation (answered above from the books, in this process or after a restart)
+    // never writes a second row. A no-charge closure is a release, and a release writes no row.
+    if req.evidence_kind == EvidenceKind::Observed {
+        st.sink.record(closure_row(&entry, settled, now));
+    }
     books.note(&record);
     tracing::info!(
         reservation = record.reservation_id,
@@ -529,6 +545,47 @@ pub fn apply(
         "retained reservation closed with evidence (D8): settled on the run chain it was admitted against and on its unit"
     );
     (StatusCode::OK, result_body(&record, false))
+}
+
+/// The `allow` row an observed closure writes: `settle::allow_record`, the shape a settled
+/// call's row has, with the attribution the retained record journaled, the observed cost, no
+/// token counts (the evidence is a cost, not a usage record) and no router savings. A record
+/// from a journal line older than the attribution field names no agent or key; its unit is
+/// taken from the unit half when it has one, so the Cloud's unit month still counts it.
+fn closure_row(
+    entry: &crate::settle::RetainedReservation,
+    settled: Microusd,
+    now: i64,
+) -> crate::sink::CallRecord {
+    let journaled = entry.attribution.clone().unwrap_or_default();
+    let unit = if journaled.unit.is_empty() {
+        entry
+            .unit
+            .as_ref()
+            .map(|u| u.unit.clone())
+            .unwrap_or_default()
+    } else {
+        journaled.unit
+    };
+    let attribution = crate::settle::CallAttribution {
+        model: entry.model.clone(),
+        agent_id: journaled.agent_id,
+        parent_run_id: journaled.parent_run_id,
+        on_behalf_of: journaled.on_behalf_of,
+        outcome: journaled.outcome,
+        key_id: journaled.key_id,
+        unit,
+        identity_reason: journaled.identity_reason,
+        ..Default::default()
+    };
+    crate::settle::allow_record(
+        &entry.run,
+        &attribution,
+        settled,
+        &tokenfuse_core::Usage::default(),
+        Microusd::ZERO,
+        now,
+    )
 }
 
 /// One row of `GET /v1/retained`.
@@ -589,12 +646,48 @@ mod tests {
         units: Arc<UnitLedger>,
         door: ClosureDoor,
         now: i64,
+        rows: Arc<Rows>,
+    }
+
+    /// Every row the closure hands the sink, the stand-in for the Parquet trace and the cloud
+    /// sink (`TeeSink` hands both the same record).
+    #[derive(Default)]
+    struct Rows(Mutex<Vec<crate::sink::CallRecord>>);
+    impl crate::sink::EventSink for Rows {
+        fn record(&self, rec: crate::sink::CallRecord) {
+            self.0.lock().unwrap().push(rec);
+        }
+        fn flush(&self) {}
+    }
+    impl Rows {
+        fn all(&self) -> Vec<crate::sink::CallRecord> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn attributed() -> Option<retainedjournal::RowAttribution> {
+        Some(retainedjournal::RowAttribution {
+            agent_id: "agent://acme/bot".into(),
+            key_id: "k-ops".into(),
+            unit: "ops".into(),
+            parent_run_id: "parent".into(),
+            on_behalf_of: "user://acme/alice".into(),
+            ..Default::default()
+        })
     }
 
     /// A state whose registry (and journal, with `dir`) holds one retained reservation of
     /// `amount` on `child` under `parent`, with a unit half on `ops`, taken the way
     /// `SettleGuard::retain` takes it.
     fn rig(dir: Option<&std::path::Path>, amount: Microusd) -> (Rig, RetainedReservation) {
+        rig_with(dir, amount, attributed())
+    }
+
+    fn rig_with(
+        dir: Option<&std::path::Path>,
+        amount: Microusd,
+        attribution: Option<retainedjournal::RowAttribution>,
+    ) -> (Rig, RetainedReservation) {
         let ledger = Arc::new(Ledger::new());
         let units = Arc::new(UnitLedger::new(HashMap::from([(
             "ops".to_string(),
@@ -616,6 +709,7 @@ mod tests {
             model: "m".into(),
             retained_at_millis: now,
             revision: String::new(),
+            attribution,
         };
         let record = Record::retained(&entry, tail);
         entry.revision = record.revision();
@@ -634,6 +728,8 @@ mod tests {
         )
         .with_retained(Arc::new(retained));
         state.units = units.clone();
+        let rows = Arc::new(Rows::default());
+        let state = state.with_sink(rows.clone());
         (
             Rig {
                 state,
@@ -641,6 +737,7 @@ mod tests {
                 units,
                 door: ClosureDoor::new(SECRET),
                 now,
+                rows,
             },
             entry,
         )
@@ -740,6 +837,7 @@ mod tests {
         assert_eq!(r.ledger.snapshot("child").unwrap().spent, Microusd(1_000));
         assert_eq!(r.ledger.snapshot("parent").unwrap().spent, Microusd(1_000));
         assert_eq!(r.units.spent("ops", r.now), Microusd(1_000));
+        assert_eq!(r.rows.all().len(), 1, "one closure, one row");
     }
 
     #[test]
@@ -760,6 +858,11 @@ mod tests {
         assert_eq!(conflict.1["error"]["type"], "closure_conflict");
         assert_eq!(r.ledger.snapshot("child").unwrap().spent, Microusd(700));
         assert_eq!(r.units.spent("ops", r.now), Microusd(700));
+        assert_eq!(
+            r.rows.all().len(),
+            1,
+            "the replay and the conflict write no row"
+        );
     }
 
     /// The closure record is written before anything moves; a write that fails closes nothing.
@@ -778,6 +881,7 @@ mod tests {
         );
         assert_eq!(r.units.reserved("ops", r.now), Microusd(8_000));
         assert_eq!(r.state.retained.len(), 1);
+        assert!(r.rows.all().is_empty(), "nothing closed, nothing spent");
         assert!(retainedjournal::read(&dir).unwrap().closures.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -816,7 +920,58 @@ mod tests {
         assert_eq!(again.0, StatusCode::OK);
         assert_eq!(again.1["replayed"], true);
         assert_eq!(again.1["settled_microusd"], 700);
+        assert!(
+            r2.rows.all().is_empty(),
+            "a replay after a restart writes no second row"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D8.1: the observed cost is spend, so it is written as the `allow` row a settled call
+    /// writes, once, under the attribution the retained record journaled.
+    #[test]
+    fn an_observed_closure_writes_one_allow_row_with_the_calls_attribution() {
+        let (r, e) = rig(None, Microusd(8_000));
+        let req = request(&e, "op", EvidenceKind::Observed, Some(5_500));
+        assert_eq!(apply(&r.state, &r.door, &req, r.now).0, StatusCode::OK);
+        let rows = r.rows.all();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.decision, "allow");
+        assert_eq!(row.run_id, "child");
+        assert_eq!(row.cost_microusd, 5_500);
+        assert_eq!(row.step, e.run.step);
+        assert_eq!(row.model, "m");
+        assert_eq!(row.agent_id, "agent://acme/bot");
+        assert_eq!(row.key_id, "k-ops");
+        assert_eq!(row.unit, "ops");
+        assert_eq!(row.parent_run_id, "parent");
+        assert_eq!(row.on_behalf_of, "user://acme/alice");
+        assert_eq!((row.input_tokens, row.output_tokens), (0, 0));
+        assert_eq!(row.saved_microusd, 0);
+        assert_eq!(row.ts_millis, r.now);
+    }
+
+    #[test]
+    fn a_no_charge_closure_writes_no_row() {
+        let (r, e) = rig(None, Microusd(8_000));
+        let req = request(&e, "op", EvidenceKind::NoCharge, None);
+        assert_eq!(apply(&r.state, &r.door, &req, r.now).0, StatusCode::OK);
+        assert!(r.rows.all().is_empty(), "{:?}", r.rows.all());
+    }
+
+    /// A reservation journaled before the attribution field existed: the row names no agent
+    /// or key, and takes its unit from the unit half, so the Cloud's unit month still counts it.
+    #[test]
+    fn a_record_from_before_the_attribution_field_files_its_unit_from_the_unit_half() {
+        let (r, e) = rig_with(None, Microusd(8_000), None);
+        let req = request(&e, "op", EvidenceKind::Observed, Some(300));
+        assert_eq!(apply(&r.state, &r.door, &req, r.now).0, StatusCode::OK);
+        let rows = r.rows.all();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].unit, "ops");
+        assert_eq!(rows[0].agent_id, "");
+        assert_eq!(rows[0].cost_microusd, 300);
     }
 
     #[test]

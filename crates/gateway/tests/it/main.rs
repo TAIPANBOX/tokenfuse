@@ -17,6 +17,7 @@ mod common;
 
 mod admin_gate;
 mod cache_default_startup;
+mod closure_reaches_the_cloud;
 mod codex_money_review;
 mod delegation_htu_matches_wire;
 mod image_user_group;
