@@ -85,9 +85,13 @@ does has something to read:
   already must for any per-request rule; one that does not will have its
   answer reused for other arguments of the same tool for the cache TTL.
 - A decide that carries a `tool_call` waits up to
-  `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` (default: the shared
-  `TOKENFUSE_WARDRYX_TIMEOUT_MS`); the LLM path never sends one and keeps the
-  shared budget.
+  `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`; unset, the shared
+  `TOKENFUSE_WARDRYX_TIMEOUT_MS` when the operator set it, else 1000 ms. The
+  LLM path never sends one and keeps the shared budget (50 ms by default).
+  The tool path's default is longer because a deny that arrives after the
+  timeout is lost to the failmode, which defaults to open, and a PDP behind
+  the typed-signal proxy routinely takes more than 50 ms (CLAUDE.md
+  invariant 74).
 
 **No identity, no call (enforce mode).** Without an `X-Fuse-Agent-Id` (every
 stdio call, and any HTTP call that omits it) an enforcing gate **refuses** the

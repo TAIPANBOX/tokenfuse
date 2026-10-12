@@ -1013,6 +1013,29 @@ run_case "visible: the gateway names a basis on a refusal" fail \
 	"$(py 'edit("crates/gateway/src/cloudsink.rs", "Some(book) if rec.decision == \"allow\" =>", "Some(book) =>")')" \
 	"the_wire_record_names_the_basis_an_admitted_call_was_charged_at ... FAILED"
 
+# --- invariant 74: the tool path waits for the policy plane ----------------
+#
+# Not a scripts/*.sh gate: the precedence is held by cargo test. The first
+# mutant is the defect itself, the tool path's default reverted to the model
+# path's 50 ms, so a deny slower than that fails open through the real broker;
+# the second ignores a shared value the operator set; the third moves the
+# model path's default to the tool path's. Each planted text still uses every
+# name it replaces, so it compiles under CI's `RUSTFLAGS=-D warnings`.
+run_case "tool-timeout: the tool path's default reverted to the shared 50 ms" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call" \
+	"$(py 'edit("crates/gateway/src/wardryx.rs", "    let fallback = shared_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);", "    let fallback = shared_ms.unwrap_or({ let _ = DEFAULT_TOOL_TIMEOUT_MS; DEFAULT_TIMEOUT_MS });")')" \
+	"a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call ... FAILED"
+
+run_case "tool-timeout: the precedence ignores a shared value the operator set" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::an_explicit_shared_timeout_still_governs_the_tool_path" \
+	"$(py 'edit("crates/gateway/src/wardryx.rs", "    let fallback = shared_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);", "    let fallback = { let _ = shared_ms; DEFAULT_TOOL_TIMEOUT_MS };")')" \
+	"an_explicit_shared_timeout_still_governs_the_tool_path ... FAILED"
+
+run_case "tool-timeout: the model path's default moved to 1000 ms" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact wardryx::tests::with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50" \
+	"$(py 'edit("crates/gateway/src/wardryx.rs", "const DEFAULT_TIMEOUT_MS: u64 = 50;", "const DEFAULT_TIMEOUT_MS: u64 = 1_000;")')" \
+	"with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50 ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

@@ -76,29 +76,50 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Default per-call timeout when `TOKENFUSE_WARDRYX_TIMEOUT_MS` is unset.
+/// Default per-call timeout when `TOKENFUSE_WARDRYX_TIMEOUT_MS` is unset: the
+/// model path's deadline. A model call is latency-critical, so it stays short.
 const DEFAULT_TIMEOUT_MS: u64 = 50;
 
-/// The tool path's timeout in milliseconds: `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`
-/// when it is a positive integer, the shared budget (`shared_ms`) otherwise.
-/// Unset or blank is silently the shared value, which is the point of the
-/// default; a value that is set and unusable (not an integer, negative, or
-/// zero, a budget under which every call would fall back) is the shared value
-/// too, with one warn line naming it, rather than a guess in either direction.
-fn tool_timeout_ms_from(raw: Option<&str>, shared_ms: u64) -> u64 {
+/// The tool path's deadline when neither `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`
+/// nor `TOKENFUSE_WARDRYX_TIMEOUT_MS` is set (invariant 74). Until 2026-10-12
+/// the tool path took the model path's 50 ms here, and a deny that took longer
+/// (the ordinary case behind `typryx wardryx-proxy`, which waits up to 150 ms
+/// for its model) arrived after the broker had given up, so the default
+/// failmode, open, let the denied call through. A tool call is not
+/// latency-critical the way a model call is, and 1000 ms clears the proxy's
+/// default and wardryx behind it with room to spare.
+const DEFAULT_TOOL_TIMEOUT_MS: u64 = 1_000;
+
+/// The tool path's timeout in milliseconds, by precedence:
+/// `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` when it is a positive integer; else the
+/// shared `TOKENFUSE_WARDRYX_TIMEOUT_MS` when the operator set one this
+/// process reads (`shared_ms`, `None` when it is unset or does not parse, as
+/// the model path reads it); else [`DEFAULT_TOOL_TIMEOUT_MS`]. An explicit
+/// shared value still governs both paths, as it always has. Unset or blank is
+/// silently the fallback, which is the point of a default; a value that is set
+/// and unusable (not an integer, negative, or zero, a budget under which every
+/// call would fall back) is the fallback too, with one warn line naming it,
+/// rather than a guess in either direction.
+fn tool_timeout_ms_from(raw: Option<&str>, shared_ms: Option<u64>) -> u64 {
+    let fallback = shared_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT_MS);
     let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
-        return shared_ms;
+        return fallback;
     };
     match text.parse::<u64>() {
         Ok(ms) if ms > 0 => ms,
         _ => {
+            let source = if shared_ms.is_some() {
+                "the shared TOKENFUSE_WARDRYX_TIMEOUT_MS"
+            } else {
+                "its own default"
+            };
             tracing::warn!(
                 value = %text,
-                shared_ms,
+                fallback_ms = fallback,
                 "TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS is not a positive integer number of \
-                 milliseconds; the tool path uses the shared TOKENFUSE_WARDRYX_TIMEOUT_MS"
+                 milliseconds; the tool path uses {source}"
             );
-            shared_ms
+            fallback
         }
     }
 }
@@ -888,10 +909,11 @@ pub struct Wardryx {
     /// 404 warning above.
     warned_filter_other: AtomicBool,
     /// The per-call timeout for a decide that carries a [`ToolCall`], the MCP
-    /// broker's question. Equal to the shared `TOKENFUSE_WARDRYX_TIMEOUT_MS`
-    /// budget unless `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` says otherwise, so an
-    /// operator can give a tool call a longer deadline (an argument-aware
-    /// policy may need one) without slowing the LLM path.
+    /// broker's question. `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` when set, else
+    /// the shared `TOKENFUSE_WARDRYX_TIMEOUT_MS` when the operator set it,
+    /// else `DEFAULT_TOOL_TIMEOUT_MS` (see `tool_timeout_ms_from`), so a
+    /// tool call can wait longer than a model call (a PDP behind a proxy, or
+    /// an argument-aware policy, may need it) without slowing the LLM path.
     tool_timeout: Duration,
 }
 
@@ -908,7 +930,7 @@ impl Wardryx {
             filter_cache: FilterCache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
             warned_filter_not_found: AtomicBool::new(false),
             warned_filter_other: AtomicBool::new(false),
-            tool_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            tool_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
         }
     }
 
@@ -981,9 +1003,12 @@ impl Wardryx {
             _ => FailMode::Open,
         };
         let key = var("TOKENFUSE_WARDRYX_KEY").filter(|s| !s.is_empty());
-        let timeout_ms: u64 = var("TOKENFUSE_WARDRYX_TIMEOUT_MS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+        // `Some` only when the operator set a value this process reads: an
+        // explicit shared value is a choice for both paths, while an unset or
+        // unparseable one leaves each path its own default (invariant 74).
+        let shared_ms: Option<u64> =
+            var("TOKENFUSE_WARDRYX_TIMEOUT_MS").and_then(|s| s.parse().ok());
+        let timeout_ms = shared_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let cache_ttl_ms: u64 = var("TOKENFUSE_WARDRYX_CACHE_TTL_MS")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_CACHE_TTL_MS);
@@ -992,7 +1017,7 @@ impl Wardryx {
         // decide never reaches for this budget.
         let tool_timeout_ms = tool_timeout_ms_from(
             var("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS").as_deref(),
-            timeout_ms,
+            shared_ms,
         );
 
         Wardryx::new(
@@ -1962,18 +1987,24 @@ mod tests {
 
     // -- the tool path's own timeout --
 
+    // Named `the_tool_timeout_defaults_to_the_shared_budget` until 2026-10-12,
+    // when an unset shared value stopped being a budget the tool path takes
+    // (invariant 74): the expectations are written out, never read from the
+    // constant, so a changed default fails here.
     #[test]
-    fn the_tool_timeout_defaults_to_the_shared_budget() {
+    fn an_unset_tool_timeout_takes_the_shared_budget_the_operator_set_or_1000() {
         for raw in [None, Some(""), Some("   ")] {
-            assert_eq!(tool_timeout_ms_from(raw, 50), 50, "{raw:?}");
-            assert_eq!(tool_timeout_ms_from(raw, 1234), 1234, "{raw:?}");
+            assert_eq!(tool_timeout_ms_from(raw, Some(50)), 50, "{raw:?}");
+            assert_eq!(tool_timeout_ms_from(raw, Some(1234)), 1234, "{raw:?}");
+            assert_eq!(tool_timeout_ms_from(raw, None), 1000, "{raw:?}");
         }
     }
 
     #[test]
     fn a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget() {
-        assert_eq!(tool_timeout_ms_from(Some("2000"), 50), 2000);
-        assert_eq!(tool_timeout_ms_from(Some(" 750 "), 50), 750);
+        assert_eq!(tool_timeout_ms_from(Some("2000"), Some(50)), 2000);
+        assert_eq!(tool_timeout_ms_from(Some(" 750 "), Some(50)), 750);
+        assert_eq!(tool_timeout_ms_from(Some("2000"), None), 2000);
         for junk in [
             "abc",
             "-5",
@@ -1983,7 +2014,7 @@ mod tests {
             "5s",
             "99999999999999999999999",
         ] {
-            assert_eq!(tool_timeout_ms_from(Some(junk), 50), 50, "{junk:?}");
+            assert_eq!(tool_timeout_ms_from(Some(junk), Some(50)), 50, "{junk:?}");
         }
     }
 
@@ -2019,11 +2050,11 @@ mod tests {
             ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
         ]));
         assert_eq!(w.tool_timeout(), Duration::from_millis(80));
-        let w = Wardryx::from_vars(vars(&[
-            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
-            ("TOKENFUSE_WARDRYX_MODE", "enforce"),
-        ]));
-        assert_eq!(w.tool_timeout(), Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        // This test also asserted, until 2026-10-12, that with nothing set
+        // the tool path took the model path's 50 ms. That was the defect
+        // invariant 74 now records (a deny slower than 50 ms failed open), so
+        // the half is gone; the unset case is
+        // `with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50`.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

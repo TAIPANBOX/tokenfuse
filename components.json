@@ -233,7 +233,7 @@
           },
           "TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS": {
             "required": false,
-            "default": "<TOKENFUSE_WARDRYX_TIMEOUT_MS>"
+            "default": "<TOKENFUSE_WARDRYX_TIMEOUT_MS if set, else 1000>"
           },
           "TOKENFUSE_MODE": {
             "required": false

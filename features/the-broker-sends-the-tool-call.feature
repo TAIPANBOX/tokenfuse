@@ -67,13 +67,15 @@ Feature: The MCP broker tells the policy plane which call it is about to make
     Then a decide carrying a tool_call gets its verdict
     And a decide without one falls back as an unreachable plane
 
-  # @test:the_tool_timeout_defaults_to_the_shared_budget
+  # @test:an_unset_tool_timeout_takes_the_shared_budget_the_operator_set_or_1000
   # @test:with_only_the_shared_timeout_set_the_tool_path_gets_it_too
   # @test:a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget
-  Scenario: Unset means the shared value and an unusable value does too
+  Scenario: Unset means the shared value the operator set and an unusable value does too
     Given TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS is unset, blank, zero, negative or not a number
+    And TOKENFUSE_WARDRYX_TIMEOUT_MS is set
     When the broker's policy hook is built
     Then the tool path's timeout is TOKENFUSE_WARDRYX_TIMEOUT_MS
+    And with neither set it is 1000 ms (see the-tool-path-waits-for-the-policy-plane.feature)
 
   # @test:hostile_arguments_never_panic_and_the_broker_keeps_serving
   # @test:arguments_that_serialize_to_exactly_the_cap_in_many_shapes_never_panic
