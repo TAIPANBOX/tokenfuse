@@ -1056,9 +1056,12 @@ run_case "drifted-tool: warn mode refuses" fail \
 	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            if st.scan == ScanMode::Block {\n                tracing::warn!(tool = %tool, \"mcp broker: refused a call", "            if st.scan != ScanMode::Off {\n                tracing::warn!(tool = %tool, \"mcp broker: refused a call")')" \
 	"warn_mode_forwards_a_drifted_tool_call_and_records_it_once ... FAILED"
 
-run_case "drifted-tool: the listing is never recorded" fail \
+# The mutant keeps the call and drops what it records: removing the call left
+# `observe` unused, which is an error under CI's RUSTFLAGS=-D warnings, so the
+# case failed for the wrong reason (WRONG REASON on 2026-10-12, run attempt 2).
+run_case "drifted-tool: a listing's changes are never recorded" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_drifted_tool_is_refused_before_anything_is_forwarded" \
-	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            st.drifted.observe(&upstream_url, &listed, &changed);\n", "            let _ = (&listed, &changed);\n")')" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            st.drifted.observe(&upstream_url, &listed, &changed);\n", "            st.drifted.observe(&upstream_url, &listed, &[]);\n")')" \
 	"a_drifted_tool_is_refused_before_anything_is_forwarded ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
