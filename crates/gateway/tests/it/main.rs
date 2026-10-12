@@ -39,6 +39,7 @@ mod reasoning_tokens_are_output;
 mod require_run_id;
 mod retained_closure;
 mod retained_journal_unreadable;
+mod retained_on_the_bus;
 mod retained_survives_restart;
 mod router;
 mod run_budget_ceiling_startup;

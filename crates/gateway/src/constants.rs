@@ -447,6 +447,10 @@ mod tests {
                 ("taint_cleared", "high"),
                 ("breaker_shadow", "medium"),
                 ("run_stalled", "medium"),
+                // D10 (agent-passport SPEC 6.2): a retained call asks a person
+                // to act soon; its closure lifts a money control.
+                ("call_retained", "medium"),
+                ("retained_closed", "high"),
             ],
             "the artifact does not publish the agent-event vocabulary this \
              repository emits. If a type was added or a severity moved, update \

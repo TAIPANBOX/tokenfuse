@@ -974,6 +974,220 @@ mod tests {
         assert_eq!(rows[0].cost_microusd, 300);
     }
 
+    // -- D10: a closure reaches the bus (invariant 90) ----------------------
+    //
+    // agent-passport SPEC 6.2 registers `retained_closed` (high): a person
+    // closing a retained reservation with evidence, raised once per closure the
+    // gateway applies, never for a refused attempt and never for a retry of an
+    // operation already applied.
+
+    /// A real exporter on a private file: it is the serialization point that
+    /// enforces `agent_id`, so a test reads what reached the bus, not what a
+    /// double was handed.
+    fn bus(name: &str) -> (Arc<crate::events::EventExporter>, std::path::PathBuf) {
+        let dir = scratch(&format!("bus-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let exporter = crate::events::EventExporter::open(path.to_str().unwrap()).unwrap();
+        (Arc::new(exporter), path)
+    }
+
+    fn closed_on_bus(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["type"] == "retained_closed")
+            .collect()
+    }
+
+    #[test]
+    fn an_applied_closure_writes_one_retained_closed_with_its_evidence() {
+        let (r, e) = rig(None, Microusd(8_000));
+        let (events, path) = bus("observed");
+        let st = r.state.clone().with_events(events);
+        let (status, body) = apply(
+            &st,
+            &r.door,
+            &request(&e, "op", EvidenceKind::Observed, Some(5_500)),
+            r.now,
+        );
+        let on_bus = closed_on_bus(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(on_bus.len(), 1, "one closure, one event: {on_bus:?}");
+        let ev = &on_bus[0];
+        assert_eq!(ev["schema"], "taipanbox.dev/agent-event/v0.2", "{ev}");
+        assert_eq!(ev["source"], "tokenfuse", "{ev}");
+        assert_eq!(ev["severity"], "high", "{ev}");
+        assert_eq!(
+            ev["agent_id"], "agent://acme/bot",
+            "the journaled call's agent: {ev}"
+        );
+        assert_eq!(ev["run_id"], "child", "{ev}");
+        assert!(
+            ev.get("on_behalf_of").is_none(),
+            "SPEC 6.2 puts agent_id and run_id on this envelope, nothing else: {ev}"
+        );
+        assert_eq!(
+            ev["data"],
+            serde_json::json!({
+                "reservation_id": e.run.id,
+                "revision": e.revision,
+                "operation_id": "op",
+                "evidence_kind": "observed",
+                "settled_microusd": 5_500,
+                "evidence_ref": "provider usage msg_1",
+                "unit": "ops",
+            }),
+            "{ev}"
+        );
+    }
+
+    #[test]
+    fn a_no_charge_closure_writes_one_retained_closed_settled_at_zero() {
+        let (r, e) = rig(None, Microusd(8_000));
+        let (events, path) = bus("no-charge");
+        let st = r.state.clone().with_events(events);
+        let (status, _) = apply(
+            &st,
+            &r.door,
+            &request(&e, "op-nc", EvidenceKind::NoCharge, None),
+            r.now,
+        );
+        let on_bus = closed_on_bus(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(on_bus.len(), 1, "{on_bus:?}");
+        assert_eq!(on_bus[0]["severity"], "high");
+        assert_eq!(on_bus[0]["data"]["evidence_kind"], "no_charge");
+        assert_eq!(on_bus[0]["data"]["settled_microusd"], 0);
+        assert_eq!(on_bus[0]["data"]["operation_id"], "op-nc");
+    }
+
+    /// Asked again with the same operation, with different content, or by a
+    /// second operation: the books answer, nothing moves, and no second
+    /// `retained_closed` is written.
+    #[test]
+    fn a_replay_a_conflict_and_a_second_operation_write_no_second_retained_closed() {
+        let (r, e) = rig(None, Microusd(8_000));
+        let (events, path) = bus("replay");
+        let st = r.state.clone().with_events(events);
+        let req = request(&e, "op", EvidenceKind::Observed, Some(700));
+        let first = apply(&st, &r.door, &req, r.now);
+        let again = apply(&st, &r.door, &req, r.now + 5);
+        let mut changed = req.clone();
+        changed.evidence_ref = "a different invoice".into();
+        let conflict = apply(&st, &r.door, &changed, r.now);
+        let second = apply(
+            &st,
+            &r.door,
+            &request(&e, "op-2", EvidenceKind::Observed, Some(700)),
+            r.now,
+        );
+        let on_bus = closed_on_bus(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(again.0, StatusCode::OK);
+        assert_eq!(again.1["replayed"], true);
+        assert_eq!(conflict.1["error"]["type"], "closure_conflict");
+        assert_eq!(second.1["error"]["type"], "already_closed");
+        assert_eq!(on_bus.len(), 1, "applied once, written once: {on_bus:?}");
+        assert_eq!(on_bus[0]["data"]["operation_id"], "op");
+    }
+
+    /// A stale revision and a closure the journal cannot take close nothing,
+    /// so neither is on the bus; the closure applied after them is, alone.
+    #[test]
+    fn a_stale_revision_or_an_unwritable_journal_writes_no_retained_closed() {
+        let dir = scratch("bus-refusals-journal");
+        let (r, e) = rig(Some(&dir), Microusd(8_000));
+        let (events, path) = bus("refusals");
+        let st = r.state.clone().with_events(events);
+        let mut stale = request(&e, "op-stale", EvidenceKind::Observed, Some(700));
+        stale.expected_revision = if e.revision == "0000000000000000" {
+            "1111111111111111".into()
+        } else {
+            "0000000000000000".into()
+        };
+        let stale = apply(&st, &r.door, &stale, r.now);
+        let mut too_big = request(&e, "op-big", EvidenceKind::Observed, Some(700));
+        too_big.evidence_ref = "x".repeat(retainedjournal::MAX_LINE_BYTES);
+        let too_big = apply(&st, &r.door, &too_big, r.now);
+        let applied = apply(
+            &st,
+            &r.door,
+            &request(&e, "op-ok", EvidenceKind::Observed, Some(700)),
+            r.now,
+        );
+        let on_bus = closed_on_bus(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(stale.1["error"]["type"], "stale_revision", "{}", stale.1);
+        assert_eq!(
+            too_big.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            too_big.1
+        );
+        assert_eq!(applied.0, StatusCode::OK, "{}", applied.1);
+        assert_eq!(on_bus.len(), 1, "only the applied closure: {on_bus:?}");
+        assert_eq!(on_bus[0]["data"]["operation_id"], "op-ok");
+    }
+
+    /// The operation answered again after a restart (the books loaded from the
+    /// journal) is a replay, and writes nothing to the bus.
+    #[test]
+    fn a_closure_answered_again_after_a_restart_writes_no_second_retained_closed() {
+        let dir = scratch("bus-restart");
+        let (r, e) = rig(Some(&dir), Microusd(8_000));
+        let (events, path) = bus("restart-first");
+        let st = r.state.clone().with_events(events);
+        let req = request(&e, "op", EvidenceKind::Observed, Some(700));
+        assert_eq!(apply(&st, &r.door, &req, r.now).0, StatusCode::OK);
+
+        let door = ClosureDoor::new(SECRET);
+        door.remember(&retainedjournal::read(&dir).unwrap().closures);
+        let (r2, _) = rig(None, Microusd(1));
+        let (events2, path2) = bus("restart-second");
+        let st2 = r2.state.clone().with_events(events2);
+        let again = apply(&st2, &door, &req, r.now);
+        let (before, after) = (closed_on_bus(&path), closed_on_bus(&path2));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(path2.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(before.len(), 1, "the closure itself: {before:?}");
+        assert_eq!(again.0, StatusCode::OK);
+        assert_eq!(again.1["replayed"], true);
+        assert!(after.is_empty(), "the replay wrote {after:?}");
+    }
+
+    /// SPEC 6.1: a record that names no agent (journaled before the attribution
+    /// field existed) still closes, and its `retained_closed` is skipped and
+    /// counted rather than filed under an invented subject.
+    #[test]
+    fn a_closure_of_a_record_that_names_no_agent_is_skipped_and_counted() {
+        let (r, e) = rig_with(None, Microusd(8_000), None);
+        let (events, path) = bus("no-agent");
+        let st = r.state.clone().with_events(Arc::clone(&events));
+        let (status, _) = apply(
+            &st,
+            &r.door,
+            &request(&e, "op", EvidenceKind::Observed, Some(300)),
+            r.now,
+        );
+        let on_bus = closed_on_bus(&path);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(status, StatusCode::OK);
+        assert!(on_bus.is_empty(), "{on_bus:?}");
+        assert_eq!(
+            events.skipped_count(),
+            1,
+            "the closure with no subject is skipped AND counted"
+        );
+    }
+
     #[test]
     fn malformed_requests_are_refused_before_anything_is_read() {
         let (_, e) = rig(None, Microusd(100));
