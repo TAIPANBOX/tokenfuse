@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.10.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1811-brightgreen)
+![tests](https://img.shields.io/badge/tests-1825-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -209,7 +209,7 @@ Point `TOKENFUSE_UPSTREAM` at Anthropic, or at an OpenAI-compatible endpoint - t
 
 ### 4. Catch a poisoned MCP tool for free, and gate CI on it
 
-`tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks tool descriptions for injection phrases and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch - exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
+`tokenfuse mcp-scan` is a standalone, free CLI: point it at a live MCP server over Streamable HTTP or SSE, and it checks every tool and parameter description for injection phrases, credentials, instructions to chain another tool, paths to local secret files, text addressed to the model and hidden characters, then pins a fingerprint of every tool you approve and flags a **rug pull** the moment a tool's description or schema silently changes on a later fetch - exactly the supply-chain gap MCP's re-fetch-on-connect model opens up. It ships as a GitHub Action, so a rug pull fails the PR, not a future incident review; [docs/17](docs/17-rugpull-demo.md) has a runnable, self-contained demo of the whole catch. At runtime, the companion **MCP credential-broker** goes further and keeps secrets out of the model entirely: the agent only ever holds a handle like `{{secret:github_token}}`, and the real value is injected at the last hop, never in the prompt, the trace, or the model's memory.
 
 Also worth knowing, in more detail under [What's inside](#-whats-inside): a semantic cache that serves repeated questions for $0, budget/step policies you can **backtest** against real traffic before turning them on, eBPF-based shadow-agent discovery with zero application changes, and a hosted Cloud fleet view for when one gateway isn't enough.
 
@@ -521,6 +521,8 @@ it.
 ## 🔍 Scan your MCP servers & gate CI
 
 MCP servers are a new, live attack surface: a client typically re-fetches `tools/list` on every connection and trusts whatever comes back, so a tool a human already approved can silently change behavior later, without anyone re-reviewing it. `tokenfuse mcp-scan` is a **free**, standalone CLI - no TokenFuse account, gateway, or Cloud connection required.
+
+The scan is deterministic and offline: it reads the *shape* of every description (a credential, an order to chain another tool, a path to a local secret file, text addressed to the model, hidden characters), not its meaning. A description that tells the model in calm plain prose to make something up passes, and so does a chain of tools whose names are single ordinary words. Treat a clean scan as "none of these shapes", not as "safe".
 
 **Pin the tool set you trust, then diff every later scan against it:**
 
