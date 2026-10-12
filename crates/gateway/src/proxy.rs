@@ -1912,6 +1912,8 @@ async fn handle_call(
     // tool history) so the response's tool calls can be judged against it.
     // Computed before `send` consumes `headers`.
     let mut firewall_prompt: Option<String> = None;
+    // Invariant 93: set when a declared tool's own text raised the label.
+    let mut declared_tools_note: Option<String> = None;
     let firewall_labels = if st.firewall.mode != FirewallMode::Off {
         let declared = taint_header_labels(&headers);
         // docs/07 B.4 gate 1, the half that makes the valve release. Taint is
@@ -1974,6 +1976,34 @@ async fn handle_call(
                 if !signals.contains(&h) {
                     signals.push(h);
                 }
+            }
+        }
+        // Invariant 93: the tools this request DECLARES are read by the same
+        // scanner the MCP broker runs over a listing. A taint SOURCE only: it
+        // adds the label, and the capability gate judges later tool calls.
+        // The request itself is never refused for what a description says.
+        if st.firewall.detect_injection {
+            let declared_hits = crate::declaredscan::scan(&request);
+            if !declared_hits.is_empty() {
+                let mut names: Vec<&str> = Vec::new();
+                for h in declared_hits.iter() {
+                    if !signals.contains(&h.kind) {
+                        signals.push(h.kind);
+                    }
+                    if !names.contains(&h.tool.as_str()) {
+                        names.push(h.tool.as_str());
+                    }
+                }
+                for n in &names {
+                    if !suspect_tools.iter().any(|t| t == n) {
+                        suspect_tools.push((*n).to_string());
+                    }
+                }
+                names.truncate(5);
+                declared_tools_note = Some(format!(
+                    "raised: {SUSPECTED_INJECTION} by declared tools [{}]",
+                    names.join(",")
+                ));
             }
         }
         signals.sort_unstable();
@@ -2062,7 +2092,7 @@ async fn handle_call(
         .zip(pruned_schema_tokens_est)
         .map(|(n, tokens)| format!("{n};est_tokens={tokens}"));
 
-    if parsed.stream {
+    let mut response = if parsed.stream {
         stream_managed(
             resp,
             guard,
@@ -2106,7 +2136,17 @@ async fn handle_call(
             pruned_header,
         )
         .await
+    };
+    // Invariant 93: the label is visible to a drill on the answer, in shadow
+    // and enforce alike. Appended beside any verdict note, never in place of
+    // it. A tool name is the caller's, so a value a header cannot carry is
+    // dropped rather than trusted.
+    if let Some(note) = declared_tools_note {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&note) {
+            response.headers_mut().append("x-fuse-taint", v);
+        }
     }
+    response
 }
 
 /// Add `name: value` to `builder`, but only if `value` is representable as a

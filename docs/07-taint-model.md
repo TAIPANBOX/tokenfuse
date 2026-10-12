@@ -306,6 +306,34 @@ JSON, so a linear sweep over them is cheaper than the parse that produced them.
 It is defeatable by anybody who reads that file, which is public. That is
 acceptable only because it cannot lower a gate.
 
+### A second taint source: the tools a request declares
+
+Built 2026-10-12. Tool RESULTS were the only text the detector read; the
+descriptions of the tools a request itself declares (`tools[]`, Anthropic and
+OpenAI shapes) reach the model just as surely and were never read. The same
+scanner the MCP broker runs over a tool listing now reads each declared tool's
+description and every parameter description, and a finding at `high` or
+`critical` adds the same `suspected_injection` label. The starter rule then
+applies to later exec, write and network calls in that run, through the answer
+path and `check-tool-call` alike.
+
+Like the detector above, it is a SOURCE and never a decision: the request is
+not refused for what a description says. The run's record is one
+`taint_raised` with stage `tool_result` (no new stage: that vocabulary is
+agent-passport's), `from_tools` naming the declared tools and `signals` the
+kinds, never a word of the text. The answer carries `x-fuse-taint: raised:
+suspected_injection by declared tools [...]`, beside a verdict note if there is
+one. `medium` findings (a bare mention of another tool, a bare local path) do
+not label: honest documentation produces them. Firewall off, or
+`"detect_injection": false`: nothing is read. Each distinct tool set is scanned
+once per process.
+
+Named limits: a calm instruction to fabricate an answer carries no shape and is
+not caught; nothing pins a declared set across turns (no lockfile, unlike the
+broker's rug-pull pin); a human clearance of the label does not outlast the
+next turn while the poisoned tool is still declared, because the declaration
+is resent and is not a block with an id.
+
 ### The release valve, and where the other two gates actually live
 
 **Gate 1 is built.** `POST /v1/fuse/declassify` takes `{run_id, agent_id,
