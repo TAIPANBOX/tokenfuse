@@ -6156,7 +6156,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     right: Some(2)` for the short secret, the gateway served) and
     `with_no_closure_secret_the_route_is_off` is the guard, green on both sides; ten in
     `closure::tests`, including a sixteen-thread race (`racing_closures_of_one_reservation_apply_exactly_once`)
-    and a 200-seed hostile-token sweep; three new in `retainedjournal::tests` for the rewrite.
+    and a 200-seed hostile-token sweep; three new in `retainedjournal::tests` for the rewrite; `admin_gate::the_closure_routes_are_behind_the_admin_gate`, red with the routes merged after the gate (`left: 200 right: 403`).
     Twelve mutants planted in the product code 2026-10-12 and reverted, eleven caught by a named
     test: the stale-revision check and the token binding (the end-to-end refusal test), expiry
     and the lifetime cap (the token boundary test and the end-to-end refusal test), a replay that

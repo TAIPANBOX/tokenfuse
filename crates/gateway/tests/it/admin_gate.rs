@@ -231,3 +231,39 @@ async fn the_price_book_route_is_behind_the_admin_gate() {
     assert_eq!(v["rows"], 1, "the one row this state's book holds: {v}");
     assert_eq!(v["operator_file"], false, "{v}");
 }
+
+/// D8 (invariant 89): the closure routes sit behind this gate like every other admin route.
+/// A wide bind with no admin key refuses both before any closure token is read; a configured
+/// key opens the listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_closure_routes_are_behind_the_admin_gate() {
+    let door = || {
+        Arc::new(tokenfuse_gateway::closure::ClosureDoor::new(
+            b"admin-gate-closure-secret-0123456789abcdef",
+        ))
+    };
+    let closed = AdminGate::resolve(AdminKeys::default(), false, false);
+    let app = tokenfuse_gateway::app(state(closed.clone()).with_closure(door()));
+    let resp = app.oneshot(get("/v1/retained")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_field(resp).await, "admin_keys_required");
+    let app = tokenfuse_gateway::app(state(closed).with_closure(door()));
+    let req = Request::post("/v1/retained/close")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_field(resp).await, "admin_keys_required");
+
+    let keyed = AdminGate::resolve(AdminKeys::from_spec("ops-key").unwrap(), false, false);
+    let app = tokenfuse_gateway::app(state(keyed.clone()).with_closure(door()));
+    let resp = app.oneshot(get("/v1/retained")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let app = tokenfuse_gateway::app(state(keyed).with_closure(door()));
+    let resp = app
+        .oneshot(get_with_bearer("/v1/retained", "ops-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
