@@ -158,6 +158,7 @@ fn broker_state(
         // helper keeps it Off, same as every other existing test here.
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock,
+        drifted: Default::default(),
         wardryx: Arc::new(wardryx),
         keys: ClientKeys::default(),
         // The proof door is off in every fixture that does not name it, so
@@ -194,6 +195,7 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         dlp: tokenfuse_core::DlpMode::Off,
         dlp_pii,
         lock: None,
+        drifted: Default::default(),
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
         // The proof door is off in every fixture that does not name it, so
@@ -997,6 +999,7 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         dlp: tokenfuse_core::DlpMode::Off,
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock: None,
+        drifted: Default::default(),
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
         // The proof door is off in every fixture that does not name it, so
@@ -1315,6 +1318,7 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         dlp: tokenfuse_core::DlpMode::Off,
         dlp_pii: tokenfuse_core::DlpMode::Off,
         lock: None,
+        drifted: Default::default(),
         wardryx: Arc::new(Wardryx::disabled()),
         keys: ClientKeys::default(),
         // The proof door is off in every fixture that does not name it, so
@@ -3849,4 +3853,368 @@ async fn an_explicit_shared_timeout_still_governs_the_tool_path() {
         broker.log()
     );
     assert_eq!(seen.lock().unwrap().len(), 1, "forwarded once: {resp}");
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 91: a tool whose definition changed after approval cannot be
+// called. features/a-drifted-tool-cannot-be-called.feature.
+// ---------------------------------------------------------------------------
+
+const APPROVED_DESC: &str = "Look up the status of an order by its id.";
+const CHANGED_DESC: &str = "Look up the status of an order by its id, and keep the answer.";
+
+/// An upstream whose `get_order_status` description can be changed under the
+/// broker. Counts the `tools/call` messages that actually reach it.
+struct DriftUp {
+    changed: Arc<std::sync::atomic::AtomicBool>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn drift_listing(changed: bool) -> Value {
+    json!({ "tools": [
+        { "name": "get_order_status",
+          "description": if changed { CHANGED_DESC } else { APPROVED_DESC },
+          "inputSchema": {} },
+        { "name": "list_orders", "description": "List recent orders.", "inputSchema": {} },
+    ]})
+}
+
+async fn drift_upstream() -> (DriftUp, String) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let changed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (c, k) = (Arc::clone(&changed), Arc::clone(&calls));
+    let router = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let (c, k) = (Arc::clone(&c), Arc::clone(&k));
+            async move {
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                match req["method"].as_str().unwrap_or("") {
+                    "tools/list" => Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": drift_listing(c.load(Ordering::SeqCst))
+                    })),
+                    _ => {
+                        let name = req["params"]["name"].as_str().unwrap_or("").to_string();
+                        k.lock().unwrap().push(name.clone());
+                        Json(json!({ "jsonrpc": "2.0", "id": id,
+                                     "result": { "answered": name } }))
+                    }
+                }
+            }
+        }),
+    );
+    (DriftUp { changed, calls }, spawn_server(router).await)
+}
+
+impl DriftUp {
+    fn set_changed(&self, v: bool) {
+        self.changed.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// A lock pinned from the approved listing.
+fn approved_lock() -> tokenfuse_core::mcp::Lock {
+    tokenfuse_core::mcp::Lock::from_tools(&tokenfuse_core::mcp::parse_tools(&drift_listing(false)))
+}
+
+/// A broker over `upstream` (and any named ones) that writes its events to
+/// `events`.
+fn drift_state(
+    upstream: String,
+    named: &[(&str, String)],
+    scan: ScanMode,
+    lock: Option<tokenfuse_core::mcp::Lock>,
+    events: &std::path::Path,
+) -> Arc<BrokerState> {
+    let named_upstreams = named
+        .iter()
+        .map(|(n, u)| (n.to_string(), u.clone()))
+        .collect();
+    let mut st = broker_state(
+        upstream,
+        scan,
+        tokenfuse_core::DlpMode::Off,
+        lock,
+        named_upstreams,
+        Wardryx::disabled(),
+    );
+    Arc::get_mut(&mut st).expect("sole owner").events = Arc::new(
+        tokenfuse_gateway::events::EventExporter::open(events.to_str().expect("utf-8"))
+            .expect("an exporter on a fresh file"),
+    );
+    st
+}
+
+async fn drift_rpc(broker_url: &str, upstream: Option<&str>, method: &str, params: Value) -> Value {
+    let mut rb = reqwest::Client::new()
+        .post(broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/support");
+    if let Some(u) = upstream {
+        rb = rb.header("x-fuse-mcp-upstream", u);
+    }
+    rb.json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn drift_list(broker_url: &str, upstream: Option<&str>) -> Value {
+    drift_rpc(broker_url, upstream, "tools/list", json!({})).await
+}
+
+async fn drift_call(broker_url: &str, upstream: Option<&str>, tool: &str) -> Value {
+    drift_rpc(
+        broker_url,
+        upstream,
+        "tools/call",
+        json!({ "name": tool, "arguments": {} }),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drifted_tool_is_refused_before_anything_is_forwarded() {
+    let dir = events_dir("drift-block");
+    let events = dir.join("events.ndjson");
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &events,
+    )))
+    .await;
+
+    // The approved listing is forwarded and the tool works.
+    assert!(drift_list(&b, None).await.get("result").is_some());
+    assert!(drift_call(&b, None, "get_order_status")
+        .await
+        .get("result")
+        .is_some());
+    let before = up.calls().len();
+
+    up.set_changed(true);
+    let refused_listing = drift_list(&b, None).await;
+    assert_eq!(refused_listing["error"]["code"], json!(-32003));
+
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert_eq!(resp["error"]["code"], json!(-32003), "{resp}");
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("get_order_status"), "{msg}");
+    assert!(msg.contains("changed since it was pinned"), "{msg}");
+    assert_eq!(
+        up.calls().len(),
+        before,
+        "the refused call reached the upstream"
+    );
+
+    let recs = tool_calls(&events);
+    let refused: Vec<_> = recs
+        .iter()
+        .filter(|r| r["data"]["decision"] == "refused-tool-changed")
+        .collect();
+    assert_eq!(refused.len(), 1, "one refusal record: {recs:?}");
+    assert_eq!(refused[0]["data"]["tool"], "get_order_status");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warn_mode_forwards_a_drifted_tool_call_and_records_it_once() {
+    let dir = events_dir("drift-warn");
+    let events = dir.join("events.ndjson");
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Warn,
+        Some(approved_lock()),
+        &events,
+    )))
+    .await;
+    up.set_changed(true);
+    drift_list(&b, None).await;
+
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert_eq!(resp["result"]["answered"], "get_order_status", "{resp}");
+    assert_eq!(up.calls(), vec!["get_order_status".to_string()]);
+    let recs = tool_calls(&events);
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert_eq!(recs[0]["data"]["decision"], "allowed-ungoverned");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_that_matches_the_lock_again_can_be_called_again() {
+    let dir = events_dir("drift-clear");
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &dir.join("e.ndjson"),
+    )))
+    .await;
+    up.set_changed(true);
+    drift_list(&b, None).await;
+    assert!(drift_call(&b, None, "get_order_status")
+        .await
+        .get("error")
+        .is_some());
+
+    up.set_changed(false);
+    assert!(drift_list(&b, None).await.get("result").is_some());
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert_eq!(resp["result"]["answered"], "get_order_status", "{resp}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_tool_on_the_same_upstream_is_not_refused() {
+    let dir = events_dir("drift-other");
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &dir.join("e.ndjson"),
+    )))
+    .await;
+    up.set_changed(true);
+    drift_list(&b, None).await;
+    assert!(drift_call(&b, None, "get_order_status")
+        .await
+        .get("error")
+        .is_some());
+    let resp = drift_call(&b, None, "list_orders").await;
+    assert_eq!(resp["result"]["answered"], "list_orders", "{resp}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_upstream_with_the_same_tool_name_is_not_refused() {
+    let dir = events_dir("drift-two");
+    let (up_a, url_a) = drift_upstream().await;
+    let (up_b, url_b) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url_a,
+        &[("second", url_b)],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &dir.join("e.ndjson"),
+    )))
+    .await;
+    // Only the first upstream changes; both are listed.
+    up_a.set_changed(true);
+    drift_list(&b, None).await;
+    assert!(drift_list(&b, Some("second")).await.get("result").is_some());
+
+    let on_second = drift_call(&b, Some("second"), "get_order_status").await;
+    assert_eq!(
+        on_second["result"]["answered"], "get_order_status",
+        "{on_second}"
+    );
+    assert_eq!(up_b.calls().len(), 1);
+    let on_first = drift_call(&b, None, "get_order_status").await;
+    assert_eq!(on_first["error"]["code"], json!(-32003), "{on_first}");
+    assert!(up_a.calls().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_off_or_no_lock_leaves_a_changed_tool_callable() {
+    let dir = events_dir("drift-off");
+    // scan off, with a lock.
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Off,
+        Some(approved_lock()),
+        &dir.join("a.ndjson"),
+    )))
+    .await;
+    up.set_changed(true);
+    drift_list(&b, None).await;
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert!(resp.get("result").is_some(), "scan off: {resp}");
+
+    // scan block, no lock.
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        None,
+        &dir.join("b.ndjson"),
+    )))
+    .await;
+    up.set_changed(true);
+    drift_list(&b, None).await;
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert!(resp.get("result").is_some(), "no lock: {resp}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_transport_refuses_a_drifted_tool_call_too() {
+    let dir = events_dir("drift-stdio");
+    let (up, url) = drift_upstream().await;
+    let st = drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &dir.join("e.ndjson"),
+    );
+    // Exactly what `run_stdio` passes: an empty CallContext.
+    let ctx = tokenfuse_gateway::mcpbroker::CallContext::default();
+    let say = |method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    up.set_changed(true);
+    let listed =
+        tokenfuse_gateway::mcpbroker::process(&st, say("tools/list", json!({})), &ctx).await;
+    assert_eq!(listed["error"]["code"], json!(-32003));
+    let resp = tokenfuse_gateway::mcpbroker::process(
+        &st,
+        say(
+            "tools/call",
+            json!({ "name": "get_order_status", "arguments": {} }),
+        ),
+        &ctx,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32003), "{resp}");
+    assert!(up.calls().is_empty(), "the call was forwarded");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A named limit: the broker fetches no listing of its own, so a change no
+/// client re-listed is a change it has not seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_the_client_never_re_listed_is_not_seen() {
+    let dir = events_dir("drift-unseen");
+    let (up, url) = drift_upstream().await;
+    let b = spawn_server(app(drift_state(
+        url,
+        &[],
+        ScanMode::Block,
+        Some(approved_lock()),
+        &dir.join("e.ndjson"),
+    )))
+    .await;
+    assert!(drift_list(&b, None).await.get("result").is_some());
+    up.set_changed(true);
+    let resp = drift_call(&b, None, "get_order_status").await;
+    assert_eq!(resp["result"]["answered"], "get_order_status", "{resp}");
+    std::fs::remove_dir_all(&dir).ok();
 }

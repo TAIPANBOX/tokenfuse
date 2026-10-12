@@ -1036,6 +1036,31 @@ run_case "tool-timeout: the model path's default moved to 1000 ms" fail \
 	"$(py 'edit("crates/gateway/src/wardryx.rs", "const DEFAULT_TIMEOUT_MS: u64 = 50;", "const DEFAULT_TIMEOUT_MS: u64 = 1_000;")')" \
 	"with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50 ... FAILED"
 
+# --- invariant 91: a tool that changed after approval cannot be called ------
+#
+# Not a scripts/*.sh gate: held by cargo test. Four mutants: the state keyed by
+# tool name alone, a refusal that never clears, warn mode refusing, and the
+# listing never recorded. Each planted text keeps using every name it replaces.
+run_case "drifted-tool: the state keyed by tool name only" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_second_upstream_with_the_same_tool_name_is_not_refused" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "        m.contains_key(&(upstream.to_string(), tool.to_string()))", "        m.keys().any(|k| k.1 == tool && { let _ = upstream; true })")')" \
+	"a_second_upstream_with_the_same_tool_name_is_not_refused ... FAILED"
+
+run_case "drifted-tool: a refusal that never clears" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_tool_that_matches_the_lock_again_can_be_called_again" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "                m.remove(&key);\n", "                let _ = &key;\n")')" \
+	"a_tool_that_matches_the_lock_again_can_be_called_again ... FAILED"
+
+run_case "drifted-tool: warn mode refuses" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::warn_mode_forwards_a_drifted_tool_call_and_records_it_once" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            if st.scan == ScanMode::Block {\n                tracing::warn!(tool = %tool, \"mcp broker: refused a call", "            if st.scan != ScanMode::Off {\n                tracing::warn!(tool = %tool, \"mcp broker: refused a call")')" \
+	"warn_mode_forwards_a_drifted_tool_call_and_records_it_once ... FAILED"
+
+run_case "drifted-tool: the listing is never recorded" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_drifted_tool_is_refused_before_anything_is_forwarded" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            st.drifted.observe(&upstream_url, &listed, &changed);\n", "            let _ = (&listed, &changed);\n")')" \
+	"a_drifted_tool_is_refused_before_anything_is_forwarded ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
