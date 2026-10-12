@@ -7,6 +7,7 @@ pub mod agentids;
 pub mod backtestcli;
 pub mod chainproof;
 pub mod clientkeys;
+pub mod closure;
 pub mod cloudsink;
 pub mod compliancecli;
 pub mod constants;
@@ -89,6 +90,10 @@ pub fn app(state: AppState) -> Router {
         // Invariant 85: which book calls are priced with, and which model
         // ids the fallback has priced (caller-chosen, so behind this gate).
         .route("/v1/price-book", get(pricebookreport::price_book))
+        // D8: closing a retained reservation with evidence and a console token. Merged before
+        // the gate so both routes sit behind it; empty (both 404) unless
+        // `TOKENFUSE_CLOSURE_SECRET` is set.
+        .merge(closure_routes(&state))
         .route_layer(from_fn_with_state(state.clone(), adminkeys::admin_gate));
     Router::new()
         .route("/healthz", get(proxy::healthz))
@@ -101,4 +106,14 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/fuse/declassify", post(declassify::declassify))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// The D8 closure routes (`crate::closure`), present only when the closure door is configured.
+fn closure_routes(state: &AppState) -> Router<AppState> {
+    if state.closure.is_none() {
+        return Router::new();
+    }
+    Router::new()
+        .route("/v1/retained", get(closure::list))
+        .route("/v1/retained/close", post(closure::close))
 }

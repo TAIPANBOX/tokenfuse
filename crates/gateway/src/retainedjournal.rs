@@ -15,10 +15,13 @@
 //! the registry `GET /v1/runs` reads. Liability is rebuilt from these records alone, never
 //! from settled-spend totals.
 //!
-//! Append-only. Nothing here removes a line: closing a retained reservation is D8, decided
-//! (`@decided 2026-10-11`) and not built, and until it is every retained reservation is
-//! outstanding for good, so every line stays true. A record of a `kind` this version does not
-//! know is counted and skipped, never read as a closure.
+//! Append-only while the process runs. Closing a retained reservation (D8, `crate::closure`)
+//! appends a `closure` record naming the reservation's id and revision, synced before the
+//! closure is applied, so a restart never puts a closed reservation back. Startup then rewrites
+//! the file with only the records still open (D-3): a temp file beside it, synced, renamed over
+//! it, the directory synced, and the append handle reopened on the new file. A record of a
+//! `kind` this version does not know is counted, never read as a closure, and kept verbatim by
+//! the rewrite, so a later version's records survive a downgrade.
 //!
 //! The file is ours, but it is still read as hostile input: a line over [`MAX_LINE_BYTES`] is
 //! skipped without being held in memory, a line that does not parse is skipped and counted,
@@ -45,8 +48,14 @@ pub const FILE_NAME: &str = "retained-reservations.ndjson";
 /// the two can never disagree.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-/// The one `kind` this version writes and restores.
+/// The `kind` of a retained reservation, restored at startup.
 pub const KIND_RETAINED: &str = "retained";
+
+/// The `kind` of a closure (D8): the reservation it names is not restored.
+pub const KIND_CLOSURE: &str = "closure";
+
+/// The name of the temp file a startup rewrite builds before renaming it over the journal.
+pub const TEMP_FILE_NAME: &str = "retained-reservations.ndjson.tmp";
 
 /// One journal line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +78,24 @@ pub struct Record {
 }
 
 impl Record {
+    /// The record's revision: the first 8 bytes of SHA-256 over a domain tag and the record's
+    /// canonical serialization, as 16 lowercase hex digits. A closure token binds it, so a
+    /// token minted for one record never closes another that reuses its id (ids are unique
+    /// only within one lineage of the journal: a restart moves the counter past the records
+    /// still open, not past the closed ones a rewrite dropped). Stable across a restart,
+    /// because the rewrite writes the same canonical bytes this hashes.
+    pub fn revision(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_vec(self).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(b"tokenfuse-retained-revision-v1\n");
+        h.update(&canonical);
+        h.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     pub fn retained(entry: &RetainedReservation, tail_parent: Option<String>) -> Self {
         Record {
             v: 1,
@@ -80,6 +107,30 @@ impl Record {
             retained_at_millis: entry.retained_at_millis,
         }
     }
+}
+
+/// One closure line (D8). Written before the closure is applied, so a crash between the two
+/// leaves the reservation closed on disk and still outstanding in nothing: the next start
+/// restores everything but this reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureRecord {
+    pub v: u32,
+    pub kind: String,
+    pub reservation_id: u64,
+    pub revision: String,
+    pub operation_id: String,
+    /// `observed` or `no_charge`.
+    pub evidence_kind: String,
+    #[serde(default)]
+    pub observed_microusd: Option<i64>,
+    pub evidence_ref: String,
+    /// What the closure settled both halves at: the observed cost, or zero.
+    pub settled_microusd: i64,
+    pub run_id: String,
+    /// The unit the reservation's unit half was on, if it had one.
+    #[serde(default)]
+    pub unit: Option<String>,
+    pub closed_at_millis: i64,
 }
 
 /// An open, append-only journal file.
@@ -131,6 +182,15 @@ impl Journal {
     /// it runs from `SettleGuard::drop`, which cannot await, and only on the rare call whose
     /// outcome is unknown.
     pub fn append(&self, record: &Record) -> io::Result<()> {
+        self.append_line(record)
+    }
+
+    /// Append one closure record, synced before returning, under the same bound and lock.
+    pub fn append_closure(&self, record: &ClosureRecord) -> io::Result<()> {
+        self.append_line(record)
+    }
+
+    fn append_line<T: Serialize>(&self, record: &T) -> io::Result<()> {
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
         if line.len() > MAX_LINE_BYTES {
@@ -146,12 +206,50 @@ impl Journal {
         file.write_all(&line)?;
         file.sync_data()
     }
+
+    /// D-3: replace the journal with exactly `lines` (each written as one line), atomically. A
+    /// temp file in the same directory is written and synced, renamed over the journal, the
+    /// directory is synced, and the append handle is reopened on the new file, all under the
+    /// append lock so no record lands on the replaced file. On any error the journal is left
+    /// as it was (the rename is the only step that changes it) and the handle keeps appending
+    /// to it.
+    pub fn rewrite(&self, lines: &[Vec<u8>]) -> io::Result<()> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let temp = dir.join(TEMP_FILE_NAME);
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut t = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp)?;
+            for line in lines {
+                t.write_all(line)?;
+                t.write_all(b"\n")?;
+            }
+            t.sync_all()?;
+        }
+        std::fs::rename(&temp, &self.path)?;
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        *file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        Ok(())
+    }
 }
 
 /// What reading a journal found, every skip counted.
 #[derive(Debug, Default)]
 pub struct ReadReport {
     pub records: Vec<Record>,
+    /// Closure records (D8), in file order.
+    pub closures: Vec<ClosureRecord>,
+    /// The raw bytes of every well-formed record of an unknown kind, kept by the rewrite.
+    pub other_kind_lines: Vec<Vec<u8>>,
     /// Lines that are not a record (a torn final line among them).
     pub malformed: usize,
     /// Lines over [`MAX_LINE_BYTES`], skipped unread.
@@ -182,9 +280,25 @@ pub fn parse<R: BufRead>(mut reader: R) -> io::Result<ReadReport> {
         if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_slice::<Record>(trimmed) {
-            Ok(r) if r.kind == KIND_RETAINED => report.records.push(r),
-            Ok(_) => report.other_kind += 1,
+        #[derive(Deserialize)]
+        struct Kind {
+            kind: String,
+        }
+        match serde_json::from_slice::<Kind>(trimmed) {
+            Ok(k) if k.kind == KIND_RETAINED => match serde_json::from_slice::<Record>(trimmed) {
+                Ok(r) => report.records.push(r),
+                Err(_) => report.malformed += 1,
+            },
+            Ok(k) if k.kind == KIND_CLOSURE => {
+                match serde_json::from_slice::<ClosureRecord>(trimmed) {
+                    Ok(c) => report.closures.push(c),
+                    Err(_) => report.malformed += 1,
+                }
+            }
+            Ok(_) => {
+                report.other_kind += 1;
+                report.other_kind_lines.push(trimmed.to_vec());
+            }
             Err(_) => report.malformed += 1,
         }
     }
@@ -241,6 +355,11 @@ pub struct ReplayReport {
     pub units_refused: usize,
     /// Restored reservations the registry did not list (past `MAX_RETAINED`); still held.
     pub unlisted: usize,
+    /// Retained records a closure in the same journal names (id and revision): not restored.
+    pub closed: usize,
+    /// What a startup rewrite keeps: each still-open retained record once, in its canonical
+    /// bytes, then every record of an unknown kind verbatim.
+    pub keep: Vec<Vec<u8>>,
 }
 
 /// Put every retained reservation in the journal back on the ledgers and in the registry.
@@ -254,8 +373,27 @@ pub fn replay(
     now_millis: i64,
 ) -> ReplayReport {
     let mut out = ReplayReport::default();
-    let entries: Vec<Outstanding> = report
-        .records
+    let closed: std::collections::HashSet<(u64, &str)> = report
+        .closures
+        .iter()
+        .map(|c| (c.reservation_id, c.revision.as_str()))
+        .collect();
+    let mut open: Vec<Record> = Vec::new();
+    let mut kept = std::collections::HashSet::new();
+    for r in &report.records {
+        let revision = r.revision();
+        if closed.contains(&(r.run.id, revision.as_str())) {
+            out.closed += 1;
+            continue;
+        }
+        if kept.insert(revision) {
+            out.keep
+                .push(serde_json::to_vec(r).expect("a record that was read serializes"));
+        }
+        open.push(r.clone());
+    }
+    out.keep.extend(report.other_kind_lines.iter().cloned());
+    let entries: Vec<Outstanding> = open
         .iter()
         .map(|r| Outstanding {
             reservation: r.run.clone(),
@@ -268,7 +406,7 @@ pub fn replay(
     };
     let restored: std::collections::HashSet<u64> = runs.restored.iter().copied().collect();
     let mut listed_ids = std::collections::HashSet::new();
-    for r in &report.records {
+    for r in &open {
         // Only a record the run ledger took back is credited anywhere else, so a duplicate
         // line never counts its unit half twice.
         if !restored.contains(&r.run.id) || !listed_ids.insert(r.run.id) {
@@ -286,6 +424,7 @@ pub fn replay(
             unit: r.unit.clone(),
             model: r.model.clone(),
             retained_at_millis: r.retained_at_millis,
+            revision: r.revision(),
         });
         if !listed {
             out.unlisted += 1;
@@ -318,6 +457,29 @@ pub async fn replay_at_startup(
         &state.retained,
         now_millis,
     );
+    // D8: closures recorded in this journal keep answering their operation id after the
+    // restart (one restart: the rewrite below drops them with the records they closed).
+    if let Some(door) = state.closure.as_ref() {
+        door.remember(&report.read.closures);
+    }
+    // D-3: the journal is rewritten with only what is still open. A failed rewrite leaves the
+    // old file in place, which reads the same way (its closures still exclude what they close),
+    // so it is an error line, not a refusal.
+    if let Some(journal) = state.retained.journal() {
+        match journal.rewrite(&report.keep) {
+            Ok(()) => tracing::info!(
+                path = %journal.path().display(),
+                kept = report.keep.len(),
+                closed = report.closed,
+                "retained-reservation journal rewritten with only the records still open"
+            ),
+            Err(e) => tracing::error!(
+                path = %journal.path().display(),
+                error = %e,
+                "the retained-reservation journal could not be rewritten; it keeps its closed records until the next start"
+            ),
+        }
+    }
     let Some(runs) = report.runs.as_ref() else {
         if records > 0 {
             tracing::warn!(
@@ -342,7 +504,8 @@ pub async fn replay_at_startup(
     let skipped =
         report.read.malformed + report.read.oversized + runs.invalid + report.units_refused;
     let line = format!(
-        "retained-reservation journal replayed: {} restored, {} runs recreated ({seeded} with their Cloud seed), {} unit halves outstanding again, {} unit halves from a past month, {} duplicate, {} links on a superseded generation, {} unlisted past the registry cap; skipped {} malformed, {} oversized, {} invalid, {} of an unknown kind, {} negative unit halves",
+        "retained-reservation journal replayed: {} closed by D8 and not restored, {} restored, {} runs recreated ({seeded} with their Cloud seed), {} unit halves outstanding again, {} unit halves from a past month, {} duplicate, {} links on a superseded generation, {} unlisted past the registry cap; skipped {} malformed, {} oversized, {} invalid, {} of an unknown kind, {} negative unit halves",
+        report.closed,
         runs.restored.len(),
         runs.runs_created.len(),
         report.units_restored,
@@ -413,6 +576,7 @@ mod tests {
                 unit: u,
                 model: "m".into(),
                 retained_at_millis: now,
+                revision: String::new(),
             },
             tail,
         )
@@ -711,5 +875,133 @@ mod tests {
         assert!(line.contains(&err.to_string()));
         std::fs::remove_dir_all(&missing).ok();
         std::fs::remove_dir_all(&unreadable).ok();
+    }
+
+    fn closure_of(entry: &RetainedReservation, revision: &str) -> ClosureRecord {
+        ClosureRecord {
+            v: 1,
+            kind: KIND_CLOSURE.into(),
+            reservation_id: entry.run.id,
+            revision: revision.into(),
+            operation_id: "op".into(),
+            evidence_kind: "no_charge".into(),
+            observed_microusd: None,
+            evidence_ref: "invoice".into(),
+            settled_microusd: 0,
+            run_id: entry.run.run_id.clone(),
+            unit: None,
+            closed_at_millis: 1,
+        }
+    }
+
+    /// D-3. The rewrite keeps each still-open record once and every record of a kind this
+    /// version does not know, verbatim; it drops closed records, their closures, torn lines
+    /// and duplicates. The file then reads back to the same open set with the same revisions,
+    /// and the append handle writes to the new file.
+    #[test]
+    fn a_rewrite_keeps_only_open_records_and_unknown_kinds_with_stable_revisions() {
+        let dir = scratch("rewrite");
+        let now = crate::sink::now_millis();
+        let (old, old_units) = (Ledger::new(), capped());
+        let (a, ta) = retained_pair(&old, &old_units, "a", None, Microusd(100), now);
+        let (b, tb) = retained_pair(&old, &old_units, "b", None, Microusd(200), now);
+        let (ra, rb) = (Record::retained(&a, ta), Record::retained(&b, tb));
+        let journal = Journal::open(&dir).unwrap();
+        journal.append(&ra).unwrap();
+        journal.append(&rb).unwrap();
+        journal.append(&rb).unwrap();
+        journal
+            .append_closure(&closure_of(&a, &ra.revision()))
+            .unwrap();
+        let future = br#"{"v":9,"kind":"from_a_later_version","x":1}"#;
+        let mut raw = OpenOptions::new()
+            .append(true)
+            .open(dir.join(FILE_NAME))
+            .unwrap();
+        raw.write_all(future).unwrap();
+        raw.write_all(b"\n{\"kind\":\"retained\",\"v\":1,\"ru")
+            .unwrap();
+        drop(raw);
+
+        let ledger = Arc::new(Ledger::new());
+        let units = capped();
+        let report = replay(
+            read(&dir).unwrap(),
+            &LocalLedger(ledger.clone()),
+            &units,
+            &Retained::default(),
+            now,
+        );
+        assert_eq!(report.closed, 1);
+        assert!(
+            ledger.snapshot("a").is_none(),
+            "the closed record is not restored"
+        );
+        assert_eq!(ledger.snapshot("b").unwrap().reserved, Microusd(200));
+        journal.rewrite(&report.keep).unwrap();
+        let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.lines().any(|l| l.as_bytes() == future), "{text}");
+        assert!(!dir.join(TEMP_FILE_NAME).exists());
+
+        let again = read(&dir).unwrap();
+        assert_eq!(again.records, vec![rb.clone()]);
+        assert_eq!(again.records[0].revision(), rb.revision());
+        assert_eq!(
+            (again.closures.len(), again.malformed, again.other_kind),
+            (0, 0, 1)
+        );
+        let (c, tc) = retained_pair(&old, &old_units, "c", None, Microusd(300), now);
+        journal.append(&Record::retained(&c, tc)).unwrap();
+        assert_eq!(
+            read(&dir).unwrap().records.len(),
+            2,
+            "appends land on the new file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A closure names a revision, not only an id: a record that reuses a closed record's id
+    /// (ids are unique only within one lineage of the journal) is still restored.
+    #[test]
+    fn a_closure_excludes_only_the_revision_it_names() {
+        let now = crate::sink::now_millis();
+        let (old, old_units) = (Ledger::new(), capped());
+        let (a, ta) = retained_pair(&old, &old_units, "a", None, Microusd(100), now);
+        let ra = Record::retained(&a, ta);
+        let ledger = Arc::new(Ledger::new());
+        let report = replay(
+            ReadReport {
+                records: vec![ra.clone()],
+                closures: vec![closure_of(&a, "0000000000000000")],
+                ..Default::default()
+            },
+            &LocalLedger(ledger.clone()),
+            &capped(),
+            &Retained::default(),
+            now,
+        );
+        assert_eq!(report.closed, 0);
+        assert_eq!(ledger.snapshot("a").unwrap().reserved, Microusd(100));
+        assert_eq!(report.keep.len(), 1);
+    }
+
+    /// A rewrite that fails before its rename leaves the journal exactly as it was, and the
+    /// append handle still writes to it.
+    #[test]
+    fn a_rewrite_that_fails_leaves_the_journal_as_it_was() {
+        let dir = scratch("rewrite-fails");
+        let now = crate::sink::now_millis();
+        let (old, old_units) = (Ledger::new(), capped());
+        let (a, ta) = retained_pair(&old, &old_units, "a", None, Microusd(100), now);
+        let journal = Journal::open(&dir).unwrap();
+        journal.append(&Record::retained(&a, ta.clone())).unwrap();
+        let before = std::fs::read(dir.join(FILE_NAME)).unwrap();
+        std::fs::create_dir_all(dir.join(TEMP_FILE_NAME)).unwrap();
+        assert!(journal.rewrite(&[]).is_err());
+        assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap(), before);
+        journal.append(&Record::retained(&a, ta)).unwrap();
+        assert_eq!(read(&dir).unwrap().records.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

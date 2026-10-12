@@ -1325,6 +1325,25 @@ async fn serve() {
         state = state.with_ledger(rl);
     }
 
+    // D8: closing a retained reservation with evidence. Read before the journal is replayed,
+    // so the closures the journal still holds load into its books.
+    // process-local: the MCP broker holds no ledger and retains nothing, so it has nothing to close.
+    match tokenfuse_gateway::closure::ClosureDoor::from_env() {
+        Ok(Some(door)) => {
+            tracing::info!(
+                "retained-reservation closure on: POST /v1/retained/close takes a console token (TOKENFUSE_CLOSURE_SECRET)"
+            );
+            state = state.with_closure(Arc::new(door));
+        }
+        Ok(None) => tracing::info!(
+            "retained-reservation closure off: TOKENFUSE_CLOSURE_SECRET is not set, so a retained reservation stays outstanding"
+        ),
+        Err(e) => {
+            eprintln!("tokenfuse: {e}");
+            std::process::exit(2);
+        }
+    }
+
     // W03: retained reservations (invariant 50) survive a restart. With a data dir, every
     // retain is appended to its journal, and what the journal holds is put back here, after
     // the Cloud seeds (a unit seed is refused once anything is outstanding on the unit) and

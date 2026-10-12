@@ -304,9 +304,13 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1759 passing** (core 380, dpop 21, delegation 60,
-gateway 1019, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
-states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 3
+`cargo test --all` runs **1780 passing** (core 380, dpop 21, delegation 60,
+gateway 1040, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 21
+with D8, closing a retained reservation (invariant 89: 10 in `gateway::closure`, 3 in
+`gateway::retainedjournal`, 7 in `tests/it/retained_closure.rs`, 1 in
+`tests/it/admin_gate.rs`; 2026-10-12, counted from `cargo test --all --no-fail-fast`, 1778
+passed and the 2 root-only failures invariant 78 records). Gateway grew by 3
 with the D-2 fix (an unreadable retained journal refuses to start: 1 in
 `gateway::retainedjournal`, 2 in `tests/it/retained_journal_unreadable.rs`;
 2026-10-11, counted by hand). Gateway grew by 1
