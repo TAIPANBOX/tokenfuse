@@ -6131,17 +6131,52 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     `@claude 2026-10-12`, choices under delegated authority, open to reversal: the token header,
     the 32-byte floor and the 300 s cap; the revision as a content hash rather than a counter;
-    closures serialised under one process-wide lock (they are rare and human-driven); a closure
-    writes no Parquet row.
+    closures serialised under one process-wide lock (they are rare and human-driven).
+
+    **An observed closure is spend, and it reaches the Cloud by the path settled spend takes
+    (D8.1).** Until 2026-10-12 the observed cost moved only the in-process ledgers, so in Cloud
+    mode a restart lost it: the rewrite had dropped the reservation, and the run seed (invariant
+    70) and the unit seed (invariant 52) read a control plane that never saw the spend. Measured
+    on 666e7ff by `closure_reaches_the_cloud.rs`: after the restart the run seed read
+    `parent=18` and the unit seed `ops=18`, the parent's call only, with the closed 4321 in
+    neither. `@decided 2026-10-12`: an observed closure's cost reaches the Cloud by the path a
+    settled call's spend takes, so a restarted gateway's run and unit seeds include it exactly
+    once, and a no-charge closure adds no spend.
+
+    So an observed closure hands the sink (`AppState::sink`, the Parquet trace and, in Cloud
+    mode, the cloud sink, invariant 53's queue included) one `allow` row built by
+    `settle::allow_record`, the function `SettleGuard::record_row` builds a settled call's row
+    with: the reservation's run, step and model, the observed cost, zero tokens, no router
+    savings, stamped at the closure. It is written after the closure record is synced and the
+    ledgers settled, inside the books' lock and before the books note the operation, so a replay
+    of the same operation (answered from the books, in this process or after one restart) writes
+    no second row, and a closure that could not be made durable writes none. A no-charge
+    closure is a release and writes no row, as a released call writes none. The row needs the
+    call's attribution, so the retained record gains an additive `attribution` (agent id, key
+    id, the resolved unit, parent run id, on-behalf-of, outcome, identity reason), taken from
+    the guard's `CallAttribution` at retain time. It is skipped when absent and each member is
+    skipped when empty, so a line written before the field existed reads with none and keeps
+    its canonical bytes, and therefore its revision; a closure or token minted against it still
+    names it. Such a record's row names no agent or key and takes its unit from the unit half
+    when it has one. Nothing crosses a repository here: the trace and wire shape of `CallRecord`
+    are unchanged.
 
     **Where it says nothing.** No agent-event is emitted. No existing type describes a closure,
-    and a retained record carries no `agent_id`, so the exporter would skip one (SPEC 6.1); a
-    `retained_closed` type, and an `agent_id` on the retained record for it to be filed under,
-    is D10, a cross-repository change through agent-passport's SPEC 6.2. The audit record until
-    then is the journal's closure line and one info log line naming the reservation, run,
-    operation, evidence kind and reference, and the settled amount. The observed cost reaches the
-    in-process run and unit ledgers only: no trace row, no Cloud ingest, so `/v1/units` and a
-    later run seed (invariant 70) do not see it. Idempotency spans one restart: the rewrite drops
+    so an event here is a `retained_closed` type, D10, a cross-repository change through
+    agent-passport's SPEC 6.2; the retained record now carries the call's `agent_id` (D8.1) for
+    such an event to be filed under, and a record journaled before that carries none. The audit
+    record until then is the journal's closure line, one info log line naming the reservation,
+    run, operation, evidence kind and reference, and the settled amount, and for an observed
+    closure the `allow` row. That row is indistinguishable from a settled call's: it counts as
+    one more call on the run in the trace and the Cloud, its zero tokens beside a nonzero cost
+    make the FOCUS export label it `estimated` (invariant 43's note), and the cloud sink names a
+    price basis from the model although the cost came from the evidence. The row reaches the
+    Cloud as any settled row does, so a gateway that dies before its cloud sink flushes, or
+    whose queue overflows (invariant 53), loses it as it would lose a settled call's, and the
+    closure is already on disk: the next start neither restores the reservation nor re-sends the
+    row. The row is filed under the leaf run only, as a settled child call's is, so the Cloud's
+    figure for an ancestor (and the run seed it gives that ancestor) does not include it; the
+    in-process ledgers settle every link. Idempotency spans one restart: the rewrite drops
     the closure with the record it closed, so a retry after a second restart answers `404
     not_retained`, never a second charge. A reservation past the registry's cap (`MAX_RETAINED`,
     listed=false) cannot be closed here, because it is not listed. A unit half whose month has
@@ -6169,4 +6204,23 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the same lock, and `restore_outstanding` refuses a second outstanding entry with one id, so
     the registry never holds two entries with one id. Scenarios:
     `features/a-retained-reservation-is-closed-with-evidence.feature`, ten, each bound. Not a
-    script gate: the rule is the handler and the journal, held by `cargo test`)*
+    script gate: the rule is the handler and the journal, held by `cargo test`. D8.1:
+    `tests/it/closure_reaches_the_cloud.rs`, two over the real binary against a stub control
+    plane that folds what it ingests into `/v1/runs` and `/v1/units`;
+    `an_observed_closure_reaches_the_cloud_once_and_the_restart_seeds_include_it` was red
+    against 666e7ff (`the observed closure never reached the Cloud: rows for child []`, the
+    seeds after the restart `parent=18` and `ops=18`), and
+    `a_no_charge_closure_sends_no_row_to_the_cloud` is the guard, green on both sides; in
+    `closure::tests`, `an_observed_closure_writes_one_allow_row_with_the_calls_attribution`,
+    `a_no_charge_closure_writes_no_row` and
+    `a_record_from_before_the_attribution_field_files_its_unit_from_the_unit_half`, with the
+    race, replay, unwritable-journal and restart tests now also counting rows;
+    `retainedjournal::tests::a_line_from_before_the_attribution_field_keeps_its_revision` and
+    `settle::tests::a_retained_reservation_journals_the_calls_attribution`. Six mutants planted
+    in the product code 2026-10-12 and reverted, each caught by a named test: the row never
+    written (four closure tests), a row on no_charge (`a_no_charge_closure_writes_no_row`), the
+    row written twice (four closure tests), the absent attribution serialized
+    (`a_line_from_before_the_attribution_field_keeps_its_revision`), the unit fallback dropped
+    (`a_record_from_before_the_attribution_field_files_its_unit_from_the_unit_half`), the
+    attribution not journaled (`a_retained_reservation_journals_the_calls_attribution`).
+    Scenarios: `features/an-observed-closure-reaches-the-cloud.feature`, five, each bound)*

@@ -75,6 +75,49 @@ pub struct Record {
     #[serde(default)]
     pub model: String,
     pub retained_at_millis: i64,
+    /// Who the call was attributed to (D8.1): what an observed closure's `allow` row carries,
+    /// so the row reaches the Cloud under the same agent, key and unit a settled call would.
+    /// Absent on a line written before this field existed, and never serialized when absent,
+    /// so such a line keeps its canonical bytes and therefore its revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<RowAttribution>,
+}
+
+/// The request-scoped fields of a retained call that its eventual `allow` row needs, a subset
+/// of `settle::CallAttribution`. Every member is skipped when empty, so the journal line grows
+/// only by what the call actually carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowAttribution {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_id: String,
+    /// The unit the identity map resolved, capped or not (a unit with no cap holds no unit
+    /// reservation, and the Cloud's unit month still needs the name).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unit: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_run_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_behalf_of: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_reason: Option<String>,
+}
+
+impl RowAttribution {
+    pub fn of(a: &crate::settle::CallAttribution) -> Self {
+        RowAttribution {
+            agent_id: a.agent_id.clone(),
+            key_id: a.key_id.clone(),
+            unit: a.unit.clone(),
+            parent_run_id: a.parent_run_id.clone(),
+            on_behalf_of: a.on_behalf_of.clone(),
+            outcome: a.outcome.clone(),
+            identity_reason: a.identity_reason.clone(),
+        }
+    }
 }
 
 impl Record {
@@ -105,6 +148,7 @@ impl Record {
             unit: entry.unit.clone(),
             model: entry.model.clone(),
             retained_at_millis: entry.retained_at_millis,
+            attribution: entry.attribution.clone(),
         }
     }
 }
@@ -425,6 +469,7 @@ pub fn replay(
             model: r.model.clone(),
             retained_at_millis: r.retained_at_millis,
             revision: r.revision(),
+            attribution: r.attribution.clone(),
         });
         if !listed {
             out.unlisted += 1;
@@ -577,6 +622,7 @@ mod tests {
                 model: "m".into(),
                 retained_at_millis: now,
                 revision: String::new(),
+                attribution: None,
             },
             tail,
         )
@@ -984,6 +1030,79 @@ mod tests {
         assert_eq!(report.closed, 0);
         assert_eq!(ledger.snapshot("a").unwrap().reserved, Microusd(100));
         assert_eq!(report.keep.len(), 1);
+    }
+
+    /// D8.1. A line written before `attribution` existed carries exactly the seven older
+    /// members; it reads with no attribution, and its revision is still the hash of the bytes
+    /// on disk, so a closure (or a token) minted against it still names it after the upgrade.
+    /// A line that does carry an attribution round-trips it.
+    #[test]
+    fn a_line_from_before_the_attribution_field_keeps_its_revision() {
+        use sha2::{Digest, Sha256};
+        let now = crate::sink::now_millis();
+        let (old, old_units) = (Ledger::new(), capped());
+        let (a, ta) = retained_pair(&old, &old_units, "a", None, Microusd(100), now);
+        let mut record = Record::retained(&a, ta);
+        record.attribution = None;
+        let line = serde_json::to_vec(&record).unwrap();
+        let keys: Vec<String> = serde_json::from_slice::<serde_json::Value>(&line)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut expected = vec![
+            "kind",
+            "model",
+            "retained_at_millis",
+            "run",
+            "tail_parent",
+            "unit",
+            "v",
+        ];
+        expected.sort();
+        assert_eq!(keys, expected, "the older line shape, member for member");
+
+        let mut h = Sha256::new();
+        h.update(b"tokenfuse-retained-revision-v1\n");
+        h.update(&line);
+        let on_disk: String = h.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let parsed: Record = serde_json::from_slice(&line).unwrap();
+        assert_eq!(parsed.attribution, None);
+        assert_eq!(parsed.revision(), on_disk);
+
+        let ledger = Arc::new(Ledger::new());
+        let report = replay(
+            ReadReport {
+                records: vec![parsed],
+                closures: vec![closure_of(&a, &on_disk)],
+                ..Default::default()
+            },
+            &LocalLedger(ledger.clone()),
+            &capped(),
+            &Retained::default(),
+            now,
+        );
+        assert_eq!(report.closed, 1, "the closure still names the older line");
+        assert!(ledger.snapshot("a").is_none());
+
+        record.attribution = Some(RowAttribution {
+            agent_id: "agent://acme/bot".into(),
+            unit: "ops".into(),
+            ..Default::default()
+        });
+        let line = serde_json::to_vec(&record).unwrap();
+        let back: Record = serde_json::from_slice(&line).unwrap();
+        assert_eq!(back, record);
+        assert_ne!(
+            back.revision(),
+            on_disk,
+            "the attribution is part of what a token binds"
+        );
     }
 
     /// A rewrite that fails before its rename leaves the journal exactly as it was, and the
