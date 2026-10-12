@@ -2051,4 +2051,153 @@ mod tests {
         );
         assert_eq!(model.decision, WardryxDecision::Deny, "failmode closed");
     }
+
+    // -- the tool path waits for the policy plane (invariant 74) --
+    //
+    // The precedence for a decide that carries a tool call: its own variable
+    // when usable, else a shared value the operator set, else 1000 ms. The
+    // model path keeps 50 ms. Each test goes through `from_vars`, the function
+    // `from_env` is, so the environment names and the precedence are read
+    // together.
+
+    /// The hook a deployment gets from exactly these variables, plus a URL and
+    /// `enforce` so a client exists to carry the model path's deadline.
+    fn hook_from(pairs: &[(&str, &str)]) -> Wardryx {
+        let mut all = vec![
+            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
+            ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+        ];
+        all.extend_from_slice(pairs);
+        Wardryx::from_vars(vars(&all))
+    }
+
+    /// (model path, tool path), in milliseconds.
+    fn deadlines(w: &Wardryx) -> (u128, u128) {
+        (
+            w.client.as_ref().expect("a client").timeout.as_millis(),
+            w.tool_timeout().as_millis(),
+        )
+    }
+
+    /// A writer for a subscriber scoped to one test's own thread, so the lines
+    /// it counts are the ones that test caused and no other test's.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+        type Writer = Lines;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Build the hook from `pairs` under a subscriber of its own and return it
+    /// with every line it logged.
+    fn hook_logging(pairs: &[(&str, &str)]) -> (Wardryx, String) {
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let w = tracing::subscriber::with_default(subscriber, || hook_from(pairs));
+        let log = String::from_utf8_lossy(&lines.0.lock().unwrap()).to_string();
+        (w, log)
+    }
+
+    #[test]
+    fn with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50() {
+        assert_eq!(
+            deadlines(&hook_from(&[])),
+            (50, 1000),
+            "(model path, tool path) with no timeout variable set"
+        );
+    }
+
+    #[test]
+    fn an_explicit_shared_timeout_is_the_deadline_of_both_paths() {
+        for (shared, ms) in [("50", 50), ("80", 80), ("2500", 2500)] {
+            assert_eq!(
+                deadlines(&hook_from(&[("TOKENFUSE_WARDRYX_TIMEOUT_MS", shared)])),
+                (ms, ms),
+                "TOKENFUSE_WARDRYX_TIMEOUT_MS={shared} is the operator's choice for both paths"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tool_paths_own_variable_wins_over_the_shared_one_and_the_default() {
+        assert_eq!(
+            deadlines(&hook_from(&[("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "900")])),
+            (50, 900)
+        );
+        assert_eq!(
+            deadlines(&hook_from(&[
+                ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
+                ("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "900"),
+            ])),
+            (80, 900)
+        );
+        // Shorter than the shared value is the operator's to choose too.
+        assert_eq!(
+            deadlines(&hook_from(&[
+                ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
+                ("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "30"),
+            ])),
+            (80, 30)
+        );
+    }
+
+    #[test]
+    fn an_unusable_tool_timeout_falls_back_by_the_precedence_and_warns_once() {
+        let warned = |log: &str| {
+            log.lines()
+                .filter(|l| l.contains("WARN") && l.contains("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS"))
+                .count()
+        };
+
+        // Nothing else set: the tool path's own default, one warning naming
+        // the value.
+        let (w, log) = hook_logging(&[("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "abc")]);
+        assert_eq!(deadlines(&w), (50, 1000), "{log}");
+        assert_eq!(warned(&log), 1, "exactly one warning: {log}");
+        assert!(log.contains("abc"), "the warning names the value: {log}");
+
+        // A shared value set: that value, one warning.
+        let (w, log) = hook_logging(&[
+            ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
+            ("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "0"),
+        ]);
+        assert_eq!(deadlines(&w), (80, 80), "{log}");
+        assert_eq!(warned(&log), 1, "exactly one warning: {log}");
+
+        // Blank is unset, which is not a mistake and says nothing.
+        let (w, log) = hook_logging(&[("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "  ")]);
+        assert_eq!(deadlines(&w), (50, 1000), "{log}");
+        assert_eq!(warned(&log), 0, "no warning for a blank value: {log}");
+    }
+
+    #[test]
+    fn an_unreadable_shared_timeout_is_not_an_operators_choice() {
+        // The model path reads an unparseable shared value as unset (its 50 ms,
+        // unchanged); the tool path reads it the same way and so takes its own
+        // default rather than the model path's.
+        for junk in ["", "abc", "1.5"] {
+            assert_eq!(
+                deadlines(&hook_from(&[("TOKENFUSE_WARDRYX_TIMEOUT_MS", junk)])),
+                (50, 1000),
+                "TOKENFUSE_WARDRYX_TIMEOUT_MS={junk:?}"
+            );
+        }
+    }
 }
