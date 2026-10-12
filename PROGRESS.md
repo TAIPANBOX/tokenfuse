@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1825 passing** (core 397, dpop 21, delegation 60,
-gateway 1068, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1840 passing** (core 398, dpop 21, delegation 60,
+gateway 1082, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by 3 and
 gateway by 14 with D10, a retained call and its closure on the agent-event bus
 (invariant 90: 3 in `core::agent_event`, 4 in `gateway::proxy`, 6 in

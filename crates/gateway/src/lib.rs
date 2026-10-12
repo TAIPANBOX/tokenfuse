@@ -11,6 +11,7 @@ pub mod closure;
 pub mod cloudsink;
 pub mod compliancecli;
 pub mod constants;
+pub mod declaredscan;
 pub mod declassify;
 pub mod defaults;
 pub mod embedder;

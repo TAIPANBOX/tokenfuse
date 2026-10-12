@@ -158,6 +158,50 @@ pub fn parse_tools(v: &serde_json::Value) -> Vec<McpTool> {
         .collect()
 }
 
+/// The tools a model REQUEST declares, as the scanner's [`McpTool`]s.
+///
+/// Reads the same two wire shapes [`crate::taint::declared_tool_defs_in`]
+/// does: Anthropic `tools[].{name, description, input_schema}` and OpenAI
+/// `tools[].function.{name, description, parameters}`. The text a model reads
+/// to decide how to call a tool is the same text whether an MCP server
+/// advertised it or the caller declared it in the request, so it goes through
+/// the same scanner.
+///
+/// The `fingerprint` is left empty: nothing here pins or diffs, and hashing a
+/// schema per tool per request would be cost for no reader. The traversal is
+/// bounded by the same schema depth and description caps as [`parse_tools`],
+/// and a malformed element is skipped, never an error.
+pub fn declared_tools(request: &serde_json::Value) -> Vec<McpTool> {
+    let Some(arr) = request.get("tools").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in arr {
+        // Anthropic puts the name on the element, OpenAI under `function`.
+        let (body, schema) = if t.get("name").and_then(|n| n.as_str()).is_some() {
+            (t, t.get("input_schema"))
+        } else if let Some(f) = t.get("function") {
+            (f, f.get("parameters"))
+        } else {
+            continue;
+        };
+        let Some(name) = body.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        out.push(McpTool {
+            name: name.to_string(),
+            description: body
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
+            param_descriptions: schema.map(schema_descriptions).unwrap_or_default(),
+            fingerprint: String::new(),
+        });
+    }
+    out
+}
+
 /// A suspicious pattern found in a tool description (tool poisoning / hidden
 /// instructions aimed at the agent reading the tool list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,6 +889,34 @@ pub fn diff(current: &[McpTool], lock: &Lock) -> Vec<Drift> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_tools_reads_both_wire_shapes_and_skips_malformed_elements() {
+        let anthropic = serde_json::json!({"tools":[
+            {"name":"a","description":"d","input_schema":{"properties":{"p":{"description":"pd"}}}},
+            {"description":"no name"}, 5, null
+        ]});
+        let t = declared_tools(&anthropic);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].name, "a");
+        assert_eq!(
+            t[0].param_descriptions,
+            vec![("p".to_string(), "pd".to_string())]
+        );
+        let openai = serde_json::json!({"tools":[
+            {"type":"function","function":{"name":"b","description":"d","parameters":{"properties":{"q":{"description":"qd"}}}}},
+            {"function":{"name":7}}
+        ]});
+        let t = declared_tools(&openai);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].name, "b");
+        assert_eq!(
+            t[0].param_descriptions,
+            vec![("q".to_string(), "qd".to_string())]
+        );
+        assert!(declared_tools(&serde_json::json!({"tools":"x"})).is_empty());
+        assert!(declared_tools(&serde_json::json!({})).is_empty());
+    }
+
     use super::*;
     use serde_json::json;
 

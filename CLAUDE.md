@@ -6463,3 +6463,53 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_cross_tool_check_is_bounded_by_the_name_cap`. Scenarios:
     `features/mcp-scan-reads-metadata-not-only-phrases.feature`, twelve, each bound.
     Not a script gate.)*
+
+93. **The tools a request declares are read for poisoning, and a finding is a
+    taint SOURCE, never a decision.** The MCP broker scans a tool listing
+    (invariant 92); a tool declared directly in an LLM request
+    (`tools[]`, either wire) reached the model with its description unread.
+    Measured 2026-10-12 against the v1.10.0 binary, firewall and budget in
+    enforce: a declared tool whose description ordered the model to call
+    another tool first and hide it was answered 200 with no mark on the run.
+
+    `declaredscan::scan` converts the declared tools
+    (`tokenfuse_core::mcp::declared_tools`, both wire shapes) and runs
+    `scan_injection` over each tool and every parameter description. A finding
+    at `high` or `critical` adds `suspected_injection` to the run, in the
+    firewall block of `proxy::handle_call` beside the tool-result scan, so the
+    starter rule applies to later tool calls through the answer path and
+    `check-tool-call`. `medium` does not label: it is the severity honest
+    documentation also produces, and a false label costs a refused action on
+    every later turn. The request is never refused because a description
+    matched (invariant 27); firewall off reads nothing, and
+    `"detect_injection": false` switches this off with the other scan.
+    Recorded as one `taint_raised` (stage `tool_result`, `from_tools` the
+    declared tool names, `signals` the kinds, no text; no new stage, because
+    that vocabulary is agent-passport's) and shown as an `x-fuse-taint:
+    raised: ...` note on the answer, in shadow and enforce alike. Each
+    distinct tool set is scanned once per process (SHA-256 of the serialised
+    array, 1024 sets, then the memo starts over). `@claude` 2026-10-12.
+    @measured release build, 20 tools with two parameters each: first scan
+    1.97 ms, a memo hit about 47 us (serialise and hash).
+    *(test: `tests/it/declared_tools_are_read.rs`, eight, of which five were
+    red against the tree with the scan disabled (200 where 403 was right, zero
+    events); `declaredscan::tests`, six; `core::mcp::tests::declared_tools_reads_both_wire_shapes_and_skips_malformed_elements`.
+    Mutants, each caught by name: OpenAI wire skipped
+    (`the_openai_wire_is_read_too`), parameter descriptions skipped
+    (`a_poisoned_parameter_description_is_read`), label applied with the
+    firewall off (`with_the_firewall_off_nothing_changes`), request refused
+    instead of labelled (`a_poisoned_declared_tool_alone_never_refuses_the_request`),
+    detector switch ignored (`the_detector_switch_off_leaves_declared_tools_unread`),
+    `medium` counted (`a_bare_mention_of_another_tool_is_documentation_not_a_label`,
+    which survived until that test was added). Scenarios:
+    `features/declared-tools-are-read-for-poisoning.feature`, eight, each
+    bound.)*
+
+    **Where it says nothing.** A calm instruction to fabricate an answer has
+    no shape and is not caught. Nothing pins a declared set across turns (no
+    lockfile, unlike the broker). A human clearance (invariant 28) does not
+    outlast the next turn while the poisoned tool is still declared, since the
+    declaration is resent and carries no block id. The record's stage says
+    `tool_result` for text that is not a result. A tool set that changes every
+    turn is rescanned every turn. It reads shapes, never meaning, and is
+    defeatable by anybody who reads the scanner.
