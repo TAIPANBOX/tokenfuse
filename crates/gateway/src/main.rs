@@ -601,6 +601,7 @@ async fn mcp_broker() {
         dlp,
         dlp_pii,
         lock,
+        drifted: Default::default(),
         wardryx,
         keys,
         clients,
