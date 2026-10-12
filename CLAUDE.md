@@ -4993,14 +4993,83 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     port of the default upstream's URL, never the URL itself (userinfo can sit
     in it, and a path says nothing about which server).
 
-    **The tool path has its own deadline.** A decide that carries a `tool_call`
-    waits up to `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`; every other decide keeps
-    `TOKENFUSE_WARDRYX_TIMEOUT_MS`. Unset or blank, the tool path takes the
-    shared value, so a deployment that sets nothing new behaves as before. A
-    value that is set and unusable (not an integer, negative, zero) is the
-    shared value with one warn line naming it, not a guess. It is keyed on the
-    call being present, not on who asks, so the two budgets cannot be crossed
-    by a caller that forgets which it is. The name is declared in
+    **The tool path has its own deadline, and its own default.** A decide that
+    carries a `tool_call` waits, in this order: `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`
+    when it is set and usable; else the shared `TOKENFUSE_WARDRYX_TIMEOUT_MS`
+    when the operator set one this process reads, so an explicit shared value
+    still governs both paths as it always has; else 1000 ms
+    (`DEFAULT_TOOL_TIMEOUT_MS`). Every other decide keeps the shared value, or
+    50 ms when it is unset. A tool-path value that is set and unusable (not an
+    integer, negative, zero) is the next value in that order with one warn line
+    naming it, not a guess; a blank one is unset and says nothing. A shared
+    value that does not parse is unset for both paths (the model path has
+    always read it so), so the tool path takes its 1000 ms there and the model
+    path its 50.
+
+    **Until 2026-10-12 the unset case was a defect.** The tool path took the
+    shared value whether or not anybody had set it, so a bare broker gave a
+    tool call the model path's 50 ms. `typryx wardryx-proxy`, which an operator
+    places in front of wardryx for the broker to add a typed risk signal, waits
+    up to `TYPRYX_PROXY_ASK_TIMEOUT_MS` (150 ms by default) for its model
+    before forwarding, so a PDP answer that took 50 to 150 ms, the proxy's
+    normal case, arrived after the broker had given up: the default failmode,
+    open, synthesised an allow and the call was forwarded even when wardryx
+    answered `deny`, a `deny_tool` rule included. The launchers set larger
+    values (the gateway 250 ms; the broker 7000 ms with the proxy at 3000 ms),
+    so it hit a component run with its defaults (the 150 ms read 2026-10-12
+    from typryx's `cmd/typryx/wardryxproxy.go`, the launcher values from
+    stack-single's `compose.yaml` and stack-k8s's `typed/mode.sh`).
+    `@decided 2026-10-11`:
+    fail-open stays the component default, and destructive tools are handled
+    by deny rules in policy, not by a changed failmode; the 50 ms against
+    150 ms gap is first shown by a test, then fixed. `@claude` 2026-10-12,
+    under delegated authority and open to reversal: the tool path gets a
+    default of its own rather than a changed shared default, because a tool
+    call is not latency-critical the way a model call is and the typed-signal
+    proxy sits on the tool path alone; 1000 ms clears the proxy's 150 ms and
+    wardryx behind it with room; and an unparseable shared value counts as
+    unset rather than as a choice, so a typo cannot bring the 50 ms back to the
+    tool path. What this does not cover: a PDP that never answers now holds a
+    `tools/call` up to 1000 ms before the failmode decides, where it held it
+    50 ms; an operator who sets the shared value below the proxy's wait still
+    gets the old outcome, as a choice they made; and 1000 ms was measured
+    against a stub that denies in 120 ms, not against a live typryx proxy in
+    front of a live wardryx.
+    *(test: `tests/it/mcp_broker.rs::a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call`,
+    the real `tokenfuse mcp-broker` binary with a cleared environment (no
+    timeout variable, the default failmode) against a PDP that denies after
+    120 ms, red in CI on the test-only commit, run 38237182208: the broker
+    answered `{"id":74,"jsonrpc":"2.0","result":{"ok":true}}`, logged `wardryx
+    decide call failed; applying failmode ... failmode=Open`, and the upstream
+    count read `left: 1 right: 0`; its guard
+    `an_explicit_shared_timeout_still_governs_the_tool_path` (50 ms set, the
+    same deny late, the call forwarded once) green on both sides. In
+    `gateway::wardryx`, through `from_vars`:
+    `with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50`,
+    `an_unusable_tool_timeout_falls_back_by_the_precedence_and_warns_once` and
+    `an_unreadable_shared_timeout_is_not_an_operators_choice`, red in CI on the
+    second test-only commit, run 38237856543, each reading
+    `left: (50, 50) right: (50, 1000)` as (model path, tool path); the guards
+    `an_explicit_shared_timeout_is_the_deadline_of_both_paths` and
+    `the_tool_paths_own_variable_wins_over_the_shared_one_and_the_default`
+    green on both sides; `an_unset_tool_timeout_takes_the_shared_budget_the_operator_set_or_1000`,
+    renamed from `the_tool_timeout_defaults_to_the_shared_budget` when the
+    function's signature changed, so red only by compile. One older test,
+    `with_only_the_shared_timeout_set_the_tool_path_gets_it_too`, asserted the
+    defect in its second half, which is gone with the reason in its body.
+    Three mutants are cases in `gates-have-teeth.sh`, each caught by name in
+    CI: the tool path's default reverted to the shared 50 ms
+    (`a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call`),
+    the precedence ignoring a shared value the operator set
+    (`an_explicit_shared_timeout_still_governs_the_tool_path`), and the model
+    path's default moved to 1000 ms
+    (`with_nothing_set_the_tool_path_waits_1000_ms_and_the_model_path_50`).
+    Scenarios: `features/the-tool-path-waits-for-the-policy-plane.feature`,
+    five, each bound.)*
+
+    The choice of deadline is keyed on the call being present, not on who
+    asks, so the two budgets cannot be crossed by a caller that forgets which
+    it is. The name is declared in
     `components.json` (additive; `compat/1.0.json` freezes nothing new).
     `Wardryx::from_env` reads it in both processes because both build their
     hook there, and only the broker's decide ever carries a `tool_call`, so
@@ -5037,7 +5106,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_decide_with_no_call_has_no_tool_call_member_at_all`,
     `a_tool_call_gets_the_tool_budget_and_a_model_call_keeps_the_shared_one`,
     `the_environment_names_reach_the_tool_timeout`,
-    `the_tool_timeout_defaults_to_the_shared_budget` and
+    `the_tool_timeout_defaults_to_the_shared_budget` (renamed 2026-10-12, see
+    above) and
     `a_set_tool_timeout_is_read_and_a_set_unusable_one_is_the_shared_budget`.
     Seven of the new tests in `gateway::wardryx` and five in
     `tests/it/mcp_broker.rs` were red by assertion against the plumbing with the

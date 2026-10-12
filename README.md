@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.9.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1787-brightgreen)
+![tests](https://img.shields.io/badge/tests-1794-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -704,8 +704,8 @@ Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). R
 | `TOKENFUSE_WARDRYX_MODE` | `off` (default) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
 | `TOKENFUSE_WARDRYX_FAILMODE` | `open` (default) · `closed` | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. |
 | `TOKENFUSE_WARDRYX_KEY` | bearer token (optional) | Sent to the PDP. |
-| `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout. |
-| `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` | default: the value of `TOKENFUSE_WARDRYX_TIMEOUT_MS` | Timeout for the MCP broker's decision on a `tools/call` only, so a tool call can have a longer budget (an argument-aware policy may need one) without slowing the model path. A value that is not a positive integer is ignored with one warning. |
+| `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout on the model path. When set, it is also the MCP broker's timeout on a `tools/call` unless the next variable is set. |
+| `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` | default: `TOKENFUSE_WARDRYX_TIMEOUT_MS` if set, else `1000` | Timeout for the MCP broker's decision on a `tools/call` only. A tool call is not latency-critical the way a model call is, and a PDP behind a proxy (such as the typed-signal proxy, which waits up to 150 ms) needs more than 50 ms; a deny that arrives after the timeout is lost to the failmode, which defaults to open. A value that is not a positive integer is ignored with one warning. |
 | `TOKENFUSE_WARDRYX_CACHE_TTL_MS` | default `3000` (`0` disables) | Short-TTL decision cache; only decisions the PDP marks `cacheable` are ever cached (a `hold` never is). |
 
 **Shadow tool-pruning measurement** (how many input tokens go to schemas of tools the wardryx policy would deny, measured, never enforced):

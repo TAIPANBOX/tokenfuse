@@ -3659,3 +3659,194 @@ async fn a_notification_the_broker_refuses_itself_is_an_error_status_too() {
     assert_eq!(err["id"], Value::Null, "{err}");
     assert!(up.seen.lock().unwrap().is_empty(), "nothing was forwarded");
 }
+
+// -- the tool path waits for the policy plane (invariant 74) --
+//
+// These two run the real `tokenfuse mcp-broker` binary, because what they are
+// about is the deadline an operator gets from the environment, and every other
+// test in this file builds its hook with `Wardryx::new` and an explicit
+// timeout, which is exactly the configuration these tests must NOT have.
+
+/// A PDP that answers `deny` after `delay`, the shape of wardryx behind the
+/// typed-signal proxy (`typryx wardryx-proxy` waits up to 150 ms for its model
+/// before forwarding), and counts every question so a test can tell "asked and
+/// answered late" from "never asked".
+async fn slow_denying_pdp(delay: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(_req): Json<Value>| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                Json(json!({
+                    "decision": "deny",
+                    "policy_version": "test-v1",
+                    "reason": "deny_tool: shell_exec"
+                }))
+            }
+        }),
+    );
+    (spawn_server(router).await, asked)
+}
+
+/// The real broker process, killed when the test ends however it ends.
+struct BrokerProcess {
+    child: std::process::Child,
+    url: String,
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Drop for BrokerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl BrokerProcess {
+    fn log(&self) -> String {
+        self.log.lock().unwrap().join("\n")
+    }
+}
+
+/// Start `tokenfuse mcp-broker` with an environment holding exactly `env`
+/// (cleared first, so nothing this shell or CI exports can be what decides
+/// the deadline) and wait until it is listening.
+fn spawn_broker_process(env: &[(&str, &str)]) -> BrokerProcess {
+    use std::io::{BufRead, BufReader};
+    let addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a.to_string()
+    };
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tokenfuse"));
+    cmd.arg("mcp-broker")
+        .env_clear()
+        .env("RUST_LOG", "info")
+        .env("TOKENFUSE_MCP_ADDR", &addr)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn the tokenfuse binary");
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let streams: [Box<dyn std::io::Read + Send>; 2] = [
+        Box::new(child.stdout.take().expect("stdout piped")),
+        Box::new(child.stderr.take().expect("stderr piped")),
+    ];
+    for stream in streams {
+        let log = Arc::clone(&log);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if line.contains("mcp credential-broker listening") {
+                    tx.send(()).ok();
+                }
+                log.lock().unwrap().push(line);
+            }
+        });
+    }
+    let process = BrokerProcess {
+        child,
+        url: format!("http://{addr}"),
+        log,
+    };
+    assert!(
+        rx.recv_timeout(Duration::from_secs(15)).is_ok(),
+        "the broker never said it was listening: {}",
+        process.log()
+    );
+    process
+}
+
+async fn call_shell_exec(broker_url: &str) -> Value {
+    reqwest::Client::new()
+        .post(broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/tool-user")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 74, "method": "tools/call",
+            "params": { "name": "shell_exec", "arguments": { "cmd": "rm -rf /" } }
+        }))
+        .send()
+        .await
+        .expect("the broker must answer")
+        .json()
+        .await
+        .expect("a JSON-RPC answer")
+}
+
+/// The defect: a broker started with no timeout variable and the default
+/// failmode (open) gave the tool path the model path's 50 ms. A deny that
+/// took 120 ms, the ordinary case behind the typed-signal proxy (its own
+/// default wait is 150 ms), arrived after the broker had given up, failmode
+/// open turned the outage into an allow, and the denied call was forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, asked) = slow_denying_pdp(Duration::from_millis(120)).await;
+    let broker = spawn_broker_process(&[
+        ("TOKENFUSE_MCP_UPSTREAM", &upstream),
+        ("TOKENFUSE_WARDRYX_URL", &pdp),
+        ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+    ]);
+
+    let resp = call_shell_exec(&broker.url).await;
+
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the policy plane was asked once: {resp}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "the deny arrived after the broker gave up and the call was forwarded \
+         upstream; the broker answered {resp}; its log:\n{}",
+        broker.log()
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32004),
+        "the deny must be honoured as a refusal: {resp}"
+    );
+    assert!(resp.get("result").is_none(), "{resp}");
+}
+
+/// The guard: an operator who set TOKENFUSE_WARDRYX_TIMEOUT_MS chose a
+/// deadline for both paths, and the tool path keeps it. With 50 ms set
+/// explicitly the same 120 ms deny is late, failmode open applies, and the
+/// call goes through, exactly as before this change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_shared_timeout_still_governs_the_tool_path() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, asked) = slow_denying_pdp(Duration::from_millis(120)).await;
+    let broker = spawn_broker_process(&[
+        ("TOKENFUSE_MCP_UPSTREAM", &upstream),
+        ("TOKENFUSE_WARDRYX_URL", &pdp),
+        ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+        ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "50"),
+    ]);
+
+    let resp = call_shell_exec(&broker.url).await;
+
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the policy plane was asked once: {resp}"
+    );
+    assert!(
+        resp["result"].is_object(),
+        "a 50 ms deadline the operator chose expires before a 120 ms deny, so \
+         failmode open forwards the call: {resp}; its log:\n{}",
+        broker.log()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "forwarded once: {resp}");
+}

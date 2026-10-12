@@ -304,9 +304,12 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1787 passing** (core 380, dpop 21, delegation 60,
-gateway 1047, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
+`cargo test --all` runs **1794 passing** (core 380, dpop 21, delegation 60,
+gateway 1054, cloud 278, umbrella 1, by `cargo test -p <crate>`), which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Gateway grew by 7
+with the tool path's own deadline for the policy plane (invariant 74: 5 in
+`gateway::wardryx`, 2 in `tests/it/mcp_broker.rs`; 2026-10-12, counted by hand and
+checked by CI's `stated-numbers.sh`). Gateway grew by 7
 with D8.1, an observed closure reaching the Cloud (invariant 89: 3 in `gateway::closure`,
 1 in `gateway::retainedjournal`, 1 in `gateway::settle`, 2 in
 `tests/it/closure_reaches_the_cloud.rs`; 2026-10-12, counted from `cargo test --all
