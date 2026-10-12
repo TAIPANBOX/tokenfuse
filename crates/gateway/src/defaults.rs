@@ -196,6 +196,47 @@ pub fn policy_mode_from_env() -> Mode {
     }
 }
 
+/// The agent firewall's mode override (`TOKENFUSE_FIREWALL`): `off | shadow |
+/// enforce`, or nothing.
+///
+/// **Unset or empty (or only spaces) is `Ok(None)`**: no override, so the mode
+/// stays what the policy file's own `mode` says, or the default. That is what a
+/// deployment that never set the variable has always had, and it is unchanged.
+///
+/// Otherwise the three words in any case, `Ok(Some(mode))`. Anything else is an
+/// `Err` carrying the value, never a reading of it. Until 2026-10-13 the match
+/// took only the exact lowercase words and ignored the rest, so
+/// `TOKENFUSE_FIREWALL=enfroce` or `=ENFORCE` started a gateway at whatever mode
+/// the file or the default gave, while its operator believed enforcement was on.
+/// Invariant 72 closed the same hole for `TOKENFUSE_MODE`; this mirrors it, and
+/// the caller owns the exit.
+pub fn firewall_mode_from(
+    value: Option<&str>,
+) -> Result<Option<tokenfuse_core::taint::FirewallMode>, String> {
+    use tokenfuse_core::taint::FirewallMode;
+    let trimmed = value.unwrap_or_default().trim();
+    match trimmed.to_lowercase().as_str() {
+        "" => Ok(None),
+        "off" => Ok(Some(FirewallMode::Off)),
+        "shadow" => Ok(Some(FirewallMode::Shadow)),
+        "enforce" => Ok(Some(FirewallMode::Enforce)),
+        _ => Err(trimmed.to_string()),
+    }
+}
+
+/// [`firewall_mode_from`] against the process environment; exits 2 on a value
+/// it cannot read, naming the variable, the value and the three words it
+/// accepts. Called before the listener binds, from `firewall::from_env`.
+pub fn firewall_mode_from_env() -> Option<tokenfuse_core::taint::FirewallMode> {
+    match firewall_mode_from(std::env::var("TOKENFUSE_FIREWALL").ok().as_deref()) {
+        Ok(mode) => mode,
+        Err(raw) => {
+            eprintln!("tokenfuse: TOKENFUSE_FIREWALL must be off|shadow|enforce, got `{raw}`");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// The operator's ceiling on any run budget the caller or a default chose
 /// (`TOKENFUSE_MAX_RUN_BUDGET_USD`), invariant 73.
 ///
@@ -412,6 +453,43 @@ mod tests {
                 policy_mode_from(Some(typo)),
                 Err(typo.to_string()),
                 "{typo} must be refused, not started as shadow"
+            );
+        }
+    }
+
+    #[test]
+    fn the_firewall_mode_is_left_alone_when_nothing_is_configured() {
+        assert_eq!(firewall_mode_from(None), Ok(None));
+        assert_eq!(firewall_mode_from(Some("")), Ok(None));
+        assert_eq!(firewall_mode_from(Some("   ")), Ok(None));
+    }
+
+    #[test]
+    fn every_named_firewall_mode_is_honoured_in_any_case() {
+        use tokenfuse_core::taint::FirewallMode;
+        for (raw, want) in [
+            ("off", FirewallMode::Off),
+            ("OFF", FirewallMode::Off),
+            ("shadow", FirewallMode::Shadow),
+            ("Shadow", FirewallMode::Shadow),
+            ("enforce", FirewallMode::Enforce),
+            ("Enforce", FirewallMode::Enforce),
+            (" ENFORCE ", FirewallMode::Enforce),
+        ] {
+            assert_eq!(firewall_mode_from(Some(raw)), Ok(Some(want)), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_mistyped_firewall_mode_is_refused_not_ignored() {
+        // Ignoring it leaves the mode at whatever the policy file or the default
+        // says, which is the gateway that refuses nothing while its operator
+        // believes it refuses. Refused, with the value, instead.
+        for typo in ["enfroce", "enforced", "on", "1", "true", "block", "warn"] {
+            assert_eq!(
+                firewall_mode_from(Some(typo)),
+                Err(typo.to_string()),
+                "{typo} must be refused, not read as no override"
             );
         }
     }
