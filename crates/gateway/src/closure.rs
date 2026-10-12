@@ -1145,7 +1145,17 @@ mod tests {
             &request(&e, "op-ok", EvidenceKind::Observed, Some(700)),
             r.now,
         );
-        let on_bus = closed_on_bus(&path);
+        // The operation ids only: the refused closure's evidence is 16 MiB, and a
+        // failure message that carried it would flood the log it is read in.
+        let on_bus: Vec<String> = closed_on_bus(&path)
+            .iter()
+            .map(|e| {
+                e["data"]["operation_id"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(stale.1["error"]["type"], "stale_revision", "{}", stale.1);
@@ -1156,8 +1166,7 @@ mod tests {
             too_big.1
         );
         assert_eq!(applied.0, StatusCode::OK, "{}", applied.1);
-        assert_eq!(on_bus.len(), 1, "only the applied closure: {on_bus:?}");
-        assert_eq!(on_bus[0]["data"]["operation_id"], "op-ok");
+        assert_eq!(on_bus, ["op-ok"], "only the applied closure is on the bus");
     }
 
     /// The operation answered again after a restart (the books loaded from the
