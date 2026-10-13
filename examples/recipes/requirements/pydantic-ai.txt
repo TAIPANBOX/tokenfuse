@@ -1,1 +1,1 @@
-pydantic-ai-slim[openai,anthropic]==2.43.0
+pydantic-ai-slim[openai,anthropic]==2.53.0
