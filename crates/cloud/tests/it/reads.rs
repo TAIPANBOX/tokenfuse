@@ -707,8 +707,8 @@ async fn cors_preflight_is_answered() {
 ///
 /// The console's Statistics view has one window selector above a table whose
 /// money columns could not follow it, because this endpoint took no time filter
-/// at all. Yurii switched to 7 days, watched Spend not move, and asked whether
-/// that was intended. Half of it was: the two windows are deliberately separate
+/// at all. The window was set to 7 days, the Spend column did not move, and
+/// the question was whether that was intended. Half of it was: the two windows are deliberately separate
 /// stores. The other half was a control that appeared to govern a column it
 /// could not reach.
 ///
@@ -822,7 +822,7 @@ async fn runs_names_the_window_it_applied() {
 /// so no filter on one can answer a period. `/v1/runs?since_millis=` came
 /// closest and was still wrong: it selects runs by last activity and each
 /// brings its lifetime total, which put a day at $8,151 beside a week at
-/// $15,024 on the console. Yurii read that and said it could not be right.
+/// $15,024 on the console. That was spotted at once as impossible.
 ///
 /// So the assertion that matters is PROPORTIONALITY: two days of equal spend
 /// must read as twice one of them, and the totals must add up rather than

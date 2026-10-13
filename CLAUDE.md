@@ -95,6 +95,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/constants.sh          # builds, unlike the text gates; see invariant 14
 ./scripts/d9-send-retention.sh  # invariant 50 (D9); its suite also runs in cargo test --all
 ./scripts/one-test-binary-per-crate.sh  # invariant 78
+./scripts/no-owner-quotes.sh     # invariant 101
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -613,7 +614,7 @@ build)`, `cloud apns (feature build)`.
    "something failed, it will not clear itself, and no other part of the estate
    will ever mention it".
 
-   Adopted `@yurii 2026-08-05` ("merge it and add the invariant"); the wording
+   Adopted `@decided 2026-08-05`: merge it and add it as an invariant; the wording
    and the general form above are `@claude`.
 
    Since invariant 53 (2026-09-18) an unreachable control plane is also said
@@ -957,7 +958,7 @@ build)`, `cloud apns (feature build)`.
    sensor gains from now on is built in idryx, and radar's job narrows to
    emitting what it observes into the shared agent-event stream instead of
    printing a table to a terminal.
-   *(@yurii 2026-08-08, "Idryx основний, radar зводимо до відправника подій")*
+   *(@decided 2026-08-08: idryx is the primary sensor; radar is reduced to an event sender)*
 
    **Three defects found on 2026-08-08 are why the direction is that way and
    not the other** (@claude, read off both trees). `radar-ebpf` reads the
@@ -1047,7 +1048,7 @@ build)`, `cloud apns (feature build)`.
    same failure one level down.
 
    **apt is in scope, and this reverses what stood here for one afternoon.**
-   `@yurii 2026-08-20`: «запінь apt теж». The argument recorded here against it
+   `@decided 2026-08-20`: apt is in scope too. The argument recorded here against it
    was that pinning apt on a hosted runner pins to versions that exist only in
    the image the runner happens to boot, so the pin breaks on the next image
    roll and the gate demanding it gets deleted by whoever is unblocking CI.
@@ -1494,7 +1495,7 @@ build)`, `cloud apns (feature build)`.
 
    Both wire shapes carry an id per tool call, so a review is recorded against
    ids. The same block arriving again is not an arrival; one that was not there
-   when somebody read the conversation is. `@yurii 2026-08-26` chose this over
+   when somebody read the conversation is. `@decided 2026-08-26`: this was chosen over
    the cheaper option of remembering how far the history reached.
 
    Four decisions inside it, each of which could have gone the other way. **A
@@ -2217,9 +2218,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the true half with the false one, which is that a customer under 23894 can
     put this product's enforcement decisions in their risk file as evidence.
 
-    `RELEVANT_FRAMEWORKS` is that third category. `@yurii 2026-08-26`, "3a (c)",
-    which confirmed the two standing refusals (ISO 23894 and OWASP ASI07) and
-    asked for this list beside them. The argument for each refusal is `@claude`,
+    `RELEVANT_FRAMEWORKS` is that third category. `@decided 2026-08-26`: the two
+    standing refusals (ISO 23894 and OWASP ASI07) stand, and this list sits beside
+    them. The argument for each refusal is `@claude`,
     dated 2026-08-26, and stands unedited in the module doc.
 
     **Three shape decisions, and each is what keeps the two from being one.** A
@@ -6954,3 +6955,15 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     **Boundary, both sides.** Exactly 12288 serialized bytes is sent whole; 12289 is truncated and flagged. The integration test pins both sides against the real broker and a stub PDP, and the unit test `the_cap_is_on_serialized_bytes_and_inclusive` pins the same edge on `ToolCall::new`.
     *(test: `tests/it/mcp_broker.rs::a_tool_call_of_13_kib_of_arguments_is_sent_truncated_so_the_pdp_decides` (red first: `13 KiB is over the policy plane's 12 KiB bound and must not be sent whole`, with the PDP answering 400), `arguments_of_exactly_12_kib_are_sent_whole_and_one_byte_more_is_truncated` (red first: the one-over call answered `blocked: policy denied tool "t" (wardryx answered 400 ...; failmode=Closed applied)`); `gateway::wardryx::a_thirteen_kib_call_is_sent_truncated_so_the_pdp_decides`, `the_cap_is_on_serialized_bytes_and_inclusive` (12288 fits, 12289 does not), `a_call_over_the_cap_loses_its_arguments_and_says_so`, and the 200-seed sweep `arguments_that_serialize_to_exactly_the_cap_in_many_shapes_never_panic`. Scenarios: `features/the-broker-sends-the-tool-call.feature`, the two scenarios for the 12 KiB bound, each bound. Mutants, planted and reverted: the cap back at 16 KiB (the red tests above fail), `>` changed to `>=` at the boundary (the exact-12-KiB tests fail), and the truncation flag not set when over (the flag and the integration tests fail). Not a script gate)*
+
+101. **No tracked file in this public repository quotes the owner, and none names him as the one
+    who said, asked, decided or found something.**
+    A decision of the owner is recorded as `@decided YYYY-MM-DD` followed by a paraphrase in this
+    repository's own English words, and that line is never edited afterwards. His wording, in any
+    language, and the old provenance marker stay out of tracked files. Holders of copyright, authors
+    and maintainers are named as before. A string literal that carries non-Latin text as test input
+    is not a quote and stays.
+    *(gate: `scripts/no-owner-quotes.sh`, four shapes: the old provenance marker; a guillemet on a line
+    that also carries Cyrillic; Cyrillic prose outside a string literal in a non-code file or in a code
+    comment; the owner's first name outside an authorship line. `scripts/gates-have-teeth.sh` plants a
+    marker line, requires a clean line to pass, and requires an empty index to say it measured nothing.)*

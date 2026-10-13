@@ -1101,6 +1101,26 @@ run_case "drifted-tool: a listing's changes are never recorded" fail \
 	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            st.drifted.observe(&upstream_url, &listed, &changed);\n", "            st.drifted.observe(&upstream_url, &listed, &[]);\n")')" \
 	"a_drifted_tool_is_refused_before_anything_is_forwarded ... FAILED"
 
+# --- invariant 101: no owner quotes in a public repository ------------------
+#
+# The planted marker is spelled as separate pieces in this file, so the file
+# does not carry the marker that the gate it tests refuses.
+run_case "no-owner-quotes: a planted marker line is refused" fail \
+	"./scripts/no-owner-quotes.sh" \
+	"$(py 'edit("README.md", "\n", "\n@" + "yu" + "rii 2026-10-13 planted\n")')" \
+	"the old provenance marker"
+
+run_case "no-owner-quotes: a clean line passes" pass \
+	"./scripts/no-owner-quotes.sh" \
+	"$(py 'edit("README.md", "\n", "\nA plain English line with no owner in it.\n")')"
+
+# An index with no entries leaves the gate nothing to read. It must say so
+# rather than report OK over an empty set.
+run_case "no-owner-quotes: an empty index, so it measured nothing" fail_env \
+	"env GIT_INDEX_FILE=$baseline_dir/no-index ./scripts/no-owner-quotes.sh" \
+	"pass" \
+	"measured nothing"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

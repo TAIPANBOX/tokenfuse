@@ -547,8 +547,8 @@ fn truncate_detail(detail: &str) -> String {
 /// back. Reading that literally left this field blank on the whole tool loop,
 /// which is the stage `taint_raised` fires on. It now walks back to the newest
 /// user message that says something, stopping there, so a changed instruction
-/// is still visible at the turn it changed. What `@yurii` asked on 2026-08-26 was "після яких саме промтів агент
-/// почав робити аномалії", and answering it means being able to say that four
+/// is still visible at the turn it changed. The question `@decided 2026-08-26` records is which instruction the agent
+/// started to produce anomalies after; answering it means being able to say that four
 /// incidents came from ONE instruction, or that the instruction changed at the
 /// turn things went wrong. Only the newest instruction has that property.
 ///
@@ -617,7 +617,8 @@ fn message_text(content: &serde_json::Value) -> Option<String> {
 
 /// Where in a call the agent firewall acted (`data.stage`).
 ///
-/// The member `@yurii` asked for first on 2026-08-26 ("на якому етапі"), and
+/// The member first wanted on 2026-08-26 (`@decided 2026-08-26`: the stage the firewall
+/// acted at), and
 /// the one a record is least useful without: "blocked" and "blocked while
 /// reading the request" are different facts to whoever has to decide whether
 /// the run got anywhere. Three stages and not more, because the gateway only
@@ -2147,7 +2148,7 @@ mod tests {
                     "on_behalf_of": ["user://acme.example/alice", "agent://acme.example/orchestrator"],
                     "data": { "budget_usd": 12.5, "n": 3, "note": "обмеження діє", "nested": { "b": 2, "a": 1 } }
                 }),
-                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"budget_usd":12.5,"n":3,"nested":{"a":1,"b":2},"note":"обмеження діє"},"on_behalf_of":["user://acme.example/alice","agent://acme.example/orchestrator"],"run_id":"run-0001","schema":"taipanbox.dev/agent-event/v0.2","severity":"critical","source":"tokenfuse","ts":"2026-07-24T12:00:01Z","type":"budget_exhausted"}"#,
+                "{\"agent_id\":\"agent://acme.example/support/tier1-bot\",\"data\":{\"budget_usd\":12.5,\"n\":3,\"nested\":{\"a\":1,\"b\":2},\"note\":\"обмеження діє\"},\"on_behalf_of\":[\"user://acme.example/alice\",\"agent://acme.example/orchestrator\"],\"run_id\":\"run-0001\",\"schema\":\"taipanbox.dev/agent-event/v0.2\",\"severity\":\"critical\",\"source\":\"tokenfuse\",\"ts\":\"2026-07-24T12:00:01Z\",\"type\":\"budget_exhausted\"}",
                 "sha256:488f1017967bf9510c62d7c31b9d5a0086ff2000d90a7d4266f171a131430243",
             ),
             (
@@ -2318,8 +2319,8 @@ mod prompt_hash_tests {
 
     #[test]
     fn the_same_instruction_hashes_to_the_same_value_across_turns() {
-        // The property the field exists for (@yurii 2026-08-26, "після яких
-        // саме промтів агент почав робити аномалії"): four incidents from one
+        // The property the field exists for (`@decided 2026-08-26`: find the
+        // instruction after which the agent started to produce anomalies): four incidents from one
         // instruction have to be recognisable as one instruction. Hashing the
         // whole history would change every turn and group nothing.
         let turn_one = json!({"messages":[

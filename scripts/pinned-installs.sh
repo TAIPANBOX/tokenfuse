@@ -26,8 +26,8 @@
 #   go install       `path@version`, and `@latest` is not a version.
 #
 #   apt-get install  a snapshot (--snapshot YYYYMMDDTHHMMSSZ), or an explicit
-#                    pkg=version. Added 2026-08-20 on Yurii's instruction,
-#                    after this header argued for leaving apt alone.
+#                    pkg=version. Added 2026-08-20 (`@decided 2026-08-20`), reversing the argument
+#                    in this header for leaving apt alone.
 #   runs-on          a released image label, never a `-latest` one.
 #
 # WHY APT IS IN SCOPE AFTER ALL, since this header used to argue the opposite

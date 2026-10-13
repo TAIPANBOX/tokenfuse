@@ -2,8 +2,8 @@
 //!
 //! # Why this is not a classifier that says yes or no
 //!
-//! `@yurii` asked on 2026-08-26 whether a strange or injected prompt could be
-//! spotted and the agent stopped before it acted. It can, and the way to get it
+//! `@decided 2026-08-26`: a strange or injected prompt should be spotted, and
+//! the agent stopped before it acts. It can, and the way to get it
 //! wrong is to let the detector decide. A text classifier is talked around: the
 //! attacker writes the text, so anything that reads the text and then chooses
 //! `allow` or `deny` has handed the attacker a vote in its own verdict, and the

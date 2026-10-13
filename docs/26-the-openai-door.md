@@ -35,8 +35,8 @@ OpenAI wire. An OpenAI SDK, an Ollama or vLLM client, or anything that appends
 `/chat/completions` to a base URL, points at TokenFuse with a base-URL swap and
 gets budgets, loop detection, DLP, the policy call and the Breaker.
 
-**Not built, and this is a decision rather than a gap** (`@yurii 2026-09-07`,
-asked directly): no translation between the two wire shapes. The gateway does
+**Not built, and this is a decision rather than a gap** (`@decided 2026-09-07`,
+settled after a direct question): no translation between the two wire shapes. The gateway does
 not turn an OpenAI request into an Anthropic one or back. A gateway process
 forwards to one upstream endpoint, and the door a caller uses must match the
 shape that upstream speaks. Translation is a different product, it is where the
@@ -159,7 +159,7 @@ Without it, `settle_amount` records `CostBasis::EstimateNoUsage` and the run
 settles on the pre-flight estimate: honest, visible in the record, and wrong by
 whatever the estimate was wrong by, on every streamed call an ordinary SDK
 makes. So the gateway injects the option when the request streams and did not
-set it (`@yurii 2026-09-07`).
+set it (`@decided 2026-09-07`).
 
 The emphasised sentence is a hazard the first draft of this design missed, and
 it lands on code that already exists. `merge_usage` reads

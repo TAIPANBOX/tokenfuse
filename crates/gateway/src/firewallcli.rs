@@ -241,8 +241,8 @@ mod tests {
 
     #[test]
     fn the_report_answers_all_four_questions() {
-        // "на якому етапі, що було зроблено, що отримав агент, як діяв"
-        // (@yurii 2026-08-26), each a section rather than a field somewhere.
+        // The four questions (`@decided 2026-08-26`): at which stage, what was done,
+        // what the agent received, how it acted; each a section rather than a field somewhere.
         let evs = vec![
             ev(serde_json::json!({
                 "ts": "2026-08-26T10:00:00Z", "type": "taint_raised",
