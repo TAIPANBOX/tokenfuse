@@ -187,6 +187,19 @@
 //!   It is not a [`RELEVANT_FRAMEWORKS`] row either; see the section above for
 //!   why the two refusals have two different shapes.
 //!
+//! - **OWASP MCP Top 10, items MCP04, MCP05 and MCP09 (2025 edition).** The
+//!   other seven items are cited above where a test holds the control.
+//!   `@claude` 2026-10-13, from the item pages in the OWASP project repository.
+//!   **MCP04 Software Supply Chain Attacks & Dependency Tampering:** the tool
+//!   lock (`TF.MCP.RUGPULL`) pins tool DEFINITIONS, not the software that serves
+//!   them. Nothing here verifies the packages or binaries an MCP server runs.
+//!   **MCP05 Command Injection & Execution:** nothing inspects a command or
+//!   query an agent builds from its inputs; the DLP and taint gates see
+//!   content, not the operation it becomes. **MCP09 Shadow MCP Servers:** the
+//!   broker only knows the upstreams it was configured with and finds none it
+//!   was not told about, so it cannot say what is running outside its
+//!   configuration. Held by `the_owasp_mcp_items_refused_are_cited_by_no_control`.
+//!
 //! - **Data residency / geo-fencing.** TokenFuse does not pin where provider
 //!   traffic or telemetry is stored/processed. Not claimed against any control.
 //! - **Model governance / bias / fairness.** TokenFuse is a runtime cost and
@@ -294,6 +307,11 @@ pub const FRAMEWORK_VERSIONS: &[(&str, &str, &str)] = &[
         "NIS2",
         "NIS 2 Directive (Directive (EU) 2022/2555)",
         "retrieved 2026-08",
+    ),
+    (
+        "OWASP-MCP-2025",
+        "OWASP MCP Top 10",
+        "2025 edition (fetched 2026-10-13 from the OWASP project repository)",
     ),
 ];
 
@@ -472,6 +490,14 @@ pub const CATALOG: &[ControlMapping] = &[
             ("OWASP-ASI-2026", "ASI05 (Unexpected Code Execution)"),
             ("OWASP-ASI-2026", "ASI09 (Human-Agent Trust Exploitation)"),
             ("OWASP-ASI-2026", "ASI01 (Agent Goal Hijack)"),
+            (
+                "OWASP-MCP-2025",
+                "MCP06:2025 Intent Flow Subversion (label-based: untrusted content gates tools; no intent anchoring)",
+            ),
+            (
+                "OWASP-MCP-2025",
+                "MCP10:2025 Context Injection & Over-Sharing (injection filtering only; no redaction of shared context)",
+            ),
             ("MITRE-ATLAS", "AML.T0051 (LLM Prompt Injection)"),
             ("DORA", "Art. 9 (Protection and prevention)"),
             ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
@@ -496,6 +522,10 @@ pub const CATALOG: &[ControlMapping] = &[
             ("DORA", "Art. 28 (General principles, ICT third-party risk)"),
             ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
             ("OWASP-ASI-2026", "ASI06 (Memory & Context Poisoning)"),
+            (
+                "OWASP-MCP-2025",
+                "MCP03:2025 Tool Poisoning (metadata scan of listings and declared tools)",
+            ),
             ("MITRE-ATLAS", "AML.T0051 (LLM Prompt Injection)"),
             (
                 "NIST-800-53r5",
@@ -517,6 +547,10 @@ pub const CATALOG: &[ControlMapping] = &[
             (
                 "OWASP-ASI-2026",
                 "ASI04 (Agentic Supply Chain Vulnerabilities)",
+            ),
+            (
+                "OWASP-MCP-2025",
+                "MCP03:2025 Tool Poisoning (changed tool definitions after approval; per process)",
             ),
             (
                 "NIST-800-53r5",
@@ -591,6 +625,10 @@ pub const CATALOG: &[ControlMapping] = &[
             ("SOC2", "CC7.2 (System Monitoring)"),
             ("DORA", "Art. 17 (ICT-related incident management process)"),
             ("NIS2", "Art. 23 (Reporting obligations)"),
+            (
+                "OWASP-MCP-2025",
+                "MCP08:2025 Lack of Audit and Telemetry (brokered calls recorded; log not tamper-evident)",
+            ),
         ],
     },
     ControlMapping {
@@ -609,6 +647,54 @@ pub const CATALOG: &[ControlMapping] = &[
             ("NIST-800-53r5", "AC-6 (Least Privilege)"),
             ("SOC2", "CC6.1 (Logical access security)"),
             ("NIS2", "Art. 21 (Cybersecurity risk-management measures)"),
+        ],
+    },
+    ControlMapping {
+        control_id: "TF.MCP.AUTH",
+        title: "MCP broker door authentication",
+        description: "The MCP credential broker's door refuses a caller it cannot \
+                      identify once a credential is configured: a shared key \
+                      (TOKENFUSE_MCP_KEYS), a proof of possession bound to a \
+                      published client (TOKENFUSE_MCP_CLIENT_IDS, replays refused), \
+                      or a vouchryx access token (XAA). A non-loopback bind with no \
+                      credential refuses to start. Partial: with nothing configured \
+                      the door is open on loopback; a shared key is a bearer secret; \
+                      the replay cache is per process.",
+        feature: "crate::mcpdoor, crate::xaadoor, crate::mcpbroker bind refusal",
+        enforcement: Enforcement::Partial,
+        evidence_decisions: &[],
+        evidence_finding_kinds: &[],
+        evidence_incident_kinds: &[],
+        frameworks: &[(
+            "OWASP-MCP-2025",
+            "MCP07:2025 Insufficient Authentication & Authorization (doors are opt-in; open when none is configured)",
+        )],
+    },
+    ControlMapping {
+        control_id: "TF.MCP.SCOPE",
+        title: "MCP secret vault: handles, per-agent scopes, redaction",
+        description: "Credentials stay in the broker's vault. An agent names a \
+                      {{secret:NAME}} handle and never sees the value, which is \
+                      injected only into the upstream call. A secret may carry a \
+                      scope naming the agents and tools allowed to use it, and a \
+                      refused scope refuses the whole call. Partial: scopes are \
+                      opt-in and an unscoped secret resolves for any agent; \
+                      redaction covers the replies the broker relays, not every \
+                      channel.",
+        feature: "crate::secretbroker (SecretVault::resolve, ScopeRule); mcpbroker DLP on replies",
+        enforcement: Enforcement::Partial,
+        evidence_decisions: &[],
+        evidence_finding_kinds: &[],
+        evidence_incident_kinds: &[],
+        frameworks: &[
+            (
+                "OWASP-MCP-2025",
+                "MCP01:2025 Token Mismanagement & Secret Exposure (handles; redaction of relayed replies)",
+            ),
+            (
+                "OWASP-MCP-2025",
+                "MCP02:2025 Privilege Escalation via Scope Creep (per-secret scopes; opt-in, no expiry)",
+            ),
         ],
     },
 ];
@@ -1321,6 +1407,94 @@ mod tests {
         assert!(json.contains("TF.BUDGET"));
         assert!(json.contains("\"enforced\""));
         assert!(json.contains("\"partial\""));
+    }
+
+    /// The OWASP MCP Top 10 items this product is mapped to, with the short
+    /// titles the OWASP project's own repository gives (`@measured` 2026-10-13:
+    /// `WebFetch` of `OWASP/www-project-mcp-top-10/index.md`, edition `2025`).
+    /// owasp.org itself was refused by the build machine's egress proxy that
+    /// day, so the repository is the source of truth here, and the edition
+    /// string is the only version the list states. Only id and short title are
+    /// recorded, which is as much as a row may quote.
+    const OWASP_MCP_TOP_10: &[(&str, &str)] = &[
+        ("MCP01", "Token Mismanagement & Secret Exposure"),
+        ("MCP02", "Privilege Escalation via Scope Creep"),
+        ("MCP03", "Tool Poisoning"),
+        (
+            "MCP04",
+            "Software Supply Chain Attacks & Dependency Tampering",
+        ),
+        ("MCP05", "Command Injection & Execution"),
+        ("MCP06", "Intent Flow Subversion"),
+        ("MCP07", "Insufficient Authentication & Authorization"),
+        ("MCP08", "Lack of Audit and Telemetry"),
+        ("MCP09", "Shadow MCP Servers"),
+        ("MCP10", "Context Injection & Over-Sharing"),
+    ];
+
+    /// Every `(control_id, citation)` that cites the OWASP MCP Top 10.
+    fn owasp_mcp_citations() -> Vec<(&'static str, &'static str)> {
+        CATALOG
+            .iter()
+            .flat_map(|c| {
+                c.frameworks
+                    .iter()
+                    .filter(|(fid, _)| *fid == "OWASP-MCP-2025")
+                    .map(move |(_, cite)| (c.control_id, *cite))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_owasp_mcp_top_10_is_declared_and_its_rows_quote_the_fetched_titles() {
+        assert!(
+            FRAMEWORK_VERSIONS
+                .iter()
+                .any(|(id, _, ver)| *id == "OWASP-MCP-2025" && ver.starts_with("2025")),
+            "OWASP-MCP-2025 must be declared in FRAMEWORK_VERSIONS with its edition"
+        );
+        let cites = owasp_mcp_citations();
+        assert!(!cites.is_empty(), "no control cites the OWASP MCP Top 10");
+        for (control, cite) in &cites {
+            let (id, title) = OWASP_MCP_TOP_10
+                .iter()
+                .find(|(id, _)| cite.starts_with(id))
+                .unwrap_or_else(|| panic!("{control} cites {cite:?}, which is no MCP item"));
+            assert!(
+                cite.starts_with(&format!("{id}:2025 {title}")),
+                "{control} cites {cite:?}; the fetched title of {id} is {title:?}"
+            );
+        }
+    }
+
+    /// MCP04, MCP05 and MCP09 are refused, each for a reason written in the
+    /// module doc's gap notes. A row citing one of them would describe a
+    /// control this product does not have, which is invariant 4's failure.
+    #[test]
+    fn the_owasp_mcp_items_refused_are_cited_by_no_control() {
+        for refused in ["MCP04", "MCP05", "MCP09"] {
+            for (control, cite) in owasp_mcp_citations() {
+                assert!(
+                    !cite.starts_with(refused),
+                    "{control} cites {cite:?}, but {refused} is refused; see the gap notes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_mcp_auth_and_scope_rows_are_partial_because_their_limits_are_real() {
+        for id in ["TF.MCP.AUTH", "TF.MCP.SCOPE"] {
+            let row = CATALOG
+                .iter()
+                .find(|c| c.control_id == id)
+                .unwrap_or_else(|| panic!("{id} is not in the catalog"));
+            assert_eq!(
+                row.enforcement,
+                Enforcement::Partial,
+                "{id}: its doors and its scopes are opt-in; it cannot be Enforced"
+            );
+        }
     }
 }
 
