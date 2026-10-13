@@ -1048,7 +1048,7 @@ async fn serve() {
     )));
     tracing::info!(?cache_mode, "semantic cache");
 
-    // Agent firewall: TOKENFUSE_FIREWALL = off | shadow | enforce (default off).
+    // Agent firewall: TOKENFUSE_FIREWALL = off | shadow | enforce (default shadow).
     //
     // process-local: the broker never sees a prompt. It brokers `tools/call`
     // and asks this gateway's firewall about a call through

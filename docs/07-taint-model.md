@@ -157,7 +157,11 @@ pins, the MCP tool lock. The SHAPE is B.2/B.5/B.6's.
   policy applies, so nothing changes for a box that has not opted in.
 - `TOKENFUSE_FIREWALL = off | shadow | enforce` sets the mode and **wins over
   the file's own `mode`**: turning enforcement down is what an operator does in
-  a hurry, and it should not need write access to a file.
+  a hurry, and it should not need write access to a file. The three words are
+  read in any case. Unset or empty leaves the mode to the file or the default.
+  **Any other value refuses to start** and names the variable and the value
+  (CLAUDE.md invariant 94), so a misspelt `enfroce` cannot run a gateway that
+  refuses nothing.
 - A file **replaces** the built-in policy rather than merging into it, so `{}`
   is a firewall that classifies nothing and refuses nothing. Merging would mean
   a rule you deleted is still live.

@@ -253,7 +253,9 @@ impl FirewallConfig {
 /// built-in starter policy. `TOKENFUSE_FIREWALL = off | shadow | enforce` sets
 /// the mode and WINS over the file's own `mode`: turning enforcement down is
 /// the thing an operator does in a hurry, and it should not require editing a
-/// file they may not have write access to.
+/// file they may not have write access to. A value outside those three, in any
+/// case other than the exact words, refuses to start (CLAUDE.md invariant 94);
+/// see [`crate::defaults::firewall_mode_from`].
 ///
 /// # The default is `shadow`, and it was `off` until 2026-08-26
 ///
@@ -282,6 +284,9 @@ impl FirewallConfig {
 /// believes their own rules are live, and a security control that silently did
 /// not load is worse than one that is plainly off.
 pub fn from_env() -> FirewallConfig {
+    // Read before the policy file, so a mistyped word refuses to start whatever
+    // the file says (CLAUDE.md invariant 94). `None` is no override.
+    let forced = crate::defaults::firewall_mode_from_env();
     let mut cfg = match std::env::var("TOKENFUSE_FIREWALL_CONFIG") {
         Ok(path) if !path.trim().is_empty() => match FirewallConfig::from_path(&path) {
             Ok(c) => c,
@@ -293,11 +298,8 @@ pub fn from_env() -> FirewallConfig {
         // SHADOW, not off, since 2026-08-26. See the note on this function.
         _ => FirewallConfig::defaults(FirewallMode::Shadow),
     };
-    match std::env::var("TOKENFUSE_FIREWALL").as_deref() {
-        Ok("enforce") => cfg.mode = FirewallMode::Enforce,
-        Ok("shadow") => cfg.mode = FirewallMode::Shadow,
-        Ok("off") => cfg.mode = FirewallMode::Off,
-        _ => {}
+    if let Some(mode) = forced {
+        cfg.mode = mode;
     }
     // The floors again, because the env var can raise the mode to enforce after
     // a file was parsed in shadow: the guarantee is about the mode in effect,
@@ -470,6 +472,69 @@ mod config_tests {
                 std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", v);
             }
         }
+    }
+
+    /// A policy file in the temp directory, named by process id so two test
+    /// binaries cannot collide. Removed by the caller.
+    fn write_policy(tag: &str, mode: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "tf-firewall-mode-{}-{}.json",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, format!(r#"{{"mode":"{mode}","rules":[]}}"#)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The variable, when set and valid, wins over the policy file's own mode,
+    /// as it always has. Invariant 94 adds only that a MISTYPED variable is
+    /// refused; a valid one still overrides the file, and a capitalised one is
+    /// read the same way.
+    #[test]
+    fn a_valid_firewall_mode_overrides_the_policy_file() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = (
+            std::env::var("TOKENFUSE_FIREWALL").ok(),
+            std::env::var("TOKENFUSE_FIREWALL_CONFIG").ok(),
+        );
+        let shadow_file = write_policy("shadow", "shadow");
+        let off_file = write_policy("off", "off");
+
+        unsafe {
+            std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", &shadow_file);
+            std::env::set_var("TOKENFUSE_FIREWALL", "enforce");
+        }
+        assert_eq!(from_env().mode, FirewallMode::Enforce, "lowercase enforce");
+
+        unsafe { std::env::set_var("TOKENFUSE_FIREWALL", "ENFORCE") };
+        assert_eq!(
+            from_env().mode,
+            FirewallMode::Enforce,
+            "capitalised enforce"
+        );
+
+        unsafe {
+            std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", &off_file);
+            std::env::set_var("TOKENFUSE_FIREWALL", "shadow");
+        }
+        assert_eq!(
+            from_env().mode,
+            FirewallMode::Shadow,
+            "shadow beats a file's off"
+        );
+
+        unsafe {
+            match saved.0 {
+                Some(v) => std::env::set_var("TOKENFUSE_FIREWALL", v),
+                None => std::env::remove_var("TOKENFUSE_FIREWALL"),
+            }
+            match saved.1 {
+                Some(v) => std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", v),
+                None => std::env::remove_var("TOKENFUSE_FIREWALL_CONFIG"),
+            }
+        }
+        let _ = std::fs::remove_file(&shadow_file);
+        let _ = std::fs::remove_file(&off_file);
     }
 
     #[test]

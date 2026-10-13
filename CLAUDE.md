@@ -6567,3 +6567,49 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `tool_result` for text that is not a result. A tool set that changes every
     turn is rescanned every turn. It reads shapes, never meaning, and is
     defeatable by anybody who reads the scanner.
+
+94. **A firewall mode the gateway cannot read stops it from starting.**
+    `TOKENFUSE_FIREWALL` decides whether the agent firewall refuses anything at
+    all, and until 2026-10-13 `firewall::from_env` matched the exact lowercase
+    words and read every other value as no override: `enfroce`, `Enforce` or
+    `ENFORCE` started a gateway at whatever mode the policy file or the default
+    gave, which in the default case is shadow, a gateway that refused nothing
+    while its operator believed it refused. Invariant 72 closed the same hole for
+    `TOKENFUSE_MODE`, and this mirrors it.
+
+    `defaults::firewall_mode_from` is the pure parser: unset, empty or only
+    spaces is `Ok(None)`, no override, so the mode stays what the policy file's
+    own `mode` says or the default, exactly as before; `off`, `shadow` and
+    `enforce` in any case are that mode; anything else is an `Err` carrying the
+    value. `defaults::firewall_mode_from_env` exits 2 on that error, before the
+    listener binds, naming `TOKENFUSE_FIREWALL`, the value and the three words it
+    accepts. `firewall::from_env` reads it first, so a mistyped word refuses
+    whatever the policy file says. A valid variable still overrides the file's
+    `mode` and the floors still run for the mode in effect.
+
+    `@claude 2026-10-13`: the parser lives in `defaults` beside the other
+    `TOKENFUSE_*` mode words, not in `firewall.rs`, so every mode word the gateway
+    reads is parsed in one file. The refusal is the same shape as invariant 72's
+    and is not a new convention.
+
+    *(test: `defaults::tests::a_mistyped_firewall_mode_is_refused_not_ignored`,
+    `every_named_firewall_mode_is_honoured_in_any_case` and
+    `the_firewall_mode_is_left_alone_when_nothing_is_configured`, the first two
+    red against the old exact-match reader by assertion, verbatim `left: Ok(None)
+    right: Ok(Some(Off))` for `OFF`; `firewall::config_tests::a_valid_firewall_mode_overrides_the_policy_file`,
+    red on its capitalised case, verbatim `left: Shadow right: Enforce`;
+    `tests/it/firewall_mode_startup.rs::a_mistyped_firewall_mode_stops_the_gateway_before_it_serves`,
+    the real binary, red against the unfixed `from_env` with the gateway kept
+    serving, and green with exit 2 naming `TOKENFUSE_FIREWALL`, `enfroce` and
+    `off|shadow|enforce`; `an_empty_firewall_mode_still_starts_the_gateway` is the
+    guard. Scenarios: `features/a-mistyped-firewall-mode-refuses-to-start.feature`,
+    six, each bound.)*
+
+    **Where it says nothing.** The refusal covers the value the environment
+    carries and nothing else: a policy file's own `mode` is still parsed by
+    `FirewallConfig::from_json`, which already refuses an unknown mode and an
+    unknown key, and the file's mode words stay exact-case as they always were. A
+    value of `enforce` in the file and a misspelt one in the variable is refused
+    by the variable, not by the file. The refusal runs in `serve()` through
+    `firewall::from_env`, so a process that never calls it (the MCP broker, which
+    builds no firewall of its own) is not refused by a bad value here.
