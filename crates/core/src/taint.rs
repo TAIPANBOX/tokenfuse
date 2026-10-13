@@ -251,14 +251,22 @@ fn push_openai_tool_calls(calls: Option<&serde_json::Value>, out: &mut Vec<ToolU
 pub fn labels_for_tools(names: &[String], sources: &HashMap<String, Vec<String>>) -> Labels {
     let mut labels = Labels::new();
     for n in names {
-        match sources.get(n) {
-            Some(mapped) if !mapped.is_empty() => labels.extend(mapped.iter().cloned()),
-            _ => {
-                labels.insert("unclassified".to_string());
-            }
+        if is_unclassified(n, sources) {
+            labels.insert("unclassified".to_string());
+        } else if let Some(mapped) = sources.get(n) {
+            labels.extend(mapped.iter().cloned());
         }
     }
     labels
+}
+
+/// Whether a tool's output lands in `unclassified`: the source map names it
+/// with no labels, or does not name it at all.
+///
+/// One function, so the labels a call carries and the log line that names an
+/// unclassified tool (invariant 96) cannot disagree about which tools those are.
+pub fn is_unclassified(name: &str, sources: &HashMap<String, Vec<String>>) -> bool {
+    !matches!(sources.get(name), Some(mapped) if !mapped.is_empty())
 }
 
 /// Map tool names to the capabilities they exercise (tools with no mapped

@@ -78,6 +78,11 @@ GRADES = {
     "TF.WASM": "Partial",
     "TF.AUDIT": "Partial",
     "TF.ACCESS": "Partial",
+    # 2026-10-13: the broker's door and its secret scopes. Both are opt-in
+    # (no credential configured = open door on loopback; unscoped secret
+    # resolves for any agent), so neither is claimable as Enforced.
+    "TF.MCP.AUTH": "Partial",
+    "TF.MCP.SCOPE": "Partial",
 }
 
 RANK = {"Documented": 0, "Partial": 1, "Enforced": 2}
@@ -102,6 +107,10 @@ ENFORCED_FRAMEWORKS = {
     "EU-AI-ACT",
     "DORA",
     "NIS2",
+    # 2026-10-13: OWASP MCP Top 10 (2025). Enforced through MCP03, MCP06, MCP08
+    # and MCP10 (cross-refs on existing rows) and MCP01, MCP02, MCP07 (the two
+    # new Partial rows). MCP04, MCP05 and MCP09 are refused, not claimed.
+    "OWASP-MCP-2025",
 }
 
 RELEVANT_ONLY = {

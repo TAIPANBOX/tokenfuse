@@ -1932,6 +1932,7 @@ async fn handle_call(
             .taint
             .split_history(&run_id, &taint::tool_uses_in(&request));
         let history_tools = split.unreviewed;
+        st.name_unclassified(&history_tools);
         let from_history = taint::labels_for_tools(&history_tools, &st.firewall.sources);
         // docs/07 B.3 P3. Recorded before the walk so the FIRST call on a child
         // already inherits: a chain nobody noted is a chain that resolves to
@@ -2533,6 +2534,7 @@ async fn buffered_managed(
             firewall_note = Some(reason);
         }
         // Executing these tools will taint future turns — record their labels now.
+        st.name_unclassified(&resp_tools);
         st.accumulate_taint(
             guard.run_id(),
             taint::labels_for_tools(&resp_tools, &st.firewall.sources),

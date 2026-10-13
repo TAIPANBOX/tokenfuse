@@ -6614,6 +6614,145 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `firewall::from_env`, so a process that never calls it (the MCP broker, which
     builds no firewall of its own) is not refused by a bad value here.
 
+95. **Memory is untrusted context: a run whose prompt holds the agent's memory is judged as
+    a run that read a web page.** An agent's memory is a store it writes to and reads back into
+    its own prompt, so an instruction somebody planted there reaches the model as though the
+    user had said it. `@measured` `cargo test -p tokenfuse-gateway --test it
+    memory_and_unclassified` on the base commit 33512db with only the new tests added, 2026-10-13:
+    `a_memory_label_declared_in_the_prompt_stops_a_later_send` read `left: 200 right: 403`, the
+    send allowed with nothing labelled memory (the gap as first measured on 2026-10-12, before any
+    change).
+
+    The label is `memory` (`firewall::MEMORY_LABEL`). It reaches a run two ways, and both are
+    judged by the starter rule `no-exec-after-untrusted`, which now lists `memory` among its
+    `when_any`: the built-in source map classifies Engram's MCP memory tools `recall` and `why`
+    as `memory` (the two that return stored content; `remember` and `forget` return nothing a
+    model reads back and stay unmapped), and a framework that injects memory itself declares it
+    with the existing `x-fuse-taint: memory` request header, read where `taint_header_labels`
+    already reads it. No new header and no new route.
+
+    **The floor, and the reason it exists.** `@claude` 2026-10-13, a choice the brief left open:
+    a policy FILE replaces the starter policy, so one that writes no rule naming `memory` would
+    leave a run that carries it free to act. `ensure_floors` therefore adds `no-action-after-memory`
+    (exec, write, network egress) in enforce mode when no rule reads the label, the same shape as
+    invariant 27's injection floor. The reason is the one that floor gives: a policy written before
+    this label existed cannot have mentioned it, and reading that silence as consent would leave the
+    label acting on nothing. An operator's own rule that names `memory` wins, and no second rule is
+    added. Shadow mode adds nothing, so the floor cannot fire where nothing is refused.
+
+    **Named limits.** The label is only as good as the mapping: a framework that recalls memory
+    through a tool the source map does not name is `unclassified`, which the starter rule already
+    denies and invariant 96 now names in the log. A memory the model paraphrases before use keeps
+    the label, the conservative direction. Nothing distinguishes a memory the user wrote from one
+    the agent wrote itself. And a label is a source, never a verdict: a memory run that answers in
+    text only is labelled and answered 200.
+
+    *(tests: `firewall::memory_and_unclassified_tests::the_starter_policy_denies_memory_after_exec`
+    and `an_operator_rule_that_names_memory_is_not_given_a_second_floor`, asserted on the built-in
+    policy and on the loader; `tests/it/memory_and_unclassified.rs`:
+    `a_memory_label_declared_in_the_prompt_stops_a_later_send`,
+    `a_recalled_memory_is_labelled_memory_not_unclassified` (the discriminating assertion is the
+    LABEL: a send after a recall is refused today too, through `unclassified`, so only
+    `added == ["memory"]` tells the mapped tool from the unmapped one),
+    `why_returns_memory_as_well`, `a_policy_file_with_no_memory_rule_still_refuses_a_memory_run`,
+    `in_shadow_a_memory_label_is_recorded_and_nothing_is_refused`,
+    `a_memory_label_on_a_text_only_answer_refuses_nothing` and
+    `with_the_firewall_off_memory_is_not_labelled`. Scenarios:
+    `features/memory-is-untrusted-context.feature`, nine, each bound. Red first, run as the brief
+    asked against the unfixed tree: seven failed and three passed, the three being the guards
+    (text-only, the classified tool, firewall off). The failures read
+    `a run whose prompt carries memory must not send` (the header case, 200),
+    `recall is mapped to memory and carries no unclassified label` and `why is mapped to memory`.
+    Mutants, planted in the product code and reverted byte-identical: M1, `memory` dropped from the
+    starter rule's `when_any`, caught by four tests (`the_starter_policy_denies_memory_after_exec`
+    and three integration tests, `a_memory_label_declared_in_the_prompt_stops_a_later_send`,
+    `a_recalled_memory_is_labelled_memory_not_unclassified` and `in_shadow_a_memory_label_is_recorded_and_nothing_is_refused`).
+    The floor does not mask it in these tests, because the harness builds the built-in policy
+    directly and the floor is added only by the file loader and the environment path. In production
+    it IS masked: `TOKENFUSE_FIREWALL=enforce` with no file runs `ensure_floors`, which is why the
+    unit test pins `defaults()` itself. M2, `recall` not mapped, caught by
+    `the_starter_policy_denies_memory_after_exec` and `a_recalled_memory_is_labelled_memory_not_unclassified`.
+    M3, the header label ignored, caught by `a_memory_label_declared_in_the_prompt_stops_a_later_send`
+    and three more integration tests. M7, the floor removed, caught by
+    `a_policy_file_with_no_memory_rule_still_refuses_a_memory_run`. Each of the seven was reverted
+    and the source compared byte-identical to its backup. Scenarios are in
+    `features/memory-is-untrusted-context.feature`.)*
+
+96. **An unclassified tool is named in the log, once per process, and the list of names is
+    bounded.** The starter policy treats the output of every tool its source map does not name
+    as untrusted, under the label `unclassified`, and the refusal it causes says `unclassified`
+    and nothing else. An operator could not see which tools those were, so the refusal could not
+    be fixed by reading the log. `@claude` 2026-10-13: the gateway writes one warning the first
+    time it sees each distinct tool name it classifies as unclassified, naming the tool and the
+    file to classify it in (`TOKENFUSE_FIREWALL_CONFIG`).
+
+    Three decisions, each of which could have gone the other way. **The classifier and the
+    warning share one predicate**, `tokenfuse_core::taint::is_unclassified`, and `labels_for_tools`
+    now reads it too, so a tool the log names is exactly a tool whose output is labelled
+    unclassified; two copies of the rule would drift the way invariant 14 says they do. **Mode
+    `off` names nothing**, because nothing is classified there. **The remembered set is capped at
+    256 names**, the cap a number an operator can read as "this is the list, and it is cut":
+    past it a new name is neither remembered nor named, one line says so the first time, and a
+    name already named is never named again, past the cap or before it. A name is cut to 128
+    characters before it reaches the log, because the model writes tool names. The check-tool-call
+    door (invariant 26) is not a site: it classifies no tool name of its own, it judges the run's
+    accumulated labels, so it has nothing to name.
+
+    **Where it says nothing.** The set is in memory and gone on restart, so a restarted gateway
+    names each tool again, once. A tool name is named by the first gateway that classifies it;
+    nothing aggregates the names across a fleet. The log is the only place this appears: the
+    refusal's own record still says `unclassified` and not the tool, as before, because the
+    agent-event record does not carry tool names for a taint verdict today.
+
+    *(tests: `firewall::memory_and_unclassified_tests::a_name_is_named_once_however_often_it_is_seen`
+    (the per-call mutant), `off_names_nothing` (the mode gate, asserted on the log as well as the
+    set, since a warning written and not remembered would pass a set check),
+    `the_names_remembered_are_capped_and_the_cap_is_said_once` (the cap, plus the cap line once and a
+    name seen again past the cap not named again), `a_classified_name_is_never_named` and
+    `a_very_long_name_is_cut_before_it_reaches_the_log`; `tests/it/memory_and_unclassified.rs`:
+    `an_unclassified_tool_is_named_once_in_the_log` (two calls, one line, the line naming
+    `TOKENFUSE_FIREWALL_CONFIG`), `a_classified_tool_is_not_named`,
+    `in_shadow_an_unclassified_tool_is_named_too`. The log is captured with a dispatch scoped to
+    the request future, as `shadow_tool_pruning` does, so no other test's warnings are counted.
+    Scenarios: `features/an-unclassified-tool-is-named.feature`, five, each bound. Red first: the
+    once test and the shadow test failed `named once per process: []` and `left: 0`, the classified
+    test and the off test passed as guards. Mutants, planted and reverted byte-identical: M4, the
+    remembered-set check removed (a warning per call), caught by `a_name_is_named_once_however_often_it_is_seen`
+    and `an_unclassified_tool_is_named_once_in_the_log`; M5, the mode gate removed, caught by
+    `off_names_nothing`; M6, the cap removed, caught by `the_names_remembered_are_capped_and_the_cap_is_said_once`.)*
+
+97. **The OWASP MCP Top 10 rows claim only what a test holds, and the list they cite was read, not recalled.**
+    `@claude` 2026-10-13, under delegated authority, open to reversal. The catalog cited OWASP's
+    Agentic Applications list and nothing from the MCP Top 10, which is the list that names this
+    product's own surface. `@measured` 2026-10-13 by `WebFetch` of the OWASP project repository's
+    `index.md` and its ten `2025/MCP*.md` item pages: edition `2025`, items MCP01 to MCP10. owasp.org
+    itself was refused at the build machine's egress proxy that day, so the repository is the source
+    of truth for this change, and the edition string is the only version the list states. The
+    repository and the search index disagree on the name of MCP06 in one secondary source, and the
+    repository's own page is the one quoted.
+
+    Rows are added where a test in this repository holds the control, and only then. Cross-references
+    land on the existing rows (`TF.MCP.POISON`, `TF.MCP.RUGPULL`, `TF.TAINT`, `TF.AUDIT`), each keeping
+    its grade. Two new rows are Partial, because their limits are real: `TF.MCP.AUTH` (the broker's
+    doors are opt-in and open on loopback with nothing configured) and `TF.MCP.SCOPE` (secret scopes are
+    opt-in, an unscoped secret resolves for any agent). MCP04 (software supply chain), MCP05 (command
+    injection) and MCP09 (shadow servers) are refused, written in the module doc's gap notes and held by
+    `the_owasp_mcp_items_refused_are_cited_by_no_control`. The framework is `OWASP-MCP-2025` and sits in
+    the enforced list, because the Enforced rows `TF.MCP.POISON`, `TF.MCP.RUGPULL` and `TF.TAINT` cite it.
+
+    **Where it says nothing.** Each cross-reference is a claim a reader can check against the named
+    test, not a mechanical proof: nothing in a gate reads the feature file's bindings against the
+    catalog strings. The item titles are checked against the fetched copy in a test, so a retitled
+    item fails it, but a changed meaning under the same title does not. The MCP03 rug-pull mapping
+    inherits invariant 91's limits: the drift state is per process and a change nobody re-listed is
+    not seen. MCP06 and MCP10 are mapped to taint, which is label-based and not intent anchoring or
+    redaction. The OWASP repository may publish a later edition, and this row describes 2025 only.
+    *(features/owasp-mcp-top-10-rows.feature, fourteen scenarios, each bound to a named test;
+    `crates/core/src/compliance.rs`, `the_owasp_mcp_top_10_is_declared_and_its_rows_quote_the_fetched_titles`,
+    red on main at its declaration assertion, and `the_mcp_auth_and_scope_rows_are_partial_because_their_limits_are_real`,
+    red on main with the rows absent; `scripts/honest-claims.sh` and two teeth cases in
+    `scripts/gates-have-teeth.sh` for the upgrade and the renamed framework id.)*
+
 98. **A security switch that cannot read its own value refuses to start, and a measurement switch says so by decision.** Invariants 72 and 94 closed the hole for `TOKENFUSE_MODE` and `TOKENFUSE_FIREWALL`. Nine more switches had the same hole, each with its own `match` and a catch-all arm that chose a mode for a value nobody had written, and for those nine the chosen mode was the weaker one: a typo for `block` ran the broker with the findings logged and forwarded, a typo for `closed` let every call through during an outage of the policy plane, a typo for `enforce` ran a gateway whose policy decided nothing while its operator believed it did. Found by reading the code on 2026-10-13 and measured on the real binary before the change (`tests/it/security_switches_startup.rs`, both red with the process "kept running").
 
     **One copy of the rule.** `defaults::switch_word` is the only place a closed word set is read: unset, empty or blank keeps the switch's own default; a set value matches its words in any case, ignoring surrounding spaces; anything else is `Err` naming the variable, the value and the words. `defaults::exit_on_refusal` prints that message and exits 2, and is called from `_from_env` wrappers that run before the listener binds in both processes, the same place invariant 72's refusal runs.
