@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.13.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1908-brightgreen)
+![tests](https://img.shields.io/badge/tests-1911-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -718,7 +718,7 @@ Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). R
 |---|---|---|
 | `TOKENFUSE_TOOLS_PRUNE` | `off` (default) · `shadow` | `shadow` calls wardryx's `/v1/filter-tools` (with the wardryx hook on, at least one tool declared and the agent named in `x-fuse-agent-id`), records how many of the declared tools its policy would deny and their estimated input-token cost, and sets `x-fuse-tools-would-prune`. Never changes the forwarded request in any mode. An unrecognised value is treated as `off`, logged once. |
 
-The MCP broker's decision request also carries the call it is about to make, `tool_call: {name, arguments, target}`: `arguments` is `params.arguments` exactly as the agent sent it, taken before any `{{secret:NAME}}` handle is replaced (the PDP sees the handle text, never the secret), `target` is the upstream server the call routes to (the `x-fuse-mcp-upstream` name, else the default upstream's host and port). Arguments over 16 KiB serialized are not sent at all: the object arrives without `arguments` and with `arguments_truncated: true`, never a cut-off copy. The model path sends no `tool_call`, because a model call only offers tools.
+The MCP broker's decision request also carries the call it is about to make, `tool_call: {name, arguments, target}`: `arguments` is `params.arguments` exactly as the agent sent it, taken before any `{{secret:NAME}}` handle is replaced (the PDP sees the handle text, never the secret), `target` is the upstream server the call routes to (the `x-fuse-mcp-upstream` name, else the default upstream's host and port). Arguments over 12 KiB serialized (the policy plane's own bound, which it refuses above that size) are not sent at all: the object arrives without `arguments` and with `arguments_truncated: true`, never a cut-off copy. The model path sends no `tool_call`, because a model call only offers tools.
 
 A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with `x-fuse-wardryx: hold` plus `x-fuse-approval-id`; obtain an approval out of band, then resubmit the identical request carrying `x-fuse-approval-token`.
 

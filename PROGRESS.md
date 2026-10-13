@@ -304,9 +304,10 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1908 passing** (core 407, dpop 21, delegation 60,
-gateway 1141, cloud 278, umbrella 1, by `cargo test -p <crate>`). Core grew by 6 and
-gateway by 14 with the price book's long-prompt tier (invariant 99: 6 in
+`cargo test --all` runs **1911 passing** (core 407, dpop 21, delegation 60,
+gateway 1144, cloud 278, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 3
+with the 12 KiB argument cap (invariant 100: one unit and two integration tests,
+2026-10-13). Core grew by 6 and gateway by 14 with the price book's long-prompt tier (invariant 99: 6 in
 `core::pricing`, 6 in `gateway::pricebook`, 4 in `gateway::provider`, 1 each in
 `gateway::pricefile` and `gateway::constants`, 2 in `tests/it`; 2026-10-13, measured by
 `cargo test --all --no-fail-fast`: 1906 passed and the 2 root-only failures invariant 78

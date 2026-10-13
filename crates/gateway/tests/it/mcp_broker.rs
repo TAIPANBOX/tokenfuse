@@ -2658,7 +2658,7 @@ async fn a_brokered_call_that_names_nobody_is_counted_as_skipped_not_never_attem
 // a policy that needs to read what the call does had nothing to read. The
 // request now also carries `tool_call: {name, arguments, target}`: the
 // arguments exactly as the agent sent them, BEFORE any secret handle is
-// replaced, capped at 16 KiB, and the upstream server the broker routes to.
+// replaced, capped at 12 KiB, and the upstream server the broker routes to.
 // ---------------------------------------------------------------------------
 
 /// A stub PDP that keeps every decide body it receives.
@@ -2880,9 +2880,9 @@ async fn arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_trun
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // `{"k":"` + 16_370 + `"}` is exactly 16 384 serialized bytes.
-    let exactly = json!({ "k": "y".repeat(16_384 - 8) });
-    assert_eq!(serde_json::to_vec(&exactly).unwrap().len(), 16_384);
+    // `{"k":"` + 12_280 + `"}` is exactly 12 288 serialized bytes, the cap.
+    let exactly = json!({ "k": "y".repeat(12_288 - 8) });
+    assert_eq!(serde_json::to_vec(&exactly).unwrap().len(), 12_288);
     let _ = tools_call(&broker_url, None, "t", exactly.clone()).await;
     let asked = seen.lock().unwrap().last().cloned().expect("asked");
     assert_eq!(asked["tool_call"]["arguments"], exactly);
@@ -2990,7 +2990,10 @@ async fn hostile_arguments_never_panic_and_the_broker_keeps_serving() {
     for asked in seen.lock().unwrap().iter() {
         let call = &asked["tool_call"];
         if let Some(a) = call.get("arguments") {
-            assert!(serde_json::to_vec(a).unwrap().len() <= 16 * 1024);
+            assert!(
+                serde_json::to_vec(a).unwrap().len()
+                    <= tokenfuse_gateway::wardryx::TOOL_CALL_ARGUMENTS_CAP_BYTES
+            );
         }
     }
 
@@ -4217,4 +4220,153 @@ async fn a_change_the_client_never_re_listed_is_not_seen() {
     let resp = drift_call(&b, None, "get_order_status").await;
     assert_eq!(resp["result"]["answered"], "get_order_status", "{resp}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// Invariant 74 follow-up (2026-10-13): the broker's argument cap must equal the
+// policy plane's own bound. Wardryx refuses `arguments` over 12 KiB with 400;
+// a broker that sent 12-16 KiB of arguments got no verdict and the failmode
+// decided. The PDP below behaves as Wardryx does.
+
+/// Wardryx's `MaxToolArgumentsBytes`, `internal/pdp/signal.go` (`12 << 10`).
+const WARDRYX_ARGUMENTS_BOUND: usize = 12 << 10;
+
+/// A PDP that answers like Wardryx to an over-bound `tool_call.arguments`: 400,
+/// and no decision. Records every request it receives and every decision it gave.
+async fn wardryx_bounded_pdp() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<Value>>>,
+    Arc<std::sync::Mutex<u32>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let decided = Arc::new(std::sync::Mutex::new(0u32));
+    let (sink, count) = (Arc::clone(&seen), Arc::clone(&decided));
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(req): Json<Value>| {
+            let (sink, count) = (Arc::clone(&sink), Arc::clone(&count));
+            async move {
+                let over = req["tool_call"]
+                    .get("arguments")
+                    .map(|a| serde_json::to_vec(a).unwrap().len() > WARDRYX_ARGUMENTS_BOUND)
+                    .unwrap_or(false);
+                sink.lock().unwrap().push(req);
+                if over {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "tool arguments exceed the 12 KiB bound" })),
+                    )
+                        .into_response();
+                }
+                *count.lock().unwrap() += 1;
+                Json(json!({ "decision": "allow", "policy_version": "test-v1" })).into_response()
+            }
+        }),
+    );
+    (spawn_server(router).await, seen, decided)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_call_of_13_kib_of_arguments_is_sent_truncated_so_the_pdp_decides() {
+    let (upstream_seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, seen, decided) = wardryx_bounded_pdp().await;
+    // Component default failmode is Open: an undecided call would be allowed.
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        Wardryx::new(
+            WardryxMode::Enforce,
+            FailMode::Open,
+            pdp,
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+        ),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let blob = "x".repeat(13 * 1024);
+    let resp: Value = tools_call(&broker_url, None, "write", json!({ "blob": blob }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    let asked = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the PDP was asked");
+    let call = &asked["tool_call"];
+    assert!(
+        call.get("arguments").is_none(),
+        "13 KiB is over the policy plane's 12 KiB bound and must not be sent whole: {asked}"
+    );
+    assert_eq!(call["arguments_truncated"], json!(true), "{asked}");
+    assert_eq!(
+        *decided.lock().unwrap(),
+        1,
+        "the PDP must give a verdict, not leave the call to the failmode"
+    );
+    assert_eq!(
+        upstream_seen.lock().unwrap().len(),
+        1,
+        "the call still reaches the tool"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn arguments_of_exactly_12_kib_are_sent_whole_and_one_byte_more_is_truncated() {
+    let (upstream_seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, seen, decided) = wardryx_bounded_pdp().await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A JSON string serializes as its characters plus two quotes.
+    let exactly = "a".repeat(WARDRYX_ARGUMENTS_BOUND - 2);
+    let resp: Value = tools_call(&broker_url, None, "t", json!(exactly))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("error").is_none(), "{resp}");
+    let asked = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        asked["tool_call"]["arguments"],
+        json!(exactly),
+        "exactly 12 KiB is inside the bound and is sent whole"
+    );
+    assert_eq!(*decided.lock().unwrap(), 1);
+
+    let one_over = "a".repeat(WARDRYX_ARGUMENTS_BOUND - 1);
+    let resp: Value = tools_call(&broker_url, None, "t", json!(one_over))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("error").is_none(), "{resp}");
+    let asked = seen.lock().unwrap().last().cloned().unwrap();
+    assert!(asked["tool_call"].get("arguments").is_none(), "{asked}");
+    assert_eq!(asked["tool_call"]["arguments_truncated"], json!(true));
+    assert_eq!(
+        *decided.lock().unwrap(),
+        2,
+        "the truncated call is decided too"
+    );
+    assert_eq!(upstream_seen.lock().unwrap().len(), 2);
 }

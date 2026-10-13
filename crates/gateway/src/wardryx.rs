@@ -307,10 +307,14 @@ pub struct DecideContext {
     pub tool_call: Option<ToolCall>,
 }
 
-/// The most serialized bytes of a call's `arguments` the PDP is sent: 16 KiB.
-/// Above it the object is sent WITHOUT `arguments` and with
+/// The most serialized bytes of a call's `arguments` the PDP is sent: 12 KiB.
+/// Equal to Wardryx's own `MaxToolArgumentsBytes` (`internal/pdp/signal.go`,
+/// `12 << 10`), which answers 400 to anything larger. The two must stay equal:
+/// a larger value here sends arguments the policy plane refuses, and a call it
+/// refuses gets no verdict at all, so the failmode decides it (invariant 100).
+/// Above the cap the object is sent WITHOUT `arguments` and with
 /// `arguments_truncated: true`, never with a cut-off copy of them.
-pub const TOOL_CALL_ARGUMENTS_CAP_BYTES: usize = 16 * 1024;
+pub const TOOL_CALL_ARGUMENTS_CAP_BYTES: usize = 12 * 1024;
 
 /// A pending tool call as the policy plane is asked about it.
 ///
@@ -1881,12 +1885,22 @@ mod tests {
         // A JSON string serializes as its characters plus two quotes.
         let exactly = serde_json::Value::String("a".repeat(TOOL_CALL_ARGUMENTS_CAP_BYTES - 2));
         let c = ToolCall::new("t", Some(&exactly), "s");
-        assert_eq!(c.arguments.as_ref(), Some(&exactly), "16384 bytes fits");
+        assert_eq!(c.arguments.as_ref(), Some(&exactly), "12288 bytes fits");
         assert!(!c.arguments_truncated);
 
         let one_over = serde_json::Value::String("a".repeat(TOOL_CALL_ARGUMENTS_CAP_BYTES - 1));
         let c = ToolCall::new("t", Some(&one_over), "s");
-        assert_eq!(c.arguments, None, "16385 bytes does not");
+        assert_eq!(c.arguments, None, "12289 bytes does not");
+        assert!(c.arguments_truncated);
+    }
+
+    #[test]
+    fn a_thirteen_kib_call_is_sent_truncated_so_the_pdp_decides() {
+        // The defect of 2026-10-13: at a 16 KiB cap a 13 KiB object was sent
+        // whole, Wardryx refused it with 400, and the failmode decided.
+        let args = serde_json::json!({ "blob": "x".repeat(13 * 1024) });
+        let c = ToolCall::new("t", Some(&args), "s");
+        assert_eq!(c.arguments, None, "13 KiB is over the 12 KiB policy bound");
         assert!(c.arguments_truncated);
     }
 

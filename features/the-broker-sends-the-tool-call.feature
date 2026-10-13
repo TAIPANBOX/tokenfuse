@@ -35,18 +35,28 @@ Feature: The MCP broker tells the policy plane which call it is about to make
   # @test:oversized_arguments_are_replaced_by_the_flag_and_still_forwarded_whole
   # @test:an_oversized_call_goes_out_as_valid_json_without_arguments_and_flagged
   # @test:a_call_over_the_cap_loses_its_arguments_and_says_so
-  Scenario: Arguments over 16 KiB are replaced by a flag, never cut short
-    Given the arguments serialize to more than 16 KiB
+  Scenario: Arguments over 12 KiB are replaced by a flag, never cut short
+    Given the arguments serialize to more than 12 KiB
     When the agent makes the call
     Then the decide request carries tool_call without arguments
     And it carries arguments_truncated true
     And the upstream still receives the whole call
 
+  # @test:a_tool_call_of_13_kib_of_arguments_is_sent_truncated_so_the_pdp_decides
+  # @test:a_thirteen_kib_call_is_sent_truncated_so_the_pdp_decides
+  Scenario: A call the policy plane would refuse for size is still decided
+    Given a call whose arguments serialize to 13 KiB
+    And a policy plane that refuses arguments over 12 KiB
+    When the agent makes the call
+    Then the policy plane gives a verdict on the call
+    And it is shown the call with arguments_truncated true and no arguments
+
   # @test:the_cap_is_on_serialized_bytes_and_inclusive
   # @test:arguments_at_the_cap_are_sent_and_a_call_with_none_says_nothing_of_truncation
   # @test:a_call_with_no_arguments_is_not_called_truncated
-  Scenario: The cap is exactly 16 KiB and a call with no arguments is not called truncated
-    Given arguments that serialize to exactly 16384 bytes
+  # @test:arguments_of_exactly_12_kib_are_sent_whole_and_one_byte_more_is_truncated
+  Scenario: The cap is exactly 12 KiB and a call with no arguments is not called truncated
+    Given arguments that serialize to exactly 12288 bytes
     When the agent makes the call
     Then the arguments are sent whole
     And one byte more is replaced by the flag
