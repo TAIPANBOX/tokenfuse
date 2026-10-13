@@ -64,7 +64,7 @@ url = re.compile(r"[a-z][a-z0-9+.-]*://[^\s)\]>\"]+", re.I)
 # One-line string literals: double-quoted, single-quoted, template, each with
 # escapes. A Rust lifetime (`'"'"'a`) is not matched, since it has no closing
 # quote right after its one character.
-literal = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'"'"'(?:[^'"'"'\\]|\\.)*'"'"'|`(?:[^`\\]|\\.)*`")
+literal = re.compile(r"(?<![A-Za-z0-9_])r(#*)\".*?\"\1|\"(?:[^\"\\]|\\.)*\"|'"'"'(?:[^'"'"'\\]|\\.)*'"'"'|`(?:[^`\\]|\\.)*`")
 CODE = (".rs", ".ts", ".tsx", ".js", ".mjs", ".cjs")
 
 paths = [p for p in sys.stdin.buffer.read().decode("utf-8", "replace").split("\0") if p]

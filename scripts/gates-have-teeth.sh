@@ -1114,6 +1114,19 @@ run_case "no-owner-quotes: a clean line passes" pass \
 	"./scripts/no-owner-quotes.sh" \
 	"$(py 'edit("README.md", "\n", "\nA plain English line with no owner in it.\n")')"
 
+# Test input in a Rust raw string with quotes inside, the shape of the pinned
+# canonical-JSON vector in crates/core/src/agent_event.rs that estate-gates C6
+# reads only as a raw string. The non-Latin text is test input, not a quote.
+# The Cyrillic is written as escapes so this file carries none of its own.
+run_case "no-owner-quotes: non-Latin test input in a Rust raw string with inner quotes passes" pass \
+	"./scripts/no-owner-quotes.sh" \
+	"$(py 'edit("crates/core/src/agent_event.rs", "\n", "\nconst _TEST_INPUT: &str = r#\"{\"note\":\"\\u043e\\u0431\\u043c\\u0435\\u0436\\u0435\\u043d\\u043d\\u044f\"}\"#;\n")')"
+
+run_case "no-owner-quotes: the same text in a Rust comment is refused" fail \
+	"./scripts/no-owner-quotes.sh" \
+	"$(py 'edit("crates/core/src/agent_event.rs", "\n", "\n// \\u043e\\u0431\\u043c\\u0435\\u0436\\u0435\\u043d\\u043d\\u044f\n")')" \
+	"Ukrainian prose"
+
 # An index with no entries leaves the gate nothing to read. It must say so
 # rather than report OK over an empty set.
 run_case "no-owner-quotes: an empty index, so it measured nothing" fail_env \

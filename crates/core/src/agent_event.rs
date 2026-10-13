@@ -2148,7 +2148,7 @@ mod tests {
                     "on_behalf_of": ["user://acme.example/alice", "agent://acme.example/orchestrator"],
                     "data": { "budget_usd": 12.5, "n": 3, "note": "обмеження діє", "nested": { "b": 2, "a": 1 } }
                 }),
-                "{\"agent_id\":\"agent://acme.example/support/tier1-bot\",\"data\":{\"budget_usd\":12.5,\"n\":3,\"nested\":{\"a\":1,\"b\":2},\"note\":\"обмеження діє\"},\"on_behalf_of\":[\"user://acme.example/alice\",\"agent://acme.example/orchestrator\"],\"run_id\":\"run-0001\",\"schema\":\"taipanbox.dev/agent-event/v0.2\",\"severity\":\"critical\",\"source\":\"tokenfuse\",\"ts\":\"2026-07-24T12:00:01Z\",\"type\":\"budget_exhausted\"}",
+                r#"{"agent_id":"agent://acme.example/support/tier1-bot","data":{"budget_usd":12.5,"n":3,"nested":{"a":1,"b":2},"note":"обмеження діє"},"on_behalf_of":["user://acme.example/alice","agent://acme.example/orchestrator"],"run_id":"run-0001","schema":"taipanbox.dev/agent-event/v0.2","severity":"critical","source":"tokenfuse","ts":"2026-07-24T12:00:01Z","type":"budget_exhausted"}"#,
                 "sha256:488f1017967bf9510c62d7c31b9d5a0086ff2000d90a7d4266f171a131430243",
             ),
             (
