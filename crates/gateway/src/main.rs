@@ -686,11 +686,13 @@ async fn serve() {
             tracing::info!(
                 overridden = applied.overridden,
                 added = applied.added,
+                long_context_dropped = applied.dropped_long_context_models.len(),
                 "price book: rows from TOKENFUSE_PRICE_BOOK are in effect"
             );
             price_book_source.operator = Some(tokenfuse_gateway::pricebookreport::OperatorRows {
                 overridden: applied.overridden_models,
                 added: applied.added_models,
+                long_context_dropped: applied.dropped_long_context_models,
             });
         }
         Err(e) => {

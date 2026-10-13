@@ -3811,13 +3811,15 @@ pub(crate) mod tests {
     /// names it answers `x-fuse-price: known` at the rate read off Google's
     /// page on 2026-10-08. The stub reports 1000 input and 500 output tokens:
     /// gemini-2.5-flash (0.30 / 2.50) is 300 + 1250 = 1550 micro-USD, where
-    /// the 15 / 75 fallback charged 52500.
+    /// the 15 / 75 fallback charged 52500. gemini-2.5-pro is a short prompt,
+    /// so its base rate 1.25 / 10.00: 1250 + 5000 = 6250 (invariant 99; it
+    /// was 10000 while the row held the > 200K rate alone).
     #[tokio::test]
     async fn a_gemini_id_on_vertex_is_priced_known_at_its_list_rate() {
         let st = shipped_book_state();
         for (i, (model, cost)) in [
             ("google/gemini-2.5-flash", "0.001550"),
-            ("google/gemini-2.5-pro", "0.010000"),
+            ("google/gemini-2.5-pro", "0.006250"),
             ("google/gemini-3.5-flash", "0.006600"),
             ("google/gemini-3.1-flash-lite", "0.001100"),
         ]

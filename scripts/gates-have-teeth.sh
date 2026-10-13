@@ -920,17 +920,40 @@ run_case "focus-export: the key dropped from the export" fail \
 #
 # Not a scripts/*.sh gate: the rows are held by a test whose expectations are
 # written out by hand. The first mutant is the defect itself, the measured
-# model with no row, so the fallback prices it; the second prices Gemini 2.5
-# Pro at its short-context tier, which under-charges every long prompt.
+# model with no row, so the fallback prices it; the second drops Gemini 2.5
+# Pro's long-prompt tier (invariant 99), which under-charges every long prompt.
 run_case "gemini-price-book: gemini-2.5-flash loses its row and falls back" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_gemini_id_on_vertex_prices_at_its_list_rate" \
-	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-flash\", (300_000, 2_500_000, 30_000)),", "")')" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "        \"google/gemini-2.5-flash\",\n        (300_000,", "        \"google/gemini-2.5-flash-gone\",\n        (300_000,")')" \
 	"every_gemini_id_on_vertex_prices_at_its_list_rate ... FAILED"
 
-run_case "gemini-price-book: gemini-2.5-pro at its short-context tier" fail \
-	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::gemini_2_5_pro_is_priced_at_its_long_context_rate" \
-	"$(py 'edit("crates/gateway/src/pricebook.rs", "    (\"google/gemini-2.5-pro\", (2_500_000, 15_000_000, 250_000)),", "    (\"google/gemini-2.5-pro\", (1_250_000, 10_000_000, 125_000)),")')" \
-	"gemini_2_5_pro_is_priced_at_its_long_context_rate ... FAILED"
+run_case "gemini-price-book: gemini-2.5-pro loses its long-prompt tier" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::gemini_2_5_pro_is_priced_by_its_prompt_length" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "        Some((2_500_000, 15_000_000, 250_000)),", "        None,")')" \
+	"gemini_2_5_pro_is_priced_by_its_prompt_length ... FAILED"
+
+# --- invariant 99: a long prompt is priced at its long rate -----------------
+#
+# Not a scripts/*.sh gate: the rule is PriceBook::price_for and the OpenAI
+# usage parser, held by cargo test. The first mutant ignores the tier (the
+# threshold moved out of reach), the second reads "up to the threshold" as
+# "below it", and the third prices an OpenAI cache write as plain input again
+# (the write counted, never netted out of input). Each planted text still uses
+# every name it touched, so it compiles under CI's `RUSTFLAGS=-D warnings`.
+run_case "long-prompt: the tier ignored in cost" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact pricing::tests::a_prompt_at_the_threshold_is_base_and_one_token_over_is_long" \
+	"$(py 'edit("crates/core/src/pricing.rs", "if usage.prompt_tokens() > t.above_prompt_tokens =>", "if usage.prompt_tokens() > t.above_prompt_tokens.saturating_mul(1_000_000) =>")')" \
+	"a_prompt_at_the_threshold_is_base_and_one_token_over_is_long ... FAILED"
+
+run_case "long-prompt: a prompt AT the threshold priced long" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact pricing::tests::a_prompt_at_the_threshold_is_base_and_one_token_over_is_long" \
+	"$(py 'edit("crates/core/src/pricing.rs", "if usage.prompt_tokens() > t.above_prompt_tokens =>", "if usage.prompt_tokens() >= t.above_prompt_tokens =>")')" \
+	"a_prompt_at_the_threshold_is_base_and_one_token_over_is_long ... FAILED"
+
+run_case "long-prompt: an OpenAI cache write not netted out of input" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact provider::tests::an_openai_cache_write_is_priced_as_a_write" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "            .saturating_sub(net.cache_write);", "            .saturating_sub(net.cache_write.min(0));")')" \
+	"an_openai_cache_write_is_priced_as_a_write ... FAILED"
 
 # --- invariant 83: every published Breaker reason is Cloud evidence ---------
 #

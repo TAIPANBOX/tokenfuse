@@ -5826,6 +5826,13 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Scenarios: `features/gemini-on-vertex-is-priced-at-its-list-rate.feature`,
     four, each bound. Not a script gate)*
 
+    `@claude` 2026-10-13: the Gemini 2.5 Pro choice above is superseded by
+    invariant 99. The row is now its <= 200K rate (1.25 / 10.00 / 0.125) with
+    the > 200K rate as a real long-prompt tier, so a short call is no longer
+    over-charged and a long one still pays the long rate; the test
+    `gemini_2_5_pro_is_priced_at_its_long_context_rate` named above is
+    replaced by `gemini_2_5_pro_is_priced_by_its_prompt_length`.
+
 83. **Every Breaker reason the gateway publishes is evidence in the Cloud, and
     the list that says so is read from the contract, not retyped.** The Cloud's
     `is_known_decision` (`crates/cloud/src/store.rs`), the allow-list a
@@ -6787,3 +6794,155 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     **Upgrade effect.** A deployment with a mistyped value that used to start now exits 2 before listening. A value written in capitals (`ENFORCE`) now means what it spells: `TOKENFUSE_WARDRYX_MODE=ENFORCE` turns enforcement on where it used to be silently off, which is the change an operator should read before upgrading.
 
     *(tests: `defaults::tests`, one per switch, each named for its variable (`dlp_pii_refuses_a_mistyped_word`, `mcp_dlp_refuses_a_mistyped_word`, `mcp_dlp_pii_refuses_a_mistyped_word`, `mcp_scan_refuses_a_mistyped_word`, `mcp_taint_failmode_refuses_a_mistyped_word`, `wardryx_mode_refuses_a_mistyped_word`, `wardryx_failmode_refuses_a_mistyped_word`, `require_proof_refuses_a_mistyped_word`, `require_secret_scopes_refuses_a_mistyped_word`), all through `assert_switch`, which checks unset, empty and blank keep the default, a mistyped word is refused with its name, value and words in the message, and every accepted word is honoured in any case; `measurement_switches_keep_unknown_as_off_by_decision`. Red first against the stub that read unknown values as the old default: nine failed, e.g. `TOKENFUSE_MCP_TAINT_FAILMODE: a mistyped word must be refused, it read as false`. `tests/it/security_switches_startup.rs`: `a_mistyped_dlp_pii_stops_the_gateway_before_it_serves` (serve) and `a_mistyped_mcp_scan_stops_the_broker_before_it_serves` (mcp-broker), red on the unfixed binary with `the process kept running instead of refusing to start`; `an_empty_dlp_pii_still_starts_the_gateway` and `an_empty_mcp_scan_still_starts_the_broker` as the guards. Mutants, each planted in `defaults.rs` and reverted byte for byte: the silent fallback restored (`None if true => return Ok(None)`, nine unit tests red), case folding removed (nine red), empty treated as an error (ten red, including the unset-keeps-default test), exit code 1 instead of 2 (both startup tests red), a wardryx mapping sent to the weaker word (`wardryx_mode_refuses_a_mistyped_word`), and the required flag losing its `true` word (both require tests red). Scenarios: `features/a-mistyped-security-switch-refuses-to-start.feature`, fourteen, each bound.)*
+
+99. **The price book holds the vendors' current prices, and a vendor's prompt-length tier is priced
+    for real: a call whose prompt is above a model's threshold is priced whole at the long rate.**
+    Read 2026-10-13. Until then the book held one rate per model, so a model sold at two rates by
+    prompt length could only be priced safely at the dearer one (invariant 82's choice for Gemini
+    2.5 Pro). With Claude Haiku 5.5 and nine OpenAI models now tiered, that would over-charge every
+    short call (Haiku 5.5 fivefold, GPT-6 twofold on input). Claude Haiku 5.5 had no row and
+    settled at the 15 / 75 fallback, about 150 times its price; Claude Sonnet 5.5's cache hits were
+    priced at Sonnet 5's 0.20 where Anthropic lists 0.10 (footnote 2 of the pricing page: 0.05x
+    input on Opus 5.5 and Sonnet 5.5); and a GPT-5.6 cache write was priced as plain input, 20
+    percent under what OpenAI bills.
+
+    **The rule (`tokenfuse_core::pricing`).** A model may carry ONE `LongContext { above_prompt_tokens,
+    price }`. `PriceBook::cost` is the one tier-aware path: when `Usage::prompt_tokens()` (input +
+    cache read + cache write, saturating; the 1-hour write is a subset and is not added twice) is
+    strictly ABOVE the threshold, every part of the call, output included, is priced at the long
+    rate; at or below it, at the base rate. That is how the vendors write it: Anthropic for Haiku
+    5.5 ("A request's prompt length counts all of its input tokens, including cache reads and cache
+    writes. Each request is priced on its own: a request over the threshold pays the higher
+    prices"), Google ("If a query input context is longer than 200K tokens, all tokens (input and
+    output) are charged at long context rates"), OpenAI (short <= 272K, long > 272K). Thresholds as
+    the pages write them, K read as 1000: 100_000, 272_000, 200_000. `PriceBook::price` still
+    answers the BASE rate. Every production cost goes through `PriceBook::cost` (grep, 2026-10-13:
+    `estimate.rs`'s pre-flight estimate, `settle.rs`'s settlement and the router's savings), so the
+    estimate reserves at the tier the estimated prompt falls in. `PriceBook::insert` drops a tier
+    the id carried, so a row inserted later is the whole price; a tier for an id with no row is not
+    kept, and an unknown model has none.
+
+    **Rows (`crate::pricebook`, each group with its page and read date).** Anthropic, re-read
+    2026-10-13 (every rate in the book re-confirmed): Sonnet 5.5 its own row, 2 / 10 / 0.10 / 2.50
+    / 4; Haiku 5.5 new, `claude-haiku-5-5`, `anthropic/claude-haiku-5.5` at list,
+    `anthropic.claude-haiku-5-5` at list plus 10 percent on both tiers, 0.10 / 0.50 / 0.01 / 0.125
+    / 0.20 up to 100,000 prompt tokens and 0.50 / 2.50 / 0.05 / 0.625 / 1 above. OpenAI, Standard
+    tier, thirteen ids (gpt-6-astra, gpt-6.1-sol, gpt-6-sol, gpt-6-luna, gpt-5.6-sol,
+    gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4 each with a > 272K tier; gpt-5.4-mini; gpt-4o,
+    gpt-4o-mini, o1 re-confirmed), the 1-hour column the write rate, a "-" write column the input
+    rate. DeepSeek (`deepseek-flash` and its two legacy names, `deepseek-v4-pro`), Moonshot
+    (`kimi-k3`, writes 3 / 6), Z.ai (`glm-5.3`, `glm-5.1`). Gemini 3.1 Pro Preview new
+    (`google/gemini-3.1-pro-preview`, 2 / 12 / 0.20, > 200K 4 / 18 / 0.40); Gemini 2.5 Pro now 1.25
+    / 10 / 0.125 with its > 200K rate as the tier. The Gemini 3.x Flash rows are unchanged.
+
+    **What the parser reads (`crate::provider::apply_openai`).** `prompt_tokens_details.cache_write_tokens`
+    goes into `Usage.cache_write_tokens` (the 1-hour subset stays 0: OpenAI has one TTL) and is
+    netted out of input with `cached_tokens` (invariant 45's rule, extended): input is `prompt_tokens
+    - cached_tokens - cache_write_tokens`, saturating, every figure kept in `OpenAiNetting`, last
+    non-zero wins across a stream's events, so the order they arrive in does not matter. A usage
+    with cached plus written past the prompt count floors input at 0 and keeps both counts, the
+    over-charging side. A usage with no `cache_write_tokens` is read exactly as before. The
+    Responses API's `input_tokens_details` is NOT parsed: the gateway serves `/v1/messages` and
+    `/v1/chat/completions` only, and a Responses-shaped usage object is read as Anthropic's shape
+    (`input_tokens` whole, no cached subset), as before this change.
+
+    **Published, reported, overridden.** `contracts/tokenfuse-constants.json` gains
+    `price_book.long_context`, a list sorted by model of `{model, above_prompt_tokens}` plus the
+    five rate columns; `price_book.models` keeps each id's BASE rate in its original shape, so
+    estate-gates C3 and verdryx's mirror keep reading the four columns they compare (additive,
+    `compat/1.0.json` names it for 1.13.0). `GET /v1/price-book` gains `long_context` (the tiers in
+    effect) and `long_context_dropped_models`. An operator row in `TOKENFUSE_PRICE_BOOK` for an id
+    with a built-in tier replaces the base rate AND drops the tier, because the file's shape has no
+    tier and the row is the operator's whole price for that id; the startup line counts the
+    dropped tiers (`long_context_dropped=`) and the route names them.
+
+    `@claude 2026-10-13`, eight decisions taken under delegated authority, each open to reversal:
+    1. Endpoint. Invariants 79 and 82's rule stands: an id that names its endpoint is priced for
+       it; where the caller chooses the endpoint and the id does not say (a bare Bedrock id, a
+       Google `@`-dated id, every Gemini id on Vertex) the row is the dearer endpoint (ADR-8). A
+       first-party API whose default endpoint is global (Claude API, OpenAI, DeepSeek, Moonshot,
+       Z.ai) is priced at that default, and its opt-in regional uplift (Claude `inference_geo`,
+       OpenAI data residency, both 1.1x) is the operator file's job. Reason: the id is the only
+       evidence of the endpoint the book sees. Gemini 3.1 Pro Preview lists a Global rate only, so
+       that is its row.
+    2. Dated prices. The book has no effective date (docs/02 section 8). Where a vendor publishes
+       two dated rates for one id the row is the dearer, so passing the date never leaves a row
+       under-charging: Gemini 3.6 to 3.8 Flash stay at the standard rate (the introductory one is a
+       50 percent credit back on net spend, billed at the standard rate first), and gpt-5.6-sol at
+       the table's 4 / 20 (the promotional note names no rate; OpenRouter's 2 / 10 is not used).
+    3. Prompt-length tiers become real, as the rule above. Reason: with one rate the only safe row
+       for a tiered model is the dearer tier, which over-charges every short call by up to five
+       times. This supersedes invariant 82's choice for Gemini 2.5 Pro.
+    4. DeepSeek bills by time of day; the row is the PEAK rate, the dearer (ADR-8), because the
+       book does not price by the clock.
+    5. OpenRouter ids are added for Anthropic models only (Haiku 5.5's, as the existing ones). Not
+       for Kimi, GLM or OpenAI models: the book cannot see which provider served the call, and the
+       providers' rates for one id are up to six times apart.
+    6. The fallback stays 15 / 75 / 1.50 / 18.75 / 30. gpt-6-astra's long tier (input 20, cache
+       read 2.00, write 25) is above it and is named as an exception beside o1's cache read, because
+       raising the fallback moves the price of every unknown model; the test covers the tiers too,
+       so no new row or tier joins them silently.
+    7. OpenAI cache writes are parsed and priced as writes (above). Reason: without it the new
+       write column means nothing and a GPT-5.6+ write is priced 20 percent under.
+    8. No row for Claude Mythos 5 and 5.1 (limited availability), gpt-5.x-pro, gpt-5.6-cyber,
+       glm-5.2 or kimi-k2.x. Not asked for; they keep the fallback.
+
+    **Where it says nothing.** A rate in this table is true on its date and on no other. From the
+    machine that wrote it, only Anthropic's pricing and models pages could be re-read on 2026-10-13;
+    OpenAI's, DeepSeek's, Moonshot's and Z.ai's did not resolve (DNS) and Google's came back
+    truncated, so those rows rest on a reading of the same pages taken the same day by the session
+    that assigned the work, not re-read here. The tier is chosen on the prompt the usage REPORTS, so
+    the pre-flight estimate (body length / 4) can reserve at the base rate a call that settles long;
+    the settlement charges the true figure and the next reservation sees it, as invariant 46 says of
+    the 1-hour write. A model with more than two tiers cannot be written. Sonnet 4.5's > 200K tier is
+    still not modelled. An OpenAI-compatible provider that reports a cache write under another name
+    prices it as input. The Parquet trace carries no cache columns (invariant 43's note), so neither
+    the tier a call was priced at nor its cache writes are recorded per call, only the cost.
+    *(test: core `pricing::tests::a_prompt_at_the_threshold_is_base_and_one_token_over_is_long`,
+    `cache_reads_and_writes_count_toward_the_prompt`,
+    `the_long_rate_prices_every_part_including_output`, `an_unknown_model_has_no_tier`,
+    `a_row_inserted_after_a_tier_drops_the_tier` and
+    `the_tier_is_chosen_by_the_prompt_alone_across_a_sweep` (200 seeds), all red by compile on
+    `d3e1f65` (no `LongContext`); gateway `pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate`
+    (extended), `every_new_vendor_id_prices_at_its_list_rate_never_the_fallback`,
+    `every_long_prompt_tier_is_the_vendors_written_out_by_hand`,
+    `sonnet_5_5_cache_hits_are_five_percent_of_input`, `a_haiku_5_5_short_call_is_priced_at_its_base_rate`,
+    `a_haiku_5_5_long_call_is_priced_at_its_long_rate`, `a_gpt_6_1_sol_long_call_is_priced_at_its_long_rate`,
+    `gemini_2_5_pro_is_priced_by_its_prompt_length`, `the_fallback_is_at_least_every_row_in_every_column`
+    (extended over the tiers); `provider::tests::an_openai_cache_write_is_priced_as_a_write`,
+    `a_streamed_openai_cache_write_is_priced_as_a_write`, `an_openai_usage_without_cache_write_tokens_is_unchanged`
+    (the guard), `cached_plus_written_past_the_prompt_floors_input_at_zero_and_keeps_both`;
+    `pricefile::tests::an_operator_row_replaces_the_base_rate_and_drops_the_tier`;
+    `constants::tests::long_prompt_tiers_are_published_beside_the_base_rows`;
+    `tests/it/long_prompt_is_priced_at_its_long_rate.rs::a_long_prompt_on_a_tiered_id_settles_at_its_long_rate_through_the_gateway`
+    (`app()`, the real `HttpProvider`, a local upstream, the shipped book) and
+    `tests/it/price_book_startup.rs::the_price_book_route_lists_the_tiers_and_an_operator_row_drops_one`
+    (the real binary). Red first, @measured `cargo test -p tokenfuse-gateway --lib` and `--test it
+    long_prompt` with the tests added to `d3e1f65`'s product code, 2026-10-13: Haiku 5.5's short call
+    `left: Some(Microusd(52500)) right: Some(Microusd(350))`, its long call `left:
+    Some(Microusd(2325000)) right: Some(Microusd(77500))`, gpt-6.1-sol `left: Some(Microusd(4575000))
+    right: Some(Microusd(1215000))`, Gemini 2.5 Pro's short call `left: Some(Microusd(40000)) right:
+    Some(Microusd(22500))`, Sonnet 5.5's read `left: Microusd(200000) right: Microusd(100000)`, the
+    new-id table "18 ids wrong", every one "no row, priced at the fallback", the Claude table "6 ids
+    wrong", the cache write `left: 8000 right: 5000` and streamed `left: (8000, 2000, 0, 100) right:
+    (5000, 2000, 3000, 100)`, the past-the-prompt case `left: (40, 60, 0, 5) right: (0, 60, 80, 5)`,
+    the gateway call `spent: Microusd(4575000)` with `x-fuse-price: fallback`. Two pre-existing
+    tests changed expectation and say why in their bodies: `proxy::tests::a_gemini_id_on_vertex_is_priced_known_at_its_list_rate`
+    (2.5 Pro's short call 0.010000 -> 0.006250) and invariant 82's Gemini 2.5 Pro test, replaced.
+    Nine mutants planted in the product code 2026-10-13 and reverted, each caught by name (@measured by
+    a throwaway script running `cargo test -p tokenfuse-core --lib pricing::`, `-p tokenfuse-gateway
+    --lib` over the four modules and `--test it long_prompt` per mutant): M1, the tier ignored in
+    `cost` (`a_prompt_at_the_threshold_is_base_and_one_token_over_is_long` and seven more, the
+    gateway call among them); M2, `>` turned into `>=` (that test alone); M3, the prompt size
+    without cache reads (`cache_reads_and_writes_count_toward_the_prompt`); M4, the long rate
+    applied to input only (`the_long_rate_prices_every_part_including_output` and six more); M5,
+    Sonnet 5.5's read back to 0.20 (`sonnet_5_5_cache_hits_are_five_percent_of_input`,
+    `every_vendor_listed_id_prices_at_its_list_rate`, `the_published_artifact_matches_the_rust_source`);
+    M6, Haiku 5.5's row removed (both Haiku cost tests, the tier table, the constants tests); M7,
+    DeepSeek at the off-peak rate (`every_new_vendor_id_prices_at_its_list_rate_never_the_fallback`,
+    the artifact test); M8, `cache_write_tokens` not netted from input and M9, not read (all three
+    cache-write tests each). Three are cases in `gates-have-teeth.sh`: M1, M2 and M8. The two
+    invariant-82 cases there were rewritten for the reshaped Gemini table: the 2.5 Flash row
+    renamed out, and 2.5 Pro's long tier dropped.
+    Scenarios: `features/a-long-prompt-is-priced-at-its-long-rate.feature`, nine, each bound. Not a
+    script gate: the rule is `PriceBook::price_for` and the parser, held by `cargo test`)*

@@ -45,7 +45,7 @@ pub use mcpreport::{to_sarif, Finding, ScanReport, Severity};
 pub use money::Microusd;
 pub use outcomes::{compute_outcomes, OutcomeRow};
 pub use policy::{evaluate, Decision, Evaluation, Mode, Policy};
-pub use pricing::{ModelPrice, PriceBook, Usage};
+pub use pricing::{LongContext, ModelPrice, PriceBook, Usage};
 pub use savings::{compute_savings, SavingsReport};
 pub use secretbroker::{
     inject_secrets, parse_scope_spec, Injection, InvalidScopeSpec, Resolved, ScopeRule, SecretVault,

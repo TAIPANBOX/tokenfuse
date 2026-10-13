@@ -377,3 +377,106 @@ async fn the_basis_each_call_was_charged_at_reaches_the_cloud() {
     assert_eq!(basis("basis-known"), "known");
     assert_eq!(basis("basis-fallback"), "fallback");
 }
+
+/// Like `wait_for_listening`, and also hands back every line logged up to
+/// the listening line, so a test can read the startup line itself.
+fn startup_lines(child: &mut Child) -> Option<Vec<String>> {
+    let stdout = child.stdout.take().expect("stdout piped");
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    thread::spawn(move || {
+        let mut seen = Vec::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let done = line.contains(LISTENING_NEEDLE);
+            seen.push(line);
+            if done {
+                tx.send(std::mem::take(&mut seen)).ok();
+            }
+        }
+    });
+    rx.recv_timeout(CEILING).ok()
+}
+
+const HAIKU_5_5_FLAT: &str = r#"{"model": "claude-haiku-5-5",
+    "input_per_mtok_microusd": 1000000, "output_per_mtok_microusd": 5000000,
+    "cache_read_per_mtok_microusd": 100000, "cache_write_per_mtok_microusd": 1250000,
+    "cache_write_1h_per_mtok_microusd": 2000000}"#;
+
+/// Invariant 99 on the real binary: the route lists the long-prompt tiers in
+/// effect; an operator row for a tiered id drops that id's tier, the route
+/// stops listing it and names it as dropped, and the startup line counts it.
+#[tokio::test]
+async fn the_price_book_route_lists_the_tiers_and_an_operator_row_drops_one() {
+    let has_tier = |body: &serde_json::Value, model: &str| {
+        body["long_context"]
+            .as_array()
+            .map(|a| a.iter().any(|t| t["model"] == model))
+            .unwrap_or(false)
+    };
+    let addr = free_addr();
+    let mut child = spawn_serving(&addr, None);
+    let up = wait_for_listening(&mut child);
+    let plain = if up {
+        Some(price_book(&addr).await)
+    } else {
+        None
+    };
+    child.kill().ok();
+    child.wait().ok();
+    assert!(up, "the gateway never reported listening");
+    let (_, plain) = plain.unwrap();
+    let haiku = plain["long_context"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["model"] == "claude-haiku-5-5"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(haiku["above_prompt_tokens"], 100_000, "{plain}");
+    assert_eq!(haiku["input_per_mtok_microusd"], 500_000, "{plain}");
+    assert_eq!(haiku["output_per_mtok_microusd"], 2_500_000, "{plain}");
+
+    let book = scratch(
+        "drop-tier.json",
+        &format!(r#"{{"models": [{HAIKU_5_5_FLAT}, {SONNET_5_REGIONAL}]}}"#),
+    );
+    let addr = free_addr();
+    let mut child = spawn_serving(&addr, Some(&book));
+    let lines = startup_lines(&mut child);
+    let over = if lines.is_some() {
+        Some(price_book(&addr).await)
+    } else {
+        None
+    };
+    child.kill().ok();
+    child.wait().ok();
+    let lines = lines.expect("the gateway never reported listening with a valid book");
+    let (_, over) = over.unwrap();
+    assert!(!has_tier(&over, "claude-haiku-5-5"), "{over}");
+    assert!(has_tier(&over, "anthropic.claude-haiku-5-5"), "{over}");
+    assert_eq!(
+        over["long_context_dropped_models"],
+        serde_json::json!(["claude-haiku-5-5"]),
+        "{over}"
+    );
+    // The log is coloured; drop the escape sequences before reading a field.
+    let plain_text = |l: &str| {
+        let mut out = String::new();
+        let mut chars = l.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    assert!(
+        lines.iter().map(|l| plain_text(l)).any(|l| {
+            l.contains("TOKENFUSE_PRICE_BOOK") && l.contains("long_context_dropped=1")
+        }),
+        "the startup line must count the dropped tier: {lines:?}"
+    );
+}

@@ -355,6 +355,9 @@ struct OpenAiNetting {
     gross_prompt: u64,
     /// `prompt_tokens_details.cached_tokens`.
     cached: u64,
+    /// `prompt_tokens_details.cache_write_tokens` (GPT-5.6 and later, billed at
+    /// 1.25x input), also INSIDE `prompt_tokens` (invariant 99).
+    cache_write: u64,
     /// `completion_tokens`. OpenAI's INCLUDES its reasoning tokens; Google's (Vertex AI's
     /// OpenAI-compatible endpoint) does not.
     completion: u64,
@@ -462,6 +465,15 @@ fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Valu
             net.cached = c;
         }
     }
+    if let Some(w) = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(|x| x.as_u64())
+    {
+        if w > 0 {
+            net.cache_write = w;
+        }
+    }
     if let Some(c) = u.get("completion_tokens").and_then(|x| x.as_u64()) {
         if c > 0 {
             net.completion = c;
@@ -491,14 +503,26 @@ fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Valu
     if carries_a_figure && output > 0 {
         usage.output_tokens = output;
     }
-    // Written from the state, not from this object, so the order the two figures arrived in
-    // cannot matter. `saturating_sub`: a cached count past the prompt count is the provider's
-    // bug, and an input count that wraps is the ADR-8 direction reversed.
+    // Written from the state, not from this object, so the order the figures arrived in
+    // cannot matter. Both the cached and the written subsets are netted out of the prompt
+    // (invariant 99 extends invariant 45's rule to the write): `prompt_tokens` holds all
+    // three. `saturating_sub`: cached plus written past the prompt count is the provider's
+    // bug (reported on GPT-5.6, since called fixed), input floors at zero and both counts are
+    // kept, the over-charging side; an input count that wraps is the ADR-8 direction
+    // reversed.
     if net.gross_prompt > 0 {
-        usage.input_tokens = net.gross_prompt.saturating_sub(net.cached);
+        usage.input_tokens = net
+            .gross_prompt
+            .saturating_sub(net.cached)
+            .saturating_sub(net.cache_write);
     }
     if net.cached > 0 {
         usage.cache_read_tokens = net.cached;
+    }
+    // OpenAI has one cache TTL, so the 1-hour subset stays zero and the whole write is
+    // priced at the write rate.
+    if net.cache_write > 0 {
+        usage.cache_write_tokens = net.cache_write;
     }
 }
 
@@ -890,6 +914,112 @@ mod tests {
         assert_eq!(u.input_tokens, 950);
         assert_eq!(u.cache_read_tokens, 0);
         assert_eq!(u.output_tokens, 120);
+    }
+
+    // -- invariant 99: an OpenAI cache write is priced as a write -----------
+    //
+    // GPT-5.6 and later bill a cache write at 1.25x input, and the Chat
+    // Completions usage reports it as `prompt_tokens_details.cache_write_tokens`
+    // beside `cached_tokens`, both INSIDE `prompt_tokens`. The rate below is
+    // gpt-5.6-sol's (4 input / 20 output / 0.40 cached / 5 cache write, USD per
+    // Mtok), written out by hand, not read from the book.
+    fn gpt_5_6_sol() -> ModelPrice {
+        ModelPrice {
+            input_per_mtok: Microusd(4_000_000),
+            output_per_mtok: Microusd(20_000_000),
+            cache_read_per_mtok: Microusd(400_000),
+            cache_write_per_mtok: Microusd(5_000_000),
+            cache_write_1h_per_mtok: Microusd(5_000_000),
+        }
+    }
+
+    /// 10000 prompt tokens of which 2000 cached and 3000 written, 100 output:
+    /// 5000 x 4 + 2000 x 0.40 + 3000 x 5 + 100 x 20 = 20000 + 800 + 15000 +
+    /// 2000 = 37800 micro-USD. Reading the write as plain input charged
+    /// 8000 x 4 + 800 + 2000 = 34800, the write 20 percent under.
+    #[test]
+    fn an_openai_cache_write_is_priced_as_a_write() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"id":"chatcmpl-w","usage":{"prompt_tokens":10000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":2000,"cache_write_tokens":3000}}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.input_tokens, 5000, "the write is netted out of input");
+        assert_eq!(u.cache_read_tokens, 2000);
+        assert_eq!(u.cache_write_tokens, 3000);
+        assert_eq!(u.cache_write_1h_tokens, 0, "OpenAI has one TTL");
+        assert_eq!(u.output_tokens, 100);
+        assert_eq!(gpt_5_6_sol().cost(&u), Microusd(37800));
+    }
+
+    /// The same figures streamed: the details first, the counts on the final
+    /// chunk, and the order reversed. Last non-zero wins, as for cached_tokens.
+    #[test]
+    fn a_streamed_openai_cache_write_is_priced_as_a_write() {
+        for chunks in [
+            [
+                "{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":2000,\"cache_write_tokens\":3000}}}",
+                "{\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":100}}",
+            ],
+            [
+                "{\"usage\":{\"prompt_tokens\":10000,\"completion_tokens\":100}}",
+                "{\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":2000,\"cache_write_tokens\":3000}}}",
+            ],
+        ] {
+            let mut p = UsageParser::new();
+            for c in chunks {
+                p.feed(format!("data: {c}\n\n").as_bytes());
+            }
+            p.feed(b"data: [DONE]\n\n");
+            let u = p.finish().usage;
+            assert_eq!(
+                (
+                    u.input_tokens,
+                    u.cache_read_tokens,
+                    u.cache_write_tokens,
+                    u.output_tokens
+                ),
+                (5000, 2000, 3000, 100),
+                "chunks {chunks:?}"
+            );
+            assert_eq!(gpt_5_6_sol().cost(&u), Microusd(37800));
+        }
+    }
+
+    /// A usage that reports no cache writes (every model before GPT-5.6, and
+    /// every OpenAI-compatible provider that does not send the field) is read
+    /// exactly as before: the write count stays zero.
+    #[test]
+    fn an_openai_usage_without_cache_write_tokens_is_unchanged() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"prompt_tokens":950,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":128}}}"#);
+        let u = p.finish().usage;
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+                u.output_tokens
+            ),
+            (822, 128, 0, 120)
+        );
+    }
+
+    /// Cached plus written past the prompt count is a provider's bug (reported
+    /// on GPT-5.6, and called fixed). Input floors at zero rather than
+    /// wrapping, and both counts are kept, the over-charging side.
+    #[test]
+    fn cached_plus_written_past_the_prompt_floors_input_at_zero_and_keeps_both() {
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":60,"cache_write_tokens":80}}}"#);
+        let u = p.finish().usage;
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+                u.output_tokens
+            ),
+            (0, 60, 80, 5)
+        );
     }
 
     // -- invariant 80: a total above prompt + completion is output ----------

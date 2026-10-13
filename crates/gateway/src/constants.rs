@@ -265,6 +265,21 @@ fn price_book() -> serde_json::Value {
         // ADR-8: an unrecognised model prices at (a margin above) the most
         // expensive known one, so it can never under-reserve.
         "fallback": book.fallback().map(entry),
+        // Invariant 99, additive: a model's long-prompt rate. `models` keeps
+        // each id's BASE rate in its original shape, so a reader that knows
+        // only `models` reads the short-prompt price; a call whose prompt
+        // (input, cache reads and cache writes) is above
+        // `above_prompt_tokens` is priced whole, output included, at this row.
+        "long_context": book
+            .long_context_entries()
+            .into_iter()
+            .map(|(model, t)| {
+                let mut row = entry(t.price);
+                row["model"] = json!(model);
+                row["above_prompt_tokens"] = json!(t.above_prompt_tokens);
+                row
+            })
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -509,6 +524,44 @@ mod tests {
             75_000_000
         );
         assert_eq!(doc["price_book"]["units"], "microusd_per_mtok");
+    }
+
+    /// Invariant 99: the long-prompt tiers are published beside the base
+    /// rows, sorted by model, as integers. Haiku 5.5's, written out by hand:
+    /// above 100,000 prompt tokens, 0.50 / 2.50, cached 0.05, writes 0.625 /
+    /// 1.00. Its base row in `models` stays 0.10 / 0.50.
+    #[test]
+    fn long_prompt_tiers_are_published_beside_the_base_rows() {
+        let doc = document();
+        let tiers = doc["price_book"]["long_context"].as_array().unwrap();
+        let ids: Vec<&str> = tiers.iter().map(|t| t["model"].as_str().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "sorted by model, so the file is stable");
+        let haiku = tiers
+            .iter()
+            .find(|t| t["model"] == "claude-haiku-5-5")
+            .expect("Haiku 5.5's tier is published");
+        assert_eq!(
+            haiku,
+            &serde_json::json!({
+                "model": "claude-haiku-5-5",
+                "above_prompt_tokens": 100_000,
+                "input_per_mtok_microusd": 500_000,
+                "output_per_mtok_microusd": 2_500_000,
+                "cache_read_per_mtok_microusd": 50_000,
+                "cache_write_per_mtok_microusd": 625_000,
+                "cache_write_1h_per_mtok_microusd": 1_000_000,
+            })
+        );
+        let base = doc["price_book"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["model"] == "claude-haiku-5-5")
+            .unwrap();
+        assert_eq!(base["input_per_mtok_microusd"], 100_000);
+        assert_eq!(base["output_per_mtok_microusd"], 500_000);
     }
 
     /// The FOCUS export's columns are what a FinOps console reads (CostCrew's
