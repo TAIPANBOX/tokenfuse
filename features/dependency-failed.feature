@@ -1,8 +1,8 @@
 Feature: The box's own dependency fails, and somebody is told
 
-  The ask, verbatim, 2026-08-25: "коли лягає апстрім, шлюз чисто вертає 502,
-  і жоден план цього не записує; у конверті подій немає типу для того, що
-  зламалась власна залежність коробки."
+  The ask, paraphrased, 2026-08-25: when the upstream goes down, the gateway
+  returns a clean 502, and no plan records that case. The event envelope has no
+  type for a failure of the box's own dependency.
 
   Measured before this feature existed: point the gateway's upstream at a dead
   port and it degrades correctly, 502, no hang, no invented answer, and the

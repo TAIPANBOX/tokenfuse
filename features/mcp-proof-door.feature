@@ -1,7 +1,7 @@
 Feature: The MCP broker's door takes a key instead of a password
 
-  Where the ask came from, and what it did not come with. There is no verbatim
-  @yurii sentence behind this one, and pretending otherwise would be the worst
+  Where the ask came from, and what it did not come with. There is no recorded
+  sentence of the owner behind this one, and pretending otherwise would be the worst
   failure the provenance rule has. It is block B5 of
   agent-identity-plan-2026-08-25.md, which is `@claude`: "CIMD
   (draft-ietf-oauth-client-id-metadata-document) and DPoP in the MCP credential

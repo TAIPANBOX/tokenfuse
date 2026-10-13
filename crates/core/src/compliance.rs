@@ -60,10 +60,9 @@
 //! pretend to.
 //!
 //! **ISO/IEC 23894 is not a control this product enforces, and that refusal is
-//! now settled rather than pending.** `@yurii 2026-08-26`, who was given the
-//! argument below and answered "3a (c)": confirm the refusal, and add a third
-//! category for what this product is merely relevant to. The argument he
-//! confirmed is `@claude` 2026-08-26 and it stands unedited: 23894 is GUIDANCE
+//! now settled rather than pending.** `@decided 2026-08-26`: the refusal is confirmed, and a third
+//! category is added for what this product is merely relevant to. The argument
+//! behind it is `@claude` 2026-08-26 and it stands unedited: 23894 is GUIDANCE
 //! on an AI risk-management PROCESS, built on ISO 31000: its clauses describe
 //! how an organisation should identify, analyse and treat AI risk, not controls
 //! a product enforces. A runtime control point can be one input to that process
@@ -174,7 +173,7 @@
 //!
 //! - **ASI07 (Insecure Inter-Agent Communication).** Named in the plan for this
 //!   pass and deliberately not mapped. Confirmed as a decision rather than left
-//!   pending, `@yurii 2026-08-26`. The argument he confirmed is `@claude` and
+//!   pending, `@decided 2026-08-26`. The argument behind it is `@claude` and
 //!   stands unedited: the agents this proxy governs do not
 //!   talk to each other across a trust boundary: they talk to a model and to
 //!   tools, both through this gateway. What the estate does have is a
@@ -1165,8 +1164,8 @@ mod tests {
 
     /// The decision this category was built for, held by name.
     ///
-    /// `@yurii 2026-08-26` confirmed the refusal to map ISO/IEC 23894 as an
-    /// enforced framework and asked for this third category in the same answer.
+    /// `@decided 2026-08-26`: the refusal to map ISO/IEC 23894 as an enforced
+    /// framework stands, and this third category is added with it.
     /// Named rather than counted, for the reason the ASI07 assertion below is:
     /// a count stays green when one framework is swapped for another.
     #[test]
@@ -1197,7 +1196,7 @@ mod tests {
     /// talk to each other across a trust boundary, so there is no channel being
     /// inspected and no relevance to record either. Filing it here would be the
     /// same claim in a softer voice, and it would be made against a decision
-    /// `@yurii 2026-08-26` confirmed rather than left open.
+    /// `@decided 2026-08-26`: kept settled rather than left open.
     ///
     /// It is also a category error on its own terms: `RELEVANT_FRAMEWORKS`
     /// holds FRAMEWORKS, and ASI07 is one control inside OWASP-ASI-2026, which

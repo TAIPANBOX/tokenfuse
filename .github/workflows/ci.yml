@@ -126,6 +126,12 @@ jobs:
       - name: one integration-test binary per crate
         run: ./scripts/one-test-binary-per-crate.sh
 
+      # This repository is public. No tracked file quotes the owner or names him
+      # as the one who said or decided something; a decision is recorded as
+      # @decided and a paraphrase (invariant 101).
+      - name: no owner quotes in a public repository
+        run: ./scripts/no-owner-quotes.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04
@@ -278,7 +284,7 @@ jobs:
   # check that never reports blocks the merge instead of skipping), a
   # third-party paths-filter action (one more pinned dependency for four
   # lines of git), and any live-archive fallback for the snapshot itself
-  # (@yurii 2026-09-08: that trade is closed; the pin stays).
+  # (@decided 2026-09-08: that trade is closed, and the pin stays.)
   changes:
     name: what changed
     runs-on: ubuntu-24.04

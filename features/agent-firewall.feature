@@ -1,9 +1,8 @@
 Feature: The agent firewall says what it did, and can be told what to do
 
-  The ask, verbatim, @yurii 2026-08-26: "роби по максимуму глибокий сервіс,
-  тобто наш фільтр, щоб можна було його налаштовувати та мати повну
-  статистику: на якому етапі, що було зроблено, що отримав агент, як діяв і
-  так далі."
+  The ask, paraphrased, `@decided 2026-08-26`: make the filter deep and
+  configurable, with full statistics: at which stage it acted, what was done, what
+  the agent received, and how it behaved.
 
   What was there before. The firewall has been able to refuse a dangerous
   action since Ring 3.1 shipped, and it was correct. It was also mute. A
@@ -126,11 +125,11 @@ Feature: The agent firewall says what it did, and can be told what to do
       produced some, rather than printing an all-clear
 
   # ---------------------------------------------------------------------
-  # 2026-08-26, the second pass. @yurii, on reading what the first pass did
-  # NOT do: "Це рівень 1 із docs/07 B.7, дорадчий: шлюз бачить tool_use у
-  # відповіді моделі, а виконує інструмент клієнт. Той, хто ігнорує 403,
-  # нічим із цього не спиняється. Рівні 2 і 3 не побудовані. Спадкування
-  # taint у під-ранах не побудоване. Фаєрвол досі за замовчуванням off."
+  # 2026-08-26, the second pass. `@decided 2026-08-26`, after reading what the first
+  # pass did NOT do: it is level 1 of docs/07 B.7, advisory only. The gateway sees
+  # tool_use in the model's answer, but the client runs the tool, and a client that
+  # ignores a 403 is stopped by nothing. Levels 2 and 3 are not built, taint does
+  # not inherit into sub-runs, and the firewall still defaults to off.
   # ---------------------------------------------------------------------
 
   # @test:a_sub_run_cannot_launder_its_parents_taint
@@ -249,7 +248,7 @@ Feature: The agent firewall says what it did, and can be told what to do
     Then the tool is credited once and the inheritance is counted separately
 
   # ---------------------------------------------------------------------
-  # 2026-08-26, the detector. @yurii: "берись за детектор" — as a taint
+  # 2026-08-26, the detector. `@decided 2026-08-26`: start on the detector, as a taint
   # SOURCE and never as a decision, so the attacker's own text has no vote
   # in the verdict it produces.
   # ---------------------------------------------------------------------

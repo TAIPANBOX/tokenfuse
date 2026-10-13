@@ -2,8 +2,8 @@
 //!
 //! The filter emits three types (`taint_raised`, `taint_shadow`,
 //! `taint_block`) and this turns a pile of them into the four questions an
-//! operator actually asks, which are the four `@yurii` named on 2026-08-26:
-//! "на якому етапі, що було зроблено, що отримав агент, як діяв".
+//! operator actually asks, which are the four that `@decided 2026-08-26` names: at which
+//! stage it happened, what was done, what the agent received, and how it acted.
 //!
 //! - **How runs became untrusted** — which labels, carried in by which tools.
 //! - **What the filter decided** — per rule, in which mode.

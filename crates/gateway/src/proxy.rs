@@ -5489,7 +5489,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_record_says_which_rule_fired_at_which_stage_and_over_what() {
-        // "на якому етапі, що було зроблено, як діяв" (@yurii 2026-08-26).
+        // At which stage, what was done, and how the agent acted (`@decided 2026-08-26`).
         // Before this change the event carried a prose `reason` and a `unit`,
         // so a consumer could display it and could not GROUP by it: no rule
         // name, no stage, no machine-readable labels or capabilities.
@@ -5566,8 +5566,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn the_record_says_which_instruction_the_turn_carried() {
-        // "Можливо, також, щоб можна було визначити, після яких саме промтів
-        // агент почав робити аномалії" (@yurii 2026-08-26). By hash, so the
+        // Also: be able to tell after which instruction the agent started to produce
+        // anomalies (`@decided 2026-08-26`). By hash, so the
         // question is answerable without the record holding a word of it:
         // identical instructions collapse, and a changed one is visible at the
         // turn it changed.

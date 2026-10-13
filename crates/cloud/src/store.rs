@@ -657,8 +657,8 @@ struct UnitMonthAcc {
 /// `RunAgg` folds per RUN over that run's whole life, so no filter on it can
 /// answer "what did this cost last week". The console tried: it narrowed runs
 /// by last activity and summed their lifetime totals, and the demo showed a day
-/// at $8,151 next to a week at $15,024. Yurii read that in seconds and said it
-/// could not be right, and it could not: a day at $8,151 is $57,000 a week.
+/// at $8,151 next to a week at $15,024. That was spotted at once as impossible,
+/// and it was: a day at $8,151 is $57,000 a week.
 ///
 /// A per-period number needs a per-period fold. This is it.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
