@@ -3672,7 +3672,7 @@ async fn a_notification_the_broker_refuses_itself_is_an_error_status_too() {
 // timeout, which is exactly the configuration these tests must NOT have.
 
 /// A PDP that answers `deny` after `delay`, the shape of wardryx behind the
-/// typed-signal proxy (`typryx wardryx-proxy` waits up to 150 ms for its model
+/// typed-signal proxy (which waits up to 150 ms for its model
 /// before forwarding), and counts every question so a test can tell "asked and
 /// answered late" from "never asked".
 async fn slow_denying_pdp(delay: Duration) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
