@@ -46,6 +46,7 @@ mod retained_on_the_bus;
 mod retained_survives_restart;
 mod router;
 mod run_budget_ceiling_startup;
+mod security_switches_startup;
 mod send_failure_retention;
 mod shadow_tool_pruning;
 mod stub_wire_mismatch;

@@ -344,7 +344,7 @@ fn print_help() {
 /// injects secret handles and scans tool listings before forwarding upstream.
 async fn mcp_broker() {
     use std::sync::Arc;
-    use tokenfuse_gateway::mcpbroker::{app, run_stdio, BrokerState, ScanMode};
+    use tokenfuse_gateway::mcpbroker::{app, run_stdio, BrokerState};
 
     // stdio mode: `mcp-broker --stdio` or TOKENFUSE_MCP_STDIO — logs go to stderr
     // so stdout stays the JSON-RPC protocol channel.
@@ -427,39 +427,28 @@ async fn mcp_broker() {
     }
     // The opt-in stricter posture beside the warning above: refuse to start
     // rather than merely warn. Same parsing this file already uses for
-    // TOKENFUSE_MCP_ALLOW_OPEN_BIND and TOKENFUSE_ALLOW_STUB: only "1" or
-    // "true" (case-insensitive) count, not any other non-empty string, so a
-    // typo reads as "not opted in", never as "opted in".
-    let require_secret_scopes = std::env::var("TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Read as 1|true (on) or 0|false (off); any other value is refused before
+    // the listener binds, rather than read as off (invariant 98).
+    let require_secret_scopes = tokenfuse_gateway::defaults::required_switch_from_env(
+        "TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES",
+    );
     if let Some(refusal) =
         tokenfuse_gateway::mcpbroker::refuse_unscoped_secrets(&vault, require_secret_scopes)
     {
         eprintln!("tokenfuse: {refusal}");
         std::process::exit(2);
     }
-    let scan = match std::env::var("TOKENFUSE_MCP_SCAN").as_deref() {
-        Ok("off") => ScanMode::Off,
-        Ok("block") => ScanMode::Block,
-        _ => ScanMode::Warn,
-    };
-    let dlp = match std::env::var("TOKENFUSE_MCP_DLP").as_deref() {
-        Ok("block") => tokenfuse_core::DlpMode::Block,
-        Ok("off") => tokenfuse_core::DlpMode::Off,
-        _ => tokenfuse_core::DlpMode::Shadow, // warn
-    };
+    // Every switch below is read through `defaults`, which refuses a value it
+    // cannot read before the listener binds (invariant 98). None of them falls
+    // to a weaker mode on a typo.
+    let scan = tokenfuse_gateway::defaults::mcp_scan_mode_from_env();
+    let dlp = tokenfuse_gateway::defaults::mcp_dlp_mode_from_env();
     // PII masks: a separate, opt-in extension of the same DLP scanner (see
     // tokenfuse_core::dlp's module doc), switched independently of
     // TOKENFUSE_MCP_DLP above. Unlike it, this one defaults to Off, not
     // Shadow: PII masking is new, and every existing mcp-broker deployment
     // must see zero behavior change until it explicitly opts in.
-    let dlp_pii = match std::env::var("TOKENFUSE_MCP_DLP_PII").as_deref() {
-        Ok("shadow") => tokenfuse_core::DlpMode::Shadow,
-        Ok("mask") => tokenfuse_core::DlpMode::Mask,
-        Ok("block") => tokenfuse_core::DlpMode::Block,
-        _ => tokenfuse_core::DlpMode::Off,
-    };
+    let dlp_pii = tokenfuse_gateway::defaults::mcp_dlp_pii_mode_from_env();
     // Optional rug-pull baseline: a JSON lockfile of pinned tool fingerprints.
     let lock = std::env::var("TOKENFUSE_MCP_LOCK").ok().and_then(|p| {
         std::fs::read_to_string(&p)
@@ -516,11 +505,10 @@ async fn mcp_broker() {
             std::process::exit(2);
         }
     };
-    // Same parsing as TOKENFUSE_MCP_ALLOW_OPEN_BIND and TOKENFUSE_ALLOW_STUB:
-    // only "1" or "true" count, so a typo reads as "not opted in".
-    let require_proof = std::env::var("TOKENFUSE_MCP_REQUIRE_PROOF")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Read as 1|true (on) or 0|false (off); any other value is refused before
+    // the listener binds, rather than read as off (invariant 98).
+    let require_proof =
+        tokenfuse_gateway::defaults::required_switch_from_env("TOKENFUSE_MCP_REQUIRE_PROOF");
     if let Some(refusal) =
         tokenfuse_gateway::mcpbroker::refuse_proof_with_no_clients(clients.enabled(), require_proof)
     {
@@ -616,7 +604,7 @@ async fn mcp_broker() {
         taint_gateway: std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY")
             .ok()
             .filter(|v| !v.trim().is_empty()),
-        taint_failclosed: std::env::var("TOKENFUSE_MCP_TAINT_FAILMODE").as_deref() == Ok("closed"),
+        taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
     });
     if stdio {
