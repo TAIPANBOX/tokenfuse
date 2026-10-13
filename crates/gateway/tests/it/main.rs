@@ -34,6 +34,7 @@ mod mcp_scan_exposure;
 mod mcp_scan_live;
 mod mcp_scan_report;
 mod mcp_xaa;
+mod memory_and_unclassified;
 mod no_usage_stream_settles_on_the_estimate;
 mod policy_plane;
 mod price_book_startup;

@@ -118,6 +118,9 @@ pub struct AppState {
     /// Bounded the same way as `budget_clamp_logged`: model ids are
     /// caller-chosen too.
     fallback_price_logged: Arc<Mutex<HashSet<String>>>,
+    /// Tool names the firewall has already named as unclassified in the log,
+    /// once per process (invariant 96). Bounded inside [`crate::firewall`].
+    unclassified_named: Arc<Mutex<crate::firewall::UnclassifiedNames>>,
     /// Where `prices` came from, fixed at startup (invariant 85): the
     /// built-in book's size and what `TOKENFUSE_PRICE_BOOK` replaced or
     /// added. `GET /v1/price-book` reads it. `new` sets the book it is
@@ -600,6 +603,7 @@ impl AppState {
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
+            unclassified_named: Arc::new(Mutex::new(Default::default())),
             price_book_source: Arc::new(crate::pricebookreport::PriceBookSource {
                 built_in_rows,
                 operator: None,
@@ -701,6 +705,13 @@ impl AppState {
             seen.clear();
         }
         seen.insert(run_id.to_string())
+    }
+
+    /// Name, once per process, each of `names` the firewall leaves unclassified
+    /// (invariant 96). Called wherever the taint labels of a tool list are
+    /// derived, so a tool is named at the first place the gateway judges it.
+    pub fn name_unclassified(&self, names: &[String]) {
+        crate::firewall::name_unclassified(&self.firewall, &self.unclassified_named, names);
     }
 
     /// Replace the full pending run-seed map (the startup seed, invariant

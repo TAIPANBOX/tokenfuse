@@ -8,7 +8,7 @@ Prompt injection at the level of ACTIONS, not words: we don't try to recognize "
 
 ## B.2. Labels, Not Levels
 
-Taint = a set of labels (label set). Labels: `web`, `email`, `file_upload`, `external_repo`, `mcp:<server>`, `user_input`, `secrets` ("read secrets"), `unclassified` (unknown source = untrusted).
+Taint = a set of labels (label set). Labels: `web`, `email`, `file_upload`, `external_repo`, `mcp:<server>`, `user_input`, `secrets` ("read secrets"), `memory` (the agent's own memory, untrusted: see "A third taint source" below), `unclassified` (unknown source = untrusted).
 
 Source classification is done via a matcher config:
 
@@ -337,6 +337,42 @@ not caught; nothing pins a declared set across turns (no lockfile, unlike the
 broker's rug-pull pin); a human clearance of the label does not outlast the
 next turn while the poisoned tool is still declared, because the declaration
 is resent and is not a block with an id.
+
+### A third taint source: memory
+
+Built 2026-10-13 (CLAUDE.md invariant 95). An agent's memory is a store the
+agent writes to and reads back into its own prompt, so an instruction somebody
+planted there reaches the model as though the user had said it. Measured
+2026-10-12: a poisoned memory put into the prompt labelled nothing, and a later
+`send_email` was allowed.
+
+The label is `memory`. It reaches a run in two ways, and both are judged by the
+starter rule `no-exec-after-untrusted`, which now lists `memory` among its
+labels:
+
+- **By the tool that returned it.** The built-in source map classifies
+  Engram's MCP memory tools `recall` and `why` as `memory`. Those are the two
+  that return stored content; `remember` and `forget` return nothing a model
+  reads back, so they are left unmapped.
+- **By the framework that put it in the prompt.** A framework that injects
+  memory itself declares it with the existing `x-fuse-taint` request header:
+  `x-fuse-taint: memory`. No new header.
+
+**A policy file that writes no rule naming `memory` still refuses after it.**
+Enforce mode adds a floor, `no-action-after-memory`, that denies exec, write
+and network egress for a run carrying the label, the same way the injection
+floor works (`ensure_floors`). The reason is the one invariant 27 gives for its
+own floor: a policy written before this label existed cannot have mentioned it,
+and reading that silence as consent would leave a run that carries memory free
+to act. A rule of the operator's own that names `memory` wins, and no second
+rule is added. Shadow mode records the label and refuses nothing.
+
+Named limits: the label is only as good as the mapping. A framework that
+recalls memory through a tool the source map does not name is classified
+`unclassified`, which the starter rule already denies, and is named in the log
+(invariant 96). A memory that the model paraphrases before it is used carries
+the label all the same, which is the conservative direction. Nothing here
+distinguishes a memory the user wrote from one the agent wrote itself.
 
 ### The release valve, and where the other two gates actually live
 

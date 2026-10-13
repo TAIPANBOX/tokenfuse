@@ -304,13 +304,17 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1854 passing** (core 398, dpop 21, delegation 60,
-gateway 1096, cloud 278, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 6
+`cargo test --all` runs **1871 passing** (core 398, dpop 21, delegation 60,
+gateway 1113, cloud 278, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 17
+with the memory label and the unclassified-tool log (invariants 95 and 96: 7 in
+`gateway::firewall`, 10 in `tests/it/memory_and_unclassified.rs`; 2026-10-13, measured by
+`cargo test --all --no-fail-fast`: 1869 passed and the 2 root-only failures invariant 78
+records). Gateway grew by 6
 with the firewall mode refusal (invariant 94: 4 in `gateway::defaults` and
 `gateway::firewall`, 2 in `tests/it/firewall_mode_startup.rs`; 2026-10-13). That
-figure is what a non-root run passes: a root run passes 1852, because two tests that
+figure is what a non-root run passes: a root run passes 1869, because two tests that
 need an unwritable 0500 directory fail for root (invariant 78), and the gate counts
-passing tests only. The 1854 is derived from that root run plus those two tests, not
+passing tests only. The 1871 is derived from that root run plus those two tests, not
 measured as a non-root user., which is the figure the README badge
 states and `scripts/stated-numbers.sh` gates (invariant 12). Core grew by 3 and
 gateway by 14 with D10, a retained call and its closure on the agent-event bus
