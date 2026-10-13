@@ -1,8 +1,24 @@
 //! Agent-firewall configuration: how tools map to taint labels and capabilities,
 //! and the rules that deny capabilities under taint.
 
-use std::collections::HashMap;
-use tokenfuse_core::taint::{FirewallMode, TaintRule};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use tokenfuse_core::taint::{is_unclassified, FirewallMode, TaintRule};
+
+/// The taint label a run carries once its prompt holds the agent's memory
+/// (CLAUDE.md invariant 95). Named once, here, because three places read it:
+/// the starter source map, the starter rule and the floor.
+pub const MEMORY_LABEL: &str = "memory";
+
+/// The most distinct unclassified tool names one process will name in its log
+/// (invariant 96). Past it a name is not remembered and so not named, and one
+/// line says so the first time that happens.
+pub const UNCLASSIFIED_NAME_CAP: usize = 256;
+
+/// The longest tool name written to the log. Names come from the model's own
+/// tool calls, so they are caller-chosen, and a name is never allowed to fill a
+/// log line.
+const LOGGED_NAME_CHARS: usize = 128;
 
 #[derive(Debug, Clone, Default)]
 pub struct FirewallConfig {
@@ -41,6 +57,11 @@ impl FirewallConfig {
             ("read_file".to_string(), vec!["file".to_string()]),
             ("vault_read".to_string(), vec!["secrets".to_string()]),
             ("read_secret".to_string(), vec!["secrets".to_string()]),
+            // Engram's MCP memory tools that return stored content (invariant 95).
+            // `remember` and `forget` return nothing a model reads back, so they
+            // stay unmapped.
+            ("recall".to_string(), vec![MEMORY_LABEL.to_string()]),
+            ("why".to_string(), vec![MEMORY_LABEL.to_string()]),
         ]);
         let capabilities = HashMap::from([
             ("run_shell".to_string(), "exec".to_string()),
@@ -72,6 +93,9 @@ impl FirewallConfig {
                     // map cannot: a source they classified as TRUSTED carrying
                     // something the world put in it.
                     tokenfuse_core::injection::SUSPECTED_INJECTION.into(),
+                    // The agent's own memory, which an instruction can be planted
+                    // in (invariant 95). Judged like a web read.
+                    MEMORY_LABEL.into(),
                 ],
                 deny: vec!["exec".into(), "write".into(), "network_egress".into()],
             },
@@ -101,6 +125,18 @@ fn injection_rule() -> TaintRule {
     TaintRule {
         name: "no-action-after-an-injection-signal".into(),
         when_any: vec![tokenfuse_core::injection::SUSPECTED_INJECTION.into()],
+        deny: vec!["exec".into(), "write".into(), "network_egress".into()],
+    }
+}
+
+/// The floor for memory (invariant 95), added in enforce mode when no rule of the
+/// operator's reads the label. Same reasoning as [`injection_rule`]: a policy
+/// file written before the label existed cannot have mentioned it, and reading
+/// its silence as consent would leave a run that carries memory free to act.
+fn memory_rule() -> TaintRule {
+    TaintRule {
+        name: "no-action-after-memory".into(),
+        when_any: vec![MEMORY_LABEL.into()],
         deny: vec!["exec".into(), "write".into(), "network_egress".into()],
     }
 }
@@ -342,9 +378,72 @@ fn ensure_floors(mode: FirewallMode, detect_injection: bool, rules: &mut Vec<Tai
     }
     if !rules
         .iter()
+        .any(|r| r.when_any.iter().any(|l| l == MEMORY_LABEL))
+    {
+        rules.insert(0, memory_rule());
+    }
+    if !rules
+        .iter()
         .any(|r| r.name == anti_exfiltration_rule().name)
     {
         rules.insert(0, anti_exfiltration_rule());
+    }
+}
+
+/// The tool names this process has already named as unclassified (invariant 96).
+#[derive(Debug, Default)]
+pub struct UnclassifiedNames {
+    named: HashSet<String>,
+    cap_said: bool,
+}
+
+/// Name, once per process, each tool the policy leaves unclassified (invariant 96).
+///
+/// A tool whose output counts as untrusted only because the source map does not
+/// name it is invisible to an operator: the refusal it causes says `unclassified`
+/// and nothing says which tool. This writes one warning per distinct name, the
+/// first time the name is seen, and says how to classify it.
+///
+/// Never in mode `off`: nothing is classified there, so nothing is unclassified.
+///
+/// Bounded. Past [`UNCLASSIFIED_NAME_CAP`] a new name is neither remembered nor
+/// named, and one line says so the first time it happens, so an operator who
+/// reads "256 names" knows the list is cut rather than complete. A name already
+/// named is never named again, past the cap or before it.
+pub fn name_unclassified(cfg: &FirewallConfig, seen: &Mutex<UnclassifiedNames>, names: &[String]) {
+    if cfg.mode == FirewallMode::Off {
+        return;
+    }
+    for name in names {
+        if !is_unclassified(name, &cfg.sources) {
+            continue;
+        }
+        let shown: String = name.chars().take(LOGGED_NAME_CHARS).collect();
+        let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if s.named.contains(&shown) {
+            continue;
+        }
+        if s.named.len() >= UNCLASSIFIED_NAME_CAP {
+            let first = !s.cap_said;
+            s.cap_said = true;
+            drop(s);
+            if first {
+                tracing::warn!(
+                    "firewall: more than {UNCLASSIFIED_NAME_CAP} distinct tools are unclassified; \
+                     further names are not remembered and not named in this log. Classify them in \
+                     the policy file named by TOKENFUSE_FIREWALL_CONFIG."
+                );
+            }
+            continue;
+        }
+        s.named.insert(shown.clone());
+        drop(s);
+        tracing::warn!(
+            tool = %shown,
+            "firewall: tool `{shown}` is not in the source map, so its output counts as untrusted \
+             (unclassified). Classify it in the policy file named by TOKENFUSE_FIREWALL_CONFIG to \
+             stop this warning."
+        );
     }
 }
 
@@ -754,5 +853,181 @@ mod config_tests {
         let c = cfg("{}");
         assert_eq!(c.mode, FirewallMode::Off);
         assert!(c.sources.is_empty() && c.capabilities.is_empty() && c.rules.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod memory_and_unclassified_tests {
+    //! Invariants 95 and 96, at the level of the policy and the once-per-name
+    //! logic. The integration tests in `tests/it/memory_and_unclassified.rs` run
+    //! the same through the real router.
+
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a capture of its own and return what it logged at WARN.
+    fn logged(f: impl FnOnce()) -> String {
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    fn named_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|l| l.contains("not in the source map"))
+            .collect()
+    }
+
+    #[test]
+    fn the_starter_policy_denies_memory_after_exec() {
+        // Asserted on the built-in policy itself, not on the file loader. The
+        // floor would also deny a memory run, so a test through the loader could
+        // not tell a dropped label from a restored floor.
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        let exec = c
+            .rules
+            .iter()
+            .find(|r| r.name == "no-exec-after-untrusted")
+            .expect("the starter rule");
+        assert!(
+            exec.when_any.iter().any(|l| l == MEMORY_LABEL),
+            "memory is one of the labels the starter rule denies after: {:?}",
+            exec.when_any
+        );
+        assert_eq!(
+            c.sources.get("recall"),
+            Some(&vec![MEMORY_LABEL.to_string()])
+        );
+        assert_eq!(c.sources.get("why"), Some(&vec![MEMORY_LABEL.to_string()]));
+        assert!(
+            !c.sources.contains_key("remember") && !c.sources.contains_key("forget"),
+            "neither returns stored content, so neither is mapped to memory"
+        );
+    }
+
+    #[test]
+    fn an_operator_rule_that_names_memory_is_not_given_a_second_floor() {
+        let c = FirewallConfig::from_json(
+            r#"{"mode":"enforce","rules":[{"name":"mine","when_any":["memory"],"deny":["exec"]}]}"#,
+        )
+        .expect("a valid policy");
+        assert!(
+            c.rules.iter().any(|r| r.name == "mine"),
+            "the operator's rule is kept"
+        );
+        assert!(
+            c.rules.iter().all(|r| r.name != "no-action-after-memory"),
+            "a rule reads the label already, so the floor adds nothing: {:?}",
+            c.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn off_names_nothing() {
+        // Mutant: the mode gate removed. Asserted on the log as well as the set,
+        // because the set alone would miss a warning written and not remembered.
+        let cfg = FirewallConfig {
+            mode: FirewallMode::Off,
+            ..FirewallConfig::defaults(FirewallMode::Shadow)
+        };
+        let seen = Mutex::new(UnclassifiedNames::default());
+        let text = logged(|| name_unclassified(&cfg, &seen, &["mystery_tool".to_string()]));
+        assert!(named_lines(&text).is_empty(), "{text}");
+        assert!(seen.lock().unwrap().named.is_empty());
+    }
+
+    #[test]
+    fn a_name_is_named_once_however_often_it_is_seen() {
+        // Mutant: the remembered-set check removed, so every call logs.
+        let cfg = FirewallConfig::defaults(FirewallMode::Enforce);
+        let seen = Mutex::new(UnclassifiedNames::default());
+        let text = logged(|| {
+            for _ in 0..3 {
+                name_unclassified(&cfg, &seen, &["mystery_tool".to_string()]);
+            }
+        });
+        let lines = named_lines(&text);
+        assert_eq!(lines.len(), 1, "one warning per name: {text}");
+        assert!(lines[0].contains("mystery_tool"));
+        assert!(
+            lines[0].contains("TOKENFUSE_FIREWALL_CONFIG"),
+            "the line says how to classify it: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_classified_name_is_never_named() {
+        let cfg = FirewallConfig::defaults(FirewallMode::Enforce);
+        let seen = Mutex::new(UnclassifiedNames::default());
+        let text = logged(|| name_unclassified(&cfg, &seen, &["web_search".to_string()]));
+        assert!(named_lines(&text).is_empty(), "{text}");
+    }
+
+    #[test]
+    fn the_names_remembered_are_capped_and_the_cap_is_said_once() {
+        // Mutant: the cap removed, so all 300 are named and remembered. Also
+        // checked: the cap line appears once however many names overflow it, and
+        // a name seen again past the cap is not named again.
+        let cfg = FirewallConfig::defaults(FirewallMode::Enforce);
+        let seen = Mutex::new(UnclassifiedNames::default());
+        let names: Vec<String> = (0..UNCLASSIFIED_NAME_CAP + 44)
+            .map(|i| format!("tool-{i}"))
+            .collect();
+        let text = logged(|| {
+            name_unclassified(&cfg, &seen, &names);
+            name_unclassified(&cfg, &seen, &names);
+        });
+        assert_eq!(
+            named_lines(&text).len(),
+            UNCLASSIFIED_NAME_CAP,
+            "exactly the remembered number is named"
+        );
+        let said = text
+            .lines()
+            .filter(|l| l.contains("more than 256 distinct"))
+            .count();
+        assert_eq!(said, 1, "one line says the list is cut: {text}");
+        assert_eq!(seen.lock().unwrap().named.len(), UNCLASSIFIED_NAME_CAP);
+    }
+
+    #[test]
+    fn a_very_long_name_is_cut_before_it_reaches_the_log() {
+        let cfg = FirewallConfig::defaults(FirewallMode::Enforce);
+        let seen = Mutex::new(UnclassifiedNames::default());
+        let long = "x".repeat(10_000);
+        let text = logged(|| name_unclassified(&cfg, &seen, std::slice::from_ref(&long)));
+        let lines = named_lines(&text);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            !text.contains(&long),
+            "the whole name never reaches the log"
+        );
     }
 }
