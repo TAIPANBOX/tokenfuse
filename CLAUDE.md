@@ -6720,3 +6720,35 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     remembered-set check removed (a warning per call), caught by `a_name_is_named_once_however_often_it_is_seen`
     and `an_unclassified_tool_is_named_once_in_the_log`; M5, the mode gate removed, caught by
     `off_names_nothing`; M6, the cap removed, caught by `the_names_remembered_are_capped_and_the_cap_is_said_once`.)*
+
+97. **The OWASP MCP Top 10 rows claim only what a test holds, and the list they cite was read, not recalled.**
+    `@claude` 2026-10-13, under delegated authority, open to reversal. The catalog cited OWASP's
+    Agentic Applications list and nothing from the MCP Top 10, which is the list that names this
+    product's own surface. `@measured` 2026-10-13 by `WebFetch` of the OWASP project repository's
+    `index.md` and its ten `2025/MCP*.md` item pages: edition `2025`, items MCP01 to MCP10. owasp.org
+    itself was refused at the build machine's egress proxy that day, so the repository is the source
+    of truth for this change, and the edition string is the only version the list states. The
+    repository and the search index disagree on the name of MCP06 in one secondary source, and the
+    repository's own page is the one quoted.
+
+    Rows are added where a test in this repository holds the control, and only then. Cross-references
+    land on the existing rows (`TF.MCP.POISON`, `TF.MCP.RUGPULL`, `TF.TAINT`, `TF.AUDIT`), each keeping
+    its grade. Two new rows are Partial, because their limits are real: `TF.MCP.AUTH` (the broker's
+    doors are opt-in and open on loopback with nothing configured) and `TF.MCP.SCOPE` (secret scopes are
+    opt-in, an unscoped secret resolves for any agent). MCP04 (software supply chain), MCP05 (command
+    injection) and MCP09 (shadow servers) are refused, written in the module doc's gap notes and held by
+    `the_owasp_mcp_items_refused_are_cited_by_no_control`. The framework is `OWASP-MCP-2025` and sits in
+    the enforced list, because the Enforced rows `TF.MCP.POISON`, `TF.MCP.RUGPULL` and `TF.TAINT` cite it.
+
+    **Where it says nothing.** Each cross-reference is a claim a reader can check against the named
+    test, not a mechanical proof: nothing in a gate reads the feature file's bindings against the
+    catalog strings. The item titles are checked against the fetched copy in a test, so a retitled
+    item fails it, but a changed meaning under the same title does not. The MCP03 rug-pull mapping
+    inherits invariant 91's limits: the drift state is per process and a change nobody re-listed is
+    not seen. MCP06 and MCP10 are mapped to taint, which is label-based and not intent anchoring or
+    redaction. The OWASP repository may publish a later edition, and this row describes 2025 only.
+    *(features/owasp-mcp-top-10-rows.feature, fourteen scenarios, each bound to a named test;
+    `crates/core/src/compliance.rs`, `the_owasp_mcp_top_10_is_declared_and_its_rows_quote_the_fetched_titles`,
+    red on main at its declaration assertion, and `the_mcp_auth_and_scope_rows_are_partial_because_their_limits_are_real`,
+    red on main with the rows absent; `scripts/honest-claims.sh` and two teeth cases in
+    `scripts/gates-have-teeth.sh` for the upgrade and the renamed framework id.)*

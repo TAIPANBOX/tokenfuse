@@ -263,6 +263,20 @@ run_case "honest-claims: a control upgraded, which is over-claiming" fail \
 	"$(py 'edit("crates/core/src/compliance.rs", "enforcement: Enforcement::Partial", "enforcement: Enforcement::Enforced")')" \
 	"UPGRADED"
 
+# 2026-10-13, the OWASP MCP rows. A Partial row that gained Enforced is the same
+# over-claim as any upgrade, and the row's own limits are what make Partial true.
+run_case "honest-claims: the MCP door row upgraded to Enforced, which is over-claiming" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "feature: \"crate::mcpdoor, crate::xaadoor, crate::mcpbroker bind refusal\",\n        enforcement: Enforcement::Partial,", "feature: \"crate::mcpdoor, crate::xaadoor, crate::mcpbroker bind refusal\",\n        enforcement: Enforcement::Enforced,")')" \
+	"UPGRADED"
+
+# The framework declared under a different id than the rows cite. The rows still
+# claim OWASP-MCP-2025, so the list the surfaces render no longer carries it.
+run_case "honest-claims: the OWASP MCP framework id renamed in FRAMEWORK_VERSIONS" fail \
+	"./scripts/honest-claims.sh" \
+	"$(py 'edit("crates/core/src/compliance.rs", "        \"OWASP-MCP-2025\",\n        \"OWASP MCP Top 10\",", "        \"OWASP-MCP-2026\",\n        \"OWASP MCP Top 10\",")')" \
+	"gone from the catalog entirely"
+
 run_case "honest-claims: README stops stating a limitation" fail \
 	"./scripts/honest-claims.sh" \
 	"$(py 'edit_all("README.md", "fail-open", "resilient-mode"); edit_all("README.md", "Fail-open", "Resilient-mode")')" \
