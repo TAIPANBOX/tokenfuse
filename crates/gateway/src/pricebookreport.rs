@@ -13,8 +13,10 @@
 //!
 //! This answers both from the process itself: the merged book's size, the
 //! built-in book's size, which model ids the operator's file replaced and
-//! which it added, the fallback rates, and the model ids a call has been
-//! priced at the fallback for since this process started.
+//! which it added, the fallback rates, the long-prompt tiers in effect and
+//! the ids whose tier the operator's file dropped (invariant 99), and the
+//! model ids a call has been priced at the fallback for since this process
+//! started.
 //!
 //! WHAT IT IS NOT
 //!
@@ -29,7 +31,7 @@ use crate::state::AppState;
 use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
-use tokenfuse_core::ModelPrice;
+use tokenfuse_core::{LongContext, ModelPrice};
 
 /// How many fallback-priced model ids the report lists. They are caller
 /// chosen, so the list is bounded in count here and in length below; the
@@ -47,6 +49,9 @@ pub const MAX_MODEL_ID_SHOWN: usize = 256;
 pub struct OperatorRows {
     pub overridden: Vec<String>,
     pub added: Vec<String>,
+    /// Overridden ids whose built-in long-prompt tier the operator's row
+    /// dropped (invariant 99).
+    pub long_context_dropped: Vec<String>,
 }
 
 /// Where the book this process prices with came from, fixed at startup.
@@ -80,6 +85,16 @@ impl From<ModelPrice> for Rates {
     }
 }
 
+/// One long-prompt tier in effect: the long rate a call to `model` pays when
+/// its prompt is above `above_prompt_tokens` (invariant 99).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LongContextRow {
+    pub model: String,
+    pub above_prompt_tokens: u64,
+    #[serde(flatten)]
+    pub rates: Rates,
+}
+
 /// The answer.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PriceBookReport {
@@ -98,6 +113,11 @@ pub struct PriceBookReport {
     /// The rate an id with no row is charged at; `null` for a book with no
     /// fallback (a test book; the shipped one always has one).
     pub fallback: Option<Rates>,
+    /// Every long-prompt tier in the book calls are priced with, sorted by
+    /// model. An id the operator's file replaced has none (invariant 99).
+    pub long_context: Vec<LongContextRow>,
+    /// The ids whose built-in tier the operator's file dropped, sorted.
+    pub long_context_dropped_models: Vec<String>,
     /// Model ids a call has been charged at the fallback for since this
     /// process started, sorted, at most [`MAX_FALLBACK_MODELS_SHOWN`].
     pub fallback_models_seen: Vec<String>,
@@ -125,6 +145,7 @@ fn shown(id: &str) -> String {
 pub fn report(
     rows: usize,
     fallback: Option<ModelPrice>,
+    long_context: Vec<(String, LongContext)>,
     source: &PriceBookSource,
     mut fallback_seen: Vec<String>,
 ) -> PriceBookReport {
@@ -135,10 +156,22 @@ pub fn report(
         .take(MAX_FALLBACK_MODELS_SHOWN)
         .map(|m| shown(m))
         .collect();
-    let (overridden_models, added_models) = match &source.operator {
-        Some(op) => (op.overridden.clone(), op.added.clone()),
-        None => (Vec::new(), Vec::new()),
+    let (overridden_models, added_models, long_context_dropped_models) = match &source.operator {
+        Some(op) => (
+            op.overridden.clone(),
+            op.added.clone(),
+            op.long_context_dropped.clone(),
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
+    let long_context = long_context
+        .into_iter()
+        .map(|(model, t)| LongContextRow {
+            model,
+            above_prompt_tokens: t.above_prompt_tokens,
+            rates: Rates::from(t.price),
+        })
+        .collect();
     let detail = match &source.operator {
         None => format!(
             "the built-in book ({} rows) is the whole book; TOKENFUSE_PRICE_BOOK is not set",
@@ -168,6 +201,8 @@ pub fn report(
         overridden_models,
         added_models,
         fallback: fallback.map(Rates::from),
+        long_context,
+        long_context_dropped_models,
         fallback_models_seen: seen,
         fallback_models_seen_total: total,
         detail,
@@ -179,6 +214,11 @@ pub async fn price_book(State(st): State<AppState>) -> Json<PriceBookReport> {
     Json(report(
         st.prices.entries().len(),
         st.prices.fallback(),
+        st.prices
+            .long_context_entries()
+            .into_iter()
+            .map(|(m, t)| (m.to_string(), t))
+            .collect(),
         &st.price_book_source,
         st.fallback_models_seen(),
     ))
@@ -196,7 +236,7 @@ mod tests {
         let mut ids: Vec<String> = (0..500).map(|i| format!("m-{i:03}")).collect();
         ids.push(format!("a{}", "é".repeat(300)));
         ids.push("x".repeat(1_000_000));
-        let r = report(1, None, &PriceBookSource::default(), ids);
+        let r = report(1, None, Vec::new(), &PriceBookSource::default(), ids);
         assert_eq!(r.fallback_models_seen_total, 502);
         assert_eq!(r.fallback_models_seen.len(), MAX_FALLBACK_MODELS_SHOWN);
         for id in &r.fallback_models_seen {
@@ -205,6 +245,7 @@ mod tests {
         let long = report(
             1,
             None,
+            Vec::new(),
             &PriceBookSource::default(),
             vec![format!("a{}", "é".repeat(300)), "x".repeat(1_000_000)],
         );

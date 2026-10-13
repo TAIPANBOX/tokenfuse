@@ -35,11 +35,14 @@ Feature: Gemini on Vertex AI is priced at the rate Google lists, not the fallbac
     When the shipped price book settles it
     Then the run is charged 1552 micro-USD, not the 46635 the fallback charged
 
-  # @test:gemini_2_5_pro_is_priced_at_its_long_context_rate
-  Scenario: A context-length tier is priced at its higher rate
+  # Superseded 2026-10-13 by invariant 99: the book now prices a prompt-length
+  # tier for real, so a short call pays the short rate and a long one the long.
+  # @test:gemini_2_5_pro_is_priced_by_its_prompt_length
+  Scenario: A context-length tier is priced by the prompt's length
     Given Gemini 2.5 Pro is listed at 1.25 / 10.00 up to 200K input tokens and 2.50 / 15.00 above
-    When the book prices it
-    Then it holds 2.50 input, 15.00 output and 0.25 cached input, the higher tier
+    When the book prices a call
+    Then a call above 200K pays 2.50 / 15.00 for every token, output included
+    And a shorter one pays 1.25 / 10.00
 
   # @test:the_fallback_is_at_least_every_row_in_every_column
   Scenario: No Gemini row is dearer than the fallback

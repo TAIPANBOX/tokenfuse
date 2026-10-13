@@ -24,6 +24,7 @@ mod delegation_htu_matches_wire;
 mod firewall_mode_startup;
 mod image_user_group;
 mod keys_endpoint;
+mod long_prompt_is_priced_at_its_long_rate;
 mod manifest;
 mod mcp_broker;
 mod mcp_client_redirect;

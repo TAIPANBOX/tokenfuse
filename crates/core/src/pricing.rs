@@ -56,6 +56,20 @@ impl Usage {
             || self.cache_write_tokens > 0
             || self.cache_write_1h_tokens > 0
     }
+
+    /// The prompt's length as a vendor's prompt-length tier counts it: every
+    /// input token, cache reads and cache writes included (invariant 99).
+    /// Anthropic's page for Haiku 5.5: "A request's prompt length counts all
+    /// of its input tokens, including cache reads and cache writes." For an
+    /// OpenAI-shaped usage this is the gross `prompt_tokens` again, since the
+    /// parser netted the cached and written subsets out of `input_tokens`.
+    /// `cache_write_1h_tokens` is a subset of `cache_write_tokens` and is not
+    /// added twice. Saturating: an absurd count is above every threshold.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
 }
 
 /// Per-model price, in microdollars per million tokens.
@@ -164,12 +178,30 @@ impl ModelPrice {
     }
 }
 
+/// A model's long-prompt rate (invariant 99): a call whose prompt
+/// ([`Usage::prompt_tokens`]) is ABOVE `above_prompt_tokens` is priced whole,
+/// output included, at `price`; at or below it, at the model's base rate.
+/// That is how every vendor that sells a model at two rates by prompt length
+/// writes it (Anthropic for Haiku 5.5 above 100,000; OpenAI above 272K;
+/// Google above 200K): the threshold decides the rate for the whole request,
+/// never a split of one request between two rates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LongContext {
+    pub above_prompt_tokens: u64,
+    pub price: ModelPrice,
+}
+
 /// A lookup of model name -> price, with an optional conservative fallback for
 /// unknown models (ADR-8: unknown model -> price at the most expensive known
 /// model, so we never under-charge a run we can't identify).
+///
+/// A model may also carry one [`LongContext`] tier. [`PriceBook::cost`] is the
+/// one tier-aware path and every production cost goes through it;
+/// [`PriceBook::price`] answers the BASE rate, the rate a short prompt pays.
 #[derive(Debug, Clone, Default)]
 pub struct PriceBook {
     prices: HashMap<String, ModelPrice>,
+    long_context: HashMap<String, LongContext>,
     fallback: Option<ModelPrice>,
 }
 
@@ -178,8 +210,61 @@ impl PriceBook {
         PriceBook::default()
     }
 
+    /// Put a base rate in the book. It REPLACES the model's whole price: a
+    /// long-prompt tier the model carried is dropped with the old row, so a
+    /// row inserted later (an operator's, `TOKENFUSE_PRICE_BOOK`) is the price
+    /// at every prompt length. Add a tier after the row with
+    /// [`PriceBook::insert_long_context`].
     pub fn insert(&mut self, model: impl Into<String>, price: ModelPrice) {
-        self.prices.insert(model.into(), price);
+        let model = model.into();
+        self.long_context.remove(&model);
+        self.prices.insert(model, price);
+    }
+
+    /// Give a model in the book a long-prompt tier, replacing any it had.
+    /// Ignored for a model with no base row: a tier is a second rate for a
+    /// known model, and an unknown model is priced at the fallback, which has
+    /// no tier (returns whether the tier was kept).
+    pub fn insert_long_context(&mut self, model: &str, tier: LongContext) -> bool {
+        if !self.prices.contains_key(model) {
+            return false;
+        }
+        self.long_context.insert(model.to_string(), tier);
+        true
+    }
+
+    pub fn with_long_context(
+        mut self,
+        model: &str,
+        above_prompt_tokens: u64,
+        price: ModelPrice,
+    ) -> Self {
+        self.insert_long_context(
+            model,
+            LongContext {
+                above_prompt_tokens,
+                price,
+            },
+        );
+        self
+    }
+
+    /// The model's long-prompt tier, if it has one. An unknown model has none.
+    pub fn long_context(&self, model: &str) -> Option<LongContext> {
+        self.long_context.get(model).copied()
+    }
+
+    /// Every long-prompt tier in the book, sorted by model name (for the
+    /// published artifact and `GET /v1/price-book`, for the reason
+    /// [`PriceBook::entries`] sorts).
+    pub fn long_context_entries(&self) -> Vec<(&str, LongContext)> {
+        let mut out: Vec<(&str, LongContext)> = self
+            .long_context
+            .iter()
+            .map(|(m, t)| (m.as_str(), *t))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
     }
 
     pub fn with(mut self, model: impl Into<String>, price: ModelPrice) -> Self {
@@ -193,7 +278,10 @@ impl PriceBook {
         self
     }
 
-    /// Price for a model: exact match first, then fallback if configured.
+    /// BASE price for a model: exact match first, then fallback if
+    /// configured. Not tier-aware: a long prompt on a model with a
+    /// [`LongContext`] tier is priced by [`PriceBook::price_for`] /
+    /// [`PriceBook::cost`], never by this.
     pub fn price(&self, model: &str) -> Option<ModelPrice> {
         self.prices.get(model).copied().or(self.fallback)
     }
@@ -224,8 +312,22 @@ impl PriceBook {
         self.fallback
     }
 
+    /// The rate this usage is priced at: the model's long-prompt tier when
+    /// the prompt is ABOVE its threshold (strictly: a prompt of exactly the
+    /// threshold is the base rate, as "prompts up to 100,000 tokens" reads),
+    /// else the base rate, else the fallback.
+    pub fn price_for(&self, model: &str, usage: &Usage) -> Option<ModelPrice> {
+        match self.long_context.get(model) {
+            Some(t) if usage.prompt_tokens() > t.above_prompt_tokens => Some(t.price),
+            _ => self.price(model),
+        }
+    }
+
+    /// The cost of a call, the prompt-length tier applied. Every production
+    /// cost goes through here (the pre-flight estimate, the settlement, the
+    /// router's savings), so this is the one place a tier is chosen.
     pub fn cost(&self, model: &str, usage: &Usage) -> Option<Microusd> {
-        self.price(model).map(|p| p.cost(usage))
+        self.price_for(model, usage).map(|p| p.cost(usage))
     }
 }
 
@@ -689,5 +791,161 @@ mod tests {
             "test setup error: this case is meant to be large but non-saturating"
         );
         assert_eq!(price.cost(&usage).0 as u128, expected);
+    }
+
+    // -- invariant 99: a prompt-length tier ---------------------------------
+    //
+    // A test book written out here, not the shipped one: base 1 / 5 / 0.10 /
+    // 1.25, long 2 / 10 / 0.20 / 2.50 above 100,000 prompt tokens.
+    fn tiered() -> PriceBook {
+        let base = ModelPrice {
+            input_per_mtok: Microusd(1_000_000),
+            output_per_mtok: Microusd(5_000_000),
+            cache_read_per_mtok: Microusd(100_000),
+            cache_write_per_mtok: Microusd(1_250_000),
+            cache_write_1h_per_mtok: Microusd(2_000_000),
+        };
+        let long = ModelPrice {
+            input_per_mtok: Microusd(2_000_000),
+            output_per_mtok: Microusd(10_000_000),
+            cache_read_per_mtok: Microusd(200_000),
+            cache_write_per_mtok: Microusd(2_500_000),
+            cache_write_1h_per_mtok: Microusd(4_000_000),
+        };
+        PriceBook::new()
+            .with("m", base)
+            .with_long_context("m", 100_000, long)
+            .with_fallback(ModelPrice::per_mtok_usd(15.0, 75.0, 1.5, 18.75))
+    }
+
+    /// 100,000 input tokens is "up to 100,000": the base rate, 100,000 x 1 =
+    /// 100,000 micro-USD. 100,001 is over: 100,001 x 2 = 200,002.
+    #[test]
+    fn a_prompt_at_the_threshold_is_base_and_one_token_over_is_long() {
+        let book = tiered();
+        let at = Usage {
+            input_tokens: 100_000,
+            ..Default::default()
+        };
+        let over = Usage {
+            input_tokens: 100_001,
+            ..Default::default()
+        };
+        assert_eq!(book.cost("m", &at), Some(Microusd(100_000)));
+        assert_eq!(book.cost("m", &over), Some(Microusd(200_002)));
+        // `price` stays the base rate whatever the prompt; it is not the
+        // tier-aware path.
+        assert_eq!(book.price("m").unwrap().input_per_mtok, Microusd(1_000_000));
+    }
+
+    /// 40,000 input + 40,000 cache read + 20,001 cache write = 100,001, over
+    /// the line, though no single part is: 40,000 x 2 + 40,000 x 0.20 +
+    /// 20,001 x 2.50 = 80,000 + 8,000 + 50,002.5 = 138,002.5, ceiled to
+    /// 138,003. At the base rate it would be 40,000 + 4,000 + 25,001.25 =
+    /// 69,002 (ceiled).
+    #[test]
+    fn cache_reads_and_writes_count_toward_the_prompt() {
+        let book = tiered();
+        let usage = Usage {
+            input_tokens: 40_000,
+            cache_read_tokens: 40_000,
+            cache_write_tokens: 20_001,
+            ..Default::default()
+        };
+        assert_eq!(usage.prompt_tokens(), 100_001);
+        assert_eq!(book.cost("m", &usage), Some(Microusd(138_003)));
+        // The 1-hour subset is inside the write total and not counted twice.
+        let with_1h = Usage {
+            cache_write_1h_tokens: 20_001,
+            ..usage
+        };
+        assert_eq!(with_1h.prompt_tokens(), 100_001);
+    }
+
+    /// Over the line, output is priced at the long rate too: 100,001 x 2 +
+    /// 1,000 x 10 = 200,002 + 10,000 = 210,002. Input alone at the long rate
+    /// would be 200,002 + 5,000 = 205,002.
+    #[test]
+    fn the_long_rate_prices_every_part_including_output() {
+        let book = tiered();
+        let usage = Usage {
+            input_tokens: 100_001,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(book.cost("m", &usage), Some(Microusd(210_002)));
+        // A long OUTPUT does not move a short prompt: 10 x 1 + 500,000 x 5.
+        let long_answer = Usage {
+            input_tokens: 10,
+            output_tokens: 500_000,
+            ..Default::default()
+        };
+        assert_eq!(book.cost("m", &long_answer), Some(Microusd(2_500_010)));
+    }
+
+    /// A model with no row has no tier and prices at the fallback at any
+    /// length; a tier for a model with no row is not kept.
+    #[test]
+    fn an_unknown_model_has_no_tier() {
+        let mut book = tiered();
+        let long = Usage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert!(book.long_context("unknown").is_none());
+        assert_eq!(book.cost("unknown", &long), Some(Microusd(15_000_000)));
+        let kept = book.insert_long_context(
+            "unknown",
+            LongContext {
+                above_prompt_tokens: 1,
+                price: ModelPrice::per_mtok_usd(0.0, 0.0, 0.0, 0.0),
+            },
+        );
+        assert!(!kept);
+        assert_eq!(book.cost("unknown", &long), Some(Microusd(15_000_000)));
+    }
+
+    /// A row inserted after the tier is the whole price: the tier is dropped.
+    #[test]
+    fn a_row_inserted_after_a_tier_drops_the_tier() {
+        let mut book = tiered();
+        book.insert("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.30, 3.75));
+        assert!(book.long_context("m").is_none());
+        let long = Usage {
+            input_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(book.cost("m", &long), Some(Microusd(600_000)));
+        assert!(book.long_context_entries().is_empty());
+    }
+
+    /// A seeded sweep over prompt sizes around the line: the cost is always
+    /// the base cost at or below it and the long cost above, and never less
+    /// than the base cost.
+    #[test]
+    fn the_tier_is_chosen_by_the_prompt_alone_across_a_sweep() {
+        let book = tiered();
+        let base = book.price("m").unwrap();
+        let long = book.long_context("m").unwrap().price;
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..200 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let usage = Usage {
+                input_tokens: x % 120_000,
+                cache_read_tokens: (x >> 20) % 30_000,
+                cache_write_tokens: (x >> 40) % 30_000,
+                output_tokens: (x >> 8) % 5_000,
+                ..Default::default()
+            };
+            let want = if usage.prompt_tokens() > 100_000 {
+                long.cost(&usage)
+            } else {
+                base.cost(&usage)
+            };
+            assert_eq!(book.cost("m", &usage), Some(want), "{usage:?}");
+            assert!(want >= base.cost(&usage));
+        }
     }
 }

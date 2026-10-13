@@ -89,6 +89,12 @@ pub struct Applied {
     pub overridden_models: Vec<String>,
     /// The model ids of `added`, sorted.
     pub added_models: Vec<String>,
+    /// The overridden ids that carried a built-in long-prompt tier, sorted.
+    /// An operator's row is the whole price for its id (invariant 99), so the
+    /// tier is dropped with the built-in row: the file's shape has no tier,
+    /// and keeping the built-in one would price a long call at a rate the
+    /// operator replaced.
+    pub dropped_long_context_models: Vec<String>,
 }
 
 impl PriceFile {
@@ -184,7 +190,8 @@ impl PriceFile {
         PriceFile::parse(&bytes)
     }
 
-    /// Put every row into `book`, replacing a built-in row of the same id.
+    /// Put every row into `book`, replacing a built-in row of the same id and
+    /// dropping that id's long-prompt tier (`PriceBook::insert` does both).
     /// The fallback is left alone.
     pub fn apply(&self, book: &mut PriceBook) -> Applied {
         let mut applied = Applied {
@@ -192,8 +199,12 @@ impl PriceFile {
             added: 0,
             overridden_models: Vec::new(),
             added_models: Vec::new(),
+            dropped_long_context_models: Vec::new(),
         };
         for (model, price) in &self.rows {
+            if book.long_context(model).is_some() {
+                applied.dropped_long_context_models.push(model.clone());
+            }
             if book.is_known(model) {
                 applied.overridden += 1;
                 applied.overridden_models.push(model.clone());
@@ -205,6 +216,7 @@ impl PriceFile {
         }
         applied.overridden_models.sort();
         applied.added_models.sort();
+        applied.dropped_long_context_models.sort();
         applied
     }
 }
@@ -274,6 +286,7 @@ mod tests {
                 added: 1,
                 overridden_models: vec!["claude-sonnet-5".to_string()],
                 added_models: vec!["my-local-model".to_string()],
+                dropped_long_context_models: Vec::new(),
             }
         );
         let p = book.price("claude-sonnet-5").unwrap();
@@ -463,5 +476,42 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    /// An operator row for an id with a built-in long-prompt tier is the whole
+    /// price at every prompt length: the tier is dropped and said so.
+    /// claude-haiku-5-5 overridden at 1 / 5: a 150000-input, 1000-output call
+    /// costs 150000 + 5000 = 155000 micro-USD, never the built-in long rate's
+    /// 77500.
+    #[test]
+    fn an_operator_row_replaces_the_base_rate_and_drops_the_tier() {
+        let mut book = crate::pricebook::default_price_book();
+        assert!(book.long_context("claude-haiku-5-5").is_some());
+        let haiku = r#"{"model": "claude-haiku-5-5",
+            "input_per_mtok_microusd": 1000000,
+            "output_per_mtok_microusd": 5000000,
+            "cache_read_per_mtok_microusd": 100000,
+            "cache_write_per_mtok_microusd": 1250000,
+            "cache_write_1h_per_mtok_microusd": 2000000}"#;
+        let f = PriceFile::parse(file(&[haiku, ROW]).as_bytes()).unwrap();
+        let applied = f.apply(&mut book);
+        assert_eq!(
+            applied.dropped_long_context_models,
+            vec!["claude-haiku-5-5".to_string()],
+            "claude-sonnet-5 has no tier, so only Haiku 5.5's is dropped"
+        );
+        assert!(book.long_context("claude-haiku-5-5").is_none());
+        let long = tokenfuse_core::Usage {
+            input_tokens: 150_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            book.cost("claude-haiku-5-5", &long),
+            Some(Microusd(155_000))
+        );
+        // Every other tier stays.
+        assert!(book.long_context("anthropic.claude-haiku-5-5").is_some());
+        assert!(book.long_context("gpt-6.1-sol").is_some());
     }
 }
