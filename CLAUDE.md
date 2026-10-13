@@ -4975,9 +4975,9 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     taken after the DLP block and the PII mask, so a span those steps redact is
     not sent to the PDP either.
 
-    **Whole or not at all.** The compact JSON of `arguments` is capped at 16 KiB
-    (`TOOL_CALL_ARGUMENTS_CAP_BYTES`, inclusive: 16384 bytes is sent, 16385 is
-    not). Over the cap the object is sent WITHOUT `arguments` and with
+    **Whole or not at all.** The compact JSON of `arguments` is capped at 12 KiB
+    (`TOOL_CALL_ARGUMENTS_CAP_BYTES`, inclusive: 12288 bytes is sent, 12289 is
+    not; lowered from 16 KiB by invariant 100). Over the cap the object is sent WITHOUT `arguments` and with
     `arguments_truncated: true`, never a prefix, because a prefix of a JSON
     document is not a document and a policy reading half an object decides on
     something the agent never sent. The flag appears only when arguments
@@ -5150,7 +5150,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `TOKENFUSE_MCP_DLP` is `shadow` or `off`, and PII does when
     `TOKENFUSE_MCP_DLP_PII` is `shadow` or `off`. The PDP is told the arguments
     and nothing here makes it use them; a deployment whose wardryx has no
-    argument-aware rule gains only a larger request (at most about 16 KiB). A
+    argument-aware rule gains only a larger request (at most 12 KiB). A
     `tools/call` with no `params.name` sends `name: ""`. The stdio transport
     reaches the same code and sends the same member, but has no agent id, so an
     enforcing gate refuses it before asking, as invariant 36's neighbours
@@ -6945,3 +6945,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     renamed out, and 2.5 Pro's long tier dropped.
     Scenarios: `features/a-long-prompt-is-priced-at-its-long-rate.feature`, nine, each bound. Not a
     script gate: the rule is `PriceBook::price_for` and the parser, held by `cargo test`)*
+
+100. **The argument cap TokenFuse applies to a tool call equals the bound the policy plane refuses at, and the two constants are held equal.** The MCP broker sends a tool call's `arguments` to Wardryx in `tool_call` when they fit `TOOL_CALL_ARGUMENTS_CAP_BYTES`, else sends none with `arguments_truncated: true`. The cap was 16 KiB; Wardryx's own `MaxToolArgumentsBytes` (`internal/pdp/signal.go`, `12 << 10`) answers 400 to anything over 12 KiB. A call with 12 to 16 KiB of arguments was therefore sent whole, refused by Wardryx with no verdict, and decided by the failmode alone: under the component default `open` it was allowed with no policy decision at all, a silent allow on the tool path. Measured 2026-10-13 by reading both repositories and reproduced red first with a stub PDP that behaves as Wardryx does (`tests/it/mcp_broker.rs::a_tool_call_of_13_kib_of_arguments_is_sent_truncated_so_the_pdp_decides`, failing on the arguments being sent whole, the PDP answering 400, no decision recorded).
+
+    `@decided 2026-10-13`: the policy plane's bound wins. TokenFuse's cap is 12 KiB, equal to Wardryx's. Arguments over it are sent as `arguments_truncated: true` with no `arguments`, which Wardryx accepts and decides on. The failmode is unchanged: it still decides a call the policy plane could not answer, and this change only makes sure the policy plane can answer the calls it is shown.
+
+    **Two constants, one number, and the rule is that they stay equal.** The TokenFuse side is `TOOL_CALL_ARGUMENTS_CAP_BYTES` (`crates/gateway/src/wardryx.rs`); the Wardryx side is `MaxToolArgumentsBytes` in another repository. Nothing in this repository can read Wardryx, so the pairing is held where the estate holds mirrored constants: an estate-gates C3 mirror across the two repositories, added separately. Until that gate exists, this invariant is held by the boundary tests below and by the sentence in the constant's doc, not by a gate here. If Wardryx lowers its bound, this cap must follow, or a call between the two bounds is refused by the policy plane and decided by the failmode.
+
+    **Boundary, both sides.** Exactly 12288 serialized bytes is sent whole; 12289 is truncated and flagged. The integration test pins both sides against the real broker and a stub PDP, and the unit test `the_cap_is_on_serialized_bytes_and_inclusive` pins the same edge on `ToolCall::new`.
+    *(test: `tests/it/mcp_broker.rs::a_tool_call_of_13_kib_of_arguments_is_sent_truncated_so_the_pdp_decides` (red first: `13 KiB is over the policy plane's 12 KiB bound and must not be sent whole`, with the PDP answering 400), `arguments_of_exactly_12_kib_are_sent_whole_and_one_byte_more_is_truncated` (red first: the one-over call answered `blocked: policy denied tool "t" (wardryx answered 400 ...; failmode=Closed applied)`); `gateway::wardryx::a_thirteen_kib_call_is_sent_truncated_so_the_pdp_decides`, `the_cap_is_on_serialized_bytes_and_inclusive` (12288 fits, 12289 does not), `a_call_over_the_cap_loses_its_arguments_and_says_so`, and the 200-seed sweep `arguments_that_serialize_to_exactly_the_cap_in_many_shapes_never_panic`. Scenarios: `features/the-broker-sends-the-tool-call.feature`, the two scenarios for the 12 KiB bound, each bound. Mutants, planted and reverted: the cap back at 16 KiB (the red tests above fail), `>` changed to `>=` at the boundary (the exact-12-KiB tests fail), and the truncation flag not set when over (the flag and the integration tests fail). Not a script gate)*
