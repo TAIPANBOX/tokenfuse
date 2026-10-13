@@ -44,7 +44,7 @@ async-stream = "0.3.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "charset"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
-datafusion = { version = "44", default-features = false, features = ["parquet"] }
+datafusion = { version = "55", default-features = false, features = ["parquet", "sql"] }
 wasmtime = { version = "49.0.2", optional = true, default-features = false, features = ["cranelift", "runtime", "wat"] }
 fastembed = { version = "4", optional = true }
 # HA: co-locate a raft node so budgets replicate across gateways. Optional — the

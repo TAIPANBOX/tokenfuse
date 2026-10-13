@@ -9,7 +9,7 @@ exclude = ["crates/radar", "crates/cluster"]
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/TAIPANBOX/tokenfuse"
-rust-version = "1.90"
+rust-version = "1.94"
 
 [workspace.dependencies]
 tokenfuse-core = { path = "crates/core" }
