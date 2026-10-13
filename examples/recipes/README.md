@@ -63,7 +63,7 @@ call on the OpenAI door is the one refused. Against a listed model, raise
 |---|---|---|---|---|---|
 | LangChain | `langchain-openai` 1.6.2, `langchain-anthropic` 1.7.2 | both | `ChatOpenAI(base_url=...)`; `ChatAnthropic(anthropic_api_url=...)` | `default_headers=` on either model object | `langchain_openai_door.py`, `langchain_messages_door.py` |
 | OpenAI Agents SDK | `openai-agents` 0.22.2 | OpenAI | `AsyncOpenAI(base_url=...)` into `OpenAIChatCompletionsModel` | `ModelSettings(extra_headers=...)` per agent or per run | `openai_agents.py` |
-| PydanticAI | `pydantic-ai-slim` 2.43.0 | both | `OpenAIProvider(base_url=...)`, `AnthropicProvider(base_url=...)` | an `httpx2.AsyncClient(headers=...)` passed as `http_client=` | `pydantic_ai_openai_door.py`, `pydantic_ai_messages_door.py` |
+| PydanticAI | `pydantic-ai-slim` 2.53.0 | both | `OpenAIProvider(base_url=...)`, `AnthropicProvider(base_url=...)` | an `httpx2.AsyncClient(headers=...)` passed as `http_client=` | `pydantic_ai_openai_door.py`, `pydantic_ai_messages_door.py` |
 | CrewAI | `crewai` 1.15.21 (Python 3.10 to 3.13) | OpenAI | `LLM(base_url=...)` | `LLM(extra_headers=...)`, handed down to LiteLLM | `crewai_recipe.py` |
 | AutoGen | `autogen-ext` 0.7.5 (maintenance mode) | OpenAI | `OpenAIChatCompletionClient(base_url=...)` | `default_headers=` | `autogen_openai_door.py` |
 | Semantic Kernel | `semantic-kernel` 1.44.1 | OpenAI | an injected `AsyncOpenAI(base_url=...)` client | `default_headers=` on that client | `semantic_kernel_recipe.py` |
@@ -108,3 +108,5 @@ the recipe had put in `extra_headers`, so the header reaches the gateway
 through LiteLLM. Not measured: the CI matrix. The gateway's offline stub
 refuses to start on the OpenAI wire on purpose, so a CI job needs a real
 OpenAI-shaped upstream; that is the open item for this directory.
+
+PydanticAI 2.53.0, measured 2026-10-13: both PydanticAI scripts ran against `ghcr.io/taipanbox/tokenfuse:v1.13.0` (one container per door) in front of a local mock upstream that answers every call with 1000 input tokens. Call 1 was answered, call 2 was refused with `402 budget_exceeded`, and both scripts exited 0. The mock is not in this directory, and no real provider was used.
