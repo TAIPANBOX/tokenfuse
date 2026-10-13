@@ -51,13 +51,238 @@ pub fn dlp_mode_from(value: Option<&str>) -> DlpMode {
 /// 2026-08-04 range said nothing about them. Turning something on by default is
 /// a claim that its false positives are worth its true positives, and that
 /// claim is only established here for the secret patterns.
-pub fn dlp_pii_mode_from(value: Option<&str>) -> DlpMode {
-    match value.map(str::trim) {
-        Some("shadow") => DlpMode::Shadow,
-        Some("mask") => DlpMode::Mask,
-        Some("block") => DlpMode::Block,
-        _ => DlpMode::Off,
+/// PII masks (`TOKENFUSE_DLP_PII`): the same four values, switched
+/// independently of the secret scanner.
+///
+/// **Unset stays `off`, deliberately.** This is a different promise from the
+/// one above: `pii_email`/`pii_card`/`pii_phone` are heuristics over ordinary
+/// text, so their false positives are prose rather than credentials, and the
+/// 2026-08-04 range said nothing about them. Turning something on by default is
+/// a claim that its false positives are worth its true positives, and that
+/// claim is only established here for the secret patterns.
+///
+/// An unknown value is refused (invariant 98). It used to read as `off`, so a
+/// typo for `block` ran the gateway with the PII masks off.
+pub fn dlp_pii_mode_from(value: Option<&str>) -> Result<DlpMode, String> {
+    pii_mode("TOKENFUSE_DLP_PII", value)
+}
+
+/// The same four words for the MCP broker's PII masks (`TOKENFUSE_MCP_DLP_PII`).
+pub fn mcp_dlp_pii_mode_from(value: Option<&str>) -> Result<DlpMode, String> {
+    pii_mode("TOKENFUSE_MCP_DLP_PII", value)
+}
+
+fn pii_mode(name: &str, value: Option<&str>) -> Result<DlpMode, String> {
+    Ok(
+        match switch_word(name, value, &["off", "shadow", "mask", "block"])? {
+            Some("shadow") => DlpMode::Shadow,
+            Some("mask") => DlpMode::Mask,
+            Some("block") => DlpMode::Block,
+            _ => DlpMode::Off,
+        },
+    )
+}
+
+/// The MCP broker's secret scanner (`TOKENFUSE_MCP_DLP`): `off | shadow | block`.
+///
+/// **Unset is `shadow`**, which is what the broker has always done. An unknown
+/// value used to read as `shadow` too, so a typo for `block` was a broker that
+/// logged the secret and forwarded it; it is refused now (invariant 98).
+pub fn mcp_dlp_mode_from(value: Option<&str>) -> Result<DlpMode, String> {
+    Ok(
+        match switch_word("TOKENFUSE_MCP_DLP", value, &["off", "shadow", "block"])? {
+            Some("block") => DlpMode::Block,
+            Some("off") => DlpMode::Off,
+            _ => DlpMode::Shadow,
+        },
+    )
+}
+
+/// The MCP broker's tool-listing scan (`TOKENFUSE_MCP_SCAN`): `off | warn | block`.
+///
+/// **Unset is `warn`.** An unknown value used to read as `warn`, so a typo for
+/// `block` let a poisoned listing through with a log line; it is refused now
+/// (invariant 98).
+pub fn mcp_scan_mode_from(value: Option<&str>) -> Result<crate::mcpbroker::ScanMode, String> {
+    use crate::mcpbroker::ScanMode;
+    Ok(
+        match switch_word("TOKENFUSE_MCP_SCAN", value, &["off", "warn", "block"])? {
+            Some("off") => ScanMode::Off,
+            Some("block") => ScanMode::Block,
+            _ => ScanMode::Warn,
+        },
+    )
+}
+
+/// What the broker does when the taint gateway cannot be reached
+/// (`TOKENFUSE_MCP_TAINT_FAILMODE`): `open | closed`. Returns whether it fails
+/// closed.
+///
+/// **Unset is `open`.** An unknown value used to read as `open`, so a typo for
+/// `closed` turned an outage of the gate into permission; it is refused now
+/// (invariant 98).
+pub fn mcp_taint_failclosed_from(value: Option<&str>) -> Result<bool, String> {
+    Ok(matches!(
+        switch_word("TOKENFUSE_MCP_TAINT_FAILMODE", value, &["open", "closed"])?,
+        Some("closed")
+    ))
+}
+
+/// A switch that turns a protection on, read as `1|true` (on) or `0|false`
+/// (off). `name` is the variable, for the refusal message.
+///
+/// **Unset is off**, as before. Until 2026-10-13 any other value read as off,
+/// so `TOKENFUSE_MCP_REQUIRE_PROOF=yes` left the bearer door open while the
+/// operator believed it closed. `yes`, `on` and `no` are refused rather than
+/// guessed at; `0` and `false` remain the explicit way to say off (invariant 98).
+pub fn required_switch_from(name: &str, value: Option<&str>) -> Result<bool, String> {
+    Ok(matches!(
+        switch_word(name, value, &["0", "false", "1", "true"])?,
+        Some("1") | Some("true")
+    ))
+}
+
+/// The wardryx policy hook's mode (`TOKENFUSE_WARDRYX_MODE`): `off | shadow | enforce`.
+///
+/// **Unset is `off`**, as before. An unknown value used to read as `off`
+/// silently, so `TOKENFUSE_WARDRYX_MODE=enfroce` ran a gateway whose policy
+/// decided nothing while its operator believed `enforce` was on; it is refused
+/// now (invariant 98). Case is folded, so `ENFORCE` is `enforce`: an operator
+/// who wrote the word in capitals meant it, and a deployment that did so before
+/// this change now enforces (see the feature file's upgrade note).
+pub fn wardryx_mode_from(value: Option<&str>) -> Result<crate::wardryx::WardryxMode, String> {
+    use crate::wardryx::WardryxMode;
+    Ok(
+        match switch_word(
+            "TOKENFUSE_WARDRYX_MODE",
+            value,
+            &["off", "shadow", "enforce"],
+        )? {
+            Some("shadow") => WardryxMode::Shadow,
+            Some("enforce") => WardryxMode::Enforce,
+            _ => WardryxMode::Off,
+        },
+    )
+}
+
+/// What the wardryx hook does when its PDP cannot be reached
+/// (`TOKENFUSE_WARDRYX_FAILMODE`): `open | closed`.
+///
+/// **Unset is `open`.** An unknown value used to read as `open`, so a typo for
+/// `closed` let every call through during an outage of the policy plane; it is
+/// refused now (invariant 98).
+pub fn wardryx_failmode_from(value: Option<&str>) -> Result<crate::wardryx::FailMode, String> {
+    use crate::wardryx::FailMode;
+    Ok(
+        match switch_word("TOKENFUSE_WARDRYX_FAILMODE", value, &["open", "closed"])? {
+            Some("closed") => FailMode::Closed,
+            _ => FailMode::Open,
+        },
+    )
+}
+
+/// Reads one switch whose words are a closed set: the single copy of the rule
+/// every security switch in this module follows (CLAUDE.md invariant 98).
+///
+/// Unset, empty or only spaces is `Ok(None)`: the caller keeps the switch's own
+/// default. A set value is matched against `words` in any case, ignoring the
+/// spaces around it, and comes back as the word in `words`. Anything else is an
+/// `Err` naming the variable, the value and the words, for the caller to exit
+/// with ([`exit_on_refusal`]).
+///
+/// The rule lives here once on purpose. Each of these switches had its own
+/// `match` with a catch-all arm, and each catch-all quietly chose a mode for a
+/// value nobody had written; for some of them the chosen mode was the weaker
+/// one. A rule written nine times is a rule that drifts nine times.
+pub fn switch_word(
+    name: &str,
+    value: Option<&str>,
+    words: &[&'static str],
+) -> Result<Option<&'static str>, String> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let lower = raw.to_ascii_lowercase();
+    match words.iter().copied().find(|w| *w == lower) {
+        Some(word) => Ok(Some(word)),
+        None => Err(format!(
+            "tokenfuse: {name} must be {}, got `{raw}`",
+            words.join("|")
+        )),
     }
+}
+
+/// Unwraps a refusal from a parser in this module by printing its message and
+/// exiting 2, before the listener binds. Every `_from_env` wrapper here ends
+/// in this, so the exit code and the message shape are one thing.
+pub fn exit_on_refusal<T>(result: Result<T, String>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// [`dlp_pii_mode_from`] against the process environment.
+pub fn dlp_pii_mode_from_env() -> DlpMode {
+    exit_on_refusal(dlp_pii_mode_from(
+        std::env::var("TOKENFUSE_DLP_PII").ok().as_deref(),
+    ))
+}
+
+/// [`mcp_dlp_mode_from`] against the process environment.
+pub fn mcp_dlp_mode_from_env() -> DlpMode {
+    exit_on_refusal(mcp_dlp_mode_from(
+        std::env::var("TOKENFUSE_MCP_DLP").ok().as_deref(),
+    ))
+}
+
+/// [`mcp_dlp_pii_mode_from`] against the process environment.
+pub fn mcp_dlp_pii_mode_from_env() -> DlpMode {
+    exit_on_refusal(mcp_dlp_pii_mode_from(
+        std::env::var("TOKENFUSE_MCP_DLP_PII").ok().as_deref(),
+    ))
+}
+
+/// [`mcp_scan_mode_from`] against the process environment.
+pub fn mcp_scan_mode_from_env() -> crate::mcpbroker::ScanMode {
+    exit_on_refusal(mcp_scan_mode_from(
+        std::env::var("TOKENFUSE_MCP_SCAN").ok().as_deref(),
+    ))
+}
+
+/// [`mcp_taint_failclosed_from`] against the process environment.
+pub fn mcp_taint_failclosed_from_env() -> bool {
+    exit_on_refusal(mcp_taint_failclosed_from(
+        std::env::var("TOKENFUSE_MCP_TAINT_FAILMODE")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+/// [`required_switch_from`] against the process environment, for the named
+/// variable.
+pub fn required_switch_from_env(name: &str) -> bool {
+    exit_on_refusal(required_switch_from(
+        name,
+        std::env::var(name).ok().as_deref(),
+    ))
+}
+
+/// [`wardryx_mode_from`] against the process environment.
+pub fn wardryx_mode_from_env() -> crate::wardryx::WardryxMode {
+    exit_on_refusal(wardryx_mode_from(
+        std::env::var("TOKENFUSE_WARDRYX_MODE").ok().as_deref(),
+    ))
+}
+
+/// [`wardryx_failmode_from`] against the process environment.
+pub fn wardryx_failmode_from_env() -> crate::wardryx::FailMode {
+    exit_on_refusal(wardryx_failmode_from(
+        std::env::var("TOKENFUSE_WARDRYX_FAILMODE").ok().as_deref(),
+    ))
 }
 
 /// Whether a call with no `x-fuse-run-id` is refused (`TOKENFUSE_REQUIRE_RUN_ID`).
@@ -150,11 +375,6 @@ pub fn cache_mode_from_env() -> tokenfuse_core::cache::CacheMode {
 /// [`dlp_mode_from`] against the process environment.
 pub fn dlp_mode_from_env() -> DlpMode {
     dlp_mode_from(std::env::var("TOKENFUSE_DLP").ok().as_deref())
-}
-
-/// [`dlp_pii_mode_from`] against the process environment.
-pub fn dlp_pii_mode_from_env() -> DlpMode {
-    dlp_pii_mode_from(std::env::var("TOKENFUSE_DLP_PII").ok().as_deref())
 }
 
 /// [`require_run_id_from`] against the process environment.
@@ -348,10 +568,10 @@ mod tests {
     /// default.
     #[test]
     fn pii_masks_stay_off_when_nothing_is_configured() {
-        assert_eq!(dlp_pii_mode_from(None), DlpMode::Off);
-        assert_eq!(dlp_pii_mode_from(Some("")), DlpMode::Off);
-        assert_eq!(dlp_pii_mode_from(Some("mask")), DlpMode::Mask);
-        assert_eq!(dlp_pii_mode_from(Some("block")), DlpMode::Block);
+        assert_eq!(dlp_pii_mode_from(None), Ok(DlpMode::Off));
+        assert_eq!(dlp_pii_mode_from(Some("")), Ok(DlpMode::Off));
+        assert_eq!(dlp_pii_mode_from(Some("mask")), Ok(DlpMode::Mask));
+        assert_eq!(dlp_pii_mode_from(Some("block")), Ok(DlpMode::Block));
     }
 
     #[test]
@@ -557,5 +777,190 @@ mod tests {
                 "{bad:?} must be refused, never read as no ceiling"
             );
         }
+    }
+
+    /// The rule every switch below must keep, asserted once so the nine
+    /// tests cannot drift apart: unset, empty and blank keep the switch's own
+    /// default; a value nobody can read is refused with an error naming the
+    /// variable, the value and the words it accepts; every accepted word is
+    /// honoured in any case and with surrounding spaces.
+    fn assert_switch<T: std::fmt::Debug + PartialEq>(
+        name: &str,
+        words: &str,
+        parse: impl Fn(Option<&str>) -> Result<T, String>,
+        default: T,
+        honoured: &[(&str, T)],
+    ) {
+        for unset in [None, Some(""), Some("   ")] {
+            match parse(unset) {
+                Ok(v) => assert!(
+                    v == default,
+                    "{name}: {unset:?} must keep {default:?}, got {v:?}"
+                ),
+                Err(e) => panic!("{name}: {unset:?} must not be refused: {e}"),
+            }
+        }
+        match parse(Some("enfroce")) {
+            Ok(v) => panic!("{name}: a mistyped word must be refused, it read as {v:?}"),
+            Err(e) => {
+                assert!(
+                    e.contains(name),
+                    "{name}: refusal does not name the variable: {e}"
+                );
+                assert!(
+                    e.contains("enfroce"),
+                    "{name}: refusal does not name the value: {e}"
+                );
+                assert!(
+                    e.contains(words),
+                    "{name}: refusal does not name the words {words}: {e}"
+                );
+            }
+        }
+        for (word, expected) in honoured {
+            for raw in [word.to_string(), word.to_uppercase(), format!(" {word} ")] {
+                match parse(Some(&raw)) {
+                    Ok(v) => assert!(
+                        v == *expected,
+                        "{name}: {raw:?} must read as {expected:?}, got {v:?}"
+                    ),
+                    Err(e) => panic!("{name}: {raw:?} is a named word and must be honoured: {e}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dlp_pii_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_DLP_PII",
+            "off|shadow|mask|block",
+            dlp_pii_mode_from,
+            DlpMode::Off,
+            &[
+                ("off", DlpMode::Off),
+                ("shadow", DlpMode::Shadow),
+                ("mask", DlpMode::Mask),
+                ("block", DlpMode::Block),
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_dlp_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_MCP_DLP",
+            "off|shadow|block",
+            mcp_dlp_mode_from,
+            DlpMode::Shadow,
+            &[
+                ("off", DlpMode::Off),
+                ("shadow", DlpMode::Shadow),
+                ("block", DlpMode::Block),
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_dlp_pii_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_MCP_DLP_PII",
+            "off|shadow|mask|block",
+            mcp_dlp_pii_mode_from,
+            DlpMode::Off,
+            &[
+                ("off", DlpMode::Off),
+                ("shadow", DlpMode::Shadow),
+                ("mask", DlpMode::Mask),
+                ("block", DlpMode::Block),
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_scan_refuses_a_mistyped_word() {
+        use crate::mcpbroker::ScanMode;
+        assert_switch(
+            "TOKENFUSE_MCP_SCAN",
+            "off|warn|block",
+            mcp_scan_mode_from,
+            ScanMode::Warn,
+            &[
+                ("off", ScanMode::Off),
+                ("warn", ScanMode::Warn),
+                ("block", ScanMode::Block),
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_taint_failmode_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_MCP_TAINT_FAILMODE",
+            "open|closed",
+            mcp_taint_failclosed_from,
+            false,
+            &[("open", false), ("closed", true)],
+        );
+    }
+
+    #[test]
+    fn wardryx_mode_refuses_a_mistyped_word() {
+        use crate::wardryx::WardryxMode;
+        assert_switch(
+            "TOKENFUSE_WARDRYX_MODE",
+            "off|shadow|enforce",
+            wardryx_mode_from,
+            WardryxMode::Off,
+            &[
+                ("off", WardryxMode::Off),
+                ("shadow", WardryxMode::Shadow),
+                ("enforce", WardryxMode::Enforce),
+            ],
+        );
+    }
+
+    #[test]
+    fn wardryx_failmode_refuses_a_mistyped_word() {
+        use crate::wardryx::FailMode;
+        assert_switch(
+            "TOKENFUSE_WARDRYX_FAILMODE",
+            "open|closed",
+            wardryx_failmode_from,
+            FailMode::Open,
+            &[("open", FailMode::Open), ("closed", FailMode::Closed)],
+        );
+    }
+
+    #[test]
+    fn require_proof_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_MCP_REQUIRE_PROOF",
+            "0|false|1|true",
+            |v| required_switch_from("TOKENFUSE_MCP_REQUIRE_PROOF", v),
+            false,
+            &[("0", false), ("false", false), ("1", true), ("true", true)],
+        );
+    }
+
+    #[test]
+    fn require_secret_scopes_refuses_a_mistyped_word() {
+        assert_switch(
+            "TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES",
+            "0|false|1|true",
+            |v| required_switch_from("TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES", v),
+            false,
+            &[("0", false), ("false", false), ("1", true), ("true", true)],
+        );
+    }
+
+    /// The measurement switches are deliberately NOT in the list above
+    /// (invariants 61 and 63): an unknown value stays `off` with one warn line,
+    /// because a measurement toggle has no stricter reading to fall back to.
+    #[test]
+    fn measurement_switches_keep_unknown_as_off_by_decision() {
+        use tokenfuse_core::cache::CacheMode;
+        assert!(matches!(cache_mode_from(Some("enfroce")), CacheMode::Off));
+        assert_eq!(tools_prune_mode_from(Some("enfroce")), ToolsPruneMode::Off);
     }
 }

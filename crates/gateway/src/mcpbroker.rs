@@ -69,7 +69,7 @@ use tokenfuse_core::agent_event::{
     dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanMode {
     Off,
     Warn,

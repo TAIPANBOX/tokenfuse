@@ -975,18 +975,19 @@ impl Wardryx {
     /// regardless of `TOKENFUSE_WARDRYX_MODE`: with nothing to call there is
     /// nothing to enforce or shadow.
     pub fn from_env() -> Self {
-        Self::from_vars(|name| std::env::var(name).ok())
+        crate::defaults::exit_on_refusal(Self::from_vars(|name| std::env::var(name).ok()))
     }
 
     /// [`Self::from_env`] over any source of variables, so a test can state
     /// the whole configuration without touching the process environment that
     /// every other test in this binary shares.
-    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
-        let requested_mode = match var("TOKENFUSE_WARDRYX_MODE").as_deref() {
-            Some("shadow") => WardryxMode::Shadow,
-            Some("enforce") => WardryxMode::Enforce,
-            _ => WardryxMode::Off,
-        };
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        // Both switches are parsed before the URL check, so a mistyped word is
+        // refused whether or not the hook has a URL (invariant 98).
+        let requested_mode =
+            crate::defaults::wardryx_mode_from(var("TOKENFUSE_WARDRYX_MODE").as_deref())?;
+        let failmode =
+            crate::defaults::wardryx_failmode_from(var("TOKENFUSE_WARDRYX_FAILMODE").as_deref())?;
         let url = var("TOKENFUSE_WARDRYX_URL").filter(|s| !s.is_empty());
         let Some(url) = url else {
             if requested_mode != WardryxMode::Off {
@@ -995,13 +996,9 @@ impl Wardryx {
                      the wardryx hook stays off"
                 );
             }
-            return Wardryx::disabled();
+            return Ok(Wardryx::disabled());
         };
 
-        let failmode = match var("TOKENFUSE_WARDRYX_FAILMODE").as_deref() {
-            Some("closed") => FailMode::Closed,
-            _ => FailMode::Open,
-        };
         let key = var("TOKENFUSE_WARDRYX_KEY").filter(|s| !s.is_empty());
         // `Some` only when the operator set a value this process reads: an
         // explicit shared value is a choice for both paths, while an unset or
@@ -1020,7 +1017,7 @@ impl Wardryx {
             shared_ms,
         );
 
-        Wardryx::new(
+        Ok(Wardryx::new(
             requested_mode,
             failmode,
             url,
@@ -1028,7 +1025,7 @@ impl Wardryx {
             Duration::from_millis(timeout_ms),
             Duration::from_millis(cache_ttl_ms),
         )
-        .with_tool_timeout(Duration::from_millis(tool_timeout_ms))
+        .with_tool_timeout(Duration::from_millis(tool_timeout_ms)))
     }
 
     /// Ask the PDP (or the cache) what to do about this call. Always
@@ -2034,7 +2031,8 @@ mod tests {
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
             ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
             ("TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS", "900"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(w.tool_timeout(), Duration::from_millis(900));
         assert_eq!(
             w.client.as_ref().unwrap().timeout,
@@ -2048,7 +2046,8 @@ mod tests {
             ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
             ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(w.tool_timeout(), Duration::from_millis(80));
         // This test also asserted, until 2026-10-12, that with nothing set
         // the tool path took the model path's 50 ms. That was the defect
@@ -2099,7 +2098,7 @@ mod tests {
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
         ];
         all.extend_from_slice(pairs);
-        Wardryx::from_vars(vars(&all))
+        Wardryx::from_vars(vars(&all)).unwrap()
     }
 
     /// (model path, tool path), in milliseconds.

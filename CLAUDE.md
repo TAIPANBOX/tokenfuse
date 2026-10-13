@@ -6613,3 +6613,38 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     by the variable, not by the file. The refusal runs in `serve()` through
     `firewall::from_env`, so a process that never calls it (the MCP broker, which
     builds no firewall of its own) is not refused by a bad value here.
+
+98. **A security switch that cannot read its own value refuses to start, and a measurement switch says so by decision.** Invariants 72 and 94 closed the hole for `TOKENFUSE_MODE` and `TOKENFUSE_FIREWALL`. Nine more switches had the same hole, each with its own `match` and a catch-all arm that chose a mode for a value nobody had written, and for those nine the chosen mode was the weaker one: a typo for `block` ran the broker with the findings logged and forwarded, a typo for `closed` let every call through during an outage of the policy plane, a typo for `enforce` ran a gateway whose policy decided nothing while its operator believed it did. Found by reading the code on 2026-10-13 and measured on the real binary before the change (`tests/it/security_switches_startup.rs`, both red with the process "kept running").
+
+    **One copy of the rule.** `defaults::switch_word` is the only place a closed word set is read: unset, empty or blank keeps the switch's own default; a set value matches its words in any case, ignoring surrounding spaces; anything else is `Err` naming the variable, the value and the words. `defaults::exit_on_refusal` prints that message and exits 2, and is called from `_from_env` wrappers that run before the listener binds in both processes, the same place invariant 72's refusal runs.
+
+    **Changed: unknown value refused.**
+
+    | Variable | Accepted words | Unknown before | Process |
+    |---|---|---|---|
+    | `TOKENFUSE_DLP_PII` | off, shadow, mask, block | off | serve |
+    | `TOKENFUSE_MCP_DLP_PII` | off, shadow, mask, block | off | mcp-broker |
+    | `TOKENFUSE_MCP_DLP` | off, shadow, block | shadow | mcp-broker |
+    | `TOKENFUSE_MCP_SCAN` | off, warn, block | warn | mcp-broker |
+    | `TOKENFUSE_MCP_TAINT_FAILMODE` | open, closed | open | mcp-broker |
+    | `TOKENFUSE_WARDRYX_MODE` | off, shadow, enforce | off, silently | both |
+    | `TOKENFUSE_WARDRYX_FAILMODE` | open, closed | open | both |
+    | `TOKENFUSE_MCP_REQUIRE_PROOF` | 0, false, 1, true | off | mcp-broker |
+    | `TOKENFUSE_MCP_REQUIRE_SECRET_SCOPES` | 0, false, 1, true | off | mcp-broker |
+
+    `TOKENFUSE_WARDRYX_MODE` and `TOKENFUSE_WARDRYX_FAILMODE` are validated before the URL check, so a typo is refused whether or not the hook has a URL. `wardryx::Wardryx::from_vars` now returns a `Result`, and its one caller that exits is `from_env`. The two "require" flags used to read `yes`, `on` and `no` as off, and they still do not accept those words (refused now); `0` and `false` remain the explicit way to say off, and surrounding spaces are ignored where they were not before.
+
+    **Left alone, already safe.** Each of these either refuses an unknown value already or reads it as the stronger side.
+    - `TOKENFUSE_DLP` (unknown reads as block; `OFF` in capitals reads as block too, the stronger side, which is loud rather than silent).
+    - `TOKENFUSE_REQUIRE_RUN_ID` (unknown reads as required).
+    - `TOKENFUSE_MODE` (exits, invariant 72), `TOKENFUSE_FIREWALL` (exits, invariant 94), `TOKENFUSE_IDENTITY_STRICT` (exits), `TOKENFUSE_AGENT_ID_MODE` (exits).
+    - `TOKENFUSE_MCP_ACCEPT_XAA` (exits, invariant 62), `TOKENFUSE_DELEGATION_REVOCATIONS_FAILMODE` (refuses).
+    - `TOKENFUSE_MCP_ALLOW_OPEN_BIND`, `TOKENFUSE_ALLOW_OPEN_OBS` and `TOKENFUSE_ALLOW_STUB` are opt-outs or opt-ins read as `1|true`. An unknown value reads as not opted out (stronger) or not opted in (refuses to start where a stub would be needed), so they are not changed.
+
+    **Measurement, left alone by decision.** `TOKENFUSE_CACHE` (invariant 63) and `TOKENFUSE_TOOLS_PRUNE` (invariant 61) keep unknown as off with one warn line. A measurement toggle has no stricter reading to fall back to, and a process refusing to start over a cache setting would be the wrong trade. `measurement_switches_keep_unknown_as_off_by_decision` pins it.
+
+    **Found, not changed, for a decision of their own.** `TOKENFUSE_MCP_LOCK` names a rug-pull baseline file: a set path that cannot be read or parsed silently means no baseline and no refusal. It is a path, not a mode, and refusing it would break deployments that ship without a lockfile on purpose. The cluster TLS pair (`TOKENFUSE_CLUSTER_TLS_CERT`, `TOKENFUSE_CLUSTER_TLS_KEY`) reads a half-set pair as plaintext; it is the `cluster` feature, which no shipped image builds. Both belong in a follow-up with the question put to an operator.
+
+    **Upgrade effect.** A deployment with a mistyped value that used to start now exits 2 before listening. A value written in capitals (`ENFORCE`) now means what it spells: `TOKENFUSE_WARDRYX_MODE=ENFORCE` turns enforcement on where it used to be silently off, which is the change an operator should read before upgrading.
+
+    *(tests: `defaults::tests`, one per switch, each named for its variable (`dlp_pii_refuses_a_mistyped_word`, `mcp_dlp_refuses_a_mistyped_word`, `mcp_dlp_pii_refuses_a_mistyped_word`, `mcp_scan_refuses_a_mistyped_word`, `mcp_taint_failmode_refuses_a_mistyped_word`, `wardryx_mode_refuses_a_mistyped_word`, `wardryx_failmode_refuses_a_mistyped_word`, `require_proof_refuses_a_mistyped_word`, `require_secret_scopes_refuses_a_mistyped_word`), all through `assert_switch`, which checks unset, empty and blank keep the default, a mistyped word is refused with its name, value and words in the message, and every accepted word is honoured in any case; `measurement_switches_keep_unknown_as_off_by_decision`. Red first against the stub that read unknown values as the old default: nine failed, e.g. `TOKENFUSE_MCP_TAINT_FAILMODE: a mistyped word must be refused, it read as false`. `tests/it/security_switches_startup.rs`: `a_mistyped_dlp_pii_stops_the_gateway_before_it_serves` (serve) and `a_mistyped_mcp_scan_stops_the_broker_before_it_serves` (mcp-broker), red on the unfixed binary with `the process kept running instead of refusing to start`; `an_empty_dlp_pii_still_starts_the_gateway` and `an_empty_mcp_scan_still_starts_the_broker` as the guards. Mutants, each planted in `defaults.rs` and reverted byte for byte: the silent fallback restored (`None if true => return Ok(None)`, nine unit tests red), case folding removed (nine red), empty treated as an error (ten red, including the unset-keeps-default test), exit code 1 instead of 2 (both startup tests red), a wardryx mapping sent to the weaker word (`wardryx_mode_refuses_a_mistyped_word`), and the required flag losing its `true` word (both require tests red). Scenarios: `features/a-mistyped-security-switch-refuses-to-start.feature`, fourteen, each bound.)*
