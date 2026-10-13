@@ -83,7 +83,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 50;
 /// The tool path's deadline when neither `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`
 /// nor `TOKENFUSE_WARDRYX_TIMEOUT_MS` is set (invariant 74). Until 2026-10-12
 /// the tool path took the model path's 50 ms here, and a deny that took longer
-/// (the ordinary case behind `typryx wardryx-proxy`, which waits up to 150 ms
+/// (the ordinary case behind a typed-signal proxy, which waits up to 150 ms
 /// for its model) arrived after the broker had given up, so the default
 /// failmode, open, let the denied call through. A tool call is not
 /// latency-critical the way a model call is, and 1000 ms clears the proxy's

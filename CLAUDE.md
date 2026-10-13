@@ -5008,16 +5008,15 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     **Until 2026-10-12 the unset case was a defect.** The tool path took the
     shared value whether or not anybody had set it, so a bare broker gave a
-    tool call the model path's 50 ms. `typryx wardryx-proxy`, which an operator
-    places in front of wardryx for the broker to add a typed risk signal, waits
-    up to `TYPRYX_PROXY_ASK_TIMEOUT_MS` (150 ms by default) for its model
-    before forwarding, so a PDP answer that took 50 to 150 ms, the proxy's
+    tool call the model path's 50 ms. A typed-signal proxy, which an operator
+    may place in front of wardryx so the broker adds a typed risk signal, waits
+    up to 150 ms by default for its model before forwarding, so a PDP answer that took 50 to 150 ms, the proxy's
     normal case, arrived after the broker had given up: the default failmode,
     open, synthesised an allow and the call was forwarded even when wardryx
     answered `deny`, a `deny_tool` rule included. The launchers set larger
     values (the gateway 250 ms; the broker 7000 ms with the proxy at 3000 ms),
     so it hit a component run with its defaults (the 150 ms read 2026-10-12
-    from typryx's `cmd/typryx/wardryxproxy.go`, the launcher values from
+    from that proxy's own source, the launcher values from
     stack-single's `compose.yaml` and stack-k8s's `typed/mode.sh`).
     `@decided 2026-10-11`:
     fail-open stays the component default, and destructive tools are handled
@@ -5033,8 +5032,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `tools/call` up to 1000 ms before the failmode decides, where it held it
     50 ms; an operator who sets the shared value below the proxy's wait still
     gets the old outcome, as a choice they made; and 1000 ms was measured
-    against a stub that denies in 120 ms, not against a live typryx proxy in
-    front of a live wardryx.
+    against a stub that denies in 120 ms, not against a live typed-signal proxy
+    in front of a live wardryx.
     *(test: `tests/it/mcp_broker.rs::a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call`,
     the real `tokenfuse mcp-broker` binary with a cleared environment (no
     timeout variable, the default failmode) against a PDP that denies after
