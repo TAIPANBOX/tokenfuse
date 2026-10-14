@@ -3650,10 +3650,11 @@ mod tests {
         assert_eq!(state.cloud_budget("r-capped"), Some(Microusd(1000)));
         assert!(!state.is_killed("r-killed"));
         let log = log_text();
-        assert!(
-            !log.contains("WARN"),
-            "a retry's failure is not a warning: {log}"
-        );
+        // Only this module's own lines: other tests share the captured log.
+        let warned = log
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("tokenfuse_gateway::cloudsink"));
+        assert!(!warned, "a retry's failure is not a warning: {log}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3688,7 +3689,10 @@ mod tests {
         assert_eq!(state.take_run_seed("r-over"), Some(Microusd(456)));
         let log = log_text();
         assert!(log.contains("the control plane answered the seed"), "{log}");
-        assert!(!log.contains("WARN"), "retries are quiet: {log}");
+        let warned = log
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("tokenfuse_gateway::cloudsink"));
+        assert!(!warned, "retries are quiet: {log}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
