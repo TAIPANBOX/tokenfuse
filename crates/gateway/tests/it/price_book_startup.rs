@@ -342,7 +342,9 @@ async fn capture_cloud() -> (
 /// with the call, so a fleet view can see fallback-priced spend. The real
 /// binary, the real CloudSink, a capturing control plane: a listed model is
 /// pushed as `known`, an unlisted one as `fallback`.
-#[tokio::test]
+// Two workers: the stub control plane must answer the gateway's startup seed while this
+// test's own thread is blocked waiting for the listening line (invariant 103).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_basis_each_call_was_charged_at_reaches_the_cloud() {
     let (cloud, got) = capture_cloud().await;
     let addr = free_addr();

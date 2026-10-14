@@ -340,7 +340,9 @@ async fn wait_for_budget_polls(polls: &AtomicUsize, n: usize) {
 /// first-sight path never fired again, so every child call was refused 402
 /// naming the parent until the parent itself called. The restored parent must
 /// get its Cloud budget the same way a declared parent does.
-#[tokio::test]
+// Two workers: the stub control plane must answer the gateway's startup seed while this
+// test's own thread is blocked waiting for the listening line (invariant 103).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_parent_gets_its_cloud_budget_back_after_a_restart() {
     let dir = std::env::temp_dir().join(format!("tf-retained-cloud-parent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
