@@ -417,4 +417,121 @@ mod tests {
         let kinds: Vec<_> = f.iter().map(|x| x.kind).collect();
         assert_eq!(kinds, vec!["aws_access_key"]);
     }
+
+    // -- Invariant 110: IBANs, and digits inside a decimal are not a card ----
+
+    fn kinds(text: &str) -> Vec<&'static str> {
+        let mut k: Vec<&'static str> = scan_pii(text).iter().map(|f| f.kind).collect();
+        k.sort_unstable();
+        k
+    }
+
+    /// The forge prompt of 2026-10-14, verbatim: the IBAN is the standard
+    /// valid example (mod-97 holds) and was the one item the scan missed.
+    #[test]
+    fn the_forge_prompt_finds_the_iban_beside_the_card_and_the_email() {
+        let prompt = "Reply OK. My email is jane.doe@example.com, my card is 4111 1111 1111 1111 \
+                      and my IBAN is GB82WEST12345698765432.";
+        assert_eq!(kinds(prompt), vec!["pii_card", "pii_email", "pii_iban"]);
+        let iban = scan_pii(prompt)
+            .into_iter()
+            .find(|f| f.kind == "pii_iban")
+            .unwrap();
+        assert_eq!(&prompt[iban.start..iban.end], "GB82WEST12345698765432");
+    }
+
+    #[test]
+    fn an_iban_written_in_groups_is_one_finding() {
+        for text in [
+            "pay GB82 WEST 1234 5698 7654 32 today",
+            "DE89 3704 0044 0532 0130 00",
+            "DE89370400440532013000",
+            "FR1420041010050500013M02606",
+            "NO9386011117947",
+        ] {
+            let f = scan_pii(text);
+            assert_eq!(f.len(), 1, "{text}: {f:?}");
+            assert_eq!(f[0].kind, "pii_iban", "{text}");
+        }
+        let text = "pay GB82 WEST 1234 5698 7654 32 today";
+        let f = scan_pii(text);
+        assert_eq!(&text[f[0].start..f[0].end], "GB82 WEST 1234 5698 7654 32");
+    }
+
+    #[test]
+    fn a_wrong_checksum_length_or_country_is_not_an_iban() {
+        for text in [
+            "GB82WEST12345698765433",
+            "GB82WEST1234569876543",
+            "GB82WEST123456987654321",
+            "ZZ82WEST12345698765432",
+            "gb82west12345698765432",
+            "GB82WEST12345698765432X",
+        ] {
+            assert!(
+                !kinds(text).contains(&"pii_iban"),
+                "{text}: {:?}",
+                scan_pii(text)
+            );
+        }
+    }
+
+    #[test]
+    fn a_masked_iban_reads_as_its_kind() {
+        let text = "IBAN GB82WEST12345698765432 ok";
+        let out = redact(text, &scan_pii(text));
+        assert_eq!(out, "IBAN [REDACTED:pii_iban] ok");
+    }
+
+    /// Strings shaped like an IBAN (a registered country, its exact length,
+    /// random alphanumerics) pass mod-97 about once in 97; the checksum is
+    /// what keeps the kind honest. 200 seeds.
+    #[test]
+    fn iban_shaped_noise_is_rarely_an_iban() {
+        let mut seed: u64 = 0x1ba2_2026_1014;
+        let mut hits = 0;
+        for _ in 0..200 {
+            let mut s = String::from("GB");
+            for i in 0..20 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let pick = (seed % 36) as u8;
+                let c = if i < 2 || pick < 10 {
+                    (b'0' + pick % 10) as char
+                } else {
+                    (b'A' + pick - 10) as char
+                };
+                s.push(c);
+            }
+            if kinds(&s).contains(&"pii_iban") {
+                hits += 1;
+            }
+        }
+        assert!(hits <= 8, "{hits} of 200 random strings read as an IBAN");
+    }
+
+    /// GCP, 2026-10-14: a clean typed answer (`TOKENFUSE_MCP_DLP_PII=block`)
+    /// was refused as a card because a probability's 17-digit fraction passed
+    /// Luhn. This is the answer the broker relayed, verbatim; both fractions
+    /// of 0.41935483870967744 are Luhn-valid.
+    #[test]
+    fn a_probability_in_a_typed_answer_is_not_a_card() {
+        let answer = r#"{"answer_id":"232db9c18dbe9521e3e83ff63ed6b947","template":"eval.outcome_met","template_version":"2d3ecbdc88d71358c281ba2163f056bc56559beff4af6a4d937cd6a66f0f732d","type":"noul","answer":0.41935483870967744,"probabilities":{"false":0.5806451612903226,"true":0.41935483870967744},"backend":"stub","model":"stub-0","latency_ms":0,"held_back_fields":0}"#;
+        assert!(scan_pii(answer).is_empty(), "{:?}", scan_pii(answer));
+        assert!(scan_pii("x = -0.41935483870967744;").is_empty());
+        assert!(scan_pii("total 41935483870967744.5 units").is_empty());
+    }
+
+    #[test]
+    fn a_card_written_like_a_card_is_still_found() {
+        for text in [
+            "card 4111 1111 1111 1111.",
+            "card 4111-1111-1111-1111, thanks",
+            "card 4111111111111111.",
+            "(4111111111111111)",
+        ] {
+            assert_eq!(kinds(text), vec!["pii_card"], "{text}");
+        }
+    }
 }
