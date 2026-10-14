@@ -304,9 +304,9 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1922 passing** (core 407, dpop 21, delegation 60,
-gateway 1153, cloud 280, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 9
-with the refused client key on the bus (invariant 105: 5 in `gateway::refusedkeys`, 4 in
+`cargo test --all` runs **1924 passing** (core 407, dpop 21, delegation 60,
+gateway 1155, cloud 280, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 11
+with the refused client key on the bus (invariant 105: 6 in `gateway::refusedkeys`, 5 in
 `tests/it/refused_key_on_the_bus.rs`; 2026-10-14, counted from the diff and judged by CI's
 `scripts/stated-numbers.sh`). Cloud grew by 2
 with the control-plane page rendering run fields as text (invariant 102: 2 in

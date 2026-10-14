@@ -7022,8 +7022,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     whose `data.reason` is `missing_key` or `unknown_key`, words no real identity mismatch uses,
     with `key_fingerprint` (`refusedkeys::fingerprint`: `sha256:` and the first 16 hex digits of
     the SHA-256 of the presented value) for an unknown key, the claimed `agent_id`, and
-    `unreported_since_last`. Filed under the `x-fuse-agent-id` the call claimed; a call naming none
-    is skipped and counted by the exporter (invariant 6). `refusedkeys::RefusedKeys` limits it: a
+    `unreported_since_last`. Filed under the `x-fuse-agent-id` the call claimed; a call naming none,
+    which is what a key scan looks like, under `refusedkeys::UNIDENTIFIED_CALLER`,
+    `agent://unidentified.invalid/caller`: a trust domain under `.invalid` (RFC 2606) is no agent
+    anybody issued, so this names the absence rather than inventing a subject (invariant 6), and
+    agent-passport's registry is asked to reserve it. `refusedkeys::RefusedKeys` limits it: a
     source (fingerprint or `missing_key`, and the claimed agent) at most once a minute, the gateway
     at most sixty a minute, the remembered sources bounded at 4096. The caller's `401` is
     byte-for-byte what it was: the two causes stay indistinguishable to the caller.
@@ -7036,8 +7039,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     grouping, which this repository does not hold.
     *(tests: `tests/it/refused_key_on_the_bus.rs`: `a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason`,
     `the_same_key_tried_again_and_again_is_one_event`, `a_scan_of_many_keys_cannot_flood_the_bus`
-    (three red first in CI on the unchanged gateway, no event at all), and the control
-    `a_good_key_writes_no_refusal`; `refusedkeys::tests` (five: the fingerprint, the per-source
+    (three red first in CI on the unchanged gateway, no event at all),
+    `a_scan_that_names_no_agent_is_on_the_bus_too` (red first against the commit before the
+    reserved subject, the scan skipped), and the control
+    `a_good_key_writes_no_refusal`; `refusedkeys::tests` (six: the reserved subject, the fingerprint, the per-source
     minute, the global sixty, the bound, the data). Mutants as cases in `scripts/gates-have-teeth.sh`:
     the report never made, the per-source limit removed, the fingerprint replaced by the key.
     Scenarios: `features/a-refused-client-key-is-on-the-bus.feature`. Not a script gate)*

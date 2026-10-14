@@ -2633,9 +2633,9 @@ fn unauthorized(stats: &KeyStats) -> Response {
 /// Invariant 105: put a refusal for a missing or unknown client key on the
 /// bus, rate-limited per source (`crate::refusedkeys`). The operator's record
 /// learns which cause it was; the caller's `401` does not change. Filed under
-/// the agent the call claimed, as every other event of this gateway is; a call
-/// that names none is skipped and counted by the exporter, which never makes
-/// one up (invariant 6).
+/// the agent the call claimed, and a call that names none (a scan names none)
+/// under `refusedkeys::UNIDENTIFIED_CALLER`, a reserved subject that can be no
+/// real agent, never one made up to look like one (invariant 6).
 fn report_refused_key(st: &AppState, headers: &HeaderMap) {
     let presented = header_str(headers, crate::clientkeys::CLIENT_KEY_HEADER)
         .map(|k| k.trim().to_string())
@@ -2653,10 +2653,15 @@ fn report_refused_key(st: &AppState, headers: &HeaderMap) {
         return;
     };
     let run_id = header_str(headers, "x-fuse-run-id");
+    let subject = if claimed_agent.is_empty() {
+        crate::refusedkeys::UNIDENTIFIED_CALLER
+    } else {
+        claimed_agent.as_str()
+    };
     let outcome = st.events.emit(
         EventType::IdentityMismatch,
         now_millis(),
-        Some(&claimed_agent),
+        Some(subject),
         run_id.as_deref(),
         None,
         crate::refusedkeys::refused_key_data(

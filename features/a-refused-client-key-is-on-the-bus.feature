@@ -38,3 +38,9 @@ Feature: A call refused for its client key is on the bus
   Scenario: A good key writes no refusal
     Given a call with a key the gateway knows
     Then no refusal is on the bus
+
+  # @test:a_scan_that_names_no_agent_is_on_the_bus_too
+  Scenario: A scan that names no agent is on the bus too
+    Given calls that present unknown keys or none and name no agent
+    Then each is on the bus under the reserved subject for an unidentified caller
+    And the event says no agent was claimed

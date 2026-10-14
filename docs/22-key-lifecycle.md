@@ -159,8 +159,8 @@ vocabulary the console is expected to use, from the fields above:
   unknown key as `sha256:` plus 16 hex digits of its SHA-256 and never the key,
   rate-limited to one event per key and claimed agent a minute and sixty a
   minute per gateway, with `unreported_since_last` counting what the limit held
-  back. A call that names no `x-fuse-agent-id` has no subject for the envelope,
-  so its refusal is skipped and counted by the exporter, not invented one.
+  back. A call that names no `x-fuse-agent-id` is filed under the reserved
+  `agent://unidentified.invalid/caller`, a subject no real agent can have.
 - `truncated_settlements_since_startup` counts settlements
   (`crates/gateway/src/settle.rs`, `crate::proxy::buffered_managed`) that fell
   back to the pre-flight estimate because the usage-parser cap

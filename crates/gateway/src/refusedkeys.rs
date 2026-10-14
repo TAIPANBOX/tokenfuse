@@ -8,6 +8,10 @@
 //! with a `reason` no real identity mismatch uses (`missing_key`,
 //! `unknown_key`) and, for an unknown key, a fingerprint of what was presented.
 //!
+//! A call that names no `x-fuse-agent-id` (a key scan names none) is filed
+//! under [`UNIDENTIFIED_CALLER`], so the case that matters most is not the
+//! one the bus cannot see.
+//!
 //! The caller's answer does not change: both causes stay one `401` with one
 //! body, because telling a caller which half it got wrong tells an attacker
 //! whether a secret exists (`clientkeys`). Only the operator's record learns
@@ -30,6 +34,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
+
+/// The subject a refusal is filed under when the call named no agent: a
+/// key scan names none, and an event must name an agent (SPEC 6.1). The
+/// trust domain is under `.invalid` (RFC 2606), so it can never be an agent
+/// anybody issued; the agent-passport registry is asked to reserve it.
+pub const UNIDENTIFIED_CALLER: &str = "agent://unidentified.invalid/caller";
 
 /// One source is reported at most once in this interval.
 pub const PER_SOURCE_INTERVAL_MILLIS: i64 = 60_000;
@@ -155,6 +165,14 @@ mod tests {
             let _ = r.admit(&format!("k{i}"), i as i64 * 60_000);
         }
         assert!(r.window.lock().unwrap().sources.len() <= SOURCES_CAP);
+    }
+
+    #[test]
+    fn the_unidentified_subject_is_a_valid_agent_id_no_one_can_hold() {
+        assert!(tokenfuse_core::agent_event::is_canonical_agent_id(
+            UNIDENTIFIED_CALLER
+        ));
+        assert!(UNIDENTIFIED_CALLER.starts_with("agent://unidentified.invalid/"));
     }
 
     #[test]
