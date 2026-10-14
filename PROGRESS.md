@@ -304,8 +304,10 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1913 passing** (core 407, dpop 21, delegation 60,
-gateway 1144, cloud 280, umbrella 1, by `cargo test -p <crate>`). Cloud grew by 2
+`cargo test --all` runs **1915 passing** (core 407, dpop 21, delegation 60,
+gateway 1146, cloud 280, umbrella 1, by `cargo test -p <crate>`). Gateway grew by
+2 with spend reports that survive a stop (invariant 112: 2 in
+`tests/it/spend_reports_survive_a_stop.rs`, 2026-10-14). Cloud grew by 2
 with the control-plane page rendering run fields as text (invariant 102: 2 in
 `tests/it/dashboard_page.rs`, 2026-10-14). Gateway grew by 3
 with the 12 KiB argument cap (invariant 100: one unit and two integration tests,

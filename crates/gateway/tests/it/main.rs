@@ -50,6 +50,7 @@ mod run_budget_ceiling_startup;
 mod security_switches_startup;
 mod send_failure_retention;
 mod shadow_tool_pruning;
+mod spend_reports_survive_a_stop;
 mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
 mod version_and_help;
