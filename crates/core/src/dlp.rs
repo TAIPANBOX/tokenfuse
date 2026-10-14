@@ -252,6 +252,22 @@ pub fn pii_summary(findings: &[Finding]) -> String {
     format_summary(findings, "pii finding(s)")
 }
 
+/// Each kind found and how often, `kind=count` joined by `,` and sorted by
+/// kind: `pii_card=1,pii_email=2`. Kinds and counts only, never a matched
+/// span, so it can go into a trace column and onto the Cloud wire (invariant
+/// 106). Empty for no findings.
+pub fn kind_counts(findings: &[Finding]) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in findings {
+        *counts.entry(f.kind).or_insert(0) += 1;
+    }
+    counts
+        .iter()
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Shared by `summary`/`pii_summary` so the two label formats cannot drift
 /// apart. `noun` supplies only the trailing label ("secret(s)" vs
 /// "pii finding(s)"); the count and the sorted, de-duplicated kind list are
@@ -266,6 +282,16 @@ fn format_summary(findings: &[Finding], noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind_counts_name_each_kind_and_how_often_never_the_text() {
+        let text = "mail a@example.com and b@example.com, card 4111 1111 1111 1111";
+        let found = scan_pii(text);
+        let counts = kind_counts(&found);
+        assert_eq!(counts, "pii_card=1,pii_email=2");
+        assert!(!counts.contains("example.com") && !counts.contains("4111"));
+        assert_eq!(kind_counts(&[]), "");
+    }
 
     #[test]
     fn detects_common_key_shapes() {

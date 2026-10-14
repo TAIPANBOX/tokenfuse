@@ -1313,6 +1313,25 @@ run_case "refused-key: the fingerprint carries the key" fail \
 	"$(py 'edit("crates/gateway/src/refusedkeys.rs", "    format!(\"sha256:{hex}\")", "    format!(\"sha256:{hex}{presented}\")")')" \
 	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
 
+# --- invariant 106: PII found and let through is on the record ----------------
+#
+# Not a scripts/*.sh gate: held by cargo test, the gateway through its router
+# and the Cloud through its HTTP reads.
+run_case "pii-recorded: shadow never sets the counts" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact pii_found_is_recorded::shadow_records_the_kinds_it_found_and_never_the_text" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "pii_counts = Some(dlp::kind_counts(&pii_findings));", "pii_counts = Some(dlp::kind_counts(&pii_findings)).filter(|_| false);")')" \
+	"shadow_records_the_kinds_it_found_and_never_the_text ... FAILED"
+
+run_case "pii-recorded: the Cloud counts a refused record" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact pii_found::a_findings_string_without_the_scanners_shape_is_not_counted" \
+	"$(py 'edit("crates/cloud/src/store.rs", "// an admitted call only, read through its own shape.\n                    if matches!(", "// an admitted call only, read through its own shape.\n                    if true || matches!(")')" \
+	"a_findings_string_without_the_scanners_shape_is_not_counted ... FAILED"
+
+run_case "pii-recorded: the Cloud reads any string as a kind" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact pii_found::a_findings_string_without_the_scanners_shape_is_not_counted" \
+	"$(py 'edit("crates/cloud/src/store.rs", "        let shaped = !suffix.is_empty()", "        let shaped = true || !suffix.is_empty()")')" \
+	"a_findings_string_without_the_scanners_shape_is_not_counted ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

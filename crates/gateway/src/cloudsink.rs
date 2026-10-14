@@ -1670,6 +1670,7 @@ mod tests {
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
             identity_reason: None,
+            pii_findings: None,
         }
     }
 

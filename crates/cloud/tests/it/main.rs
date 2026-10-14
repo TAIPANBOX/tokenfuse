@@ -24,6 +24,7 @@ mod mutations;
 mod oidc;
 mod openapi;
 mod pairing;
+mod pii_found;
 mod reads;
 mod replay;
 mod run_spend;

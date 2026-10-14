@@ -304,15 +304,17 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1956 passing** (core 407, dpop 21, delegation 60,
-gateway 1187, cloud 280, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 13
+`cargo test --all` runs **1963 passing** (core 408, dpop 21, delegation 60,
+gateway 1190, cloud 283, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 13
 with the seed gate (invariant 103: 4 in `gateway::seedgate`, 5 in `gateway::cloudsink`,
 1 in `gateway::unitledger`, 3 in `tests/it/seed_before_admit.rs`), by 19 with the streamed
 tool-call judgement (invariant 104: 11 in `gateway::streamgate`, 8 in
-`tests/it/streamed_tool_calls_are_judged.rs`) and by 11 with the refused client key on the bus
-(invariant 105: 6 in `gateway::refusedkeys`, 5 in `tests/it/refused_key_on_the_bus.rs`); 2026-10-14,
-counted from the diff and judged by CI's `scripts/stated-numbers.sh`, which measures the merged
-tree. Cloud grew by 2
+`tests/it/streamed_tool_calls_are_judged.rs`), by 11 with the refused client key on the bus
+(invariant 105: 6 in `gateway::refusedkeys`, 5 in `tests/it/refused_key_on_the_bus.rs`), and PII
+found and let through on the trace and in the fleet view (invariant 106) added 1 to core, 3 to
+gateway and 3 to cloud (1 in `core::dlp`, 3 in `tests/it/pii_found_is_recorded.rs`, 1 in
+`cloud::store`, 2 in the Cloud's `tests/it/pii_found.rs`); 2026-10-14, counted from the diff and
+judged by CI's `scripts/stated-numbers.sh`, which measures the merged tree. Cloud grew by 2
 with the control-plane page rendering run fields as text (invariant 102: 2 in
 `tests/it/dashboard_page.rs`, 2026-10-14). Gateway grew by 3
 with the 12 KiB argument cap (invariant 100: one unit and two integration tests,
