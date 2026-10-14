@@ -1,6 +1,6 @@
 [package]
 name = "tokenfuse"
-version = "1.13.1"
+version = "1.13.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
