@@ -2179,6 +2179,7 @@ async fn handle_call(
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
+                pii_findings: pii_counts.clone(),
             },
             unit.clone(),
         )
@@ -7254,6 +7255,7 @@ pub(crate) mod tests {
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
+                pii_findings: None,
             },
             String::new(),
         );
