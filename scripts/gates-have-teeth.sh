@@ -1230,6 +1230,12 @@ for p in paths:
     os.remove(p)')" \
 	"measured nothing"
 
+# --- invariant 108: a brokered tool_call names its run --------------------------
+run_case "broker-run-id: the record names no run" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_brokered_tool_call_record_carries_the_callers_run_id" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    ctx.run_id.as_deref().filter(|r| !r.is_empty())", "    ctx.run_id.as_deref().filter(|r| !r.is_empty() && false)")')" \
+	"a_brokered_tool_call_record_carries_the_callers_run_id ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
