@@ -2031,7 +2031,7 @@ impl Store {
                     // untrusted here and must not credit either dimension.
                     // Without this, any principal could POST
                     // `{"decision":"anything","saved_microusd":huge}` and
-                    // inflate "Saved this month" for free.
+                    // inflate the all-time "Saved" headline for free.
                     match r.decision.as_str() {
                         "cache_hit" => {
                             sav.cache_saved_microusd =
