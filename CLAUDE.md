@@ -7285,3 +7285,31 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     columns. Mutants as cases in `scripts/gates-have-teeth.sh`: the basis never set on the
     attribution, the export reading the PII column into the basis. Scenarios:
     `features/the-focus-export-names-basis-and-pii.feature`. Not a script gate)*
+
+110. **The PII scan finds an IBAN, and the digits of a decimal number are not a card.** Two
+    measurements of 2026-10-14: on forge the prompt "... my card is 4111 1111 1111 1111 and my IBAN
+    is GB82WEST12345698765432." gave two kinds where three were written (the IBAN was the
+    documented scope limit of `docs/13`); on GCP the MCP broker in `TOKENFUSE_MCP_DLP_PII=block`
+    refused a clean typed answer because a probability's 17-digit fraction, `0.41935483870967744`,
+    passed Luhn. `@decided 2026-10-14`: add the IBAN kind and fix the card detector, keeping real
+    cards written with spaces or dashes.
+
+    `tokenfuse_core::dlp::scan_ibans` adds `pii_iban`: a start of two capital letters and two
+    digits at a word boundary, the country's length from `IBAN_LENGTHS` (the 89 countries of the
+    ISO 13616 registry, read 2026-10-14), that many capitals and digits with a single space allowed
+    between any two, no word character after them, and ISO 7064 mod 97-10 equal to 1; upper case
+    only. IBANs are found before the regex kinds, so an IBAN wins the de-overlap against a card
+    candidate inside its own digits. `part_of_a_decimal` drops a card candidate that follows a `.`
+    no letter precedes (a fraction; `no.4111...` still reads as a card) or that is followed by `.`
+    and a digit (an integer part); an exponent never matched, since the candidate's `\b` refuses a
+    run that continues into `e`. Not covered: a lower-case or a non-registry IBAN; an IBAN split
+    other than by single spaces; a card number written as the fraction of a decimal is now missed
+    on purpose.
+    *(tests: `core::dlp::tests` (seven, all red or guarding on the unchanged scanner):
+    `the_forge_prompt_finds_the_iban_beside_the_card_and_the_email` (red: two kinds),
+    `an_iban_written_in_groups_is_one_finding` (red), `a_masked_iban_reads_as_its_kind` (red),
+    `a_probability_in_a_typed_answer_is_not_a_card` (red: two cards in the GCP answer, verbatim),
+    and the guards `a_wrong_checksum_length_or_country_is_not_an_iban`,
+    `iban_shaped_noise_is_rarely_an_iban` (200 seeds), `a_card_written_like_a_card_is_still_found`.
+    Mutants as cases in `scripts/gates-have-teeth.sh`: the checksum skipped, the decimal rule
+    removed. Scenarios: `features/the-pii-scan-finds-an-iban.feature`. Not a script gate)*

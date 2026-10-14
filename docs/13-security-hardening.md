@@ -71,11 +71,21 @@ accept the same four values as their `_DLP` counterpart: `off` (default),
 `shadow` (flag, forward unchanged), `mask` (replace with
 `[REDACTED:pii_kind]`), `block` (refuse the call/response).
 
-Three kinds, all regex-based:
+Four kinds, all pattern-based:
 
 - **`pii_email`**: a standard email-address shape.
 - **`pii_card`**: a 13 to 19 digit run that also passes the Luhn checksum
-  and is not all the same digit (a common false-positive shape).
+  and is not all the same digit (a common false-positive shape). A run that is
+  part of a decimal number is not a candidate: a fraction after a `.`
+  (`0.41935483870967744`, a typed answer's probability that passes Luhn, which
+  had the MCP broker in `block` refuse a clean answer on 2026-10-14) or an
+  integer part before `.` and a digit; an exponent never matched in the first
+  place. Since invariant 110.
+- **`pii_iban`**: an IBAN in upper case, compact or in groups of four
+  (`GB82 WEST 1234 5698 7654 32`): a country of the ISO 13616 registry (89 of
+  them), exactly that country's length, and the mod-97 checksum, which is what
+  keeps a random alphanumeric run from being called one. Since invariant 110;
+  before it the forge prompt's `GB82WEST12345698765432` was a documented miss.
 - **`pii_phone`**: international form only (a leading `+`); a bare national
   number never matches.
 

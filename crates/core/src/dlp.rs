@@ -9,10 +9,13 @@
 //! masking is a plain substring replacement that keeps the JSON valid.
 //!
 //! PII masks (`scan_pii`/`pii_summary`) are a separate, opt-in extension of
-//! this same scanner. Regex-only, like everything else here: no ML, no
+//! this same scanner. Pattern-based, like everything else here: no ML, no
 //! external call. Card numbers are Luhn-gated (a checksum plus a
 //! same-digit-run rejection) to keep the false-positive rate down on a plain
-//! 13 to 19 digit run; phone numbers only match the international `+` form,
+//! 13 to 19 digit run, and a run that is part of a decimal number (`0.4193...`,
+//! `4193....5`) is not a candidate at all (invariant 110); IBANs are checked
+//! against the ISO 13616 registry's country lengths and the mod-97 checksum
+//! (invariant 110); phone numbers only match the international `+` form,
 //! never a bare national number, since a bare digit string is too easy to
 //! confuse with an id, an amount, or a card number. False negatives are
 //! expected and accepted by design, the same way a missed secret pattern is.
@@ -107,8 +110,10 @@ pub fn scan(text: &str) -> Vec<Finding> {
     dedup_overlaps(found)
 }
 
-/// The three PII kinds this module detects, deliberately narrow: an email
+/// The regex PII kinds this module detects, deliberately narrow: an email
 /// address, a card-number candidate, and an international (`+`) phone number.
+/// The fourth kind, `pii_iban`, is found by [`scan_ibans`], since its length
+/// depends on its country.
 /// The card entry's regex only finds *candidates*; `scan_pii` still has to
 /// run the Luhn check (a regex alone can't compute a checksum).
 fn pii_patterns() -> &'static [(&'static str, Regex)] {
@@ -151,10 +156,15 @@ fn pii_patterns() -> &'static [(&'static str, Regex)] {
 /// PII mode; `scan` never calls it and its own findings are unaffected by
 /// whatever PII-shaped text sits alongside a secret in the same request.
 pub fn scan_pii(text: &str) -> Vec<Finding> {
-    let mut found = Vec::new();
+    // IBANs first, so an IBAN wins the de-overlap against a card candidate
+    // inside its own digits (leftmost, then longer, then earlier).
+    let mut found = scan_ibans(text);
     for (kind, re) in pii_patterns() {
         for m in re.find_iter(text) {
             if *kind == "pii_card" {
+                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) {
+                    continue;
+                }
                 let digits: String = m.as_str().chars().filter(char::is_ascii_digit).collect();
                 if all_same_digit(&digits) || !luhn_valid(&digits) {
                     continue;
@@ -168,6 +178,191 @@ pub fn scan_pii(text: &str) -> Vec<Finding> {
         }
     }
     dedup_overlaps(found)
+}
+
+/// Invariant 110: whether the digit run at `start..end` is part of a decimal
+/// number rather than a number of its own. A fraction (`0.41935483870967744`,
+/// `-0.4193...`, `.4193...`) follows a `.` that no letter precedes (`no.4111...`
+/// still reads as a card); an integer part (`41935483870967744.5`) is followed
+/// by `.` and a digit. An exponent needs nothing here: the candidate pattern's
+/// `\b` already refuses a run that runs on into `e` or `E`. Measured on GCP,
+/// 2026-10-14: a typed answer's probability, `0.41935483870967744`, passes
+/// Luhn, and the broker in PII block mode refused a clean answer as a card.
+fn part_of_a_decimal(text: &[u8], start: usize, end: usize) -> bool {
+    let fraction = start >= 1
+        && text[start - 1] == b'.'
+        && (start < 2 || !text[start - 2].is_ascii_alphabetic());
+    let integer_part =
+        text.get(end) == Some(&b'.') && text.get(end + 1).is_some_and(|b| b.is_ascii_digit());
+    fraction || integer_part
+}
+
+/// The ISO 13616 IBAN registry: each country code and its IBAN's exact
+/// length. The 89 countries of the registry as Wikipedia's IBAN article lists
+/// them, read 2026-10-14; the "aspirational" codes outside the registry are
+/// left out on purpose, since a bank there issues no IBAN yet.
+const IBAN_LENGTHS: &[(&str, usize)] = &[
+    ("AD", 24),
+    ("AE", 23),
+    ("AL", 28),
+    ("AT", 20),
+    ("AZ", 28),
+    ("BA", 20),
+    ("BE", 16),
+    ("BG", 22),
+    ("BH", 22),
+    ("BI", 27),
+    ("BR", 29),
+    ("BY", 28),
+    ("CH", 21),
+    ("CR", 22),
+    ("CY", 28),
+    ("CZ", 24),
+    ("DE", 22),
+    ("DJ", 27),
+    ("DK", 18),
+    ("DO", 28),
+    ("EE", 20),
+    ("EG", 29),
+    ("ES", 24),
+    ("FI", 18),
+    ("FK", 18),
+    ("FO", 18),
+    ("FR", 27),
+    ("GB", 22),
+    ("GE", 22),
+    ("GI", 23),
+    ("GL", 18),
+    ("GR", 27),
+    ("GT", 28),
+    ("HN", 28),
+    ("HR", 21),
+    ("HU", 28),
+    ("IE", 22),
+    ("IL", 23),
+    ("IQ", 23),
+    ("IS", 26),
+    ("IT", 27),
+    ("JO", 30),
+    ("KW", 30),
+    ("KZ", 20),
+    ("LB", 28),
+    ("LC", 32),
+    ("LI", 21),
+    ("LT", 20),
+    ("LU", 20),
+    ("LV", 21),
+    ("LY", 25),
+    ("MC", 27),
+    ("MD", 24),
+    ("ME", 22),
+    ("MK", 19),
+    ("MN", 20),
+    ("MR", 27),
+    ("MT", 31),
+    ("MU", 30),
+    ("NI", 28),
+    ("NL", 18),
+    ("NO", 15),
+    ("OM", 23),
+    ("PK", 24),
+    ("PL", 28),
+    ("PS", 29),
+    ("PT", 25),
+    ("QA", 29),
+    ("RO", 24),
+    ("RS", 22),
+    ("RU", 33),
+    ("SA", 24),
+    ("SC", 31),
+    ("SD", 18),
+    ("SE", 24),
+    ("SI", 19),
+    ("SK", 24),
+    ("SM", 27),
+    ("SO", 23),
+    ("ST", 25),
+    ("SV", 28),
+    ("TL", 23),
+    ("TN", 24),
+    ("TR", 26),
+    ("UA", 29),
+    ("VA", 22),
+    ("VG", 24),
+    ("XK", 20),
+    ("YE", 30),
+];
+
+/// Invariant 110: IBANs in `text`, compact (`GB82WEST12345698765432`) or in
+/// groups of four (`GB82 WEST 1234 ...`), upper case only. A candidate starts
+/// with two capital letters and two digits at a word boundary; its country
+/// fixes its length; that many letters and digits are read, a single space
+/// allowed between any two; the next character must not continue the word;
+/// and the ISO 7064 mod-97 check over the rearranged string must give 1.
+/// Like the Luhn gate on a card, the checksum is what keeps a random
+/// alphanumeric run from being called an IBAN.
+fn scan_ibans(text: &str) -> Vec<Finding> {
+    static START: OnceLock<Regex> = OnceLock::new();
+    let start = START.get_or_init(|| Regex::new(r"\b[A-Z]{2}[0-9]{2}").unwrap());
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    for m in start.find_iter(text) {
+        let s = m.start();
+        let Some(&(_, len)) = IBAN_LENGTHS
+            .iter()
+            .find(|(c, _)| text.get(s..s + 2) == Some(*c))
+        else {
+            continue;
+        };
+        let mut compact = String::with_capacity(len);
+        let mut i = s;
+        while compact.len() < len && i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_uppercase() || b.is_ascii_digit() {
+                compact.push(b as char);
+                i += 1;
+            } else if b == b' '
+                && !compact.is_empty()
+                && bytes
+                    .get(i + 1)
+                    .is_some_and(|n| n.is_ascii_uppercase() || n.is_ascii_digit())
+            {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if compact.len() < len || bytes.get(i).is_some_and(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if iban_checksum_holds(&compact) {
+            out.push(Finding {
+                kind: "pii_iban",
+                start: s,
+                end: i,
+            });
+        }
+    }
+    out
+}
+
+/// ISO 7064 mod 97-10 as IBANs use it: move the first four characters to the
+/// end, read each letter as two digits (A = 10 ... Z = 35), and the number
+/// modulo 97 must be 1. Computed piecewise, so no length overflows.
+fn iban_checksum_holds(compact: &str) -> bool {
+    let rearranged = compact[4..].chars().chain(compact[..4].chars());
+    let mut rem: u32 = 0;
+    for c in rearranged {
+        let Some(v) = c.to_digit(36) else {
+            return false;
+        };
+        rem = if v < 10 {
+            (rem * 10 + v) % 97
+        } else {
+            (rem * 100 + v) % 97
+        };
+    }
+    rem == 1
 }
 
 /// Standard mod-10 Luhn checksum over an ASCII-digit string: pure arithmetic,

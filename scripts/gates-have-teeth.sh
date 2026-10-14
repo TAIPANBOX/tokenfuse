@@ -1360,6 +1360,17 @@ run_case "focus-basis-pii: the export reads the PII column as the basis" fail \
 	"$(py 'edit("crates/gateway/src/focusexport.rs", "price_basis: str_at(b.column(14).as_ref(), i),", "price_basis: str_at(b.column(15).as_ref(), i),")')" \
 	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
 
+# --- invariant 110: IBANs, and decimals are not cards -------------------------
+run_case "pii-iban: the checksum skipped" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact dlp::tests::a_wrong_checksum_length_or_country_is_not_an_iban" \
+	"$(py 'edit("crates/core/src/dlp.rs", "        if iban_checksum_holds(&compact) {", "        if iban_checksum_holds(&compact) || !compact.is_empty() {")')" \
+	"a_wrong_checksum_length_or_country_is_not_an_iban ... FAILED"
+
+run_case "pii-card: the decimal rule removed" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact dlp::tests::a_probability_in_a_typed_answer_is_not_a_card" \
+	"$(py 'edit("crates/core/src/dlp.rs", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) {", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) && false {")')" \
+	"a_probability_in_a_typed_answer_is_not_a_card ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
