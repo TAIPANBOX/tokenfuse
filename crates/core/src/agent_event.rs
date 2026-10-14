@@ -422,6 +422,12 @@ pub enum Dependency {
     Provider,
     /// The policy decision point (wardryx).
     PolicyPlane,
+    /// The TokenFuse Cloud control plane, which holds the money state a
+    /// restarted gateway seeds from (a run's spend, a unit's month, the
+    /// Cloud-set budgets and kills). Named on the bus only for the startup
+    /// seed (stage [`DependencyStage::Seed`]): telemetry that cannot reach it
+    /// is queued, not refused (invariant 53).
+    ControlPlane,
 }
 
 impl Dependency {
@@ -429,6 +435,7 @@ impl Dependency {
         match self {
             Dependency::Provider => "provider",
             Dependency::PolicyPlane => "policy_plane",
+            Dependency::ControlPlane => "control_plane",
         }
     }
 }
@@ -453,6 +460,12 @@ pub enum DependencyStage {
     /// refused, a 5xx), which `data.detail` names. Not [`Self::Response`]:
     /// that stage is a PROVIDER's refusal and is rendered as one downstream.
     Decide,
+    /// The control plane has not yet answered the seed a restarted gateway
+    /// reads before it admits money it cannot check: the run spend, the unit
+    /// month, the Cloud budgets and kills (invariant 103). A call a budget
+    /// governs is refused (`effect` `denied_unasked`) or, in shadow and warn,
+    /// forwarded and marked (`allowed_ungoverned`) until the seed lands.
+    Seed,
 }
 
 impl DependencyStage {
@@ -463,6 +476,7 @@ impl DependencyStage {
             DependencyStage::ResponseBody => "response_body",
             DependencyStage::Response => "response",
             DependencyStage::Decide => "decide",
+            DependencyStage::Seed => "seed",
         }
     }
 }

@@ -1203,6 +1203,11 @@ async fn serve() {
     // TokenFuse Cloud: push telemetry to a control plane for a cross-fleet view,
     // and pull operator kills back down. TOKENFUSE_CLOUD_URL is the control
     // plane base URL; TOKENFUSE_CLOUD_KEY is the org key.
+    //
+    // Set when the startup seed did not complete: the retry is started after
+    // the retained-reservation replay, so it can credit the runs that replay
+    // recreates (invariant 103).
+    let mut seed_retry: Option<(String, String, tokenfuse_gateway::cloudsink::SeedParts)> = None;
     if let (Ok(base), Ok(key)) = (
         std::env::var("TOKENFUSE_CLOUD_URL"),
         std::env::var("TOKENFUSE_CLOUD_KEY"),
@@ -1229,39 +1234,43 @@ async fn serve() {
                     stb.set_cloud_budgets(budgets);
                 },
             );
-            // Invariant 70: stage this org's Cloud-known per-run spend so a
-            // run this gateway opens fresh (its first admission since this
-            // process started) is checked against that spend plus whatever
-            // is settled from here on, instead of silently starting at
-            // zero. Synchronously and before the listener binds, the same
-            // posture invariant 52 already takes for the unit seed below;
-            // unlike that one, this is not gated on the identity map, since
-            // every gateway enforces per-run budgets, with or without one.
-            let _ = tokenfuse_gateway::cloudsink::seed_run_ledger(
+            // Invariants 70, 52 and 103: read the control plane's money state
+            // before the first call is admitted: each run's spend so far
+            // (staged for that run's first open here), the Cloud run budgets
+            // and kills, and, with an identity map loaded, each unit's month
+            // and the Cloud unit caps. Synchronously and before the listener
+            // binds, each read bounded by SEED_TIMEOUT. A control plane that
+            // cannot be asked never stops the gateway from starting; it
+            // closes the seed gate instead, and a call a budget governs waits
+            // (503 in enforce) until the retry below reads what is missing.
+            let mut seed_parts =
+                tokenfuse_gateway::cloudsink::SeedParts::new(state.identity.enabled());
+            if let Err(e) = tokenfuse_gateway::cloudsink::seed_control_plane(
                 &base,
                 &key,
                 &state,
+                &mut seed_parts,
                 tokenfuse_gateway::sink::now_millis(),
+                true,
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    reason = %e,
+                    missing = %seed_parts.missing().join(","),
+                    "the control plane did not answer the seed at startup: calls a budget governs \
+                     are refused (503 seed_pending) in enforce, and marked in shadow and warn, \
+                     until it does; asking again in the background"
+                );
+                state = state.with_seed_gate(Arc::new(
+                    tokenfuse_gateway::seedgate::SeedGate::closed(e.to_string()),
+                ));
+                seed_retry = Some((base.clone(), key.clone(), seed_parts));
+            }
             // Pull centrally-managed per-unit monthly caps (docs/20). Only
             // when the identity map is on: an unconfigured gateway has no
             // units to apply them to, so it does not poll the endpoint.
             if state.identity.enabled() {
-                // #293 (invariant 52): start each unit's month where the
-                // control plane left it, synchronously and before the
-                // listener binds, so the first admitted call already sees
-                // the month. Bounded by SEED_TIMEOUT; never refuses to
-                // start; one line either way. Gated like the poller below:
-                // a gateway with no identity map resolves no unit and has
-                // nothing to seed.
-                let _ = tokenfuse_gateway::cloudsink::seed_unit_ledger(
-                    &base,
-                    &key,
-                    &units,
-                    tokenfuse_gateway::sink::now_millis(),
-                )
-                .await;
                 let stu = units.clone();
                 tokenfuse_gateway::cloudsink::spawn_unit_budget_poller(
                     base.clone(),
@@ -1379,6 +1388,12 @@ async fn serve() {
         _ => tracing::info!(
             "retained-reservation journal off: TOKENFUSE_DATA_DIR is not set, so a retained reservation lives only in this process"
         ),
+    }
+
+    // Invariant 103: after the replay, so a late seed is credited to the runs it recreated, and
+    // before the listener binds, so the state the retry opens is the state that serves.
+    if let Some((base, key, parts)) = seed_retry {
+        tokenfuse_gateway::cloudsink::spawn_seed_retry(base, key, state.clone(), parts);
     }
 
     let listener = tokio::net::TcpListener::bind(&addr)

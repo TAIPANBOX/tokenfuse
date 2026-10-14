@@ -539,13 +539,19 @@ pub async fn replay_at_startup(
     // the proxy gives it that budget on a child's call, as it does for an unopened parent.
     state.note_restored_unbudgeted(runs.runs_created.iter().map(|(run, _)| run.clone()));
     let mut seeded = 0;
+    let mut unseeded = Vec::new();
     for (run, generation) in &runs.runs_created {
         if let Some(seed) = state.take_run_seed(run) {
             if state.ledger.seed_spend(run, seed, *generation).await {
                 seeded += 1;
             }
+        } else if !state.seed.is_open() {
+            unseeded.push((run.clone(), *generation));
         }
     }
+    // Invariant 103: the control plane has not answered the seed yet, so these runs had none to
+    // take; the retry that opens the gate credits them before it does.
+    state.note_replayed_unseeded(unseeded);
     let skipped =
         report.read.malformed + report.read.oversized + runs.invalid + report.units_refused;
     let line = format!(

@@ -267,7 +267,7 @@ async fn a_retained_reservation_survives_a_gateway_restart() {
 /// `/v1/budgets`, knows no run's spend (`/v1/runs` is an empty list), and
 /// answers 404 to everything else (the ingest then fails on its own, which
 /// nothing here depends on). The run list is served because a gateway that
-/// cannot read run spend admits nothing a budget governs (invariant 102).
+/// cannot read run spend admits nothing a budget governs (invariant 103).
 /// Returns its base URL and a counter of budget polls, so a test can wait
 /// until the gateway has the budget instead of sleeping on a guess.
 async fn cloud_with_parent_budget(parent_budget_micros: i64) -> (String, Arc<AtomicUsize>) {

@@ -1,4 +1,4 @@
-//! Invariant 102: a gateway that starts before its control plane admits
+//! Invariant 103: a gateway that starts before its control plane admits
 //! nothing a budget governs until it has read the control plane's money state.
 //!
 //! Measured on forge 2026-10-14 (`systemctl restart docker`): the gateway
@@ -175,7 +175,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs() {
     let dir = scratch("enforce");
     let events = dir.join("events.ndjson");
@@ -274,7 +274,7 @@ async fn a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shadow_forwards_while_the_seed_is_missing_and_says_so() {
     let dir = scratch("shadow");
     let events = dir.join("events.ndjson");
@@ -313,7 +313,7 @@ async fn shadow_forwards_while_the_seed_is_missing_and_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_control_plane_that_answers_at_startup_opens_the_gate_before_the_first_call() {
     let dir = scratch("up");
     let events = dir.join("events.ndjson");

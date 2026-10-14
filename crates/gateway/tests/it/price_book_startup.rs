@@ -305,7 +305,7 @@ async fn the_price_book_route_names_the_operators_rows_and_the_fallback() {
 
 /// A control plane that keeps every record pushed to `/v1/ingest`, answers the
 /// two budget maps with an empty map, and every other route with an empty
-/// list, so the gateway reads its seed (invariant 102) and admits calls.
+/// list, so the gateway reads its seed (invariant 103) and admits calls.
 async fn capture_cloud() -> (
     String,
     std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
