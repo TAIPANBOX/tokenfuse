@@ -1190,10 +1190,13 @@ run_case "streamed-tools: the held call leaks before the refusal" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "                    yield Bytes::from(crate::streamgate::refusal_event(", "                    yield Bytes::from(held.held.clone());\n                    yield Bytes::from(crate::streamgate::refusal_event(")')" \
 	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
 
+# The OpenAI wire puts a tool marker on every argument delta, so this mutant is
+# invisible there; the Anthropic wire sends its argument deltas as bare
+# input_json_delta events with no name, which the mutant forwards, so that test is the one that goes red.
 run_case "streamed-tools: only the event that opened the call is held" fail \
-	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
 	"$(py 'edit("crates/gateway/src/streamgate.rs", "        if self.holding || opens_tool {", "        if opens_tool {")')" \
-	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
 
 # --- invariant 102: a served page builds no markup from data ----------------
 #
