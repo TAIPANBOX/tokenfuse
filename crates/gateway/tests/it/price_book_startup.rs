@@ -303,8 +303,9 @@ async fn the_price_book_route_names_the_operators_rows_and_the_fallback() {
     assert_eq!(after["fallback_models_seen_total"], 1, "{after}");
 }
 
-/// A control plane that keeps every record pushed to `/v1/ingest` and answers
-/// every other route with an empty list.
+/// A control plane that keeps every record pushed to `/v1/ingest`, answers the
+/// two budget maps with an empty map, and every other route with an empty
+/// list, so the gateway reads its seed (invariant 102) and admits calls.
 async fn capture_cloud() -> (
     String,
     std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -326,6 +327,8 @@ async fn capture_cloud() -> (
                 }
             }),
         )
+        .route("/v1/budgets", axum::routing::get(|| async { "{}" }))
+        .route("/v1/unit-budgets", axum::routing::get(|| async { "{}" }))
         .fallback(|| async { "[]" });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
