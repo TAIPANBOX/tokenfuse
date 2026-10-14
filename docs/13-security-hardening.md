@@ -86,6 +86,17 @@ caught. When a PII span and a secret span overlap, the secret wins and the
 PII finding is dropped, so masking never corrupts an existing secret
 redaction. See `crates/core/src/dlp.rs`'s module doc for the full writeup.
 
+**What shadow and mask record (invariant 106, 2026-10-14).** A call the
+gateway forwards with PII in its prompt, as written (`shadow`) or redacted
+(`mask`), carries the kinds found and how often on its `allow` trace row, the
+nullable `pii_findings` column (`pii_card=1,pii_email=2`), and on its Cloud
+record; the control plane counts `pii_calls` per run on `/v1/runs` and
+`pii_calls` plus `pii_kinds` (most calls first, at most 16 kinds) on
+`/v1/summary`, reading only strings shaped like the scanner's output. Kinds
+and counts only, never a matched span. A `block` refusal is unchanged (a
+`403 dlp_blocked`). The agent-event bus carries no shadow finding yet: the
+`dlp_shadow` type waits for its row in agent-passport's registry.
+
 ## OIDC bearer authentication (optional, offline)
 
 The Cloud control plane authenticates every request at a single chokepoint. The

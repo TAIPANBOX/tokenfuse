@@ -204,6 +204,9 @@ pub struct CallAttribution {
     /// `TOKENFUSE_IDENTITY_STRICT=warn` forwarded it anyway (invariant 87).
     /// `None` for every call the check passed or did not run on.
     pub identity_reason: Option<String>,
+    /// The PII found in the prompt and let through (invariant 106), copied
+    /// onto the `allow` row unchanged. See `sink::CallRecord::pii_findings`.
+    pub pii_findings: Option<String>,
 }
 
 /// A reservation kept outstanding on purpose (D7): the request was handed to the provider and
@@ -744,6 +747,7 @@ pub fn allow_record(
         tools_would_prune: a.tools_would_prune,
         pruned_schema_tokens_est: a.pruned_schema_tokens_est,
         identity_reason: a.identity_reason.clone(),
+        pii_findings: a.pii_findings.clone(),
     }
 }
 

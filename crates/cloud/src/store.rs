@@ -255,6 +255,37 @@ pub struct CallRecord {
     /// gateway's vocabulary ([`IDENTITY_REASONS`]).
     #[serde(default)]
     pub identity_reason: Option<String>,
+    /// The PII the gateway's scanner found in the call's prompt and let
+    /// through, shadow or mask (invariant 106,
+    /// `crates/gateway/src/sink.rs::CallRecord::pii_findings`): `kind=count`
+    /// pairs joined by `,`. Absent when nothing was found and from an older
+    /// gateway. Untrusted: read only as [`parse_pii_findings`] reads it.
+    #[serde(default)]
+    pub pii_findings: Option<String>,
+}
+
+/// Invariant 106: a gateway's `pii_findings` read as `(kind, count)` pairs,
+/// keeping only what has the scanner's shape: a kind `pii_` followed by 1 to
+/// 24 lowercase letters or `_`, a count from 1 to 100 000. Anything else is
+/// dropped, never shown; at most 16 pairs are read from one record.
+pub fn parse_pii_findings(raw: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for pair in raw.split(',').take(16) {
+        let Some((kind, count)) = pair.split_once('=') else {
+            continue;
+        };
+        let suffix = kind.strip_prefix("pii_").unwrap_or("");
+        let shaped = !suffix.is_empty()
+            && suffix.len() <= 24
+            && suffix.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+        let Ok(n) = count.parse::<u64>() else {
+            continue;
+        };
+        if shaped && (1..=100_000).contains(&n) && !out.iter().any(|(k, _)| k == kind) {
+            out.push((kind.to_string(), n));
+        }
+    }
+    out
 }
 
 /// The reasons the gateway's identity check gives (`identitymap.rs` and the
@@ -378,6 +409,10 @@ pub struct RunAgg {
     /// refused, when it is a word of the gateway's vocabulary; `""` otherwise.
     #[serde(default)]
     pub last_identity_reason: String,
+    /// Admitted calls whose prompt held PII the gateway let through, shadow
+    /// or mask (invariant 106).
+    #[serde(default)]
+    pub pii_calls: u64,
 }
 
 /// One model id and how many admitted calls were charged at the fallback
@@ -421,7 +456,27 @@ pub struct Summary {
     /// Admitted calls forwarded under identity warn mode (invariant 87),
     /// exact over the org's whole ingest history.
     pub identity_warned_calls: u64,
+    /// Admitted calls whose prompt held PII the gateway let through
+    /// (invariant 106), exact.
+    pub pii_calls: u64,
+    /// `pii_calls` per kind, most calls first, then by kind; bounded at 16
+    /// kinds plus `(other kinds)`.
+    pub pii_kinds: Vec<KindCalls>,
 }
+
+/// One PII kind and how many admitted calls carried it (invariant 106).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct KindCalls {
+    pub kind: String,
+    pub calls: u64,
+}
+
+/// How many distinct PII kinds the per-org fold keeps; past it, calls are
+/// counted under [`OTHER_PII_KINDS`].
+const MAX_PII_KINDS: usize = 16;
+
+/// The bucket for PII kinds past [`MAX_PII_KINDS`].
+pub const OTHER_PII_KINDS: &str = "(other kinds)";
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
 /// The empty-string `agent_id` is kept as an explicit "unattributed" bucket.
@@ -811,6 +866,12 @@ struct OrgTotals {
     /// Invariant 87, exact like `calls`.
     #[serde(default)]
     identity_warned_calls: u64,
+    /// Invariant 106, exact like `calls`; per kind bounded at
+    /// [`MAX_PII_KINDS`].
+    #[serde(default)]
+    pii_calls: u64,
+    #[serde(default)]
+    pii_kinds: HashMap<String, u64>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -1843,6 +1904,29 @@ impl Store {
                         } else {
                             String::new()
                         };
+                    }
+                    // Invariant 106: PII the gateway found and let through, on
+                    // an admitted call only, read through its own shape.
+                    if matches!(r.decision.as_str(), "allow" | "cache_hit") {
+                        let kinds = r
+                            .pii_findings
+                            .as_deref()
+                            .map(parse_pii_findings)
+                            .unwrap_or_default();
+                        if !kinds.is_empty() {
+                            agg.pii_calls += 1;
+                            totals.pii_calls += 1;
+                            for (kind, _) in kinds {
+                                let key = if totals.pii_kinds.contains_key(&kind)
+                                    || totals.pii_kinds.len() < MAX_PII_KINDS
+                                {
+                                    kind
+                                } else {
+                                    OTHER_PII_KINDS.to_string()
+                                };
+                                *totals.pii_kinds.entry(key).or_insert(0) += 1;
+                            }
+                        }
                     }
                     if r.decision == "allow" {
                         match r.price_basis.as_str() {
@@ -2904,6 +2988,17 @@ impl Store {
             models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)));
             sum.fallback_models = models;
             sum.identity_warned_calls = totals.identity_warned_calls;
+            sum.pii_calls = totals.pii_calls;
+            let mut kinds: Vec<KindCalls> = totals
+                .pii_kinds
+                .iter()
+                .map(|(kind, calls)| KindCalls {
+                    kind: kind.clone(),
+                    calls: *calls,
+                })
+                .collect();
+            kinds.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.kind.cmp(&b.kind)));
+            sum.pii_kinds = kinds;
         }
         sum
     }
@@ -4287,6 +4382,39 @@ fn write_file_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Invariant 106: only the scanner's shape is read from a gateway's
+    /// `pii_findings`; anything else is dropped, and the read is bounded.
+    #[test]
+    fn pii_findings_are_read_only_in_the_scanners_shape() {
+        assert_eq!(
+            parse_pii_findings("pii_card=1,pii_email=2"),
+            vec![("pii_card".to_string(), 1), ("pii_email".to_string(), 2)]
+        );
+        for hostile in [
+            "",
+            "pii_email",
+            "pii_=1",
+            "PII_EMAIL=1",
+            "pii_email=0",
+            "pii_email=100001",
+            "pii_email=-1",
+            "pii_e-mail=1",
+            "<script>=1",
+            "pii_aaaaaaaaaaaaaaaaaaaaaaaaa=1",
+        ] {
+            assert!(parse_pii_findings(hostile).is_empty(), "{hostile:?}");
+        }
+        assert_eq!(
+            parse_pii_findings("pii_email=1,pii_email=5").len(),
+            1,
+            "a kind is read once"
+        );
+        let many: Vec<String> = (0..40)
+            .map(|i| format!("pii_k{}=1", "x".repeat(i % 20 + 1)))
+            .collect();
+        assert!(parse_pii_findings(&many.join(",")).len() <= 16);
+    }
 
     fn rec(run: &str, cost: i64) -> CallRecord {
         CallRecord {

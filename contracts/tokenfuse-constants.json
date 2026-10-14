@@ -1190,6 +1190,11 @@
         "name": "identity_reason",
         "nullable": true,
         "type": "Utf8"
+      },
+      {
+        "name": "pii_findings",
+        "nullable": true,
+        "type": "Utf8"
       }
     ],
     "write_schema": [
@@ -1290,6 +1295,11 @@
       },
       {
         "name": "identity_reason",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "pii_findings",
         "nullable": true,
         "type": "Utf8"
       }

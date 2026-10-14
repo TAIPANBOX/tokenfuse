@@ -7010,3 +7010,33 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
     page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
     each bound.)*
+
+106. **PII the scanner finds and lets through is on the call's trace row and in the fleet view,
+    as kinds and counts, never the matched text.** A shadow PII finding was an `x-fuse-dlp` note
+    on the answer and nothing else (forge, 2026-10-14), so no dashboard could show what shadow mode
+    found. `@decided 2026-10-14`: a trace column and a Cloud count now; a bus event once its type
+    has a row in agent-passport's registry.
+
+    In `proxy::handle_call`, `TOKENFUSE_DLP_PII` `shadow` or `mask` with findings sets
+    `pii_counts` from `tokenfuse_core::dlp::kind_counts` (`kind=count` sorted by kind,
+    `pii_card=1,pii_email=2`); it rides `CallAttribution.pii_findings` onto the `allow` row and the
+    `cache_hit` row (`sink::CallRecord::pii_findings`, appended last, nullable in both Parquet
+    schemas and published in `trace_parquet`, invariants 6 and 14) and onto the Cloud wire only
+    when set. `block` is unchanged. The Cloud reads it through `store::parse_pii_findings` (a kind
+    `pii_` plus 1 to 24 lowercase letters or `_`, a count from 1 to 100 000, a kind once, at most 16
+    pairs), on an admitted record only, and folds `RunAgg.pii_calls`, `Summary.pii_calls` and
+    `Summary.pii_kinds` (`KindCalls`, bounded at 16 kinds plus `(other kinds)`).
+
+    Not covered: no agent event yet (`dlp_shadow` needs its registry row); the MCP broker's PII
+    scan of tool calls and answers records nothing new; the FOCUS export does not carry the column;
+    a block refusal writes no trace row, as before.
+    *(tests: `tests/it/pii_found_is_recorded.rs` (`shadow_records_the_kinds_it_found_and_never_the_text`
+    and `mask_records_what_it_redacted` red first in CI on the unchanged gateway, the row carrying
+    no `pii_findings`; `nothing_found_or_the_scan_off_records_nothing` the control), the Cloud's
+    `tests/it/pii_found.rs` (`pii_a_gateway_let_through_reaches_the_runs_and_summary_reads`,
+    `a_findings_string_without_the_scanners_shape_is_not_counted`, both red first: no such
+    field), `core::dlp::tests::kind_counts_name_each_kind_and_how_often_never_the_text`,
+    `cloud::store::tests::pii_findings_are_read_only_in_the_scanners_shape`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the counts never set in shadow, the Cloud counting a refused
+    record, the shape check dropped. Scenarios: `features/pii-found-is-on-the-record.feature`.
+    Not a script gate)*

@@ -1002,6 +1002,7 @@ async fn handle_call(
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
                     identity_reason: Some(mismatch.reason.to_string()),
+                    pii_findings: None,
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -1108,6 +1109,7 @@ async fn handle_call(
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
             identity_reason: identity_reason.clone(),
+            pii_findings: None,
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1129,6 +1131,9 @@ async fn handle_call(
 
     // DLP: scan the outgoing prompt for secrets. Block, mask, or just flag.
     let mut dlp_note: Option<String> = None;
+    // Invariant 106: the PII the scan found and let through (shadow or mask),
+    // as kinds and counts, for the `allow` row and the Cloud wire.
+    let mut pii_counts: Option<String> = None;
     if st.dlp != DlpMode::Off || st.dlp_pii != DlpMode::Off {
         let text = String::from_utf8_lossy(&body).into_owned();
         let findings = if st.dlp != DlpMode::Off {
@@ -1175,6 +1180,7 @@ async fn handle_call(
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
+                        pii_findings: None,
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1212,6 +1218,9 @@ async fn handle_call(
             let pii_findings = dlp::scan_pii(&text);
             if !pii_findings.is_empty() {
                 let pii_summary = dlp::pii_summary(&pii_findings);
+                if matches!(st.dlp_pii, DlpMode::Shadow | DlpMode::Mask) {
+                    pii_counts = Some(dlp::kind_counts(&pii_findings));
+                }
                 match st.dlp_pii {
                     DlpMode::Block => return dlp_block(&run_id, &pii_summary),
                     DlpMode::Mask => {
@@ -1305,6 +1314,7 @@ async fn handle_call(
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
+                        pii_findings: pii_counts.clone(),
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1393,6 +1403,7 @@ async fn handle_call(
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
+                pii_findings: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1434,6 +1445,7 @@ async fn handle_call(
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
+                pii_findings: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1502,6 +1514,7 @@ async fn handle_call(
                 tools_would_prune: None,
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
+                pii_findings: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1643,6 +1656,7 @@ async fn handle_call(
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
+                        pii_findings: None,
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1673,6 +1687,7 @@ async fn handle_call(
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
+                        pii_findings: None,
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -1753,6 +1768,7 @@ async fn handle_call(
                         tools_would_prune: None,
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
+                        pii_findings: None,
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -1807,6 +1823,7 @@ async fn handle_call(
             tools_would_prune,
             pruned_schema_tokens_est,
             identity_reason: identity_reason.clone(),
+            pii_findings: pii_counts.clone(),
         },
         unit_reservation,
     )
@@ -1850,6 +1867,7 @@ async fn handle_call(
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
                     identity_reason: identity_reason.clone(),
+                    pii_findings: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -2492,6 +2510,7 @@ async fn buffered_managed(
                     tools_would_prune: None,
                     pruned_schema_tokens_est: None,
                     identity_reason: guard.identity_reason(),
+                    pii_findings: None,
                 });
                 let outcome = st.events.emit(
                     EventType::TaintBlock,
