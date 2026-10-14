@@ -304,17 +304,13 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1963 passing** (core 408, dpop 21, delegation 60,
-gateway 1190, cloud 283, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 13
-with the seed gate (invariant 103: 4 in `gateway::seedgate`, 5 in `gateway::cloudsink`,
-1 in `gateway::unitledger`, 3 in `tests/it/seed_before_admit.rs`), by 19 with the streamed
-tool-call judgement (invariant 104: 11 in `gateway::streamgate`, 8 in
-`tests/it/streamed_tool_calls_are_judged.rs`), by 11 with the refused client key on the bus
-(invariant 105: 6 in `gateway::refusedkeys`, 5 in `tests/it/refused_key_on_the_bus.rs`), and PII
-found and let through on the trace and in the fleet view (invariant 106) added 1 to core, 3 to
-gateway and 3 to cloud (1 in `core::dlp`, 3 in `tests/it/pii_found_is_recorded.rs`, 1 in
-`cloud::store`, 2 in the Cloud's `tests/it/pii_found.rs`); 2026-10-14, counted from the diff and
-judged by CI's `scripts/stated-numbers.sh`, which measures the merged tree. Cloud grew by 2
+`cargo test --all` runs **1988 passing** (core 415, dpop 21, delegation 60,
+gateway 1204, cloud 287, umbrella 1, by `cargo test -p <crate>`), the train carrying the
+PII trace column and the Cloud count (#433), the OpenRouter `openai/` ids (#434), the broker's run id
+(#435), the FOCUS price basis (#436), the IBAN and decimal-digit rules (#437), the per-run model list
+(#438) and the exit flush (#439). Counted from the diff against main (1956), split per crate by the
+`#[test]` attributes each crate gained, and judged by CI's `scripts/stated-numbers.sh`, which
+measures the merged tree. Cloud grew by 2
 with the control-plane page rendering run fields as text (invariant 102: 2 in
 `tests/it/dashboard_page.rs`, 2026-10-14). Gateway grew by 3
 with the 12 KiB argument cap (invariant 100: one unit and two integration tests,
