@@ -7010,3 +7010,35 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
     page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
     each bound.)*
+
+107. **An `openai/<id>` model id is priced at OpenAI's list rate for that id, and an `openai/` id
+    the book does not know stays at the fallback.** Measured on forge 2026-10-14 through the OpenAI
+    door over OpenRouter: `openai/gpt-4.1-mini` had no row, the forge call (14 in, 2 out) settled
+    at the 15 / 75 fallback, USD 0.000360 where the list price is 9 micro-USD, and run budgets of USD
+    0.004 and 0.012 were refused before their first call. `@decided 2026-10-14`: price OpenRouter's
+    `vendor/model` ids at the vendor's row where the bare model is known, without weakening the
+    fallback for an unknown id.
+
+    `pricebook::default_price_book` inserts every [`OPENAI`] row twice, under its id and under
+    `openai/<id>` (`OPENROUTER_OPENAI`), the long-prompt tier with it, as explicit rows published in
+    `price_book.models` and `price_book.long_context` (invariant 14), not as a lookup rule: a row a
+    reader can see is a price a reader can check. `OPENAI` gains the GPT-4.1 family, read 2026-10-14
+    (`gpt-4.1` 2.00 / 8.00 cached 0.50, `gpt-4.1-mini` 0.40 / 1.60 cached 0.10, `gpt-4.1-nano` 0.10 /
+    0.40 cached 0.025; no write fee, no long tier). `@claude` 2026-10-14: an `openai/` id names
+    OpenAI's own model sold at OpenAI's list, unlike `moonshotai/kimi-k3` or `z-ai/glm-5.3`, which
+    many providers serve at different rates and which keep the fallback. `anthropic/` ids were rows
+    already (invariant 79) and `google/` ids are Vertex AI's own names (invariant 82).
+
+    Not covered: an operator `TOKENFUSE_PRICE_BOOK` row for a bare id does not move its `openai/`
+    twin (write both); OpenRouter's credit fee is not in any row; verdryx's by-value mirror of the
+    book needs the new rows (estate-gates C3).
+    *(tests: `tests/it/openrouter_openai_ids_are_priced.rs`:
+    `the_measured_openrouter_call_is_priced_at_openais_list_rate` (red first: `fallback`,
+    `0.000360`), `a_small_budget_is_no_longer_refused_before_its_first_call` (red first: 402),
+    `the_gpt_4_1_family_is_priced_under_its_own_ids` (red first), and the control
+    `an_openai_id_the_book_does_not_know_still_takes_the_fallback`; `pricebook::tests`:
+    `every_openai_id_is_priced_under_its_openrouter_name_too`,
+    `the_gpt_4_1_family_is_priced_at_its_list_rate`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the `openai/` twin not inserted, its long tier not inserted.
+    Scenarios: `features/an-openrouter-openai-id-is-priced-at-its-list-rate.feature`. Not a script
+    gate)*

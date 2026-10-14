@@ -1230,6 +1230,17 @@ for p in paths:
     os.remove(p)')" \
 	"measured nothing"
 
+# --- invariant 107: an openai/ id is priced at OpenAI's list rate -------------
+run_case "openrouter-ids: the openai/ twin not inserted" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact openrouter_openai_ids_are_priced::the_measured_openrouter_call_is_priced_at_openais_list_rate" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "for name in [id.to_string(), format!(\"{OPENROUTER_OPENAI}{id}\")] {", "for name in [id.to_string(), format!(\"{OPENROUTER_OPENAI}{id}\")].into_iter().take(1) {")')" \
+	"the_measured_openrouter_call_is_priced_at_openais_list_rate ... FAILED"
+
+run_case "openrouter-ids: the twin's long tier not inserted" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_openai_id_is_priced_under_its_openrouter_name_too" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "            if let Some(l) = long {", "            if let Some(l) = long.as_ref().filter(|_| name.as_str() == *id) {")')" \
+	"every_openai_id_is_priced_under_its_openrouter_name_too ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
