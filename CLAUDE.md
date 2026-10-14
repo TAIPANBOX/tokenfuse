@@ -97,6 +97,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/one-test-binary-per-crate.sh  # invariant 78
 ./scripts/no-owner-quotes.sh     # invariant 101
 ./scripts/no-html-from-data.sh   # invariant 102
+./scripts/teeth-shards-cover-every-case.sh  # invariant 106
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7185,3 +7186,20 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     minute, the global sixty, the bound, the data). Mutants as cases in `scripts/gates-have-teeth.sh`:
     the report never made, the per-source limit removed, the fingerprint replaced by the key.
     Scenarios: `features/a-refused-client-key-is-on-the-bus.feature`. Not a script gate)*
+
+106. **The teeth harness runs as four CI shards, and the shards together run every case exactly once.**
+    One job took 30 to 60 minutes, the slowest step in this repository. `TEETH_SHARD=i/N` runs the cases at
+    positions `i`, `i+N`, ... of the list; `TEETH_LIST=1` prints the names through the same filter and runs
+    none; a shard that runs no case says it measured nothing. `scripts/teeth-shards-cover-every-case.sh` lists
+    the full harness and each of the four shards, and requires that no name is listed twice, that no shard is
+    empty, and that the shards together are the full list: nothing dropped, nothing run in two shards. The
+    required check `security (cargo audit)` is an aggregate: it passes only when the `cargo audit` job and all
+    four shards pass. `@claude` 2026-10-14, the split and the aggregate, under delegated authority; open to
+    reversal.
+
+    Not covered: the shard count of four is written twice (the workflow matrix and the gate's `shards=4`) and
+    nothing checks that they agree; the wall time is measured in CI, not here; the four shards compile the same
+    dependencies, each in its own runner.
+    *(gate: `scripts/teeth-shards-cover-every-case.sh`; teeth cases in `scripts/gates-have-teeth.sh`: the real
+    harness partitions, a filter that drops every fifth case, a filter that runs a case in every shard up to its
+    own, and a harness that is gone)*

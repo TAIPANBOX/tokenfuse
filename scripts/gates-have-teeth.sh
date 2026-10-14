@@ -79,7 +79,22 @@ set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-if [ -n "$(git status --porcelain)" ]; then
+# TEETH_SHARD=i/N runs only the cases at positions i, i+N, i+2N, ... (1-based), so
+# CI can split the harness across N jobs. Unset runs every case, as before.
+# TEETH_LIST=1 prints the names this run would run, in order, and stops. It
+# mutates nothing, so it needs no clean tree and no restore trap: a nested list
+# run that restored the tree would undo the edit its caller had just planted.
+if [ -n "${TEETH_SHARD:-}" ]; then
+	shard_re='^([1-9][0-9]*)/([1-9][0-9]*)$'
+	if ! [[ "$TEETH_SHARD" =~ $shard_re ]] || [ "${BASH_REMATCH[1]}" -gt "${BASH_REMATCH[2]}" ]; then
+		printf 'TEETH_SHARD must be i/N with 1 <= i <= N, got: %s\n' "$TEETH_SHARD"
+		exit 2
+	fi
+	shard_i="${BASH_REMATCH[1]}"
+	shard_n="${BASH_REMATCH[2]}"
+fi
+
+if [ -z "${TEETH_LIST:-}" ] && [ -n "$(git status --porcelain)" ]; then
 	printf 'this script mutates tracked files, so it needs a clean tree.\n'
 	printf 'commit or stash first; it restores with `git checkout` and cannot\n'
 	printf 'tell your edits from its own.\n'
@@ -95,7 +110,6 @@ restore() {
 	git checkout -- . 2>/dev/null
 	git clean -fdq -- crates scripts 2>/dev/null
 }
-baseline_dir="$(mktemp -d)"
 
 # One trap for both, because a second `trap ... EXIT` REPLACES the first
 # rather than adding to it. Writing them separately disarmed `restore` on
@@ -104,11 +118,15 @@ cleanup() {
 	restore
 	rm -rf "$baseline_dir"
 }
-trap cleanup EXIT INT TERM
+if [ -z "${TEETH_LIST:-}" ]; then
+	baseline_dir="$(mktemp -d)"
+	trap cleanup EXIT INT TERM
+fi
 
 
 failures=0
 cases=0
+case_no=0
 
 # run_case <name> <expect: fail|pass> <gate> <python edit> [required output]
 #
@@ -117,6 +135,16 @@ cases=0
 # satisfied by any failure at all, including one caused by the harness itself.
 run_case() {
 	local name="$1" expect="$2" gate="$3" edit="$4" needle="${5:-}"
+	# Every call takes a position, in a run, a shard and a list alike, so that the
+	# shards and the list agree on which case is which.
+	case_no=$((case_no + 1))
+	if [ -n "${TEETH_SHARD:-}" ] && [ $(( (case_no - 1) % shard_n )) -ne $(( shard_i - 1 )) ]; then
+		return
+	fi
+	if [ -n "${TEETH_LIST:-}" ]; then
+		printf '%s\n' "$name"
+		return
+	fi
 	cases=$((cases + 1))
 
 	# The baseline applies to EVERY case, not only the ones expecting a failure.
@@ -184,6 +212,36 @@ run_case() {
 
 # A tiny helper for the edits: replace once, and prove it happened.
 py() { printf 'import sys\ndef edit(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b, 1))\ndef edit_all(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b))\n%s\n' "$1"; }
+
+# --- the teeth run is split into shards, and the split must cover every case ---
+#
+# The shards are this list filtered by TEETH_SHARD (see the head of this file), and
+# scripts/teeth-shards-cover-every-case.sh checks them against the full list. Its
+# planted faults edit a COPY of this file, never this one: a case must not rewrite
+# the harness that is running it. The copy exists only after the edit, so these
+# cases skip the baseline (fail_env); the unmutated harness is judged by the first.
+run_case "teeth-shards: the four shards together run every case once" pass \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"pass"
+
+run_case "teeth-shards: a filter that drops every fifth case is not a partition" fail_env \
+	"./scripts/teeth-shards-cover-every-case.sh scripts/planted-teeth.sh" \
+	"$(py 'import shutil
+shutil.copy("scripts/gates-have-teeth.sh", "scripts/planted-teeth.sh")
+edit("scripts/planted-teeth.sh", "% shard_n )) -ne", "% (shard_n + 1) )) -ne")')" \
+	"not a partition"
+
+run_case "teeth-shards: a filter that runs a case in every shard up to its own is not a partition" fail_env \
+	"./scripts/teeth-shards-cover-every-case.sh scripts/planted-teeth.sh" \
+	"$(py 'import shutil
+shutil.copy("scripts/gates-have-teeth.sh", "scripts/planted-teeth.sh")
+edit("scripts/planted-teeth.sh", "-ne $(( shard_i - 1 )) ]; then", "-gt $(( shard_i - 1 )) ]; then")')" \
+	"not a partition"
+
+run_case "teeth-shards: a harness that is gone, so the shards measured nothing" fail_env \
+	"./scripts/teeth-shards-cover-every-case.sh scripts/no-such-harness.sh" \
+	"pass" \
+	"measured nothing"
 
 # --- invariant 1: core stays dependency-minimal ----------------------------
 
@@ -1319,6 +1377,11 @@ run_case "refused-key: the fingerprint carries the key" fail \
 # stale silently: a gate added without a case looks exactly like a gate with
 # nothing to catch, and that is the whole thing this file exists to deny. So
 # the list is checked against what is actually on disk.
+# A list run stops here: it has printed its names, and nothing else may be printed.
+if [ -n "${TEETH_LIST:-}" ]; then
+	exit 0
+fi
+
 uncovered=""
 for gate in scripts/*.sh; do
 	base="$(basename "$gate")"
@@ -1339,6 +1402,12 @@ restore
 if [ -n "$(git status --porcelain)" ]; then
 	printf '\nthis script left the tree dirty, which means a case restored badly:\n'
 	git status --porcelain
+	failures=$((failures + 1))
+fi
+
+# A shard that ran no case has measured nothing, and must say so rather than pass.
+if [ -n "${TEETH_SHARD:-}" ] && [ "$cases" -eq 0 ]; then
+	printf '\nshard %s ran no cases, so it measured nothing\n' "$TEETH_SHARD"
 	failures=$((failures + 1))
 fi
 

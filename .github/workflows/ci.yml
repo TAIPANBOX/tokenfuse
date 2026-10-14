@@ -126,6 +126,12 @@ jobs:
       - name: one integration-test binary per crate
         run: ./scripts/one-test-binary-per-crate.sh
 
+      # The teeth harness runs as four shards (the teeth jobs below). This lists
+      # what each shard would run and requires the four to run every case exactly
+      # once. It runs no case and needs no cargo (invariant 106).
+      - name: the teeth shards run every case exactly once
+        run: ./scripts/teeth-shards-cover-every-case.sh
+
       # This repository is public. No tracked file quotes the owner or names him
       # as the one who said or decided something; a decision is recorded as
       # @decided and a paraphrase (invariant 101).
@@ -233,9 +239,20 @@ jobs:
         working-directory: crates/cluster
         run: cargo test
 
-  security:
-    name: security (cargo audit)
+  # The teeth harness is the slowest step in this repository, 30 to 60 minutes as
+  # one job, so it runs as four shards of the same case list. Shard i runs the
+  # cases at positions i, i+4, ..., and scripts/teeth-shards-cover-every-case.sh
+  # requires the four together to run each case exactly once (invariant 106).
+  # Standard runners: this repository is public, so they cost nothing.
+  teeth:
+    name: teeth (shard ${{ matrix.shard }} of 4)
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      TEETH_SHARD: ${{ matrix.shard }}/4
     steps:
       # fetch-depth: 0 here too: this job runs gates-have-teeth.sh, whose
       # stated-numbers cases call the version-badge check, and a checkout
@@ -250,30 +267,67 @@ jobs:
           toolchain: stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The harness's cargo-audit case needs the tool on PATH, or that gate
+      # reports UNJUDGEABLE. Same pin as the audit job below.
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
-      # Both lockfiles, one ignore list, and a check that each ignore's reason
-      # still holds. Two bare `cargo audit` calls needed the list in two
-      # places, because cargo-audit reads `.cargo/audit.toml` from the current
-      # directory and does not walk up.
-      - name: Audit both lockfiles
-        run: ./scripts/audit.sh
 
       # The gates parse text with regular expressions, which does not break
       # loudly: a parser stops matching and reports success. This breaks each
       # of them on purpose and requires the failure.
       #
-      # It lives in THIS job rather than beside the other gates, and the reason
-      # is cargo-audit: it exercises every gate in scripts/, audit.sh among
-      # them, and that one needs a tool only this job installs. Run anywhere
-      # else it reports three cases UNJUDGEABLE, correctly, because a gate that
-      # cannot run is not a gate that passed. That is how this was found.
+      # It lives in the teeth jobs rather than beside the other gates, and the
+      # reason is cargo-audit: it exercises every gate in scripts/, audit.sh
+      # among them, and that one needs a tool only these jobs install. Run
+      # anywhere else it reports three cases UNJUDGEABLE, correctly, because a
+      # gate that cannot run is not a gate that passed. That is how this was
+      # found.
       #
-      # It mutates tracked files and restores them, so it goes last, and it
-      # needs a clean tree and says so plainly, which also reports any earlier
-      # step that starts writing into the checkout.
+      # It mutates tracked files and restores them, which is why each shard
+      # starts from its own checkout, and it needs a clean tree and says so
+      # plainly if an earlier step has written into it.
       - name: the gates still fail on the faults they exist to catch
         run: ./scripts/gates-have-teeth.sh
+
+  # Both lockfiles, one ignore list, and a check that each ignore's reason still
+  # holds (scripts/audit.sh, invariant 11). Its own job, so it runs beside the
+  # teeth shards. Two bare `cargo audit` calls needed the list in two places,
+  # because cargo-audit reads `.cargo/audit.toml` from the current directory and
+  # does not walk up.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit both lockfiles
+        run: ./scripts/audit.sh
+
+  # The required check. Its name stays, because branch protection names it. It
+  # passes only when the audit job and all four teeth shards passed: a skipped
+  # or cancelled need reads as not success, so it fails here too.
+  security:
+    name: security (cargo audit)
+    needs: [audit, teeth]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: audit and all four teeth shards passed
+        env:
+          AUDIT: ${{ needs.audit.result }}
+          TEETH: ${{ needs.teeth.result }}
+        run: |
+          echo "cargo audit: $AUDIT" >>"$GITHUB_STEP_SUMMARY"
+          echo "teeth, four shards: $TEETH" >>"$GITHUB_STEP_SUMMARY"
+          test "$AUDIT" = success
+          test "$TEETH" = success
 
   # Decides whether the radar job below has anything to test. radar is its own
   # nested workspace with no path dependency on the rest of the repository, so
