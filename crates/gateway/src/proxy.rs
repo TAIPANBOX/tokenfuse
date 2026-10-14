@@ -2117,6 +2117,9 @@ async fn handle_call(
         .zip(pruned_schema_tokens_est)
         .map(|(n, tokens)| format!("{n};est_tokens={tokens}"));
 
+    // The step the guard settles this call at, for a refusal row the stream
+    // may write after the guard has moved into it (invariant 104).
+    let guard_step = guard.step();
     let mut response = if parsed.stream {
         stream_managed(
             resp,
@@ -2134,6 +2137,31 @@ async fn handle_call(
             router_header,
             wardryx_header,
             pruned_header,
+            firewall_labels,
+            firewall_prompt,
+            CallRecord {
+                ts_millis: now_millis(),
+                run_id: run_id.clone(),
+                model: parsed.model.clone(),
+                decision: "taint_blocked".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: guard_step,
+                agent_id: agent_id.clone(),
+                saved_microusd: 0,
+                parent_run_id: parent_run_id.clone(),
+                on_behalf_of: on_behalf_of.clone(),
+                outcome: outcome_tag.clone(),
+                key_id: key_id.clone(),
+                unit: unit.clone(),
+                tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
+                identity_reason: identity_reason.clone(),
+            },
+            unit.clone(),
         )
     } else {
         buffered_managed(
@@ -2226,6 +2254,94 @@ fn price_basis(st: &AppState, model: &str) -> &'static str {
     "fallback"
 }
 
+/// What the firewall decided about the tool calls a model's answer asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolCallVerdict {
+    /// Nothing the run's taint denies (or the firewall is off).
+    Allowed,
+    /// Denied, in shadow or warn: forwarded, and recorded as `taint_shadow`.
+    WouldBlock(String),
+    /// Denied, in enforce: recorded as a `taint_blocked` row and a
+    /// `taint_block` event; the caller withholds the answer.
+    Blocked(String),
+}
+
+/// Judge the tool calls a model's answer asks for against the run's taint,
+/// and record what was decided: one function for the buffered answer and the
+/// streamed one (invariant 104), so the two paths cannot drift apart.
+/// `blocked_row` is built only when a refusal is recorded. A call that is not
+/// refused accumulates the labels its tools' output will carry, so the next
+/// turn is judged with them.
+#[allow(clippy::too_many_arguments)]
+fn judge_model_tool_calls(
+    st: &AppState,
+    labels: &Labels,
+    resp_tools: &[String],
+    blocked_row: impl FnOnce() -> CallRecord,
+    event_agent_id: &str,
+    run_id: &str,
+    chain_on_record: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+    firewall_prompt: Option<&str>,
+    unit: &str,
+) -> ToolCallVerdict {
+    if st.firewall.mode == FirewallMode::Off {
+        return ToolCallVerdict::Allowed;
+    }
+    let requested = taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities);
+    let mut out = ToolCallVerdict::Allowed;
+    if let Some(verdict) = taint::evaluate(labels, &requested, &st.firewall.rules) {
+        let reason = verdict.reason();
+        if st.firewall.mode == FirewallMode::Enforce {
+            st.sink.record(blocked_row());
+            let outcome = st.events.emit(
+                EventType::TaintBlock,
+                now_millis(),
+                Some(event_agent_id),
+                Some(run_id),
+                chain_on_record,
+                taint_verdict_data(
+                    TaintStage::ModelToolCall,
+                    TaintEnforcement::Enforce,
+                    &verdict,
+                    resp_tools,
+                    firewall_prompt,
+                    unit,
+                ),
+            );
+            crate::events::log_outcome(EventType::TaintBlock, outcome);
+            return ToolCallVerdict::Blocked(reason);
+        }
+        // Shadow: the action is PERMITTED and this response carries it to
+        // a client that will execute it. Before 2026-08-26 that fact left
+        // the box as a response header and nothing else, so the only party
+        // ever told was the agent that had just been talked into it.
+        let outcome = st.events.emit(
+            EventType::TaintShadow,
+            now_millis(),
+            Some(event_agent_id),
+            Some(run_id),
+            chain_on_record,
+            taint_verdict_data(
+                TaintStage::ModelToolCall,
+                TaintEnforcement::Shadow,
+                &verdict,
+                resp_tools,
+                firewall_prompt,
+                unit,
+            ),
+        );
+        crate::events::log_outcome(EventType::TaintShadow, outcome);
+        out = ToolCallVerdict::WouldBlock(reason);
+    }
+    // Executing these tools will taint future turns — record their labels now.
+    st.name_unclassified(resp_tools);
+    st.accumulate_taint(
+        run_id,
+        taint::labels_for_tools(resp_tools, &st.firewall.sources),
+    );
+    out
+}
+
 /// Streaming managed response: pass chunks through and settle at end-of-stream.
 /// Cost headers are omitted because headers are sent before the body — the
 /// settled figures go to the ledger (and, later, the event sink).
@@ -2253,9 +2369,23 @@ fn stream_managed(
     router_header: Option<String>,
     wardryx_header: Option<String>,
     pruned_header: Option<String>,
+    // Invariant 104: what the buffered path judges a complete answer's tool
+    // calls with, owned because the stream outlives this call.
+    firewall_labels: Labels,
+    firewall_prompt: Option<String>,
+    blocked_row: CallRecord,
+    unit: String,
 ) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let inner = resp.body;
+    // Invariant 104: with the firewall on, a 2xx stream's tool calls are held
+    // until the provider's stream ends and judged as the buffered path judges
+    // them. Off, or a refusal (which carries no tool call), passes through as
+    // it always has, byte for byte and unheld.
+    let hold = (st.firewall.mode != FirewallMode::Off && status.is_success())
+        .then(crate::streamgate::ToolCallHold::new);
+    let fw_state = st.clone();
+    let openai_wire = st.wire == Wire::OpenAi;
     // The guard arrives already answered (invariant 50: `guard.answered` ran
     // in `handle`, on the line the status became known), so its run id and
     // step are all this function needs from it before it moves into the
@@ -2292,6 +2422,7 @@ fn stream_managed(
     // guard's Drop settles instead, so the reservation is never leaked.
     let wrapped = async_stream::try_stream! {
         let guard = guard;
+        let mut hold = hold;
         futures::pin_mut!(inner);
         while let Some(chunk) = inner.next().await {
             // Reported before it is propagated, and this is the one failure
@@ -2327,9 +2458,54 @@ fn stream_managed(
                     Err(e)?
                 }
             };
-            yield chunk;
+            match hold.as_mut() {
+                Some(h) => {
+                    let now = h.push(&chunk);
+                    if !now.is_empty() {
+                        yield Bytes::from(now);
+                    }
+                }
+                None => yield chunk,
+            }
         }
+        // Settled first, as the buffered path settles before it judges: the
+        // call happened, and a refusal below withholds the answer, not the cost.
         guard.complete();
+        if let Some(h) = hold {
+            let held = h.finish();
+            let chain = (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
+                Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
+                None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
+            });
+            let verdict = judge_model_tool_calls(
+                &fw_state,
+                &firewall_labels,
+                &held.tools,
+                move || CallRecord { ts_millis: now_millis(), ..blocked_row },
+                &ev_agent_id,
+                &ev_run_id,
+                chain,
+                firewall_prompt.as_deref(),
+                &unit,
+            );
+            match verdict {
+                ToolCallVerdict::Blocked(reason) => {
+                    yield Bytes::from(crate::streamgate::refusal_event(
+                        openai_wire,
+                        &ev_run_id,
+                        &reason,
+                    ));
+                }
+                ToolCallVerdict::Allowed | ToolCallVerdict::WouldBlock(_) => {
+                    if !held.held.is_empty() {
+                        yield Bytes::from(held.held);
+                    }
+                    if !held.tail.is_empty() {
+                        yield Bytes::from(held.tail);
+                    }
+                }
+            }
+        }
     };
     // Pin with an explicit error type so `Body::from_stream` can pick up the
     // `Into<BoxError>` bound.
@@ -2478,91 +2654,58 @@ async fn buffered_managed(
         .unwrap_or(actual);
 
     // Agent firewall: judge the model's requested tool calls against the run's
-    // accumulated taint. Enforce → 403; shadow/warn → header note.
+    // accumulated taint. Enforce → 403; shadow/warn → header note. The same
+    // judgement the streamed path makes on the tool calls it held
+    // (`judge_model_tool_calls`, invariant 104).
     let mut firewall_note: Option<String> = None;
     if st.firewall.mode != FirewallMode::Off {
         let resp_json: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         let resp_tools = taint::tool_names_in(&resp_json);
-        let requested = taint::capabilities_for_tools(&resp_tools, &st.firewall.capabilities);
-        if let Some(verdict) = taint::evaluate(&firewall_labels, &requested, &st.firewall.rules) {
-            let reason = verdict.reason();
-            if st.firewall.mode == FirewallMode::Enforce {
-                // The call already happened and its real cost was recorded as
-                // "allow" above — this second record is the security verdict
-                // that blocks the *response* from reaching the caller, so it
-                // carries no additional cost (avoids double-counting spend).
-                st.sink.record(CallRecord {
-                    ts_millis: now_millis(),
-                    run_id: guard.run_id().to_string(),
-                    model: model.to_string(),
-                    decision: "taint_blocked".into(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cost_microusd: 0,
-                    step: guard.step(),
-                    agent_id: agent_id.to_string(),
-                    saved_microusd: 0,
-                    parent_run_id: parent_run_id.to_string(),
-                    on_behalf_of: on_behalf_of.to_string(),
-                    outcome: outcome_tag.to_string(),
-                    key_id: key_id.to_string(),
-                    unit: unit.to_string(),
-                    // The real observation already landed on the sibling
-                    // "allow" row above; this verdict row isn't a second
-                    // model response, so it carries none of its own (I1).
-                    tool_calls: None,
-                    tools_offered: None,
-                    tools_would_prune: None,
-                    pruned_schema_tokens_est: None,
-                    identity_reason: guard.identity_reason(),
-                });
-                let outcome = st.events.emit(
-                    EventType::TaintBlock,
-                    now_millis(),
-                    Some(event_agent_id),
-                    Some(guard.run_id()),
-                    chain_on_record,
-                    taint_verdict_data(
-                        TaintStage::ModelToolCall,
-                        TaintEnforcement::Enforce,
-                        &verdict,
-                        &resp_tools,
-                        firewall_prompt.as_deref(),
-                        unit,
-                    ),
-                );
-                crate::events::log_outcome(EventType::TaintBlock, outcome);
-                return firewall_block(guard.run_id(), &reason);
-            }
-            // Shadow: the action is PERMITTED and this response carries it to
-            // a client that will execute it. Before 2026-08-26 that fact left
-            // the box as a response header and nothing else, so the only party
-            // ever told was the agent that had just been talked into it.
-            let outcome = st.events.emit(
-                EventType::TaintShadow,
-                now_millis(),
-                Some(event_agent_id),
-                Some(guard.run_id()),
-                chain_on_record,
-                taint_verdict_data(
-                    TaintStage::ModelToolCall,
-                    TaintEnforcement::Shadow,
-                    &verdict,
-                    &resp_tools,
-                    firewall_prompt.as_deref(),
-                    unit,
-                ),
-            );
-            crate::events::log_outcome(EventType::TaintShadow, outcome);
-            firewall_note = Some(reason);
-        }
-        // Executing these tools will taint future turns — record their labels now.
-        st.name_unclassified(&resp_tools);
-        st.accumulate_taint(
+        let verdict = judge_model_tool_calls(
+            st,
+            &firewall_labels,
+            &resp_tools,
+            // The call already happened and its real cost was recorded as
+            // "allow" above — this second record is the security verdict
+            // that blocks the *response* from reaching the caller, so it
+            // carries no additional cost (avoids double-counting spend).
+            || CallRecord {
+                ts_millis: now_millis(),
+                run_id: guard.run_id().to_string(),
+                model: model.to_string(),
+                decision: "taint_blocked".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: guard.step(),
+                agent_id: agent_id.to_string(),
+                saved_microusd: 0,
+                parent_run_id: parent_run_id.to_string(),
+                on_behalf_of: on_behalf_of.to_string(),
+                outcome: outcome_tag.to_string(),
+                key_id: key_id.to_string(),
+                unit: unit.to_string(),
+                // The real observation already landed on the sibling
+                // "allow" row above; this verdict row isn't a second
+                // model response, so it carries none of its own (I1).
+                tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
+                identity_reason: guard.identity_reason(),
+            },
+            event_agent_id,
             guard.run_id(),
-            taint::labels_for_tools(&resp_tools, &st.firewall.sources),
+            chain_on_record,
+            firewall_prompt.as_deref(),
+            unit,
         );
+        match verdict {
+            ToolCallVerdict::Blocked(reason) => return firewall_block(guard.run_id(), &reason),
+            ToolCallVerdict::WouldBlock(reason) => firewall_note = Some(reason),
+            ToolCallVerdict::Allowed => {}
+        }
     }
 
     // Store a successful response for future cache hits.
@@ -7022,6 +7165,33 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            // Invariant 104's inputs; the firewall is off here, so nothing is
+            // held and the row is never written.
+            Labels::new(),
+            None,
+            CallRecord {
+                ts_millis: 0,
+                run_id: String::new(),
+                model: String::new(),
+                decision: "taint_blocked".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: 0,
+                agent_id: String::new(),
+                saved_microusd: 0,
+                parent_run_id: String::new(),
+                on_behalf_of: String::new(),
+                outcome: String::new(),
+                key_id: String::new(),
+                unit: String::new(),
+                tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
+                identity_reason: None,
+            },
+            String::new(),
         );
         {
             // Consume a single chunk, then drop the stream (simulated cancel).

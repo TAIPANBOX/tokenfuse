@@ -1164,6 +1164,40 @@ run_case "seed-gate: a restored reservation refuses the late unit seed" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact unitledger::tests::a_late_seed_lands_beside_a_restored_reservation" \
 	"$(py 'edit("crates/gateway/src/unitledger.rs", "        if s.spent != Microusd::ZERO {", "        if s.spent != Microusd::ZERO || s.reserved != Microusd::ZERO {")')" \
 	"a_late_seed_lands_beside_a_restored_reservation ... FAILED"
+
+# --- invariant 104: a streamed tool call is judged ------------------------------
+#
+# Not a scripts/*.sh gate: the rule is the stream gate and the shared judgement,
+# held by cargo test through the real router with the answers cut into chunks.
+# Each mutant is a way a denied tool call reaches a streaming agent again.
+run_case "streamed-tools: the hold never engaged" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let hold = (st.firewall.mode != FirewallMode::Off && status.is_success())", "    let hold = (false && st.firewall.mode != FirewallMode::Off && status.is_success())")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the OpenAI wire's tool calls not read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", ".and_then(|d| d.get(\"tool_calls\"))", ".and_then(|d| d.get(\"tool_calls_mutant\"))")')" \
+	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the Anthropic wire's tool calls not read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "== Some(\"tool_use\")", "== Some(\"tool_use_mutant\")")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the held call leaks before the refusal" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                    yield Bytes::from(crate::streamgate::refusal_event(", "                    yield Bytes::from(held.held.clone());\n                    yield Bytes::from(crate::streamgate::refusal_event(")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+# The OpenAI wire puts a tool marker on every argument delta, so this mutant is
+# invisible there; the Anthropic wire sends its argument deltas as bare
+# input_json_delta events with no name, which the mutant forwards, so that test is the one that goes red.
+run_case "streamed-tools: only the event that opened the call is held" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "        if self.holding || opens_tool {", "        if opens_tool {")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
 # --- invariant 102: a served page builds no markup from data ----------------
 #
 # The faults are planted in the page the control plane serves, just before the
