@@ -156,3 +156,24 @@ async fn a_good_key_writes_no_refusal() {
     assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert!(refusals(&bus).is_empty());
 }
+
+/// A scanner sends no `x-fuse-agent-id`. Its refusals are on the bus too,
+/// under the one reserved subject for a caller that presented no identity,
+/// rate-limited like the rest.
+#[tokio::test]
+async fn a_scan_that_names_no_agent_is_on_the_bus_too() {
+    let (st, bus) = gateway("anonymous");
+    for i in 0..5 {
+        let (status, _) = call(&st, Some(&format!("sk-anon-{i}")), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _) = call(&st, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let events = refusals(&bus);
+    assert_eq!(events.len(), 6, "{events:?}");
+    for e in &events {
+        assert_eq!(e["agent_id"], "agent://unidentified.invalid/caller", "{e}");
+        assert!(e["data"]["agent_id"].is_null(), "no agent was claimed: {e}");
+    }
+    assert_eq!(events[5]["data"]["reason"], "missing_key");
+}
