@@ -7086,6 +7086,7 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     gate, the closed gate's reason and its once-per-run count, the bound, the backoff and its
     overflow); `unitledger::tests::a_late_seed_lands_beside_a_restored_reservation` and the narrowed
     `a_seed_never_overwrites_a_window_already_counting`. Mutants as cases in
-    `scripts/gates-have-teeth.sh`: the gate never consulted, the gate opened on a failed startup
-    attempt, the retry never opening the gate, kills left out of the seed. Scenarios:
+    `scripts/gates-have-teeth.sh`: the gate never consulted, the gate left open after a failed
+    startup attempt, the retry never opening the gate, shadow forwarding without saying so, a
+    restored reservation refusing the late unit seed. Scenarios:
     `features/a-gateway-admits-nothing-until-its-seed-is-read.feature`. Not a script gate)*
