@@ -181,7 +181,9 @@
       "x_tool_calls",
       "x_key_id",
       "x_block_reason",
-      "x_identity_reason"
+      "x_identity_reason",
+      "x_price_basis",
+      "x_pii_findings"
     ]
   },
   "generated_by": "tokenfuse constants (crates/gateway/src/constants.rs)",
@@ -1428,6 +1430,11 @@
         "name": "pii_findings",
         "nullable": true,
         "type": "Utf8"
+      },
+      {
+        "name": "price_basis",
+        "nullable": true,
+        "type": "Utf8"
       }
     ],
     "write_schema": [
@@ -1533,6 +1540,11 @@
       },
       {
         "name": "pii_findings",
+        "nullable": true,
+        "type": "Utf8"
+      },
+      {
+        "name": "price_basis",
         "nullable": true,
         "type": "Utf8"
       }

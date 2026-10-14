@@ -7261,3 +7261,27 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     paths, a named run and none; red first in CI on the unchanged broker. Mutant as a case in
     `scripts/gates-have-teeth.sh`: `record_run_id` answering none. Scenarios:
     `features/a-brokered-tool-call-names-its-run.feature`. Not a script gate)*
+
+109. **The FOCUS export names the price basis an admitted call was charged at and the PII the
+    scanner let through.** costcrew reads only the FOCUS export (its invariant 64); the price basis
+    rode the Cloud wire alone (invariant 86) and `pii_findings` the trace alone (invariant 106), so
+    a call charged at the fallback (forge 2026-10-14: `openai/gpt-4.1-mini` at 15 / 75) and a shadow
+    PII finding were invisible to it. `@decided 2026-10-14`: both reach the export, backward
+    compatible.
+
+    The trace gains a nullable `price_basis` column (`known` or `fallback`, `pricebook::basis`, the
+    word `x-fuse-price` carries), set by `proxy::handle_call` on `CallAttribution` and written on
+    the `allow` row only; it is kept off the Cloud wire (`#[serde(skip_serializing)]`), where
+    `cloudsink` already puts its own `price_basis` beside the record. `focusexport` appends
+    `x_price_basis` and `x_pii_findings` after `x_identity_reason`, read through `COALESCE`, so a
+    trace segment written before either column exports them empty; `focus_export.columns` and both
+    `trace_parquet` schemas publish them (invariant 14), and `compat/1.0.json`'s additive FOCUS
+    sentence names them. Not covered: a refusal row carries no basis (nothing was charged at a
+    rate); a cache hit carries no basis; costcrew's reader is its own PR.
+    *(test: `tests/it/focus_names_price_basis_and_pii.rs::the_export_names_the_price_basis_and_the_pii_let_through`,
+    the router into a Parquet trace and the real `tokenfuse focus-export` binary, red first in CI
+    (no such columns); the golden export test and
+    `constants::tests::the_focus_export_columns_are_published_in_export_order` gained the two
+    columns. Mutants as cases in `scripts/gates-have-teeth.sh`: the basis never set on the
+    attribution, the export reading the PII column into the basis. Scenarios:
+    `features/the-focus-export-names-basis-and-pii.feature`. Not a script gate)*

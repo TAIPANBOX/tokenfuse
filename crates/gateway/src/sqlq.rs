@@ -149,6 +149,7 @@ mod tests {
                     pruned_schema_tokens_est: None,
                     identity_reason: None,
                     pii_findings: None,
+                    price_basis: None,
                 });
             }
         }
@@ -264,6 +265,7 @@ mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             });
         }
 
@@ -410,6 +412,7 @@ mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             });
         }
 
@@ -531,6 +534,7 @@ mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             });
         }
 
@@ -653,6 +657,7 @@ mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             });
         }
 
@@ -778,6 +783,7 @@ mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             });
         }
 

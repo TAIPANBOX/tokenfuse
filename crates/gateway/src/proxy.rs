@@ -1022,6 +1022,7 @@ async fn handle_call(
                     pruned_schema_tokens_est: None,
                     identity_reason: Some(mismatch.reason.to_string()),
                     pii_findings: None,
+                    price_basis: None,
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -1129,6 +1130,7 @@ async fn handle_call(
             pruned_schema_tokens_est: None,
             identity_reason: identity_reason.clone(),
             pii_findings: None,
+            price_basis: None,
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1200,6 +1202,7 @@ async fn handle_call(
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
+                        price_basis: None,
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1334,6 +1337,7 @@ async fn handle_call(
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
                         pii_findings: pii_counts.clone(),
+                        price_basis: None,
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1423,6 +1427,7 @@ async fn handle_call(
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
+                price_basis: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1465,6 +1470,7 @@ async fn handle_call(
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
+                price_basis: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1534,6 +1540,7 @@ async fn handle_call(
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
+                price_basis: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1676,6 +1683,7 @@ async fn handle_call(
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
+                        price_basis: None,
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1707,6 +1715,7 @@ async fn handle_call(
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
+                        price_basis: None,
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -1794,6 +1803,7 @@ async fn handle_call(
                         pruned_schema_tokens_est: None,
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
+                        price_basis: None,
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -1849,6 +1859,9 @@ async fn handle_call(
             pruned_schema_tokens_est,
             identity_reason: identity_reason.clone(),
             pii_findings: pii_counts.clone(),
+            // Invariant 109: the same word `x-fuse-price` carries, from the
+            // pure function behind it, onto the `allow` row.
+            price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()),
         },
         unit_reservation,
     )
@@ -1893,6 +1906,7 @@ async fn handle_call(
                     pruned_schema_tokens_est: None,
                     identity_reason: identity_reason.clone(),
                     pii_findings: None,
+                    price_basis: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -2180,6 +2194,7 @@ async fn handle_call(
                 pruned_schema_tokens_est: None,
                 identity_reason: identity_reason.clone(),
                 pii_findings: pii_counts.clone(),
+                price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()),
             },
             unit.clone(),
         )
@@ -2715,6 +2730,7 @@ async fn buffered_managed(
                 pruned_schema_tokens_est: None,
                 identity_reason: guard.identity_reason(),
                 pii_findings: None,
+                price_basis: None,
             },
             event_agent_id,
             guard.run_id(),
@@ -7256,6 +7272,7 @@ pub(crate) mod tests {
                 pruned_schema_tokens_est: None,
                 identity_reason: None,
                 pii_findings: None,
+                price_basis: None,
             },
             String::new(),
         );

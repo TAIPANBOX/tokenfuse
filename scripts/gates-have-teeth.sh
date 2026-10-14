@@ -1349,6 +1349,17 @@ run_case "broker-run-id: the record names no run" fail \
 	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    ctx.run_id.as_deref().filter(|r| !r.is_empty())", "    ctx.run_id.as_deref().filter(|r| !r.is_empty() && false)")')" \
 	"a_brokered_tool_call_record_carries_the_callers_run_id ... FAILED"
 
+# --- invariant 109: the FOCUS export names the basis and the PII ----------------
+run_case "focus-basis-pii: the basis never set on the attribution" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_names_price_basis_and_pii::the_export_names_the_price_basis_and_the_pii_let_through" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()),", "price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()).filter(|_| false),")')" \
+	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
+
+run_case "focus-basis-pii: the export reads the PII column as the basis" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_names_price_basis_and_pii::the_export_names_the_price_basis_and_the_pii_let_through" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "price_basis: str_at(b.column(14).as_ref(), i),", "price_basis: str_at(b.column(15).as_ref(), i),")')" \
+	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
