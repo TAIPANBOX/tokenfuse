@@ -586,7 +586,7 @@ mod tests {
         // mcpbroker.rs) drops the overlapping pii finding and keeps the
         // secret; this proves spans_overlap actually flags the overlap for
         // that logic to act on.
-        let text = "token eyJhbGciOiJIUzI1NiJ9.4111111111111111.dGVzdHNpZ25hdHVyZQ end";
+        let text = "token eyJhbGciOiJIUzI1NiJ9.x4111111111111111.dGVzdHNpZ25hdHVyZQ end";
         let secrets = scan(text);
         let pii = scan_pii(text);
         assert_eq!(secrets.len(), 1);
