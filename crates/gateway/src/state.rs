@@ -162,6 +162,9 @@ pub struct AppState {
     /// whether or not client keys/identity are configured. See
     /// `crate::keystats`/`crate::keysreport`.
     pub keystats: Arc<KeyStats>,
+    /// Which refusals for a missing or unknown client key go on the bus, so a
+    /// scan is seen without flooding it (invariant 105, `crate::refusedkeys`).
+    pub refused_keys: Arc<crate::refusedkeys::RefusedKeys>,
     /// What `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`
     /// and `/v1/agent-ids` require of a caller (`crate::adminkeys`). Defaults
     /// to [`AdminGate::Open`], the behaviour every existing deployment and
@@ -616,6 +619,7 @@ impl AppState {
             units: Arc::new(UnitLedger::default()),
             retained: Arc::new(crate::settle::Retained::default()),
             keystats: Arc::new(KeyStats::default()),
+            refused_keys: Arc::new(crate::refusedkeys::RefusedKeys::default()),
             admin_gate: AdminGate::default(),
             closure: None,
             // Every deployment that predates this field is Anthropic-only, so

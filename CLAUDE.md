@@ -7010,3 +7010,34 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
     page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
     each bound.)*
+
+105. **A call refused for its client key is on the bus, by reason and fingerprint, never the key,
+    and a scan cannot flood it.** A `401` for a missing or unknown `x-fuse-key` bumped one aggregate
+    counter and wrote nothing else, so a key scan was invisible to every consumer of the bus
+    (forge, 2026-10-14: no key, an unknown key and the other door's key, all silent).
+    `@decided 2026-10-14`: a refused client key goes on the bus with a non-reversible fingerprint
+    of what was presented, never the key, rate-limited per source so a scan cannot flood it.
+
+    `proxy::report_refused_key` emits one `identity_mismatch` (the identity gate's type, `high`)
+    whose `data.reason` is `missing_key` or `unknown_key`, words no real identity mismatch uses,
+    with `key_fingerprint` (`refusedkeys::fingerprint`: `sha256:` and the first 16 hex digits of
+    the SHA-256 of the presented value) for an unknown key, the claimed `agent_id`, and
+    `unreported_since_last`. Filed under the `x-fuse-agent-id` the call claimed; a call naming none
+    is skipped and counted by the exporter (invariant 6). `refusedkeys::RefusedKeys` limits it: a
+    source (fingerprint or `missing_key`, and the claimed agent) at most once a minute, the gateway
+    at most sixty a minute, the remembered sources bounded at 4096. The caller's `401` is
+    byte-for-byte what it was: the two causes stay indistinguishable to the caller.
+
+    Not covered: the MCP broker's own door refuses through `mcpbroker::unauthorized` and writes
+    nothing yet; a source is not a network address (the gateway does not read one), so one client
+    rotating keys spends the global sixty; the fingerprint of a short guess is recoverable by
+    guessing, which is not a secret; heraldyx alerts on `identity_mismatch` at `high`, so a client
+    retrying one wrong key raises one alert a minute and a scan at most sixty, before heraldyx's own
+    grouping, which this repository does not hold.
+    *(tests: `tests/it/refused_key_on_the_bus.rs`: `a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason`,
+    `the_same_key_tried_again_and_again_is_one_event`, `a_scan_of_many_keys_cannot_flood_the_bus`
+    (three red first in CI on the unchanged gateway, no event at all), and the control
+    `a_good_key_writes_no_refusal`; `refusedkeys::tests` (five: the fingerprint, the per-source
+    minute, the global sixty, the bound, the data). Mutants as cases in `scripts/gates-have-teeth.sh`:
+    the report never made, the per-source limit removed, the fingerprint replaced by the key.
+    Scenarios: `features/a-refused-client-key-is-on-the-bus.feature`. Not a script gate)*

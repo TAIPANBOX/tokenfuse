@@ -153,7 +153,14 @@ vocabulary the console is expected to use, from the fields above:
   (`crates/gateway/src/clientkeys.rs`'s documented security stance); this
   report does not, and must not, narrow that down. `unauthorized_since_startup`
   is an AGGREGATE, process-wide counter only, with no per-secret, per-key,
-  or per-source breakdown anywhere, on purpose.
+  or per-source breakdown anywhere, on purpose. The operator's event bus is
+  where the cause is named (since 2026-10-14, invariant 105): one
+  `identity_mismatch` per refusal, `reason` `missing_key` or `unknown_key`, the
+  unknown key as `sha256:` plus 16 hex digits of its SHA-256 and never the key,
+  rate-limited to one event per key and claimed agent a minute and sixty a
+  minute per gateway, with `unreported_since_last` counting what the limit held
+  back. A call that names no `x-fuse-agent-id` has no subject for the envelope,
+  so its refusal is skipped and counted by the exporter, not invented one.
 - `truncated_settlements_since_startup` counts settlements
   (`crates/gateway/src/settle.rs`, `crate::proxy::buffered_managed`) that fell
   back to the pre-flight estimate because the usage-parser cap
