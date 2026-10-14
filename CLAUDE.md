@@ -7002,9 +7002,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `setHTMLUnsafe`, `parseHTMLUnsafe`) unless it is one constant string an ALLOW entry names with
     a reason. In `cloud/dashboard` any code line naming `dangerouslySetInnerHTML` or a sink is
     refused. `scripts/gates-have-teeth.sh` plants both shapes of the fault (a template literal and
-    a concatenation), requires `textContent` and the committed page to pass, holds the allow-list's
-    three rules, and takes the subject away five ways, each of which must read as measured
-    nothing. Tests: `crates/cloud/tests/it/dashboard_page.rs`,
+    a concatenation), requires `textContent`, a sink named in a comment or a string, and the
+    committed page to pass, finds a sink in a second embedded file no list names, holds the
+    allow-list's three rules, and takes the subject away five ways, each of which must read as
+    measured nothing. Tests: `crates/cloud/tests/it/dashboard_page.rs`,
     `the_served_page_never_parses_a_run_field_as_markup` and
     `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
     page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
