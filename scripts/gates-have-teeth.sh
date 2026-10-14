@@ -1294,6 +1294,25 @@ for p in paths:
     os.remove(p)')" \
 	"measured nothing"
 
+# --- invariant 105: a refused client key is on the bus ------------------------
+#
+# Not a scripts/*.sh gate: held by cargo test through the real router. Each
+# mutant is a way a key scan goes quiet again, floods the bus, or leaks the key.
+run_case "refused-key: the refusal never reported" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        report_refused_key(&st, &headers);", "        if false { report_refused_key(&st, &headers); }")')" \
+	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
+
+run_case "refused-key: the per-source limit removed" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::the_same_key_tried_again_and_again_is_one_event" \
+	"$(py 'edit("crates/gateway/src/refusedkeys.rs", "        if !due || global_full {", "        if (!due && false) || global_full {")')" \
+	"the_same_key_tried_again_and_again_is_one_event ... FAILED"
+
+run_case "refused-key: the fingerprint carries the key" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
+	"$(py 'edit("crates/gateway/src/refusedkeys.rs", "    format!(\"sha256:{hex}\")", "    format!(\"sha256:{hex}{presented}\")")')" \
+	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

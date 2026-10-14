@@ -655,6 +655,7 @@ async fn handle_call(
     // credential, so an operator who turned this on to control who may use the
     // gateway would be surprised to find "omit the run id" is a way around it.
     let Some(key_id) = resolve_client_key(&st, &headers) else {
+        report_refused_key(&st, &headers);
         return unauthorized(&st.keystats);
     };
     // Key lifecycle health (docs/22): one increment per request that
@@ -2794,6 +2795,50 @@ fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
 fn unauthorized(stats: &KeyStats) -> Response {
     stats.record_unauthorized();
     unauthorized_response()
+}
+
+/// Invariant 105: put a refusal for a missing or unknown client key on the
+/// bus, rate-limited per source (`crate::refusedkeys`). The operator's record
+/// learns which cause it was; the caller's `401` does not change. Filed under
+/// the agent the call claimed, and a call that names none (a scan names none)
+/// under `refusedkeys::UNIDENTIFIED_CALLER`, a reserved subject that can be no
+/// real agent, never one made up to look like one (invariant 6).
+fn report_refused_key(st: &AppState, headers: &HeaderMap) {
+    let presented = header_str(headers, crate::clientkeys::CLIENT_KEY_HEADER)
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let (reason, fingerprint) = match presented.as_deref() {
+        None => ("missing_key", None),
+        Some(k) => ("unknown_key", Some(crate::refusedkeys::fingerprint(k))),
+    };
+    let claimed_agent = header_str(headers, "x-fuse-agent-id").unwrap_or_default();
+    let source = format!(
+        "{}|{claimed_agent}",
+        fingerprint.as_deref().unwrap_or(reason)
+    );
+    let Some(unreported) = st.refused_keys.admit(&source, now_millis()) else {
+        return;
+    };
+    let run_id = header_str(headers, "x-fuse-run-id");
+    let subject = if claimed_agent.is_empty() {
+        crate::refusedkeys::UNIDENTIFIED_CALLER
+    } else {
+        claimed_agent.as_str()
+    };
+    let outcome = st.events.emit(
+        EventType::IdentityMismatch,
+        now_millis(),
+        Some(subject),
+        run_id.as_deref(),
+        None,
+        crate::refusedkeys::refused_key_data(
+            reason,
+            fingerprint.as_deref(),
+            &claimed_agent,
+            unreported,
+        ),
+    );
+    crate::events::log_outcome(EventType::IdentityMismatch, outcome);
 }
 
 /// The bytes of that 401, without the counter.
