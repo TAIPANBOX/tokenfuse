@@ -132,6 +132,12 @@ jobs:
       - name: no owner quotes in a public repository
         run: ./scripts/no-owner-quotes.sh
 
+      # A run id and a model name are chosen by whoever calls a gateway. A page
+      # this repository serves puts what the API returns into the document as
+      # text and never assigns it as markup (invariant 102).
+      - name: served pages build no markup from data
+        run: ./scripts/no-html-from-data.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04
