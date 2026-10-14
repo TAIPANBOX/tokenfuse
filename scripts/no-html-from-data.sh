@@ -296,11 +296,18 @@ for k, (path, expr, _) in enumerate(ALLOW):
     if k not in allow_used:
         findings.append("ALLOW entry %r for %s matches no sink; remove it" % (expr, path))
 
-dashboard = [p for p in tracked("cloud/dashboard") if p.endswith((".tsx", ".ts", ".jsx", ".js", ".mjs"))]
+dashboard = []
+for path in tracked("cloud/dashboard"):
+    if not path.endswith((".tsx", ".ts", ".jsx", ".js", ".mjs")):
+        continue
+    try:
+        dashboard.append((path, open(path, encoding="utf-8").read()))
+    except OSError:
+        continue
 if not dashboard:
-    nothing.append("cloud/dashboard has no tracked source file, so nothing of the dashboard was read")
-for path in dashboard:
-    for i, line in enumerate(open(path, encoding="utf-8").read().split("\n"), 1):
+    nothing.append("cloud/dashboard has no source file to read, so nothing of the dashboard was read")
+for path, source in dashboard:
+    for i, line in enumerate(source.split("\n"), 1):
         if line.lstrip().startswith(("//", "*", "/*", "{/*")):
             continue
         m = DASHBOARD_WORDS.search(line)
