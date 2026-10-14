@@ -27,6 +27,7 @@ mod pairing;
 mod pii_found;
 mod reads;
 mod replay;
+mod run_models;
 mod run_spend;
 mod run_stalled;
 mod streaming;
