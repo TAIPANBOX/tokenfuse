@@ -50,6 +50,7 @@ pub mod settle;
 pub mod sink;
 pub mod sqlq;
 pub mod state;
+pub mod streamgate;
 #[cfg(test)]
 pub(crate) mod testlog;
 pub mod toolcheck;
