@@ -1371,6 +1371,22 @@ run_case "pii-card: the decimal rule removed" fail \
 	"$(py 'edit("crates/core/src/dlp.rs", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) {", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) && false {")')" \
 	"a_probability_in_a_typed_answer_is_not_a_card ... FAILED"
 
+# --- invariant 111: a run names every model it used, and a gateway's kill ----
+run_case "run-models: the model taken in arrival order" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::an_older_record_never_takes_the_model_from_a_later_call" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if !r.model.is_empty() && r.ts_millis >= agg.model_millis {", "if !r.model.is_empty() && (true || r.ts_millis >= agg.model_millis) {")')" \
+	"an_older_record_never_takes_the_model_from_a_later_call ... FAILED"
+
+run_case "run-models: a refusal counted as a model used" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::a_refusal_names_no_model_the_run_used_and_changes_nothing" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if matches!(r.decision.as_str(), \"allow\" | \"cache_hit\") && !r.model.is_empty() {", "if !r.model.is_empty() {")')" \
+	"a_refusal_names_no_model_the_run_used_and_changes_nothing ... FAILED"
+
+run_case "run-models: the gateway's kill not read" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::a_run_a_gateway_refused_as_killed_reads_killed" \
+	"$(py 'edit("crates/cloud/src/store.rs", "                a.killed = a.killed_by_gateway\n                    || killed", "                a.killed = (a.killed_by_gateway && false)\n                    || killed")')" \
+	"a_run_a_gateway_refused_as_killed_reads_killed ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

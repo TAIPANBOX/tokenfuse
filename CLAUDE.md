@@ -7313,3 +7313,36 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `iban_shaped_noise_is_rarely_an_iban` (200 seeds), `a_card_written_like_a_card_is_still_found`.
     Mutants as cases in `scripts/gates-have-teeth.sh`: the checksum skipped, the decimal rule
     removed. Scenarios: `features/the-pii-scan-finds-an-iban.feature`. Not a script gate)*
+
+111. **The fleet view names every model a run used, how often it changed model, the model of its
+    latest call by time, and a run a gateway refused as killed.** Measured on forge 2026-10-14: a
+    run that spent 96% of its money on Opus and then made one Haiku call read `claude-haiku-5-5`
+    in `GET /v1/runs`, because `RunAgg.model` was overwritten by every record in arrival order, and
+    the console's assistant said the run used Haiku; a run killed on one gateway's own admin route
+    read `killed: false` in the Cloud. `@decided 2026-10-14`: keep the per-run model list (bounded,
+    with calls and spend) and the switch count, name the model by the latest timestamp, return them
+    from the run API, and show a gateway's kill in the Cloud, backward compatible.
+
+    `RunAgg` gains `models` (`[{model, calls, spent_microusd}]`, sorted by id, `MAX_RUN_MODELS` =
+    16 ids, the rest counted under `(other models)`, never dropped), `model_switches`,
+    `killed_by_gateway`, and the bookkeeping `model_millis`, `last_admitted_model`,
+    `last_admitted_millis`; every field is `#[serde(default)]`, so a snapshot written before them
+    loads. `model` is taken only from a record at least as new as the one it came from. Only an
+    admitted call (`allow`, `cache_hit`) joins `models` or moves `model_switches`; a switch is
+    counted when an admitted call newer than every admitted call already folded names another
+    model, so a run pushed in order is exact and one pushed out of order by two gateways is a
+    floor. A record with decision `killed` (the gateway's refusal of a killed run) sets
+    `killed_by_gateway`, and `runs_since` reads `killed` as that or the Cloud's own kill list;
+    the kill list, `/v1/kills`, `/v1/runs/spend` and the gateways' kill pollers are unchanged.
+
+    `@claude` 2026-10-14, the limits: a run killed on a gateway that makes no further call never
+    produces a `killed` row, so the Cloud never learns of it (sending the gateway's admin kill to
+    the Cloud is a follow-up); a gateway's kill is shown, not enforced by other gateways.
+    *(tests: `crates/cloud/tests/it/run_models.rs`, four, all red on the unchanged store in CI:
+    `a_run_that_changed_model_says_which_and_how_often`,
+    `an_older_record_never_takes_the_model_from_a_later_call`,
+    `a_refusal_names_no_model_the_run_used_and_changes_nothing`,
+    `a_run_a_gateway_refused_as_killed_reads_killed`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the model taken in arrival order, a refusal counted as a model
+    used, the gateway's kill not read. Scenarios: `features/a-run-names-every-model-it-used.feature`.
+    Not a script gate)*

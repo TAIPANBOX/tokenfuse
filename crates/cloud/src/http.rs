@@ -40,7 +40,8 @@ use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
     AgentAgg, AgentWindowSpend, Alert, CallRecord, GatewayAgg, Incident, KindCalls, ModelCalls,
-    OwnerAgg, RunAgg, RunSpend, SavingsSummary, SeriesBucket, Store, Summary, UnitAgg, WindowSpend,
+    OwnerAgg, RunAgg, RunModel, RunSpend, SavingsSummary, SeriesBucket, Store, Summary, UnitAgg,
+    WindowSpend,
 };
 
 /// The OpenAPI document for the control-plane API. Rendered at `/openapi.json`
@@ -72,6 +73,7 @@ use crate::store::{
         Summary,
         ModelCalls,
         KindCalls,
+        RunModel,
         Alert,
         SeriesBucket,
         Incident,

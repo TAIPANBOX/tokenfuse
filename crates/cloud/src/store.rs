@@ -310,6 +310,40 @@ pub struct RunSpend {
     pub killed: bool,
 }
 
+/// Invariant 111: count one admitted call of `model` on the run, bounded at
+/// [`MAX_RUN_MODELS`] ids plus the [`OTHER_FALLBACK_MODELS`] bucket, sorted
+/// by id with the bucket last.
+fn fold_run_model(agg: &mut RunAgg, model: &str, cost_microusd: i64) {
+    let known = agg.models.iter().any(|m| m.model == model);
+    let distinct = agg
+        .models
+        .iter()
+        .filter(|m| m.model != OTHER_FALLBACK_MODELS)
+        .count();
+    let key = if known || distinct < MAX_RUN_MODELS {
+        model
+    } else {
+        OTHER_FALLBACK_MODELS
+    };
+    match agg.models.iter_mut().find(|m| m.model == key) {
+        Some(m) => {
+            m.calls += 1;
+            m.spent_microusd = m.spent_microusd.saturating_add(cost_microusd);
+        }
+        None => {
+            agg.models.push(RunModel {
+                model: key.to_string(),
+                calls: 1,
+                spent_microusd: cost_microusd,
+            });
+            agg.models.sort_by(|a, b| {
+                (a.model == OTHER_FALLBACK_MODELS, &a.model)
+                    .cmp(&(b.model == OTHER_FALLBACK_MODELS, &b.model))
+            });
+        }
+    }
+}
+
 /// The aggregated state of one run within an organization.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RunAgg {
@@ -413,7 +447,49 @@ pub struct RunAgg {
     /// or mask (invariant 106).
     #[serde(default)]
     pub pii_calls: u64,
+
+    /// Every model this run's admitted calls named, with their calls and
+    /// spend (invariant 111), sorted by model id; at most [`MAX_RUN_MODELS`]
+    /// ids, the rest counted under [`OTHER_FALLBACK_MODELS`], never dropped.
+    /// `model` above is only the latest call's.
+    #[serde(default)]
+    pub models: Vec<RunModel>,
+    /// How many times an admitted call named a different model from the
+    /// admitted call before it in time (invariant 111). A record older than
+    /// the newest admitted call already folded joins `models` but cannot
+    /// change this count, so a run pushed in order (one gateway) is exact and
+    /// one pushed out of order by two is a floor.
+    #[serde(default)]
+    pub model_switches: u64,
+    /// The timestamp `model` was taken at: the latest call by its own time
+    /// names the run's model, never the latest to arrive.
+    #[serde(default)]
+    pub model_millis: i64,
+    /// The model and time of the newest admitted call folded so far, which
+    /// `model_switches` compares the next one against.
+    #[serde(default)]
+    pub last_admitted_model: String,
+    #[serde(default)]
+    pub last_admitted_millis: i64,
+    /// A gateway refused a call on this run because the run is killed there
+    /// (invariant 111): a kill made on one gateway's own admin route, which
+    /// the Cloud otherwise never hears of. `killed` reads true when this is
+    /// set or the Cloud's own kill list names the run; this never adds the run
+    /// to that list, which only an admin's kill does.
+    #[serde(default)]
+    pub killed_by_gateway: bool,
 }
+
+/// One model a run used: its admitted calls and their spend (invariant 111).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunModel {
+    pub model: String,
+    pub calls: u64,
+    pub spent_microusd: i64,
+}
+
+/// How many distinct model ids one run's `models` keeps (invariant 111).
+pub const MAX_RUN_MODELS: usize = 16;
 
 /// One model id and how many admitted calls were charged at the fallback
 /// rate for it (invariant 86).
@@ -1949,8 +2025,27 @@ impl Store {
                             }
                         }
                     }
-                    if !r.model.is_empty() {
+                    // Invariant 111: the run's model is its latest call's by
+                    // that call's own time, so a record pushed late never
+                    // renames the run.
+                    if !r.model.is_empty() && r.ts_millis >= agg.model_millis {
                         agg.model = r.model.clone();
+                        agg.model_millis = r.ts_millis;
+                    }
+                    if matches!(r.decision.as_str(), "allow" | "cache_hit") && !r.model.is_empty() {
+                        fold_run_model(agg, &r.model, r.cost_microusd.max(0));
+                        if r.ts_millis >= agg.last_admitted_millis {
+                            if !agg.last_admitted_model.is_empty()
+                                && agg.last_admitted_model != r.model
+                            {
+                                agg.model_switches += 1;
+                            }
+                            agg.last_admitted_model = r.model.clone();
+                            agg.last_admitted_millis = r.ts_millis;
+                        }
+                    }
+                    if r.decision == "killed" {
+                        agg.killed_by_gateway = true;
                     }
                     // Invariant 84: by [`filed_under`], never the claimed id
                     // of a refusal for identity. A run id is the caller's
@@ -2894,10 +2989,11 @@ impl Store {
                     continue;
                 }
                 let mut a = agg.clone();
-                a.killed = killed
-                    .and_then(|k| k.get(&a.run_id))
-                    .copied()
-                    .unwrap_or(false);
+                a.killed = a.killed_by_gateway
+                    || killed
+                        .and_then(|k| k.get(&a.run_id))
+                        .copied()
+                        .unwrap_or(false);
                 out.push(a);
             }
         }

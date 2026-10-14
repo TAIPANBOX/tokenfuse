@@ -36,7 +36,11 @@ enforcement.
   **admin** credential (it is a write, and what it writes raises incidents and
   grades compliance controls).
 - **`GET /v1/runs`** — the caller org's per-run aggregates (spend, calls, cache
-  hits, steps, last-seen).
+  hits, steps, last-seen). `model` is the model of the run's latest call by
+  that call's own timestamp; `models` lists every model its admitted calls
+  named, each with `calls` and `spent_microusd` (at most 16 ids, the rest under
+  `(other models)`), and `model_switches` counts how often an admitted call
+  named a different model from the one before it (CLAUDE.md invariant 111).
 - **`GET /v1/summary`** — org totals (runs, calls, spend).
 - **`GET /`** — an embedded, dependency-free dashboard (vanilla JS; enter your
   org key, auto-refreshes every 3 s).
@@ -159,6 +163,15 @@ runs a **kill poller** (`cloudsink::spawn_kill_poller`) that fetches
 `GET /v1/kills` every few seconds and applies each id to its local kill set —
 so the run is hard-stopped (`402 killed`) across the whole fleet, not just on one
 gateway. Enabled automatically whenever `TOKENFUSE_CLOUD_URL` + `_KEY` are set.
+
+A kill made on one gateway's own `POST /v1/runs/{id}/kill` stays on that
+gateway: it is not sent to the Cloud's kill list, so no other gateway applies
+it. What the Cloud does learn is the gateway's refusal: a call refused as
+`killed` is a trace row like any other, and the run's row in `GET /v1/runs`
+then reads `killed: true` (and `killed_by_gateway: true`), so the fleet view
+and anything reading it show the run as killed. The run is not added to
+`GET /v1/kills`. A run killed locally that makes no further call never reaches
+the Cloud as killed (invariant 111).
 
 ## Central budgets (implemented)
 
