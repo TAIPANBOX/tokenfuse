@@ -26,6 +26,7 @@ mod openapi;
 mod pairing;
 mod reads;
 mod replay;
+mod run_models;
 mod run_spend;
 mod run_stalled;
 mod streaming;
