@@ -7078,6 +7078,33 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            // Invariant 104's inputs; the firewall is off here, so nothing is
+            // held and the row is never written.
+            Labels::new(),
+            None,
+            CallRecord {
+                ts_millis: 0,
+                run_id: String::new(),
+                model: String::new(),
+                decision: "taint_blocked".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_microusd: 0,
+                step: 0,
+                agent_id: String::new(),
+                saved_microusd: 0,
+                parent_run_id: String::new(),
+                on_behalf_of: String::new(),
+                outcome: String::new(),
+                key_id: String::new(),
+                unit: String::new(),
+                tool_calls: None,
+                tools_offered: None,
+                tools_would_prune: None,
+                pruned_schema_tokens_est: None,
+                identity_reason: None,
+            },
+            String::new(),
         );
         {
             // Consume a single chunk, then drop the stream (simulated cancel).
