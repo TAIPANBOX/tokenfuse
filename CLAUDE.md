@@ -97,6 +97,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/one-test-binary-per-crate.sh  # invariant 78
 ./scripts/no-owner-quotes.sh     # invariant 101
 ./scripts/no-html-from-data.sh   # invariant 102
+./scripts/teeth-shards-cover-every-case.sh  # invariant 113
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7348,3 +7349,20 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     Not a script gate)*
 
 112. **A call the gateway answered just before it stops reaches the Cloud: the stop delivers what it holds, bounded, and names what it could not deliver.** On SIGTERM or SIGINT the server stops taking calls first; `flush_before_exit` then delivers the queue (in order) and the buffer within `EXIT_FLUSH_WITHIN`, waits for a push already on the wire, and starts nothing new while stopping. What is still undelivered at the bound is logged with its count. A SIGKILL, an out-of-memory kill or a lost node still loses what was not yet pushed, at most the last flush interval of calls plus the queue; a local spool is a follow-up, because replaying it needs the Cloud to recognise a record it already holds. `@decided 2026-10-14`: spend reports are made durable across a stop, and this change takes the delivery-before-exit half. *(test: `gateway::cloudsink::the_exit_flush_delivers_the_queue_then_the_buffer_in_order`, `gateway::cloudsink::the_exit_flush_is_bounded_and_says_what_it_could_not_deliver`, `gateway::cloudsink::a_push_on_the_wire_at_exit_is_counted_when_it_never_lands`, `tests/it/spend_reports_survive_a_stop.rs`: `a_call_served_just_before_sigterm_reaches_the_cloud`, `a_stop_while_the_cloud_does_not_answer_says_what_was_not_delivered`. Scenarios: `features/a-served-call-reaches-the-cloud-when-the-gateway-stops.feature`.)*
+
+113. **The teeth harness runs as four CI shards, and the shards together run every case exactly once.**
+    One job took 30 to 60 minutes, the slowest step in this repository. `TEETH_SHARD=i/N` runs the cases at
+    positions `i`, `i+N`, ... of the list; `TEETH_LIST=1` prints the names through the same filter and runs
+    none; a shard that runs no case says it measured nothing. `scripts/teeth-shards-cover-every-case.sh` lists
+    the full harness and each of the four shards, and requires that no name is listed twice, that no shard is
+    empty, and that the shards together are the full list: nothing dropped, nothing run in two shards. The
+    required check `security (cargo audit)` is an aggregate: it passes only when the `cargo audit` job and all
+    four shards pass. `@claude` 2026-10-14, the split and the aggregate, under delegated authority; open to
+    reversal.
+
+    Not covered: the shard count of four is written twice (the workflow matrix and the gate's `shards=4`) and
+    nothing checks that they agree; the wall time is measured in CI, not here; the four shards compile the same
+    dependencies, each in its own runner.
+    *(gate: `scripts/teeth-shards-cover-every-case.sh`; teeth cases in `scripts/gates-have-teeth.sh`: the real
+    harness partitions, a filter that drops every fifth case, a filter that runs a case in every shard up to its
+    own, and a harness that is gone)*
