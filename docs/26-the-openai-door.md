@@ -293,21 +293,30 @@ variable behaves exactly as it does today.
   2026-09-07`: no such code exists in `proxy.rs`; the field is read for the
   estimate and never rewritten. That is a separate decision, either build it or
   correct the doc, and this work neither fixes nor worsens it.
-- **The response-side firewall judgement still runs only on the buffered
-  path.** `stream_managed` has no `taint::evaluate`. That asymmetry predates
-  this work and is not addressed by it. `@measured 2026-09-07`, checking the
-  premise before repeating it: on the buffered path, `taint::tool_uses_in`
-  already reads both wire shapes (`push_openai_tool_calls` has read
-  `tool_calls` on a message, both in request history and in a non-streaming
-  `choices[].message`, since the taint module's original commit, which
-  predates the OpenAI door entirely) - it is not Anthropic-only, and every
-  caller in `proxy.rs` (the pre-reservation request scan, the wasm hook, the
-  Wardryx PEP, the response-side firewall judgement) reads through it, so
-  none of them is one-sided either. The gap named above is real but
-  symmetric: neither wire's tool calls are seen when they arrive as stream
-  deltas (Anthropic's `content_block_delta`, OpenAI's `choices[].delta.tool_calls`),
-  because nothing on the streaming path calls `taint::evaluate` at all,
-  regardless of which door is open.
+- **The response-side firewall judgement runs on both paths since
+  2026-10-14 (invariant 104).** Until then `stream_managed` had no
+  `taint::evaluate`, so neither wire's tool calls were judged when they arrived
+  as stream deltas, and an agent that streams (most do) was never refused a
+  tool call: measured that day on a router agent through this door, a
+  `write_file` the run's taint denied reached the agent and ran. Now
+  `streamgate::ToolCallHold` splits the stream into events by the event-stream
+  grammar, forwards each one as it completes until an event opens a tool call
+  (Anthropic `content_block_start` with a `tool_use` block, OpenAI
+  `choices[].delta.tool_calls`), holds everything from there to the end of the
+  provider's stream, and the names it collected are judged by
+  `judge_model_tool_calls`, the one function the buffered path calls too. A
+  denial in enforce replaces the held part with one error event in the shape
+  each wire's client libraries raise on mid-stream (Anthropic `event: error`,
+  OpenAI a `data:` chunk holding `error` with `message`, `code` and `param`),
+  carrying the buffered path's `taint_blocked` fields; the status line was
+  already 200 and stays 200. Shadow forwards byte for byte and records
+  `taint_shadow`. Text before the first tool call streams as before; with the
+  firewall off, or on a refused status, the stream is not touched at all.
+  Not covered: the shadow `x-fuse-taint: would-block` note, a header the
+  buffered answer carries, cannot be added to a stream whose headers already
+  left; a tool call whose name never arrives is not judged (the buffered path
+  reads names too); the held part is not bounded beyond what the provider's
+  `max_tokens` bounds, as the buffered body is not.
 - **No performance claim.** The enforcement decision's measured cost belongs to
   the existing path; nothing here is benchmarked until it is.
 - **The OpenAI models in the price book are whatever ships today.** Pricing

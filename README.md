@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.13.2-brightgreen)
-![tests](https://img.shields.io/badge/tests-1937-brightgreen)
+![tests](https://img.shields.io/badge/tests-1956-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -288,7 +288,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 🛠️ **Tool-run metric**: counts the tool calls (`tool_use` blocks / `tool_calls` arrays) the model emits per LLM call, for both Anthropic and OpenAI shapes, streaming and non-streaming alike. Rides the trace as a new nullable `tool_calls` column (schema-evolution safe, like every prior addition), as `x_tool_calls` in FOCUS export, and rolls up into the Cloud dashboard's Runs table and summary tile. Observed only in this release: no budget, no enforcement, just a count (see [docs/21](docs/21-tool-runs.md)).
 
 **Also hardens your agents**
-- 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data.
+- 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data. A tool call the model asks for is judged whether the answer is buffered or streamed: a streamed answer's text flows as it arrives, its tool calls are held to the end of the stream and judged, and a denied one is replaced by an error event the client library raises on (see [docs/26](docs/26-the-openai-door.md) section 8).
 - 🕵️ **DLP**: catches a recognisable secret pasted into a prompt and refuses the call before it leaves (`TOKENFUSE_DLP`, `block` by default). It reads contiguous text and matches patterns, so it catches carelessness, not intent: a secret with no distinctive prefix, or one split across the text, goes through. See [Safe by default](#-safe-by-default) for the measured cases.
 - 🔑 **MCP credential-broker** + a free tool-poisoning / rug-pull scanner, CI-gated - see [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci).
 - 📡 **eBPF Radar**: discover shadow agents on a host, zero config (Linux).

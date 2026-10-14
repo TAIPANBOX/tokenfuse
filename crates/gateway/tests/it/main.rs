@@ -52,6 +52,7 @@ mod security_switches_startup;
 mod seed_before_admit;
 mod send_failure_retention;
 mod shadow_tool_pruning;
+mod streamed_tool_calls_are_judged;
 mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
 mod version_and_help;
