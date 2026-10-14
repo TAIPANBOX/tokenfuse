@@ -118,8 +118,10 @@ cleanup() {
 	restore
 	rm -rf "$baseline_dir"
 }
+# Made in every mode: a case's gate string names $baseline_dir, and that string is
+# expanded when the case is called, before run_case has any chance to skip it.
+baseline_dir="$(mktemp -d)"
 if [ -z "${TEETH_LIST:-}" ]; then
-	baseline_dir="$(mktemp -d)"
 	trap cleanup EXIT INT TERM
 fi
 
@@ -1379,6 +1381,7 @@ run_case "refused-key: the fingerprint carries the key" fail \
 # the list is checked against what is actually on disk.
 # A list run stops here: it has printed its names, and nothing else may be printed.
 if [ -n "${TEETH_LIST:-}" ]; then
+	rm -rf "$baseline_dir"
 	exit 0
 fi
 
