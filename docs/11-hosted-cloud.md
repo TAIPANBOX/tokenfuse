@@ -91,8 +91,14 @@ push the control plane cannot be reached for is queued in memory (10,000
 records, oldest dropped first) and replayed in order when it answers again,
 with one log line at the start of an outage and one at its end (invariant 53); a
 push the control plane REFUSES is dropped and warned about once per status
-(invariant 13); a restart loses the queue, and the local Parquet trace stays the
-source of truth. Every record carries the unit's `owner` from the identity map
+(invariant 13). A gateway stopped with SIGTERM or SIGINT (`docker stop`, a
+Kubernetes pod deletion) first stops taking calls, then delivers what it still
+holds (the queue, then the calls answered since the last flush tick, after any
+push already on the wire has been answered) within 5 s, and logs a warning with
+the count of records the control plane did not receive if any are left
+(invariant 112). A SIGKILL, an out-of-memory kill or a lost node still loses
+whatever was not yet pushed, at most the last 2 s of calls plus the queue; the
+local Parquet trace stays the source of truth. Every record carries the unit's `owner` from the identity map
 beside its trace fields (invariant 54). A periodic flush ships telemetry
 promptly even below the batch size, and is what retries the queue. It composes
 with the other sinks via `TeeSink`.

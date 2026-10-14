@@ -5,9 +5,10 @@
 //! never blocked on the network. A push the control plane cannot be REACHED
 //! for is queued in memory, `QUEUE_CAP` records, oldest dropped first, and
 //! replayed in order when it answers again (invariant 53); a push the control
-//! plane REFUSES is dropped and reported once per status (invariant 13); a
-//! restart loses the queue, and the local Parquet trace remains the source of
-//! truth. Every record carries its unit's owner beside the trace's fields
+//! plane REFUSES is dropped and reported once per status (invariant 13). A
+//! stopping gateway delivers what it holds, bounded, before it exits
+//! (`flush_before_exit`, invariant 112); a SIGKILL loses the buffer and the
+//! queue, and the local Parquet trace remains the source of truth. Every record carries its unit's owner beside the trace's fields
 //! (invariant 54). At startup the unit ledger's month is seeded from the same
 //! control plane (`seed_unit_ledger`, invariant 52). An idle gateway still
 //! pushes an empty batch every `TOKENFUSE_CLOUD_HEARTBEAT_SECONDS` so
@@ -50,6 +51,12 @@ const QUEUE_CAP: usize = 10_000;
 /// can be held by a control plane that accepts a connection and says nothing;
 /// without it that wait is the operating system's connect timeout, minutes.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Invariant 112: how long a stopping gateway spends delivering what it has
+/// not yet pushed (`CloudSink::flush_before_exit`). Inside the 30 s an
+/// orchestrator gives a container between SIGTERM and SIGKILL by default,
+/// with room for a preStop hook before it and the server's own drain.
+pub const EXIT_FLUSH_WITHIN: Duration = Duration::from_secs(5);
 
 /// The literal the control plane files unattributed spend under
 /// (`crates/cloud/src/store.rs`, `units_at`/`owners`); never a unit here.
@@ -227,6 +234,18 @@ enum PushOutcome {
     Unencodable(serde_json::Error),
 }
 
+/// Invariant 112: what `CloudSink::flush_before_exit` delivered.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExitFlush {
+    /// Records the control plane accepted.
+    pub sent: usize,
+    /// Records the control plane answered with a refusal (invariant 13).
+    pub refused: usize,
+    /// Records the control plane never received: still queued or on the wire
+    /// when the time ran out, or unencodable.
+    pub unsent: usize,
+}
+
 /// #294: records whose push never reached the control plane, oldest first.
 struct Queue {
     records: Mutex<VecDeque<CallRecord>>,
@@ -241,6 +260,15 @@ struct Queue {
     replayed: AtomicUsize,
     /// Records dropped at the cap during this outage.
     dropped: AtomicUsize,
+    /// Invariant 112: records a POST holds right now, the fast path's and the
+    /// drainer's current chunk. A record is always in the buffer, here, or in
+    /// `records` until the control plane answers for it, so a stopping
+    /// gateway can count what it owes.
+    in_flight: AtomicUsize,
+    /// Invariant 112: the gateway is stopping. `ship` queues instead of
+    /// spawning a push and `drain` does nothing, so `flush_before_exit` is
+    /// the only sender and the exit can count what is left.
+    closing: AtomicBool,
 }
 
 impl Default for Queue {
@@ -252,6 +280,8 @@ impl Default for Queue {
             drop_warned: AtomicBool::new(false),
             replayed: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
         }
     }
 }
@@ -382,6 +412,10 @@ impl CloudSink {
         if records.is_empty() {
             return;
         }
+        if self.queue.closing.load(Ordering::SeqCst) {
+            self.queue.push_back_capped(records);
+            return;
+        }
         if self.queue.is_holding() || self.queue.draining.load(Ordering::Acquire) {
             self.queue.push_back_capped(records);
             self.drain();
@@ -393,6 +427,8 @@ impl CloudSink {
             Arc::clone(&self.unit_owners),
             self.prices.clone(),
         );
+        let held = records.len();
+        queue.in_flight.fetch_add(held, Ordering::SeqCst);
         tokio::spawn(async move {
             match push.post(&records, &owners, prices.as_deref()).await {
                 PushOutcome::Accepted => {}
@@ -406,6 +442,9 @@ impl CloudSink {
                     queue.push_front_capped(records);
                 }
             }
+            // After a failed chunk is back in the queue, so a stopping
+            // gateway never finds it in neither place.
+            queue.in_flight.fetch_sub(held, Ordering::SeqCst);
         });
     }
 
@@ -414,7 +453,7 @@ impl CloudSink {
     /// front. Attempted on every `ship` and every `flush`, so the 2 s flush tick
     /// in `main.rs` is the retry cadence. A no-op when nothing is queued.
     fn drain(&self) {
-        if !self.queue.is_holding() {
+        if !self.queue.is_holding() || self.queue.closing.load(Ordering::SeqCst) {
             return;
         }
         if self
@@ -437,7 +476,11 @@ impl CloudSink {
                 if chunk.is_empty() {
                     break;
                 }
-                match push.post(&chunk, &owners, prices.as_deref()).await {
+                let held = chunk.len();
+                queue.in_flight.fetch_add(held, Ordering::SeqCst);
+                let outcome = push.post(&chunk, &owners, prices.as_deref()).await;
+                let stop = matches!(outcome, PushOutcome::Unreachable(_));
+                match outcome {
                     PushOutcome::Accepted => {
                         queue.replayed.fetch_add(chunk.len(), Ordering::SeqCst);
                     }
@@ -453,8 +496,11 @@ impl CloudSink {
                         tracing::debug!("cloud telemetry push failed: {e}");
                         queue.outage_began(&push.url, &e);
                         queue.push_front_capped(chunk);
-                        break;
                     }
+                }
+                queue.in_flight.fetch_sub(held, Ordering::SeqCst);
+                if stop || queue.closing.load(Ordering::SeqCst) {
+                    break;
                 }
             }
             if !queue.is_holding() {
@@ -464,6 +510,87 @@ impl CloudSink {
             // A record appended between the last pop and this store waits for
             // the next ship or flush, at most one tick.
         });
+    }
+
+    /// Invariant 112: deliver what this gateway has not yet pushed before the
+    /// process exits, within `within`, and say what could not be delivered.
+    ///
+    /// Called once by `main` after the server has stopped on SIGTERM or
+    /// SIGINT. Without it the last 2 s of answered calls (the buffer between
+    /// flush ticks), a push on the wire and anything queued during an outage
+    /// went down with the runtime, and the Cloud, and every gateway seeded
+    /// from it afterwards, read the run as cheaper than it was (GCP,
+    /// 2026-10-14: 41 of 43 calls).
+    ///
+    /// The sink is closed first, so nothing else starts a push; pushes
+    /// already on the wire are waited for, so a chunk one of them fails to
+    /// deliver is back at the front of the queue before this reads it; then
+    /// the queue and the buffer, in that order, go out `BATCH` records a POST
+    /// until done, refused, unreachable or out of time. A SIGKILL never runs
+    /// this: the records it held are in the local trace only.
+    pub async fn flush_before_exit(&self, within: Duration) -> ExitFlush {
+        let deadline = tokio::time::Instant::now() + within;
+        self.queue.closing.store(true, Ordering::SeqCst);
+        let buffered = std::mem::take(&mut *self.buf.lock().unwrap());
+        while (self.queue.in_flight.load(Ordering::SeqCst) > 0
+            || self.queue.draining.load(Ordering::Acquire))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.queue.push_back_capped(buffered);
+        let mut out = ExitFlush::default();
+        loop {
+            let chunk = self.queue.pop_front_chunk(BATCH);
+            if chunk.is_empty() {
+                break;
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                self.queue.push_front_capped(chunk);
+                break;
+            }
+            let post = self
+                .push
+                .post(&chunk, &self.unit_owners, self.prices.as_deref());
+            let outcome = tokio::time::timeout(left, post).await;
+            match outcome {
+                Ok(PushOutcome::Accepted) => out.sent += chunk.len(),
+                Ok(PushOutcome::Refused(status)) => {
+                    report_refusal(&self.push.reported, status, &self.push.url);
+                    out.refused += chunk.len();
+                }
+                Ok(PushOutcome::Unencodable(e)) => {
+                    tracing::debug!("cloud telemetry encode failed: {e}");
+                    out.unsent += chunk.len();
+                }
+                Ok(PushOutcome::Unreachable(_)) | Err(_) => {
+                    self.queue.push_front_capped(chunk);
+                    break;
+                }
+            }
+        }
+        out.unsent +=
+            self.queue.records.lock().unwrap().len() + self.queue.in_flight.load(Ordering::SeqCst);
+        if out.unsent > 0 {
+            tracing::warn!(
+                unsent = out.unsent,
+                sent = out.sent,
+                refused = out.refused,
+                within_secs = within.as_secs_f64(),
+                "cloud telemetry could not deliver every record before exit: these calls are in \
+                 the local trace but not in the control plane, so the Cloud's spend for their \
+                 runs, and the seed a restarted gateway takes from it, is short by them"
+            );
+        } else if out.sent + out.refused > 0 {
+            tracing::info!(
+                sent = out.sent,
+                refused = out.refused,
+                "cloud telemetry flushed before exit: every record this gateway held was \
+                 delivered to the control plane"
+            );
+        }
+        out
     }
 
     fn take_if_full(&self) -> Option<Vec<CallRecord>> {
@@ -3719,5 +3846,117 @@ mod tests {
         assert_eq!(state.credit_late_seed().await, 1);
         assert_eq!(ledger.snapshot("r-restored").unwrap().spent, Microusd(456));
         assert_eq!(state.credit_late_seed().await, 0, "credited once");
+    }
+
+    // --- invariant 112: delivering what is held before the process exits ---
+
+    /// The buffer and what an outage queued go out in recorded order, the
+    /// queue first, and the exit reports them sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exit_flush_delivers_the_queue_then_the_buffer_in_order() {
+        let _g = log_lock();
+        clear_log();
+        let (base, toggle) = toggle_control_plane(Plane::Down).await;
+        let sink = CloudSink::new(base, "k");
+        sink.record(record_named("q-1"));
+        sink.record(record_named("q-2"));
+        sink.flush();
+        wait_for("the outage to queue both", || sink.queued() == 2).await;
+        wait_for("the drainer to let go", || {
+            !sink.queue.draining.load(Ordering::Acquire)
+                && sink.queue.in_flight.load(Ordering::SeqCst) == 0
+        })
+        .await;
+        sink.record(record_named("b-3"));
+        toggle.set(Plane::Up);
+
+        let out = sink.flush_before_exit(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            out,
+            ExitFlush {
+                sent: 3,
+                refused: 0,
+                unsent: 0
+            }
+        );
+        assert_eq!(toggle.received_run_ids(), vec!["q-1", "q-2", "b-3"]);
+        let log = log_text();
+        assert_eq!(
+            lines_at(&log, "INFO", "flushed before exit").len(),
+            1,
+            "{log}"
+        );
+        assert!(lines_at(&log, "WARN", "before exit").is_empty(), "{log}");
+    }
+
+    /// A control plane that takes the connection and never answers cannot
+    /// hold the exit past its bound, even though the client's own timeout is
+    /// the production 10 s; what it did not get is counted and said.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_exit_flush_is_bounded_and_says_what_it_could_not_deliver() {
+        let _g = log_lock();
+        clear_log();
+        let (base, _toggle) = toggle_control_plane(Plane::Stall).await;
+        let sink = CloudSink::new(base, "k");
+        for i in 0..3 {
+            sink.record(record_named(&format!("s-{i}")));
+        }
+        let started = std::time::Instant::now();
+        let out = sink.flush_before_exit(Duration::from_millis(300)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bound holds: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            out,
+            ExitFlush {
+                sent: 0,
+                refused: 0,
+                unsent: 3
+            }
+        );
+        let log = log_text();
+        let warned = lines_at(&log, "WARN", "before exit");
+        assert_eq!(warned.len(), 1, "{log}");
+        assert!(warned[0].contains("unsent=3"), "{log}");
+    }
+
+    /// A push already on the wire when the exit begins is waited for, and
+    /// counted as undelivered when the time runs out before it is answered:
+    /// its records are in neither the buffer nor the queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_on_the_wire_at_exit_is_counted_when_it_never_lands() {
+        let _g = log_lock();
+        clear_log();
+        let (base, _toggle) = toggle_control_plane(Plane::Stall).await;
+        let sink = CloudSink::new(base, "k");
+        sink.record(record_named("w-1"));
+        sink.record(record_named("w-2"));
+        sink.flush();
+        wait_for("the push to be on the wire", || {
+            sink.queue.in_flight.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        let out = sink.flush_before_exit(Duration::from_millis(300)).await;
+        assert_eq!(out.unsent, 2, "{out:?}");
+        assert_eq!(out.sent, 0, "{out:?}");
+    }
+
+    /// Once closing, a flush tick or a full batch queues instead of pushing,
+    /// so the exit is the only sender and nothing races its count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_sink_starts_no_push_of_its_own() {
+        let _g = log_lock();
+        let (base, toggle) = toggle_control_plane(Plane::Up).await;
+        let sink = CloudSink::new(base, "k");
+        let out = sink.flush_before_exit(Duration::from_millis(300)).await;
+        assert_eq!(out, ExitFlush::default());
+        sink.record(record_named("late"));
+        sink.flush();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(toggle.received_run_ids().is_empty());
+        assert_eq!(sink.queued(), 1);
     }
 }
