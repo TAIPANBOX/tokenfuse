@@ -46,7 +46,7 @@ pub fn dlp_mode_from(value: Option<&str>) -> DlpMode {
 /// independently of the secret scanner.
 ///
 /// **Unset stays `off`, deliberately.** This is a different promise from the
-/// one above: `pii_email`/`pii_card`/`pii_phone` are heuristics over ordinary
+/// one above: `pii_email`/`pii_card`/`pii_phone`/`pii_iban` are heuristics over ordinary
 /// text, so their false positives are prose rather than credentials, and the
 /// 2026-08-04 range said nothing about them. Turning something on by default is
 /// a claim that its false positives are worth its true positives, and that
@@ -55,7 +55,7 @@ pub fn dlp_mode_from(value: Option<&str>) -> DlpMode {
 /// independently of the secret scanner.
 ///
 /// **Unset stays `off`, deliberately.** This is a different promise from the
-/// one above: `pii_email`/`pii_card`/`pii_phone` are heuristics over ordinary
+/// one above: `pii_email`/`pii_card`/`pii_phone`/`pii_iban` are heuristics over ordinary
 /// text, so their false positives are prose rather than credentials, and the
 /// 2026-08-04 range said nothing about them. Turning something on by default is
 /// a claim that its false positives are worth its true positives, and that

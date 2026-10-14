@@ -36,7 +36,11 @@ enforcement.
   **admin** credential (it is a write, and what it writes raises incidents and
   grades compliance controls).
 - **`GET /v1/runs`** — the caller org's per-run aggregates (spend, calls, cache
-  hits, steps, last-seen).
+  hits, steps, last-seen). `model` is the model of the run's latest call by
+  that call's own timestamp; `models` lists every model its admitted calls
+  named, each with `calls` and `spent_microusd` (at most 16 ids, the rest under
+  `(other models)`), and `model_switches` counts how often an admitted call
+  named a different model from the one before it (CLAUDE.md invariant 111).
 - **`GET /v1/summary`** — org totals (runs, calls, spend).
 - **`GET /`** — an embedded, dependency-free dashboard (vanilla JS; enter your
   org key, auto-refreshes every 3 s).
@@ -87,8 +91,14 @@ push the control plane cannot be reached for is queued in memory (10,000
 records, oldest dropped first) and replayed in order when it answers again,
 with one log line at the start of an outage and one at its end (invariant 53); a
 push the control plane REFUSES is dropped and warned about once per status
-(invariant 13); a restart loses the queue, and the local Parquet trace stays the
-source of truth. Every record carries the unit's `owner` from the identity map
+(invariant 13). A gateway stopped with SIGTERM or SIGINT (`docker stop`, a
+Kubernetes pod deletion) first stops taking calls, then delivers what it still
+holds (the queue, then the calls answered since the last flush tick, after any
+push already on the wire has been answered) within 5 s, and logs a warning with
+the count of records the control plane did not receive if any are left
+(invariant 112). A SIGKILL, an out-of-memory kill or a lost node still loses
+whatever was not yet pushed, at most the last 2 s of calls plus the queue; the
+local Parquet trace stays the source of truth. Every record carries the unit's `owner` from the identity map
 beside its trace fields (invariant 54). A periodic flush ships telemetry
 promptly even below the batch size, and is what retries the queue. It composes
 with the other sinks via `TeeSink`.
@@ -159,6 +169,15 @@ runs a **kill poller** (`cloudsink::spawn_kill_poller`) that fetches
 `GET /v1/kills` every few seconds and applies each id to its local kill set —
 so the run is hard-stopped (`402 killed`) across the whole fleet, not just on one
 gateway. Enabled automatically whenever `TOKENFUSE_CLOUD_URL` + `_KEY` are set.
+
+A kill made on one gateway's own `POST /v1/runs/{id}/kill` stays on that
+gateway: it is not sent to the Cloud's kill list, so no other gateway applies
+it. What the Cloud does learn is the gateway's refusal: a call refused as
+`killed` is a trace row like any other, and the run's row in `GET /v1/runs`
+then reads `killed: true` (and `killed_by_gateway: true`), so the fleet view
+and anything reading it show the run as killed. The run is not added to
+`GET /v1/kills`. A run killed locally that makes no further call never reaches
+the Cloud as killed (invariant 111).
 
 ## Central budgets (implemented)
 

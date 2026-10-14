@@ -55,6 +55,16 @@
 //!     what it would do without doing it; this column is how a reader tells
 //!     it from an honest one. `""` on every other row, and for a row from a
 //!     trace file written before the column existed.
+//!   - `x_price_basis`: `CallRecord.price_basis` (invariant 109), the word
+//!     the call was charged at, `known` or `fallback` (the same word
+//!     `x-fuse-price` and the Cloud wire use), on an admitted row; `""` on any
+//!     other row and on a row written before the column existed. A FinOps tool
+//!     reading only this export can tell a guess priced at the fallback from a
+//!     list price with it.
+//!   - `x_pii_findings`: `CallRecord.pii_findings` (invariant 106), the PII
+//!     the scanner found and let through in shadow or mask, `kind=count` pairs
+//!     joined by `,` (so the field is quoted); `""` when nothing was found or
+//!     the row predates the column. Never a matched span.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -151,10 +161,17 @@ struct FocusRecord {
     /// The identity check's finding (`CallRecord::identity_reason`,
     /// invariant 87); `""` when it found nothing or the row predates it.
     identity_reason: String,
+    /// The price basis of an admitted call (`CallRecord::price_basis`,
+    /// invariant 109): `known` or `fallback`; `""` on any other row and on a
+    /// row that predates the column.
+    price_basis: String,
+    /// The PII the scanner let through (`CallRecord::pii_findings`,
+    /// invariant 106): `kind=count` pairs; `""` when nothing was found.
+    pii_findings: String,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 29] = [
+const HEADER: [&str; 31] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -187,6 +204,11 @@ const HEADER: [&str; 29] = [
     "x_block_reason",
     // Invariant 87: appended after them, same rule.
     "x_identity_reason",
+    // Invariant 109: appended after it, same rule, for a reader that sees
+    // only this export (costcrew): the basis a call was charged at and the PII
+    // the scanner let through.
+    "x_price_basis",
+    "x_pii_findings",
 ];
 
 /// The prefix a row refused for identity is filed under, ahead of the key id
@@ -265,7 +287,9 @@ async fn load_records(
          coalesce(unit, '') as unit, \
          cast(tool_calls as bigint) as tool_calls, \
          coalesce(key_id, '') as key_id, \
-         coalesce(identity_reason, '') as identity_reason \
+         coalesce(identity_reason, '') as identity_reason, \
+         coalesce(price_basis, '') as price_basis, \
+         coalesce(pii_findings, '') as pii_findings \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -333,6 +357,8 @@ async fn load_records(
                 },
                 key_id: str_at(b.column(12).as_ref(), i),
                 identity_reason: str_at(b.column(13).as_ref(), i),
+                price_basis: str_at(b.column(14).as_ref(), i),
+                pii_findings: str_at(b.column(15).as_ref(), i),
             });
         }
     }
@@ -423,8 +449,8 @@ fn filed_under(rec: &FocusRecord) -> (String, String) {
     }
 }
 
-/// Project one trace row into the 29 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 29] {
+/// Project one trace row into the 31 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 31] {
     let blocked = is_blocked_decision(&rec.decision);
     // Non-empty exactly when `x_blocked` is true: the Breaker reason's own
     // wire string, which is what `decision` holds on a blocked row.
@@ -475,6 +501,8 @@ fn to_row(rec: &FocusRecord) -> [String; 29] {
         rec.key_id.clone(),                                        // x_key_id
         block_reason,                                              // x_block_reason
         rec.identity_reason.clone(),                               // x_identity_reason
+        rec.price_basis.clone(),                                   // x_price_basis
+        rec.pii_findings.clone(),                                  // x_pii_findings
     ]
 }
 
@@ -801,6 +829,8 @@ mod tests {
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
             identity_reason: None,
+            pii_findings: None,
+            price_basis: None,
         }
     }
 
@@ -873,23 +903,24 @@ mod tests {
             "ChargeDescription,ProviderName,PublisherName,InvoiceIssuerName,ServiceName,",
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
-            "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason,x_identity_reason\n",
+            "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason,x_identity_reason,x_price_basis,",
+            "x_pii_findings\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,,\n",
+            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,,,,\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,,\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled,,,,,,\n",
+            "0,0,false,settled,,,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked,,,,,budget_exceeded,\n",
+            "blocked,,,,,budget_exceeded,,,\n",
         );
         assert_eq!(got, want);
 
