@@ -7247,3 +7247,17 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `scripts/gates-have-teeth.sh`: the `openai/` twin not inserted, its long tier not inserted.
     Scenarios: `features/an-openrouter-openai-id-is-priced-at-its-list-rate.feature`. Not a script
     gate)*
+
+108. **A brokered call's `tool_call` record names the run the caller named.** Every `tool_call`
+    the MCP broker wrote passed no `run_id` to the envelope, though the caller's `x-fuse-run-id`
+    was in hand for the taint gate (`CallContext::run_id`), so a per-run or per-agent egress
+    policy could not be written from the bus (forge, 2026-10-14). `@decided 2026-10-14`: carry the
+    caller's run id when the request has one. `mcpbroker::record_run_id` (the header, an empty one
+    being none) is passed to both writers, `emit_tool_call` (the governed and the ungoverned
+    sites) and `emit_tool_call_refused` (the drift refusal); a call that names no run gets none
+    invented. Not covered: stdio has no header channel, so a stdio call names no run; the run id
+    is the caller's claim, as every `x-fuse-run-id` is.
+    *(test: `tests/it/mcp_broker.rs::a_brokered_tool_call_record_carries_the_callers_run_id`, both
+    paths, a named run and none; red first in CI on the unchanged broker. Mutant as a case in
+    `scripts/gates-have-teeth.sh`: `record_run_id` answering none. Scenarios:
+    `features/a-brokered-tool-call-names-its-run.feature`. Not a script gate)*

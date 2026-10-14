@@ -679,6 +679,7 @@ impl DriftedTools {
 fn emit_tool_call_refused(
     st: &BrokerState,
     agent_id: Option<&str>,
+    run_id: Option<&str>,
     chain: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     tool: &str,
     upstream: &str,
@@ -687,7 +688,7 @@ fn emit_tool_call_refused(
         EventType::ToolCall,
         crate::sink::now_millis(),
         agent_id,
-        None,
+        run_id,
         chain,
         json!({ "tool": tool, "upstream": upstream, "decision": DRIFT_DECISION }),
     );
@@ -708,9 +709,14 @@ fn emit_tool_call_refused(
 /// In shadow mode the recorded `decision` is `would-<decision>`, matching the
 /// `x-fuse-wardryx` header convention, so a shadow rollout's audit trail never
 /// reads as if a call was actually enforced.
+#[allow(clippy::too_many_arguments)]
 fn emit_tool_call(
     st: &BrokerState,
     agent_id: Option<&str>,
+    // Invariant 108: the run the caller named in `x-fuse-run-id`, so a per-run
+    // or per-agent egress policy can be written from the bus; `None` when the
+    // call named none, never one made up.
+    run_id: Option<&str>,
     chain: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
     tool: &str,
     upstream: &str,
@@ -731,7 +737,7 @@ fn emit_tool_call(
         EventType::ToolCall,
         crate::sink::now_millis(),
         agent_id,
-        None,
+        run_id,
         // Measured 2026-08-26: this passed `None` while the PDP one screen up
         // was told the whole chain. The per-action audit record of a DELEGATED
         // tool call said nothing about whose delegation it was.
@@ -739,6 +745,12 @@ fn emit_tool_call(
         json!({ "tool": tool, "upstream": upstream, "decision": decision_str }),
     );
     crate::events::log_outcome(EventType::ToolCall, outcome);
+}
+
+/// The run a `tool_call` record names (invariant 108): the caller's
+/// `x-fuse-run-id`, an empty one being none.
+fn record_run_id(ctx: &CallContext) -> Option<&str> {
+    ctx.run_id.as_deref().filter(|r| !r.is_empty())
 }
 
 /// The agent id this request can be attributed to, or `None`.
@@ -1541,6 +1553,7 @@ async fn process_into(
                 emit_tool_call_refused(
                     st,
                     record_agent_id,
+                    record_run_id(ctx),
                     chain_on_record(ctx),
                     &tool,
                     &upstream_url,
@@ -1692,6 +1705,7 @@ async fn process_into(
                     emit_tool_call(
                         st,
                         record_agent_id,
+                        record_run_id(ctx),
                         chain_on_record(ctx),
                         &tool,
                         &upstream_url,
@@ -1839,6 +1853,7 @@ async fn process_into(
             emit_tool_call(
                 st,
                 record_agent_id,
+                record_run_id(ctx),
                 chain_on_record(ctx),
                 &tool,
                 &upstream_url,
