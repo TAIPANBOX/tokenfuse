@@ -1134,6 +1134,36 @@ run_case "no-owner-quotes: an empty index, so it measured nothing" fail_env \
 	"pass" \
 	"measured nothing"
 
+# --- invariant 104: a streamed tool call is judged ------------------------------
+#
+# Not a scripts/*.sh gate: the rule is the stream gate and the shared judgement,
+# held by cargo test through the real router with the answers cut into chunks.
+# Each mutant is a way a denied tool call reaches a streaming agent again.
+run_case "streamed-tools: the hold never engaged" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let hold = (st.firewall.mode != FirewallMode::Off && status.is_success())", "    let hold = (false && st.firewall.mode != FirewallMode::Off && status.is_success())")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the OpenAI wire's tool calls not read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", ".and_then(|d| d.get(\"tool_calls\"))", ".and_then(|d| d.get(\"tool_calls_mutant\"))")')" \
+	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the Anthropic wire's tool calls not read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "== Some(\"tool_use\")", "== Some(\"tool_use_mutant\")")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: the held call leaks before the refusal" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                    yield Bytes::from(crate::streamgate::refusal_event(", "                    yield Bytes::from(held.held.clone());\n                    yield Bytes::from(crate::streamgate::refusal_event(")')" \
+	"a_streamed_anthropic_tool_call_the_taint_denies_is_refused ... FAILED"
+
+run_case "streamed-tools: only the event that opened the call is held" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "        if self.holding || opens_tool {", "        if opens_tool {")')" \
+	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

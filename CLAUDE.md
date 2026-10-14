@@ -6967,3 +6967,62 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     that also carries Cyrillic; Cyrillic prose outside a string literal in a non-code file or in a code
     comment; the owner's first name outside an authorship line. `scripts/gates-have-teeth.sh` plants a
     marker line, requires a clean line to pass, and requires an empty index to say it measured nothing.)*
+
+104. **A streamed answer's tool calls are judged as a buffered answer's are.** The buffered path
+    judges the tool calls a model asks for against the run's taint (`taint::evaluate`) and refuses
+    the answer with `403 taint_blocked` in enforce; the streamed path forwarded every byte, so the
+    judgement never reached an agent that streams. Measured 2026-10-14 on a router agent streaming
+    through the OpenAI door: the run carried `suspected_injection` and `unclassified`, the starter
+    rule denies `write` after either, and a `write_file` the model streamed back reached the agent
+    and ran (trace `allow`, 0 blocked). docs/26 section 8 had named the gap since 2026-09-07.
+
+    `@claude` 2026-10-14, the shape this change was asked to take: on the streamed path, hold
+    tool-call deltas on both wires until the tool call is complete, judge it exactly as the
+    buffered path does, then forward it or replace it with the same refusal in a form the stream
+    can carry; text keeps streaming.
+
+    **How.** `streamgate::ToolCallHold` splits the provider's bytes into events by the event-stream
+    grammar (CRLF, LF or CR; a CR at the end of a chunk waits for the next byte), forwards each
+    event the moment it is complete, and from the first event that opens a tool call (an Anthropic
+    `content_block_start` whose block is `tool_use`; an OpenAI chunk with `choices[].delta.tool_calls`)
+    holds every event to the end of the provider's stream, collecting the names (an OpenAI name
+    split across deltas is joined by call index). The names are read by `taint::tool_names_in` over
+    the two buffered shapes rebuilt, and judged by `proxy::judge_model_tool_calls`, which the
+    buffered path now calls too, so the two cannot drift: the same rules, the same `taint_blocked`
+    row and `taint_block` event in enforce, the same `taint_shadow` in shadow, the same taint
+    accumulated for the next turn. Holding to the end of the stream rather than of each call,
+    `@claude` 2026-10-14: a client cannot run a call before its arguments end, the usage the
+    settlement reads arrives last, and the buffered path judges every name of an answer together.
+    The guard settles before the judgement, as the buffered path settles before it judges: a
+    refusal withholds the answer, not the cost.
+
+    **The refusal.** The status line already left as 200, so a denial in enforce replaces the held
+    part with one error event (`streamgate::refusal_event`): Anthropic `event: error` with
+    `{"type":"error","error":{...}}`, OpenAI a `data:` chunk with `{"error":{...}}` carrying
+    `message`, `code` and `param`, the shapes each wire's client libraries raise on mid-stream; the
+    fields are the buffered body's (`type: taint_blocked`, `run_id`, `reason`, `retryable: false`)
+    plus `message`; no `message_stop` and no `[DONE]` follow. Shadow forwards byte for byte. With
+    the firewall off, or on a refused status, nothing is held and the stream is untouched.
+
+    Not covered: the shadow `x-fuse-taint` note a buffered answer carries cannot be added to a
+    stream whose headers left; a tool call that never names itself is not judged (nor is it
+    buffered); the held part is bounded only by the provider's output, like a buffered body; an
+    Anthropic `server_tool_use` block runs on the provider's side and is not judged, as on the
+    buffered path; the fixtures are the two wires' documented event shapes with the measured
+    call in them, not a capture of the live run.
+    *(tests: `tests/it/streamed_tool_calls_are_judged.rs` through the real router, the answers cut
+    into 7-byte chunks: `a_streamed_anthropic_tool_call_the_taint_denies_is_refused`,
+    `a_streamed_openai_tool_call_the_taint_denies_is_refused`,
+    `the_refusal_is_the_event_each_wires_clients_raise_on`,
+    `shadow_forwards_a_denied_streamed_tool_call_and_records_it`,
+    `a_streamed_tool_calls_output_taints_the_next_turn` (five red first in CI run 38582043872 on the
+    unchanged gateway: the tool call in the body, `left: 0 right: 1` taint_shadow events,
+    `left: 200 right: 403` on the next turn), and the three controls green on both sides,
+    `an_untainted_streamed_tool_call_is_forwarded_byte_for_byte`,
+    `with_the_firewall_off_a_stream_is_never_held_or_changed`,
+    `the_buffered_answer_is_still_refused_with_a_403`; `streamgate::tests` (eleven, two of them
+    200-seed sweeps: any chunking holds the same bytes, hostile bytes never panic and are never
+    lost). Mutants as cases in `scripts/gates-have-teeth.sh`: the hold never engaged, the OpenAI
+    wire not read, the Anthropic wire not read, the held tool call leaked before the refusal,
+    holding only the event that opened the call. Scenarios:
+    `features/a-streamed-tool-call-is-judged.feature`. Not a script gate)*

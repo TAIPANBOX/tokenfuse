@@ -304,8 +304,11 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1911 passing** (core 407, dpop 21, delegation 60,
-gateway 1144, cloud 278, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 3
+`cargo test --all` runs **1930 passing** (core 407, dpop 21, delegation 60,
+gateway 1163, cloud 278, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 19
+with the streamed tool-call judgement (invariant 104: 11 in `gateway::streamgate`, 8 in
+`tests/it/streamed_tool_calls_are_judged.rs`; 2026-10-14, counted from the diff and judged by
+CI's `scripts/stated-numbers.sh`). Gateway grew by 3
 with the 12 KiB argument cap (invariant 100: one unit and two integration tests,
 2026-10-13). Core grew by 6 and gateway by 14 with the price book's long-prompt tier (invariant 99: 6 in
 `core::pricing`, 6 in `gateway::pricebook`, 4 in `gateway::provider`, 1 each in
