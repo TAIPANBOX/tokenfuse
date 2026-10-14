@@ -41,6 +41,7 @@ mod pii_found_is_recorded;
 mod policy_plane;
 mod price_book_startup;
 mod reasoning_tokens_are_output;
+mod refused_key_on_the_bus;
 mod require_run_id;
 mod retained_closure;
 mod retained_journal_unreadable;

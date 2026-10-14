@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.13.2-brightgreen)
-![tests](https://img.shields.io/badge/tests-1952-brightgreen)
+![tests](https://img.shields.io/badge/tests-1963-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -769,7 +769,7 @@ Notes, because the details matter more than the flag:
 - **Unset changes nothing.** No credential is required and `key_id` is empty. A drop-in proxy has to stay drop-in on upgrade.
 - **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
 - **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
-- **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body.
+- **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body. The operator's record does tell them apart: with `TOKENFUSE_EVENTS_PATH` set, each refusal is an `identity_mismatch` event whose `data.reason` is `missing_key` or `unknown_key`, with `data.key_fingerprint` (`sha256:` and 16 hex digits of the presented value, never the value) for an unknown one, filed under the `x-fuse-agent-id` the call claimed (or the reserved `agent://unidentified.invalid/caller` when it names none, which is what a scan looks like); one event per key and claimed agent a minute and at most sixty a minute per gateway, so a key scan is seen without flooding the bus (invariant 105).
 - **Scope, stated plainly:** both model doors, `/v1/messages` and `/v1/chat/completions`, share this check and nothing else. This adds identity; the budget enforced against it is the identity map, next.
 
 **Admin keys: `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`, `/v1/agent-ids`, `/v1/price-book`** (loopback-safe by default; a wide bind needs a key):
