@@ -175,6 +175,14 @@ pub struct AppState {
     /// from the upstream URL. The other door refuses rather than forwarding a
     /// body the upstream cannot read.
     pub wire: crate::wire::Wire,
+    /// Whether this process has read the control plane's money state (run
+    /// spend, unit month, Cloud budgets and kills; invariant 103). Open unless
+    /// `serve` configured a control plane that has not answered the seed yet.
+    pub seed: Arc<crate::seedgate::SeedGate>,
+    /// Runs the retained-reservation replay recreated while the seed was still
+    /// missing, with the generation each came back at, so the seed can be
+    /// credited to them when it lands (`cloudsink::spawn_seed_retry`).
+    replayed_unseeded: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
 /// How many runs the once-per-run clamp log remembers before it starts over.
@@ -621,7 +629,41 @@ impl AppState {
             // Every deployment that predates this field is Anthropic-only, so
             // that is the default until `main.rs` (or a test) sets otherwise.
             wire: crate::wire::Wire::Anthropic,
+            // No control plane until `serve` configures one, so nothing waits.
+            seed: Arc::new(crate::seedgate::SeedGate::open()),
+            replayed_unseeded: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Say whether the control plane's money state has been read (invariant
+    /// 102). Chainable; `serve` passes a closed gate when its startup seed did
+    /// not complete.
+    pub fn with_seed_gate(mut self, gate: Arc<crate::seedgate::SeedGate>) -> Self {
+        self.seed = gate;
+        self
+    }
+
+    /// Remember runs the startup replay recreated before the seed landed, so a
+    /// late seed is credited to them (`credit_late_seed`).
+    pub fn note_replayed_unseeded(&self, runs: impl IntoIterator<Item = (String, u64)>) {
+        self.replayed_unseeded.lock().unwrap().extend(runs);
+    }
+
+    /// Credit a seed that landed after the startup replay to every run that
+    /// replay recreated, at the generation it came back at. The runs a request
+    /// opens later take theirs on first open, as at an ordinary startup.
+    /// Returns how many were credited.
+    pub async fn credit_late_seed(&self) -> usize {
+        let runs = std::mem::take(&mut *self.replayed_unseeded.lock().unwrap());
+        let mut credited = 0;
+        for (run, generation) in runs {
+            if let Some(seed) = self.take_run_seed(&run) {
+                if self.ledger.seed_spend(&run, seed, generation).await {
+                    credited += 1;
+                }
+            }
+        }
+        credited
     }
 
     /// Require a client credential on metered calls, resolving it to a stable
@@ -715,7 +757,10 @@ impl AppState {
     }
 
     /// Replace the full pending run-seed map (the startup seed, invariant
-    /// 69). Called once, before the listener binds; never after.
+    /// 70). Called before the listener binds, or, when the control plane was
+    /// not up yet, by the retry that opens the seed gate (invariant 103); in
+    /// enforce no run has been opened in between, since the closed gate
+    /// refuses every call a budget governs before `open_run`.
     pub fn set_run_seed(&self, seed: HashMap<String, Microusd>) {
         *self.run_seed.lock().unwrap() = seed;
     }

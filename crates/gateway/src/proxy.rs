@@ -725,6 +725,24 @@ async fn handle_call(
             .note_blocks(&run_id, &taint::tool_uses_in(&request));
     }
 
+    // Invariant 103: a gateway that has not yet read the control plane's money
+    // state (this run's spend, the unit month, the Cloud budgets and kills)
+    // cannot check the budget this call carries, and every call that reaches
+    // here carries one. Enforce refuses it with a retryable 503 before the run
+    // is opened, so nothing is opened, reserved, forwarded or seeded from an
+    // empty ledger; shadow and warn forward it and say so in
+    // `x-fuse-would-block`, since they refuse nothing for money anyway.
+    let mut seed_pending_note: Option<String> = None;
+    if let Some(reason) = st.seed.pending_reason() {
+        let enforce = matches!(st.policy.mode, Mode::Enforce);
+        let caller_agent = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+        report_seed_pending(&st, &run_id, &caller_agent, enforce, &reason);
+        if enforce {
+            return seed_pending(&run_id, &reason);
+        }
+        seed_pending_note = Some(format!("seed_pending: {reason}"));
+    }
+
     // A sub-agent's run rolls up into its parent's budget (hierarchical budgets, invariant 49).
     // An empty header is no declaration.
     let parent = header_str(&headers, "x-fuse-parent-run-id").filter(|p| !p.is_empty());
@@ -1731,6 +1749,12 @@ async fn handle_call(
     // For shadow/warn, surface whichever signal tripped in the response header.
     // `mut`: the run-budget check below adds its own reason in shadow/warn.
     let mut would_block = eval.violated.clone().or(loop_reason);
+    if let Some(note) = seed_pending_note.take() {
+        would_block = Some(match would_block.take() {
+            Some(prior) => format!("{prior}; {note}"),
+            None => note,
+        });
+    }
 
     // Unit budget gate (docs/20): the resolved unit's monthly cap, checked
     // BEFORE the run-level reserve so a unit-capped call never holds a run
@@ -2767,6 +2791,69 @@ pub(crate) fn identity_required() -> Response {
         .status(StatusCode::BAD_REQUEST)
         .header("content-type", "application/json")
         .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// Invariant 103: one `dependency_failed` per run, and one warning, while the
+/// seed gate is closed. The bus carries it under the caller's own
+/// `x-fuse-agent-id` (an event names an agent or is not written, invariant 6);
+/// `effect` says what the gate did: `denied_unasked` in enforce, nothing having
+/// decided against the call, `allowed_ungoverned` in shadow and warn, nothing
+/// having checked it.
+fn report_seed_pending(st: &AppState, run_id: &str, agent_id: &str, enforce: bool, reason: &str) {
+    if !st.seed.note_call(run_id) {
+        return;
+    }
+    tracing::warn!(
+        run = %run_id,
+        reason = %reason,
+        refused = enforce,
+        "the control plane has not answered the seed yet, so this run's spend, its unit's month, \
+         its Cloud budget and its kill are unknown here; enforce refuses it with 503 until the seed \
+         lands, shadow and warn forward it marked; logged once per run while the seed is missing"
+    );
+    let effect = if enforce {
+        DependencyEffect::DeniedUnasked
+    } else {
+        DependencyEffect::AllowedUngoverned
+    };
+    emit_dependency_failed(
+        st,
+        Some(run_id),
+        agent_id,
+        None,
+        Dependency::ControlPlane,
+        DependencyStage::Seed,
+        effect,
+        reason,
+    );
+}
+
+/// Invariant 103: `503 seed_pending`, retryable, with `retry-after`. Not a 402:
+/// nothing says the run's money is gone, the dependency that holds it has not
+/// answered, and the client libraries an agent uses retry a 503 by themselves.
+/// See `crate::seedgate` for the choice. The body names the state and the
+/// reason, never a figure, since no figure is known.
+fn seed_pending(run_id: &str, reason: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "seed_pending",
+            "run_id": run_id,
+            "reason": format!(
+                "this gateway has not yet read the run's spend, the unit month, the Cloud \
+                 budgets and kills from its control plane ({reason}), so it admits nothing a \
+                 budget governs; retry shortly"
+            ),
+            "retryable": true,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "application/json")
+        .header("retry-after", "1")
+        .header("x-fuse", "blocked")
+        .header("x-fuse-run-id", run_id.to_string())
         .body(Body::from(body.to_string()))
         .expect("valid response")
 }

@@ -69,8 +69,12 @@ pub enum SeedOutcome {
     Applied,
     /// `window` is not the current month by `now_millis`: skipped, nothing touched.
     OtherMonth,
-    /// The unit already has spend or a reservation in the current window:
-    /// skipped, nothing touched. Cannot happen at startup; a guard, not a path.
+    /// The unit already has settled spend in the current window: skipped,
+    /// nothing touched. A reservation alone does not count: it is a liability
+    /// the control plane has not seen (nothing reaches it before it settles),
+    /// so seeding `spent` beside it counts nothing twice. That is what lets a
+    /// seed that lands after the startup replay (invariant 103) apply to a
+    /// unit the replay put a retained reservation back on.
     AlreadyCounting,
     /// A negative figure names no spend and is refused (hostile input).
     Negative,
@@ -125,7 +129,8 @@ impl UnitLedger {
     /// Start a unit's month where the control plane left it (#293). `spent`
     /// is the org's month-to-date for `unit` as `GET /v1/units` reported it;
     /// applied only when `window` is the current UTC month here and the unit
-    /// has neither spend nor a reservation in that window yet. `reserved` is
+    /// has no settled spend in that window yet (a reservation outstanding
+    /// beside it is kept, see [`SeedOutcome::AlreadyCounting`]). `reserved` is
     /// never seeded: the reservations that were in flight in the process that
     /// died went with it, and the control plane never saw them. From here on
     /// this gateway counts its own spend on top, and the seed rolls over with
@@ -146,7 +151,7 @@ impl UnitLedger {
         }
         let mut state = self.state.lock().unwrap();
         let s = Self::rolled(&mut state, unit, &now_window);
-        if s.spent != Microusd::ZERO || s.reserved != Microusd::ZERO {
+        if s.spent != Microusd::ZERO {
             return SeedOutcome::AlreadyCounting;
         }
         s.spent = spent;
@@ -158,9 +163,9 @@ impl UnitLedger {
     /// month, and nothing at all if it is not, which is what [`UnitLedger::settle`] already
     /// does with a reservation from a rolled-over window. Applied whether or not the unit has
     /// a cap in effect now, because a cap set later (an override) must see the liability too.
-    /// Adds to whatever the unit already counts, so it composes with [`Self::seed_month`] run
-    /// first; seeding after a restore is refused as `AlreadyCounting`, which is why startup
-    /// seeds first.
+    /// Adds to whatever the unit already counts, so it composes with [`Self::seed_month`] in
+    /// either order: startup seeds first, and a seed that lands later (invariant 103) sets the
+    /// spend beside the restored reservation.
     pub fn restore(&self, reservation: &UnitReservation, now_millis: i64) -> RestoreOutcome {
         if reservation.amount < Microusd::ZERO {
             return RestoreOutcome::Negative;
@@ -561,18 +566,36 @@ mod tests {
             .try_reserve("aws", usd(4.0), JULY)
             .unwrap()
             .expect("capped unit reserves");
-        assert_eq!(
-            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
-            SeedOutcome::AlreadyCounting
-        );
-        assert_eq!(ledger.reserved("aws", JULY), usd(4.0));
-        assert_eq!(ledger.spent("aws", JULY), Microusd::ZERO);
         ledger.settle(&held, usd(3.5), JULY);
         assert_eq!(
             ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
             SeedOutcome::AlreadyCounting
         );
         assert_eq!(ledger.spent("aws", JULY), usd(3.5));
+        assert_eq!(ledger.reserved("aws", JULY), Microusd::ZERO);
+    }
+
+    /// Invariant 103: a seed that lands after the startup replay put a retained reservation back
+    /// on the unit sets the month's spend beside it. The reservation never reached the control
+    /// plane, so nothing is counted twice, and the next call is checked against both.
+    #[test]
+    fn a_late_seed_lands_beside_a_restored_reservation() {
+        let ledger = UnitLedger::new(HashMap::from([("aws".to_string(), Microusd(3_000))]));
+        let held = ledger
+            .try_reserve("aws", Microusd(400), JULY)
+            .unwrap()
+            .expect("capped unit reserves");
+        assert_eq!(
+            ledger.seed_month("aws", Microusd(2_145), "2026-07", JULY),
+            SeedOutcome::Applied
+        );
+        assert_eq!(ledger.spent("aws", JULY), Microusd(2_145));
+        assert_eq!(ledger.reserved("aws", JULY), Microusd(400));
+        // 2145 + 400 + 456 = 3001 > 3000: refused at the seeded tally plus the liability.
+        assert!(ledger.try_reserve("aws", Microusd(456), JULY).is_err());
+        assert!(ledger.try_reserve("aws", Microusd(455), JULY).is_ok());
+        ledger.settle(&held, Microusd(0), JULY);
+        assert_eq!(ledger.spent("aws", JULY), Microusd(2_145));
     }
 
     #[test]
