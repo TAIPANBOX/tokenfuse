@@ -1373,6 +1373,80 @@ run_case "refused-key: the fingerprint carries the key" fail \
 	"$(py 'edit("crates/gateway/src/refusedkeys.rs", "    format!(\"sha256:{hex}\")", "    format!(\"sha256:{hex}{presented}\")")')" \
 	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
 
+# --- invariant 106: PII found and let through is on the record ----------------
+#
+# Not a scripts/*.sh gate: held by cargo test, the gateway through its router
+# and the Cloud through its HTTP reads.
+run_case "pii-recorded: shadow never sets the counts" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact pii_found_is_recorded::shadow_records_the_kinds_it_found_and_never_the_text" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "pii_counts = Some(dlp::kind_counts(&pii_findings));", "pii_counts = Some(dlp::kind_counts(&pii_findings)).filter(|_| false);")')" \
+	"shadow_records_the_kinds_it_found_and_never_the_text ... FAILED"
+
+run_case "pii-recorded: the Cloud counts a refused record" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact pii_found::a_findings_string_without_the_scanners_shape_is_not_counted" \
+	"$(py 'edit("crates/cloud/src/store.rs", "// an admitted call only, read through its own shape.\n                    if matches!(", "// an admitted call only, read through its own shape.\n                    if true || matches!(")')" \
+	"a_findings_string_without_the_scanners_shape_is_not_counted ... FAILED"
+
+run_case "pii-recorded: the Cloud reads any string as a kind" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact pii_found::a_findings_string_without_the_scanners_shape_is_not_counted" \
+	"$(py 'edit("crates/cloud/src/store.rs", "        let shaped = !suffix.is_empty()", "        let shaped = true || !suffix.is_empty()")')" \
+	"a_findings_string_without_the_scanners_shape_is_not_counted ... FAILED"
+
+# --- invariant 107: an openai/ id is priced at OpenAI's list rate -------------
+run_case "openrouter-ids: the openai/ twin not inserted" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact openrouter_openai_ids_are_priced::the_measured_openrouter_call_is_priced_at_openais_list_rate" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "for name in [id.to_string(), format!(\"{OPENROUTER_OPENAI}{id}\")] {", "for name in [id.to_string(), format!(\"{OPENROUTER_OPENAI}{id}\")].into_iter().take(1) {")')" \
+	"the_measured_openrouter_call_is_priced_at_openais_list_rate ... FAILED"
+
+run_case "openrouter-ids: the twin's long tier not inserted" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_openai_id_is_priced_under_its_openrouter_name_too" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "            if let Some(l) = long {", "            if let Some(l) = long.as_ref().filter(|_| name.as_str() == *id) {")')" \
+	"every_openai_id_is_priced_under_its_openrouter_name_too ... FAILED"
+
+# --- invariant 108: a brokered tool_call names its run --------------------------
+run_case "broker-run-id: the record names no run" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_brokered_tool_call_record_carries_the_callers_run_id" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    ctx.run_id.as_deref().filter(|r| !r.is_empty())", "    ctx.run_id.as_deref().filter(|r| !r.is_empty() && false)")')" \
+	"a_brokered_tool_call_record_carries_the_callers_run_id ... FAILED"
+
+# --- invariant 109: the FOCUS export names the basis and the PII ----------------
+run_case "focus-basis-pii: the basis never set on the attribution" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_names_price_basis_and_pii::the_export_names_the_price_basis_and_the_pii_let_through" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()),", "price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()).filter(|_| false),")')" \
+	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
+
+run_case "focus-basis-pii: the export reads the PII column as the basis" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_names_price_basis_and_pii::the_export_names_the_price_basis_and_the_pii_let_through" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "price_basis: str_at(b.column(14).as_ref(), i),", "price_basis: str_at(b.column(15).as_ref(), i),")')" \
+	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
+
+# --- invariant 110: IBANs, and decimals are not cards -------------------------
+run_case "pii-iban: the checksum skipped" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact dlp::tests::a_wrong_checksum_length_or_country_is_not_an_iban" \
+	"$(py 'edit("crates/core/src/dlp.rs", "        if iban_checksum_holds(&compact) {", "        if iban_checksum_holds(&compact) || !compact.is_empty() {")')" \
+	"a_wrong_checksum_length_or_country_is_not_an_iban ... FAILED"
+
+run_case "pii-card: the decimal rule removed" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact dlp::tests::a_probability_in_a_typed_answer_is_not_a_card" \
+	"$(py 'edit("crates/core/src/dlp.rs", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) {", "                if part_of_a_decimal(text.as_bytes(), m.start(), m.end()) && false {")')" \
+	"a_probability_in_a_typed_answer_is_not_a_card ... FAILED"
+
+# --- invariant 111: a run names every model it used, and a gateway's kill ----
+run_case "run-models: the model taken in arrival order" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::an_older_record_never_takes_the_model_from_a_later_call" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if !r.model.is_empty() && r.ts_millis >= agg.model_millis {", "if !r.model.is_empty() && (true || r.ts_millis >= agg.model_millis) {")')" \
+	"an_older_record_never_takes_the_model_from_a_later_call ... FAILED"
+
+run_case "run-models: a refusal counted as a model used" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::a_refusal_names_no_model_the_run_used_and_changes_nothing" \
+	"$(py 'edit("crates/cloud/src/store.rs", "if matches!(r.decision.as_str(), \"allow\" | \"cache_hit\") && !r.model.is_empty() {", "if !r.model.is_empty() {")')" \
+	"a_refusal_names_no_model_the_run_used_and_changes_nothing ... FAILED"
+
+run_case "run-models: the gateway's kill not read" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact run_models::a_run_a_gateway_refused_as_killed_reads_killed" \
+	"$(py 'edit("crates/cloud/src/store.rs", "                a.killed = a.killed_by_gateway\n                    || killed", "                a.killed = (a.killed_by_gateway && false)\n                    || killed")')" \
+	"a_run_a_gateway_refused_as_killed_reads_killed ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

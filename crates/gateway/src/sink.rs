@@ -135,6 +135,24 @@ pub struct CallRecord {
     /// the Cloud wire only when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_reason: Option<String>,
+    /// The PII the scanner found in this call's prompt and let through
+    /// (invariant 106): `TOKENFUSE_DLP_PII=shadow` (forwarded as written) or
+    /// `mask` (forwarded redacted), as `kind=count` pairs sorted by kind,
+    /// `pii_card=1,pii_email=2` (`tokenfuse_core::dlp::kind_counts`). Kinds
+    /// and counts only, never a matched span. `None` when the scan was off or
+    /// found nothing, and on every row but the call's `allow` row. Appended
+    /// last as a nullable column, and on the Cloud wire only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii_findings: Option<String>,
+    /// The price basis an admitted call was charged at (invariant 109),
+    /// `known` or `fallback`, `pricebook::basis`, the word `x-fuse-price` and
+    /// the Cloud wire use. Set on the `allow` row only, `None` everywhere else
+    /// and on a row written before the column existed. Kept off the Cloud wire
+    /// here (`#[serde(skip_serializing)]`): `cloudsink` puts its own
+    /// `price_basis` beside the record (invariant 86), and the same key twice
+    /// would be one record saying two things.
+    #[serde(skip_serializing)]
+    pub price_basis: Option<String>,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -265,6 +283,12 @@ impl ParquetSink {
             // genuinely nullable in the write schema: NULL is "the check
             // found nothing", which no string default may stand in for.
             Field::new("identity_reason", DataType::Utf8, true),
+            // Invariant 106: the PII found and let through, appended LAST,
+            // nullable for the same reason: NULL is "nothing found".
+            Field::new("pii_findings", DataType::Utf8, true),
+            // Invariant 109: the price basis of an admitted call, appended
+            // LAST, nullable: NULL is "not an admitted row" or "older row".
+            Field::new("price_basis", DataType::Utf8, true),
         ]))
     }
 
@@ -325,6 +349,10 @@ impl ParquetSink {
             // Invariant 87: same treatment, so a trace written before the
             // column existed reads back with it NULL.
             Field::new("identity_reason", DataType::Utf8, true),
+            // Invariant 106: same treatment once more.
+            Field::new("pii_findings", DataType::Utf8, true),
+            // Invariant 109: same treatment once more.
+            Field::new("price_basis", DataType::Utf8, true),
         ]))
     }
 
@@ -424,6 +452,20 @@ impl ParquetSink {
                     records
                         .iter()
                         .map(|r| r.identity_reason.clone())
+                        .collect::<Vec<Option<String>>>(),
+                )),
+                // Invariant 106: a real NULL for `None`.
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.pii_findings.clone())
+                        .collect::<Vec<Option<String>>>(),
+                )),
+                // Invariant 109: a real NULL for `None`.
+                Arc::new(StringArray::from(
+                    records
+                        .iter()
+                        .map(|r| r.price_basis.clone())
                         .collect::<Vec<Option<String>>>(),
                 )),
             ],
@@ -526,6 +568,8 @@ mod tests {
             tools_would_prune: None,
             pruned_schema_tokens_est: None,
             identity_reason: None,
+            pii_findings: None,
+            price_basis: None,
         }
     }
 

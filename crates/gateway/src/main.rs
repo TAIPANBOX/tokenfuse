@@ -1200,6 +1200,9 @@ async fn serve() {
             });
         }
     }
+    // Invariant 112: the Cloud sink, kept to deliver what it holds after the
+    // server stops.
+    let mut cloud_exit: Option<Arc<tokenfuse_gateway::cloudsink::CloudSink>> = None;
     // TokenFuse Cloud: push telemetry to a control plane for a cross-fleet view,
     // and pull operator kills back down. TOKENFUSE_CLOUD_URL is the control
     // plane base URL; TOKENFUSE_CLOUD_KEY is the org key.
@@ -1304,6 +1307,7 @@ async fn serve() {
                     flusher.flush();
                 }
             });
+            cloud_exit = Some(Arc::clone(&cloud));
             sink = Arc::new(TeeSink {
                 first: sink,
                 second: cloud,
@@ -1405,6 +1409,15 @@ async fn serve() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+
+    // Invariant 112: the server has stopped taking calls; deliver the calls it
+    // answered that the Cloud has not yet received, bounded, before the
+    // runtime (and the sink's buffer with it) goes away.
+    if let Some(cloud) = cloud_exit {
+        cloud
+            .flush_before_exit(tokenfuse_gateway::cloudsink::EXIT_FLUSH_WITHIN)
+            .await;
+    }
 }
 
 /// Build the raft-replicated ledger from `TOKENFUSE_CLUSTER_*` env, or `None` if

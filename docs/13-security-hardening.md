@@ -71,11 +71,21 @@ accept the same four values as their `_DLP` counterpart: `off` (default),
 `shadow` (flag, forward unchanged), `mask` (replace with
 `[REDACTED:pii_kind]`), `block` (refuse the call/response).
 
-Three kinds, all regex-based:
+Four kinds, all pattern-based:
 
 - **`pii_email`**: a standard email-address shape.
 - **`pii_card`**: a 13 to 19 digit run that also passes the Luhn checksum
-  and is not all the same digit (a common false-positive shape).
+  and is not all the same digit (a common false-positive shape). A run that is
+  part of a decimal number is not a candidate: a fraction after a `.`
+  (`0.41935483870967744`, a typed answer's probability that passes Luhn, which
+  had the MCP broker in `block` refuse a clean answer on 2026-10-14) or an
+  integer part before `.` and a digit; an exponent never matched in the first
+  place. Since invariant 110.
+- **`pii_iban`**: an IBAN in upper case, compact or in groups of four
+  (`GB82 WEST 1234 5698 7654 32`): a country of the ISO 13616 registry (89 of
+  them), exactly that country's length, and the mod-97 checksum, which is what
+  keeps a random alphanumeric run from being called one. Since invariant 110;
+  before it the forge prompt's `GB82WEST12345698765432` was a documented miss.
 - **`pii_phone`**: international form only (a leading `+`); a bare national
   number never matches.
 
@@ -85,6 +95,17 @@ format like `(415) 555-2671` or a national number with no `+` will not be
 caught. When a PII span and a secret span overlap, the secret wins and the
 PII finding is dropped, so masking never corrupts an existing secret
 redaction. See `crates/core/src/dlp.rs`'s module doc for the full writeup.
+
+**What shadow and mask record (invariant 106, 2026-10-14).** A call the
+gateway forwards with PII in its prompt, as written (`shadow`) or redacted
+(`mask`), carries the kinds found and how often on its `allow` trace row, the
+nullable `pii_findings` column (`pii_card=1,pii_email=2`), and on its Cloud
+record; the control plane counts `pii_calls` per run on `/v1/runs` and
+`pii_calls` plus `pii_kinds` (most calls first, at most 16 kinds) on
+`/v1/summary`, reading only strings shaped like the scanner's output. Kinds
+and counts only, never a matched span. A `block` refusal is unchanged (a
+`403 dlp_blocked`). The agent-event bus carries no shadow finding yet: the
+`dlp_shadow` type waits for its row in agent-passport's registry.
 
 ## OIDC bearer authentication (optional, offline)
 

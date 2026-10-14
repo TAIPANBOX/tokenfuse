@@ -97,7 +97,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/one-test-binary-per-crate.sh  # invariant 78
 ./scripts/no-owner-quotes.sh     # invariant 101
 ./scripts/no-html-from-data.sh   # invariant 102
-./scripts/teeth-shards-cover-every-case.sh  # invariant 106
+./scripts/teeth-shards-cover-every-case.sh  # invariant 113
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7187,7 +7187,170 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the report never made, the per-source limit removed, the fingerprint replaced by the key.
     Scenarios: `features/a-refused-client-key-is-on-the-bus.feature`. Not a script gate)*
 
-106. **The teeth harness runs as four CI shards, and the shards together run every case exactly once.**
+106. **PII the scanner finds and lets through is on the call's trace row and in the fleet view,
+    as kinds and counts, never the matched text.** A shadow PII finding was an `x-fuse-dlp` note
+    on the answer and nothing else (forge, 2026-10-14), so no dashboard could show what shadow mode
+    found. `@decided 2026-10-14`: a trace column and a Cloud count now; a bus event once its type
+    has a row in agent-passport's registry.
+
+    In `proxy::handle_call`, `TOKENFUSE_DLP_PII` `shadow` or `mask` with findings sets
+    `pii_counts` from `tokenfuse_core::dlp::kind_counts` (`kind=count` sorted by kind,
+    `pii_card=1,pii_email=2`); it rides `CallAttribution.pii_findings` onto the `allow` row and the
+    `cache_hit` row (`sink::CallRecord::pii_findings`, appended last, nullable in both Parquet
+    schemas and published in `trace_parquet`, invariants 6 and 14) and onto the Cloud wire only
+    when set. `block` is unchanged. The Cloud reads it through `store::parse_pii_findings` (a kind
+    `pii_` plus 1 to 24 lowercase letters or `_`, a count from 1 to 100 000, a kind once, at most 16
+    pairs), on an admitted record only, and folds `RunAgg.pii_calls`, `Summary.pii_calls` and
+    `Summary.pii_kinds` (`KindCalls`, bounded at 16 kinds plus `(other kinds)`).
+
+    Not covered: no agent event yet (`dlp_shadow` needs its registry row); the MCP broker's PII
+    scan of tool calls and answers records nothing new; the FOCUS export does not carry the column;
+    a block refusal writes no trace row, as before.
+    *(tests: `tests/it/pii_found_is_recorded.rs` (`shadow_records_the_kinds_it_found_and_never_the_text`
+    and `mask_records_what_it_redacted` red first in CI on the unchanged gateway, the row carrying
+    no `pii_findings`; `nothing_found_or_the_scan_off_records_nothing` the control), the Cloud's
+    `tests/it/pii_found.rs` (`pii_a_gateway_let_through_reaches_the_runs_and_summary_reads`,
+    `a_findings_string_without_the_scanners_shape_is_not_counted`, both red first: no such
+    field), `core::dlp::tests::kind_counts_name_each_kind_and_how_often_never_the_text`,
+    `cloud::store::tests::pii_findings_are_read_only_in_the_scanners_shape`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the counts never set in shadow, the Cloud counting a refused
+    record, the shape check dropped. Scenarios: `features/pii-found-is-on-the-record.feature`.
+    Not a script gate)*
+
+107. **An `openai/<id>` model id is priced at OpenAI's list rate for that id, and an `openai/` id
+    the book does not know stays at the fallback.** Measured on forge 2026-10-14 through the OpenAI
+    door over OpenRouter: `openai/gpt-4.1-mini` had no row, the forge call (14 in, 2 out) settled
+    at the 15 / 75 fallback, USD 0.000360 where the list price is 9 micro-USD, and run budgets of USD
+    0.004 and 0.012 were refused before their first call. `@decided 2026-10-14`: price OpenRouter's
+    `vendor/model` ids at the vendor's row where the bare model is known, without weakening the
+    fallback for an unknown id.
+
+    `pricebook::default_price_book` inserts every [`OPENAI`] row twice, under its id and under
+    `openai/<id>` (`OPENROUTER_OPENAI`), the long-prompt tier with it, as explicit rows published in
+    `price_book.models` and `price_book.long_context` (invariant 14), not as a lookup rule: a row a
+    reader can see is a price a reader can check. `OPENAI` gains the GPT-4.1 family, read 2026-10-14
+    (`gpt-4.1` 2.00 / 8.00 cached 0.50, `gpt-4.1-mini` 0.40 / 1.60 cached 0.10, `gpt-4.1-nano` 0.10 /
+    0.40 cached 0.025; no write fee, no long tier). `@claude` 2026-10-14: an `openai/` id names
+    OpenAI's own model sold at OpenAI's list, unlike `moonshotai/kimi-k3` or `z-ai/glm-5.3`, which
+    many providers serve at different rates and which keep the fallback. `anthropic/` ids were rows
+    already (invariant 79) and `google/` ids are Vertex AI's own names (invariant 82).
+
+    Not covered: an operator `TOKENFUSE_PRICE_BOOK` row for a bare id does not move its `openai/`
+    twin (write both); OpenRouter's credit fee is not in any row; verdryx's by-value mirror of the
+    book needs the new rows (estate-gates C3).
+    *(tests: `tests/it/openrouter_openai_ids_are_priced.rs`:
+    `the_measured_openrouter_call_is_priced_at_openais_list_rate` (red first: `fallback`,
+    `0.000360`), `a_small_budget_is_no_longer_refused_before_its_first_call` (red first: 402),
+    `the_gpt_4_1_family_is_priced_under_its_own_ids` (red first), and the control
+    `an_openai_id_the_book_does_not_know_still_takes_the_fallback`; `pricebook::tests`:
+    `every_openai_id_is_priced_under_its_openrouter_name_too`,
+    `the_gpt_4_1_family_is_priced_at_its_list_rate`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the `openai/` twin not inserted, its long tier not inserted.
+    Scenarios: `features/an-openrouter-openai-id-is-priced-at-its-list-rate.feature`. Not a script
+    gate)*
+
+108. **A brokered call's `tool_call` record names the run the caller named.** Every `tool_call`
+    the MCP broker wrote passed no `run_id` to the envelope, though the caller's `x-fuse-run-id`
+    was in hand for the taint gate (`CallContext::run_id`), so a per-run or per-agent egress
+    policy could not be written from the bus (forge, 2026-10-14). `@decided 2026-10-14`: carry the
+    caller's run id when the request has one. `mcpbroker::record_run_id` (the header, an empty one
+    being none) is passed to both writers, `emit_tool_call` (the governed and the ungoverned
+    sites) and `emit_tool_call_refused` (the drift refusal); a call that names no run gets none
+    invented. Not covered: stdio has no header channel, so a stdio call names no run; the run id
+    is the caller's claim, as every `x-fuse-run-id` is.
+    *(test: `tests/it/mcp_broker.rs::a_brokered_tool_call_record_carries_the_callers_run_id`, both
+    paths, a named run and none; red first in CI on the unchanged broker. Mutant as a case in
+    `scripts/gates-have-teeth.sh`: `record_run_id` answering none. Scenarios:
+    `features/a-brokered-tool-call-names-its-run.feature`. Not a script gate)*
+
+109. **The FOCUS export names the price basis an admitted call was charged at and the PII the
+    scanner let through.** costcrew reads only the FOCUS export (its invariant 64); the price basis
+    rode the Cloud wire alone (invariant 86) and `pii_findings` the trace alone (invariant 106), so
+    a call charged at the fallback (forge 2026-10-14: `openai/gpt-4.1-mini` at 15 / 75) and a shadow
+    PII finding were invisible to it. `@decided 2026-10-14`: both reach the export, backward
+    compatible.
+
+    The trace gains a nullable `price_basis` column (`known` or `fallback`, `pricebook::basis`, the
+    word `x-fuse-price` carries), set by `proxy::handle_call` on `CallAttribution` and written on
+    the `allow` row only; it is kept off the Cloud wire (`#[serde(skip_serializing)]`), where
+    `cloudsink` already puts its own `price_basis` beside the record. `focusexport` appends
+    `x_price_basis` and `x_pii_findings` after `x_identity_reason`, read through `COALESCE`, so a
+    trace segment written before either column exports them empty; `focus_export.columns` and both
+    `trace_parquet` schemas publish them (invariant 14), and `compat/1.0.json`'s additive FOCUS
+    sentence names them. Not covered: a refusal row carries no basis (nothing was charged at a
+    rate); a cache hit carries no basis; costcrew's reader is its own PR.
+    *(test: `tests/it/focus_names_price_basis_and_pii.rs::the_export_names_the_price_basis_and_the_pii_let_through`,
+    the router into a Parquet trace and the real `tokenfuse focus-export` binary, red first in CI
+    (no such columns); the golden export test and
+    `constants::tests::the_focus_export_columns_are_published_in_export_order` gained the two
+    columns. Mutants as cases in `scripts/gates-have-teeth.sh`: the basis never set on the
+    attribution, the export reading the PII column into the basis. Scenarios:
+    `features/the-focus-export-names-basis-and-pii.feature`. Not a script gate)*
+
+110. **The PII scan finds an IBAN, and the digits of a decimal number are not a card.** Two
+    measurements of 2026-10-14: on forge the prompt "... my card is 4111 1111 1111 1111 and my IBAN
+    is GB82WEST12345698765432." gave two kinds where three were written (the IBAN was the
+    documented scope limit of `docs/13`); on GCP the MCP broker in `TOKENFUSE_MCP_DLP_PII=block`
+    refused a clean typed answer because a probability's 17-digit fraction, `0.41935483870967744`,
+    passed Luhn. `@decided 2026-10-14`: add the IBAN kind and fix the card detector, keeping real
+    cards written with spaces or dashes.
+
+    `tokenfuse_core::dlp::scan_ibans` adds `pii_iban`: a start of two capital letters and two
+    digits at a word boundary, the country's length from `IBAN_LENGTHS` (the 89 countries of the
+    ISO 13616 registry, read 2026-10-14), that many capitals and digits with a single space allowed
+    between any two, no word character after them, and ISO 7064 mod 97-10 equal to 1; upper case
+    only. IBANs are found before the regex kinds, so an IBAN wins the de-overlap against a card
+    candidate inside its own digits. `part_of_a_decimal` drops a card candidate that follows a `.`
+    no letter precedes (a fraction; `no.4111...` still reads as a card) or that is followed by `.`
+    and a digit (an integer part); an exponent never matched, since the candidate's `\b` refuses a
+    run that continues into `e`. Not covered: a lower-case or a non-registry IBAN; an IBAN split
+    other than by single spaces; a card number written as the fraction of a decimal is now missed
+    on purpose.
+    *(tests: `core::dlp::tests` (seven, all red or guarding on the unchanged scanner):
+    `the_forge_prompt_finds_the_iban_beside_the_card_and_the_email` (red: two kinds),
+    `an_iban_written_in_groups_is_one_finding` (red), `a_masked_iban_reads_as_its_kind` (red),
+    `a_probability_in_a_typed_answer_is_not_a_card` (red: two cards in the GCP answer, verbatim),
+    and the guards `a_wrong_checksum_length_or_country_is_not_an_iban`,
+    `iban_shaped_noise_is_rarely_an_iban` (200 seeds), `a_card_written_like_a_card_is_still_found`.
+    Mutants as cases in `scripts/gates-have-teeth.sh`: the checksum skipped, the decimal rule
+    removed. Scenarios: `features/the-pii-scan-finds-an-iban.feature`. Not a script gate)*
+
+111. **The fleet view names every model a run used, how often it changed model, the model of its
+    latest call by time, and a run a gateway refused as killed.** Measured on forge 2026-10-14: a
+    run that spent 96% of its money on Opus and then made one Haiku call read `claude-haiku-5-5`
+    in `GET /v1/runs`, because `RunAgg.model` was overwritten by every record in arrival order, and
+    the console's assistant said the run used Haiku; a run killed on one gateway's own admin route
+    read `killed: false` in the Cloud. `@decided 2026-10-14`: keep the per-run model list (bounded,
+    with calls and spend) and the switch count, name the model by the latest timestamp, return them
+    from the run API, and show a gateway's kill in the Cloud, backward compatible.
+
+    `RunAgg` gains `models` (`[{model, calls, spent_microusd}]`, sorted by id, `MAX_RUN_MODELS` =
+    16 ids, the rest counted under `(other models)`, never dropped), `model_switches`,
+    `killed_by_gateway`, and the bookkeeping `model_millis`, `last_admitted_model`,
+    `last_admitted_millis`; every field is `#[serde(default)]`, so a snapshot written before them
+    loads. `model` is taken only from a record at least as new as the one it came from. Only an
+    admitted call (`allow`, `cache_hit`) joins `models` or moves `model_switches`; a switch is
+    counted when an admitted call newer than every admitted call already folded names another
+    model, so a run pushed in order is exact and one pushed out of order by two gateways is a
+    floor. A record with decision `killed` (the gateway's refusal of a killed run) sets
+    `killed_by_gateway`, and `runs_since` reads `killed` as that or the Cloud's own kill list;
+    the kill list, `/v1/kills`, `/v1/runs/spend` and the gateways' kill pollers are unchanged.
+
+    `@claude` 2026-10-14, the limits: a run killed on a gateway that makes no further call never
+    produces a `killed` row, so the Cloud never learns of it (sending the gateway's admin kill to
+    the Cloud is a follow-up); a gateway's kill is shown, not enforced by other gateways.
+    *(tests: `crates/cloud/tests/it/run_models.rs`, four, all red on the unchanged store in CI:
+    `a_run_that_changed_model_says_which_and_how_often`,
+    `an_older_record_never_takes_the_model_from_a_later_call`,
+    `a_refusal_names_no_model_the_run_used_and_changes_nothing`,
+    `a_run_a_gateway_refused_as_killed_reads_killed`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the model taken in arrival order, a refusal counted as a model
+    used, the gateway's kill not read. Scenarios: `features/a-run-names-every-model-it-used.feature`.
+    Not a script gate)*
+
+112. **A call the gateway answered just before it stops reaches the Cloud: the stop delivers what it holds, bounded, and names what it could not deliver.** On SIGTERM or SIGINT the server stops taking calls first; `flush_before_exit` then delivers the queue (in order) and the buffer within `EXIT_FLUSH_WITHIN`, waits for a push already on the wire, and starts nothing new while stopping. What is still undelivered at the bound is logged with its count. A SIGKILL, an out-of-memory kill or a lost node still loses what was not yet pushed, at most the last flush interval of calls plus the queue; a local spool is a follow-up, because replaying it needs the Cloud to recognise a record it already holds. `@decided 2026-10-14`: spend reports are made durable across a stop, and this change takes the delivery-before-exit half. *(test: `gateway::cloudsink::the_exit_flush_delivers_the_queue_then_the_buffer_in_order`, `gateway::cloudsink::the_exit_flush_is_bounded_and_says_what_it_could_not_deliver`, `gateway::cloudsink::a_push_on_the_wire_at_exit_is_counted_when_it_never_lands`, `tests/it/spend_reports_survive_a_stop.rs`: `a_call_served_just_before_sigterm_reaches_the_cloud`, `a_stop_while_the_cloud_does_not_answer_says_what_was_not_delivered`. Scenarios: `features/a-served-call-reaches-the-cloud-when-the-gateway-stops.feature`.)*
+
+113. **The teeth harness runs as four CI shards, and the shards together run every case exactly once.**
     One job took 30 to 60 minutes, the slowest step in this repository. `TEETH_SHARD=i/N` runs the cases at
     positions `i`, `i+N`, ... of the list; `TEETH_LIST=1` prints the names through the same filter and runs
     none; a shard that runs no case says it measured nothing. `scripts/teeth-shards-cover-every-case.sh` lists

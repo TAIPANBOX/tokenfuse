@@ -255,6 +255,37 @@ pub struct CallRecord {
     /// gateway's vocabulary ([`IDENTITY_REASONS`]).
     #[serde(default)]
     pub identity_reason: Option<String>,
+    /// The PII the gateway's scanner found in the call's prompt and let
+    /// through, shadow or mask (invariant 106,
+    /// `crates/gateway/src/sink.rs::CallRecord::pii_findings`): `kind=count`
+    /// pairs joined by `,`. Absent when nothing was found and from an older
+    /// gateway. Untrusted: read only as [`parse_pii_findings`] reads it.
+    #[serde(default)]
+    pub pii_findings: Option<String>,
+}
+
+/// Invariant 106: a gateway's `pii_findings` read as `(kind, count)` pairs,
+/// keeping only what has the scanner's shape: a kind `pii_` followed by 1 to
+/// 24 lowercase letters or `_`, a count from 1 to 100 000. Anything else is
+/// dropped, never shown; at most 16 pairs are read from one record.
+pub fn parse_pii_findings(raw: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for pair in raw.split(',').take(16) {
+        let Some((kind, count)) = pair.split_once('=') else {
+            continue;
+        };
+        let suffix = kind.strip_prefix("pii_").unwrap_or("");
+        let shaped = !suffix.is_empty()
+            && suffix.len() <= 24
+            && suffix.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+        let Ok(n) = count.parse::<u64>() else {
+            continue;
+        };
+        if shaped && (1..=100_000).contains(&n) && !out.iter().any(|(k, _)| k == kind) {
+            out.push((kind.to_string(), n));
+        }
+    }
+    out
 }
 
 /// The reasons the gateway's identity check gives (`identitymap.rs` and the
@@ -277,6 +308,40 @@ pub struct RunSpend {
     pub run_id: String,
     pub spent_microusd: i64,
     pub killed: bool,
+}
+
+/// Invariant 111: count one admitted call of `model` on the run, bounded at
+/// [`MAX_RUN_MODELS`] ids plus the [`OTHER_FALLBACK_MODELS`] bucket, sorted
+/// by id with the bucket last.
+fn fold_run_model(agg: &mut RunAgg, model: &str, cost_microusd: i64) {
+    let known = agg.models.iter().any(|m| m.model == model);
+    let distinct = agg
+        .models
+        .iter()
+        .filter(|m| m.model != OTHER_FALLBACK_MODELS)
+        .count();
+    let key = if known || distinct < MAX_RUN_MODELS {
+        model
+    } else {
+        OTHER_FALLBACK_MODELS
+    };
+    match agg.models.iter_mut().find(|m| m.model == key) {
+        Some(m) => {
+            m.calls += 1;
+            m.spent_microusd = m.spent_microusd.saturating_add(cost_microusd);
+        }
+        None => {
+            agg.models.push(RunModel {
+                model: key.to_string(),
+                calls: 1,
+                spent_microusd: cost_microusd,
+            });
+            agg.models.sort_by(|a, b| {
+                (a.model == OTHER_FALLBACK_MODELS, &a.model)
+                    .cmp(&(b.model == OTHER_FALLBACK_MODELS, &b.model))
+            });
+        }
+    }
 }
 
 /// The aggregated state of one run within an organization.
@@ -378,7 +443,53 @@ pub struct RunAgg {
     /// refused, when it is a word of the gateway's vocabulary; `""` otherwise.
     #[serde(default)]
     pub last_identity_reason: String,
+    /// Admitted calls whose prompt held PII the gateway let through, shadow
+    /// or mask (invariant 106).
+    #[serde(default)]
+    pub pii_calls: u64,
+
+    /// Every model this run's admitted calls named, with their calls and
+    /// spend (invariant 111), sorted by model id; at most [`MAX_RUN_MODELS`]
+    /// ids, the rest counted under [`OTHER_FALLBACK_MODELS`], never dropped.
+    /// `model` above is only the latest call's.
+    #[serde(default)]
+    pub models: Vec<RunModel>,
+    /// How many times an admitted call named a different model from the
+    /// admitted call before it in time (invariant 111). A record older than
+    /// the newest admitted call already folded joins `models` but cannot
+    /// change this count, so a run pushed in order (one gateway) is exact and
+    /// one pushed out of order by two is a floor.
+    #[serde(default)]
+    pub model_switches: u64,
+    /// The timestamp `model` was taken at: the latest call by its own time
+    /// names the run's model, never the latest to arrive.
+    #[serde(default)]
+    pub model_millis: i64,
+    /// The model and time of the newest admitted call folded so far, which
+    /// `model_switches` compares the next one against.
+    #[serde(default)]
+    pub last_admitted_model: String,
+    #[serde(default)]
+    pub last_admitted_millis: i64,
+    /// A gateway refused a call on this run because the run is killed there
+    /// (invariant 111): a kill made on one gateway's own admin route, which
+    /// the Cloud otherwise never hears of. `killed` reads true when this is
+    /// set or the Cloud's own kill list names the run; this never adds the run
+    /// to that list, which only an admin's kill does.
+    #[serde(default)]
+    pub killed_by_gateway: bool,
 }
+
+/// One model a run used: its admitted calls and their spend (invariant 111).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RunModel {
+    pub model: String,
+    pub calls: u64,
+    pub spent_microusd: i64,
+}
+
+/// How many distinct model ids one run's `models` keeps (invariant 111).
+pub const MAX_RUN_MODELS: usize = 16;
 
 /// One model id and how many admitted calls were charged at the fallback
 /// rate for it (invariant 86).
@@ -421,7 +532,27 @@ pub struct Summary {
     /// Admitted calls forwarded under identity warn mode (invariant 87),
     /// exact over the org's whole ingest history.
     pub identity_warned_calls: u64,
+    /// Admitted calls whose prompt held PII the gateway let through
+    /// (invariant 106), exact.
+    pub pii_calls: u64,
+    /// `pii_calls` per kind, most calls first, then by kind; bounded at 16
+    /// kinds plus `(other kinds)`.
+    pub pii_kinds: Vec<KindCalls>,
 }
+
+/// One PII kind and how many admitted calls carried it (invariant 106).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct KindCalls {
+    pub kind: String,
+    pub calls: u64,
+}
+
+/// How many distinct PII kinds the per-org fold keeps; past it, calls are
+/// counted under [`OTHER_PII_KINDS`].
+const MAX_PII_KINDS: usize = 16;
+
+/// The bucket for PII kinds past [`MAX_PII_KINDS`].
+pub const OTHER_PII_KINDS: &str = "(other kinds)";
 
 /// Per-agent spend rollup (P2), folded from an org's [`RunAgg`]s by `agent_id`.
 /// The empty-string `agent_id` is kept as an explicit "unattributed" bucket.
@@ -811,6 +942,12 @@ struct OrgTotals {
     /// Invariant 87, exact like `calls`.
     #[serde(default)]
     identity_warned_calls: u64,
+    /// Invariant 106, exact like `calls`; per kind bounded at
+    /// [`MAX_PII_KINDS`].
+    #[serde(default)]
+    pii_calls: u64,
+    #[serde(default)]
+    pii_kinds: HashMap<String, u64>,
 }
 
 /// A run that has spent at or above a fraction of its central budget.
@@ -1718,7 +1855,12 @@ impl Store {
                 // has to read (invariant 65), not a gateway's own clock.
                 gacc.last_push_millis = now_ms;
 
-                for r in records {
+                // Invariant 111: fold in time order within one push, so a push sent
+                // newest first still counts every model change it holds. Stable: equal
+                // timestamps keep their arrival order.
+                let mut ordered: Vec<&CallRecord> = records.iter().collect();
+                ordered.sort_by_key(|r| r.ts_millis);
+                for r in ordered {
                     // C4: `cost_microusd`/`saved_microusd` are attacker-
                     // controlled (a record is untrusted input). A negative value is
                     // nonsensical and an attack vector (it could be used to
@@ -1844,6 +1986,29 @@ impl Store {
                             String::new()
                         };
                     }
+                    // Invariant 106: PII the gateway found and let through, on
+                    // an admitted call only, read through its own shape.
+                    if matches!(r.decision.as_str(), "allow" | "cache_hit") {
+                        let kinds = r
+                            .pii_findings
+                            .as_deref()
+                            .map(parse_pii_findings)
+                            .unwrap_or_default();
+                        if !kinds.is_empty() {
+                            agg.pii_calls += 1;
+                            totals.pii_calls += 1;
+                            for (kind, _) in kinds {
+                                let key = if totals.pii_kinds.contains_key(&kind)
+                                    || totals.pii_kinds.len() < MAX_PII_KINDS
+                                {
+                                    kind
+                                } else {
+                                    OTHER_PII_KINDS.to_string()
+                                };
+                                *totals.pii_kinds.entry(key).or_insert(0) += 1;
+                            }
+                        }
+                    }
                     if r.decision == "allow" {
                         match r.price_basis.as_str() {
                             "known" => {}
@@ -1865,8 +2030,27 @@ impl Store {
                             }
                         }
                     }
-                    if !r.model.is_empty() {
+                    // Invariant 111: the run's model is its latest call's by
+                    // that call's own time, so a record pushed late never
+                    // renames the run.
+                    if !r.model.is_empty() && r.ts_millis >= agg.model_millis {
                         agg.model = r.model.clone();
+                        agg.model_millis = r.ts_millis;
+                    }
+                    if matches!(r.decision.as_str(), "allow" | "cache_hit") && !r.model.is_empty() {
+                        fold_run_model(agg, &r.model, r.cost_microusd.max(0));
+                        if r.ts_millis >= agg.last_admitted_millis {
+                            if !agg.last_admitted_model.is_empty()
+                                && agg.last_admitted_model != r.model
+                            {
+                                agg.model_switches += 1;
+                            }
+                            agg.last_admitted_model = r.model.clone();
+                            agg.last_admitted_millis = r.ts_millis;
+                        }
+                    }
+                    if r.decision == "killed" {
+                        agg.killed_by_gateway = true;
                     }
                     // Invariant 84: by [`filed_under`], never the claimed id
                     // of a refusal for identity. A run id is the caller's
@@ -2810,10 +2994,11 @@ impl Store {
                     continue;
                 }
                 let mut a = agg.clone();
-                a.killed = killed
-                    .and_then(|k| k.get(&a.run_id))
-                    .copied()
-                    .unwrap_or(false);
+                a.killed = a.killed_by_gateway
+                    || killed
+                        .and_then(|k| k.get(&a.run_id))
+                        .copied()
+                        .unwrap_or(false);
                 out.push(a);
             }
         }
@@ -2904,6 +3089,17 @@ impl Store {
             models.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.model.cmp(&b.model)));
             sum.fallback_models = models;
             sum.identity_warned_calls = totals.identity_warned_calls;
+            sum.pii_calls = totals.pii_calls;
+            let mut kinds: Vec<KindCalls> = totals
+                .pii_kinds
+                .iter()
+                .map(|(kind, calls)| KindCalls {
+                    kind: kind.clone(),
+                    calls: *calls,
+                })
+                .collect();
+            kinds.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.kind.cmp(&b.kind)));
+            sum.pii_kinds = kinds;
         }
         sum
     }
@@ -4287,6 +4483,39 @@ fn write_file_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Invariant 106: only the scanner's shape is read from a gateway's
+    /// `pii_findings`; anything else is dropped, and the read is bounded.
+    #[test]
+    fn pii_findings_are_read_only_in_the_scanners_shape() {
+        assert_eq!(
+            parse_pii_findings("pii_card=1,pii_email=2"),
+            vec![("pii_card".to_string(), 1), ("pii_email".to_string(), 2)]
+        );
+        for hostile in [
+            "",
+            "pii_email",
+            "pii_=1",
+            "PII_EMAIL=1",
+            "pii_email=0",
+            "pii_email=100001",
+            "pii_email=-1",
+            "pii_e-mail=1",
+            "<script>=1",
+            "pii_aaaaaaaaaaaaaaaaaaaaaaaaa=1",
+        ] {
+            assert!(parse_pii_findings(hostile).is_empty(), "{hostile:?}");
+        }
+        assert_eq!(
+            parse_pii_findings("pii_email=1,pii_email=5").len(),
+            1,
+            "a kind is read once"
+        );
+        let many: Vec<String> = (0..40)
+            .map(|i| format!("pii_k{}=1", "x".repeat(i % 20 + 1)))
+            .collect();
+        assert!(parse_pii_findings(&many.join(",")).len() <= 16);
+    }
 
     fn rec(run: &str, cost: i64) -> CallRecord {
         CallRecord {

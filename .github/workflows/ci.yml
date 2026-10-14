@@ -128,7 +128,7 @@ jobs:
 
       # The teeth harness runs as four shards (the teeth jobs below). This lists
       # what each shard would run and requires the four to run every case exactly
-      # once. It runs no case and needs no cargo (invariant 106).
+      # once. It runs no case and needs no cargo (invariant 113).
       - name: the teeth shards run every case exactly once
         run: ./scripts/teeth-shards-cover-every-case.sh
 
@@ -242,7 +242,7 @@ jobs:
   # The teeth harness is the slowest step in this repository, 30 to 60 minutes as
   # one job, so it runs as four shards of the same case list. Shard i runs the
   # cases at positions i, i+4, ..., and scripts/teeth-shards-cover-every-case.sh
-  # requires the four together to run each case exactly once (invariant 106).
+  # requires the four together to run each case exactly once (invariant 113).
   # Standard runners: this repository is public, so they cost nothing.
   teeth:
     name: teeth (shard ${{ matrix.shard }} of 4)

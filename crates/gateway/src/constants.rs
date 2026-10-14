@@ -614,6 +614,8 @@ mod tests {
                 "x_key_id",
                 "x_block_reason",
                 "x_identity_reason",
+                "x_price_basis",
+                "x_pii_findings",
             ]
         );
     }

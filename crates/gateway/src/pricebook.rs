@@ -460,6 +460,25 @@ const OPENAI: &[(&str, Rates, Option<Rates>)] = &[
         (150_000, 600_000, 75_000, 150_000, 150_000),
         None,
     ),
+    // The GPT-4.1 family, read 2026-10-14 from the same page: 2.00 / 8.00,
+    // cached 0.50; mini 0.40 / 1.60, cached 0.10; nano 0.10 / 0.40, cached
+    // 0.025. Cache writes "-", so the write columns are the input rate. No
+    // long tier listed. Invariant 107.
+    (
+        "gpt-4.1",
+        (2_000_000, 8_000_000, 500_000, 2_000_000, 2_000_000),
+        None,
+    ),
+    (
+        "gpt-4.1-mini",
+        (400_000, 1_600_000, 100_000, 400_000, 400_000),
+        None,
+    ),
+    (
+        "gpt-4.1-nano",
+        (100_000, 400_000, 25_000, 100_000, 100_000),
+        None,
+    ),
     // 15.00 / 60.00, cached 7.50.
     (
         "o1",
@@ -471,6 +490,10 @@ const OPENAI: &[(&str, Rates, Option<Rates>)] = &[
 /// OpenAI's prompt-length threshold, "long context (>272K input tokens)", K
 /// read as 1000.
 const OPENAI_LONG_ABOVE: u64 = 272_000;
+
+/// The prefix OpenRouter names OpenAI's models with (`openai/gpt-4.1-mini`).
+/// Every [`OPENAI`] id is also priced under it (invariant 107).
+const OPENROUTER_OPENAI: &str = "openai/";
 
 /// First-party APIs priced at their default (global) endpoint, one rate per
 /// id, no write fee unless a column says so.
@@ -640,17 +663,25 @@ pub fn default_price_book() -> PriceBook {
             );
         }
     }
-    // OpenAI (see `OPENAI`).
+    // OpenAI (see `OPENAI`), each id also under its OpenRouter name,
+    // `openai/<id>` (invariant 107). Unlike `moonshotai/kimi-k3` and
+    // `z-ai/glm-5.3`, which dozens of providers serve at rates up to six
+    // times apart, an `openai/` id names OpenAI's own model sold at OpenAI's
+    // list, so the vendor's row is the honest price. `@claude` 2026-10-14. An
+    // `openai/` id with no bare row stays at the fallback: nothing here maps a
+    // name the book does not know.
     for (id, base, long) in OPENAI {
-        book.insert(*id, rates(*base));
-        if let Some(l) = long {
-            book.insert_long_context(
-                id,
-                LongContext {
-                    above_prompt_tokens: OPENAI_LONG_ABOVE,
-                    price: rates(*l),
-                },
-            );
+        for name in [id.to_string(), format!("{OPENROUTER_OPENAI}{id}")] {
+            book.insert(name.as_str(), rates(*base));
+            if let Some(l) = long {
+                book.insert_long_context(
+                    name.as_str(),
+                    LongContext {
+                        above_prompt_tokens: OPENAI_LONG_ABOVE,
+                        price: rates(*l),
+                    },
+                );
+            }
         }
     }
     // DeepSeek, Moonshot, Z.ai (see `FIRST_PARTY`).
@@ -1106,6 +1137,63 @@ mod tests {
 
     /// Every id added on 2026-10-13 has a row at the vendor's base rate. On
     /// the book before it each one settled at the 15 / 75 fallback.
+    /// Invariant 107: every OpenAI row is also the price of its OpenRouter
+    /// name, the long tier included, and the prefix maps nothing the book does
+    /// not know.
+    #[test]
+    fn every_openai_id_is_priced_under_its_openrouter_name_too() {
+        let book = default_price_book();
+        let long = Usage {
+            input_tokens: 300_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        let short = Usage {
+            input_tokens: 14,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        for (id, _, _) in OPENAI {
+            let alias = format!("openai/{id}");
+            assert!(book.is_known(&alias), "{alias}");
+            assert_eq!(book.price(&alias), book.price(id), "{alias}");
+            assert_eq!(book.cost(&alias, &long), book.cost(id, &long), "{alias}");
+            assert_eq!(book.cost(&alias, &short), book.cost(id, &short), "{alias}");
+        }
+        assert!(!book.is_known("openai/gpt-9-turbo"));
+        assert!(!book.is_known("openai/"));
+        assert!(
+            !book.is_known("moonshotai/kimi-k3"),
+            "a many-seller id keeps the fallback"
+        );
+    }
+
+    /// Invariant 107: the GPT-4.1 family at OpenAI's list, read 2026-10-14,
+    /// and the forge call (14 in, 2 out on `openai/gpt-4.1-mini`) at 9
+    /// micro-USD where the fallback charged 360.
+    #[test]
+    fn the_gpt_4_1_family_is_priced_at_its_list_rate() {
+        let book = default_price_book();
+        let rate = |id: &str| {
+            let p = book.price(id).unwrap();
+            (
+                p.input_per_mtok.0,
+                p.output_per_mtok.0,
+                p.cache_read_per_mtok.0,
+                p.cache_write_per_mtok.0,
+            )
+        };
+        assert_eq!(rate("gpt-4.1"), (2_000_000, 8_000_000, 500_000, 2_000_000));
+        assert_eq!(rate("gpt-4.1-mini"), (400_000, 1_600_000, 100_000, 400_000));
+        assert_eq!(rate("gpt-4.1-nano"), (100_000, 400_000, 25_000, 100_000));
+        let forge = Usage {
+            input_tokens: 14,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        assert_eq!(book.cost("openai/gpt-4.1-mini", &forge), Some(Microusd(9)));
+    }
+
     #[test]
     fn every_new_vendor_id_prices_at_its_list_rate_never_the_fallback() {
         let book = default_price_book();
@@ -1246,7 +1334,10 @@ mod tests {
     fn the_fallback_is_at_least_every_row_in_every_column() {
         let book = default_price_book();
         let f = book.fallback().unwrap();
+        // Invariant 107: an `openai/` row is the OpenAI row it copies, so it
+        // carries the same exceptions.
         let exception = |id: &str, column: &str| {
+            let id = id.strip_prefix(OPENROUTER_OPENAI).unwrap_or(id);
             matches!(
                 (id, column),
                 ("o1", "read")
@@ -1377,10 +1468,18 @@ mod tests {
                 )
             })
             .collect();
-        let want: Vec<(String, u64, Rates)> = want
+        let mut want: Vec<(String, u64, Rates)> = want
             .into_iter()
             .map(|(id, a, r)| (id.to_string(), a, r))
             .collect();
+        // Invariant 107: every OpenAI tier above is also OpenRouter's
+        // `openai/` id, at the same rates.
+        let openrouter: Vec<(String, u64, Rates)> = want
+            .iter()
+            .filter(|(id, _, _)| id.starts_with("gpt-"))
+            .map(|(id, a, r)| (format!("{OPENROUTER_OPENAI}{id}"), *a, *r))
+            .collect();
+        want.extend(openrouter);
         assert_eq!(got, want);
     }
 

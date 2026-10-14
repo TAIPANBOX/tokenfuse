@@ -2447,6 +2447,65 @@ async fn a_brokered_tool_call_is_recorded_when_no_policy_gate_is_configured() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Invariant 108: a brokered call's `tool_call` record carries the run the
+/// caller named in `x-fuse-run-id`, on the ungoverned and the governed path,
+/// so a per-run or per-agent egress policy can be written from the bus.
+/// Measured 2026-10-14 on forge: every broker `tool_call` had no run id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brokered_tool_call_record_carries_the_callers_run_id() {
+    let dir = events_dir("run-id");
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let pdp = stub_pdp("allow").await;
+    for (i, wardryx) in [Wardryx::disabled(), a_wardryx(WardryxMode::Enforce, pdp)]
+        .into_iter()
+        .enumerate()
+    {
+        let events = dir.join(format!("events-{i}.ndjson"));
+        let (router, _exp) = broker_recording(
+            upstream.clone(),
+            &events,
+            wardryx,
+            None,
+            tokenfuse_core::DlpMode::Off,
+        );
+        let broker_url = spawn_server(router).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        for run in [Some("run-egress-7"), None] {
+            let mut req = reqwest::Client::new()
+                .post(&broker_url)
+                .header("x-fuse-agent-id", "agent://acme.example/triage");
+            if let Some(r) = run {
+                req = req.header("x-fuse-run-id", r);
+            }
+            let resp: Value = req
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "gh_api", "arguments": {} }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(resp.get("result").is_some(), "{resp}");
+        }
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 2, "path {i}: {calls:?}");
+        assert_eq!(
+            calls[0]["run_id"], "run-egress-7",
+            "path {i}: the run the caller named is on the record: {}",
+            calls[0]
+        );
+        assert!(
+            calls[1].get("run_id").is_none(),
+            "path {i}: no run named, none invented: {}",
+            calls[1]
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// One record per brokered call, not two.
 ///
 /// The wardryx branch writes its own record with the decision the PDP gave. A
