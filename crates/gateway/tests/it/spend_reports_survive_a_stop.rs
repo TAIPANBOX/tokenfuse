@@ -203,7 +203,27 @@ async fn a_stop_while_the_cloud_does_not_answer_says_what_was_not_delivered() {
         .cloned()
         .unwrap_or_default();
     assert!(
-        line.contains("unsent=3"),
+        strip_ansi(&line).contains("unsent=3"),
         "the exit says how many answered calls did not reach the Cloud:\n{all}"
     );
+}
+
+/// The log line's fields are coloured (`unsent` and `=` sit in separate CSI
+/// sequences), so a plain substring match on `unsent=3` cannot see them.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
