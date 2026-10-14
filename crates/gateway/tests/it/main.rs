@@ -37,6 +37,7 @@ mod mcp_scan_report;
 mod mcp_xaa;
 mod memory_and_unclassified;
 mod no_usage_stream_settles_on_the_estimate;
+mod openrouter_openai_ids_are_priced;
 mod policy_plane;
 mod price_book_startup;
 mod reasoning_tokens_are_output;
