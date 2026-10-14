@@ -1855,7 +1855,12 @@ impl Store {
                 // has to read (invariant 65), not a gateway's own clock.
                 gacc.last_push_millis = now_ms;
 
-                for r in records {
+                // Invariant 111: fold in time order within one push, so a push sent
+                // newest first still counts every model change it holds. Stable: equal
+                // timestamps keep their arrival order.
+                let mut ordered: Vec<&CallRecord> = records.iter().collect();
+                ordered.sort_by_key(|r| r.ts_millis);
+                for r in ordered {
                     // C4: `cost_microusd`/`saved_microusd` are attacker-
                     // controlled (a record is untrusted input). A negative value is
                     // nonsensical and an attack vector (it could be used to
