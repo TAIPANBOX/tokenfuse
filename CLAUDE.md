@@ -96,6 +96,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/d9-send-retention.sh  # invariant 50 (D9); its suite also runs in cargo test --all
 ./scripts/one-test-binary-per-crate.sh  # invariant 78
 ./scripts/no-owner-quotes.sh     # invariant 101
+./scripts/no-html-from-data.sh   # invariant 102
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -6967,6 +6968,48 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     that also carries Cyrillic; Cyrillic prose outside a string literal in a non-code file or in a code
     comment; the owner's first name outside an authorship line. `scripts/gates-have-teeth.sh` plants a
     marker line, requires a clean line to pass, and requires an empty index to say it measured nothing.)*
+
+102. **A page this repository serves builds no markup out of the data it shows.**
+    The control plane serves one page of its own at `GET /` (`crates/cloud/index.html`, embedded
+    with `include_str!`). It rendered the runs table as a template string assigned to `innerHTML`,
+    each run's `run_id` and `model` interpolated into it, attributes included. Both are chosen by
+    whoever calls a gateway (an agent names its run, and the model is whatever its request body
+    says), and the Cloud stores them as sent, so the page parsed caller-chosen text as markup in
+    the operator's browser, on the same page that keeps the org key in `localStorage`: a script
+    injection path open to any caller of a gateway and any holder of an ingest key. Found on
+    2026-10-14 in an audit of the page. The rows are now built with `createElement`, every value is
+    set with `textContent`, and the Budget and Kill buttons take the run id as a handler argument
+    rather than reading it back from an attribute.
+
+    The same change corrected two stale texts on that page: the key field suggested `devkey`, the
+    fallback removed in v1.9.0 (#380), and the savings tile read "Saved this month" while
+    `/v1/savings` totals everything the plane has ingested (`SavingsAcc` has no month boundary;
+    the Next.js dashboard has said "all time" since #131).
+
+    `@claude` 2026-10-14, the choices: DOM APIs rather than an escape helper, so no string of
+    markup is built from data anywhere on the page; and a gate that refuses any value but one
+    constant string, because a script reader cannot know where a variable came from.
+
+    Not covered: a `Content-Security-Policy` on `GET /` (the page's script is inline, so a policy
+    needs a hash or a nonce, or the script on a route of its own: a follow-up); a sink reached
+    through a computed property, an inline event handler, a `javascript:` URL; the static mock
+    under `docs/preview/`, which no binary serves and whose data is written into the page.
+    *(gate: `scripts/no-html-from-data.sh`. It reads every file a crate embeds with `include_str!`
+    or `include_bytes!` whose name ends in .html, .htm, .js or .mjs, discovered from the Rust
+    sources rather than listed; it masks comments and strings in each inline script, keeps a
+    template's `${...}` as code, and refuses the value given to any HTML sink (`innerHTML`,
+    `outerHTML`, `srcdoc`, `insertAdjacentHTML`, `document.write`, `createContextualFragment`,
+    `setHTMLUnsafe`, `parseHTMLUnsafe`) unless it is one constant string an ALLOW entry names with
+    a reason. In `cloud/dashboard` any code line naming `dangerouslySetInnerHTML` or a sink is
+    refused. `scripts/gates-have-teeth.sh` plants both shapes of the fault (a template literal and
+    a concatenation), requires `textContent`, a sink named in a comment or a string, and the
+    committed page to pass, finds a sink in a second embedded file no list names, holds the
+    allow-list's three rules, and takes the subject away five ways, each of which must read as
+    measured nothing. Tests: `crates/cloud/tests/it/dashboard_page.rs`,
+    `the_served_page_never_parses_a_run_field_as_markup` and
+    `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
+    page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
+    each bound.)*
 
 104. **A streamed answer's tool calls are judged as a buffered answer's are.** The buffered path
     judges the tool calls a model asks for against the run's taint (`taint::evaluate`) and refuses

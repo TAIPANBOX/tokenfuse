@@ -1163,6 +1163,101 @@ run_case "streamed-tools: only the event that opened the call is held" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
 	"$(py 'edit("crates/gateway/src/streamgate.rs", "        if self.holding || opens_tool {", "        if opens_tool {")')" \
 	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+# --- invariant 102: a served page builds no markup from data ----------------
+#
+# The faults are planted in the page the control plane serves, just before the
+# line that starts its refresh timer, so each lands inside its inline script.
+# The first two are the defect's two shapes, a template literal and a
+# concatenation; the third is the fix's own shape and must NOT fire. Then the
+# allow-list, which may only excuse a constant string and only with a reason,
+# and the five ways the gate's subject can be taken away, each of which must
+# read as measured nothing.
+run_case "no-html-from-data: a run field interpolated into innerHTML" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"rows\").innerHTML = `<td>${key}</td>`;\n  setInterval(refresh, 3000);")')" \
+	"which is built from data"
+
+run_case "no-html-from-data: a run field concatenated into insertAdjacentHTML" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"rows\").insertAdjacentHTML(\"beforeend\", \"<td>\" + key + \"</td>\");\n  setInterval(refresh, 3000);")')" \
+	"insertAdjacentHTML is given \"<td>\" + key"
+
+run_case "no-html-from-data: a run field set as textContent passes" pass \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"status\").textContent = `key ${key}`;\n  setInterval(refresh, 3000);")')"
+
+run_case "no-html-from-data: the page as committed passes" pass \
+	"./scripts/no-html-from-data.sh" \
+	"pass"
+
+# A sink named inside a comment or a string is text, not a sink. An overeager
+# gate here would be the one somebody deletes.
+run_case "no-html-from-data: a sink named in a comment or a string passes" pass \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  /* el.innerHTML = key */ // el.outerHTML = key\n  const said = \"el.innerHTML = \\\"x\\\" + key\";\n  setInterval(refresh, 3000);")')"
+
+# The reader finds what a binary serves from the Rust sources, so a second
+# embedded file is read without anybody adding it to a list.
+run_case "no-html-from-data: a second embedded script with a sink is found" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'open("crates/cloud/planted.js", "w").write("document.write(\"<p>\" + location.hash);\n")
+edit("crates/cloud/src/http.rs", "Html(include_str!(\"../index.html\"))", "Html(include_str!(\"../index.html\"))\n}\n\nconst _PLANTED: &str = include_str!(\"../planted.js\");\nfn _planted() {")')" \
+	"crates/cloud/planted.js:1: write is given"
+
+run_case "no-html-from-data: a constant string no ALLOW entry names" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"rows\").innerHTML = \"\";\n  setInterval(refresh, 3000);")')" \
+	"which no ALLOW entry names"
+
+run_case "no-html-from-data: a constant string the ALLOW list names with a reason passes" pass \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"rows\").innerHTML = \"\";\n  setInterval(refresh, 3000);")
+edit("scripts/no-html-from-data.sh", "ALLOW = [\n]", "ALLOW = [(\"crates/cloud/index.html\", \x27\"\"\x27, \"empties the table and carries no data\"),\n]")')"
+
+run_case "no-html-from-data: an ALLOW entry with no reason" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  $(\"rows\").innerHTML = \"\";\n  setInterval(refresh, 3000);")
+edit("scripts/no-html-from-data.sh", "ALLOW = [\n]", "ALLOW = [(\"crates/cloud/index.html\", \x27\"\"\x27, \" \"),\n]")')" \
+	"is unusable"
+
+run_case "no-html-from-data: an ALLOW entry that matches no sink" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("scripts/no-html-from-data.sh", "ALLOW = [\n]", "ALLOW = [(\"crates/cloud/index.html\", \x27\"\"\x27, \"empties the table and carries no data\"),\n]")')" \
+	"matches no sink"
+
+run_case "no-html-from-data: the served page deleted, so it measured nothing" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'import os; os.remove("crates/cloud/index.html")')" \
+	"measured nothing"
+
+run_case "no-html-from-data: no page embedded at all, so it measured nothing" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/src/http.rs", "Html(include_str!(\"../index.html\"))", "Html(\"<!doctype html>\")")')" \
+	"measured nothing"
+
+run_case "no-html-from-data: the page's script moved out of the page, so it measured nothing" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "<script>", "<script src=\"app.js\"></script><script type=\"text/plain\" src=\"x\">")')" \
+	"has no inline <script>"
+
+run_case "no-html-from-data: a script it cannot read to the end, so it measured nothing" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("crates/cloud/index.html", "  setInterval(refresh, 3000);", "  const unclosed = \"refresh;\n  setInterval(refresh, 3000);")')" \
+	"could not be read to its end"
+
+run_case "no-html-from-data: dangerouslySetInnerHTML in the dashboard" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "\n", "\nconst planted = <div dangerouslySetInnerHTML={{ __html: location.hash }} />;\n")')" \
+	"dangerouslySetInnerHTML in the dashboard"
+
+run_case "no-html-from-data: the dashboard sources gone, so it measured nothing" fail \
+	"./scripts/no-html-from-data.sh" \
+	"$(py 'import os, subprocess
+paths = [p for p in subprocess.run(["git", "ls-files", "cloud/dashboard"], capture_output=True, text=True).stdout.split() if p.endswith((".tsx", ".ts", ".jsx", ".js", ".mjs"))]
+assert paths, "no dashboard source to remove"
+for p in paths:
+    os.remove(p)')" \
+	"measured nothing"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #
