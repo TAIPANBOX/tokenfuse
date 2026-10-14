@@ -303,8 +303,9 @@ async fn the_price_book_route_names_the_operators_rows_and_the_fallback() {
     assert_eq!(after["fallback_models_seen_total"], 1, "{after}");
 }
 
-/// A control plane that keeps every record pushed to `/v1/ingest` and answers
-/// every other route with an empty list.
+/// A control plane that keeps every record pushed to `/v1/ingest`, answers the
+/// two budget maps with an empty map, and every other route with an empty
+/// list, so the gateway reads its seed (invariant 103) and admits calls.
 async fn capture_cloud() -> (
     String,
     std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -326,6 +327,8 @@ async fn capture_cloud() -> (
                 }
             }),
         )
+        .route("/v1/budgets", axum::routing::get(|| async { "{}" }))
+        .route("/v1/unit-budgets", axum::routing::get(|| async { "{}" }))
         .fallback(|| async { "[]" });
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -339,7 +342,9 @@ async fn capture_cloud() -> (
 /// with the call, so a fleet view can see fallback-priced spend. The real
 /// binary, the real CloudSink, a capturing control plane: a listed model is
 /// pushed as `known`, an unlisted one as `fallback`.
-#[tokio::test]
+// Two workers: the stub control plane must answer the gateway's startup seed while this
+// test's own thread is blocked waiting for the listening line (invariant 103).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_basis_each_call_was_charged_at_reaches_the_cloud() {
     let (cloud, got) = capture_cloud().await;
     let addr = free_addr();

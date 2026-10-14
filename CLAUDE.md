@@ -3387,7 +3387,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     invariant 13's own test for a warning, met.
 
     **Where it says nothing.** Startup only: no refresh, no retry; a control plane down at startup
-    leaves the month at zero until the next restart, as before. The figure is the org's, so two
+    leaves the month at zero until the next restart, as before. (Superseded on 2026-10-14 by
+    invariant 103: the seed is now retried until it lands, and a call a budget governs waits.) The figure is the org's, so two
     gateways each start from the org total and then count their own spend, which makes each more
     conservative than before and no more consistent with the other (docs/20's non-fleet-consistency
     stands). Clock skew: the row's `month` is the control plane's, compared with this gateway's;
@@ -7010,6 +7011,85 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_served_page_names_no_removed_key_and_calls_its_savings_all_time`, both red on the unfixed
     page in CI. Scenarios: `features/the-control-plane-page-shows-run-fields-as-text.feature`,
     each bound.)*
+
+103. **A gateway that has not read its control plane's money state admits nothing a budget
+    governs.** Invariants 52 and 70 seed a restarted gateway's unit month and run spend from the
+    control plane once, at startup, and a control plane that could not be asked cost one warning
+    and a ledger that started at zero until the next restart. Measured 2026-10-14 on forge
+    (`systemctl restart docker`): the gateway started 60 ms before the control plane, logged both
+    warnings, then admitted a call for a unit already over its monthly cap (200, 48 micro-USD) and
+    a call on a run whose Cloud-known spend, 0.000456, was past its 0.0004 budget. It lost that
+    race in one restart of two.
+
+    `@decided 2026-10-14`: never admit a budgeted run or a capped unit on state that was not
+    seeded; keep asking the control plane in the background until it answers; say on the bus when
+    the seed is missing. The 2026-09-18 decision under invariant 52 stands unchanged: the gateway
+    still never refuses to START because the control plane cannot be reached.
+
+    **What the seed is now.** Five reads, each bounded by `SEED_TIMEOUT` and `SEED_MAX_BODY_BYTES`
+    (`cloudsink::seed_control_plane`, `SeedParts`): run spend (invariant 70, `/v1/run-spend` then
+    `/v1/runs`), the Cloud run budgets (`/v1/budgets`), the Cloud kills (`/v1/kills`) and, with an
+    identity map loaded, the unit month (invariant 52, `/v1/units`) and the Cloud unit caps
+    (`/v1/unit-budgets`). Budgets and kills joined because a run admitted before the 3-second
+    pollers' first answer would be checked against the caller's budget instead of the operator's,
+    or not at all if killed. A 404 on budgets, kills or unit caps is an empty list (a control plane
+    that does not serve it holds none); a 404 on run spend or units is a failure, as before. Each
+    part is applied the moment it is read; an attempt stops at the first part that fails, so an
+    unreachable control plane costs one bounded wait per attempt.
+
+    **The gate.** `seedgate::SeedGate`, on `AppState.seed`: open with no control plane configured
+    (every deployment without a Cloud is unchanged), closed when the startup attempt did not read
+    all five. While closed, `proxy::handle_call` answers a call carrying `x-fuse-run-id` (every such
+    call has a budget: the header's, the policy's or the built-in one), BEFORE the run is opened,
+    with `503` `seed_pending`, `retryable: true`, `retry-after: 1`, in enforce; shadow and warn
+    forward it and append `seed_pending: <reason>` to `x-fuse-would-block`, since they refuse
+    nothing for money. 503 and not 402, `@claude` 2026-10-14: nothing says the run's money is gone,
+    the dependency holding it has not answered, the state clears by itself, and the Anthropic and
+    OpenAI client libraries retry a 503 on their own; it is not a tenth Breaker reason, so nothing
+    that mirrors the nine moves. An unmetered call (no run id, `TOKENFUSE_REQUIRE_RUN_ID=false`) is
+    not governed by a budget and passes as before.
+
+    **The retry.** `cloudsink::spawn_seed_retry`, started once after the retained-reservation replay
+    and before the listener binds: waits `seedgate::backoff` (250 ms, doubling, at most 5 s), asks
+    only for the parts still missing, logs failures at debug (the startup attempt's warnings are
+    the one warning), then credits the late run seed to the runs the replay recreated
+    (`AppState::credit_late_seed`, the generation each came back at), opens the gate and says so
+    in one INFO line with the attempts and the calls it refused or marked.
+    `UnitLedger::seed_month` now refuses only a window with settled spend: a reservation the replay
+    put back beside it never reached the control plane, so the late seed counts nothing twice.
+    Nothing this process admitted is in the late seed's figures in enforce, since every call a
+    budget governs was refused before `open_run`; in shadow a run opened while the seed was missing
+    keeps its own tally (its pending entry is taken only on a fresh open), so nothing is counted
+    twice there either.
+
+    **On the bus.** One `dependency_failed` per run while the gate is closed, under the caller's
+    `x-fuse-agent-id`: `dependency` `control_plane` and `stage` `seed`, both new values of the
+    existing type; `effect` `denied_unasked` in enforce, `allowed_ungoverned` in shadow and warn;
+    `detail` the reason. The run set is bounded at `REPORTED_RUNS_CAP` (8192) and starts over past
+    it. Recovery is the INFO line, not an event: an event needs an agent, and a recovery names
+    none; a registered recovery type is agent-passport SPEC 6.2's to add first.
+
+    Not covered: a control plane that is up and answers stale figures; a kill or budget set in the
+    window between the seed and the pollers' next tick (the pollers' own 3 s, unchanged); the
+    seed's own figures only reflect telemetry that reached the control plane (invariant 53's
+    queue); `seed_pending` is a new `error.type` value on the wire, not a frozen name.
+    *(tests: `tests/it/seed_before_admit.rs` against the real binary and a control plane that is
+    not listening at start and comes up on the same address: `a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs`
+    (red first in CI run 38580618518 on the unchanged gateway, `left: 200 right: 503`, the forge
+    measurement), `shadow_forwards_while_the_seed_is_missing_and_says_so` (red first, no
+    `seed_pending` in `x-fuse-would-block`), `a_control_plane_that_answers_at_startup_opens_the_gate_before_the_first_call`
+    (the control: no 503 at all when the control plane is up); `cloudsink::tests`
+    (`the_seed_reads_every_part_and_applies_each`, `a_part_that_fails_stops_the_attempt_and_keeps_what_was_read`,
+    `the_retry_reads_a_late_control_plane_and_opens_the_gate`,
+    `a_late_seed_is_credited_to_the_runs_the_replay_recreated`, `seed_parts_name_what_is_missing`);
+    `seedgate::tests` (four: the open
+    gate, the closed gate's reason and its once-per-run count, the bound, the backoff and its
+    overflow); `unitledger::tests::a_late_seed_lands_beside_a_restored_reservation` and the narrowed
+    `a_seed_never_overwrites_a_window_already_counting`. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the gate never consulted, the gate left open after a failed
+    startup attempt, the retry never opening the gate, shadow forwarding without saying so, a
+    restored reservation refusing the late unit seed. Scenarios:
+    `features/a-gateway-admits-nothing-until-its-seed-is-read.feature`. Not a script gate)*
 
 104. **A streamed answer's tool calls are judged as a buffered answer's are.** The buffered path
     judges the tool calls a model asks for against the run's taint (`taint::evaluate`) and refuses

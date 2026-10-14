@@ -264,10 +264,12 @@ async fn a_retained_reservation_survives_a_gateway_restart() {
 }
 
 /// A control plane that serves one Cloud-managed budget, for `parent`, on
-/// `/v1/budgets` and answers 404 to everything else (the seeds and the ingest
-/// then fail on their own, which nothing here depends on). Returns its base URL
-/// and a counter of budget polls, so a test can wait until the gateway has the
-/// budget instead of sleeping on a guess.
+/// `/v1/budgets`, knows no run's spend (`/v1/runs` is an empty list), and
+/// answers 404 to everything else (the ingest then fails on its own, which
+/// nothing here depends on). The run list is served because a gateway that
+/// cannot read run spend admits nothing a budget governs (invariant 103).
+/// Returns its base URL and a counter of budget polls, so a test can wait
+/// until the gateway has the budget instead of sleeping on a guess.
 async fn cloud_with_parent_budget(parent_budget_micros: i64) -> (String, Arc<AtomicUsize>) {
     use axum::routing::get;
     let polls = Arc::new(AtomicUsize::new(0));
@@ -282,6 +284,10 @@ async fn cloud_with_parent_budget(parent_budget_micros: i64) -> (String, Arc<Ato
                     axum::Json(serde_json::json!({ "parent": parent_budget_micros }))
                 }
             }),
+        )
+        .route(
+            "/v1/runs",
+            get(|| async { axum::Json(serde_json::json!([])) }),
         )
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,7 +340,9 @@ async fn wait_for_budget_polls(polls: &AtomicUsize, n: usize) {
 /// first-sight path never fired again, so every child call was refused 402
 /// naming the parent until the parent itself called. The restored parent must
 /// get its Cloud budget the same way a declared parent does.
-#[tokio::test]
+// Two workers: the stub control plane must answer the gateway's startup seed while this
+// test's own thread is blocked waiting for the listening line (invariant 103).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restored_parent_gets_its_cloud_budget_back_after_a_restart() {
     let dir = std::env::temp_dir().join(format!("tf-retained-cloud-parent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

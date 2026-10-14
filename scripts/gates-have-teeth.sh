@@ -1134,6 +1134,37 @@ run_case "no-owner-quotes: an empty index, so it measured nothing" fail_env \
 	"pass" \
 	"measured nothing"
 
+# --- invariant 103: nothing a budget governs before the seed is read ---------
+#
+# Not a scripts/*.sh gate: the rule is the seed gate, held by cargo test against
+# the real binary and a control plane that comes up after the gateway. Each
+# mutant is a way the forge restart of 2026-10-14 comes back. The planted texts
+# keep every variable used, so each mutant compiles under `-D warnings`.
+run_case "seed-gate: the gate never consulted on the request path" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact seed_before_admit::a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if let Some(reason) = st.seed.pending_reason() {", "    if let Some(reason) = st.seed.pending_reason().filter(|_| false) {")')" \
+	"a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs ... FAILED"
+
+run_case "seed-gate: a failed startup seed leaves the gate open" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact seed_before_admit::a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs" \
+	"$(py 'edit("crates/gateway/src/main.rs", "tokenfuse_gateway::seedgate::SeedGate::closed(e.to_string()),", "{ let _ = e.to_string(); tokenfuse_gateway::seedgate::SeedGate::open() },")')" \
+	"a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs ... FAILED"
+
+run_case "seed-gate: the retry reads the seed and never opens the gate" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact seed_before_admit::a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs" \
+	"$(py 'edit("crates/gateway/src/cloudsink.rs", "    if let Some(touched) = state.seed.open_now() {", "    if let Some(touched) = state.seed.pending_reason().map(|_| 0u64).filter(|_| false) {")')" \
+	"a_gateway_that_starts_before_its_control_plane_admits_nothing_a_budget_governs ... FAILED"
+
+run_case "seed-gate: shadow forwards and does not say so" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact seed_before_admit::shadow_forwards_while_the_seed_is_missing_and_says_so" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        seed_pending_note = Some(format!(\"seed_pending: {reason}\"));", "        let _ = &reason;")')" \
+	"shadow_forwards_while_the_seed_is_missing_and_says_so ... FAILED"
+
+run_case "seed-gate: a restored reservation refuses the late unit seed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact unitledger::tests::a_late_seed_lands_beside_a_restored_reservation" \
+	"$(py 'edit("crates/gateway/src/unitledger.rs", "        if s.spent != Microusd::ZERO {", "        if s.spent != Microusd::ZERO || s.reserved != Microusd::ZERO {")')" \
+	"a_late_seed_lands_beside_a_restored_reservation ... FAILED"
+
 # --- invariant 104: a streamed tool call is judged ------------------------------
 #
 # Not a scripts/*.sh gate: the rule is the stream gate and the shared judgement,
@@ -1163,6 +1194,7 @@ run_case "streamed-tools: only the event that opened the call is held" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_tool_call_the_taint_denies_is_refused" \
 	"$(py 'edit("crates/gateway/src/streamgate.rs", "        if self.holding || opens_tool {", "        if opens_tool {")')" \
 	"a_streamed_openai_tool_call_the_taint_denies_is_refused ... FAILED"
+
 # --- invariant 102: a served page builds no markup from data ----------------
 #
 # The faults are planted in the page the control plane serves, just before the
