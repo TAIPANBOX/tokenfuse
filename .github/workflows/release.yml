@@ -109,7 +109,10 @@ jobs:
       - name: musl linker
         # A hard ceiling for a flapping snapshot service; the probe catches
         # "down", apt's per-fetch bounds do not add up to a bound on the step.
-        timeout-minutes: 6
+        # 12 rather than CI's 6: a release that fails on a slow but working
+        # snapshot cannot be re-run from a fixed workflow without a new tag
+        # (2026-10-14, v1.13.2, six attempts).
+        timeout-minutes: 12
         if: endsWith(matrix.target, '-linux-musl')
         run: |
           # The snapshot service is served from archive.ubuntu.com; the runner
