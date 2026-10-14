@@ -10,7 +10,7 @@
 
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
-![release](https://img.shields.io/badge/release-v1.13.1-brightgreen)
+![release](https://img.shields.io/badge/release-v1.13.2-brightgreen)
 ![tests](https://img.shields.io/badge/tests-1920-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -26,7 +26,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 > **⚡ Try it in one command**, no signup, no account:
 > ```bash
-> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.1
+> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.2
 > ```
 > `TOKENFUSE_ALLOW_STUB=1` is what makes this offline: with no provider behind
 > it, the gateway answers from a built-in stub and meters a fixed 1000/500
@@ -267,7 +267,7 @@ One case is neither settled nor released: a call the gateway has already handed 
 <sub>One shared core, enabled as config-gated capability packs.</sub>
 </div>
 
-Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v1.13.1** release versus landed on `main` since.
+Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v1.13.2** release versus landed on `main` since.
 
 <div align="center">
 
@@ -314,7 +314,7 @@ TokenFuse is a **proxy**: start it, then point your agent at it instead of the p
 Published to GitHub Container Registry, so it runs anywhere with Docker, nothing to compile:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.1
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.2
 ```
 
 A working gateway on **http://localhost:4100**, answering from a built-in fake
@@ -347,7 +347,7 @@ Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your a
 ```bash
 docker run -p 4100:4100 \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.13.1
+  ghcr.io/taipanbox/tokenfuse:v1.13.2
 ```
 
 Then change **one line** in your app, the base URL:
@@ -390,7 +390,7 @@ curl http://localhost:4100/v1/messages \
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.13.1
+  ghcr.io/taipanbox/tokenfuse:v1.13.2
 ```
 
 `TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
@@ -400,7 +400,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_USD=25 \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.13.1
+  ghcr.io/taipanbox/tokenfuse:v1.13.2
 ```
 
 A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling, widening an open run still works up to the ceiling and never past it, and a budget an operator set in the Cloud is the operator's own word and is not clamped. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
@@ -441,7 +441,7 @@ curl -s localhost:4100/v1/price-book
 Every release from v0.5.0 on is signed keyless with Sigstore and carries a build-provenance attestation and an SBOM. The image tag is pinned on purpose: there is no `:latest`, so what you run is what a release page describes. With `cosign` and `gh` installed:
 
 ```bash
-tag=v1.13.1
+tag=v1.13.2
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-identity "https://github.com/TAIPANBOX/tokenfuse/.github/workflows/release.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
@@ -452,10 +452,10 @@ gh attestation verify tokenfuse-x86_64-unknown-linux-musl -R TAIPANBOX/tokenfuse
 The image:
 
 ```bash
-cosign verify ghcr.io/taipanbox/tokenfuse:v1.13.1 \
+cosign verify ghcr.io/taipanbox/tokenfuse:v1.13.2 \
   --certificate-identity-regexp '^https://github.com/TAIPANBOX/tokenfuse/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.13.1 -R TAIPANBOX/tokenfuse
+gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.13.2 -R TAIPANBOX/tokenfuse
 ```
 
 Releases before v0.5.0 carry checksums only. Verified on 2026-09-13 from a machine that built nothing: `sha256sum -c` OK on a downloaded binary, and `gh attestation verify` on the binary and on the image both returned a SLSA provenance v1 statement signed by this workflow at `refs/tags/v0.5.0`. The release assets are plain binaries, not archives: `tokenfuse-<target>` and `tokenfuse-cloud-<target>`.
@@ -609,11 +609,11 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 ## 📋 Project status
 
-**v1.13.1: the current release, functional and shipped, young and not yet battle-tested.**
+**v1.13.2: the current release, functional and shipped, young and not yet battle-tested.**
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-The newest tag, [v1.13.1](docs/releases/v1.13.1.md), caps a tool call's arguments at the policy plane's own 12 KiB bound, so a larger call reaches Wardryx flagged as truncated and gets a verdict instead of being left to the failmode, and moves datafusion to 55, which drops the thrift crate. [v1.13.0](docs/releases/v1.13.0.md) before it holds the built-in price book as the vendors' rates read on 2026-10-13, and a model sold at two rates by prompt length (Claude Haiku 5.5, OpenAI's tiered models, Gemini 2.5 Pro and 3.1 Pro Preview) is priced by the prompt each call sent. Each release's notes also say what is not proven.
+The newest tag, [v1.13.2](docs/releases/v1.13.2.md), is a security patch: rustls 0.23.46 for four RustSec advisories (RUSTSEC-2026-0346 to 0349), and the control-plane page now renders run fields as text, so a run id or model name a caller chose can never become markup on that page. [v1.13.1](docs/releases/v1.13.1.md) before it caps a tool call's arguments at the policy plane's own 12 KiB bound, so a larger call reaches Wardryx flagged as truncated and gets a verdict instead of being left to the failmode, and moves datafusion to 55, which drops the thrift crate. [v1.13.0](docs/releases/v1.13.0.md) before it holds the built-in price book as the vendors' rates read on 2026-10-13, and a model sold at two rates by prompt length (Claude Haiku 5.5, OpenAI's tiered models, Gemini 2.5 Pro and 3.1 Pro Preview) is priced by the prompt each call sent. Each release's notes also say what is not proven.
 
 **v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
@@ -622,7 +622,7 @@ Since v0.4.0, on `main` and in the releases after it (see `docs/releases/`): Tok
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.1   # gateway, offline
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.13.2   # gateway, offline
 cd cloud && docker compose up                                                    # + Cloud dashboard (:3000)
 ```
 
