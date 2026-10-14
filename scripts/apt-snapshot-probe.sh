@@ -21,6 +21,14 @@
 #      into 27 minutes. The probe catches "down", not "flapping"; the hard
 #      bound for flapping is `timeout-minutes` on the workflow step itself,
 #      which every snapshot-pinned step carries.
+#
+#   3. Fetch only the Packages indexes an install reads. On 2026-10-14 the
+#      service answered every file but took about 10 s each; apt fetched about
+#      70 (Translation-en and command-not-found metadata for every pocket and
+#      component beside Packages) and the release job's musl step hit its
+#      6-minute ceiling six times in a row with the musl-tools download itself
+#      already done. Languages=none and CNF off cut that to the Packages files,
+#      which is all `apt-get install` needs.
 set -euo pipefail
 
 snap="${APT_SNAPSHOT:?APT_SNAPSHOT is not set; the pin lives in the workflow env}"
@@ -44,7 +52,9 @@ if [ -d /etc/apt/apt.conf.d ]; then
 	conf='Acquire::Retries "1";
 Acquire::http::Timeout "20";
 Acquire::https::Timeout "20";
-APT::Update::Error-Mode "any";'
+APT::Update::Error-Mode "any";
+Acquire::Languages "none";
+Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";'
 	if [ "$(id -u)" = 0 ]; then
 		printf '%s\n' "$conf" >/etc/apt/apt.conf.d/99-ci-bounded
 	else
