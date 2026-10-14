@@ -38,8 +38,9 @@ Feature: The unit month survives a restart when a control plane knows it
   Scenario: A control plane that cannot be asked leaves the month at zero and says so
     Given a control plane that is unreachable, silent past the timeout, or refusing the request
     When the gateway starts
-    Then it starts anyway, every unit's month at zero
+    Then it starts anyway, with no unit's month read
     And one warning says the month could not be seeded and why
+    And since invariant 103 a call a unit cap governs waits until a retry reads it
 
   # @test:a_seed_for_another_month_is_skipped
   # @test:a_row_without_a_month_is_skipped_and_counted

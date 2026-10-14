@@ -866,6 +866,26 @@ async fn seed_unit_ledger_within(
     now_millis: i64,
     within: Duration,
 ) -> Result<SeedReport, SeedError> {
+    seed_unit_ledger_at(base, key, units, now_millis, within, FailureLine::Warn).await
+}
+
+/// How a seed that did not complete is reported: the startup attempt warns,
+/// every retry after it (`spawn_seed_retry`) is a debug line, so a control
+/// plane that stays down costs one warning and not one every few seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureLine {
+    Warn,
+    Debug,
+}
+
+async fn seed_unit_ledger_at(
+    base: &str,
+    key: &str,
+    units: &UnitLedger,
+    now_millis: i64,
+    within: Duration,
+    failure: FailureLine,
+) -> Result<SeedReport, SeedError> {
     let url = format!("{}/v1/units", base.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let fetched = match tokio::time::timeout(within, fetch_unit_months(&client, base, key)).await {
@@ -898,13 +918,14 @@ async fn seed_unit_ledger_within(
                  the org's month-to-date plus this gateway's own spend from here on"
             );
         }
-        Err(e) => tracing::warn!(
+        Err(e) if failure == FailureLine::Warn => tracing::warn!(
             url = %url,
             reason = %e,
-            "the unit month could not be seeded from the control plane: every unit starts this \
-             month at zero and a central cap is enforced against this gateway's own tally until \
-             the next restart"
+            "the unit month could not be seeded from the control plane: no unit's month is known \
+             here, so a call a budget governs waits for the seed (invariant 103), asked again in \
+             the background until the control plane answers"
         ),
+        Err(e) => tracing::debug!(url = %url, reason = %e, "the unit month seed is still missing"),
     }
     result
 }
@@ -1085,6 +1106,17 @@ async fn seed_run_ledger_within(
     now_millis: i64,
     within: Duration,
 ) -> Result<RunSeedReport, SeedError> {
+    seed_run_ledger_at(base, key, state, now_millis, within, FailureLine::Warn).await
+}
+
+async fn seed_run_ledger_at(
+    base: &str,
+    key: &str,
+    state: &AppState,
+    now_millis: i64,
+    within: Duration,
+    failure: FailureLine,
+) -> Result<RunSeedReport, SeedError> {
     let since_millis = now_millis - RUN_SEED_WINDOW_MILLIS;
     let client = reqwest::Client::new();
     // One timeout over both routes together: the fallback spends what the
@@ -1125,14 +1157,240 @@ async fn seed_run_ledger_within(
                  from here on"
             );
         }
-        Err(e) => tracing::warn!(
+        Err(e) if failure == FailureLine::Warn => tracing::warn!(
             url = %url,
             reason = %e,
-            "pending run spend could not be seeded from the control plane: every run this \
-             gateway opens fresh starts its spend at zero until the next restart"
+            "pending run spend could not be seeded from the control plane: no run's spend is \
+             known here, so a call a budget governs waits for the seed (invariant 103), asked \
+             again in the background until the control plane answers"
         ),
+        Err(e) => tracing::debug!(url = %url, reason = %e, "the run spend seed is still missing"),
     }
     result
+}
+
+/// Invariant 103: the parts of the control plane's money state a gateway reads
+/// before it admits a call a budget governs. Each is set when its read
+/// completed and was applied; a retry asks only for what is still missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedParts {
+    /// Each run's spend so far (invariant 70), staged for its first open here.
+    pub run_spend: bool,
+    /// The run budgets an operator set in the Cloud (`GET /v1/budgets`).
+    pub budgets: bool,
+    /// The runs an operator killed in the Cloud (`GET /v1/kills`).
+    pub kills: bool,
+    /// Each unit's month (invariant 52); `true` from the start with no identity map.
+    pub unit_month: bool,
+    /// The unit caps an operator set in the Cloud (`GET /v1/unit-budgets`);
+    /// `true` from the start with no identity map.
+    pub unit_budgets: bool,
+}
+
+impl SeedParts {
+    /// Nothing read yet. With no identity map loaded no call resolves a unit,
+    /// so there is no unit state to read.
+    pub fn new(with_units: bool) -> Self {
+        SeedParts {
+            run_spend: false,
+            budgets: false,
+            kills: false,
+            unit_month: !with_units,
+            unit_budgets: !with_units,
+        }
+    }
+
+    pub fn complete(&self) -> bool {
+        self.run_spend && self.budgets && self.kills && self.unit_month && self.unit_budgets
+    }
+
+    /// The parts still missing, by the route that answers each.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.run_spend {
+            out.push("run spend");
+        }
+        if !self.budgets {
+            out.push("/v1/budgets");
+        }
+        if !self.kills {
+            out.push("/v1/kills");
+        }
+        if !self.unit_month {
+            out.push("/v1/units");
+        }
+        if !self.unit_budgets {
+            out.push("/v1/unit-budgets");
+        }
+        out
+    }
+}
+
+/// One `GET {base}{route}` for a list the seed reads beside the two figures,
+/// bounded by `SEED_TIMEOUT` and `SEED_MAX_BODY_BYTES`. `Ok(None)` is a 404:
+/// a control plane that does not serve the list holds none (one older than
+/// `/v1/unit-budgets`, or a stub), which is an answer, unlike a refusal.
+async fn fetch_seed_list(
+    client: &reqwest::Client,
+    base: &str,
+    route: &str,
+    key: &str,
+) -> Result<Option<Vec<u8>>, SeedError> {
+    let url = format!("{}{}", base.trim_end_matches('/'), route);
+    let read = async {
+        let mut resp = client
+            .get(&url)
+            .bearer_auth(key)
+            .send()
+            .await
+            .map_err(|e| SeedError::Transport(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(SeedError::Status(resp.status().as_u16()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| SeedError::Transport(e.to_string()))?
+        {
+            if body.len() + chunk.len() > SEED_MAX_BODY_BYTES {
+                return Err(SeedError::BodyTooLarge(SEED_MAX_BODY_BYTES));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(body))
+    };
+    match tokio::time::timeout(SEED_TIMEOUT, read).await {
+        Ok(r) => r,
+        Err(_) => Err(SeedError::TimedOut(SEED_TIMEOUT)),
+    }
+}
+
+/// `GET /v1/budgets` or `/v1/unit-budgets`: a map of id to micro-USD, empty on a 404.
+async fn fetch_budget_map(
+    client: &reqwest::Client,
+    base: &str,
+    route: &str,
+    key: &str,
+) -> Result<HashMap<String, Microusd>, SeedError> {
+    let Some(body) = fetch_seed_list(client, base, route, key).await? else {
+        return Ok(HashMap::new());
+    };
+    let map = serde_json::from_slice::<HashMap<String, i64>>(&body)
+        .map_err(|e| SeedError::Malformed(format!("{route}: {e}")))?;
+    Ok(map
+        .into_iter()
+        .map(|(id, micros)| (id, Microusd(micros)))
+        .collect())
+}
+
+/// `GET /v1/kills`: the killed run ids, empty on a 404.
+async fn fetch_kill_list(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+) -> Result<Vec<String>, SeedError> {
+    let Some(body) = fetch_seed_list(client, base, "/v1/kills", key).await? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_slice::<Vec<String>>(&body)
+        .map_err(|e| SeedError::Malformed(format!("/v1/kills: {e}")))
+}
+
+/// Invariant 103: read whatever is still missing of the control plane's money
+/// state into `state`, applying each part the moment it is read, and say
+/// whether the whole of it has now been read. Stops at the first part that
+/// fails, so a control plane that cannot be reached costs one bounded wait per
+/// attempt rather than one per part; the parts already read stay read.
+///
+/// `startup` is the first attempt, before the listener binds: its failures are
+/// one WARN per seed, as before; the retries after it log at debug.
+pub async fn seed_control_plane(
+    base: &str,
+    key: &str,
+    state: &AppState,
+    parts: &mut SeedParts,
+    now_millis: i64,
+    startup: bool,
+) -> Result<(), SeedError> {
+    let failure = if startup {
+        FailureLine::Warn
+    } else {
+        FailureLine::Debug
+    };
+    let client = reqwest::Client::new();
+    if !parts.run_spend {
+        seed_run_ledger_at(base, key, state, now_millis, SEED_TIMEOUT, failure).await?;
+        parts.run_spend = true;
+    }
+    if !parts.budgets {
+        let budgets = fetch_budget_map(&client, base, "/v1/budgets", key).await?;
+        state.set_cloud_budgets(budgets);
+        parts.budgets = true;
+    }
+    if !parts.kills {
+        for run in fetch_kill_list(&client, base, key).await? {
+            state.kill(&run);
+        }
+        parts.kills = true;
+    }
+    if !parts.unit_month {
+        seed_unit_ledger_at(base, key, &state.units, now_millis, SEED_TIMEOUT, failure).await?;
+        parts.unit_month = true;
+    }
+    if !parts.unit_budgets {
+        let caps = fetch_budget_map(&client, base, "/v1/unit-budgets", key).await?;
+        state.units.set_overrides(caps);
+        parts.unit_budgets = true;
+    }
+    Ok(())
+}
+
+/// Invariant 103: keep asking until the control plane answers the seed, then
+/// credit it to the runs the startup replay recreated and open the gate. One
+/// task, started once by `serve` after the replay and before the listener
+/// binds, only when the startup attempt did not complete. Waits
+/// [`crate::seedgate::backoff`] between attempts (a quarter second, doubling,
+/// at most five).
+pub fn spawn_seed_retry(base: String, key: String, state: AppState, parts: SeedParts) {
+    tokio::spawn(async move {
+        retry_seed_until_read(&base, &key, &state, parts).await;
+    });
+}
+
+/// The body of [`spawn_seed_retry`], awaitable so a test can drive it.
+pub async fn retry_seed_until_read(base: &str, key: &str, state: &AppState, mut parts: SeedParts) {
+    let mut attempt: u32 = 0;
+    loop {
+        tokio::time::sleep(crate::seedgate::backoff(attempt)).await;
+        attempt = attempt.saturating_add(1);
+        let now = crate::sink::now_millis();
+        match seed_control_plane(base, key, state, &mut parts, now, false).await {
+            Ok(()) => break,
+            Err(e) => {
+                state.seed.set_reason(e.to_string());
+                tracing::debug!(
+                    attempt,
+                    missing = %parts.missing().join(","),
+                    reason = %e,
+                    "the control plane has not answered the seed yet"
+                );
+            }
+        }
+    }
+    let credited = state.credit_late_seed().await;
+    if let Some(touched) = state.seed.open_now() {
+        tracing::info!(
+            attempts = attempt,
+            calls_while_missing = touched,
+            replayed_runs_credited = credited,
+            "the control plane answered the seed: run spend, unit month, Cloud budgets and kills \
+             are read, and calls a budget governs are admitted again (invariant 103)"
+        );
+    }
 }
 
 /// Poll the control plane's per-run budget overrides and hand them to `apply`
@@ -3270,5 +3528,194 @@ mod tests {
             toggle.bodies.lock().unwrap().is_empty(),
             "an interval of zero must mean off, not a very fast heartbeat"
         );
+    }
+
+    // --- invariant 103: the seed a gateway reads before it admits money ------
+
+    /// A control plane answering every part of the seed: run `r-over` spent
+    /// 456, run `r-capped` has a Cloud budget of 1000, run `r-killed` is
+    /// killed (answered with `kills_status`), unit `ops` spent 2145 this
+    /// month, and `/v1/unit-budgets` is a 404 (a plane that holds none).
+    async fn serve_seed_plane(listener: tokio::net::TcpListener, kills_status: u16) {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        let month = month_key(now_millis());
+        let app = Router::new()
+            .route(
+                "/v1/run-spend",
+                get(|| async { Json(serde_json::json!([{"run_id": "r-over", "spent_microusd": 456}])) }),
+            )
+            .route(
+                "/v1/budgets",
+                get(|| async { Json(serde_json::json!({"r-capped": 1000})) }),
+            )
+            .route(
+                "/v1/kills",
+                get(move || async move {
+                    (
+                        StatusCode::from_u16(kills_status).unwrap(),
+                        Json(serde_json::json!(["r-killed"])),
+                    )
+                }),
+            )
+            .route(
+                "/v1/units",
+                get(move || {
+                    let month = month.clone();
+                    async move {
+                        Json(serde_json::json!([{"unit": "ops", "month": month, "month_spent_microusd": 2145}]))
+                    }
+                }),
+            )
+            .route("/v1/unit-budgets", get(|| async { StatusCode::NOT_FOUND }));
+        let _ = axum::serve(listener, app).await;
+    }
+
+    async fn seed_plane(kills_status: u16) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_seed_plane(listener, kills_status));
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn seed_parts_name_what_is_missing() {
+        let all = SeedParts::new(true);
+        assert!(!all.complete());
+        assert_eq!(
+            all.missing(),
+            vec![
+                "run spend",
+                "/v1/budgets",
+                "/v1/kills",
+                "/v1/units",
+                "/v1/unit-budgets"
+            ]
+        );
+        let no_units = SeedParts::new(false);
+        assert_eq!(
+            no_units.missing(),
+            vec!["run spend", "/v1/budgets", "/v1/kills"]
+        );
+        let done = SeedParts {
+            run_spend: true,
+            budgets: true,
+            kills: true,
+            unit_month: true,
+            unit_budgets: true,
+        };
+        assert!(done.complete());
+        assert!(done.missing().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_seed_reads_every_part_and_applies_each() {
+        let _g = log_lock();
+        clear_log();
+        let base = seed_plane(200).await;
+        let state = test_state();
+        let mut parts = SeedParts::new(true);
+        let now = now_millis();
+        seed_control_plane(&base, "k", &state, &mut parts, now, true)
+            .await
+            .unwrap();
+        assert!(parts.complete(), "{parts:?}");
+        assert_eq!(state.take_run_seed("r-over"), Some(Microusd(456)));
+        assert_eq!(state.cloud_budget("r-capped"), Some(Microusd(1000)));
+        assert!(state.is_killed("r-killed"));
+        assert!(!state.is_killed("r-over"));
+        assert_eq!(state.units.spent("ops", now), Microusd(2145));
+        assert_eq!(
+            state.units.effective_cap("ops"),
+            None,
+            "a 404 on the unit caps is no cap, not a failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_part_that_fails_stops_the_attempt_and_keeps_what_was_read() {
+        let _g = log_lock();
+        clear_log();
+        let base = seed_plane(503).await;
+        let state = test_state();
+        let mut parts = SeedParts::new(true);
+        let err = seed_control_plane(&base, "k", &state, &mut parts, now_millis(), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SeedError::Status(503)), "{err:?}");
+        assert!(parts.run_spend && parts.budgets, "{parts:?}");
+        assert_eq!(
+            parts.missing(),
+            vec!["/v1/kills", "/v1/units", "/v1/unit-budgets"]
+        );
+        assert_eq!(state.cloud_budget("r-capped"), Some(Microusd(1000)));
+        assert!(!state.is_killed("r-killed"));
+        let log = log_text();
+        // Only this module's own lines: other tests share the captured log.
+        let warned = log
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("tokenfuse_gateway::cloudsink"));
+        assert!(!warned, "a retry's failure is not a warning: {log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_retry_reads_a_late_control_plane_and_opens_the_gate() {
+        let _g = log_lock();
+        clear_log();
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let base = format!("http://{addr}");
+        let state = test_state()
+            .with_seed_gate(Arc::new(crate::seedgate::SeedGate::closed("not asked yet")));
+        let retrying = state.clone();
+        let retry = tokio::spawn(async move {
+            retry_seed_until_read(&base, "k", &retrying, SeedParts::new(false)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!state.seed.is_open());
+        let reason = state.seed.pending_reason().unwrap_or_default();
+        assert!(reason.contains("could not be reached"), "{reason}");
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(serve_seed_plane(listener, 200));
+        tokio::time::timeout(Duration::from_secs(20), retry)
+            .await
+            .expect("the retry lands once the control plane answers")
+            .unwrap();
+        assert!(state.seed.is_open());
+        assert!(state.is_killed("r-killed"));
+        assert_eq!(state.take_run_seed("r-over"), Some(Microusd(456)));
+        let log = log_text();
+        assert!(log.contains("the control plane answered the seed"), "{log}");
+        let warned = log
+            .lines()
+            .any(|l| l.contains("WARN") && l.contains("tokenfuse_gateway::cloudsink"));
+        assert!(!warned, "retries are quiet: {log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_seed_is_credited_to_the_runs_the_replay_recreated() {
+        let ledger = Arc::new(tokenfuse_core::Ledger::new());
+        let state = AppState::new(
+            Arc::clone(&ledger),
+            Arc::new(tokenfuse_core::PriceBook::new()),
+            Arc::new(tokenfuse_core::Policy::default()),
+            Arc::new(NeverCalledProvider),
+            "test-policy",
+        );
+        let generation = ledger
+            .open_run("r-restored", Microusd(1_000_000), None)
+            .expect("opens")
+            .generation;
+        state.note_replayed_unseeded(vec![
+            ("r-restored".to_string(), generation),
+            ("r-no-seed".to_string(), 1),
+        ]);
+        state.set_run_seed(HashMap::from([("r-restored".to_string(), Microusd(456))]));
+        assert_eq!(state.credit_late_seed().await, 1);
+        assert_eq!(ledger.snapshot("r-restored").unwrap().spent, Microusd(456));
+        assert_eq!(state.credit_late_seed().await, 0, "credited once");
     }
 }

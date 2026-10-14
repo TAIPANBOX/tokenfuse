@@ -304,8 +304,11 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1913 passing** (core 407, dpop 21, delegation 60,
-gateway 1144, cloud 280, umbrella 1, by `cargo test -p <crate>`). Cloud grew by 2
+`cargo test --all` runs **1926 passing** (core 407, dpop 21, delegation 60,
+gateway 1157, cloud 280, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 13
+with the seed gate (invariant 103: 4 in `gateway::seedgate`, 5 in `gateway::cloudsink`,
+1 in `gateway::unitledger`, 3 in `tests/it/seed_before_admit.rs`; 2026-10-14, counted from the diff and judged by CI's
+`scripts/stated-numbers.sh`). Cloud grew by 2
 with the control-plane page rendering run fields as text (invariant 102: 2 in
 `tests/it/dashboard_page.rs`, 2026-10-14). Gateway grew by 3
 with the 12 KiB argument cap (invariant 100: one unit and two integration tests,
