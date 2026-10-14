@@ -1334,7 +1334,10 @@ mod tests {
     fn the_fallback_is_at_least_every_row_in_every_column() {
         let book = default_price_book();
         let f = book.fallback().unwrap();
+        // Invariant 107: an `openai/` row is the OpenAI row it copies, so it
+        // carries the same exceptions.
         let exception = |id: &str, column: &str| {
+            let id = id.strip_prefix(OPENROUTER_OPENAI).unwrap_or(id);
             matches!(
                 (id, column),
                 ("o1", "read")
@@ -1465,10 +1468,18 @@ mod tests {
                 )
             })
             .collect();
-        let want: Vec<(String, u64, Rates)> = want
+        let mut want: Vec<(String, u64, Rates)> = want
             .into_iter()
             .map(|(id, a, r)| (id.to_string(), a, r))
             .collect();
+        // Invariant 107: every OpenAI tier above is also OpenRouter's
+        // `openai/` id, at the same rates.
+        let openrouter: Vec<(String, u64, Rates)> = want
+            .iter()
+            .filter(|(id, _, _)| id.starts_with("gpt-"))
+            .map(|(id, a, r)| (format!("{OPENROUTER_OPENAI}{id}"), *a, *r))
+            .collect();
+        want.extend(openrouter);
         assert_eq!(got, want);
     }
 
