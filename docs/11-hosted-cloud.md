@@ -97,8 +97,14 @@ At startup, a gateway with an identity map asks the same control plane for
 `GET /v1/units` once, within five seconds, and seeds each unit's month-to-date
 into its unit ledger before it listens, so a central monthly cap is enforced
 against the month rather than against the tally since the last restart
-(invariant 52). A control plane it cannot reach costs one warning and a month
-that starts at zero.
+(invariant 52). It reads each run's spend so far, the Cloud run budgets and the
+Cloud kills the same way (invariants 70 and 103). A control plane it cannot reach
+costs one warning, not a gap: the gateway starts, keeps asking in the background
+(a quarter second, doubling, at most five), and until it has read all of it
+answers a call carrying `x-fuse-run-id` with `503 seed_pending` (retryable,
+`retry-after: 1`) in enforce, or forwards it marked `seed_pending` in
+`x-fuse-would-block` in shadow and warn. Each run it touches that way is one
+`dependency_failed` on the bus (`dependency: control_plane`, `stage: seed`).
 
 Enable it on any gateway, with a key the control plane lists for that gateway
 (`secret:org:ingest:site-name` in `TOKENFUSE_CLOUD_KEYS`; there is no built-in key):
