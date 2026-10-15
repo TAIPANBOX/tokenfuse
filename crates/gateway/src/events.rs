@@ -12,7 +12,8 @@
 //! call sites that are only observable from inside a running gateway
 //! process:
 //!   - `crate::proxy` — `breaker_tripped` (all five Breaker 402 sites, via
-//!     `emit_breaker_event`), `dlp_block`, `taint_block`.
+//!     `emit_breaker_event`), `dlp_block`, `taint_block`, and `dlp_shadow`
+//!     for a DLP finding the scanners let through (invariant 114).
 //!   - `crate::mcpbroker` — `mcp_drift` (the live rug-pull check).
 //!   - `crate::settle`: `call_retained`, once per reservation a guard retains
 //!     (D10, invariant 90).

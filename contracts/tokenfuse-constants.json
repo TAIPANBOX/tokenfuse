@@ -90,6 +90,10 @@
       {
         "severity": "high",
         "type": "retained_closed"
+      },
+      {
+        "severity": "medium",
+        "type": "dlp_shadow"
       }
     ]
   },

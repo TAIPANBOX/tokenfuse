@@ -1447,6 +1447,26 @@ run_case "run-models: the gateway's kill not read" fail \
 	"$(py 'edit("crates/cloud/src/store.rs", "                a.killed = a.killed_by_gateway\n                    || killed", "                a.killed = (a.killed_by_gateway && false)\n                    || killed")')" \
 	"a_run_a_gateway_refused_as_killed_reads_killed ... FAILED"
 
+# --- invariant 114: a DLP finding let through is on the bus ----------------
+#
+# Not a scripts/*.sh gate: held by cargo test through the real router. Each
+# mutant is a way a shadow week goes quiet again, says the wrong mode, or
+# reports a finding the other scanner refused as let through.
+run_case "dlp-shadow: the queue never written" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact dlp_shadow_on_the_bus::a_secret_found_in_shadow_is_one_dlp_shadow_on_the_bus" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    for data in dlp_shadow {", "    for data in dlp_shadow.into_iter().filter(|_| false) {")')" \
+	"a_secret_found_in_shadow_is_one_dlp_shadow_on_the_bus ... FAILED"
+
+run_case "dlp-shadow: a mask finding reported as shadow" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact dlp_shadow_on_the_bus::each_scanner_that_let_a_finding_through_is_its_own_event_in_its_own_mode" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                        \"mask\",\n", "                        \"shadow\",\n")')" \
+	"each_scanner_that_let_a_finding_through_is_its_own_event_in_its_own_mode ... FAILED"
+
+run_case "dlp-shadow: written before the PII scan could refuse" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact dlp_shadow_on_the_bus::a_prompt_a_scanner_refused_writes_no_dlp_shadow" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "DlpMode::Block => return dlp_block(&run_id, &pii_summary),", "DlpMode::Block => { for data in dlp_shadow.drain(..) { let _ = st.events.emit(EventType::DlpShadow, now_millis(), Some(&event_agent_id), Some(&run_id), chain_on_record, data); } return dlp_block(&run_id, &pii_summary) }")')" \
+	"a_prompt_a_scanner_refused_writes_no_dlp_shadow ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

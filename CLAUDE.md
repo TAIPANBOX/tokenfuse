@@ -7203,8 +7203,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     pairs), on an admitted record only, and folds `RunAgg.pii_calls`, `Summary.pii_calls` and
     `Summary.pii_kinds` (`KindCalls`, bounded at 16 kinds plus `(other kinds)`).
 
-    Not covered: no agent event yet (`dlp_shadow` needs its registry row); the MCP broker's PII
-    scan of tool calls and answers records nothing new; the FOCUS export does not carry the column;
+    Not covered: the agent event is invariant 114's (its registry row landed in agent-passport#76);
+    the MCP broker's PII scan of tool calls and answers records nothing new; the FOCUS export does not carry the column;
     a block refusal writes no trace row, as before.
     *(tests: `tests/it/pii_found_is_recorded.rs` (`shadow_records_the_kinds_it_found_and_never_the_text`
     and `mask_records_what_it_redacted` red first in CI on the unchanged gateway, the row carrying
@@ -7366,3 +7366,41 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(gate: `scripts/teeth-shards-cover-every-case.sh`; teeth cases in `scripts/gates-have-teeth.sh`: the real
     harness partitions, a filter that drops every fifth case, a filter that runs a case in every shard up to its
     own, and a harness that is gone)*
+
+114. **A DLP finding the scanner lets through is one `dlp_shadow` on the bus per scanner, kinds and counts,
+    never the text, and only when neither scanner refused the prompt.** agent-passport SPEC 6.2 registered
+    `dlp_shadow` (`medium`) under `tokenfuse` on 2026-10-14 (agent-passport#76) and trailryx maps it
+    (trailryx#101, `MAPPER_VERSION` 113), in the order estate-gates C8 then C4 asks for; the emitter here was the
+    last step and was never made, so the scheduled estate gates run of 2026-10-15 failed C4
+    (`registered-type-not-emitted`). `@decided 2026-10-14` (agent-passport#76): shadow DLP findings go on the bus.
+
+    `EventType::DlpShadow` is appended after `retained_closed`, so no published position moves;
+    `contracts/tokenfuse-constants.json` carries 23 types. `tokenfuse_core::agent_event::dlp_shadow_data` builds
+    `data` in one place: `summary` (the string `dlp_block` carries), `counts` (an object of each finding's `kind`
+    to how often, built from the kind alone, so no span can reach it), `mode` (`shadow` or `mask`) and `unit`
+    (`null` when none resolved, as on `dlp_block`). In `proxy::handle_call` each scanner (the secret scan,
+    `TOKENFUSE_DLP`, and the PII scan, `TOKENFUSE_DLP_PII`) that found something in `shadow` or `mask` queues one
+    event in its own mode; the queue is written after both scans have run, so a secret finding the PII scan then
+    refused (`block`, 403) is never reported as let through. Filed under the request's `event_agent_id` with its
+    chain, as `dlp_block` is; a call naming no agent is skipped and counted (invariant 6).
+
+    `@claude` 2026-10-15, choices under delegated authority, open to reversal: one event per scanner rather than
+    one per call, because the two scanners have their own modes and `data.mode` holds one word; written at the
+    scan rather than after the provider answered, as `taint_shadow` and `breaker_shadow` are written at their
+    verdicts.
+
+    Not covered: a call the scanners let through and a later gate refused (a budget, the firewall, the PDP) still
+    carries its `dlp_shadow`, since the scanner did let it through; the MCP broker's own DLP and PII scans of tool
+    calls and answers write no `dlp_shadow`; a PII `block` still writes no `dlp_block` event (only the secret
+    scan's block does), which predates this.
+    *(test: `tests/it/dlp_shadow_on_the_bus.rs`: `a_secret_found_in_shadow_is_one_dlp_shadow_on_the_bus`,
+    `pii_masked_on_its_way_is_one_dlp_shadow_in_mask_mode` and
+    `each_scanner_that_let_a_finding_through_is_its_own_event_in_its_own_mode`, red first in CI on the test-only
+    commit (no `dlp_shadow` on the bus); `a_prompt_a_scanner_refused_writes_no_dlp_shadow` and
+    `a_prompt_with_nothing_found_writes_no_dlp_shadow`, the controls, green on both sides;
+    `core::agent_event::tests::dlp_shadow_is_on_the_wire_at_the_band_of_the_other_shadow_findings` and
+    `dlp_shadow_data_counts_kinds_and_never_carries_a_span`, red by compile before the type existed; the
+    written-out list in `constants::tests::every_event_type_reaches_the_artifact_with_its_own_severity`. Mutants
+    as cases in `scripts/gates-have-teeth.sh`: the queue never written, a mask finding reported as shadow, the
+    event written before the PII scan could refuse. Scenarios:
+    `features/a-dlp-finding-let-through-is-on-the-bus.feature`, seven, each bound. Not a script gate)*
