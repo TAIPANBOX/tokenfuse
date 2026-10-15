@@ -304,8 +304,10 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **1988 passing** (core 415, dpop 21, delegation 60,
-gateway 1204, cloud 287, umbrella 1, by `cargo test -p <crate>`), the train carrying the
+`cargo test --all` runs **1995 passing** (core 417, dpop 21, delegation 60,
+gateway 1209, cloud 287, umbrella 1, by `cargo test -p <crate>`). Core grew by 2 and gateway by 5
+with `dlp_shadow` on the bus (invariant 114: 2 in `core::agent_event`, 5 in
+`tests/it/dlp_shadow_on_the_bus.rs`; counted from the diff against main, 1988). Before that, the train carrying the
 PII trace column and the Cloud count (#433), the OpenRouter `openai/` ids (#434), the broker's run id
 (#435), the FOCUS price basis (#436), the IBAN and decimal-digit rules (#437), the per-run model list
 (#438) and the exit flush (#439). Counted from the diff against main (1956), split per crate by the

@@ -344,6 +344,25 @@ pub enum EventType {
     /// the agent the journal recorded for the call; a record that names none
     /// is skipped and counted.
     RetainedClosed,
+
+    /// The DLP scanner found a secret or PII in a prompt and let the prompt
+    /// through: forwarded as written (`shadow`) or redacted on its way to the
+    /// provider (`mask`). Raised by the gateway once per scanner per call
+    /// (the secret scan and the PII scan each have their own mode), after
+    /// both scans have run and neither refused the prompt, so a finding the
+    /// other scanner then blocked is never reported as let through
+    /// (invariant 114).
+    ///
+    /// `medium`, fixed, by agent-passport SPEC 6.2 and for `taint_shadow`'s
+    /// and `breaker_shadow`'s reason: the text reached the provider or was
+    /// rewritten on its way there, so it is not `low`, and a shadow week
+    /// paging at `dlp_block`'s `high` on every finding is a week whose sender
+    /// gets turned off. A separate type and not `dlp_block` with a mode, so a
+    /// consumer counting refusals never counts a call that went through.
+    ///
+    /// `data` is [`dlp_shadow_data`]: `{summary, counts, mode, unit}`, kinds
+    /// and how often, never a matched span in any member.
+    DlpShadow,
 }
 
 /// `data` for [`EventType::CallRetained`] (agent-passport SPEC 6.2), in one
@@ -369,6 +388,35 @@ pub fn call_retained_data(
         data["unit"] = serde_json::Value::from(unit);
     }
     data
+}
+
+/// `data` for [`EventType::DlpShadow`] (agent-passport SPEC 6.2), in one place
+/// so the gateway's emit site cannot spell a member differently from what
+/// trailryx maps. `summary` is the string `dlp_block` already carries;
+/// `counts` is an object of kind to how often, built from each finding's
+/// `kind` alone, so no matched span can reach it; `mode` is `shadow` or
+/// `mask`; `unit` is the resolved business unit, `null` when none resolved,
+/// as on `dlp_block`.
+pub fn dlp_shadow_data(
+    summary: &str,
+    findings: &[crate::dlp::Finding],
+    mode: &str,
+    unit: Option<&str>,
+) -> serde_json::Value {
+    let mut counts = serde_json::Map::new();
+    for f in findings {
+        let n = counts
+            .get(f.kind)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        counts.insert(f.kind.to_string(), serde_json::Value::from(n + 1));
+    }
+    serde_json::json!({
+        "summary": summary,
+        "counts": counts,
+        "mode": mode,
+        "unit": unit.filter(|u| !u.is_empty()),
+    })
 }
 
 /// `data` for [`EventType::RetainedClosed`] (agent-passport SPEC 6.2).
@@ -910,6 +958,7 @@ impl EventType {
             EventType::RunStalled => "run_stalled",
             EventType::CallRetained => "call_retained",
             EventType::RetainedClosed => "retained_closed",
+            EventType::DlpShadow => "dlp_shadow",
         }
     }
 
@@ -920,7 +969,7 @@ impl EventType {
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
     /// `budget_threshold` / `breaker_tripped` / `taint_shadow` / `run_stalled` /
-    /// `call_retained` = `medium`;
+    /// `call_retained` / `dlp_shadow` = `medium`;
     /// `taint_cleared` / `retained_closed` = `high`;
     /// `tool_call` / `taint_raised` = `low`.
     ///
@@ -980,7 +1029,10 @@ impl EventType {
             | EventType::RunStalled
             // And a call whose money stays held until a person closes it: act
             // soon, not now.
-            | EventType::CallRetained => Severity::Medium,
+            | EventType::CallRetained
+            // And the DLP scanner's finding on a prompt it let through, at
+            // the band of the two other shadow findings beside it.
+            | EventType::DlpShadow => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             // Taint acquisition sits here for the same reason: a run reading
@@ -1661,6 +1713,7 @@ mod tests {
             (EventType::RunStalled, "run_stalled"),
             (EventType::CallRetained, "call_retained"),
             (EventType::RetainedClosed, "retained_closed"),
+            (EventType::DlpShadow, "dlp_shadow"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
@@ -1680,6 +1733,48 @@ mod tests {
             EventType::RetainedClosed.severity(),
             EventType::TaintCleared.severity()
         );
+    }
+
+    /// Invariant 114, agent-passport SPEC 6.2: a finding let through is a
+    /// shadow finding, at the band of the other two, and never a refusal's.
+    #[test]
+    fn dlp_shadow_is_on_the_wire_at_the_band_of_the_other_shadow_findings() {
+        assert_eq!(EventType::DlpShadow.as_wire_str(), "dlp_shadow");
+        assert_eq!(EventType::DlpShadow.severity(), Severity::Medium);
+        assert_eq!(
+            EventType::DlpShadow.severity(),
+            EventType::TaintShadow.severity()
+        );
+        assert_ne!(
+            EventType::DlpShadow.severity(),
+            EventType::DlpBlock.severity()
+        );
+    }
+
+    #[test]
+    fn dlp_shadow_data_counts_kinds_and_never_carries_a_span() {
+        let text = "write to jane.doe@example.com or ops@example.org, card 4111 1111 1111 1111";
+        let findings = crate::dlp::scan_pii(text);
+        let summary = crate::dlp::pii_summary(&findings);
+        let data = dlp_shadow_data(&summary, &findings, "shadow", Some("treasury"));
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "summary": "3 pii finding(s): pii_card, pii_email",
+                "counts": {"pii_card": 1, "pii_email": 2},
+                "mode": "shadow",
+                "unit": "treasury",
+            })
+        );
+        let wire = data.to_string();
+        for span in ["jane.doe", "ops@example", "4111"] {
+            assert!(!wire.contains(span), "a matched span reached data: {wire}");
+        }
+        for unit in [None, Some("")] {
+            let data = dlp_shadow_data(&summary, &findings, "mask", unit);
+            assert!(data["unit"].is_null(), "null, as on dlp_block: {data}");
+            assert_eq!(data["mode"], "mask");
+        }
     }
 
     #[test]

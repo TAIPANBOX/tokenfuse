@@ -27,7 +27,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokenfuse_core::agent_event::EventType;
 use tokenfuse_core::agent_event::{
-    dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
+    dependency_failed_data, dlp_shadow_data, Dependency, DependencyEffect, DependencyStage,
 };
 use tokenfuse_core::agent_event::{
     taint_raised_data, taint_verdict_data, TaintEnforcement, TaintStage,
@@ -1155,6 +1155,10 @@ async fn handle_call(
     // Invariant 106: the PII the scan found and let through (shadow or mask),
     // as kinds and counts, for the `allow` row and the Cloud wire.
     let mut pii_counts: Option<String> = None;
+    // Invariant 114: one `dlp_shadow` per scanner that found something and let
+    // the prompt through, held until both scans have run, so a finding the
+    // other scanner then refused is never reported as let through.
+    let mut dlp_shadow: Vec<serde_json::Value> = Vec::new();
     if st.dlp != DlpMode::Off || st.dlp_pii != DlpMode::Off {
         let text = String::from_utf8_lossy(&body).into_owned();
         let findings = if st.dlp != DlpMode::Off {
@@ -1226,8 +1230,22 @@ async fn handle_call(
                 DlpMode::Mask => {
                     to_redact.extend(findings.iter().cloned());
                     dlp_note = Some(format!("masked {summary}"));
+                    dlp_shadow.push(dlp_shadow_data(
+                        &summary,
+                        &findings,
+                        "mask",
+                        Some(unit.as_str()),
+                    ));
                 }
-                DlpMode::Shadow => dlp_note = Some(format!("found {summary}")),
+                DlpMode::Shadow => {
+                    dlp_note = Some(format!("found {summary}"));
+                    dlp_shadow.push(dlp_shadow_data(
+                        &summary,
+                        &findings,
+                        "shadow",
+                        Some(unit.as_str()),
+                    ));
+                }
                 DlpMode::Off => {}
             }
         }
@@ -1242,6 +1260,17 @@ async fn handle_call(
                 let pii_summary = dlp::pii_summary(&pii_findings);
                 if matches!(st.dlp_pii, DlpMode::Shadow | DlpMode::Mask) {
                     pii_counts = Some(dlp::kind_counts(&pii_findings));
+                    let mode = if st.dlp_pii == DlpMode::Mask {
+                        "mask"
+                    } else {
+                        "shadow"
+                    };
+                    dlp_shadow.push(dlp_shadow_data(
+                        &pii_summary,
+                        &pii_findings,
+                        mode,
+                        Some(&unit),
+                    ));
                 }
                 match st.dlp_pii {
                     DlpMode::Block => return dlp_block(&run_id, &pii_summary),
@@ -1275,6 +1304,18 @@ async fn handle_call(
         if !to_redact.is_empty() {
             body = Bytes::from(dlp::redact(&text, &to_redact).into_bytes());
         }
+    }
+    // Both scanners have let the prompt through: say so on the bus.
+    for data in dlp_shadow {
+        let outcome = st.events.emit(
+            EventType::DlpShadow,
+            now_millis(),
+            Some(&event_agent_id),
+            Some(&run_id),
+            chain_on_record,
+            data,
+        );
+        crate::events::log_outcome(EventType::DlpShadow, outcome);
     }
 
     // Semantic cache (non-streaming, tool-free requests only). A hit in `on`
