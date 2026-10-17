@@ -17,6 +17,7 @@ mod common;
 
 mod admin_gate;
 mod cache_default_startup;
+mod check_tool_call_answers_its_callers_runs;
 mod closure_reaches_the_cloud;
 mod codex_money_review;
 mod declared_tools_are_read;
@@ -41,7 +42,9 @@ mod memory_and_unclassified;
 mod no_usage_stream_settles_on_the_estimate;
 mod pii_found_is_recorded;
 
+mod open_bind_without_client_keys;
 mod openrouter_openai_ids_are_priced;
+mod policy_hook_fails_closed_by_default;
 mod policy_plane;
 mod price_book_startup;
 mod reasoning_tokens_are_output;
@@ -62,6 +65,7 @@ mod streamed_tool_calls_are_judged;
 mod spend_reports_survive_a_stop;
 mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
+mod unmapped_tool_after_untrusted;
 mod version_and_help;
 mod wardryx;
 mod wire_door;

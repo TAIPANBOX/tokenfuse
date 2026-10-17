@@ -2244,4 +2244,46 @@ mod tests {
             );
         }
     }
+
+    // -- F-006 (agent-security review 2026-10-17): enforce fails closed unless
+    // an operator chose open --
+    //
+    // Measured 2026-10-17 on the bare binary: a policy that denied a tool
+    // denied it while wardryx was up and allowed it four seconds after wardryx
+    // stopped, with `x-fuse-wardryx: allow` and no sign the PDP was not asked.
+
+    #[test]
+    fn enforce_with_no_failmode_fails_closed() {
+        let w = hook_from(&[]);
+        assert_eq!(
+            w.failmode,
+            FailMode::Closed,
+            "an enforcing hook nobody configured a failmode for must not turn an outage into allow"
+        );
+    }
+
+    #[test]
+    fn enforce_with_a_blank_failmode_fails_closed_too() {
+        // Blank is unset (invariant 98's rule), so it gets the same default.
+        let w = hook_from(&[("TOKENFUSE_WARDRYX_FAILMODE", "  ")]);
+        assert_eq!(w.failmode, FailMode::Closed);
+    }
+
+    #[test]
+    fn an_explicit_open_still_opens_under_enforce() {
+        let w = hook_from(&[("TOKENFUSE_WARDRYX_FAILMODE", "open")]);
+        assert_eq!(w.failmode, FailMode::Open, "open is one variable away");
+    }
+
+    #[test]
+    fn shadow_with_no_failmode_is_unchanged() {
+        // Shadow blocks nothing whatever the failmode says, so its default is
+        // left where it was.
+        let w = Wardryx::from_vars(vars(&[
+            ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
+            ("TOKENFUSE_WARDRYX_MODE", "shadow"),
+        ]))
+        .unwrap();
+        assert_eq!(w.failmode, FailMode::Open);
+    }
 }

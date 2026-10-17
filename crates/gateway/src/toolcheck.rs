@@ -320,6 +320,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unmapped_tool_in_a_tainted_run_is_denied_at_the_check() {
+        // F-003 at the level-2 door. `fetch` is in neither map, so before this it
+        // requested nothing and a web-tainted run was told `allow`.
+        let st = state_with(FirewallMode::Enforce);
+        st.accumulate_taint("run-fetch", ["web".to_string()].into_iter().collect());
+        let a = ask(st, r#"{"run_id":"run-fetch","tool":"fetch"}"#).await;
+        assert_eq!(a["decision"], "deny", "{a}");
+        assert_eq!(a["rule"], "no-exec-after-untrusted");
+        assert_eq!(a["denied"], serde_json::json!(["unclassified"]));
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_tool_in_a_clean_run_is_still_allowed_at_the_check() {
+        let st = state_with(FirewallMode::Enforce);
+        let a = ask(st, r#"{"run_id":"run-fetch-clean","tool":"fetch"}"#).await;
+        assert_eq!(a["decision"], "allow", "{a}");
+        assert_eq!(a["governed"], true);
+        assert!(a.get("would_block").is_none_or(|w| w.is_null()), "{a}");
+    }
+
+    /// The raw answer, status included, for a caller presenting `key` (or none).
+    async fn ask_as(
+        st: AppState,
+        body: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::post("/v1/fuse/check-tool-call")
+            .header("content-type", "application/json")
+            .header("x-fuse-agent-id", "agent://test.local/executor");
+        if let Some(k) = key {
+            req = req.header(crate::clientkeys::CLIENT_KEY_HEADER, k);
+        }
+        let resp = crate::app(st)
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn keyed(mode: FirewallMode) -> AppState {
+        state_with(mode).with_client_keys(Arc::new(
+            crate::clientkeys::ClientKeys::from_spec("sk-a:agent-a,sk-b:agent-b")
+                .expect("valid spec"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn with_client_keys_a_check_without_a_key_is_refused() {
+        // F-024. Measured 2026-10-17 on a deployed configuration: with client
+        // keys on, this route answered any caller with any run's labels.
+        let st = keyed(FirewallMode::Enforce);
+        st.accumulate_taint("run-victim", ["web".to_string()].into_iter().collect());
+        let (status, body) =
+            ask_as(st, r#"{"run_id":"run-victim","tool":"send_email"}"#, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(
+            !body.to_string().contains("web"),
+            "a refused caller learns nothing about the run: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_client_keys_a_check_with_an_unknown_key_is_refused() {
+        let st = keyed(FirewallMode::Enforce);
+        st.accumulate_taint("run-victim2", ["web".to_string()].into_iter().collect());
+        let (status, body) = ask_as(
+            st,
+            r#"{"run_id":"run-victim2","tool":"send_email"}"#,
+            Some("sk-nobody"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(!body.to_string().contains("web"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn without_client_keys_a_check_is_answered_as_before() {
+        // The documented posture of a gateway that configured no client keys:
+        // nothing is authenticated, this door included.
+        let st = state_with(FirewallMode::Enforce);
+        st.accumulate_taint("run-open", ["web".to_string()].into_iter().collect());
+        let (status, body) = ask_as(st, r#"{"run_id":"run-open","tool":"run_shell"}"#, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["carrying"], serde_json::json!(["web"]));
+    }
+
+    #[tokio::test]
     async fn a_sub_run_is_checked_against_what_its_parent_touched() {
         // The bypass closed in `proxy.rs` has to be closed at this door too, or
         // level 2 becomes the easier way round level 1.

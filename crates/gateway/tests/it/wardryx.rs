@@ -1128,3 +1128,92 @@ async fn the_llm_paths_decide_body_has_no_tool_call_even_with_tools_offered() {
         "the LLM path has no pending call and must not send one: {sent}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F-005 (agent-security review 2026-10-17): the attestation method the PDP is
+// told comes from the door that authenticated the call, never from
+// `x-fuse-attestation-method`, which the caller writes. Before this a
+// `deny_if_unattested` policy admitted any caller that sent `spiffe-svid`, and
+// the decision record said the agent was attested.
+// ---------------------------------------------------------------------------
+
+async fn asked_with(headers: &[(&str, &str)]) -> Value {
+    let stub = WardryxStub::new(json!({"decision": "allow", "policy_version": "v1"}));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = tokenfuse_gateway::app(state(enforcing(url)))
+        .oneshot(request_with_headers(&body(), headers))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "status {}", resp.status());
+    let asked = stub.last_request.lock().unwrap().clone();
+    asked.expect("the PDP was not asked")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_attestation_header_never_reaches_the_pdp() {
+    let asked = asked_with(&[("x-fuse-attestation-method", "spiffe-svid")]).await;
+    assert_eq!(
+        asked["attestation_method"],
+        json!("none"),
+        "nothing proved possession of a key on this call: {asked}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_with_no_proof_is_sent_as_none_not_left_out() {
+    // `none` is the agent-passport word for "nothing is proven", and wardryx
+    // reads it exactly as it reads an empty value. Sending it says that the
+    // enforcement point looked, rather than that it had nothing to say.
+    let asked = asked_with(&[]).await;
+    assert_eq!(asked["attestation_method"], json!("none"), "{asked}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proven_delegation_is_attested_as_dpop_key_whatever_the_header_says() {
+    use tokenfuse_delegation::testing::{cfg, proof_at, token, Key, URL};
+
+    let stub = WardryxStub::new(json!({"decision": "allow", "policy_version": "v1"}));
+    let url = spawn_server(wardryx_router(stub.clone())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut st = state(enforcing(url));
+
+    let issuer = Key::new();
+    let holder = Key::new();
+    st.chain_proof = Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
+        cfg: cfg(&issuer),
+        origin: URL.trim_end_matches("/v1/messages").to_string(),
+    }));
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = token(
+        &issuer,
+        &holder,
+        now,
+        json!({
+            "sub": "user://acme.example/alice",
+            "act": { "sub": "agent://acme.example/orchestrator" }
+        }),
+    );
+    let pf = proof_at(&holder, now, "POST", URL, "p-attest");
+
+    let resp = tokenfuse_gateway::app(st)
+        .oneshot(request_with_headers(
+            &body(),
+            &[
+                ("authorization", &format!("DPoP {tok}")),
+                (tokenfuse_gateway::mcpdoor::PROOF_HEADER, &pf),
+                ("x-fuse-attestation-method", "spiffe-svid"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "status {}", resp.status());
+    let asked = stub
+        .last_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the PDP was not asked");
+    assert_eq!(asked["chain_proven"], json!(true), "{asked}");
+    assert_eq!(asked["attestation_method"], json!("dpop-key"), "{asked}");
+}

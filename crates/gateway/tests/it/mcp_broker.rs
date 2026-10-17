@@ -1467,6 +1467,151 @@ async fn a_gateway_that_cannot_be_reached_does_not_silently_become_permission() 
     );
 }
 
+/// A stand-in for the gateway's check route that answers `status` with
+/// `body`, and records the client key each question carried.
+fn judge_answering(
+    status: u16,
+    body: Value,
+) -> (Router, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+    let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&keys);
+    let r = Router::new().route(
+        "/v1/fuse/check-tool-call",
+        post(
+            move |headers: axum::http::HeaderMap, Json(_req): Json<Value>| {
+                let sink = Arc::clone(&sink);
+                let body = body.clone();
+                async move {
+                    sink.lock().unwrap().push(
+                        headers
+                            .get(CLIENT_KEY_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(body),
+                    )
+                        .into_response()
+                }
+            },
+        ),
+    );
+    (r, keys)
+}
+
+/// F-024 at the MCP door. A gateway with client keys refuses a check that
+/// carries none with 401 and a body that has no `decision`. The broker read
+/// that body as "not deny" and forwarded the call, recording nothing: a gate
+/// that cannot answer became a permission, the shape
+/// `a_gateway_that_cannot_be_reached_does_not_silently_become_permission`
+/// already refuses for a gateway that cannot be reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_the_gateway_refuses_to_answer_is_not_read_as_permission() {
+    let up = spawn_server(marker_router("upstream")).await;
+    let (refusing, _) = judge_answering(401, json!({"error": "unauthorized"}));
+    let gw = spawn_server(refusing).await;
+    let strict = spawn_server(broker_with_taint(up, Some(gw), true)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = mcp_call(&strict, Some("run-refused-check")).await;
+    assert!(
+        out.get("result").is_none(),
+        "a refused check must not forward the call: {out}"
+    );
+    let msg = out["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("401"), "the refusal names the status: {out}");
+}
+
+/// The run a check asks about belongs to the client key that opened it, so the
+/// broker asks with the caller's own key, never one of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broker_asks_the_gateway_with_the_callers_client_key() {
+    let up = spawn_server(marker_router("upstream")).await;
+    let (judge_router, keys) = judge_answering(200, json!({"decision": "allow", "governed": true}));
+    let gw = spawn_server(judge_router).await;
+    let broker_url = spawn_server(broker_with_taint(up, Some(gw), false)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "run_shell" } });
+    let out: Value = reqwest::Client::new()
+        .post(format!("{broker_url}/"))
+        .header("x-fuse-agent-id", "agent://acme.example/sre/rca")
+        .header("x-fuse-run-id", "run-with-key")
+        .header(CLIENT_KEY_HEADER, "sk-the-callers-own")
+        .json(&call)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(out["result"]["upstream"], "upstream", "{out}");
+    assert_eq!(
+        *keys.lock().unwrap(),
+        vec![Some("sk-the-callers-own".to_string())],
+        "the check carried the caller's key"
+    );
+}
+
+// --- F-005: the attestation the PDP is told comes from the door ------------
+
+/// A PDP that allows and records each question it was asked.
+async fn recording_pdp() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&asked);
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(req): Json<Value>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(req);
+                Json(json!({ "decision": "allow", "policy_version": "test-v1" }))
+            }
+        }),
+    );
+    (spawn_server(router).await, asked)
+}
+
+/// Red on the unfixed tree: the broker copied `x-fuse-attestation-method` from
+/// the caller into the PDP question, so a `deny_if_unattested` policy admitted
+/// whoever wrote `spiffe-svid` in a header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broker_never_tells_the_pdp_an_attestation_the_caller_wrote() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, asked) = recording_pdp().await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/tool-user")
+        .header("x-fuse-attestation-method", "spiffe-svid")
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("result").is_some(), "{resp}");
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        asked[0]["attestation_method"], "none",
+        "no door proved possession of a key, so nothing is attested: {}",
+        asked[0]
+    );
+}
+
 // --- the proof door on the live HTTP path ---------------------------------
 //
 // `tests/it/mcp_door.rs` drives `mcpdoor::admit` as a pure function. These three
@@ -1592,6 +1737,54 @@ async fn a_call_carrying_a_proof_of_possession_reaches_the_upstream() {
         "the handle is resolved for an admitted caller: {:?}",
         forwarded[0]
     );
+}
+
+/// F-005: a call admitted by a proof of possession is the one call this broker
+/// can say is attested, and it says so with the agent-passport word for that
+/// mechanism, whatever the caller wrote in a header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_admitted_by_a_proof_of_possession_is_attested_as_dpop_key() {
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let (pdp, asked) = recording_pdp().await;
+    let key = ProofKey::new();
+    let broker_url = spawn_broker_at(|origin| {
+        let spec = json!([{
+            "client_id": "https://release-bot.acme.example/mcp-client.json",
+            "client_name": "release-bot",
+            "jwks": {"keys": [key.jwk()]},
+        }])
+        .to_string();
+        let mut state = broker_state(
+            upstream,
+            ScanMode::Off,
+            tokenfuse_core::DlpMode::Off,
+            None,
+            Default::default(),
+            a_wardryx(WardryxMode::Enforce, pdp),
+        );
+        let state_mut = Arc::get_mut(&mut state).expect("sole owner");
+        state_mut.clients = ClientRegistry::from_spec(&spec, origin).expect("a usable client spec");
+        app(state)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("dpop", key.proof(&broker_url, "attest-1"))
+        .header("x-fuse-agent-id", "agent://acme.example/release-bot")
+        .header("x-fuse-attestation-method", "spiffe-svid")
+        .json(&a_tool_call())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp.get("result").is_some(), "{resp}");
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["attestation_method"], "dpop-key", "{}", asked[0]);
 }
 
 /// The refusal, and the assertion that matters is the second one: a call the
