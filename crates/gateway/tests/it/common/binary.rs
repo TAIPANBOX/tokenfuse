@@ -51,11 +51,34 @@ pub struct Running {
     pub port: u16,
 }
 
+/// `tracing_subscriber::fmt()` writes ANSI colour codes even into a pipe, and
+/// they split a field like `failmode=Closed` into the name, an escape, `=`,
+/// another escape and the value, so a plain substring match on a field fails
+/// on a line that is there. Every `ESC '[' ... letter` sequence is dropped, as
+/// `cache_default_startup.rs` does for the same reason.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn keep(stream: impl Read + Send + 'static, into: Arc<Mutex<String>>) {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
             let mut out = into.lock().unwrap();
-            out.push_str(&line);
+            out.push_str(&strip_ansi(&line));
             out.push('\n');
         }
     });
@@ -113,7 +136,8 @@ impl Running {
         }
     }
 
-    /// Everything it has printed so far, stdout and stderr together.
+    /// Everything it has printed so far, stdout and stderr together, with the
+    /// colour codes taken out.
     pub fn output(&self) -> String {
         self.output.lock().unwrap().clone()
     }
