@@ -1556,30 +1556,13 @@ async fn the_broker_asks_the_gateway_with_the_callers_client_key() {
 
 // --- F-005: the attestation the PDP is told comes from the door ------------
 
-/// A PDP that allows and records each question it was asked.
-async fn recording_pdp() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
-    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&asked);
-    let router = Router::new().route(
-        "/v1/decide",
-        post(move |Json(req): Json<Value>| {
-            let sink = Arc::clone(&sink);
-            async move {
-                sink.lock().unwrap().push(req);
-                Json(json!({ "decision": "allow", "policy_version": "test-v1" }))
-            }
-        }),
-    );
-    (spawn_server(router).await, asked)
-}
-
 /// Red on the unfixed tree: the broker copied `x-fuse-attestation-method` from
 /// the caller into the PDP question, so a `deny_if_unattested` policy admitted
 /// whoever wrote `spiffe-svid` in a header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_broker_never_tells_the_pdp_an_attestation_the_caller_wrote() {
     let upstream = spawn_server(Router::new().route("/", post(stub))).await;
-    let (pdp, asked) = recording_pdp().await;
+    let (pdp, asked) = recording_pdp("allow").await;
     let broker_url = spawn_server(broker_cfg(
         upstream,
         ScanMode::Off,
@@ -1745,7 +1728,7 @@ async fn a_call_carrying_a_proof_of_possession_reaches_the_upstream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_admitted_by_a_proof_of_possession_is_attested_as_dpop_key() {
     let upstream = spawn_server(Router::new().route("/", post(stub))).await;
-    let (pdp, asked) = recording_pdp().await;
+    let (pdp, asked) = recording_pdp("allow").await;
     let key = ProofKey::new();
     let broker_url = spawn_broker_at(|origin| {
         let spec = json!([{
