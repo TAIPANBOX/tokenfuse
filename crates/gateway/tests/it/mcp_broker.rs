@@ -4028,6 +4028,12 @@ async fn call_shell_exec(broker_url: &str) -> Value {
 /// took 120 ms, the ordinary case behind the typed-signal proxy (its own
 /// default wait is 150 ms), arrived after the broker had given up, failmode
 /// open turned the outage into an allow, and the denied call was forwarded.
+///
+/// Failmode open is set explicitly since invariant 117 made unset mean closed
+/// under enforce. Closed would refuse the late call by fallback too, so a tool
+/// path back on 50 ms would still be refused and this test would pass on the
+/// fault it exists for; only open tells a verdict that arrived from one that
+/// did not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call() {
     let (seen, upstream_router) = recording_upstream();
@@ -4037,6 +4043,7 @@ async fn a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call
         ("TOKENFUSE_MCP_UPSTREAM", &upstream),
         ("TOKENFUSE_WARDRYX_URL", &pdp),
         ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+        ("TOKENFUSE_WARDRYX_FAILMODE", "open"),
     ]);
 
     let resp = call_shell_exec(&broker.url).await;
