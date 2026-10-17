@@ -28,7 +28,8 @@
 //! answers without a verdict (a status outside 2xx): `open` treats an outage
 //! as `allow`, `closed` as `deny`. It only changes which decision is
 //! synthesized; the mode above still decides whether that decision can
-//! actually block.
+//! actually block. Unset, it is `closed` under `enforce` and `open` otherwise
+//! (invariant 117, `defaults::wardryx_failmode_from`).
 //!
 //! A short-TTL in-memory cache keyed by `(agent_id, sorted tool-set hash,
 //! attestation_method)` skips the network round trip on repeat calls in a hot
@@ -288,6 +289,9 @@ pub struct DecideContext {
     pub domains: Vec<String>,
     pub model: String,
     pub est_cost_usd: f64,
+    /// The agent-passport 4.3 attestation method, derived by the caller of
+    /// `decide` from the door that authenticated the request
+    /// ([`crate::attestation`], invariant 116), never from a request header.
     pub attestation_method: Option<String>,
     /// Whether THIS gateway verified a delegation token for this request, per
     /// agent-passport SPEC 5.2, and took `on_behalf_of` from it.
@@ -974,6 +978,11 @@ impl Wardryx {
         self.tool_timeout
     }
 
+    /// What an unanswered decide falls back to, for the startup line.
+    pub fn failmode(&self) -> FailMode {
+        self.failmode
+    }
+
     /// Build from `TOKENFUSE_WARDRYX_*` env (see the module doc for the
     /// full list). A missing/empty `TOKENFUSE_WARDRYX_URL` forces `Off`
     /// regardless of `TOKENFUSE_WARDRYX_MODE`: with nothing to call there is
@@ -990,8 +999,10 @@ impl Wardryx {
         // refused whether or not the hook has a URL (invariant 98).
         let requested_mode =
             crate::defaults::wardryx_mode_from(var("TOKENFUSE_WARDRYX_MODE").as_deref())?;
-        let failmode =
-            crate::defaults::wardryx_failmode_from(var("TOKENFUSE_WARDRYX_FAILMODE").as_deref())?;
+        let failmode = crate::defaults::wardryx_failmode_from(
+            requested_mode,
+            var("TOKENFUSE_WARDRYX_FAILMODE").as_deref(),
+        )?;
         let url = var("TOKENFUSE_WARDRYX_URL").filter(|s| !s.is_empty());
         let Some(url) = url else {
             if requested_mode != WardryxMode::Off {
@@ -1002,6 +1013,18 @@ impl Wardryx {
             }
             return Ok(Wardryx::disabled());
         };
+
+        if requested_mode == WardryxMode::Enforce && failmode == FailMode::Open {
+            // Only an explicit `open` reaches here under enforce (invariant
+            // 117). Said once, at startup, where an operator reads it: the
+            // choice is legitimate and it is also the one that turns an outage
+            // of the policy plane into permission.
+            tracing::warn!(
+                "TOKENFUSE_WARDRYX_FAILMODE=open with TOKENFUSE_WARDRYX_MODE=enforce: while the \
+                 policy plane cannot answer, every call it would judge is let through. Unset it \
+                 (or set closed) to refuse those calls instead."
+            );
+        }
 
         let key = var("TOKENFUSE_WARDRYX_KEY").filter(|s| !s.is_empty());
         // `Some` only when the operator set a value this process reads: an

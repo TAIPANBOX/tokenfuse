@@ -89,7 +89,8 @@ does has something to read:
   `TOKENFUSE_WARDRYX_TIMEOUT_MS` when the operator set it, else 1000 ms. The
   LLM path never sends one and keeps the shared budget (50 ms by default).
   The tool path's default is longer because a deny that arrives after the
-  timeout is lost to the failmode, which defaults to open, and a PDP behind
+  timeout is lost to the failmode (closed under enforce since invariant 117,
+  open when an operator chooses it), and a PDP behind
   the typed-signal proxy routinely takes more than 50 ms (CLAUDE.md
   invariant 74).
 

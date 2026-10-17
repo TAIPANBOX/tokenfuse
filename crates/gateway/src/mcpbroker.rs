@@ -232,8 +232,10 @@ pub struct CallContext {
     /// derived boolean, and a record that carries the boolean without the proof
     /// cannot be audited back to the token.
     pub delegation_proof: Option<tokenfuse_core::agent_event::DelegationProof>,
-    /// `x-fuse-attestation-method`, forwarded to the PDP for a
-    /// `deny_if_unattested` policy.
+    /// The attestation method the PDP is told for a `deny_if_unattested`
+    /// policy, derived from the door that admitted the call
+    /// ([`crate::attestation`], invariant 116). Never the caller's
+    /// `x-fuse-attestation-method` header, which is ignored.
     pub attestation_method: Option<String>,
     /// `x-fuse-approval-token`: an operator-granted token that lets a
     /// previously-held `tools/call` through, verified by the PDP exactly as on
@@ -248,6 +250,10 @@ pub struct CallContext {
     /// `proof:<client_id>`, `xaa:<client_id>`), empty when the door is open.
     /// A session is bound to it, so one caller cannot ride another's session.
     pub principal: String,
+    /// The caller's own `x-fuse-key`, passed to the gateway's
+    /// `/v1/fuse/check-tool-call` so the gateway answers it about its own run
+    /// and nobody else's (invariant 118). Never logged, never sent upstream.
+    pub gateway_key: Option<String>,
 }
 
 /// Where a call's session id came from, which decides whether it is trusted.
@@ -1053,8 +1059,9 @@ fn http_answer(out: Outcome, principal: &str) -> Response {
 /// `x-fuse-*` headers into a [`CallContext`]: `X-Fuse-Agent-Id`
 /// (agent-passport SPEC.md §3.2) so an event raised for this request can carry
 /// the required `agent_id` (without it, events are skipped, not fabricated),
-/// `X-Fuse-Mcp-Upstream` to pick a named upstream, and the delegation /
-/// attestation / approval headers the Wardryx gate forwards to the PDP.
+/// `X-Fuse-Mcp-Upstream` to pick a named upstream, and the delegation and
+/// approval headers the Wardryx gate forwards to the PDP. The attestation the
+/// PDP is told is derived from the door instead ([`crate::attestation`]).
 ///
 /// # The XAA door (W3-tokenfuse), before and instead of the classic two
 ///
@@ -1077,6 +1084,7 @@ async fn handle(
             .map(str::to_string)
     };
     let now = crate::sink::now_millis() / 1000;
+    crate::attestation::note_ignored_header(&headers, "mcp_broker");
 
     if let Some(xaa) = &st.xaa {
         if let Some(credential) = bearer_credential(header("authorization").as_deref()) {
@@ -1147,11 +1155,15 @@ async fn handle(
                 // `crate::xaadoor`'s module doc and the invariant this change
                 // adds.
                 delegation_proof: None,
-                attestation_method: header("x-fuse-attestation-method"),
+                // A bearer token proves no possession, so nothing is attested
+                // (invariant 116).
+                attestation_method: Some(crate::attestation::NONE.to_string()),
                 approval_token: header("x-fuse-approval-token"),
                 session: header(crate::mcpsession::SESSION_HEADER).map(SessionId::Presented),
                 protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
                 principal: format!("xaa:{}", verified.client_id),
+                // A client key beside an XAA token is refused above.
+                gateway_key: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1166,7 +1178,10 @@ async fn handle(
     // `TOKENFUSE_MAX_BODY_BYTES` limit `app` puts on every route; the check
     // lives here rather than in a `route_layer` so a future route reaching
     // this handler cannot be added without it.
-    let principal = match crate::mcpdoor::admit(
+    // `door_proof`: whether the door itself verified a proof of possession on
+    // this request, one of the two facts the attestation method is derived
+    // from (invariant 116).
+    let (principal, door_proof) = match crate::mcpdoor::admit(
         crate::mcpdoor::Door {
             keys: &st.keys,
             clients: &st.clients,
@@ -1198,12 +1213,12 @@ async fn handle(
         }
         crate::mcpdoor::Admission::Proof(client_id) => {
             tracing::debug!(%client_id, "mcp broker: admitted by proof of possession");
-            format!("proof:{client_id}")
+            (format!("proof:{client_id}"), true)
         }
         // What a session is bound to (invariant 77): the key's id, never the
         // secret that resolved to it.
-        crate::mcpdoor::Admission::Bearer(key_id) => format!("key:{key_id}"),
-        crate::mcpdoor::Admission::Open => String::new(),
+        crate::mcpdoor::Admission::Bearer(key_id) => (format!("key:{key_id}"), false),
+        crate::mcpdoor::Admission::Open => (String::new(), false),
     };
     // The same parse and the same cap as the LLM door (tokenfuse#297): a
     // chain longer than SPEC 5.1 allows is refused here, before the chain is
@@ -1261,11 +1276,15 @@ async fn handle(
         run_id: header("x-fuse-run-id"),
         on_behalf_of,
         chain_proven,
-        attestation_method: header("x-fuse-attestation-method"),
+        // From the door, never from the caller (invariant 116).
+        attestation_method: Some(
+            crate::attestation::from_door(door_proof || chain_proven).to_string(),
+        ),
         approval_token: header("x-fuse-approval-token"),
         session: header(crate::mcpsession::SESSION_HEADER).map(SessionId::Presented),
         protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
         principal,
+        gateway_key: header(CLIENT_KEY_HEADER),
     };
     finish(&st, req, ctx).await
 }
@@ -1330,11 +1349,9 @@ fn upstream_target(ctx: &CallContext, resolved_url: &str) -> String {
 /// is fail-closed, allowed otherwise, and either way it is not silence: the
 /// same shape the Wardryx gate above already takes about an unattributed call.
 ///
-/// **The gateway did not answer.** Recorded as a `dependency_failed` naming
-/// the policy plane, exactly as the LLM path records its own unreachable PDP,
-/// because it is the same fact through a second door: a call proceeded and
-/// nothing governed it. A broker that swallowed this would leave an operator
-/// unable to tell a quiet week from a week the gate was down.
+/// **The gateway did not answer**, or answered outside 2xx (a gateway with
+/// client keys refuses a check that carries none with 401). See
+/// [`taint_gate_unanswered`]: recorded, and then the gate's own failmode.
 async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(), String> {
     let Some(base) = st.taint_gateway.as_deref() else {
         return Ok(());
@@ -1373,39 +1390,29 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
     if let Some(aid) = ctx.event_agent_id.as_deref() {
         req = req.header("x-fuse-agent-id", aid);
     }
+    // The caller's own key, because the gateway answers a keyed caller only
+    // about its own runs (invariant 118). The broker has no key of its own to
+    // ask with, by design: one would make it an oracle for every run.
+    if let Some(key) = ctx.gateway_key.as_deref() {
+        req = req.header(CLIENT_KEY_HEADER, key);
+    }
+    // An answer outside 2xx is no answer. It used to be read as JSON like any
+    // other, and a gateway's `401 {"error":"unauthorized"}` carries no
+    // `decision`, so it was taken for "not deny" and the call went through
+    // with nothing recorded (invariant 118).
     let answer = match req.send().await {
-        Ok(r) => r
+        Ok(r) if r.status().is_success() => r
             .text()
             .await
             .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()),
-        Err(_) => None,
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .ok_or_else(|| "answered with a body that is not JSON".to_string()),
+        Ok(r) => Err(format!("answered {}", r.status().as_u16())),
+        Err(_) => Err("could not be reached".to_string()),
     };
-    let Some(answer) = answer else {
-        let effect = if st.taint_failclosed {
-            DependencyEffect::DeniedUnasked
-        } else {
-            DependencyEffect::AllowedUngoverned
-        };
-        let outcome = st.events.emit(
-            EventType::DependencyFailed,
-            crate::sink::now_millis(),
-            ctx.event_agent_id.as_deref(),
-            Some(run_id),
-            chain_on_record(ctx),
-            dependency_failed_data(
-                Dependency::PolicyPlane,
-                DependencyStage::Decide,
-                effect,
-                &format!("mcp broker could not reach the taint gate at {url}"),
-            ),
-        );
-        crate::events::log_outcome(EventType::DependencyFailed, outcome);
-        return if st.taint_failclosed {
-            Err("blocked: the taint gate could not be reached".into())
-        } else {
-            Ok(())
-        };
+    let answer = match answer {
+        Ok(a) => a,
+        Err(what) => return taint_gate_unanswered(st, ctx, run_id, &url, &what),
     };
 
     if answer.get("decision").and_then(|d| d.as_str()) == Some("deny") {
@@ -1416,6 +1423,47 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
         return Err(format!("blocked: {reason}"));
     }
     Ok(())
+}
+
+/// The taint gate gave no answer: it could not be reached, or it answered
+/// outside 2xx, or its body was not JSON (`what` says which).
+///
+/// Recorded as a `dependency_failed` naming the policy plane, exactly as the
+/// LLM path records its own unreachable PDP, because it is the same fact through
+/// a second door: a call proceeded, or was refused, and nothing governed it. A
+/// broker that swallowed this would leave an operator unable to tell a quiet
+/// week from a week the gate was down, or refusing to answer it.
+fn taint_gate_unanswered(
+    st: &BrokerState,
+    ctx: &CallContext,
+    run_id: &str,
+    url: &str,
+    what: &str,
+) -> Result<(), String> {
+    let effect = if st.taint_failclosed {
+        DependencyEffect::DeniedUnasked
+    } else {
+        DependencyEffect::AllowedUngoverned
+    };
+    let outcome = st.events.emit(
+        EventType::DependencyFailed,
+        crate::sink::now_millis(),
+        ctx.event_agent_id.as_deref(),
+        Some(run_id),
+        chain_on_record(ctx),
+        dependency_failed_data(
+            Dependency::PolicyPlane,
+            DependencyStage::Decide,
+            effect,
+            &format!("mcp broker: the taint gate at {url} {what}"),
+        ),
+    );
+    crate::events::log_outcome(EventType::DependencyFailed, outcome);
+    if st.taint_failclosed {
+        Err(format!("blocked: the taint gate {what}"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Broker a single JSON-RPC request and return the response - shared by the HTTP

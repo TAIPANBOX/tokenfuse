@@ -269,15 +269,42 @@ pub fn is_unclassified(name: &str, sources: &HashMap<String, Vec<String>>) -> bo
     !matches!(sources.get(name), Some(mapped) if !mapped.is_empty())
 }
 
-/// Map tool names to the capabilities they exercise (tools with no mapped
-/// capability are treated as harmless and omitted).
+/// The capability an action exercises when the policy names its tool nowhere.
+///
+/// The same word as the source label, on purpose: it says the same thing about
+/// the tool from the other side. A rule denies it like any other capability.
+pub const UNCLASSIFIED_CAPABILITY: &str = "unclassified";
+
+/// Map tool names to the capabilities they exercise.
+///
+/// A tool the capability map names exercises that capability. A tool named in
+/// NEITHER map exercises [`UNCLASSIFIED_CAPABILITY`]: nobody said what it does,
+/// so it is not harmless (agent-security review 2026-10-17, F-003). Until then
+/// such a tool requested nothing, so after a web read a model could call
+/// `http_request`, `fetch` or any MCP tool outside the map with what it had
+/// read in the arguments, and no rule had anything to deny. Sources already
+/// failed closed ([`labels_for_tools`]); this is the same rule for actions.
+///
+/// A tool the source map names and the capability map does not is a read the
+/// operator classified, and requests nothing, as before: a search after a
+/// search is the commonest thing an agent does. That is a judgement, and its
+/// cost is named: a classified read tool can still carry data out in its
+/// arguments.
+///
+/// Whether a tool is unclassified is [`is_unclassified`], the one predicate the
+/// source labels and the log line already share (invariant 96).
 pub fn capabilities_for_tools(
     names: &[String],
     capabilities: &HashMap<String, String>,
+    sources: &HashMap<String, Vec<String>>,
 ) -> BTreeSet<String> {
     names
         .iter()
-        .filter_map(|n| capabilities.get(n).cloned())
+        .filter_map(|n| match capabilities.get(n) {
+            Some(cap) => Some(cap.clone()),
+            None if is_unclassified(n, sources) => Some(UNCLASSIFIED_CAPABILITY.to_string()),
+            None => None,
+        })
         .collect()
 }
 
@@ -565,14 +592,14 @@ mod tests {
     #[test]
     fn web_context_blocks_exec() {
         let labels = labels_for_tools(&["web_search".to_string()], &sources());
-        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
         assert!(evaluate(&labels, &requested, &rules()).is_some());
     }
 
     #[test]
     fn trusted_context_allows_exec() {
         let labels = Labels::new(); // nothing untrusted touched
-        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
         assert!(evaluate(&labels, &requested, &rules()).is_none());
     }
 
@@ -581,7 +608,7 @@ mod tests {
         // Red against the pre-2026-08-26 module, which returned a String: a
         // consumer could print a refusal and could not group a week of them.
         let labels = labels_for_tools(&["web_search".to_string()], &sources());
-        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
         let v = evaluate(&labels, &requested, &rules()).expect("web + exec is refused");
         assert_eq!(v.rule, "no-exec-after-untrusted");
         assert_eq!(v.labels, vec!["web"]);
@@ -594,7 +621,7 @@ mod tests {
         // the 403 body's `reason`. Structuring the verdict must not reword
         // what an existing client already parses.
         let labels = labels_for_tools(&["web_search".to_string()], &sources());
-        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps());
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
         let v = evaluate(&labels, &requested, &rules()).unwrap();
         assert_eq!(v.reason(), "tainted context [web] denies capability [exec]");
     }
@@ -608,6 +635,7 @@ mod tests {
         let requested = capabilities_for_tools(
             &["run_shell".to_string(), "send_email".to_string()],
             &caps(),
+            &sources(),
         );
         let v = evaluate(&labels, &requested, &rules()).unwrap();
         assert_eq!(v.rule, "anti-exfiltration");
@@ -622,10 +650,65 @@ mod tests {
     #[test]
     fn secrets_context_blocks_only_egress_not_exec() {
         let labels = labels_for_tools(&["vault_read".to_string()], &sources());
-        let exec = capabilities_for_tools(&["run_shell".to_string()], &caps());
-        let egress = capabilities_for_tools(&["send_email".to_string()], &caps());
+        let exec = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
+        let egress = capabilities_for_tools(&["send_email".to_string()], &caps(), &sources());
         // secrets rule denies egress but not exec
         assert!(evaluate(&labels, &exec, &rules()).is_none());
         assert!(evaluate(&labels, &egress, &rules()).is_some());
+    }
+
+    // -- F-003 (agent-security review 2026-10-17): a tool the policy names
+    // nowhere is not harmless --
+
+    #[test]
+    fn a_tool_neither_map_names_exercises_the_unclassified_capability() {
+        let requested = capabilities_for_tools(&["http_request".to_string()], &caps(), &sources());
+        assert_eq!(
+            requested.into_iter().collect::<Vec<_>>(),
+            vec![UNCLASSIFIED_CAPABILITY.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tool_the_source_map_names_requests_nothing() {
+        // A read the operator classified. Refusing it after a web read would
+        // refuse a search after a search.
+        let requested = capabilities_for_tools(&["web_search".to_string()], &caps(), &sources());
+        assert!(requested.is_empty(), "{requested:?}");
+    }
+
+    #[test]
+    fn a_source_mapped_to_no_labels_is_unclassified_as_an_action_too() {
+        // The same reading `labels_for_tools` gives it: an empty list is a
+        // tool nobody classified, so it cannot be a way to make a tool harmless.
+        let src = HashMap::from([("half_done".to_string(), Vec::new())]);
+        let requested = capabilities_for_tools(&["half_done".to_string()], &caps(), &src);
+        assert!(requested.contains(UNCLASSIFIED_CAPABILITY), "{requested:?}");
+    }
+
+    #[test]
+    fn a_mapped_capability_is_named_and_never_unclassified() {
+        let requested = capabilities_for_tools(&["run_shell".to_string()], &caps(), &sources());
+        assert_eq!(
+            requested.into_iter().collect::<Vec<_>>(),
+            vec!["exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rule_that_denies_unclassified_refuses_an_unmapped_tool_only_under_its_labels() {
+        let rules = vec![TaintRule {
+            name: "no-exec-after-untrusted".into(),
+            when_any: vec!["web".into()],
+            deny: vec![UNCLASSIFIED_CAPABILITY.into()],
+        }];
+        let unmapped = capabilities_for_tools(&["http_request".to_string()], &caps(), &sources());
+        let web = labels_for_tools(&["web_search".to_string()], &sources());
+        let v = evaluate(&web, &unmapped, &rules).expect("web + unclassified is refused");
+        assert_eq!(v.denied, vec![UNCLASSIFIED_CAPABILITY.to_string()]);
+        assert!(
+            evaluate(&Labels::new(), &unmapped, &rules).is_none(),
+            "a run with no label is judged exactly as before"
+        );
     }
 }

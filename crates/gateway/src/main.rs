@@ -869,6 +869,18 @@ async fn serve() {
             tokenfuse_gateway::clientkeys::CLIENT_KEY_HEADER
         );
     }
+    // Invariant 119: a gateway that authenticates nobody and listens beyond
+    // loopback says so, loudly, on stderr where a container log keeps it, and
+    // in the log. Not a refusal: a deployment behind a network only trusted
+    // callers reach is legitimate, and refusing would break it at boot.
+    if let Some(warning) =
+        tokenfuse_gateway::clientkeys::open_bind_warning(&addr, client_keys.enabled())
+    {
+        eprintln!("tokenfuse: WARNING ************************************************");
+        eprintln!("tokenfuse: WARNING {warning}");
+        eprintln!("tokenfuse: WARNING ************************************************");
+        tracing::warn!("{warning}");
+    }
 
     // The declarative key<->agent<->unit identity map (docs/20). Unset leaves
     // identity off, exactly as before. Set-but-unusable exits instead of
@@ -980,6 +992,7 @@ async fn serve() {
         "default",
     )
     .with_client_keys(Arc::new(client_keys))
+    .with_bind_addr(&addr)
     .with_price_book_source(price_book_source)
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
     .with_agent_id_mode(agent_id_mode)
@@ -1117,7 +1130,7 @@ async fn serve() {
     // to call and nothing to enforce. See wardryx.rs for the full contract
     // (fail-open/closed, the decision cache, etc.).
     let wardryx = tokenfuse_gateway::wardryx::Wardryx::from_env();
-    tracing::info!(mode = ?wardryx.mode, "wardryx enforcement hook");
+    tracing::info!(mode = ?wardryx.mode, failmode = ?wardryx.failmode(), "wardryx enforcement hook");
     state = state.with_wardryx(Arc::new(wardryx));
 
     // Shadow tool-pruning measurement (W2a, invariant 61): TOKENFUSE_TOOLS_PRUNE

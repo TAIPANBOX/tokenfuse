@@ -171,6 +171,11 @@ pub struct AppState {
     /// test already gets; `main.rs` sets it from `TOKENFUSE_ADMIN_KEYS`, the
     /// bind address and `TOKENFUSE_ALLOW_OPEN_OBS`.
     pub admin_gate: AdminGate,
+    /// The address the listener is bound to. With client keys off and this not
+    /// loopback, anyone who can reach the port spends through the gateway, and
+    /// `/healthz?detail=1` says so (invariant 119). The default bind until
+    /// `main.rs` sets it from `TOKENFUSE_ADDR`.
+    pub bind_addr: String,
     /// D8: the closure route's secret and books, `None` (route off) unless
     /// `TOKENFUSE_CLOSURE_SECRET` is set (`crate::closure`).
     pub closure: Option<Arc<crate::closure::ClosureDoor>>,
@@ -220,6 +225,10 @@ pub struct TaintStore {
     /// Per run: the tool blocks this gateway has carried, and which of them a
     /// human has signed for. See [`BlockLedger`] and [`TaintStore::split_history`].
     blocks: Mutex<HashMap<String, BlockLedger>>,
+    /// Run -> the client key id whose metered call first named it, so
+    /// `/v1/fuse/check-tool-call` answers only the run's own caller (invariant
+    /// 118). Empty while client keys are not configured.
+    owners: Mutex<HashMap<String, String>>,
 }
 
 /// How many tool blocks are tracked per run.
@@ -292,6 +301,28 @@ pub struct HistorySplit {
 }
 
 impl TaintStore {
+    /// Record that the client key `key_id` named `run_id` on a metered call.
+    ///
+    /// First write wins (invariant 118): a run belongs to the credential that
+    /// opened it, and a later caller naming the same run id does not take it
+    /// over. An empty `key_id`, the value when client keys are off, records
+    /// nothing, so a gateway without keys keeps no owners at all.
+    pub fn note_owner(&self, run_id: &str, key_id: &str) {
+        if run_id.is_empty() || key_id.is_empty() {
+            return;
+        }
+        self.owners
+            .lock()
+            .unwrap()
+            .entry(run_id.to_string())
+            .or_insert_with(|| key_id.to_string());
+    }
+
+    /// The client key id that owns `run_id`, if a keyed metered call named it.
+    pub fn owner(&self, run_id: &str) -> Option<String> {
+        self.owners.lock().unwrap().get(run_id).cloned()
+    }
+
     /// Record which run a child declared as its parent.
     ///
     /// Last write wins, deliberately: the value comes off a request header, so
@@ -629,6 +660,7 @@ impl AppState {
             keystats: Arc::new(KeyStats::default()),
             refused_keys: Arc::new(crate::refusedkeys::RefusedKeys::default()),
             admin_gate: AdminGate::default(),
+            bind_addr: "127.0.0.1:4100".to_string(),
             closure: None,
             // Every deployment that predates this field is Anthropic-only, so
             // that is the default until `main.rs` (or a test) sets otherwise.
@@ -898,6 +930,16 @@ impl AppState {
         self.taint.inherited(run_id)
     }
 
+    /// See [`TaintStore::note_owner`].
+    pub fn note_run_owner(&self, run_id: &str, key_id: &str) {
+        self.taint.note_owner(run_id, key_id);
+    }
+
+    /// See [`TaintStore::owner`].
+    pub fn run_owner(&self, run_id: &str) -> Option<String> {
+        self.taint.owner(run_id)
+    }
+
     /// Attach an event sink (e.g. the Parquet trace). Chainable.
     pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.sink = sink;
@@ -928,6 +970,12 @@ impl AppState {
     /// which is what every existing deployment and test gets on upgrade.
     pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
         self.admin_gate = gate;
+        self
+    }
+
+    /// Record the address the listener is bound to (invariant 119).
+    pub fn with_bind_addr(mut self, addr: &str) -> Self {
+        self.bind_addr = addr.to_string();
         self
     }
 

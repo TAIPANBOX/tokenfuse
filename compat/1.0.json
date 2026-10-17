@@ -300,7 +300,8 @@
       "crates/gateway/src/proxy.rs",
       "crates/gateway/src/clientkeys.rs",
       "crates/gateway/src/declassify.rs",
-      "crates/gateway/src/mcpbroker.rs"
+      "crates/gateway/src/mcpbroker.rs",
+      "crates/gateway/src/attestation.rs"
     ],
     "http.response_headers": [
       "crates/gateway/src/proxy.rs"

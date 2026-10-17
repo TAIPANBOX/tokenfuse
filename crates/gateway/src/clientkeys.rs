@@ -147,9 +147,56 @@ impl ClientKeys {
     }
 }
 
+/// The startup warning for a gateway that authenticates nobody and listens
+/// beyond loopback, or `None` when there is nothing to warn about (invariant
+/// 119).
+///
+/// The shipped image binds `0.0.0.0:4100`. With `TOKENFUSE_CLIENT_KEYS` unset,
+/// anyone who can reach that port spends through the gateway's provider
+/// credential and names any run and agent they like. That is a legitimate
+/// posture behind a network that only trusted callers reach, so it is said
+/// loudly rather than refused: refusing would break every deployment that
+/// relies on placement, at boot. Loopback is the standard library's answer
+/// (`mcpbroker::is_loopback`), as for the admin gate (invariant 41).
+#[must_use]
+pub fn open_bind_warning(addr: &str, client_auth_enabled: bool) -> Option<String> {
+    if client_auth_enabled || crate::mcpbroker::is_loopback(addr) {
+        return None;
+    }
+    Some(format!(
+        "client authentication is OFF and the gateway is bound to {addr}, which is not \
+         loopback: anyone who can reach this address can spend through it and name any run \
+         and agent. Set TOKENFUSE_CLIENT_KEYS to require a key on every call, or bind to \
+         127.0.0.1."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_bind_with_no_keys_is_warned_about_and_names_the_fix() {
+        for addr in ["0.0.0.0:4100", "[::]:4100", "10.0.0.5:4100"] {
+            let w = open_bind_warning(addr, false).unwrap_or_else(|| panic!("{addr}: no warning"));
+            assert!(w.contains("client authentication is OFF"), "{w}");
+            assert!(w.contains("TOKENFUSE_CLIENT_KEYS"), "{w}");
+            assert!(w.contains(addr), "{w}");
+        }
+    }
+
+    #[test]
+    fn loopback_or_keys_is_not_warned_about() {
+        for addr in [
+            "127.0.0.1:4100",
+            "[::1]:4100",
+            "localhost:4100",
+            "127.0.0.2:4100",
+        ] {
+            assert_eq!(open_bind_warning(addr, false), None, "{addr}");
+        }
+        assert_eq!(open_bind_warning("0.0.0.0:4100", true), None);
+    }
 
     #[test]
     fn an_unset_spec_leaves_authentication_off() {

@@ -210,7 +210,7 @@ NAT. The gateway was published on the box's tailnet address only, never on the L
 `TOKENFUSE_CLIENT_KEYS` carried one key per cloud; the identity map bound the AWS key to
 `agent://customer.example/aws/*` and the GCP key to `agent://customer.example/gcp/*` (units
 `aws` and `gcp`). The launcher set `TOKENFUSE_WARDRYX_MODE=enforce` and
-`TOKENFUSE_WARDRYX_FAILMODE=closed`; the binary's own default is `mode=off, failmode=open`.
+`TOKENFUSE_WARDRYX_FAILMODE=closed`; the binary's own default was then `mode=off, failmode=open` (since 2026-10-17 an unset failmode is `closed` under `enforce`, invariant 117).
 Full detail: the run's evidence and
 [estate-gates/PROVEN.md](https://github.com/TAIPANBOX/estate-gates/blob/main/PROVEN.md), the
 rows dated 2026-09-17.

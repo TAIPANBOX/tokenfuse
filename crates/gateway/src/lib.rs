@@ -4,6 +4,7 @@
 
 pub mod adminkeys;
 pub mod agentids;
+pub mod attestation;
 pub mod backtestcli;
 pub mod chainproof;
 pub mod clientkeys;

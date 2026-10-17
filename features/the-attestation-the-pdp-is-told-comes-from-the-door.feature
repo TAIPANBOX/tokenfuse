@@ -39,3 +39,10 @@ Feature: The attestation the policy plane is told comes from the door
     Given the MCP broker's only door is the proof door
     When a client presents its proof and a header naming spiffe-svid
     Then the PDP is told dpop-key
+
+  # @test:the_door_decides_the_word
+  # @test:the_header_is_named_once_however_often_it_arrives
+  Scenario: An ignored header is said once
+    Given a caller that sends x-fuse-attestation-method on every call
+    When the gateway serves those calls
+    Then one log line says the header is ignored and why

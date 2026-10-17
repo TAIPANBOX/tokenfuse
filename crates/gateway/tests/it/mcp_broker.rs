@@ -4065,6 +4065,10 @@ async fn a_deny_slower_than_the_model_paths_deadline_still_refuses_the_tool_call
 /// deadline for both paths, and the tool path keeps it. With 50 ms set
 /// explicitly the same 120 ms deny is late, failmode open applies, and the
 /// call goes through, exactly as before this change.
+///
+/// Failmode open is set explicitly since invariant 117: unset under enforce
+/// it is closed, and this test is about whose deadline applies, which only a
+/// failmode that lets a late call through can show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_shared_timeout_still_governs_the_tool_path() {
     let (seen, upstream_router) = recording_upstream();
@@ -4074,6 +4078,7 @@ async fn an_explicit_shared_timeout_still_governs_the_tool_path() {
         ("TOKENFUSE_MCP_UPSTREAM", &upstream),
         ("TOKENFUSE_WARDRYX_URL", &pdp),
         ("TOKENFUSE_WARDRYX_MODE", "enforce"),
+        ("TOKENFUSE_WARDRYX_FAILMODE", "open"),
         ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "50"),
     ]);
 
