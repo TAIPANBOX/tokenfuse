@@ -524,8 +524,38 @@ fn emit_breaker_event(
     }
 }
 
-pub async fn healthz() -> &'static str {
-    "ok"
+/// `GET /healthz`: `ok`, byte for byte, as every launcher's probe reads it.
+///
+/// `GET /healthz?detail=1` answers JSON with the exposure posture as well
+/// (invariant 119): whether client authentication is on, whether the bind is
+/// loopback, and a warning when neither protects the gateway. Nothing in it is
+/// a secret, and what it says about an open gateway is what the gateway
+/// already shows anyone who sends it a call.
+pub async fn healthz(
+    State(st): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let detail = query.as_deref().is_some_and(|q| {
+        q.split('&').any(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            key == "detail" && value != "0" && value != "false"
+        })
+    });
+    if !detail {
+        return "ok".into_response();
+    }
+    let client_auth = st.client_keys.enabled();
+    let loopback = crate::mcpbroker::is_loopback(&st.bind_addr);
+    let warnings: Vec<String> = crate::clientkeys::open_bind_warning(&st.bind_addr, client_auth)
+        .into_iter()
+        .collect();
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "client_auth": if client_auth { "on" } else { "off" },
+        "bind": if loopback { "loopback" } else { "not_loopback" },
+        "warnings": warnings,
+    }))
+    .into_response()
 }
 
 /// The Anthropic Messages door. Everything it does lives in [`handle`]; this
@@ -682,6 +712,10 @@ async fn handle_call(
             Err(e) => upstream_error(e),
         };
     };
+    // The run belongs to the credential that first named it (invariant 118),
+    // so the tool-call check can answer this caller about it and nobody else.
+    // Nothing is recorded when client keys are off: `key_id` is empty.
+    st.note_run_owner(&run_id, &key_id);
 
     // A Cloud-managed budget (set by an operator) overrides the client-supplied
     // header; otherwise use the header, then the policy default.
@@ -1627,7 +1661,11 @@ async fn handle_call(
         tool_names.sort();
         tool_names.dedup();
         let approval_token = header_str(&headers, "x-fuse-approval-token");
-        let attestation_method = header_str(&headers, "x-fuse-attestation-method");
+        // From the door, never from the caller (invariant 116): `dpop-key`
+        // only when this request proved possession of the key its delegation
+        // is bound to.
+        crate::attestation::note_ignored_header(&headers, "proxy");
+        let attestation_method = Some(crate::attestation::from_door(chain_proven).to_string());
         let wardryx_outcome = st
             .wardryx
             .decide(DecideContext {
@@ -2363,7 +2401,8 @@ fn judge_model_tool_calls(
     if st.firewall.mode == FirewallMode::Off {
         return ToolCallVerdict::Allowed;
     }
-    let requested = taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities);
+    let requested =
+        taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
     if let Some(verdict) = taint::evaluate(labels, &requested, &st.firewall.rules) {
         let reason = verdict.reason();
@@ -2849,7 +2888,7 @@ async fn buffered_managed(
 /// unknown secret both yield `None` - deliberately indistinguishable, since
 /// telling the caller which of the two they got wrong tells an attacker
 /// whether a secret exists.
-fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
     if !st.client_keys.enabled() {
         return Some(String::new());
     }
@@ -2869,7 +2908,7 @@ fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<String> {
 /// counter is aggregate-only and never keyed by the presented secret, so it
 /// cannot narrow the "missing vs unknown credential" distinction this
 /// response deliberately elides.
-fn unauthorized(stats: &KeyStats) -> Response {
+pub(crate) fn unauthorized(stats: &KeyStats) -> Response {
     stats.record_unauthorized();
     unauthorized_response()
 }
@@ -2880,7 +2919,7 @@ fn unauthorized(stats: &KeyStats) -> Response {
 /// the agent the call claimed, and a call that names none (a scan names none)
 /// under `refusedkeys::UNIDENTIFIED_CALLER`, a reserved subject that can be no
 /// real agent, never one made up to look like one (invariant 6).
-fn report_refused_key(st: &AppState, headers: &HeaderMap) {
+pub(crate) fn report_refused_key(st: &AppState, headers: &HeaderMap) {
     let presented = header_str(headers, crate::clientkeys::CLIENT_KEY_HEADER)
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
@@ -4060,6 +4099,52 @@ pub(crate) mod tests {
         let req = Request::get("/healthz").body(Body::empty()).unwrap();
         let resp = call(state(Mode::Enforce, StubProvider::default()), req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    async fn health_detail(st: AppState, query: &str) -> serde_json::Value {
+        let req = Request::get(format!("/healthz?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn the_health_detail_reads_the_bind_and_the_keys_it_was_given() {
+        // Invariant 119 at the handler: the three postures, each from state.
+        let open = state(Mode::Enforce, StubProvider::default()).with_bind_addr("0.0.0.0:4100");
+        let d = health_detail(open, "detail=1").await;
+        assert_eq!(d["client_auth"], "off", "{d}");
+        assert_eq!(d["bind"], "not_loopback", "{d}");
+        assert_eq!(d["warnings"].as_array().map(Vec::len), Some(1), "{d}");
+
+        let local = state(Mode::Enforce, StubProvider::default());
+        let d = health_detail(local, "detail=1").await;
+        assert_eq!(d["bind"], "loopback", "{d}");
+        assert_eq!(d["warnings"], serde_json::json!([]), "{d}");
+
+        let keyed = with_keys(
+            state(Mode::Enforce, StubProvider::default()).with_bind_addr("0.0.0.0:4100"),
+            "sk-h:agent-h",
+        );
+        let d = health_detail(keyed, "detail=1").await;
+        assert_eq!(d["client_auth"], "on", "{d}");
+        assert_eq!(d["warnings"], serde_json::json!([]), "{d}");
+    }
+
+    #[tokio::test]
+    async fn the_plain_health_answer_is_ok_whatever_the_query() {
+        for query in ["", "detail=0", "detail=false", "other=1"] {
+            let st = state(Mode::Enforce, StubProvider::default()).with_bind_addr("0.0.0.0:4100");
+            let req = Request::get(format!("/healthz?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = call(st, req).await;
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&bytes[..], b"ok", "?{query}");
+        }
     }
 
     #[tokio::test]

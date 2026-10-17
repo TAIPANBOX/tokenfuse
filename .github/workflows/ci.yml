@@ -144,6 +144,12 @@ jobs:
       - name: served pages build no markup from data
         run: ./scripts/no-html-from-data.sh
 
+      # The attestation method the policy plane is told comes from the door that
+      # authenticated the call; only crate::attestation names the caller's
+      # header, to say once that it is ignored (invariant 116).
+      - name: the attestation is derived, never read from the caller
+        run: ./scripts/attestation-is-derived.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04

@@ -166,17 +166,31 @@ pub fn wardryx_mode_from(value: Option<&str>) -> Result<crate::wardryx::WardryxM
 }
 
 /// What the wardryx hook does when its PDP cannot be reached
-/// (`TOKENFUSE_WARDRYX_FAILMODE`): `open | closed`.
+/// (`TOKENFUSE_WARDRYX_FAILMODE`): `open | closed`, for a hook in `mode`.
 ///
-/// **Unset is `open`.** An unknown value used to read as `open`, so a typo for
-/// `closed` let every call through during an outage of the policy plane; it is
-/// refused now (invariant 98).
-pub fn wardryx_failmode_from(value: Option<&str>) -> Result<crate::wardryx::FailMode, String> {
-    use crate::wardryx::FailMode;
+/// **Unset is `closed` under `enforce`** (invariant 117), and `open` in every
+/// other mode. Until 2026-10-17 it was `open` everywhere, and measured on the
+/// bare binary that day: a call the policy denied while wardryx was up was
+/// allowed four seconds after wardryx stopped, answered `x-fuse-wardryx:
+/// allow`. With a 50 ms deadline a busy PDP is enough. An operator who chose
+/// enforcement did not choose an outage that turns every deny into an allow;
+/// `open` stays one variable away. Shadow keeps `open` because shadow blocks
+/// nothing whatever the failmode says.
+///
+/// An unknown value used to read as `open`, so a typo for `closed` let every
+/// call through during an outage of the policy plane; it is refused (invariant
+/// 98). Blank is unset, so it gets the mode's default.
+pub fn wardryx_failmode_from(
+    mode: crate::wardryx::WardryxMode,
+    value: Option<&str>,
+) -> Result<crate::wardryx::FailMode, String> {
+    use crate::wardryx::{FailMode, WardryxMode};
     Ok(
         match switch_word("TOKENFUSE_WARDRYX_FAILMODE", value, &["open", "closed"])? {
             Some("closed") => FailMode::Closed,
-            _ => FailMode::Open,
+            Some(_) => FailMode::Open,
+            None if mode == WardryxMode::Enforce => FailMode::Closed,
+            None => FailMode::Open,
         },
     )
 }
@@ -278,9 +292,10 @@ pub fn wardryx_mode_from_env() -> crate::wardryx::WardryxMode {
     ))
 }
 
-/// [`wardryx_failmode_from`] against the process environment.
-pub fn wardryx_failmode_from_env() -> crate::wardryx::FailMode {
+/// [`wardryx_failmode_from`] against the process environment, for a hook in `mode`.
+pub fn wardryx_failmode_from_env(mode: crate::wardryx::WardryxMode) -> crate::wardryx::FailMode {
     exit_on_refusal(wardryx_failmode_from(
+        mode,
         std::env::var("TOKENFUSE_WARDRYX_FAILMODE").ok().as_deref(),
     ))
 }
@@ -922,13 +937,40 @@ mod tests {
 
     #[test]
     fn wardryx_failmode_refuses_a_mistyped_word() {
-        use crate::wardryx::FailMode;
+        use crate::wardryx::{FailMode, WardryxMode};
+        // Shadow, where unset still means open.
         assert_switch(
             "TOKENFUSE_WARDRYX_FAILMODE",
             "open|closed",
-            wardryx_failmode_from,
+            |v| wardryx_failmode_from(WardryxMode::Shadow, v),
             FailMode::Open,
             &[("open", FailMode::Open), ("closed", FailMode::Closed)],
+        );
+        // Enforce, where unset means closed (invariant 117) and both words
+        // still mean what they say.
+        assert_switch(
+            "TOKENFUSE_WARDRYX_FAILMODE",
+            "open|closed",
+            |v| wardryx_failmode_from(WardryxMode::Enforce, v),
+            FailMode::Closed,
+            &[("open", FailMode::Open), ("closed", FailMode::Closed)],
+        );
+    }
+
+    #[test]
+    fn the_failmode_nobody_set_is_closed_only_under_enforce() {
+        use crate::wardryx::{FailMode, WardryxMode};
+        assert_eq!(
+            wardryx_failmode_from(WardryxMode::Enforce, None),
+            Ok(FailMode::Closed)
+        );
+        assert_eq!(
+            wardryx_failmode_from(WardryxMode::Shadow, None),
+            Ok(FailMode::Open)
+        );
+        assert_eq!(
+            wardryx_failmode_from(WardryxMode::Off, None),
+            Ok(FailMode::Open)
         );
     }
 

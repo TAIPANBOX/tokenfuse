@@ -1467,6 +1467,75 @@ run_case "dlp-shadow: written before the PII scan could refuse" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "DlpMode::Block => return dlp_block(&run_id, &pii_summary),", "DlpMode::Block => { for data in dlp_shadow.drain(..) { let _ = st.events.emit(EventType::DlpShadow, now_millis(), Some(&event_agent_id), Some(&run_id), chain_on_record, data); } return dlp_block(&run_id, &pii_summary) }")')" \
 	"a_prompt_a_scanner_refused_writes_no_dlp_shadow ... FAILED"
 
+# --- invariants 115 to 119: the agent-security wave of 2026-10-17 -----------
+#
+# invariant 116 has a scripts/*.sh gate; the cases right below are its teeth. The
+# rest are mutants of the product code, held by cargo test, each a way the
+# finding it closed comes back silently.
+run_case "attestation-derived: a planted read of the header in the broker" fail \
+	"./scripts/attestation-is-derived.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "attestation_method: Some(crate::attestation::NONE.to_string()),", "attestation_method: header(\"x-fuse-attestation-method\"),")')" \
+	"READS THE HEADER"
+
+run_case "attestation-derived: a read through the constant in the proxy" fail \
+	"./scripts/attestation-is-derived.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::attestation::note_ignored_header(&headers, \"proxy\");", "let _ = header_str(&headers, crate::attestation::CLIENT_HEADER);")')" \
+	"READS THE HEADER"
+
+run_case "attestation-derived: a comment naming the header passes" pass \
+	"./scripts/attestation-is-derived.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        crate::attestation::note_ignored_header(&headers, \"proxy\");", "        // \"x-fuse-attestation-method\" is ignored here\n        crate::attestation::note_ignored_header(&headers, \"proxy\");")')"
+
+run_case "attestation-derived: the module deleted, so it measured nothing" fail \
+	"./scripts/attestation-is-derived.sh" \
+	"$(py 'import os; os.remove("crates/gateway/src/attestation.rs")')" \
+	"measured nothing"
+
+run_case "unclassified: the starter rule no longer denies it" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact unmapped_tool_after_untrusted::a_tainted_run_calling_an_unmapped_tool_is_refused_in_enforce" \
+	"$(py 'edit("crates/gateway/src/firewall.rs", "                    tokenfuse_core::taint::UNCLASSIFIED_CAPABILITY.into(),\n", "")')" \
+	"a_tainted_run_calling_an_unmapped_tool_is_refused_in_enforce ... FAILED"
+
+run_case "unclassified: an unmapped tool requests nothing again" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact taint::tests::a_tool_neither_map_names_exercises_the_unclassified_capability" \
+	"$(py 'edit("crates/core/src/taint.rs", "None if is_unclassified(n, sources) =>", "None if false && is_unclassified(n, sources) =>")')" \
+	"a_tool_neither_map_names_exercises_the_unclassified_capability ... FAILED"
+
+run_case "attestation: the LLM path reads the caller's header again" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact wardryx::a_client_attestation_header_never_reaches_the_pdp" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "let attestation_method = Some(crate::attestation::from_door(chain_proven).to_string());", "let attestation_method = header_str(&headers, \"x-fuse-attestation-method\").or(Some(crate::attestation::from_door(chain_proven).to_string()));")')" \
+	"a_client_attestation_header_never_reaches_the_pdp ... FAILED"
+
+run_case "attestation: the broker's proof door is not counted" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_call_admitted_by_a_proof_of_possession_is_attested_as_dpop_key" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "from_door(door_proof || chain_proven)", "from_door(door_proof && chain_proven)")')" \
+	"a_call_admitted_by_a_proof_of_possession_is_attested_as_dpop_key ... FAILED"
+
+run_case "failmode: an enforcing hook nobody configured fails open again" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact wardryx::tests::enforce_with_no_failmode_fails_closed" \
+	"$(py 'edit("crates/gateway/src/defaults.rs", "None if mode == WardryxMode::Enforce => FailMode::Closed,", "None if mode == WardryxMode::Enforce => FailMode::Open,")')" \
+	"enforce_with_no_failmode_fails_closed ... FAILED"
+
+run_case "tool-check: the key is not asked for" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact toolcheck::tests::with_client_keys_a_check_without_a_key_is_refused" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "crate::proxy::resolve_client_key(&st, &headers) else {", "crate::proxy::resolve_client_key(&st, &headers).or(Some(String::new())) else {")')" \
+	"with_client_keys_a_check_without_a_key_is_refused ... FAILED"
+
+run_case "tool-check: another key's run is described" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact check_tool_call_answers_its_callers_runs::a_check_about_another_keys_run_says_nothing_about_it" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "let foreign = !caller.is_empty()", "let foreign = false && !caller.is_empty()")')" \
+	"a_check_about_another_keys_run_says_nothing_about_it ... FAILED"
+
+run_case "tool-check: the broker reads a refusal as an answer" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::a_check_the_gateway_refuses_to_answer_is_not_read_as_permission" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "Ok(r) if r.status().is_success() => r", "Ok(r) if true || r.status().is_success() => r")')" \
+	"a_check_the_gateway_refuses_to_answer_is_not_read_as_permission ... FAILED"
+
+run_case "open-bind: the warning is never printed" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact open_bind_without_client_keys::an_open_bind_with_no_client_keys_is_said_at_startup" \
+	"$(py 'edit("crates/gateway/src/main.rs", "open_bind_warning(&addr, client_keys.enabled())", "open_bind_warning(&addr, true)")')" \
+	"an_open_bind_with_no_client_keys_is_said_at_startup ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

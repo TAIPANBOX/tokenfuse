@@ -22,6 +22,7 @@
 //! those together would report "the gateway permitted this" for a box where
 //! nothing was asked, which is the `allowed_ungoverned` mistake one plane over.
 
+use axum::response::{IntoResponse, Response};
 use axum::{extract::State, http::HeaderMap, Json};
 use serde::Deserialize;
 use tokenfuse_core::agent_event::{taint_verdict_data, EventType, TaintEnforcement, TaintStage};
@@ -78,17 +79,44 @@ impl CheckRequest {
 
 /// Judge a tool call an executor is about to make.
 ///
-/// Always HTTP 200. The decision is in the body, deliberately: an executor
-/// asking permission is not itself an error, a 403 here would be
-/// indistinguishable from an auth failure or a proxy in the way, and a client
-/// that cannot tell those apart has to choose between failing closed on a
-/// network blip and failing open on a refusal.
+/// HTTP 200 for every question it answers. The decision is in the body,
+/// deliberately: an executor asking permission is not itself an error, a 403
+/// here would be indistinguishable from a proxy in the way, and a client that
+/// cannot tell those apart has to choose between failing closed on a network
+/// blip and failing open on a refusal.
+///
+/// # Who may ask (invariant 118)
+///
+/// With client keys configured, a caller presents one in `x-fuse-key` or gets
+/// the same `401` a metered call gets, before anything about any run is read.
+/// And it is answered only about its own runs: a run belongs to the client key
+/// whose metered call first named it, and a question about a run another key
+/// owns is answered `deny` with nothing of that run in it. Measured 2026-10-17
+/// on a deployed configuration, before this: any caller, with no credential,
+/// was told any run's taint labels, which say what the run read.
+///
+/// Without client keys nothing is authenticated at any door of this gateway,
+/// and this one is no exception: the answer is what it always was. That is a
+/// documented posture, not an oversight; `TOKENFUSE_CLIENT_KEYS` is the switch.
 pub async fn check_tool_call(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<CheckRequest>,
+) -> Response {
+    let Some(caller) = crate::proxy::resolve_client_key(&st, &headers) else {
+        crate::proxy::report_refused_key(&st, &headers);
+        return crate::proxy::unauthorized(&st.keystats);
+    };
+    answer(&st, &headers, &caller, req).into_response()
+}
+
+fn answer(
+    st: &AppState,
+    headers: &HeaderMap,
+    caller: &str,
+    req: CheckRequest,
 ) -> Json<serde_json::Value> {
-    let agent_id = crate::proxy::header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+    let agent_id = crate::proxy::header_str(headers, "x-fuse-agent-id").unwrap_or_default();
     let unit = String::new();
 
     if st.firewall.mode == FirewallMode::Off {
@@ -116,6 +144,22 @@ pub async fn check_tool_call(
         }));
     }
 
+    // Another key's run is not described, not even by whether it read
+    // anything (invariant 118). `deny` rather than a bare refusal, so an
+    // executor that reads only the decision fails closed. An empty `caller` is
+    // a gateway without client keys, where no run has an owner.
+    let foreign = !caller.is_empty()
+        && st
+            .run_owner(&req.run_id)
+            .is_some_and(|owner| owner != caller);
+    if foreign {
+        return Json(serde_json::json!({
+            "decision": "deny",
+            "governed": true,
+            "reason": "this run was opened under another client key; a check is answered only for the caller's own runs",
+        }));
+    }
+
     // The same three inputs the model-tool-call path uses, in the same order,
     // so the two doors cannot answer differently about one run.
     st.note_taint_parent(&req.run_id, "");
@@ -123,7 +167,8 @@ pub async fn check_tool_call(
         .accumulate_taint(&req.run_id, Default::default())
         .carrying;
     labels.extend(st.inherited_taint(&req.run_id));
-    let requested = taint::capabilities_for_tools(&names, &st.firewall.capabilities);
+    let requested =
+        taint::capabilities_for_tools(&names, &st.firewall.capabilities, &st.firewall.sources);
 
     let Some(verdict) = taint::evaluate(&labels, &requested, &st.firewall.rules) else {
         return Json(serde_json::json!({
@@ -257,8 +302,11 @@ mod tests {
         let labels = st
             .accumulate_taint("run-agree", Default::default())
             .carrying;
-        let requested =
-            taint::capabilities_for_tools(&["send_email".to_string()], &st.firewall.capabilities);
+        let requested = taint::capabilities_for_tools(
+            &["send_email".to_string()],
+            &st.firewall.capabilities,
+            &st.firewall.sources,
+        );
         let direct = taint::evaluate(&labels, &requested, &st.firewall.rules).unwrap();
 
         assert_eq!(exec["decision"], "deny");
@@ -317,6 +365,99 @@ mod tests {
             b["governed"], false,
             "no tool is the same shape of question"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_tool_in_a_tainted_run_is_denied_at_the_check() {
+        // F-003 at the level-2 door. `fetch` is in neither map, so before this it
+        // requested nothing and a web-tainted run was told `allow`.
+        let st = state_with(FirewallMode::Enforce);
+        st.accumulate_taint("run-fetch", ["web".to_string()].into_iter().collect());
+        let a = ask(st, r#"{"run_id":"run-fetch","tool":"fetch"}"#).await;
+        assert_eq!(a["decision"], "deny", "{a}");
+        assert_eq!(a["rule"], "no-exec-after-untrusted");
+        assert_eq!(a["denied"], serde_json::json!(["unclassified"]));
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_tool_in_a_clean_run_is_still_allowed_at_the_check() {
+        let st = state_with(FirewallMode::Enforce);
+        let a = ask(st, r#"{"run_id":"run-fetch-clean","tool":"fetch"}"#).await;
+        assert_eq!(a["decision"], "allow", "{a}");
+        assert_eq!(a["governed"], true);
+        assert!(a.get("would_block").is_none_or(|w| w.is_null()), "{a}");
+    }
+
+    /// The raw answer, status included, for a caller presenting `key` (or none).
+    async fn ask_as(
+        st: AppState,
+        body: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::post("/v1/fuse/check-tool-call")
+            .header("content-type", "application/json")
+            .header("x-fuse-agent-id", "agent://test.local/executor");
+        if let Some(k) = key {
+            req = req.header(crate::clientkeys::CLIENT_KEY_HEADER, k);
+        }
+        let resp = crate::app(st)
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn keyed(mode: FirewallMode) -> AppState {
+        state_with(mode).with_client_keys(Arc::new(
+            crate::clientkeys::ClientKeys::from_spec("sk-a:agent-a,sk-b:agent-b")
+                .expect("valid spec"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn with_client_keys_a_check_without_a_key_is_refused() {
+        // F-024. Measured 2026-10-17 on a deployed configuration: with client
+        // keys on, this route answered any caller with any run's labels.
+        let st = keyed(FirewallMode::Enforce);
+        st.accumulate_taint("run-victim", ["web".to_string()].into_iter().collect());
+        let (status, body) =
+            ask_as(st, r#"{"run_id":"run-victim","tool":"send_email"}"#, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(
+            !body.to_string().contains("web"),
+            "a refused caller learns nothing about the run: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_client_keys_a_check_with_an_unknown_key_is_refused() {
+        let st = keyed(FirewallMode::Enforce);
+        st.accumulate_taint("run-victim2", ["web".to_string()].into_iter().collect());
+        let (status, body) = ask_as(
+            st,
+            r#"{"run_id":"run-victim2","tool":"send_email"}"#,
+            Some("sk-nobody"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(!body.to_string().contains("web"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn without_client_keys_a_check_is_answered_as_before() {
+        // The documented posture of a gateway that configured no client keys:
+        // nothing is authenticated, this door included.
+        let st = state_with(FirewallMode::Enforce);
+        st.accumulate_taint("run-open", ["web".to_string()].into_iter().collect());
+        let (status, body) = ask_as(st, r#"{"run_id":"run-open","tool":"run_shell"}"#, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "deny");
+        assert_eq!(body["carrying"], serde_json::json!(["web"]));
     }
 
     #[tokio::test]

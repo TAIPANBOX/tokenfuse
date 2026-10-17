@@ -98,6 +98,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/no-owner-quotes.sh     # invariant 101
 ./scripts/no-html-from-data.sh   # invariant 102
 ./scripts/teeth-shards-cover-every-case.sh  # invariant 113
+./scripts/attestation-is-derived.sh  # invariant 116
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7404,3 +7405,186 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     as cases in `scripts/gates-have-teeth.sh`: the queue never written, a mask finding reported as shadow, the
     event written before the PII scan could refuse. Scenarios:
     `features/a-dlp-finding-let-through-is-on-the-bus.feature`, seven, each bound. Not a script gate)*
+
+115. **A tool the policy names nowhere is not harmless after untrusted input.** Sources failed closed
+    and capabilities failed open: the OUTPUT of a tool the source map does not name has been labelled
+    `unclassified` since the firewall shipped, but a tool the capability map does not name requested
+    nothing, so a run that had read a web page could call `http_request`, `fetch`, `slack_post` or any
+    MCP tool outside the nine starter names, with what it had read in the arguments, and no rule had
+    anything to deny. Silent: no rule fired and the operator saw an allowed call. Found by the
+    agent-security review of 2026-10-17 (F-003), read in code at `6576a08`.
+
+    `@decided 2026-10-17`: close the agent-security findings of that review, starting with defaults and
+    small fixes, on the hybrid architecture (identity from vouchryx, key custody and record witness off
+    the request path). For this one: an unmapped tool's capability is `unclassified`, the starter policy
+    denies it after untrusted sources, a run with no untrusted label behaves exactly as before, and
+    shadow records what enforce would do.
+
+    `tokenfuse_core::taint::capabilities_for_tools` now takes the source map too: a tool in the
+    capability map exercises that capability; a tool in NEITHER map exercises
+    `UNCLASSIFIED_CAPABILITY` (`unclassified`), decided by `is_unclassified`, the one predicate the source
+    labels and the invariant 96 log line already share, so a source mapped to an empty list is
+    unclassified on both sides. The starter rule `no-exec-after-untrusted` lists `unclassified` in its
+    `deny`. Both doors that judge an action read the same function: the model's tool calls
+    (`proxy::judge_model_tool_calls`, buffered and streamed, invariant 104) and
+    `/v1/fuse/check-tool-call` (so the MCP broker's level 3 too).
+
+    `@claude` 2026-10-17, choices the decision left open: a tool the SOURCE map names (`web_search`,
+    `fetch_url`, `recall`) is classified and requests nothing, because a search after a search is the
+    commonest thing an agent does and refusing it is how a firewall gets switched off (invariant 28's
+    lesson). `anti-exfiltration` is unchanged: `secrets` is a sensitivity label, not an untrusted
+    source. No floor is added to an operator's policy file: a file names its own capabilities, and its
+    rules do not deny `unclassified` unless it says so.
+
+    **Where it says nothing.** A classified read tool can still carry data out in its arguments
+    (`fetch_url` with a secret in the URL); closing that is a capability for reads, which is a policy
+    decision per tool. An operator's policy file is judged by its own rules, so a file that names no
+    rule denying `unclassified` keeps the old behaviour for unmapped tools. Tool names only, as
+    invariant 26 already says: an MCP server's own name and argument globs are not read.
+    *(test: `core::taint::tests` `a_tool_neither_map_names_exercises_the_unclassified_capability`,
+    `a_tool_the_source_map_names_requests_nothing`,
+    `a_source_mapped_to_no_labels_is_unclassified_as_an_action_too`,
+    `a_mapped_capability_is_named_and_never_unclassified` and
+    `a_rule_that_denies_unclassified_refuses_an_unmapped_tool_only_under_its_labels`, red by compile
+    (the third argument did not exist); `firewall::memory_and_unclassified_tests::the_starter_policy_denies_an_unclassified_action_after_untrusted_input`;
+    `toolcheck::tests::an_unmapped_tool_in_a_tainted_run_is_denied_at_the_check`, red first in CI on the
+    test-only commit; `tests/it/unmapped_tool_after_untrusted.rs`, six, of which the enforce and shadow
+    cases are the red ones and the clean-run, classified-source, secrets-only and firewall-off cases are
+    the guards. Mutants as cases in `scripts/gates-have-teeth.sh`: `unclassified` dropped from the
+    starter rule, and the unclassified arm of `capabilities_for_tools` never taken. Scenarios:
+    `features/an-unmapped-tool-is-not-harmless-after-untrusted-input.feature`, six, each bound)*
+
+116. **The attestation method the policy plane is told comes from the door that authenticated the
+    call, never from the caller.** Both doors copied `x-fuse-attestation-method` into the question put
+    to wardryx (`proxy.rs:1630` and the MCP broker's two `CallContext`s at `6576a08`), and wardryx's
+    `deny_if_unattested` denies only an empty value or `none`, so any caller that wrote `spiffe-svid`
+    in a header passed a policy meant to admit only attested agents, and the decision record said the
+    agent was attested. This held with client keys and an identity map on, because neither binds
+    attestation (F-005 of the same review).
+
+    `@decided 2026-10-17` (the same decision as 115): derive the method from the door and ignore the
+    header, with one log line.
+
+    `crate::attestation` is the one place: `from_door(possession_proven)` answers `dpop-key` or
+    `none`, the agent-passport SPEC 4.3 words, a closed enum. The LLM path passes whether a DPoP-bound
+    delegation was verified on this request (`chain_proven`); the broker passes that or its own proof
+    door's admission. `note_ignored_header` says once per process that the header is ignored and why.
+
+    `@claude` 2026-10-17: a client key and an XAA bearer token are `none`. They authenticate a caller,
+    but a bearer secret binds no workload, and SPEC 4.3 names no method for one. `none` is sent rather
+    than left out, so a record says the enforcement point looked. A deployment whose policy uses
+    `deny_if_unattested` and whose agents authenticate by client key alone will see those agents
+    refused, which is what the rule says.
+
+    **Where it says nothing.** mTLS and SPIFFE are not doors this gateway has, so `mtls-cert` and
+    `spiffe-svid` are never sent. wardryx still trusts whatever its PEP sends; making the field accepted
+    only from a principal whose role may assert it is wardryx's half of F-005 and is not here.
+    *(gate: `scripts/attestation-is-derived.sh`: no Rust file under `crates/gateway/src` other than
+    `attestation.rs` names the header, as the literal or as `attestation::CLIENT_HEADER`, outside a
+    comment; `attestation.rs` gone or no longer naming it is "measured nothing". Teeth: a planted read
+    in the broker and one through the constant in the proxy must fail, a comment naming the header must
+    pass, the module deleted must say measured nothing. test: `tests/it/wardryx.rs`
+    `a_client_attestation_header_never_reaches_the_pdp`, `a_call_with_no_proof_is_sent_as_none_not_left_out`
+    and `a_proven_delegation_is_attested_as_dpop_key_whatever_the_header_says`; `tests/it/mcp_broker.rs`
+    `the_broker_never_tells_the_pdp_an_attestation_the_caller_wrote` and
+    `a_call_admitted_by_a_proof_of_possession_is_attested_as_dpop_key`; `attestation::tests`
+    `the_door_decides_the_word` and `the_header_is_named_once_however_often_it_arrives`. Mutants as teeth
+    cases: the header read again on the LLM path, the broker's proof door not counted. Scenarios:
+    `features/the-attestation-the-pdp-is-told-comes-from-the-door.feature`, five, each bound)*
+
+117. **An enforcing policy hook fails closed unless an operator chose open.** `TOKENFUSE_WARDRYX_FAILMODE`
+    unset was `open` in every mode. Measured on the bare binary on 2026-10-17: a call the policy denied
+    while wardryx was up was allowed four seconds after wardryx stopped, answered `x-fuse-wardryx:
+    allow`, with nothing on the answer to say the PDP was not asked. With a 50 ms deadline a busy PDP is
+    enough (F-006 of the same review).
+
+    `@decided 2026-10-17` (the same decision as 115): when the mode is `enforce` and the failmode is
+    unset, it is `closed`; an explicit `open` still works and is logged at startup.
+
+    `defaults::wardryx_failmode_from(mode, value)` decides it: a word is honoured as written, blank is
+    unset (invariant 98's rule), and unset is `closed` under `enforce`, `open` otherwise. Both processes
+    build their hook through `Wardryx::from_vars`, which warns once when `enforce` meets an explicit
+    `open`; `serve` logs `failmode=` beside the mode at startup. `@claude`: shadow and off keep `open`,
+    because shadow blocks nothing whatever the failmode says.
+
+    **Upgrade effect.** A deployment that runs `enforce` and never set the failmode now refuses, during
+    an outage of wardryx, the calls the hook would judge. stack-single and stack-k8s already set
+    `closed`; stack-up set nothing and so changes. `open` is one variable away.
+    *(test: `wardryx::tests` `enforce_with_no_failmode_fails_closed` and
+    `enforce_with_a_blank_failmode_fails_closed_too`, red first in CI on the test-only commit,
+    `an_explicit_open_still_opens_under_enforce` and `shadow_with_no_failmode_is_unchanged` the guards;
+    `defaults::tests::wardryx_failmode_refuses_a_mistyped_word` now asserts both modes and
+    `the_failmode_nobody_set_is_closed_only_under_enforce`; the real binary in
+    `tests/it/policy_hook_fails_closed_by_default.rs`: `an_enforcing_gateway_with_no_failmode_refuses_while_its_pdp_is_down`
+    and `an_explicit_open_still_opens_and_is_said_at_startup`. Mutant as a teeth case: the unset arm
+    sent back to `open`. Scenarios: `features/an-enforcing-policy-hook-fails-closed-by-default.feature`,
+    four, each bound)*
+
+118. **With client keys configured, the tool-call check needs a key and answers a caller only about its
+    own runs.** `/v1/fuse/check-tool-call` sat outside every gate by construction (`lib.rs`: the admin
+    gate applies "never to `/healthz`, `/v1/messages`, or `/v1/fuse/*`"). Measured on 2026-10-17 against
+    a deployed configuration with client keys on: a caller with no credential asked about a run another
+    caller had opened and was told its labels, `suspected_injection` and `web`, which say what the run
+    read (F-024 of the same review).
+
+    `@decided 2026-10-17` (the same decision as 115): the route requires a client key whenever client
+    keys are configured and answers only for runs that belong to the caller's identity; without client
+    keys it keeps today's behaviour, documented.
+
+    The route resolves the key with the metered doors' own `proxy::resolve_client_key`, refuses with
+    their `401`, and puts the refusal on the bus as invariant 105 does. A run belongs to the client key
+    whose metered call first named it (`TaintStore::note_owner`, first write wins, nothing recorded
+    while keys are off). `@claude` 2026-10-17: a check about a run another key owns is answered HTTP 200
+    `deny` with no labels and no rule, so an executor that reads only the decision fails closed and
+    learns nothing. This narrows invariant 26's "always HTTP 200" to every question it answers.
+
+    The MCP broker's level 3 asks this route, so two changes there are part of the same rule. It passes
+    the caller's own `x-fuse-key` (never a key of its own, which would make it an oracle for every run),
+    and an answer outside 2xx is no answer: it used to read a `401 {"error":...}` as "not deny" and
+    forward the call with nothing recorded; it is now a `dependency_failed` naming the status, decided by
+    `TOKENFUSE_MCP_TAINT_FAILMODE` like an unreachable gateway.
+
+    **Where it says nothing.** The metered doors still let key B name a run key A opened, and a call
+    refused there for taint says the run's labels in its `403`; binding a run to its key at the metered
+    door is a separate decision. A child run declaring another key's run as its parent inherits that
+    parent's labels, here and at the metered door. A first key that names a run id before its real
+    owner does takes it, which costs the owner its checks, not its labels; run ids are the caller's own
+    and usually random. The owner map is in memory, like the rest of the taint store, and gone on
+    restart. An XAA caller of the broker presents no client key, so with gateway keys on its checks are
+    unanswered and fall to the taint failmode.
+    *(test: `toolcheck::tests` `with_client_keys_a_check_without_a_key_is_refused` and
+    `with_client_keys_a_check_with_an_unknown_key_is_refused`, red first in CI on the test-only commit,
+    `without_client_keys_a_check_is_answered_as_before` the guard;
+    `tests/it/check_tool_call_answers_its_callers_runs.rs`: `a_check_about_another_keys_run_says_nothing_about_it`,
+    `with_client_keys_a_check_with_no_key_is_refused_before_anything_is_read`,
+    `the_owner_of_a_run_is_answered_as_before`, `without_client_keys_the_check_is_unchanged`;
+    `tests/it/mcp_broker.rs`: `a_check_the_gateway_refuses_to_answer_is_not_read_as_permission` and
+    `the_broker_asks_the_gateway_with_the_callers_client_key`. Mutants as teeth cases: the key check
+    skipped, the ownership check skipped, the broker reading a refusal as an answer. Scenarios:
+    `features/a-tool-check-answers-only-its-callers-runs.feature`, seven, each bound)*
+
+119. **A gateway that authenticates nobody and listens beyond loopback says so.** The shipped image
+    binds `0.0.0.0:4100`, and with `TOKENFUSE_CLIENT_KEYS` unset anyone who can reach the port spends
+    through the gateway's provider credential and names any run and agent; nothing at startup said so
+    (F-010 of the same review, the part decided for this wave).
+
+    `@decided 2026-10-17` (the same decision as 115): when client authentication is off and the bind
+    address is not loopback, print a loud warning at startup and expose the fact in the health detail.
+
+    `clientkeys::open_bind_warning(addr, enabled)` is the one sentence, loopback asked of the standard
+    library as invariants 20 and 41 ask it; `serve` prints it to stderr between two marker lines and to
+    the log. `GET /healthz?detail=1` answers `status`, `client_auth`, `bind` (`loopback` or
+    `not_loopback`) and `warnings`, the same sentence. `@claude`: plain `GET /healthz` still answers
+    `ok`, byte for byte, because every launcher probes it; and it is a warning, not a refusal, because a
+    deployment that relies on network placement is legitimate and refusing would break it at boot.
+
+    **Where it says nothing.** The rest of F-010 (one governed default profile with a named observe
+    profile) is not built here. A bind address that is loopback inside a container published on every
+    host interface is read as loopback, because this process cannot see the publish.
+    *(test: `clientkeys::tests` `an_open_bind_with_no_keys_is_warned_about_and_names_the_fix` and
+    `loopback_or_keys_is_not_warned_about`; `proxy::tests` `the_health_detail_reads_the_bind_and_the_keys_it_was_given`
+    and `the_plain_health_answer_is_ok_whatever_the_query`; the real binary in
+    `tests/it/open_bind_without_client_keys.rs`: `an_open_bind_with_no_client_keys_is_said_at_startup` and
+    `the_health_detail_says_the_gateway_is_open_to_the_network`, red first, and three guards. Mutant as a
+    teeth case: the warning never printed. Scenarios:
+    `features/an-open-bind-without-client-keys-says-so.feature`, five, each bound)*

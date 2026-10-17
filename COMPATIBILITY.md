@@ -241,7 +241,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - `x-fuse-attestation-method`
 - `x-fuse-declassify-key`
 - `x-fuse-mcp-upstream`
-- held in: `crates/gateway/src/proxy.rs`, `crates/gateway/src/clientkeys.rs`, `crates/gateway/src/declassify.rs`, `crates/gateway/src/mcpbroker.rs`
+- held in: `crates/gateway/src/proxy.rs`, `crates/gateway/src/clientkeys.rs`, `crates/gateway/src/declassify.rs`, `crates/gateway/src/mcpbroker.rs`, `crates/gateway/src/attestation.rs`
 
 ### http.response_headers (16)
 

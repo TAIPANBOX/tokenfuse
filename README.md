@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.14.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-1995-brightgreen)
+![tests](https://img.shields.io/badge/tests-2041-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -288,7 +288,7 @@ Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md
 - 🛠️ **Tool-run metric**: counts the tool calls (`tool_use` blocks / `tool_calls` arrays) the model emits per LLM call, for both Anthropic and OpenAI shapes, streaming and non-streaming alike. Rides the trace as a new nullable `tool_calls` column (schema-evolution safe, like every prior addition), as `x_tool_calls` in FOCUS export, and rolls up into the Cloud dashboard's Runs table and summary tile. Observed only in this release: no budget, no enforcement, just a count (see [docs/21](docs/21-tool-runs.md)).
 
 **Also hardens your agents**
-- 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data. A tool call the model asks for is judged whether the answer is buffered or streamed: a streamed answer's text flows as it arrives, its tool calls are held to the end of the stream and judged, and a denied one is replaced by an error event the client library raises on (see [docs/26](docs/26-the-openai-door.md) section 8).
+- 🔒 **Agent firewall (taint)**: block risky actions after an agent touches untrusted data. A tool the policy names nowhere is one of those risky actions: after untrusted input the starter policy refuses it as capability `unclassified` rather than presuming it harmless. A tool call the model asks for is judged whether the answer is buffered or streamed: a streamed answer's text flows as it arrives, its tool calls are held to the end of the stream and judged, and a denied one is replaced by an error event the client library raises on (see [docs/26](docs/26-the-openai-door.md) section 8).
 - 🕵️ **DLP**: catches a recognisable secret pasted into a prompt and refuses the call before it leaves (`TOKENFUSE_DLP`, `block` by default). It reads contiguous text and matches patterns, so it catches carelessness, not intent: a secret with no distinctive prefix, or one split across the text, goes through. See [Safe by default](#-safe-by-default) for the measured cases.
 - 🔑 **MCP credential-broker** + a free tool-poisoning / rug-pull scanner, CI-gated - see [Scan your MCP servers & gate CI](#-scan-your-mcp-servers--gate-ci).
 - 📡 **eBPF Radar**: discover shadow agents on a host, zero config (Linux).
@@ -706,11 +706,13 @@ Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). R
 |---|---|---|
 | `TOKENFUSE_WARDRYX_URL` | URL (unset ⇒ hook off) | The PDP's `/v1/decide` base URL. Unset forces `off` regardless of mode. |
 | `TOKENFUSE_WARDRYX_MODE` | `off` (default) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
-| `TOKENFUSE_WARDRYX_FAILMODE` | `open` (default) · `closed` | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. |
+| `TOKENFUSE_WARDRYX_FAILMODE` | `closed` (default under `enforce`) · `open` (default otherwise) | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. Unset under `enforce` it is `closed`, so an outage of the policy plane refuses what the policy would judge; an explicit `open` still works and is said once at startup. |
 | `TOKENFUSE_WARDRYX_KEY` | bearer token (optional) | Sent to the PDP. |
 | `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout on the model path. When set, it is also the MCP broker's timeout on a `tools/call` unless the next variable is set. |
-| `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` | default: `TOKENFUSE_WARDRYX_TIMEOUT_MS` if set, else `1000` | Timeout for the MCP broker's decision on a `tools/call` only. A tool call is not latency-critical the way a model call is, and a PDP behind a proxy (such as the typed-signal proxy, which waits up to 150 ms) needs more than 50 ms; a deny that arrives after the timeout is lost to the failmode, which defaults to open. A value that is not a positive integer is ignored with one warning. |
+| `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` | default: `TOKENFUSE_WARDRYX_TIMEOUT_MS` if set, else `1000` | Timeout for the MCP broker's decision on a `tools/call` only. A tool call is not latency-critical the way a model call is, and a PDP behind a proxy (such as the typed-signal proxy, which waits up to 150 ms) needs more than 50 ms; a deny that arrives after the timeout is lost to the failmode, which is closed under `enforce` unless set to open. A value that is not a positive integer is ignored with one warning. |
 | `TOKENFUSE_WARDRYX_CACHE_TTL_MS` | default `3000` (`0` disables) | Short-TTL decision cache; only decisions the PDP marks `cacheable` are ever cached (a `hold` never is). |
+
+The `attestation_method` the PDP is told comes from the door that authenticated the call, in agent-passport's words: `dpop-key` when the request proved possession of a key (a DPoP-bound delegation, or the MCP broker's proof door), `none` otherwise, a client key and an XAA bearer token included. A caller's `x-fuse-attestation-method` header is ignored, and the gateway says so once per process, so a `deny_if_unattested` policy cannot be satisfied by a string the caller wrote.
 
 **Shadow tool-pruning measurement** (how many input tokens go to schemas of tools the wardryx policy would deny, measured, never enforced):
 
@@ -770,7 +772,9 @@ Notes, because the details matter more than the flag:
 - **Set-but-unusable refuses to start.** A typo, a stray quote or an empty interpolated variable would otherwise be read as "off", leaving the gateway open at exactly the moment you believed you had closed it. It exits with a message instead.
 - **`x-fuse-key`, not `Authorization`.** `Authorization` on an inbound call is *your provider's* credential and is deliberately forwarded upstream; `x-fuse-*` headers never are.
 - **A missing and an unknown credential are refused identically**, and the presented secret is never echoed into the error body. The operator's record does tell them apart: with `TOKENFUSE_EVENTS_PATH` set, each refusal is an `identity_mismatch` event whose `data.reason` is `missing_key` or `unknown_key`, with `data.key_fingerprint` (`sha256:` and 16 hex digits of the presented value, never the value) for an unknown one, filed under the `x-fuse-agent-id` the call claimed (or the reserved `agent://unidentified.invalid/caller` when it names none, which is what a scan looks like); one event per key and claimed agent a minute and at most sixty a minute per gateway, so a key scan is seen without flooding the bus (invariant 105).
-- **Scope, stated plainly:** both model doors, `/v1/messages` and `/v1/chat/completions`, share this check and nothing else. This adds identity; the budget enforced against it is the identity map, next.
+- **An open bind with no keys says so.** Unset on a bind that is not loopback (the shipped image binds `0.0.0.0:4100`), anyone who can reach the port spends through the gateway. The gateway prints a warning at startup naming `TOKENFUSE_CLIENT_KEYS`, and `GET /healthz?detail=1` answers `client_auth`, `bind` and the same warning as JSON. Plain `GET /healthz` still answers `ok`.
+- **The tool-call check needs a key too.** With keys set, `POST /v1/fuse/check-tool-call` refuses a missing or unknown key with the same `401`, and answers a caller only about runs its own key opened: a question about a run another key opened is answered `deny` with nothing of that run in it. Without keys it answers anyone, as every door of a gateway with no keys does.
+- **Scope, stated plainly:** both model doors, `/v1/messages` and `/v1/chat/completions`, and the tool-call check share this check. This adds identity; the budget enforced against it is the identity map, next.
 
 **Admin keys: `/v1/runs`, `/v1/runs/{id}/kill`, `/v1/keys`, `/v1/policy-plane`, `/v1/agent-ids`, `/v1/price-book`** (loopback-safe by default; a wide bind needs a key):
 

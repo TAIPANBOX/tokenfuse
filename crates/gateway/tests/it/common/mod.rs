@@ -9,6 +9,8 @@
 //! allowed here and in no other test file.
 #![allow(dead_code)]
 
+pub mod binary;
+
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::http::HeaderMap;

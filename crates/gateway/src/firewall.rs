@@ -46,7 +46,8 @@ impl FirewallConfig {
     }
 
     /// A sensible starter policy: untrusted input (web/file/unknown) blocks
-    /// exec/write/egress; a context that read secrets can't send data out.
+    /// exec/write/egress and any tool the policy names nowhere; a context that
+    /// read secrets can't send data out.
     pub fn defaults(mode: FirewallMode) -> Self {
         let sources = HashMap::from([
             ("web_search".to_string(), vec!["web".to_string()]),
@@ -97,7 +98,15 @@ impl FirewallConfig {
                     // in (invariant 95). Judged like a web read.
                     MEMORY_LABEL.into(),
                 ],
-                deny: vec!["exec".into(), "write".into(), "network_egress".into()],
+                deny: vec![
+                    "exec".into(),
+                    "write".into(),
+                    "network_egress".into(),
+                    // A tool the policy names nowhere (invariant 115). After
+                    // untrusted input, `http_request` or an MCP tool outside the
+                    // map is not presumed harmless: nobody said what it does.
+                    tokenfuse_core::taint::UNCLASSIFIED_CAPABILITY.into(),
+                ],
             },
             TaintRule {
                 name: "anti-exfiltration".into(),
@@ -660,6 +669,7 @@ mod config_tests {
         let requested = tokenfuse_core::taint::capabilities_for_tools(
             &["wire_transfer".to_string()],
             &c.capabilities,
+            &c.sources,
         );
         let v = tokenfuse_core::taint::evaluate(&labels, &requested, &c.rules)
             .expect("the operator's own rule fires");
@@ -928,6 +938,36 @@ mod memory_and_unclassified_tests {
         assert!(
             !c.sources.contains_key("remember") && !c.sources.contains_key("forget"),
             "neither returns stored content, so neither is mapped to memory"
+        );
+    }
+
+    #[test]
+    fn the_starter_policy_denies_an_unclassified_action_after_untrusted_input() {
+        // Invariant 115, on the built-in policy itself: the starter rule is the
+        // only thing that denies the capability, so a test through the loader
+        // could not see it dropped.
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        let exec = c
+            .rules
+            .iter()
+            .find(|r| r.name == "no-exec-after-untrusted")
+            .expect("the starter rule");
+        assert!(
+            exec.deny
+                .iter()
+                .any(|d| d == tokenfuse_core::taint::UNCLASSIFIED_CAPABILITY),
+            "{:?}",
+            exec.deny
+        );
+        let anti = c
+            .rules
+            .iter()
+            .find(|r| r.name == "anti-exfiltration")
+            .expect("the floor");
+        assert_eq!(
+            anti.deny,
+            vec!["network_egress".to_string()],
+            "a sensitivity label is not an untrusted source; that rule is unchanged"
         );
     }
 
