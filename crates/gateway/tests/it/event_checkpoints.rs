@@ -277,7 +277,12 @@ fn verified(dir: &Path, jwk: &Value) -> Vec<(String, u64)> {
 }
 
 /// key.json beside the stream, so the Go verifiers can be pointed at the run.
-fn keep_key(dir: &Path, k: &Keyryx) {
+fn keep_key(dir: &Path, k: &Keyryx, log: &Mutex<Vec<String>>) {
+    assert!(
+        !k.certified.lock().unwrap().is_empty(),
+        "keyryx was never asked to certify a checkpoint key: {}",
+        log.lock().unwrap().join("\n")
+    );
     let (jwk, nb, na) = k.certified.lock().unwrap()[0].clone();
     std::fs::write(
         dir.join("key.json"),
@@ -319,7 +324,7 @@ async fn the_gateway_signs_checkpoints_of_its_stream_and_closes_them_on_sigterm(
         assert_eq!(r.status().as_u16(), 402);
     }
     assert!(terminate(&mut child).await, "the gateway exits on SIGTERM");
-    keep_key(&dir, &k);
+    keep_key(&dir, &k, &log);
     let all = log.lock().unwrap().join("\n");
     assert!(all.contains("signed agent-event checkpoints ON"), "{all}");
     assert!(all.contains("checkpoint key certified by keyryx"), "{all}");
@@ -381,7 +386,7 @@ async fn the_mcp_broker_signs_its_own_stream_and_closes_it_on_sigterm() {
         assert_eq!(r["result"]["ok"], true, "{r}");
     }
     assert!(terminate(&mut child).await, "the broker exits on SIGTERM");
-    keep_key(&dir, &k);
+    keep_key(&dir, &k, &log);
     let all = log.lock().unwrap().join("\n");
     let jwk = k.certified.lock().unwrap()[0].0.clone();
     assert_eq!(
