@@ -33,11 +33,14 @@
 //! And an XAA resource and an agent audience that differ, because one document
 //! cannot name two resources.
 //!
-//! The scaffold below answers nothing yet: it is the red commit of this
-//! change, and every decision is the test module's to hold.
+//! `startup_refusal` holds the agent audience to the same rule the XAA resource
+//! already meets (`crate::xaadoor`), so the document can always name its
+//! resource. The unit tests below hold each decision.
 
 use serde_json::Value;
 
+use crate::agenttoken::Tokens;
+use crate::chainproof::ChainProof;
 use crate::xaadoor::XaaDoor;
 
 /// The agent-token door as the metadata describes it, read from the
@@ -53,26 +56,112 @@ pub struct AgentDoor {
     pub require: bool,
 }
 
+/// The agent door as the metadata describes it: `None` when the door is off, and
+/// the delegation door's audience and issuer, read from the process that verifies
+/// its tokens, when it is on.
+pub fn agent_door(chain: &ChainProof, tokens: &Tokens) -> Option<AgentDoor> {
+    if tokens.is_none() {
+        return None;
+    }
+    let proving = chain.as_ref()?;
+    Some(AgentDoor {
+        resource: proving.cfg.audience.clone(),
+        issuer: proving.cfg.issuer.clone(),
+        require: crate::agenttoken::required(tokens),
+    })
+}
+
 /// The document to serve at the well-known path, or `None` when neither door
-/// publishes one.
+/// publishes one. With both doors on it is XAA's own body plus the agent fields:
+/// one document for one resource, which `startup_refusal` holds to be the same.
 pub fn document(agent: Option<&AgentDoor>, xaa: Option<&XaaDoor>) -> Option<Value> {
-    let _ = (agent, xaa);
-    None
+    match (agent, xaa) {
+        (None, None) => None,
+        (None, Some(xaa)) => Some(crate::xaadoor::resource_metadata_body(xaa)),
+        (Some(agent), None) => Some(serde_json::json!({
+            "resource": agent.resource,
+            "authorization_servers": [agent.issuer],
+            "bearer_methods_supported": ["header"],
+            "dpop_signing_alg_values_supported": ["ES256"],
+            "dpop_bound_access_tokens_required": agent.require,
+        })),
+        (Some(_), Some(xaa)) => {
+            let mut body = crate::xaadoor::resource_metadata_body(xaa);
+            if let Some(fields) = body.as_object_mut() {
+                // XAA's bearer tokens are unbound and `require` admits them, so the
+                // one document never says bound tokens are required.
+                fields.insert(
+                    "dpop_signing_alg_values_supported".to_string(),
+                    serde_json::json!(["ES256"]),
+                );
+                fields.insert(
+                    "dpop_bound_access_tokens_required".to_string(),
+                    serde_json::json!(false),
+                );
+            }
+            Some(body)
+        }
+    }
+}
+
+/// The document URL for a resource: its origin, the well-known path, then the
+/// resource's own path (RFC 9728 section 3.1). `None` for a resource that is not a
+/// valid https resource, which startup refuses before any URL is formed.
+fn metadata_url(resource: &str) -> Option<String> {
+    let (origin, path) = crate::xaadoor::valid_https_resource(resource)?;
+    let suffix = if path == "/" { String::new() } else { path };
+    Some(format!(
+        "{origin}/.well-known/oauth-protected-resource{suffix}"
+    ))
 }
 
 /// The `WWW-Authenticate` value for a refused or missing agent token: a DPoP
 /// challenge naming the metadata. `token_refused` adds `error="invalid_token"`,
 /// which RFC 6750 section 3.1 reserves for a token that was presented.
 pub fn agent_challenge(agent: &AgentDoor, token_refused: bool) -> String {
-    let _ = (agent, token_refused);
-    String::new()
+    let error = if token_refused {
+        ", error=\"invalid_token\""
+    } else {
+        ""
+    };
+    match metadata_url(&agent.resource) {
+        Some(url) => format!("DPoP algs=\"ES256\"{error}, resource_metadata=\"{url}\""),
+        None => format!("DPoP algs=\"ES256\"{error}"),
+    }
 }
 
-/// The startup refusal for an agent door beside an XAA resource, or `None`
-/// when the two can share one document.
+/// The startup refusal for the agent door's audience, or for an agent door beside
+/// an XAA resource that is not the same URL, or `None` when the document can name
+/// its resource.
 pub fn startup_refusal(agent: Option<&AgentDoor>, xaa_resource: Option<&str>) -> Option<String> {
-    let _ = (agent, xaa_resource);
-    None
+    let agent = agent?;
+    let audience = agent.resource.as_str();
+    if !usable_resource(audience) {
+        return Some(format!(
+            "TOKENFUSE_AGENT_TOKENS is on, but TOKENFUSE_DELEGATION_AUDIENCE ({audience:?}) is \
+             not an absolute https URL with a host, no query or fragment, and printable ASCII \
+             only. That audience is the resource an agent's token is minted for, and the \
+             protected resource metadata publishes it (RFC 9728 section 2), so it must be one."
+        ));
+    }
+    match xaa_resource {
+        Some(xaa) if xaa != audience => Some(format!(
+            "TOKENFUSE_MCP_RESOURCE ({xaa:?}) and TOKENFUSE_DELEGATION_AUDIENCE ({audience:?}) \
+             name two resources, and one protected resource metadata document cannot name both. \
+             Set them to the same URL, or turn XAA off with TOKENFUSE_MCP_ACCEPT_XAA."
+        )),
+        _ => None,
+    }
+}
+
+/// Whether `s` can be published as a protected resource identifier and carried in
+/// a `WWW-Authenticate` challenge: an absolute https URL the metadata can be formed
+/// from, of printable ASCII, with no double quote or backslash to end the quoted
+/// value early.
+fn usable_resource(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+        && crate::xaadoor::valid_https_resource(s).is_some()
 }
 
 #[cfg(test)]

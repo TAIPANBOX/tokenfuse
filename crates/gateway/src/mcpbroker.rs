@@ -313,10 +313,18 @@ pub fn app(state: Arc<BrokerState>) -> Router {
         .route("/", post(handle))
         .route("/mcp", post(handle))
         .route("/healthz", get(|| async { "ok" }));
-    // RFC 9728, only while XAA is on: off, these paths answer axum's own 404
-    // exactly as today, because they are never registered at all.
-    if let Some(xaa) = &state.xaa {
-        let body = crate::xaadoor::resource_metadata_body(xaa);
+    // RFC 9728: one document for whichever of the two doors is on, the agent door
+    // (invariant 123) and XAA (invariant 62). With both off these paths are never
+    // registered, so they answer axum's own 404 exactly as before. Registered once,
+    // so the two doors share a route rather than colliding on it.
+    let agent = crate::resourcemeta::agent_door(&state.chain_proof, &state.agent_tokens);
+    let xaa = state.xaa.as_deref();
+    if let Some(body) = crate::resourcemeta::document(agent.as_ref(), xaa) {
+        let resource = match (&agent, xaa) {
+            (Some(a), _) => Some(a.resource.clone()),
+            (None, Some(x)) => Some(x.resource.clone()),
+            (None, None) => None,
+        };
         router = router.route(
             "/.well-known/oauth-protected-resource",
             get({
@@ -324,7 +332,10 @@ pub fn app(state: Arc<BrokerState>) -> Router {
                 move || async move { Json(body) }
             }),
         );
-        if let Some(suffixed) = crate::xaadoor::resource_metadata_path(&xaa.resource) {
+        if let Some(suffixed) = resource
+            .as_deref()
+            .and_then(crate::xaadoor::resource_metadata_path)
+        {
             router = router.route(&suffixed, get(move || async move { Json(body) }));
         }
     }
@@ -945,6 +956,25 @@ fn unauthorized(st: &BrokerState) -> Response {
     resp
 }
 
+/// The agent door's own refusal at this broker: a presented agent token that did
+/// not verify (`token_refused`), or a call with no credential the door accepts
+/// under `require`. The challenge is the DPoP scheme naming the protected resource
+/// document (RFC 9728 section 5.1), built from the configured resource and never
+/// from a `Host` header. `error="invalid_token"` goes only with a presented token
+/// (RFC 6750 section 3.1). The body is the agent door's own, as at the LLM door.
+fn agent_refusal(st: &BrokerState, token_refused: bool) -> Response {
+    let challenge = match crate::resourcemeta::agent_door(&st.chain_proof, &st.agent_tokens) {
+        Some(door) => crate::resourcemeta::agent_challenge(&door, token_refused),
+        None if token_refused => "DPoP algs=\"ES256\", error=\"invalid_token\"".to_string(),
+        None => "DPoP algs=\"ES256\"".to_string(),
+    };
+    if token_refused {
+        crate::agenttoken::refused_response_with(&challenge)
+    } else {
+        crate::agenttoken::required_response_with(&challenge)
+    }
+}
+
 /// The classic door's delegation-chain refusal (`chainproof::resolve`'s
 /// `Chain::Refused`), which is a chain PROOF failing, never the broker's own
 /// door credential: `unauthorized` above answers those. Until this existed
@@ -1139,7 +1169,7 @@ async fn handle(
     ) {
         crate::agenttoken::Door::Refused(why) => {
             crate::agenttoken::log_refusal("mcp_broker", why);
-            return unauthorized(&st);
+            return agent_refusal(&st, true);
         }
         crate::agenttoken::Door::Admitted(agent) => {
             // The token names the agent; a header naming another is refused
@@ -1314,6 +1344,11 @@ async fn handle(
         // it, but only after this arm has already refused the request.
         crate::mcpdoor::Admission::Open if st.xaa.is_some() => {
             tracing::warn!("mcp broker: refused a call with no credential while XAA is configured");
+            // Under `require` the caller is told what the agent door wants, as a
+            // call with no credential is told with XAA off.
+            if crate::agenttoken::required(&st.agent_tokens) {
+                return agent_refusal(&st, false);
+            }
             return unauthorized(&st);
         }
         crate::mcpdoor::Admission::Proof(client_id) => {
@@ -1331,7 +1366,7 @@ async fn handle(
         tracing::warn!(
             "mcp broker: refused a call with no agent token while TOKENFUSE_AGENT_TOKENS=require"
         );
-        return unauthorized(&st);
+        return agent_refusal(&st, false);
     }
     let identity_source =
         crate::agenttoken::identity_source(false, !principal.is_empty()).to_string();

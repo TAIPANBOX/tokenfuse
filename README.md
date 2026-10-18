@@ -518,6 +518,8 @@ cannot fail reports zero forever. The endpoint carries no prompt content. It sit
 
 **An agent's own token.** With `TOKENFUSE_AGENT_TOKENS=accept`, an agent can present the five-minute token [vouchryx](https://github.com/TAIPANBOX/vouchryx) mints it (`Authorization: DPoP`, with a proof of possession that names the token) instead of a static `x-fuse-key`, at both doors, the MCP broker and the tool-call check. The agent, its unit and its run's owner then come from the token, never from `x-fuse-agent-id`, and the policy plane is told the agent was proven. Static keys keep working beside it; `require` refuses them. It needs the delegation door's issuer, key set, origin and audience and a revocation list that fails closed, or the process refuses to start. [docs/25](docs/25-the-delegation-door.md) section 7 has the rules; CLAUDE.md invariants 123 and 124 hold them.
 
+**The protected resource document.** With the agent-token door on, the broker publishes RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource`, and at the path-suffixed twin of its resource's own path, as the MCP authorization specification requires. A refused agent token is answered with a DPoP challenge that names that document. Two configurations refuse to start: an agent audience that is not an absolute https URL, and XAA naming a resource other than the audience. CLAUDE.md invariant 125 holds the rules.
+
 ---
 
 ## 🔍 Scan your MCP servers & gate CI
