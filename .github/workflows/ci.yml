@@ -165,7 +165,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install pytest==9.1.1 httpx==0.28.1 cryptography==46.0.7
+        run: |
+          pip install pytest==9.1.1
+          pip install httpx==0.28.1 cryptography==46.0.7
       - name: Test
         working-directory: sdk/python
         run: python -m pytest -q
