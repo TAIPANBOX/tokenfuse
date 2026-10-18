@@ -87,6 +87,24 @@
           "TOKENFUSE_CACHE_EMBEDDER": {
             "required": false
           },
+          "TOKENFUSE_CHECKPOINTS_DIR": {
+            "required": false
+          },
+          "TOKENFUSE_CHECKPOINT_KEYRYX_CONSUMER": {
+            "required": false
+          },
+          "TOKENFUSE_CHECKPOINT_KEYRYX_CREDENTIAL_FILE": {
+            "required": false
+          },
+          "TOKENFUSE_CHECKPOINT_KEYRYX_URL": {
+            "required": false
+          },
+          "TOKENFUSE_CHECKPOINT_KEY_LIFETIME_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_CHECKPOINT_KEY_NAME": {
+            "required": false
+          },
           "TOKENFUSE_CLIENT_KEYS": {
             "required": false
           },

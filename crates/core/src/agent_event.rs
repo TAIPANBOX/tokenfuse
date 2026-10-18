@@ -1238,7 +1238,7 @@ pub fn chain_hash(event: &AgentEvent) -> Option<String> {
 /// [`chain_hash`] over an already-parsed JSON value (used to resume a chain
 /// from a file tail, where the previous event exists only as a line of
 /// JSON). Removes any `prev_hash` member before canonicalizing.
-fn chain_hash_value(mut value: serde_json::Value) -> String {
+pub(crate) fn chain_hash_value(mut value: serde_json::Value) -> String {
     if let Some(map) = value.as_object_mut() {
         map.remove("prev_hash");
     }
@@ -1293,6 +1293,11 @@ struct ChainSink {
     next: Option<String>,
     /// What the chain resumed from at open (`None` = started fresh).
     resumed_from: Option<String>,
+    /// The path the stream was opened at, which names its checkpoint sidecar.
+    path: std::path::PathBuf,
+    /// The SPEC 6.5.1 checkpoint sidecar, when one is attached (invariant
+    /// 128). `None` is the exporter exactly as it was before checkpoints.
+    checkpoints: Option<crate::checkpoint::Checkpointer>,
 }
 
 /// The outcome of one [`Exporter::emit`] call, for the caller to log (this
@@ -1428,6 +1433,8 @@ impl Exporter {
                 file,
                 next: resumed.clone(),
                 resumed_from: resumed,
+                path: std::path::PathBuf::from(path),
+                checkpoints: None,
             })),
             skipped: std::sync::atomic::AtomicU64::new(0),
             write_errors: std::sync::atomic::AtomicU64::new(0),
@@ -1543,12 +1550,27 @@ impl Exporter {
             };
         };
         line.push('\n');
+        let sink = &mut *sink;
+        // With a checkpoint sidecar attached, a stream that ends in a fragment
+        // (a torn append) gets an LF first, so this line is not glued onto it
+        // and the bytes every record covers are lines. Without one the stream
+        // is written exactly as it always was.
+        if let Some(ck) = &sink.checkpoints {
+            if ck.needs_newline(&sink.file) {
+                line.insert(0, '\n');
+            }
+        }
         use std::io::Write;
         match sink.file.write_all(line.as_bytes()) {
             Ok(()) => {
                 // chain_hash is prev-hash-independent, so this is the same
                 // value a verifier recomputes from the line on disk.
                 sink.next = chain_hash(&event);
+                if let Some(ck) = sink.checkpoints.as_mut() {
+                    // Under the sink lock, after the line is on disk. Never
+                    // fails the event: an error is counted in the stats.
+                    ck.after_append(&sink.file, line.as_bytes(), sink.next.as_deref());
+                }
                 if nonconforming {
                     // Counted only once the line is actually on the bus. A write
                     // that failed is reported as a WriteError, which is louder,
@@ -1574,6 +1596,71 @@ impl Exporter {
                 }
             }
         }
+    }
+
+    /// Attach the SPEC 6.5.1 checkpoint sidecar to this stream (invariant
+    /// 128), under the sink lock: the stream is hashed once from byte zero,
+    /// the sidecar's chain is continued from its last record, and a `resume`
+    /// record is written when the next line will start a fresh chain after
+    /// lines already in the file. From then on every [`Self::emit`] keeps the
+    /// running prefix, and a record is written every
+    /// [`crate::checkpoint::EVERY_LINES`] lines or after
+    /// [`crate::checkpoint::INTERVAL_MILLIS`] (see [`Self::checkpoint_tick`]).
+    ///
+    /// An `Err` names why the sidecar could not be attached; the exporter goes
+    /// on exactly as before. A disabled exporter has no stream to checkpoint.
+    pub fn attach_checkpoints(
+        &self,
+        cfg: crate::checkpoint::CheckpointConfig,
+    ) -> Result<crate::checkpoint::Opened, String> {
+        let Some(sink) = &self.sink else {
+            return Err(
+                "the agent-event export is off, so there is no stream to checkpoint".into(),
+            );
+        };
+        let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+        if sink.checkpoints.is_some() {
+            return Err("a checkpoint sidecar is already attached to this stream".into());
+        }
+        let fresh_chain = sink.next.is_none();
+        let (ck, opened) =
+            crate::checkpoint::Checkpointer::open(cfg, &sink.path, &sink.file, fresh_chain)?;
+        sink.checkpoints = Some(ck);
+        Ok(opened)
+    }
+
+    /// Write a `checkpoint` record if lines are waiting and the interval has
+    /// passed. A process calls this about once a second, so a stream that
+    /// stops writing still gets its record. A no-op with no sidecar attached.
+    pub fn checkpoint_tick(&self) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ck) = sink.checkpoints.as_mut() {
+            ck.tick();
+        }
+    }
+
+    /// Write the `close` record, on a clean close. `Ok(None)` when no sidecar
+    /// is attached or the stream holds no event to name.
+    pub fn close_checkpoints(&self) -> Result<Option<u64>, String> {
+        let Some(sink) = &self.sink else {
+            return Ok(None);
+        };
+        let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+        let sink = &mut *sink;
+        match sink.checkpoints.as_mut() {
+            Some(ck) => ck.close(&sink.file),
+            None => Ok(None),
+        }
+    }
+
+    /// The sidecar's counters, or `None` when no sidecar is attached.
+    pub fn checkpoint_stats(&self) -> Option<crate::checkpoint::CheckpointStats> {
+        let sink = self.sink.as_ref()?;
+        let sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+        sink.checkpoints.as_ref().map(|c| c.stats())
     }
 
     pub fn skipped_count(&self) -> u64 {

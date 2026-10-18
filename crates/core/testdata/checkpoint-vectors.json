@@ -1,0 +1,82 @@
+{
+  "description": "Public test vectors for SPEC 6.5.1 (checkpoint sidecar, format v1). Verify them; do not reuse the key. The private key was generated for these vectors, is not published, and was discarded.",
+  "key": {
+    "crv": "P-256",
+    "kty": "EC",
+    "x": "Yqex81UAJpGgFHYp_z-363qqCjstxnuNwXqmspqvPyY",
+    "y": "J5LaRFEtlNSrorBS48E1WjkkBLxOHHsaLvoDnCIZ-IA",
+    "kid": "FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE"
+  },
+  "stream": {
+    "name": "wardryx.ndjson",
+    "lines": [
+      "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:00.000Z\",\"type\":\"policy_allow\"}",
+      "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:c7218ef9daae89503aa8bd0ac7e4508089225d4c77605bb16fccd3816826752c\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:02.000Z\",\"type\":\"policy_allow\"}",
+      "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:90a9c16cfc2efed1c225aa052b589ef32104fbd9e51e3e3a123e568cc1b47c90\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:04.000Z\",\"type\":\"approval_granted\"}"
+    ]
+  },
+  "checkpoints": [
+    {
+      "signing_input": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:10.000Z\",\"count\":2,\"head\":\"sha256:90a9c16cfc2efed1c225aa052b589ef32104fbd9e51e3e3a123e568cc1b47c90\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"checkpoint\",\"prefix\":\"sha256:fd1a5891303a6b8fe8ed0a05d76392fe1e87ee0d3bb6f2083b264d923ee43dbe\",\"prev\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"stream\":\"wardryx.ndjson\",\"v\":1}",
+      "record": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:10.000Z\",\"count\":2,\"head\":\"sha256:90a9c16cfc2efed1c225aa052b589ef32104fbd9e51e3e3a123e568cc1b47c90\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"checkpoint\",\"prefix\":\"sha256:fd1a5891303a6b8fe8ed0a05d76392fe1e87ee0d3bb6f2083b264d923ee43dbe\",\"prev\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"sig\":\"3MZreN0553P2J65w7QpmB82jMlMMx-m54y8EOda09DZqafwsxVfe5bpxx5cAIEzg24PgEjWOFIAZLwIVDnZCcg\",\"stream\":\"wardryx.ndjson\",\"v\":1}"
+    },
+    {
+      "signing_input": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:20.000Z\",\"count\":3,\"head\":\"sha256:c54b5972bc6255eede8af666f7f4f71b6541bbc3655520557a168be9d381044f\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"resume\",\"prefix\":\"sha256:9ae9df9e422652b01d5377e81626c35f7e28f1d5583886c5a80a67513e50b9f4\",\"prev\":\"sha256:3e3afa3a0d43c60ca43a4c648d965d07cbc2c5015e1ef69c7caafc43316a455c\",\"stream\":\"wardryx.ndjson\",\"v\":1}",
+      "record": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:20.000Z\",\"count\":3,\"head\":\"sha256:c54b5972bc6255eede8af666f7f4f71b6541bbc3655520557a168be9d381044f\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"resume\",\"prefix\":\"sha256:9ae9df9e422652b01d5377e81626c35f7e28f1d5583886c5a80a67513e50b9f4\",\"prev\":\"sha256:3e3afa3a0d43c60ca43a4c648d965d07cbc2c5015e1ef69c7caafc43316a455c\",\"sig\":\"qTW9hXRxsoj2lZe-GiJaaYJuj6HXf0W6sd5Ju2yXI-UJhMWlF7qLLu38ko1eh_Y3DiUSKvLpwiVNTyeKUm2PjA\",\"stream\":\"wardryx.ndjson\",\"v\":1}"
+    },
+    {
+      "signing_input": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:30.000Z\",\"count\":3,\"head\":\"sha256:c54b5972bc6255eede8af666f7f4f71b6541bbc3655520557a168be9d381044f\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"close\",\"prefix\":\"sha256:9ae9df9e422652b01d5377e81626c35f7e28f1d5583886c5a80a67513e50b9f4\",\"prev\":\"sha256:df354abc4c9969e09aa7f323a4b14995d2f6da11e46b37feca2d380a62ac9982\",\"stream\":\"wardryx.ndjson\",\"v\":1}",
+      "record": "{\"alg\":\"ES256\",\"at\":\"2026-10-18T09:00:30.000Z\",\"count\":3,\"head\":\"sha256:c54b5972bc6255eede8af666f7f4f71b6541bbc3655520557a168be9d381044f\",\"kid\":\"FXG0i91Nag8j0ITnQFhO8mLmW8ijBkZvamjNsS9g1dE\",\"kind\":\"close\",\"prefix\":\"sha256:9ae9df9e422652b01d5377e81626c35f7e28f1d5583886c5a80a67513e50b9f4\",\"prev\":\"sha256:df354abc4c9969e09aa7f323a4b14995d2f6da11e46b37feca2d380a62ac9982\",\"sig\":\"0rAWyQtYpBtcsOEvMfBczYfqGc4TDR_qje8H09wkvn53Tv_OVIfhKzjvUgfsYdhPTx7snvcrAYSVto-q85WPFA\",\"stream\":\"wardryx.ndjson\",\"v\":1}"
+    },
+    {
+      "record": "{\"at\":\"2026-10-18T09:00:40.000Z\",\"count\":3,\"head\":\"sha256:c54b5972bc6255eede8af666f7f4f71b6541bbc3655520557a168be9d381044f\",\"kind\":\"checkpoint\",\"prefix\":\"sha256:9ae9df9e422652b01d5377e81626c35f7e28f1d5583886c5a80a67513e50b9f4\",\"prev\":\"sha256:188f2883104b0c7b8f0553fd97ec0d2e263f4ad0eb4bfc908b50e89e2b6be2cc\",\"stream\":\"wardryx.ndjson\",\"unsigned_reason\":\"key_expired\",\"v\":1}"
+    }
+  ],
+  "negative_variants": {
+    "forged_prefix": {
+      "description": "Line 1 rewritten (policy_version 3 to 4) and line 2 re-linked to it. The chain verifies; every record names line 1, so every record is refused.",
+      "lines": [
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":4},\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:00.000Z\",\"type\":\"policy_allow\"}",
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:dc1a77e3648643e03cda9a9192f3e0ff7721486d87a286192420acab4c70f40e\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:02.000Z\",\"type\":\"policy_allow\"}",
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:90a9c16cfc2efed1c225aa052b589ef32104fbd9e51e3e3a123e568cc1b47c90\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:04.000Z\",\"type\":\"approval_granted\"}"
+      ],
+      "refused": {
+        "0": "prefix does not match",
+        "1": "prefix does not match",
+        "2": "prefix does not match",
+        "3": "prefix does not match"
+      },
+      "accepted": []
+    },
+    "prefix_only": {
+      "description": "Line 1 changed only by a space after its first colon. The JCS form and so every chain hash are unchanged; only the bytes differ, so only the prefix refuses.",
+      "lines": [
+        "{\"agent_id\": \"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:00.000Z\",\"type\":\"policy_allow\"}",
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:c7218ef9daae89503aa8bd0ac7e4508089225d4c77605bb16fccd3816826752c\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:02.000Z\",\"type\":\"policy_allow\"}",
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:90a9c16cfc2efed1c225aa052b589ef32104fbd9e51e3e3a123e568cc1b47c90\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:04.000Z\",\"type\":\"approval_granted\"}"
+      ],
+      "refused": {
+        "0": "prefix does not match",
+        "1": "prefix does not match",
+        "2": "prefix does not match",
+        "3": "prefix does not match"
+      },
+      "accepted": []
+    },
+    "truncated": {
+      "description": "The third line removed. Record 0 counts two lines and still verifies; the three records that count three refer to bytes the stream no longer holds.",
+      "lines": [
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:00.000Z\",\"type\":\"policy_allow\"}",
+        "{\"agent_id\":\"agent://acme-bank.example/support/tier1-bot\",\"data\":{\"policy_id\":\"pol-refunds\",\"policy_version\":3},\"prev_hash\":\"sha256:c7218ef9daae89503aa8bd0ac7e4508089225d4c77605bb16fccd3816826752c\",\"schema\":\"taipanbox.dev/agent-event/v1.0\",\"severity\":\"info\",\"source\":\"wardryx\",\"ts\":\"2026-10-18T09:00:02.000Z\",\"type\":\"policy_allow\"}"
+      ],
+      "refused": {
+        "1": "shorter than",
+        "2": "shorter than",
+        "3": "shorter than"
+      },
+      "accepted": [
+        0
+      ]
+    }
+  }
+}

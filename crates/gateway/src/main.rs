@@ -555,6 +555,9 @@ async fn mcp_broker() {
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
     let events = Arc::new(tokenfuse_gateway::events::from_env());
+    // Signed checkpoints of this process's own stream (SPEC 6.5.1, invariant
+    // 128): the broker writes a stream of its own, so it signs its own.
+    let checkpoints = tokenfuse_gateway::checkpoints::from_env(&events).await;
     // The delegation issuer, or nothing, in which case every chain the PDP is
     // asked about stays a claim and says so.
     let broker_client = reqwest::Client::new();
@@ -653,6 +656,9 @@ async fn mcp_broker() {
         if let Err(e) = run_stdio(state).await {
             eprintln!("stdio error: {e}");
         }
+        if let Some(c) = &checkpoints {
+            c.close();
+        }
         return;
     }
     // Bind to loopback by DEFAULT. Until 2026-08-05 the default bind was the
@@ -690,9 +696,21 @@ async fn mcp_broker() {
         .await
         .expect("failed to bind");
     tracing::info!(%addr, %upstream, "mcp credential-broker listening");
-    axum::serve(listener, app(state))
-        .await
-        .expect("server error");
+    match checkpoints {
+        // A clean close is what a close record says, so with checkpoints on the
+        // broker stops on SIGTERM or SIGINT the way `serve` does and writes it.
+        // Off, the broker stops exactly as it always has.
+        Some(c) => {
+            axum::serve(listener, app(state))
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .expect("server error");
+            c.close();
+        }
+        None => axum::serve(listener, app(state))
+            .await
+            .expect("server error"),
+    }
 }
 
 /// Reads the provider key the operator holds for the upstream (invariant 122), or refuses to
@@ -1446,7 +1464,11 @@ async fn serve() {
     // Agent-event NDJSON export (agent-passport SPEC.md §6): TOKENFUSE_EVENTS_PATH,
     // read once here at startup — absent/empty keeps the exporter disabled
     // (zero per-request cost, see `tokenfuse_core::agent_event::Exporter`).
-    state = state.with_events(Arc::new(tokenfuse_gateway::events::from_env()));
+    let events = Arc::new(tokenfuse_gateway::events::from_env());
+    // Signed checkpoints of the stream (SPEC 6.5.1, invariant 128): off unless
+    // TOKENFUSE_CHECKPOINTS_DIR is set; set and unusable, this refuses to start.
+    let checkpoints = tokenfuse_gateway::checkpoints::from_env(&events).await;
+    state = state.with_events(Arc::clone(&events));
 
     // HA: replace the in-process ledger with a raft-replicated one shared across
     // gateways (built with --features cluster; configured via TOKENFUSE_CLUSTER_*).
@@ -1590,6 +1612,10 @@ async fn serve() {
         cloud
             .flush_before_exit(tokenfuse_gateway::cloudsink::EXIT_FLUSH_WITHIN)
             .await;
+    }
+    // Invariant 128: the close record, after the last call was answered.
+    if let Some(c) = &checkpoints {
+        c.close();
     }
 }
 

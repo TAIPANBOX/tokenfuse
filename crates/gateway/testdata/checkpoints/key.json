@@ -1,0 +1,14 @@
+{
+  "description": "The public key of the fixture's checkpoint records, certified (in the fixture's own terms) from 2026-10-18T09:00:00Z for 600 seconds. Its private scalar is 32 bytes of 0x42, a test value: never use it.",
+  "jwk": {
+    "alg": "ES256",
+    "crv": "P-256",
+    "kid": "Dwhk3O9GXmaAbt1mdgUKbjwl127gQtvRuBzEJcPhLDo",
+    "kty": "EC",
+    "use": "sig",
+    "x": "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
+    "y": "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0"
+  },
+  "not_after": 1792314600,
+  "not_before": 1792314000
+}
