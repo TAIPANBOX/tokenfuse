@@ -1360,7 +1360,7 @@ for p in paths:
 # mutant is a way a key scan goes quiet again, floods the bus, or leaks the key.
 run_case "refused-key: the refusal never reported" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "        report_refused_key(&st, &headers);", "        if false { report_refused_key(&st, &headers); }")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                report_refused_key(st, headers);", "                if false { report_refused_key(st, headers); }")')" \
 	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
 
 run_case "refused-key: the per-source limit removed" fail \
@@ -1503,7 +1503,7 @@ run_case "unclassified: an unmapped tool requests nothing again" fail \
 
 run_case "attestation: the LLM path reads the caller's header again" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact wardryx::a_client_attestation_header_never_reaches_the_pdp" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "let attestation_method = Some(crate::attestation::from_door(chain_proven).to_string());", "let attestation_method = header_str(&headers, \"x-fuse-attestation-method\").or(Some(crate::attestation::from_door(chain_proven).to_string()));")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::attestation::from_door(chain_proven || caller.proved_possession()).to_string(),", "header_str(&headers, \"x-fuse-attestation-method\").unwrap_or_else(|| crate::attestation::from_door(chain_proven || caller.proved_possession()).to_string()),")')" \
 	"a_client_attestation_header_never_reaches_the_pdp ... FAILED"
 
 run_case "attestation: the broker's proof door is not counted" fail \
@@ -1518,7 +1518,7 @@ run_case "failmode: an enforcing hook nobody configured fails open again" fail \
 
 run_case "tool-check: the key is not asked for" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact toolcheck::tests::with_client_keys_a_check_without_a_key_is_refused" \
-	"$(py 'edit("crates/gateway/src/toolcheck.rs", "crate::proxy::resolve_client_key(&st, &headers) else {", "crate::proxy::resolve_client_key(&st, &headers).or(Some(String::new())) else {")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers) {", "crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers).or(Some(String::new())) {")')" \
 	"with_client_keys_a_check_without_a_key_is_refused ... FAILED"
 
 run_case "tool-check: another key's run is described" fail \
@@ -1544,7 +1544,7 @@ run_case "open-bind: the warning is never printed" fail \
 # foreign parent adopted, the journal not replayed, the held parent unchecked.
 run_case "run-owner-first: the run's tool blocks recorded before the claim" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    st.taint.note_blocks(&run_id, &[]);\n    let principal = crate::runowners::key_principal(&key_id);\n")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = caller.principal.clone();\n", "    st.taint.note_blocks(&run_id, &[]);\n    let principal = caller.principal.clone();\n")')" \
 	"TOUCHES THE RUN BEFORE ITS OWNER"
 
 run_case "run-owner-first: the metered door never claims" fail \
@@ -1559,12 +1559,12 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 
 run_case "run-owner-first: the check reads the taint before the owner" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = crate::runowners::key_principal(caller);\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = crate::runowners::key_principal(caller);\n")')" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = caller.principal.as_str();\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = caller.principal.as_str();\n")')" \
 	"TOUCHES THE RUN BEFORE ITS OWNER"
 
 run_case "run-owner-first: a comment naming open_run above the claim passes" pass \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    // st.ledger.open_run(..) and st.taint.note_blocks(..) come after the claim\n    let principal = crate::runowners::key_principal(&key_id);\n")')"
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = caller.principal.clone();\n", "    // st.ledger.open_run(..) and st.taint.note_blocks(..) come after the claim\n    let principal = caller.principal.clone();\n")')"
 
 run_case "run-owner-first: handle_call renamed, so it measured nothing" fail \
 	"./scripts/run-owner-is-checked-first.sh" \

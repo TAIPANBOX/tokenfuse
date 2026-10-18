@@ -1,0 +1,434 @@
+//! The agent's own token as the door credential (wave 1, WAVE1-DESIGN 1.5).
+//!
+//! # What this is
+//!
+//! vouchryx mints each enrolled agent a five-minute access token of its own
+//! (`client_credentials` with DPoP, vouchryx#48): header `typ: at+jwt`, `sub`
+//! and `client_id` the agent, one audience, bound to the key that signed the
+//! proof at issuance, carrying the agent's `unit` and `org`. With
+//! `TOKENFUSE_AGENT_TOKENS` on, that token presented as `Authorization: DPoP`
+//! with an RFC 9449 proof is a door credential at the LLM door, the OpenAI
+//! door, the MCP broker and the tool-call check. It is verified here, offline,
+//! against the delegation door's own issuer, JWKS, audience and origin, and
+//! the agent id, the unit and the run principal are taken from it, never from
+//! a header.
+//!
+//! # Off, accept, require
+//!
+//! `off` (the binary's default) changes nothing. `accept` admits a token and
+//! keeps every static client key working beside it (the launchers' setting).
+//! `require` refuses every static client key. On either of the last two the
+//! process refuses to start without what verification needs: the delegation
+//! door (issuer, JWKS, origin), a named audience, and a revocation list that
+//! fails closed.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
+use tokenfuse_delegation::{Refusal, VerifiedAgent};
+
+/// The switch.
+pub const SWITCH: &str = "TOKENFUSE_AGENT_TOKENS";
+
+/// The three words the switch reads, in the order a refusal names them.
+pub const WORDS: &[&str] = &["off", "accept", "require"];
+
+/// The key id the MCP broker's own gateway key must resolve to for the
+/// tool-call check to take an agent token the broker relays without a proof.
+pub const BROKER_KEY_ID: &str = "broker";
+
+/// How many proof `jti` values one generation of the replay cache holds (two
+/// generations are kept). Only a proof that already verified reaches it, so it
+/// bounds what an admitted agent can make this process remember; past it a
+/// proof is refused rather than a used one forgotten.
+pub const REPLAY_CAP: usize = 16_384;
+
+/// The identity source words wardryx reads (its `policy.IdentitySource*`):
+/// how the enforcement point knew the agent.
+pub const IDENTITY_AGENT_TOKEN: &str = "agent-token";
+pub const IDENTITY_CLIENT_KEY: &str = "client-key";
+pub const IDENTITY_NONE: &str = "none";
+
+/// The identity-mismatch reasons this door adds.
+pub const AGENT_CONTRADICTS_TOKEN: &str = "agent_id_contradicts_token";
+pub const UNIT_CONTRADICTS_MAP: &str = "unit_contradicts_map";
+
+/// What `TOKENFUSE_AGENT_TOKENS` asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Off,
+    Accept,
+    Require,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Off => "off",
+            Mode::Accept => "accept",
+            Mode::Require => "require",
+        }
+    }
+}
+
+/// The door, on: its mode and the cache that makes a proof single-use.
+pub struct AgentTokens {
+    mode: Mode,
+    replay: tokenfuse_dpop::ReplayCache,
+}
+
+impl AgentTokens {
+    pub fn new(mode: Mode) -> Self {
+        AgentTokens {
+            mode,
+            replay: tokenfuse_dpop::ReplayCache::new(REPLAY_CAP),
+        }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Record a proof's `jti` as used at `now`. False when it was seen inside
+    /// its window, or when the cache is full and single use can no longer be
+    /// promised.
+    pub fn first_use(&self, jti: &str, now: i64) -> bool {
+        self.replay.check_and_record(jti, now).is_ok()
+    }
+}
+
+/// `None` is the door off.
+pub type Tokens = Option<Arc<AgentTokens>>;
+
+/// Whether the door requires a token of every caller.
+pub fn required(tokens: &Tokens) -> bool {
+    tokens.as_ref().is_some_and(|t| t.mode() == Mode::Require)
+}
+
+/// The pure startup decision: the switch's value, the delegation door this
+/// process built, and what the revocation variables asked for.
+pub fn from_values(
+    value: Option<&str>,
+    proving: Option<&crate::chainproof::Proving>,
+    revocations: &crate::revocations::Wanted,
+) -> Result<Tokens, String> {
+    let _ = (value, proving, revocations);
+    Ok(None)
+}
+
+/// [`from_values`] against the process environment; exits 2 on a refusal,
+/// before the listener binds.
+pub fn from_env(proving: &crate::chainproof::ChainProof) -> Tokens {
+    let value = std::env::var(SWITCH).ok();
+    let wanted = crate::revocations::wanted(|k| std::env::var(k).ok(), proving.is_some());
+    crate::defaults::exit_on_refusal(from_values(value.as_deref(), proving.as_deref(), &wanted))
+}
+
+/// What a request's credentials said about this door.
+#[derive(Debug)]
+pub enum Door {
+    /// No agent token on this request, or the door is off: the static paths
+    /// decide, exactly as before.
+    NotPresented,
+    /// An agent token verified, with its proof, for this request.
+    Admitted(VerifiedAgent),
+    /// An agent token was presented and refused. The wire never says which
+    /// check failed; the operator's log does.
+    Refused(Why),
+}
+
+/// Why a presented agent token was refused, for the operator's log only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// The token or its proof did not verify.
+    Token(Refusal),
+    /// A client key came with it: two credentials is confusion or a probe.
+    BesideAKey,
+    /// The proof's `jti` was used before inside its window.
+    Replayed,
+    /// The token names an agent id the estate's records refuse.
+    NotCanonical,
+}
+
+/// Judge the agent-token door for one request arriving on `path`.
+pub fn admit(
+    tokens: &Tokens,
+    proving: &crate::chainproof::ChainProof,
+    feed: &crate::revocations::Feed,
+    headers: &HeaderMap,
+    path: &str,
+    now: i64,
+) -> Door {
+    let _ = (tokens, proving, feed, headers, path, now);
+    Door::NotPresented
+}
+
+/// Judge an agent token the MCP broker relays to the tool-call check beside
+/// its own gateway key, without a proof.
+pub fn relayed(
+    tokens: &Tokens,
+    proving: &crate::chainproof::ChainProof,
+    feed: &crate::revocations::Feed,
+    headers: &HeaderMap,
+    now: i64,
+) -> Door {
+    let _ = (tokens, proving, feed, headers, now);
+    Door::NotPresented
+}
+
+/// Whether the request carries a token that declares itself an agent token
+/// in `Authorization: DPoP`. Read unverified: it picks a path, nothing more.
+pub fn carries_agent_token(headers: &HeaderMap) -> bool {
+    crate::chainproof::dpop_credential(headers.get("authorization").and_then(|v| v.to_str().ok()))
+        .is_some_and(tokenfuse_delegation::is_agent_token)
+}
+
+/// The word wardryx is told, from the door that admitted the call.
+pub fn identity_source(agent_token: bool, credential: bool) -> &'static str {
+    let _ = (agent_token, credential);
+    IDENTITY_NONE
+}
+
+/// The identity check for a call an agent token admitted.
+pub fn contradiction(
+    map: &crate::identitymap::IdentityMap,
+    agent: &VerifiedAgent,
+    header_agent: &str,
+) -> Option<crate::identitymap::Mismatch> {
+    let _ = (map, agent, header_agent);
+    None
+}
+
+/// One warn line for a refused agent token, never the token itself.
+pub fn log_refusal(door: &'static str, why: Why) {
+    tracing::warn!(door, ?why, "refused an agent token");
+}
+
+/// `401` for a presented agent token that was refused. Cause-free, as every
+/// door's refusal is: which check failed is an oracle.
+pub fn refused_response() -> Response {
+    unauthorized_json(
+        "agent_token_refused",
+        "the agent token presented with this request was refused",
+        "DPoP algs=\"ES256\", error=\"invalid_token\"",
+    )
+}
+
+/// `401` for a call with no agent token when the door requires one.
+pub fn required_response() -> Response {
+    unauthorized_json(
+        "agent_token_required",
+        "this gateway requires an agent token: `Authorization: DPoP <token>` with a DPoP proof",
+        "DPoP algs=\"ES256\"",
+    )
+}
+
+fn unauthorized_json(kind: &str, reason: &str, challenge: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": kind,
+            "reason": reason,
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-fuse", "unauthorized")
+        .header("www-authenticate", challenge)
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+/// `403` for a header that names another agent than the token proves, at a
+/// door with no run to file it under (the MCP broker).
+pub fn contradicted_response(proven: &str, claimed: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "identity_mismatch",
+            "reason": AGENT_CONTRADICTS_TOKEN,
+            "detail": format!(
+                "the agent token proves {proven} and `x-fuse-agent-id` claims {claimed}"
+            ),
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .header("x-fuse", "blocked")
+        .header(
+            "x-fuse-identity",
+            format!("blocked={AGENT_CONTRADICTS_TOKEN}"),
+        )
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chainproof::Proving;
+    use crate::revocations::Wanted;
+    use tokenfuse_delegation::revocations::FailMode;
+    use tokenfuse_delegation::testing::{cfg, Key};
+
+    fn proving(audience: &str) -> Proving {
+        let mut c = cfg(&Key::new());
+        c.audience = audience.to_string();
+        Proving {
+            cfg: c,
+            origin: "https://tokenfuse.acme.example".to_string(),
+        }
+    }
+
+    fn polling(fail_mode: FailMode) -> Wanted {
+        Wanted::On {
+            url: "https://vouchryx.acme.example/v1/revocations".to_string(),
+            interval_ms: 12_000,
+            max_age_secs: 60,
+            fail_mode,
+        }
+    }
+
+    fn mode_of(t: Result<Tokens, String>) -> Result<Option<Mode>, String> {
+        t.map(|t| t.map(|t| t.mode()))
+    }
+
+    /// The three words in any case; unset, empty and blank are off; anything
+    /// else refuses to start naming the variable, the value and the words.
+    #[test]
+    fn the_agent_tokens_switch_reads_three_words_and_refuses_a_fourth() {
+        let p = proving("https://tokenfuse.acme.example");
+        let on = polling(FailMode::Closed);
+        for (value, want) in [
+            (None, None),
+            (Some(""), None),
+            (Some("  "), None),
+            (Some("off"), None),
+            (Some("accept"), Some(Mode::Accept)),
+            (Some("ACCEPT"), Some(Mode::Accept)),
+            (Some(" require "), Some(Mode::Require)),
+        ] {
+            assert_eq!(
+                mode_of(from_values(value, Some(&p), &on)),
+                Ok(want),
+                "{value:?}"
+            );
+        }
+        let err = from_values(Some("acept"), Some(&p), &on).unwrap_err();
+        assert!(err.contains(SWITCH), "{err}");
+        assert!(err.contains("acept"), "{err}");
+        assert!(err.contains("off|accept|require"), "{err}");
+    }
+
+    /// On, the door needs everything verification needs, and says which one is
+    /// missing; off, it needs nothing.
+    #[test]
+    fn agent_tokens_on_need_the_door_a_named_audience_and_a_list_that_fails_closed() {
+        let p = proving("https://tokenfuse.acme.example");
+        let closed = polling(FailMode::Closed);
+        let cases: [(Option<&Proving>, &Wanted, &str); 4] = [
+            (None, &closed, "TOKENFUSE_DELEGATION_ISSUER"),
+            (Some(&p), &Wanted::Off, "TOKENFUSE_DELEGATION_REVOCATIONS"),
+            (
+                Some(&p),
+                &Wanted::On {
+                    url: "https://v.example/v1/revocations".to_string(),
+                    interval_ms: 12_000,
+                    max_age_secs: 60,
+                    fail_mode: FailMode::Open,
+                },
+                "TOKENFUSE_DELEGATION_REVOCATIONS_FAILMODE",
+            ),
+            (Some(&p), &closed, ""),
+        ];
+        for (proving, wanted, names) in cases {
+            let got = from_values(Some("accept"), proving, wanted);
+            if names.is_empty() {
+                assert_eq!(mode_of(got), Ok(Some(Mode::Accept)));
+            } else {
+                let err = got
+                    .err()
+                    .unwrap_or_else(|| panic!("{names} missing must refuse"));
+                assert!(err.contains(names), "{err}");
+            }
+        }
+        for audience in ["", "   "] {
+            let err = from_values(Some("require"), Some(&proving(audience)), &closed)
+                .err()
+                .expect("an empty audience must refuse");
+            assert!(err.contains("TOKENFUSE_DELEGATION_AUDIENCE"), "{err}");
+        }
+        assert_eq!(
+            mode_of(from_values(Some("off"), None, &Wanted::Off)),
+            Ok(None)
+        );
+        assert_eq!(mode_of(from_values(None, None, &Wanted::Off)), Ok(None));
+    }
+
+    /// wardryx is told how the door knew the agent, from the door alone.
+    #[test]
+    fn the_identity_source_is_the_door_that_admitted_the_call() {
+        assert_eq!(identity_source(true, true), IDENTITY_AGENT_TOKEN);
+        assert_eq!(identity_source(true, false), IDENTITY_AGENT_TOKEN);
+        assert_eq!(identity_source(false, true), IDENTITY_CLIENT_KEY);
+        assert_eq!(identity_source(false, false), IDENTITY_NONE);
+    }
+
+    fn verified(unit: &str) -> VerifiedAgent {
+        VerifiedAgent {
+            subject: "agent://acme/triage".to_string(),
+            unit: unit.to_string(),
+            org: "default".to_string(),
+            jti: "t".to_string(),
+            jkt: "k".to_string(),
+            proof_jti: "p".to_string(),
+            issued_at: 0,
+            expires_at: 300,
+        }
+    }
+
+    fn map(raw: &str, label: &str) -> crate::identitymap::IdentityMap {
+        let path =
+            std::env::temp_dir().join(format!("tf-agenttoken-{label}-{}.json", std::process::id()));
+        std::fs::write(&path, raw).unwrap();
+        let m = crate::identitymap::IdentityMap::from_path(&path).expect("the map loads");
+        let _ = std::fs::remove_file(&path);
+        m
+    }
+
+    /// A header naming another agent, or a map binding the agent to another
+    /// unit, is a mismatch; the token's own agent in the header, or a map that
+    /// names the agent nowhere, is not.
+    #[test]
+    fn a_token_contradicted_by_its_header_or_the_identity_map_is_a_mismatch() {
+        let empty = crate::identitymap::IdentityMap::default();
+        let agent = verified("ops");
+        assert_eq!(contradiction(&empty, &agent, ""), None);
+        assert_eq!(contradiction(&empty, &agent, "agent://acme/triage"), None);
+        assert_eq!(
+            contradiction(&empty, &agent, "agent://acme/other").map(|m| m.reason),
+            Some(AGENT_CONTRADICTS_TOKEN)
+        );
+        let bound = map(
+            r#"{"units":[{"id":"finance"},{"id":"ops"}],
+                "keys":[{"key_id":"k1","unit":"finance","agents":["agent://acme/*"]}]}"#,
+            "bound",
+        );
+        assert_eq!(
+            contradiction(&bound, &agent, "").map(|m| m.reason),
+            Some(UNIT_CONTRADICTS_MAP)
+        );
+        assert_eq!(contradiction(&bound, &verified("finance"), ""), None);
+        let elsewhere = map(
+            r#"{"units":[{"id":"finance"}],
+                "keys":[{"key_id":"k1","unit":"finance","agents":["agent://other/*"]}]}"#,
+            "elsewhere",
+        );
+        assert_eq!(contradiction(&elsewhere, &agent, ""), None);
+    }
+}

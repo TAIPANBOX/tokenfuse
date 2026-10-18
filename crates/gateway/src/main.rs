@@ -606,6 +606,8 @@ async fn mcp_broker() {
             .filter(|v| !v.trim().is_empty()),
         taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
+        agent_tokens: None,
+        taint_gateway_key: None,
     });
     if stdio {
         tracing::info!(%upstream, "mcp credential-broker on stdio");

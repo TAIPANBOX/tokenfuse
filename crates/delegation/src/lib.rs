@@ -91,6 +91,9 @@ pub enum Refusal {
     /// The presenter does not hold the key the token is bound to.
     WrongKey,
     Revoked,
+    /// The token says it was issued further ahead of this verifier's clock than
+    /// [`AGENT_TOKEN_LEEWAY_SECS`] allows. Only an agent token is held to it.
+    NotYetValid,
 }
 
 /// What an enforcement point may rely on after a successful check.
@@ -111,6 +114,12 @@ pub struct VerifiedDelegation {
     pub jti: String,
     pub issued_at: i64,
     pub expires_at: i64,
+    /// The `jti` of the PROOF presented with the token, which is what a door
+    /// makes single-use (WAVE1-DESIGN 1.5); the token's own `jti` is `jti`.
+    pub proof_jti: String,
+    /// The proof's RFC 9449 `ath`, when it carried one: the hash of the token
+    /// it was made to accompany. Compared by the door that holds the token.
+    pub proof_ath: Option<String>,
 }
 
 /// Everything the process already holds. No client, no URL, no timeout.
@@ -314,6 +323,8 @@ pub fn verify_delegation(
         jti: claims.jti,
         issued_at: claims.iat,
         expires_at: claims.exp,
+        proof_jti: presented.jti,
+        proof_ath: presented.ath,
     })
 }
 
@@ -451,6 +462,90 @@ pub fn verify_access_token(
         expires_at: claims.exp,
         scope: claims.scope,
     })
+}
+
+/// The JWS `typ` of an agent's own access token, RFC 9068 section 2.1: what
+/// vouchryx's `client_credentials` grant mints (its `AgentTokenTyp`). Checked
+/// exactly and both ways: [`verify_agent_token`] refuses any other `typ`, and
+/// [`verify_delegation`] refuses this one, so neither token is read as the
+/// other.
+pub const AGENT_TOKEN_TYP: &str = "at+jwt";
+
+/// How far past `exp` an agent token still verifies, and how far ahead of the
+/// verifier's clock its `iat` may sit (WAVE1-DESIGN 1.4). Two hosts' clocks
+/// drift, and a refusal in the second a token turns over is an outage rather
+/// than a defence. The token lives five minutes, so this is a tenth of it.
+pub const AGENT_TOKEN_LEEWAY_SECS: i64 = 30;
+
+/// What a door may rely on after an agent's own token verified: who the agent
+/// is, and the unit and org vouchryx's registry put it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAgent {
+    /// `sub`, an `agent://` URI, equal to `client_id`.
+    pub subject: String,
+    /// The registry's unit for the agent: what the call is billed to.
+    pub unit: String,
+    /// The registry's org for the agent.
+    pub org: String,
+    /// The token's own `jti`.
+    pub jti: String,
+    /// The thumbprint the token is bound to, which MATCHED the proof.
+    pub jkt: String,
+    /// The `jti` of the proof presented with it, which a door makes
+    /// single-use. Empty for a relayed token, which came with no proof.
+    pub proof_jti: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+
+/// Whether `token` declares itself an agent token in its JWS header.
+///
+/// Read WITHOUT verifying anything, so it may decide only WHICH verifier a door
+/// runs, never whether the token is trusted: [`verify_agent_token`] reads the
+/// same header again and checks the signature behind it.
+pub fn is_agent_token(token: &str) -> bool {
+    decode_header(token)
+        .ok()
+        .and_then(|h| h.typ)
+        .is_some_and(|t| t == AGENT_TOKEN_TYP)
+}
+
+/// Verify an agent's own access token and the proof presented with it, at a
+/// door (WAVE1-DESIGN 1.4 and 1.5).
+pub fn verify_agent_token(
+    cfg: &DelegationConfig,
+    token: &str,
+    proof: Option<&str>,
+    method: &str,
+    url: &str,
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+) -> Result<VerifiedAgent, Refusal> {
+    // Scaffold: until the agent-token rules land, such a token reaches the
+    // delegation path, which is what a door does with it today.
+    let v = verify_delegation(cfg, token, proof, method, url, now, revoked)?;
+    Ok(VerifiedAgent {
+        subject: v.subject,
+        unit: String::new(),
+        org: String::new(),
+        jti: v.jti,
+        jkt: v.jkt,
+        proof_jti: v.proof_jti,
+        issued_at: v.issued_at,
+        expires_at: v.expires_at,
+    })
+}
+
+/// Verify an agent token another door of this deployment already verified
+/// WITH its proof, relayed here by a credential that door holds.
+pub fn verify_relayed_agent_token(
+    _cfg: &DelegationConfig,
+    _token: &str,
+    _now: i64,
+    _revoked: impl Fn(&str, &str, i64) -> bool,
+) -> Result<VerifiedAgent, Refusal> {
+    // Scaffold: today a bound token with no proof is refused.
+    Err(Refusal::NoProof)
 }
 
 /// The delegation chain: the subject, then the actors, root first.
@@ -1593,6 +1688,354 @@ mod tests {
                 )
             };
             let _ = verify_access_token(&cfg(&issuer), &candidate, now, never);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // verify_agent_token (wave 1: the agent's own token at every door)
+    // -------------------------------------------------------------------
+
+    /// The door's view of a good agent token: the agent, and the unit and org
+    /// the registry gave it, never a header's.
+    #[test]
+    fn an_agent_token_verifies_and_carries_its_unit_and_org() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        let v = verify_agent_token(
+            &cfg(&issuer),
+            &tok,
+            Some(&proof_for(&holder, now, "POST", URL, "pa-1", &tok)),
+            "POST",
+            URL,
+            now,
+            never,
+        )
+        .expect("a good agent token");
+        assert_eq!(v.subject, AGENT);
+        assert_eq!(v.unit, AGENT_UNIT, "the unit is the token's");
+        assert_eq!(v.org, AGENT_ORG);
+        assert_eq!(v.jti, "agent-tok-1");
+        assert_eq!(v.proof_jti, "pa-1", "the proof's jti, for the replay cache");
+        assert_eq!(v.expires_at, now + 300);
+    }
+
+    /// `typ` both ways: a delegation token is not an agent token here, and an
+    /// agent token is not a delegation token at the chain door.
+    #[test]
+    fn a_delegation_token_is_never_an_agent_token_and_the_reverse() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let as_jwt = agent_token_typed(&issuer, &holder, now, "JWT", serde_json::json!({}));
+        assert_eq!(
+            verify_agent_token(
+                &cfg(&issuer),
+                &as_jwt,
+                Some(&proof_for(&holder, now, "POST", URL, "pa-2", &as_jwt)),
+                "POST",
+                URL,
+                now,
+                never,
+            )
+            .unwrap_err(),
+            Refusal::Malformed,
+            "typ JWT is a delegation token or an ID-JAG, never an agent token"
+        );
+        let agent = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        assert!(
+            verify_delegation(
+                &cfg(&issuer),
+                &agent,
+                Some(&proof_for(&holder, now, "POST", URL, "pa-3", &agent)),
+                "POST",
+                URL,
+                now,
+                never,
+            )
+            .is_err(),
+            "an at+jwt token must not verify as a delegation chain"
+        );
+        assert!(is_agent_token(&agent));
+        assert!(!is_agent_token(&as_jwt));
+    }
+
+    /// The audience is required and exact: an empty configured audience
+    /// accepts nothing, and a token for another resource, or for a prefix of
+    /// this one, is refused.
+    #[test]
+    fn an_agent_tokens_audience_is_required_and_exact() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        let pf = proof_for(&holder, now, "POST", URL, "pa-4", &tok);
+        let mut open = cfg(&issuer);
+        open.audience = String::new();
+        assert_eq!(
+            verify_agent_token(&open, &tok, Some(&pf), "POST", URL, now, never).unwrap_err(),
+            Refusal::Audience,
+            "an empty configured audience refuses every agent token"
+        );
+        for aud in [
+            "https://other.acme.example",
+            "https://tokenfuse.acme.exampl",
+        ] {
+            let t = agent_token(&issuer, &holder, now, serde_json::json!({"aud": aud}));
+            let p = proof_for(&holder, now, "POST", URL, "pa-5", &t);
+            assert_eq!(
+                verify_agent_token(&cfg(&issuer), &t, Some(&p), "POST", URL, now, never)
+                    .unwrap_err(),
+                Refusal::Audience,
+                "{aud}"
+            );
+        }
+        let other_iss = agent_token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({"iss": "https://vouchryx.evil.example"}),
+        );
+        let p = proof_for(&holder, now, "POST", URL, "pa-6", &other_iss);
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &other_iss, Some(&p), "POST", URL, now, never)
+                .unwrap_err(),
+            Refusal::Issuer
+        );
+    }
+
+    /// Thirty seconds past `exp` is the edge: one second inside it verifies,
+    /// the edge itself does not.
+    #[test]
+    fn an_agent_token_expires_at_its_leeway_and_not_before() {
+        let (issuer, holder, issued) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, issued, serde_json::json!({}));
+        let exp = issued + 300;
+        let inside = exp + AGENT_TOKEN_LEEWAY_SECS - 1;
+        let p = proof_for(&holder, inside, "POST", URL, "pa-7", &tok);
+        assert!(
+            verify_agent_token(&cfg(&issuer), &tok, Some(&p), "POST", URL, inside, never).is_ok(),
+            "29 s past exp is inside the 30 s leeway"
+        );
+        let edge = exp + AGENT_TOKEN_LEEWAY_SECS;
+        let p = proof_for(&holder, edge, "POST", URL, "pa-8", &tok);
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &tok, Some(&p), "POST", URL, edge, never)
+                .unwrap_err(),
+            Refusal::Expired
+        );
+    }
+
+    /// A token issued more than the leeway ahead of this clock is refused; at
+    /// the leeway it is not.
+    #[test]
+    fn an_agent_token_issued_in_the_future_is_refused_past_the_leeway() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let ahead = agent_token(
+            &issuer,
+            &holder,
+            now + AGENT_TOKEN_LEEWAY_SECS + 1,
+            serde_json::json!({}),
+        );
+        let p = proof_for(&holder, now, "POST", URL, "pa-9", &ahead);
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &ahead, Some(&p), "POST", URL, now, never)
+                .unwrap_err(),
+            Refusal::NotYetValid
+        );
+        let at_edge = agent_token(
+            &issuer,
+            &holder,
+            now + AGENT_TOKEN_LEEWAY_SECS,
+            serde_json::json!({}),
+        );
+        let p = proof_for(&holder, now, "POST", URL, "pa-10", &at_edge);
+        assert!(
+            verify_agent_token(&cfg(&issuer), &at_edge, Some(&p), "POST", URL, now, never).is_ok()
+        );
+    }
+
+    /// RFC 9449 4.2: the proof must name THIS token. A proof naming none, or
+    /// another token of the same holder, is refused.
+    #[test]
+    fn a_proof_that_does_not_name_this_token_is_refused() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        let other = agent_token(
+            &issuer,
+            &holder,
+            now,
+            serde_json::json!({"jti": "agent-tok-2"}),
+        );
+        for pf in [
+            proof_at(&holder, now, "POST", URL, "pa-11"),
+            proof_for(&holder, now, "POST", URL, "pa-12", &other),
+        ] {
+            assert_eq!(
+                verify_agent_token(&cfg(&issuer), &tok, Some(&pf), "POST", URL, now, never)
+                    .unwrap_err(),
+                Refusal::WrongKey
+            );
+        }
+    }
+
+    /// The binding: no proof, a stranger's proof, or no `cnf` at all.
+    #[test]
+    fn an_agent_token_needs_its_holders_proof_and_a_binding() {
+        let (issuer, holder, thief, now) = (Key::new(), Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &tok, None, "POST", URL, now, never).unwrap_err(),
+            Refusal::NoProof
+        );
+        let stolen = proof_for(&thief, now, "POST", URL, "pa-13", &tok);
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &tok, Some(&stolen), "POST", URL, now, never)
+                .unwrap_err(),
+            Refusal::WrongKey
+        );
+        let unbound = agent_token(&issuer, &holder, now, serde_json::json!({"cnf": null}));
+        let p = proof_for(&holder, now, "POST", URL, "pa-14", &unbound);
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &unbound, Some(&p), "POST", URL, now, never)
+                .unwrap_err(),
+            Refusal::NotBound
+        );
+    }
+
+    /// An agent token names an agent acting for nobody: `sub` an `agent://`
+    /// URI equal to `client_id`, no `act`.
+    #[test]
+    fn an_agent_token_names_one_agent_and_nobody_else() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        for over in [
+            serde_json::json!({"client_id": "agent://acme/other"}),
+            serde_json::json!({"client_id": null}),
+            serde_json::json!({"sub": "user://acme/alice", "client_id": "user://acme/alice"}),
+            serde_json::json!({"sub": "agent://", "client_id": "agent://"}),
+            serde_json::json!({"act": {"sub": "agent://acme/runbook"}}),
+            serde_json::json!({"jti": null}),
+        ] {
+            let t = agent_token(&issuer, &holder, now, over.clone());
+            let p = proof_for(&holder, now, "POST", URL, "pa-15", &t);
+            assert_eq!(
+                verify_agent_token(&cfg(&issuer), &t, Some(&p), "POST", URL, now, never)
+                    .unwrap_err(),
+                Refusal::Malformed,
+                "{over}"
+            );
+        }
+    }
+
+    /// The revocation hook is asked about the agent, by its `jti` and its
+    /// subject, after everything else verified.
+    #[test]
+    fn a_revoked_agent_token_is_refused_by_its_subject_or_its_jti() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        let p = proof_for(&holder, now, "POST", URL, "pa-16", &tok);
+        let by_subject = |_: &str, sub: &str, _: i64| sub == AGENT;
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &tok, Some(&p), "POST", URL, now, by_subject)
+                .unwrap_err(),
+            Refusal::Revoked
+        );
+        let by_jti = |jti: &str, _: &str, _: i64| jti == "agent-tok-1";
+        assert_eq!(
+            verify_agent_token(&cfg(&issuer), &tok, Some(&p), "POST", URL, now, by_jti)
+                .unwrap_err(),
+            Refusal::Revoked
+        );
+    }
+
+    /// The relay: a token another door of this deployment verified with its
+    /// proof is checked again on everything but the proof.
+    #[test]
+    fn a_relayed_agent_token_skips_the_proof_and_nothing_else() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = agent_token(&issuer, &holder, now, serde_json::json!({}));
+        let v = verify_relayed_agent_token(&cfg(&issuer), &tok, now, never)
+            .expect("a relayed agent token verifies without a proof");
+        assert_eq!(v.subject, AGENT);
+        assert_eq!(v.unit, AGENT_UNIT);
+        assert_eq!(v.proof_jti, "", "a relayed token came with no proof");
+        for (t, at, why) in [
+            (
+                agent_token(&issuer, &holder, now, serde_json::json!({"cnf": null})),
+                now,
+                Refusal::NotBound,
+            ),
+            (
+                tok.clone(),
+                now + 300 + AGENT_TOKEN_LEEWAY_SECS,
+                Refusal::Expired,
+            ),
+            (
+                agent_token_typed(&issuer, &holder, now, "JWT", serde_json::json!({})),
+                now,
+                Refusal::Malformed,
+            ),
+        ] {
+            assert_eq!(
+                verify_relayed_agent_token(&cfg(&issuer), &t, at, never).unwrap_err(),
+                why
+            );
+        }
+        assert_eq!(
+            verify_relayed_agent_token(&cfg(&issuer), &tok, now, |_: &str, s: &str, _: i64| s
+                == AGENT)
+            .unwrap_err(),
+            Refusal::Revoked
+        );
+    }
+
+    /// A delegation verified at a door hands back the proof's `jti` and `ath`,
+    /// which the door makes single-use and compares with the token it holds.
+    #[test]
+    fn a_verified_delegation_names_its_proofs_jti_and_hash() {
+        let (issuer, holder, now) = (Key::new(), Key::new(), 1_800_000_000);
+        let tok = token(&issuer, &holder, now, serde_json::json!({}));
+        let v = verify_delegation(
+            &cfg(&issuer),
+            &tok,
+            Some(&proof_for(&holder, now, "POST", URL, "pd-1", &tok)),
+            "POST",
+            URL,
+            now,
+            never,
+        )
+        .expect("a good delegation");
+        assert_eq!(v.proof_jti, "pd-1");
+        assert_eq!(
+            v.proof_ath.as_deref(),
+            Some(tokenfuse_dpop::access_token_hash(&tok).as_str())
+        );
+    }
+
+    /// Hostile input never panics the agent-token verifiers.
+    #[test]
+    fn two_hundred_hostile_strings_never_panic_the_agent_token_verifiers() {
+        let (issuer, now) = (Key::new(), 1_800_000_000_i64);
+        let mut seed: u64 = 20261018;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for i in 0..200 {
+            let len = 1 + (next() % 512) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() % 256) as u8).collect();
+            let candidate = if i % 2 == 0 {
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                let a = len / 3;
+                let b = 2 * len / 3;
+                format!(
+                    "{}.{}.{}",
+                    b64(&bytes[..a]),
+                    b64(&bytes[a..b]),
+                    b64(&bytes[b..])
+                )
+            };
+            let _ = is_agent_token(&candidate);
+            let _ = verify_agent_token(&cfg(&issuer), &candidate, None, "POST", URL, now, never);
+            let _ = verify_relayed_agent_token(&cfg(&issuer), &candidate, now, never);
         }
     }
 }

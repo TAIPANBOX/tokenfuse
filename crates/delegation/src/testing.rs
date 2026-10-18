@@ -131,6 +131,75 @@ pub fn access_token(issuer: &Key, now: i64, over: serde_json::Value) -> String {
     )
 }
 
+/// The agent the agent-token fixture names, and its registry unit and org.
+pub const AGENT: &str = "agent://acme/triage";
+pub const AGENT_UNIT: &str = "ops";
+pub const AGENT_ORG: &str = "default";
+
+/// Mint a token shaped like vouchryx's agent token (`internal/api/agents.go`'s
+/// `tokenClientCredentials`, vouchryx#48): header `typ: at+jwt`, `sub` and
+/// `client_id` the agent, one audience, five minutes, bound to `holder`, and
+/// the registry's `unit`, `org` and `auth_src`. `over` replaces claims, a
+/// `null` removing one.
+pub fn agent_token(issuer: &Key, holder: &Key, now: i64, over: serde_json::Value) -> String {
+    agent_token_typed(issuer, holder, now, "at+jwt", over)
+}
+
+/// [`agent_token`] with another header `typ`, for the door that must refuse it.
+pub fn agent_token_typed(
+    issuer: &Key,
+    holder: &Key,
+    now: i64,
+    typ: &str,
+    over: serde_json::Value,
+) -> String {
+    let jkt = {
+        let jwk: jsonwebtoken::jwk::Jwk =
+            serde_json::from_value(holder.jwk_value(None)).expect("a jwk");
+        thumbprint(&jwk).expect("a thumbprint")
+    };
+    let mut claims = serde_json::json!({
+        "iss": ISS, "sub": AGENT, "client_id": AGENT, "aud": AUD,
+        "iat": now, "exp": now + 300, "jti": "agent-tok-1",
+        "cnf": {"jkt": jkt},
+        "unit": AGENT_UNIT, "org": AGENT_ORG, "auth_src": "enrolment-key",
+    });
+    if let serde_json::Value::Object(o) = over {
+        for (k, v) in o {
+            if v.is_null() {
+                claims.as_object_mut().unwrap().remove(&k);
+            } else {
+                claims[k] = v;
+            }
+        }
+    }
+    issuer.sign(
+        serde_json::json!({"alg": "ES256", "typ": typ, "kid": "v-1"}),
+        claims,
+    )
+}
+
+/// A proof made to accompany `token`: RFC 9449's `ath` beside the usual four
+/// claims. What a client that presents an agent token sends.
+pub fn proof_for(
+    holder: &Key,
+    now: i64,
+    method: &str,
+    url: &str,
+    jti: &str,
+    token: &str,
+) -> String {
+    holder.sign(
+        serde_json::json!({
+            "typ": "dpop+jwt", "alg": "ES256", "jwk": holder.jwk_value(None)
+        }),
+        serde_json::json!({
+            "htm": method, "htu": url, "iat": now, "jti": jti,
+            "ath": tokenfuse_dpop::access_token_hash(token),
+        }),
+    )
+}
+
 pub fn proof(holder: &Key, now: i64) -> String {
     proof_at(holder, now, "POST", URL, "p1")
 }

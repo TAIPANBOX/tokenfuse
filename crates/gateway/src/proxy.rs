@@ -684,10 +684,14 @@ async fn handle_call(
     // still reaches the provider and still spends the operator's provider
     // credential, so an operator who turned this on to control who may use the
     // gateway would be surprised to find "omit the run id" is a way around it.
-    let Some(key_id) = resolve_client_key(&st, &headers) else {
-        report_refused_key(&st, &headers);
-        return unauthorized(&st.keystats);
+    //
+    // With `TOKENFUSE_AGENT_TOKENS` on, an agent token is the credential, and
+    // the agent, its unit and its run principal come from it (`crate::agenttoken`).
+    let caller = match resolve_caller(&st, &headers, wire.route_path(), false) {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
     };
+    let key_id = caller.key_id.clone();
     // Key lifecycle health (docs/22): one increment per request that
     // resolved a credential, regardless of what happens downstream
     // (success, a 402 Breaker trip, a 403 identity block) - see
@@ -718,7 +722,7 @@ async fn handle_call(
     // run another principal opened is refused having learnt nothing about it
     // and changed nothing in it. With client keys off the principal is empty,
     // nothing is recorded and nothing is refused (`scripts/run-owner-is-checked-first.sh`).
-    let principal = crate::runowners::key_principal(&key_id);
+    let principal = caller.principal.clone();
     if let crate::runowners::Claim::Elsewhere(owner) = st.run_owners.claim(&run_id, &principal) {
         return foreign_run_refused(
             &st,
@@ -799,7 +803,9 @@ async fn handle_call(
     let mut seed_pending_note: Option<String> = None;
     if let Some(reason) = st.seed.pending_reason() {
         let enforce = matches!(st.policy.mode, Mode::Enforce);
-        let caller_agent = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+        let caller_agent = caller
+            .agent_id()
+            .unwrap_or_else(|| header_str(&headers, "x-fuse-agent-id").unwrap_or_default());
         report_seed_pending(&st, &run_id, &caller_agent, enforce, &reason);
         if enforce {
             return seed_pending(&run_id, &reason);
@@ -875,8 +881,11 @@ async fn handle_call(
 
     // Attribution only: which logical agent made this call. Request-scoped like
     // `model` — it rides along into every CallRecord and never touches the
-    // ledger/budget. Defaults to "" when the header is absent.
-    let agent_id = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+    // ledger/budget. Defaults to "" when the header is absent. A call an agent
+    // token admitted is the token's agent, whatever the header says; a header
+    // that says otherwise is refused below.
+    let header_agent = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+    let agent_id = caller.agent_id().unwrap_or_else(|| header_agent.clone());
 
     // An id the envelope would reject, handled per the configured mode. See
     // `crate::agentids` for why the default records rather than refuses: the
@@ -945,9 +954,15 @@ async fn handle_call(
     let chain_now = crate::sink::now_millis() / 1000;
     let resolved = crate::chainproof::resolve(
         &st.chain_proof,
-        crate::chainproof::dpop_credential(
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ),
+        // An agent token admitted this call: the `Authorization` it came in is
+        // the door credential, never a delegation chain as well.
+        if caller.agent.is_some() {
+            None
+        } else {
+            crate::chainproof::dpop_credential(
+                headers.get("authorization").and_then(|v| v.to_str().ok()),
+            )
+        },
         headers
             .get(crate::mcpdoor::PROOF_HEADER)
             .and_then(|v| v.to_str().ok()),
@@ -965,6 +980,7 @@ async fn handle_call(
         &declared_chain,
         chain_now,
         crate::revocations::hook(&st.revocations, chain_now),
+        &st.agent_tokens,
     );
     // The agent a PROVEN chain names, before the chain is taken apart. Only a
     // proven one: see `chainproof::proven_actor` for why a claimed chain is the
@@ -1014,12 +1030,20 @@ async fn handle_call(
     // claimed agent id at all. `unit` is resolved server-side (never
     // caller-written) and rides into every CallRecord below; the mismatch
     // check gates before anything is routed, priced, or forwarded.
-    let (unit, identity_mismatch) = {
-        let resolution = st.identity.resolve(&key_id, &agent_id);
-        (
-            resolution.unit.unwrap_or_default().to_string(),
-            resolution.mismatch,
-        )
+    let (unit, identity_mismatch) = match caller.agent.as_ref() {
+        // The token's unit, never the map's guess from a header; the map may
+        // only contradict it (`agenttoken::contradiction`).
+        Some(agent) => (
+            agent.unit.clone(),
+            crate::agenttoken::contradiction(&st.identity, agent, &header_agent),
+        ),
+        None => {
+            let resolution = st.identity.resolve(&key_id, &agent_id);
+            (
+                resolution.unit.unwrap_or_default().to_string(),
+                resolution.mismatch,
+            )
+        }
     };
     let mut identity_header: Option<String> = None;
     // Invariant 87: the reason the identity check would refuse this call,
@@ -1048,8 +1072,15 @@ async fn handle_call(
         })
     });
 
+    // A call an agent token admitted is refused on a mismatch in every strict
+    // mode: the token is not a claim to warn about.
+    let identity_strict = if caller.agent.is_some() {
+        caller.strict_for_tokens(st.identity_strict)
+    } else {
+        st.identity_strict
+    };
     if let Some(mismatch) = identity_mismatch {
-        match st.identity_strict {
+        match identity_strict {
             StrictMode::Off => {}
             StrictMode::Warn => {
                 // Key lifecycle health (docs/22): warn mode still DETECTS
@@ -1702,7 +1733,9 @@ async fn handle_call(
         // only when this request proved possession of the key its delegation
         // is bound to.
         crate::attestation::note_ignored_header(&headers, "proxy");
-        let attestation_method = Some(crate::attestation::from_door(chain_proven).to_string());
+        let attestation_method = Some(
+            crate::attestation::from_door(chain_proven || caller.proved_possession()).to_string(),
+        );
         let wardryx_outcome = st
             .wardryx
             .decide(DecideContext {
@@ -1722,6 +1755,7 @@ async fn handle_call(
                 model: parsed.model.clone(),
                 est_cost_usd: estimate.as_usd(),
                 attestation_method,
+                identity_source: caller.identity_source(),
                 approval_token,
                 // The LLM path has no pending call to name: the tools in the
                 // request are only OFFERED. See `DecideContext::tool_call`.
@@ -2926,6 +2960,106 @@ async fn buffered_managed(
         builder = builder.header("x-fuse-identity", ih);
     }
     builder.body(Body::from(bytes)).expect("valid response")
+}
+
+/// Who is calling, as the door that admitted the call established it.
+pub struct Caller {
+    /// What records, FOCUS and keystats file the call under: the static key's
+    /// id, `tok:<agent>` for an agent token, empty when nothing authenticates.
+    pub key_id: String,
+    /// The run principal (invariant 120): `key:<key_id>`, `tok:<agent>`, or
+    /// empty.
+    pub principal: String,
+    /// The agent token that admitted the call, when one did.
+    pub agent: Option<tokenfuse_delegation::VerifiedAgent>,
+}
+
+impl Caller {
+    /// The agent the credential names, when it names one.
+    pub fn agent_id(&self) -> Option<String> {
+        self.agent.as_ref().map(|a| a.subject.clone())
+    }
+
+    /// Whether this request proved possession of a key at the door.
+    pub fn proved_possession(&self) -> bool {
+        false
+    }
+
+    /// The `identity_source` wardryx is told: how the door knew the agent.
+    pub fn identity_source(&self) -> Option<String> {
+        None
+    }
+
+    /// The strict mode an agent-token caller's mismatch is judged under.
+    pub fn strict_for_tokens(&self, configured: StrictMode) -> StrictMode {
+        configured
+    }
+}
+
+/// The door, for the metered routes and the tool-call check: an agent token
+/// when the agent-token door is on and the request carries one, otherwise the
+/// static client key exactly as before (`resolve_client_key`). `relay` is the
+/// tool-call check's: an agent token the MCP broker relays beside its own key
+/// (`agenttoken::BROKER_KEY_ID`), with no proof.
+///
+/// The refusal is the whole `Response` the door answers with, the shape
+/// `mcpbroker::declared_chain_or_refuse` takes for the same reason: it is
+/// called once per request, never in a loop, so boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+pub(crate) fn resolve_caller(
+    st: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    relay: bool,
+) -> Result<Caller, Response> {
+    let now = crate::sink::now_millis() / 1000;
+    let relaying = relay
+        && crate::agenttoken::carries_agent_token(headers)
+        && resolve_client_key(st, headers).as_deref() == Some(crate::agenttoken::BROKER_KEY_ID);
+    let door = if relaying {
+        crate::agenttoken::relayed(
+            &st.agent_tokens,
+            &st.chain_proof,
+            &st.revocations,
+            headers,
+            now,
+        )
+    } else {
+        crate::agenttoken::admit(
+            &st.agent_tokens,
+            &st.chain_proof,
+            &st.revocations,
+            headers,
+            path,
+            now,
+        )
+    };
+    match door {
+        crate::agenttoken::Door::Refused(why) => {
+            crate::agenttoken::log_refusal("proxy", why);
+            st.keystats.record_unauthorized();
+            Err(crate::agenttoken::refused_response())
+        }
+        crate::agenttoken::Door::Admitted(agent) => {
+            let principal = crate::runowners::token_principal(&agent.subject);
+            Ok(Caller {
+                key_id: principal.clone(),
+                principal,
+                agent: Some(agent),
+            })
+        }
+        crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers) {
+            Some(key_id) => Ok(Caller {
+                principal: crate::runowners::key_principal(&key_id),
+                key_id,
+                agent: None,
+            }),
+            None => {
+                report_refused_key(st, headers);
+                Err(unauthorized(&st.keystats))
+            }
+        },
+    }
 }
 
 /// DLP block: a secret was found in the outgoing prompt.

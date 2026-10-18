@@ -174,6 +174,8 @@ fn broker_state(
         // XAA is off in every fixture built through this helper (W3-tokenfuse's
         // own tests build their own state); see `xaa_test_state` there.
         xaa: None,
+        agent_tokens: None,
+        taint_gateway_key: None,
     })
 }
 
@@ -209,6 +211,8 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         taint_gateway: None,
         taint_failclosed: false,
         xaa: None,
+        agent_tokens: None,
+        taint_gateway_key: None,
     }))
 }
 
@@ -1013,6 +1017,8 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         taint_gateway: None,
         taint_failclosed: false,
         xaa: None,
+        agent_tokens: None,
+        taint_gateway_key: None,
     })
 }
 
@@ -1330,6 +1336,8 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         taint_gateway: gateway,
         taint_failclosed: failclosed,
         xaa: None,
+        agent_tokens: None,
+        taint_gateway_key: None,
     }))
 }
 

@@ -188,6 +188,15 @@ pub struct BrokerState {
     /// `Authorization: Bearer` request exactly as it was before this
     /// existed.
     pub xaa: crate::xaadoor::Xaa,
+    /// The agent-token door (`TOKENFUSE_AGENT_TOKENS`, [`crate::agenttoken`]),
+    /// judged first and alone. `None` (the default) changes nothing.
+    pub agent_tokens: crate::agenttoken::Tokens,
+    /// The broker's OWN gateway client key (`TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE`),
+    /// used only to relay an agent token to the taint gateway's
+    /// `/v1/fuse/check-tool-call`, which answers it about the token's runs and
+    /// no others. A caller admitted by a client key is still asked about with
+    /// that caller's own key (invariant 118).
+    pub taint_gateway_key: Option<String>,
 }
 
 /// Per-request context the HTTP transport reads off headers and the stdio
@@ -254,6 +263,13 @@ pub struct CallContext {
     /// `/v1/fuse/check-tool-call` so the gateway answers it about its own run
     /// and nobody else's (invariant 118). Never logged, never sent upstream.
     pub gateway_key: Option<String>,
+    /// The agent token that admitted the call, relayed to the taint gateway
+    /// beside the broker's own key so it is answered about the token's runs.
+    /// Never logged, never sent upstream.
+    pub gateway_token: Option<String>,
+    /// How the door knew the agent, for the policy plane: `agent-token`,
+    /// `client-key` or `none`, from the door and never from a header.
+    pub identity_source: Option<String>,
 }
 
 /// Where a call's session id came from, which decides whether it is trusted.
@@ -1086,6 +1102,66 @@ async fn handle(
     let now = crate::sink::now_millis() / 1000;
     crate::attestation::note_ignored_header(&headers, "mcp_broker");
 
+    // The agent-token door, judged before every other door and alone: a token
+    // that does not verify is a refusal, never a fall-back to another door.
+    match crate::agenttoken::admit(
+        &st.agent_tokens,
+        &st.chain_proof,
+        &st.revocations,
+        &headers,
+        uri.path(),
+        now,
+    ) {
+        crate::agenttoken::Door::Refused(why) => {
+            crate::agenttoken::log_refusal("mcp_broker", why);
+            return unauthorized(&st);
+        }
+        crate::agenttoken::Door::Admitted(agent) => {
+            // The token names the agent; a header naming another is refused
+            // in every strict mode, never reconciled.
+            if let Some(claimed) = header("x-fuse-agent-id")
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty() && *h != agent.subject)
+            {
+                tracing::warn!(
+                    proven = %agent.subject,
+                    claimed = %claimed,
+                    "mcp broker: refused a header naming another agent than its token"
+                );
+                return crate::agenttoken::contradicted_response(&agent.subject, &claimed);
+            }
+            let declared = match declared_chain_or_refuse(&st, &header) {
+                Ok(d) => d,
+                Err(resp) => return resp,
+            };
+            let token = crate::chainproof::dpop_credential(header("authorization").as_deref())
+                .map(str::to_string);
+            let ctx = CallContext {
+                agent_id: Some(agent.subject.clone()),
+                // The token proves the agent, not a delegation: a declared
+                // chain stays a claim, as it is beside a client key.
+                proven_actor: None,
+                event_agent_id: Some(agent.subject.clone()),
+                upstream: header("x-fuse-mcp-upstream"),
+                run_id: header("x-fuse-run-id"),
+                on_behalf_of: declared,
+                chain_proven: false,
+                delegation_proof: None,
+                // The proof of possession was verified at this door.
+                attestation_method: Some(crate::attestation::from_door(true).to_string()),
+                approval_token: header("x-fuse-approval-token"),
+                session: header(crate::mcpsession::SESSION_HEADER).map(SessionId::Presented),
+                protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
+                principal: crate::runowners::token_principal(&agent.subject),
+                gateway_key: None,
+                gateway_token: token,
+                identity_source: Some(crate::agenttoken::IDENTITY_AGENT_TOKEN.to_string()),
+            };
+            return finish(&st, req, ctx).await;
+        }
+        crate::agenttoken::Door::NotPresented => {}
+    }
+
     if let Some(xaa) = &st.xaa {
         if let Some(credential) = bearer_credential(header("authorization").as_deref()) {
             // Judged by this door ALONE: a second credential alongside it is
@@ -1164,6 +1240,8 @@ async fn handle(
                 principal: format!("xaa:{}", verified.client_id),
                 // A client key beside an XAA token is refused above.
                 gateway_key: None,
+                gateway_token: None,
+                identity_source: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1285,6 +1363,8 @@ async fn handle(
         protocol_version: header(crate::mcpsession::PROTOCOL_VERSION_HEADER),
         principal,
         gateway_key: header(CLIENT_KEY_HEADER),
+        gateway_token: None,
+        identity_source: None,
     };
     finish(&st, req, ctx).await
 }
@@ -1738,6 +1818,7 @@ async fn process_into(
                         model: String::new(),
                         est_cost_usd: 0.0,
                         attestation_method: ctx.attestation_method.clone(),
+                        identity_source: ctx.identity_source.clone(),
                         approval_token: ctx.approval_token.clone(),
                         // The call itself, as the agent sent it: this is the
                         // site that runs BEFORE secret injection, so a
