@@ -1557,6 +1557,51 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- invariant 122: a brokered gateway never forwards the caller's provider key ---
+#
+# The script gate holds the copy loop in HttpProvider::send (the skip is taken only when the
+# gateway holds the key, the header list is exactly the two credentials, the gateway's own key
+# is sent). The product mutants are the ways the bypass comes back silently: the caller's key
+# refused less often, the stock SDK's key header ignored, the gateway's key never sent.
+run_case "upstream-key: the copy loop skips the caller's credential unconditionally" fail \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "if self.upstream_key.is_some() && PROVIDER_CREDENTIAL_HEADERS.contains(name) {", "if PROVIDER_CREDENTIAL_HEADERS.contains(name) {")')" \
+	"no longer skips the caller"
+
+run_case "upstream-key: the copy loop never skips the caller's credential" fail \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "if self.upstream_key.is_some() && PROVIDER_CREDENTIAL_HEADERS.contains(name) {", "if false && self.upstream_key.is_some() && PROVIDER_CREDENTIAL_HEADERS.contains(name) {")')" \
+	"no longer skips the caller"
+
+run_case "upstream-key: the gateway's own key is not sent upstream" fail \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "let (name, value) = key.header();", "let (name, value) = (\"x-api-key\", String::new());")')" \
+	"no longer takes the upstream header"
+
+run_case "upstream-key: the credential list drops x-api-key" fail \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\", \"x-api-key\"];", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\"];")')" \
+	"no longer declares PROVIDER_CREDENTIAL_HEADERS"
+
+run_case "upstream-key: a comment naming the list passes" pass \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'edit("crates/gateway/src/provider.rs", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\", \"x-api-key\"];", "// Read by scripts/upstream-key-is-never-forwarded.sh.\nconst PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\", \"x-api-key\"];")')"
+
+run_case "upstream-key: provider.rs gone, so the gate measured nothing" fail \
+	"./scripts/upstream-key-is-never-forwarded.sh" \
+	"$(py 'import os; os.rename("crates/gateway/src/provider.rs", "crates/gateway/src/provider.rs.moved")')" \
+	"measured nothing"
+
+run_case "upstream-key: the caller's provider credential is not refused" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact the_gateway_holds_the_provider_key::a_caller_supplied_x_api_key_is_refused_when_brokered" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        st.provider.brokers_key(),\n        &st.client_keys,", "        false,\n        &st.client_keys,")')" \
+	"a_caller_supplied_x_api_key_is_refused_when_brokered ... FAILED"
+
+run_case "upstream-key: a stock SDK's key header is no longer read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact the_gateway_holds_the_provider_key::a_stock_sdk_key_is_the_gateway_key_on_the_anthropic_door" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "if presented.trim().is_empty() && st.provider.brokers_key() {", "if false && st.provider.brokers_key() {")')" \
+	"a_stock_sdk_key_is_the_gateway_key_on_the_anthropic_door ... FAILED"
+
 run_case "run-owner-first: the check reads the taint before the owner" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
 	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = crate::runowners::key_principal(caller);\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = crate::runowners::key_principal(caller);\n")')" \

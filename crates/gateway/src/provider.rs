@@ -69,6 +69,12 @@ pub trait Provider: Send + Sync {
     fn brokers_key(&self) -> bool {
         false
     }
+
+    /// Whether this provider sends the caller's own provider credential upstream as it arrived
+    /// (invariant 122). Only an unbrokered HTTP upstream does; the built-in stub never does.
+    fn forwards_caller_credential(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,56 +597,170 @@ pub enum UpstreamAuth {
     Bearer,
 }
 
+/// The words `TOKENFUSE_UPSTREAM_AUTH` accepts, read through `defaults::switch_word` (invariant 98).
+pub const UPSTREAM_AUTH_WORDS: &[&str] = &["x-api-key", "bearer"];
+
+/// The largest provider key file the gateway reads, in bytes (invariant 122). The file is
+/// refused whole when it is larger, a trailing line break included.
+pub const UPSTREAM_KEY_MAX_BYTES: usize = 4096;
+
 impl UpstreamAuth {
-    /// Reads the upstream auth word an operator set. Scaffold: nothing is read yet.
-    pub fn parse(_word: &str) -> Option<UpstreamAuth> {
-        None
+    /// The auth word `TOKENFUSE_UPSTREAM_AUTH` names. The word has already been checked by
+    /// `defaults::switch_word`, so the `None` arm never reaches an operator.
+    pub fn parse(word: &str) -> Option<UpstreamAuth> {
+        match word.to_ascii_lowercase().as_str() {
+            "x-api-key" => Some(UpstreamAuth::XApiKey),
+            "bearer" => Some(UpstreamAuth::Bearer),
+            _ => None,
+        }
     }
 
     /// The header a wire's upstream expects when no auth word is set.
-    /// Scaffold: every wire gets `x-api-key`.
-    pub fn default_for(_wire: crate::wire::Wire) -> UpstreamAuth {
-        UpstreamAuth::XApiKey
+    pub fn default_for(wire: crate::wire::Wire) -> UpstreamAuth {
+        match wire {
+            crate::wire::Wire::Anthropic => UpstreamAuth::XApiKey,
+            crate::wire::Wire::OpenAi => UpstreamAuth::Bearer,
+        }
     }
 }
 
-/// A provider key the gateway holds for one upstream (invariant 122).
-#[derive(Debug)]
+/// A provider key the gateway holds for one upstream (invariant 122). Its `Debug` output
+/// never carries the key.
 pub struct UpstreamKey {
     auth: UpstreamAuth,
     value: String,
 }
 
+impl std::fmt::Debug for UpstreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamKey")
+            .field("auth", &self.auth)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 impl UpstreamKey {
-    /// Scaffold: the value is kept as given, with no check.
+    /// Checks a provider key the operator gave: not empty, at most `UPSTREAM_KEY_MAX_BYTES`,
+    /// and a header value. The error says what is wrong and never echoes the key.
     pub fn new(value: &str, auth: UpstreamAuth) -> Result<UpstreamKey, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("it is empty".to_string());
+        }
+        if value.len() > UPSTREAM_KEY_MAX_BYTES {
+            return Err(format!("it is longer than {UPSTREAM_KEY_MAX_BYTES} bytes"));
+        }
+        if axum::http::HeaderValue::from_str(value).is_err() {
+            return Err("it is not a valid HTTP header value".to_string());
+        }
         Ok(UpstreamKey {
             auth,
             value: value.to_string(),
         })
     }
 
-    /// Scaffold: the file is read and its contents kept as they are.
+    /// Reads the key from a file. At most one byte past the limit is read, so a file over it is
+    /// refused without being read whole. White space around the key, a trailing line break
+    /// included, is not part of the key.
     pub fn from_file(path: &std::path::Path, auth: UpstreamAuth) -> Result<UpstreamKey, String> {
-        let value = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        Ok(UpstreamKey { auth, value })
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|e| format!("it cannot be opened: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(UPSTREAM_KEY_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("it cannot be read: {e}"))?;
+        if bytes.len() > UPSTREAM_KEY_MAX_BYTES {
+            return Err(format!("it is longer than {UPSTREAM_KEY_MAX_BYTES} bytes"));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| "it is not UTF-8 text".to_string())?;
+        UpstreamKey::new(text, auth)
+    }
+
+    /// The header name the gateway sends the key in.
+    pub fn header_name(&self) -> &'static str {
+        match self.auth {
+            UpstreamAuth::XApiKey => "x-api-key",
+            UpstreamAuth::Bearer => "authorization",
+        }
     }
 
     /// The header name and the full value the gateway sends upstream with it.
     pub fn header(&self) -> (&'static str, String) {
-        match self.auth {
-            UpstreamAuth::XApiKey => ("x-api-key", self.value.clone()),
-            UpstreamAuth::Bearer => ("authorization", format!("Bearer {}", self.value)),
-        }
+        let value = match self.auth {
+            UpstreamAuth::XApiKey => self.value.clone(),
+            UpstreamAuth::Bearer => format!("Bearer {}", self.value),
+        };
+        (self.header_name(), value)
     }
 }
 
-impl HttpProvider {
-    /// Holds `key` as this upstream's provider credential (invariant 122). Scaffold: the
-    /// key is accepted and not yet used, so the caller's credential is still forwarded.
-    pub fn with_upstream_key(self, _key: UpstreamKey) -> HttpProvider {
-        self
+/// The headers that carry a provider credential. A brokered gateway forwards neither (invariant
+/// 122); `FORWARD_HEADERS` still names them, so the unbrokered path is unchanged.
+const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &["authorization", "x-api-key"];
+
+/// The warning a gateway prints, and its health detail carries, when it forwards the caller's
+/// provider credential (invariant 122). One line, so a search for it finds it.
+pub const UNBROKERED_WARNING: &str = "the provider key comes from the caller: this gateway forwards the caller's own provider credential upstream and holds none of its own, so an agent holding a provider key can call the provider around this gateway; set TOKENFUSE_UPSTREAM_KEY_FILE to hold the key here";
+
+/// The provider credentials a caller presented, each with the header that carried it. An
+/// `Authorization` in the DPoP scheme is a delegation credential, not a provider credential
+/// (invariant 69).
+fn caller_provider_credentials(headers: &HeaderMap) -> Vec<(&'static str, String)> {
+    let mut presented = Vec::new();
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            presented.push(("x-api-key", v.to_string()));
+        }
     }
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        let (scheme, rest) = match v.split_once(char::is_whitespace) {
+            Some((scheme, rest)) => (scheme, rest.trim()),
+            None => (v, ""),
+        };
+        if !scheme.eq_ignore_ascii_case("dpop") {
+            let token = if scheme.eq_ignore_ascii_case("bearer") {
+                rest
+            } else {
+                v
+            };
+            if !token.is_empty() {
+                presented.push(("authorization", token.to_string()));
+            }
+        }
+    }
+    presented
+}
+
+/// Invariant 122: with the provider key held here, the first provider credential a caller
+/// presented that is not a gateway credential, named by the header that carried it. `None`
+/// when the key is not held here, or when every credential presented is a gateway credential.
+pub fn refused_caller_credential(
+    brokered: bool,
+    keys: &crate::clientkeys::ClientKeys,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
+    if !brokered {
+        return None;
+    }
+    caller_provider_credentials(headers)
+        .into_iter()
+        .find(|(_, token)| keys.resolve(token).is_none())
+        .map(|(header, _)| header)
+}
+
+/// Invariant 122: the gateway credential a stock SDK sent in a provider header, for a call that
+/// named no `x-fuse-key`. The refusal of any other provider credential is checked before this
+/// is asked.
+pub fn gateway_credential_in_provider_headers(
+    keys: &crate::clientkeys::ClientKeys,
+    headers: &HeaderMap,
+) -> Option<String> {
+    caller_provider_credentials(headers)
+        .into_iter()
+        .find_map(|(_, token)| keys.resolve(&token).map(str::to_string))
 }
 
 /// Forwards requests to a real upstream endpoint and streams the response back,
@@ -648,9 +768,18 @@ impl HttpProvider {
 pub struct HttpProvider {
     client: reqwest::Client,
     endpoint: String,
+    /// The provider key this gateway holds for the upstream, when it is brokered (invariant 122).
+    upstream_key: Option<UpstreamKey>,
 }
 
 impl HttpProvider {
+    /// Holds `key` as this upstream's provider credential (invariant 122): the gateway sends it
+    /// upstream itself, and forwards none of the caller's provider credentials.
+    pub fn with_upstream_key(mut self, key: UpstreamKey) -> HttpProvider {
+        self.upstream_key = Some(key);
+        self
+    }
+
     pub fn new(endpoint: impl Into<String>) -> Self {
         // A connect timeout bounds how long a stalled upstream can tie up a
         // request during the TCP+TLS handshake. We deliberately set *no* overall
@@ -680,12 +809,21 @@ impl HttpProvider {
         HttpProvider {
             client,
             endpoint: endpoint.into(),
+            upstream_key: None,
         }
     }
 }
 
 #[async_trait]
 impl Provider for HttpProvider {
+    fn brokers_key(&self) -> bool {
+        self.upstream_key.is_some()
+    }
+
+    fn forwards_caller_credential(&self) -> bool {
+        self.upstream_key.is_none()
+    }
+
     async fn send(
         &self,
         headers: HeaderMap,
@@ -693,6 +831,11 @@ impl Provider for HttpProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let mut req = self.client.post(&self.endpoint).body(body.to_vec());
         for name in FORWARD_HEADERS {
+            // Brokered (invariant 122): the caller's own provider credential never leaves, and
+            // the gateway's key is sent below instead.
+            if self.upstream_key.is_some() && PROVIDER_CREDENTIAL_HEADERS.contains(name) {
+                continue;
+            }
             if let Some(v) = headers.get(*name) {
                 // A DPoP-scheme Authorization is a delegation credential
                 // (RFC 9449 / RFC 8693 §5), never a provider API key,
@@ -707,6 +850,11 @@ impl Provider for HttpProvider {
                 }
                 req = req.header(*name, v);
             }
+        }
+
+        if let Some(key) = &self.upstream_key {
+            let (name, value) = key.header();
+            req = req.header(name, value);
         }
 
         // Building is proof that no bytes were dispatched.

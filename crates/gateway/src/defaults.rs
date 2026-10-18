@@ -293,6 +293,26 @@ pub fn wardryx_mode_from_env() -> crate::wardryx::WardryxMode {
 }
 
 /// [`wardryx_failmode_from`] against the process environment, for a hook in `mode`.
+/// `TOKENFUSE_UPSTREAM_AUTH` (invariant 122): the header the held provider key goes in. Unset is
+/// `Ok(None)`, which means the wire's own header; `x-api-key` or `bearer` in any case otherwise.
+pub fn upstream_auth_from(
+    value: Option<&str>,
+) -> Result<Option<crate::provider::UpstreamAuth>, String> {
+    let word = switch_word(
+        "TOKENFUSE_UPSTREAM_AUTH",
+        value,
+        crate::provider::UPSTREAM_AUTH_WORDS,
+    )?;
+    Ok(word.and_then(crate::provider::UpstreamAuth::parse))
+}
+
+/// `upstream_auth_from` for the process environment, exiting 2 on a value it cannot read.
+pub fn upstream_auth_from_env() -> Option<crate::provider::UpstreamAuth> {
+    exit_on_refusal(upstream_auth_from(
+        std::env::var("TOKENFUSE_UPSTREAM_AUTH").ok().as_deref(),
+    ))
+}
+
 pub fn wardryx_failmode_from_env(mode: crate::wardryx::WardryxMode) -> crate::wardryx::FailMode {
     exit_on_refusal(wardryx_failmode_from(
         mode,
