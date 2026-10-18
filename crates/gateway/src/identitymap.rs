@@ -736,6 +736,14 @@ impl IdentityMap {
     pub fn key_count(&self) -> usize {
         self.keys.len()
     }
+
+    /// SCAFFOLD (red-first commit): whether `parent_key`'s runs may be named as
+    /// the parent of `child_key`'s runs. Today nothing is checked, so nothing
+    /// is listed.
+    #[must_use]
+    pub fn may_parent(&self, _parent_key: &str, _child_key: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1661,5 +1669,62 @@ mod tests {
                 "{bad} was quietly turned into a mode"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // may_parent (invariant 120)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn may_parent_lets_the_listed_key_parent_and_no_other() {
+        let raw = r#"{
+            "units": [{"id": "ops"}],
+            "keys": [
+                {"key_id": "coordinator", "unit": "ops", "may_parent": ["worker-1", "worker-2"]},
+                {"key_id": "worker-1", "unit": "ops"}
+            ]
+        }"#;
+        let map = IdentityMap::parse(raw).expect("loads");
+        assert!(map.may_parent("coordinator", "worker-1"));
+        assert!(
+            map.may_parent("coordinator", "worker-2"),
+            "a listed key the map does not bind"
+        );
+        assert!(!map.may_parent("worker-1", "coordinator"), "one way only");
+        assert!(
+            !map.may_parent("coordinator", "worker-3"),
+            "a key not listed"
+        );
+        assert!(
+            !map.may_parent("ghost", "worker-1"),
+            "a parent key the map does not bind"
+        );
+        assert!(!map.may_parent("coordinator", ""), "no key is never listed");
+    }
+
+    #[test]
+    fn a_blank_or_wildcard_may_parent_entry_is_refused() {
+        for bad in [r#"" ""#, r#""*""#, r#""worker-*""#] {
+            let raw = format!(
+                r#"{{"units": [{{"id": "u"}}],
+                    "keys": [{{"key_id": "k", "unit": "u", "may_parent": [{bad}]}}]}}"#
+            );
+            match IdentityMap::parse(&raw) {
+                Err(LoadError::Invalid(msg)) => assert!(
+                    msg.contains("may_parent"),
+                    "the refusal names the field: {msg}"
+                ),
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_map_without_may_parent_lets_no_key_parent_another() {
+        let raw = r#"{"units": [{"id": "u"}], "keys": [{"key_id": "a", "unit": "u"}, {"key_id": "b", "unit": "u"}]}"#;
+        let map = IdentityMap::parse(raw).expect("loads");
+        assert!(!map.may_parent("a", "b"));
+        assert!(!map.may_parent("b", "a"));
+        assert!(!IdentityMap::default().may_parent("a", "b"));
     }
 }

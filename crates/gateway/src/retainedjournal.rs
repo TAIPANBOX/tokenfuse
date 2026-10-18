@@ -352,7 +352,7 @@ pub fn parse<R: BufRead>(mut reader: R) -> io::Result<ReadReport> {
 /// Read the next line into `buf` without ever holding more than [`MAX_LINE_BYTES`] of it.
 /// `None` at end of input; `Some(true)` for a line that was over the bound (its bytes are
 /// discarded, `buf` is empty).
-fn next_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<bool>> {
+pub(crate) fn next_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<Option<bool>> {
     buf.clear();
     let mut oversized = false;
     let mut any = false;
