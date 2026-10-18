@@ -690,7 +690,7 @@ run_case "pinned-installs: a runner label goes back to -latest" fail \
 # which is the broker's.
 run_case "same-doors: a door configured in one process only" fail \
 	"./scripts/both-processes-configure-the-same-doors.sh" \
-	"$(py 'edit("crates/gateway/src/main.rs", "let chain_proof = tokenfuse_gateway::chainproof::from_env();", "let chain_proof = None;")')" \
+	"$(py 'edit("crates/gateway/src/main.rs", "let chain_proof = tokenfuse_gateway::chainproof::from_env(&broker_client).await;", "let chain_proof = None;")')" \
 	"and not in"
 
 # An exception has to be written in the form the gate reads. A near-miss is how
