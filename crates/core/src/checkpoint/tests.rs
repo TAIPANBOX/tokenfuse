@@ -275,7 +275,7 @@ fn verify_one(
     if !is_signed && keys != unsigned {
         return refuse("members are not v1's");
     }
-    if o["v"] != Value::from(1) {
+    if o["v"] != 1 {
         return refuse("v is not 1");
     }
     if !matches!(o["kind"].as_str(), Some("checkpoint" | "close" | "resume")) {

@@ -1686,6 +1686,31 @@ run_case "identity-source: a token's call told client-key" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::agenttoken::identity_source(self.agent.is_some(),", "crate::agenttoken::identity_source(false && self.agent.is_some(),")')" \
 	"the_policy_plane_is_told_how_the_door_knew_the_agent ... FAILED"
 
+run_case "checkpoints: prefix over the wrong bytes, the LF left out" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact checkpoint::tests::every_64_lines_writes_one_record" \
+	"$(py 'edit("crates/core/src/checkpoint.rs", "self.sum.update(written);", "self.sum.update(&written[..written.len() - 1]);")')" \
+	"every_64_lines_writes_one_record ... FAILED"
+
+run_case "checkpoints: prev not chained to the record before" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact checkpoint::tests::prev_chains_from_genesis_through_every_record_and_across_a_reopen" \
+	"$(py 'edit("crates/core/src/checkpoint.rs", "self.prev = sha256_hex(record);", "")')" \
+	"prev_chains_from_genesis_through_every_record_and_across_a_reopen ... FAILED"
+
+run_case "checkpoints: an unsigned record counted as signed" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact checkpoint::tests::an_unsigned_record_is_written_when_no_key_is_valid_and_counted_as_unsigned" \
+	"$(py 'edit("crates/core/src/checkpoint.rs", "self.stats.unsigned += 1;", "self.stats.signed += 1;")')" \
+	"an_unsigned_record_is_written_when_no_key_is_valid_and_counted_as_unsigned ... FAILED"
+
+run_case "checkpoints: the signature over non-canonical bytes" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact checkpoint::tests::the_signature_covers_the_canonical_signing_input" \
+	"$(py 'edit("crates/core/src/checkpoint.rs", "let sig = key.sign(&signing_input)?;", "let sig = key.sign(&serde_json::to_vec_pretty(&Value::Object(m.clone())).unwrap())?;")')" \
+	"the_signature_covers_the_canonical_signing_input ... FAILED"
+
+run_case "checkpoints: a key used after its statement expired" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact checkpoints::tests::a_key_past_its_statement_is_never_used_and_the_record_is_unsigned" \
+	"$(py 'edit("crates/gateway/src/checkpoints.rs", ".filter(|k| k.not_before <= at && at < k.not_after)", ".filter(|k| k.not_before <= at)")')" \
+	"a_key_past_its_statement_is_never_used_and_the_record_is_unsigned ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

@@ -77,7 +77,7 @@ const FIRST_CERTIFICATION_WITHIN: Duration = Duration::from_secs(10);
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 
-/// What `TOKENFUSE_CHECKPOINT*` configures.
+/// What the six checkpoint variables configure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub dir: PathBuf,
