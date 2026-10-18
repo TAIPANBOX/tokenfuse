@@ -592,12 +592,12 @@ pub enum UpstreamAuth {
 }
 
 impl UpstreamAuth {
-    /// Reads the word `TOKENFUSE_UPSTREAM_AUTH` names. Scaffold: nothing is read yet.
+    /// Reads the upstream auth word an operator set. Scaffold: nothing is read yet.
     pub fn parse(_word: &str) -> Option<UpstreamAuth> {
         None
     }
 
-    /// The header a wire's upstream expects when `TOKENFUSE_UPSTREAM_AUTH` is unset.
+    /// The header a wire's upstream expects when no auth word is set.
     /// Scaffold: every wire gets `x-api-key`.
     pub fn default_for(_wire: crate::wire::Wire) -> UpstreamAuth {
         UpstreamAuth::XApiKey
