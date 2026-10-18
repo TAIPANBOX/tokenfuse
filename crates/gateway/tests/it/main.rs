@@ -50,6 +50,7 @@ mod openrouter_openai_ids_are_priced;
 mod policy_hook_fails_closed_by_default;
 mod policy_plane;
 mod price_book_startup;
+mod protected_resource_metadata;
 mod reasoning_tokens_are_output;
 mod refused_key_on_the_bus;
 mod require_run_id;

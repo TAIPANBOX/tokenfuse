@@ -7902,5 +7902,57 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     and the same names in `sdk/js/test.js`, which run against the stub vouchryx and the stub door of those files.
     Scenarios: `features/the-sdk-holds-an-agent-token.feature`. Not a script gate.)*
 
-126. **The issuer's key set a door verifies against is fetched from a URL and polled, and a door that cannot read it does not start.** `@decided 2026-10-18`, paraphrased: a vouchryx or Keyryx key rotation reaches a running door within a poll, without a restart of every door. `TOKENFUSE_DELEGATION_JWKS_URL` names an absolute http(s) set, which needs `TOKENFUSE_DELEGATION_ISSUER`, and it is mutually exclusive with `TOKENFUSE_DELEGATION_JWKS` (the file form, read once, unchanged). The first fetch must succeed or the process exits 2, because a door holding no keys refuses every delegation while reporting itself as on. A poll that succeeds replaces the held set whole, so a key the set no longer names stops verifying at that poll; a poll that fails, or serves a body that is not a JWKS, has no keys, or is over 4 MiB, keeps the set held. The verifier resolves a `kid` only against the set as it stands at the lookup, and an unknown `kid` is refused even when the one key held would verify the signature. `@claude`, under delegated authority: a default interval of 60 s, which a key rotation's overlap window far outlasts; no age limit on a held set, so an unreachable issuer keeps the keys it has, the cache KEYRYX-DESIGN section 2.6 asks for, which means a removed key keeps verifying until a poll succeeds.
+126. **The broker publishes the protected resource document whenever the agent door is on, and a
+    refused agent token is challenged from configuration.** The MCP authorization specification
+    (revision 2026-07-28) requires an MCP server to publish RFC 9728 protected resource metadata.
+    The broker published it only for XAA (invariant 62), so an agent meeting the broker with its
+    own token (invariant 123) found no document, and a refusal named none. `@decided 2026-10-18`,
+    paraphrased: the document is published whenever the agent-token door is on, and a refused
+    agent token is challenged with the DPoP scheme naming it.
+
+    **What is published.** `crate::resourcemeta::document` builds one document for whichever doors
+    are on. The agent door alone gives `resource` (`TOKENFUSE_DELEGATION_AUDIENCE`),
+    `authorization_servers` (the delegation issuer), `dpop_signing_alg_values_supported` (`ES256`)
+    and `dpop_bound_access_tokens_required` (true under `require`, false under `accept`). XAA alone
+    gives XAA's body unchanged. Both give XAA's body with the agent fields added.
+    `mcpbroker::app` registers the bare well-known route, and for a resource with a path its
+    suffixed twin, once. With both doors off nothing is registered, so the paths answer 404 as they
+    did before.
+
+    **What a refusal says.** A presented agent token that does not verify is answered `401` with
+    `WWW-Authenticate: DPoP algs="ES256", error="invalid_token", resource_metadata="..."`. A call
+    with no credential under `require` gets the same challenge without the `error` parameter. The
+    URL is built from the configured resource, never from a `Host` header. The bodies are the agent
+    door's own, `agent_token_refused` and `agent_token_required`. The LLM door keeps its own
+    challenge, because it is not a protected resource at this level.
+
+    **What the process refuses to start with.** `resourcemeta::startup_refusal`, read by `main.rs`
+    before the listener binds, exits 2 for an agent audience that is not an absolute https URL with
+    a host, no query or fragment, and printable ASCII without a quote or backslash. It also exits 2
+    for XAA on with a resource other than the audience, since one document cannot name two resources.
+
+    `@claude` 2026-10-18, choices the brief left open, open to reversal: the challenge takes its
+    origin and path from the configured resource, not from `TOKENFUSE_DELEGATION_URL` (RFC 9728
+    section 3.1, and the XAA precedent); `error="invalid_token"` goes only with a presented token
+    (RFC 6750 section 3.1); XAA and the agent door share one document, which never says bound tokens
+    are required, because XAA's bearer tokens are unbound and `require` admits them; and an audience
+    that is not https is refused at startup, which is breaking for a deployment with an opaque
+    audience.
+
+    **Where it says nothing.** The document names one resource, so a broker that serves several is
+    not covered. The challenge points at the document and nothing more: the authorization server's
+    own metadata is not served here. With XAA on and `require`, a call with no credential now gets
+    the agent challenge and body instead of the XAA ones.
+    *(test: `crates/gateway/tests/it/protected_resource_metadata.rs`, sixteen, among them
+    `a_refused_token_is_challenged_with_dpop_and_invalid_token`,
+    `with_xaa_the_document_adds_the_agent_fields_and_never_requires_bound_tokens`,
+    `an_agent_audience_that_is_not_https_refuses_to_start` and
+    `an_xaa_resource_that_differs_from_the_agent_audience_refuses_to_start`, the last two over the
+    real binary; `resourcemeta::tests`, nine. Red first on 4c9c8ef, CI run 39149651145: eight of the
+    nine unit tests failed on their assertions, and the integration binary did not run because cargo
+    stopped at the library binary. Scenarios: `features/a-protected-resource-document-names-the-agent-door.feature`,
+    seven, each bound. Not a script gate: the rule is `resourcemeta` and the routes in
+    `mcpbroker::app`, held by `cargo test`.)*
+
+127. **The issuer's key set a door verifies against is fetched from a URL and polled, and a door that cannot read it does not start.** `@decided 2026-10-18`, paraphrased: a vouchryx or Keyryx key rotation reaches a running door within a poll, without a restart of every door. `TOKENFUSE_DELEGATION_JWKS_URL` names an absolute http(s) set, which needs `TOKENFUSE_DELEGATION_ISSUER`, and it is mutually exclusive with `TOKENFUSE_DELEGATION_JWKS` (the file form, read once, unchanged). The first fetch must succeed or the process exits 2, because a door holding no keys refuses every delegation while reporting itself as on. A poll that succeeds replaces the held set whole, so a key the set no longer names stops verifying at that poll; a poll that fails, or serves a body that is not a JWKS, has no keys, or is over 4 MiB, keeps the set held. The verifier resolves a `kid` only against the set as it stands at the lookup, and an unknown `kid` is refused even when the one key held would verify the signature. `@claude`, under delegated authority: a default interval of 60 s, which a key rotation's overlap window far outlasts; no age limit on a held set, so an unreachable issuer keeps the keys it has, the cache KEYRYX-DESIGN section 2.6 asks for, which means a removed key keeps verifying until a poll succeeds.
     *(test: `keysfeed::tests::naming_no_key_url_leaves_the_file_behaviour_alone`, `a_key_url_together_with_a_key_file_refuses_to_start`, `a_key_url_with_no_issuer_refuses_to_start`, `a_key_url_that_is_not_absolute_http_is_refused`, `the_interval_defaults_and_a_bad_one_is_refused`, `an_empty_or_unparsable_key_set_is_never_installed`, `a_key_set_over_the_size_cap_is_refused_before_it_is_read`, `a_first_fetch_that_fails_refuses_to_start`, `a_poll_installs_the_set_the_server_now_holds`, `a_removed_key_stops_verifying_after_a_poll`, `a_failed_poll_keeps_the_keys_already_held`, all in `gateway::keysfeed`; `delegation::key_source_tests::a_key_the_live_set_names_verifies_and_a_different_key_under_its_kid_does_not`, `an_unknown_kid_is_refused_even_when_the_only_key_held_would_verify` and `a_key_the_set_no_longer_names_stops_verifying`. Red first on the test-only commit 5ea3b20. Scenarios: `features/a-delegation-key-set-is-polled.feature`, twelve, each bound. Not a script gate: held by `cargo test`.)*

@@ -582,6 +582,18 @@ async fn mcp_broker() {
             "agent-token door: ON, an agent's own token is a door credential here"
         );
     }
+    // One protected resource document names one resource (RFC 9728 section 2), and
+    // this process alone publishes it: the agent door's audience must be a URL it
+    // can name, and XAA's resource, when XAA is on, must be that same URL. Refused
+    // here, before the listener binds.
+    let agent_door = tokenfuse_gateway::resourcemeta::agent_door(&chain_proof, &agent_tokens);
+    if let Some(refusal) = tokenfuse_gateway::resourcemeta::startup_refusal(
+        agent_door.as_ref(),
+        xaa.as_ref().map(|x| x.resource.as_str()),
+    ) {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
     // The broker's own key for relaying an agent token to the taint gateway's
     // check (invariant 123), from a file; a file it cannot use refuses to start.
     let taint_gateway_key = tokenfuse_gateway::defaults::exit_on_refusal(
