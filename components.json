@@ -260,7 +260,13 @@
           "TOKENFUSE_UPSTREAM": {
             "required": false
           },
+          "TOKENFUSE_UPSTREAM_AUTH": {
+            "required": false
+          },
           "TOKENFUSE_UPSTREAM_CONNECT_TIMEOUT_SECS": {
+            "required": false
+          },
+          "TOKENFUSE_UPSTREAM_KEY_FILE": {
             "required": false
           },
           "TOKENFUSE_URL": {
