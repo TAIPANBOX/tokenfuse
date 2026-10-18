@@ -2428,6 +2428,7 @@ fn judge_model_tool_calls(
     st: &AppState,
     labels: &Labels,
     resp_tools: &[String],
+    resp_args: &[serde_json::Value],
     blocked_row: impl FnOnce() -> CallRecord,
     event_agent_id: &str,
     run_id: &str,
@@ -2441,7 +2442,15 @@ fn judge_model_tool_calls(
     let requested =
         taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
-    if let Some(verdict) = taint::evaluate(labels, &requested, &st.firewall.rules) {
+    // A read after private data is judged on what its arguments carry (design 4.2,
+    // invariant 120). `evaluate` never refuses it on its labels alone.
+    let pii_blocks = st.dlp_pii == DlpMode::Block;
+    let verdict = taint::evaluate(labels, &requested, &st.firewall.rules).or_else(|| {
+        resp_args.iter().find_map(|a| {
+            taint::read_argument_verdict(labels, &requested, a, pii_blocks, &st.firewall.rules)
+        })
+    });
+    if let Some(verdict) = verdict {
         let reason = verdict.reason();
         if st.firewall.mode == FirewallMode::Enforce {
             st.sink.record(blocked_row());
@@ -2633,6 +2642,10 @@ fn stream_managed(
                 &fw_state,
                 &firewall_labels,
                 &held.tools,
+                // The streamed hold keeps tool NAMES only, not their arguments
+                // (streamgate::tool_names), so a streamed read is not yet judged on
+                // what it carries. Named as a gap in invariant 120.
+                &[],
                 move || CallRecord { ts_millis: now_millis(), ..blocked_row },
                 &ev_agent_id,
                 &ev_run_id,
@@ -2814,10 +2827,12 @@ async fn buffered_managed(
         let resp_json: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         let resp_tools = taint::tool_names_in(&resp_json);
+        let resp_args = taint::tool_arguments_in(&resp_json);
         let verdict = judge_model_tool_calls(
             st,
             &firewall_labels,
             &resp_tools,
+            &resp_args,
             // The call already happened and its real cost was recorded as
             // "allow" above — this second record is the security verdict
             // that blocks the *response* from reaching the caller, so it
