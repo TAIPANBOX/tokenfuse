@@ -304,8 +304,11 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **2087 passing** (core 433, dpop 21, delegation 60,
-gateway 1285, cloud 287, umbrella 1, by `cargo test -p <crate>`). Gateway grew by 25 with run
+`cargo test --all` runs **2133 passing** (core 433, dpop 23, delegation 72,
+gateway 1317, cloud 287, umbrella 1, by `cargo test -p <crate>`). The agent's own token at every
+door (invariants 123 and 124) adds 46: 2 in `dpop`, 12 in `delegation`, and in `gateway` 6 unit tests
+(`agenttoken`, `chainproof`, `mcpbroker`) and 26 in `tests/it`; counted from the diff against
+main, 2087. Gateway grew by 25 with run
 ownership across credentials (invariant 120: 8 in `gateway::runowners`, 3 in
 `gateway::identitymap`, 14 in `tests/it`; counted from the diff against main, 2041). The read-tool judgement of invariant 121 adds 21 more: 11 in `core::taint` and 10 in `gateway::firewall`, counted from the diff against main, 2066. Before that,
 core grew by 5 and gateway by 41

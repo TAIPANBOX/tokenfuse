@@ -181,8 +181,7 @@ pub struct VerifiedProof {
 /// the holder made for one of its tokens is good beside any other token bound
 /// to the same key. The door that holds the token computes this and compares.
 pub fn access_token_hash(token: &str) -> String {
-    let _ = token;
-    String::new()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
 /// Why a proof was refused.
@@ -303,11 +302,17 @@ pub fn verify_proof(
     if jti.is_empty() || jti.len() > MAX_JTI_BYTES {
         return Err(ProofRefusal::WrongRequest);
     }
+    // RFC 9449 4.2's `ath`, read and handed back, never judged here: only the
+    // caller holds the token it must name.
+    let ath = claims
+        .get("ath")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(VerifiedProof {
         jkt: thumbprint(jwk).ok_or(ProofRefusal::BadSignature)?,
         jti: jti.to_string(),
-        ath: None,
+        ath,
     })
 }
 

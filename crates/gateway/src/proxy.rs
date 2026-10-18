@@ -1075,7 +1075,7 @@ async fn handle_call(
     // A call an agent token admitted is refused on a mismatch in every strict
     // mode: the token is not a claim to warn about.
     let identity_strict = if caller.agent.is_some() {
-        caller.strict_for_tokens(st.identity_strict)
+        StrictMode::Enforce
     } else {
         st.identity_strict
     };
@@ -2980,19 +2980,20 @@ impl Caller {
         self.agent.as_ref().map(|a| a.subject.clone())
     }
 
-    /// Whether this request proved possession of a key at the door.
+    /// Whether this request proved possession of a key at the door: an agent
+    /// token is admitted only with its holder's proof (invariant 116's
+    /// `dpop-key`).
     pub fn proved_possession(&self) -> bool {
-        false
+        self.agent.is_some()
     }
 
-    /// The `identity_source` wardryx is told: how the door knew the agent.
+    /// The `identity_source` wardryx is told: how the door knew the agent,
+    /// from the door and never from a header (invariant 124).
     pub fn identity_source(&self) -> Option<String> {
-        None
-    }
-
-    /// The strict mode an agent-token caller's mismatch is judged under.
-    pub fn strict_for_tokens(&self, configured: StrictMode) -> StrictMode {
-        configured
+        Some(
+            crate::agenttoken::identity_source(self.agent.is_some(), !self.key_id.is_empty())
+                .to_string(),
+        )
     }
 }
 
@@ -3047,6 +3048,13 @@ pub(crate) fn resolve_caller(
                 principal,
                 agent: Some(agent),
             })
+        }
+        // `require` (invariant 123): every static key is refused, and so is a
+        // call with no credential, because the door that would admit it is the
+        // one this mode closes.
+        crate::agenttoken::Door::NotPresented if crate::agenttoken::required(&st.agent_tokens) => {
+            st.keystats.record_unauthorized();
+            Err(crate::agenttoken::required_response())
         }
         crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers) {
             Some(key_id) => Ok(Caller {

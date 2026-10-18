@@ -270,6 +270,12 @@ pub fn verify_delegation(
     now: i64,
     revoked: impl Fn(&str, &str, i64) -> bool,
 ) -> Result<VerifiedDelegation, Refusal> {
+    // An agent's own token acts for nobody and is never a delegation chain,
+    // even though its claims would read as a chain of one: `typ` decides,
+    // both ways (see [`AGENT_TOKEN_TYP`]).
+    if is_agent_token(token) {
+        return Err(Refusal::Malformed);
+    }
     let claims: DelegationClaims = decode_claims(cfg, token, false)?;
 
     if now >= claims.exp {
@@ -510,8 +516,80 @@ pub fn is_agent_token(token: &str) -> bool {
         .is_some_and(|t| t == AGENT_TOKEN_TYP)
 }
 
+#[derive(Deserialize)]
+struct AgentClaims {
+    #[serde(default)]
+    sub: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    jti: String,
+    #[serde(default)]
+    iat: i64,
+    exp: i64,
+    #[serde(default)]
+    cnf: Option<Confirmation>,
+    /// Read only to refuse it: an agent token acts for nobody.
+    #[serde(default)]
+    act: Option<serde_json::Value>,
+    #[serde(default)]
+    unit: String,
+    #[serde(default)]
+    org: String,
+}
+
+/// Every check an agent token is held to before its proof, shared by the door
+/// that sees the proof and the one a token is relayed to: `typ`, the key the
+/// `kid` names and the algorithm from its type, the signature, the exact `iss`,
+/// the REQUIRED exact `aud` (an empty configured audience refuses everything),
+/// `exp` with [`AGENT_TOKEN_LEEWAY_SECS`], `iat` no further ahead than that,
+/// `sub` an `agent://` URI equal to `client_id`, a `jti`, no `act`, and a
+/// `cnf.jkt` to bind it. Returns the claims and the bound thumbprint.
+fn agent_claims(
+    cfg: &DelegationConfig,
+    token: &str,
+    now: i64,
+) -> Result<(AgentClaims, String), Refusal> {
+    let typ = decode_header(token).map_err(|_| Refusal::Malformed)?.typ;
+    if typ.as_deref() != Some(AGENT_TOKEN_TYP) {
+        return Err(Refusal::Malformed);
+    }
+    let claims: AgentClaims = decode_claims(cfg, token, true)?;
+    if now >= claims.exp.saturating_add(AGENT_TOKEN_LEEWAY_SECS) {
+        return Err(Refusal::Expired);
+    }
+    if claims.iat > now.saturating_add(AGENT_TOKEN_LEEWAY_SECS) {
+        return Err(Refusal::NotYetValid);
+    }
+    let names_an_agent = claims
+        .sub
+        .strip_prefix("agent://")
+        .is_some_and(|rest| !rest.is_empty());
+    if !names_an_agent
+        || claims.client_id != claims.sub
+        || claims.jti.is_empty()
+        || claims.act.is_some()
+    {
+        return Err(Refusal::Malformed);
+    }
+    let jkt = claims
+        .cnf
+        .as_ref()
+        .map(|c| c.jkt.clone())
+        .filter(|j| !j.is_empty())
+        .ok_or(Refusal::NotBound)?;
+    Ok((claims, jkt))
+}
+
 /// Verify an agent's own access token and the proof presented with it, at a
 /// door (WAVE1-DESIGN 1.4 and 1.5).
+///
+/// [`agent_claims`]'s checks, then the binding, RFC 9449 section 4.2's `ath`
+/// (the proof must name THIS token, so a proof the holder made beside one of
+/// its tokens is no good beside another), and the revocation hook for the
+/// token's `jti` and its agent, last, as [`verify_delegation`] asks it. Making
+/// the proof single-use is the door's: it holds the cache, and gets the proof's
+/// `jti` in [`VerifiedAgent::proof_jti`].
 pub fn verify_agent_token(
     cfg: &DelegationConfig,
     token: &str,
@@ -521,31 +599,61 @@ pub fn verify_agent_token(
     now: i64,
     revoked: impl Fn(&str, &str, i64) -> bool,
 ) -> Result<VerifiedAgent, Refusal> {
-    // Scaffold: until the agent-token rules land, such a token reaches the
-    // delegation path, which is what a door does with it today.
-    let v = verify_delegation(cfg, token, proof, method, url, now, revoked)?;
+    let (claims, jkt) = agent_claims(cfg, token, now)?;
+    let presented = match proof {
+        None => return Err(Refusal::NoProof),
+        Some(p) => {
+            tokenfuse_dpop::verify_proof(p, method, url, now).map_err(|_| Refusal::WrongKey)?
+        }
+    };
+    if presented.jkt != jkt {
+        return Err(Refusal::WrongKey);
+    }
+    if presented.ath.as_deref() != Some(tokenfuse_dpop::access_token_hash(token).as_str()) {
+        return Err(Refusal::WrongKey);
+    }
+    if revoked(&claims.jti, &claims.sub, claims.iat) {
+        return Err(Refusal::Revoked);
+    }
     Ok(VerifiedAgent {
-        subject: v.subject,
-        unit: String::new(),
-        org: String::new(),
-        jti: v.jti,
-        jkt: v.jkt,
-        proof_jti: v.proof_jti,
-        issued_at: v.issued_at,
-        expires_at: v.expires_at,
+        subject: claims.sub,
+        unit: claims.unit,
+        org: claims.org,
+        jti: claims.jti,
+        jkt,
+        proof_jti: presented.jti,
+        issued_at: claims.iat,
+        expires_at: claims.exp,
     })
 }
 
 /// Verify an agent token another door of this deployment already verified
 /// WITH its proof, relayed here by a credential that door holds.
+///
+/// Every check [`verify_agent_token`] makes except the proof: the token is
+/// still bound (`cnf.jkt` present), still in its life, still for this
+/// audience, and still not revoked. The caller decides who may relay; this
+/// function only knows that nobody here can check the proof again.
 pub fn verify_relayed_agent_token(
-    _cfg: &DelegationConfig,
-    _token: &str,
-    _now: i64,
-    _revoked: impl Fn(&str, &str, i64) -> bool,
+    cfg: &DelegationConfig,
+    token: &str,
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
 ) -> Result<VerifiedAgent, Refusal> {
-    // Scaffold: today a bound token with no proof is refused.
-    Err(Refusal::NoProof)
+    let (claims, jkt) = agent_claims(cfg, token, now)?;
+    if revoked(&claims.jti, &claims.sub, claims.iat) {
+        return Err(Refusal::Revoked);
+    }
+    Ok(VerifiedAgent {
+        subject: claims.sub,
+        unit: claims.unit,
+        org: claims.org,
+        jti: claims.jti,
+        jkt,
+        proof_jti: String::new(),
+        issued_at: claims.iat,
+        expires_at: claims.exp,
+    })
 }
 
 /// The delegation chain: the subject, then the actors, root first.

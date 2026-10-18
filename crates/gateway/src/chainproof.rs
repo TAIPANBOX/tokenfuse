@@ -176,7 +176,6 @@ pub fn resolve(
     revoked: impl Fn(&str, &str, i64) -> bool,
     tokens: &crate::agenttoken::Tokens,
 ) -> Chain {
-    let _ = tokens;
     let (Some(proving), Some(token)) = (cfg.as_ref(), token) else {
         // Either the operator configured no issuer, or the caller presented no
         // token. Both mean the same thing to the PDP and neither is an error:
@@ -205,6 +204,22 @@ pub fn resolve(
             | Refusal::NotYetValid),
         ) => return Chain::Refused(ChainRefusal::BadToken(reason)),
     };
+
+    // With agent tokens on (invariant 123), every proof this process verifies
+    // is held to the agent-token door's rules: one that names an access token
+    // must name this one, and none is good twice. Off, nothing here changes.
+    if let Some(tokens) = tokens.as_ref() {
+        let names_another = verified
+            .proof_ath
+            .as_deref()
+            .is_some_and(|ath| ath != tokenfuse_dpop::access_token_hash(token));
+        if names_another {
+            return Chain::Refused(ChainRefusal::BadToken(Refusal::WrongKey));
+        }
+        if !tokens.first_use(&verified.proof_jti, now) {
+            return Chain::Refused(ChainRefusal::Replayed);
+        }
+    }
 
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
         return Chain::Refused(ChainRefusal::Contradicted);

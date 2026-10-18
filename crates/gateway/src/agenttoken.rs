@@ -125,8 +125,48 @@ pub fn from_values(
     proving: Option<&crate::chainproof::Proving>,
     revocations: &crate::revocations::Wanted,
 ) -> Result<Tokens, String> {
-    let _ = (value, proving, revocations);
-    Ok(None)
+    let mode = match crate::defaults::switch_word(SWITCH, value, WORDS)? {
+        None | Some("off") => return Ok(None),
+        Some("require") => Mode::Require,
+        Some(_) => Mode::Accept,
+    };
+    let on = mode.as_str();
+    let Some(proving) = proving else {
+        return Err(format!(
+            "tokenfuse: {SWITCH}={on} verifies each agent token against the delegation door, \
+             and none is configured: set TOKENFUSE_DELEGATION_ISSUER, TOKENFUSE_DELEGATION_JWKS \
+             and TOKENFUSE_DELEGATION_URL (vouchryx's issuer, its key set, and this process's \
+             public origin)"
+        ));
+    };
+    if proving.cfg.audience.trim().is_empty() {
+        return Err(format!(
+            "tokenfuse: {SWITCH}={on} needs TOKENFUSE_DELEGATION_AUDIENCE, this process's own \
+             resource: an empty audience would accept a token minted for any resource"
+        ));
+    }
+    match revocations {
+        crate::revocations::Wanted::On {
+            fail_mode: tokenfuse_delegation::revocations::FailMode::Closed,
+            ..
+        } => {}
+        crate::revocations::Wanted::On { .. } => {
+            return Err(format!(
+                "tokenfuse: {SWITCH}={on} needs a revocation list that fails closed: \
+                 TOKENFUSE_DELEGATION_REVOCATIONS_FAILMODE=open would honour a stopped agent \
+                 while the list cannot be read"
+            ));
+        }
+        crate::revocations::Wanted::Off => {
+            return Err(format!(
+                "tokenfuse: {SWITCH}={on} needs TOKENFUSE_DELEGATION_REVOCATIONS, vouchryx's \
+                 revocation list: without it an agent stopped there keeps working here until \
+                 its token expires"
+            ));
+        }
+        crate::revocations::Wanted::Refused(why) => return Err(why.clone()),
+    }
+    Ok(Some(Arc::new(AgentTokens::new(mode))))
 }
 
 /// [`from_values`] against the process environment; exits 2 on a refusal,
@@ -172,8 +212,52 @@ pub fn admit(
     path: &str,
     now: i64,
 ) -> Door {
-    let _ = (tokens, proving, feed, headers, path, now);
-    Door::NotPresented
+    let (Some(tokens), Some(proving)) = (tokens.as_ref(), proving.as_ref()) else {
+        return Door::NotPresented;
+    };
+    let Some(token) = agent_token_in(headers) else {
+        return Door::NotPresented;
+    };
+    if headers.contains_key(crate::clientkeys::CLIENT_KEY_HEADER) {
+        return Door::Refused(Why::BesideAKey);
+    }
+    let proof = headers
+        .get(crate::mcpdoor::PROOF_HEADER)
+        .and_then(|v| v.to_str().ok());
+    // The origin is the deployment's, the path the route's: never a `Host`
+    // header, which the caller writes (invariant 30's `htu` rule).
+    let url = format!("{}{}", proving.origin.trim_end_matches('/'), path);
+    let agent = match tokenfuse_delegation::verify_agent_token(
+        &proving.cfg,
+        token,
+        proof,
+        "POST",
+        &url,
+        now,
+        crate::revocations::hook(feed, now),
+    ) {
+        Ok(agent) => agent,
+        Err(refusal) => return Door::Refused(Why::Token(refusal)),
+    };
+    admitted(tokens, agent, now)
+}
+
+/// The checks after a token verified, shared by both ways in: an agent id the
+/// records accept, and a proof used once (none for a relayed token).
+fn admitted(tokens: &AgentTokens, agent: VerifiedAgent, now: i64) -> Door {
+    if !tokenfuse_core::agent_event::is_canonical_agent_id(&agent.subject) {
+        return Door::Refused(Why::NotCanonical);
+    }
+    if !agent.proof_jti.is_empty() && !tokens.first_use(&agent.proof_jti, now) {
+        return Door::Refused(Why::Replayed);
+    }
+    Door::Admitted(agent)
+}
+
+/// The agent token in `Authorization: DPoP`, when that is what it holds.
+fn agent_token_in(headers: &HeaderMap) -> Option<&str> {
+    crate::chainproof::dpop_credential(headers.get("authorization").and_then(|v| v.to_str().ok()))
+        .filter(|t| tokenfuse_delegation::is_agent_token(t))
 }
 
 /// Judge an agent token the MCP broker relays to the tool-call check beside
@@ -185,21 +269,43 @@ pub fn relayed(
     headers: &HeaderMap,
     now: i64,
 ) -> Door {
-    let _ = (tokens, proving, feed, headers, now);
-    Door::NotPresented
+    let (Some(tokens), Some(proving)) = (tokens.as_ref(), proving.as_ref()) else {
+        return Door::NotPresented;
+    };
+    let Some(token) = agent_token_in(headers) else {
+        return Door::NotPresented;
+    };
+    match tokenfuse_delegation::verify_relayed_agent_token(
+        &proving.cfg,
+        token,
+        now,
+        crate::revocations::hook(feed, now),
+    ) {
+        Ok(agent) => admitted(tokens, agent, now),
+        Err(refusal) => Door::Refused(Why::Token(refusal)),
+    }
 }
 
 /// Whether the request carries a token that declares itself an agent token
 /// in `Authorization: DPoP`. Read unverified: it picks a path, nothing more.
 pub fn carries_agent_token(headers: &HeaderMap) -> bool {
-    crate::chainproof::dpop_credential(headers.get("authorization").and_then(|v| v.to_str().ok()))
-        .is_some_and(tokenfuse_delegation::is_agent_token)
+    agent_token_in(headers).is_some()
 }
 
 /// The word wardryx is told, from the door that admitted the call.
+///
+/// `@claude` 2026-10-18: any door credential that is not an agent token (a
+/// static key, the broker's CIMD proof door, an XAA bearer token) is
+/// `client-key`, the word wardryx has for a credential vouchryx did not mint
+/// to this agent; `none` is a door that authenticated nobody.
 pub fn identity_source(agent_token: bool, credential: bool) -> &'static str {
-    let _ = (agent_token, credential);
-    IDENTITY_NONE
+    if agent_token {
+        IDENTITY_AGENT_TOKEN
+    } else if credential {
+        IDENTITY_CLIENT_KEY
+    } else {
+        IDENTITY_NONE
+    }
 }
 
 /// The identity check for a call an agent token admitted.
@@ -208,7 +314,21 @@ pub fn contradiction(
     agent: &VerifiedAgent,
     header_agent: &str,
 ) -> Option<crate::identitymap::Mismatch> {
-    let _ = (map, agent, header_agent);
+    let header_agent = header_agent.trim();
+    if !header_agent.is_empty() && header_agent != agent.subject {
+        return Some(crate::identitymap::Mismatch {
+            reason: AGENT_CONTRADICTS_TOKEN,
+        });
+    }
+    // The map may name the agent's unit; where it does, the token's must be
+    // one of the units it names. A map that names the agent nowhere has no
+    // say, and the token's unit stands.
+    let units = map.units_naming(&agent.subject);
+    if !units.is_empty() && !units.contains(&agent.unit.as_str()) {
+        return Some(crate::identitymap::Mismatch {
+            reason: UNIT_CONTRADICTS_MAP,
+        });
+    }
     None
 }
 

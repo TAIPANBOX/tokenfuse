@@ -1591,6 +1591,56 @@ run_case "run-ownership: the parent the ledger holds is not checked" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "    if parent.is_none() && !parent_run_id.is_empty() {", "    if false && parent.is_none() && !parent_run_id.is_empty() {")')" \
 	"a_parent_held_by_the_ledger_is_checked_when_the_header_is_omitted ... FAILED"
 
+# --- invariants 123 and 124: an agent's own token at every door ------------
+#
+# Product mutants, held by cargo test: each is a way the agent-token door
+# admits a token it should refuse, or lets a header or a static key back in.
+# The first is the both-processes gate's case for the new switch.
+run_case "agent-tokens: the door read in one process only" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);\n", "    let agent_tokens: tokenfuse_gateway::agenttoken::Tokens = None;\n")')" \
+	"agenttoken"
+
+run_case "agent-tokens: typ unchecked, a delegation token read as an agent token" fail \
+	"cargo test -p tokenfuse-delegation --lib -- --exact tests::a_delegation_token_is_never_an_agent_token_and_the_reverse" \
+	"$(py 'edit("crates/delegation/src/lib.rs", "    if typ.as_deref() != Some(AGENT_TOKEN_TYP) {", "    if false && typ.as_deref() != Some(AGENT_TOKEN_TYP) {")')" \
+	"a_delegation_token_is_never_an_agent_token_and_the_reverse ... FAILED"
+
+run_case "agent-tokens: the proof's ath skipped" fail \
+	"cargo test -p tokenfuse-delegation --lib -- --exact tests::a_proof_that_does_not_name_this_token_is_refused" \
+	"$(py 'edit("crates/delegation/src/lib.rs", "    if presented.ath.as_deref() != Some(", "    if false && presented.ath.as_deref() != Some(")')" \
+	"a_proof_that_does_not_name_this_token_is_refused ... FAILED"
+
+run_case "agent-tokens: the replay cache bypassed at the LLM door" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_replayed_agent_token_proof_is_refused_the_second_time" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if !agent.proof_jti.is_empty() && !tokens.first_use(", "    if false && !agent.proof_jti.is_empty() && !tokens.first_use(")')" \
+	"a_replayed_agent_token_proof_is_refused_the_second_time ... FAILED"
+
+run_case "agent-tokens: the revocation hook not passed" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_revoked_agent_is_refused_at_the_door" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "        crate::revocations::hook(feed, now),", "        crate::revocations::hook(&feed.clone().filter(|_| false), now),")')" \
+	"a_revoked_agent_is_refused_at_the_door ... FAILED"
+
+run_case "agent-tokens: the header's agent not compared with the token's" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_header_naming_another_agent_beside_its_token_is_refused_whatever_the_strict_mode" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if !header_agent.is_empty() && header_agent != agent.subject {", "    if false && !header_agent.is_empty() && header_agent != agent.subject {")')" \
+	"a_header_naming_another_agent_beside_its_token_is_refused_whatever_the_strict_mode ... FAILED"
+
+run_case "agent-tokens: require lets a static key in" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::require_refuses_a_static_key_and_admits_an_agent_token" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "Door::NotPresented if crate::agenttoken::required(&st.agent_tokens) => {", "Door::NotPresented if false && crate::agenttoken::required(&st.agent_tokens) => {")')" \
+	"require_refuses_a_static_key_and_admits_an_agent_token ... FAILED"
+
+run_case "agent-tokens: an empty audience accepted at startup" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact agenttoken::tests::agent_tokens_on_need_the_door_a_named_audience_and_a_list_that_fails_closed" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if proving.cfg.audience.trim().is_empty() {", "    if false && proving.cfg.audience.trim().is_empty() {")')" \
+	"agent_tokens_on_need_the_door_a_named_audience_and_a_list_that_fails_closed ... FAILED"
+
+run_case "identity-source: a token's call told client-key" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::the_policy_plane_is_told_how_the_door_knew_the_agent" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::agenttoken::identity_source(self.agent.is_some(),", "crate::agenttoken::identity_source(false && self.agent.is_some(),")')" \
+	"the_policy_plane_is_told_how_the_door_knew_the_agent ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

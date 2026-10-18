@@ -539,6 +539,31 @@ pub fn refuse_unscoped_secrets(vault: &SecretVault, require_scopes: bool) -> Opt
     ))
 }
 
+/// The broker's own gateway client key, read from the file
+/// `TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE` names (invariant 123): `Ok(None)`
+/// when the variable is unset or blank, the trimmed first line otherwise, and
+/// `Err` naming the variable and the path, never the key, when the file cannot
+/// be read or holds nothing. A file and never a plain value, so the key is not
+/// in the process's environment or a command line.
+pub fn taint_gateway_key_from(
+    path: Option<&str>,
+    read: impl FnOnce(&str) -> std::io::Result<String>,
+) -> Result<Option<String>, String> {
+    let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let raw = read(path).map_err(|e| {
+        format!("tokenfuse: TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE ({path}) cannot be read: {e}")
+    })?;
+    let key = raw.lines().next().unwrap_or_default().trim().to_string();
+    if key.is_empty() {
+        return Err(format!(
+            "tokenfuse: TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE ({path}) holds no key"
+        ));
+    }
+    Ok(Some(key))
+}
+
 /// The startup warning for a broker with BOTH doors configured and the bearer
 /// one still open, or `None` when there is nothing to say.
 ///
@@ -1241,7 +1266,9 @@ async fn handle(
                 // A client key beside an XAA token is refused above.
                 gateway_key: None,
                 gateway_token: None,
-                identity_source: None,
+                // A credential vouchryx minted for a person and an agent, not
+                // the agent's own token.
+                identity_source: Some(crate::agenttoken::IDENTITY_CLIENT_KEY.to_string()),
             };
             return finish(&st, req, ctx).await;
         }
@@ -1298,6 +1325,16 @@ async fn handle(
         crate::mcpdoor::Admission::Bearer(key_id) => (format!("key:{key_id}"), false),
         crate::mcpdoor::Admission::Open => (String::new(), false),
     };
+    // `require` (invariant 123) closes the static key door and the open one; a
+    // client that proved possession of a key it published stays admitted.
+    if crate::agenttoken::required(&st.agent_tokens) && !door_proof {
+        tracing::warn!(
+            "mcp broker: refused a call with no agent token while TOKENFUSE_AGENT_TOKENS=require"
+        );
+        return unauthorized(&st);
+    }
+    let identity_source =
+        crate::agenttoken::identity_source(false, !principal.is_empty()).to_string();
     // The same parse and the same cap as the LLM door (tokenfuse#297): a
     // chain longer than SPEC 5.1 allows is refused here, before the chain is
     // resolved, the policy asked or the upstream reached, with the LLM path's
@@ -1365,7 +1402,7 @@ async fn handle(
         principal,
         gateway_key: header(CLIENT_KEY_HEADER),
         gateway_token: None,
-        identity_source: None,
+        identity_source: Some(identity_source),
     };
     finish(&st, req, ctx).await
 }
@@ -1476,6 +1513,17 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
     // ask with, by design: one would make it an oracle for every run.
     if let Some(key) = ctx.gateway_key.as_deref() {
         req = req.header(CLIENT_KEY_HEADER, key);
+    } else if let (Some(token), Some(key)) = (
+        ctx.gateway_token.as_deref(),
+        st.taint_gateway_key.as_deref(),
+    ) {
+        // A call an agent token admitted: the broker's own key and the
+        // caller's token, which the check verifies again (all but the proof
+        // this broker already checked) and answers about the token's runs
+        // only (invariant 123).
+        req = req
+            .header(CLIENT_KEY_HEADER, key)
+            .header("authorization", format!("DPoP {token}"));
     }
     // An answer outside 2xx is no answer. It used to be read as JSON like any
     // other, and a gateway's `401 {"error":"unauthorized"}` carries no
@@ -2795,5 +2843,31 @@ mod tests {
             None,
             "the default asks for nothing and refuses nothing"
         );
+    }
+
+    /// The broker's own gateway key comes from a file: unset is no key, a
+    /// file is its first line trimmed, and a file that cannot be read or holds
+    /// nothing refuses with the variable and the path and never the key.
+    #[test]
+    fn the_brokers_own_gateway_key_is_read_from_a_file_and_never_named() {
+        assert_eq!(taint_gateway_key_from(None, |_| unreachable!()), Ok(None));
+        assert_eq!(
+            taint_gateway_key_from(Some("  "), |_| unreachable!()),
+            Ok(None)
+        );
+        assert_eq!(
+            taint_gateway_key_from(Some("/k"), |_| Ok("  sk-broker-1  \nrest\n".to_string())),
+            Ok(Some("sk-broker-1".to_string()))
+        );
+        let empty = taint_gateway_key_from(Some("/k"), |_| Ok("\n".to_string())).unwrap_err();
+        assert!(
+            empty.contains("TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE"),
+            "{empty}"
+        );
+        let gone = taint_gateway_key_from(Some("/nope"), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap_err();
+        assert!(gone.contains("/nope"), "{gone}");
     }
 }

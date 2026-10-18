@@ -7609,7 +7609,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 
     `crate::runowners` is the one place. A principal is the credential the door verified, never a
     header: `key:<key_id>` for a static client key, `tok:<subject>` for an agent token (named here so
-    a key and a token sharing a name are two principals; no door produces a token principal yet).
+    a key and a token sharing a name are two principals; since invariant 123 the agent-token door
+    produces one).
     With client keys off the principal is empty, nothing is recorded and nothing is refused.
     `proxy::handle_call` claims the run (`RunOwners::claim`, first claim wins) before it reads or
     writes anything of it: the budget, the tool blocks, the seed gate, the taint, the ledger. A
@@ -7659,8 +7660,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     the coordinator's key lists the worker's under `may_parent`.
 
     **Where it says nothing.** The delegated arm for agent tokens (a verified token chain naming the
-    parent owner's agent) is not built: no door produces a token principal yet, and the token door
-    is its own change. A first claim and a second call of the same new run by its owner can race,
+    parent owner's agent) is not built: the agent-token door (invariant 123) admits an agent's own
+    token, which acts for nobody, and a delegation token is not a door credential. A first claim and a second call of the same new run by its owner can race,
     and the second may be admitted before the first's line is synced, so a crash in that window
     loses the owner. The owner map and the journal are bounded by nothing but the run ids
     authenticated callers send, as the ledger is. A first key that names a run id before its real
@@ -7737,3 +7738,111 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
    the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
    refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
+
+123. **An agent's own token is a door credential at every door, and the agent, its unit and its run
+    principal come from the token, never from a header.** The agent-security review of 2026-10-17
+    (F-001, F-005) found an agent's identity was the `x-fuse-agent-id` header at every door on every
+    launcher; the strongest credential was a static key one namespace shared, so no credential could
+    stop one agent. vouchryx now mints each enrolled agent a five-minute `at+jwt` access token bound
+    to a key (vouchryx#48).
+
+    `@decided 2026-10-18`, paraphrased: every agent gets its own short-lived credential from vouchryx,
+    verified offline at every door; the agent and its unit come from that credential and never from a
+    header; static client keys keep working beside it until a later release dates their end, and the
+    launchers accept both.
+
+    `TOKENFUSE_AGENT_TOKENS` is `off` (the binary's default, nothing changes), `accept` (a token is a
+    door credential and every static key keeps working) or `require` (every static key is refused,
+    `401 agent_token_required` with `WWW-Authenticate: DPoP`). `crate::agenttoken` is the one place.
+    On, a process refuses to start (exit 2, naming what is missing) without the delegation door's
+    issuer, JWKS and origin, a non-empty `TOKENFUSE_DELEGATION_AUDIENCE`, and a revocation list that
+    fails closed; a word it cannot read exits 2 too (invariant 98's rule). Both processes read it
+    through `agenttoken::from_env`, which `scripts/both-processes-configure-the-same-doors.sh`
+    discovers.
+
+    `tokenfuse_delegation::verify_agent_token` checks, cheapest first: header `typ` exactly `at+jwt`
+    (and `verify_delegation` now refuses `at+jwt`, so neither token is read as the other); the key
+    the `kid` names, the algorithm from its type (invariant 29), the signature; `iss` exact; `aud`
+    required and exact; `exp` with 30 s of leeway and `iat` no more than 30 s ahead
+    (`AGENT_TOKEN_LEEWAY_SECS`); `sub` an `agent://` URI equal to `client_id`; a `jti`; no `act`; a
+    `cnf.jkt`; then the proof: signed by that key, for `POST` at the configured origin plus the
+    route's own path, inside its window, and naming this token in `ath` (RFC 9449 4.2, the base64url
+    SHA-256 of the token, `tokenfuse_dpop::access_token_hash`); then the revocation hook for the
+    token's `jti` and its agent. The door then requires an agent id the record accepts and a proof
+    `jti` never seen in its window (`AgentTokens`, a two-generation `ReplayCache`, 16 384 per
+    generation, refusing when full). A token beside an `x-fuse-key` is refused. Every refusal is one
+    cause-free `401 agent_token_refused`; the log names the cause.
+
+    At the LLM and OpenAI doors (`proxy::resolve_caller`) a token's call is filed under
+    `tok:<agent>` as its `key_id` and its run principal (invariant 120), its agent is the token's,
+    and its unit is the token's. A non-empty `x-fuse-agent-id` naming another agent is `403`
+    `agent_id_contradicts_token`, and an identity map that binds the agent to units not including
+    the token's (`IdentityMap::units_naming`) is `403` `unit_contradicts_map`, in every strict mode.
+    The token is never also read as a delegation chain, and attests `dpop-key` (invariant 116).
+    With the door on, runs are owned and journaled with client keys off. With the door on, the chain
+    door holds every delegation proof to one use, and a proof that names a token must name the one
+    it came with.
+
+    At the MCP broker the token is judged first and alone, before XAA and the classic doors; a
+    header naming another agent is `403`. Under `require` the static key door and the open door are
+    refused, and a client's proof of possession (invariant 30) and XAA stay. The tool-call check
+    (invariant 118) takes a token proved for its own route; the broker relays a token there beside
+    its own gateway key (`TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE`, key id `broker`), and the check
+    verifies it again without the proof the broker already checked
+    (`verify_relayed_agent_token`). Any other key beside a token is refused there too.
+
+    `@claude` 2026-10-18, choices the decision left open, open to reversal: the switch's name and
+    words; one cause-free 401 type for every refusal; the 30 s leeway; the relay pair, fixed to key
+    id `broker`; `require` keeping the broker's CIMD door; an empty audience refused rather than read
+    as "any", as the XAA door already does.
+
+    **Where it says nothing.** A delegation token is not a door credential: it still needs a client
+    key, so under `require` a delegated call is refused. A delegation proof's `ath` is checked only
+    when the proof carries one, because the Go clients do not send it yet. The replay cache is per
+    process. The JWKS is read at startup, so a vouchryx key rotation needs a restart of each door. A
+    compromised broker can, for the life of a token it was shown (five minutes), ask the check about
+    that token's runs. The OpenAI door's provider key cannot ride `Authorization` beside a token, so
+    a token caller there needs the gateway to hold the provider key (invariant 122). stdio carries
+    no token. The open-bind warning (invariant 119) and the health detail do not count the token
+    door. The unit a delegation exchange copied from an agent token is not read. The revocation
+    latency (about one 12 s poll) is designed, not measured here.
+    *(test: `delegation::tests`, twelve, among them
+    `a_delegation_token_is_never_an_agent_token_and_the_reverse`,
+    `a_proof_that_does_not_name_this_token_is_refused`,
+    `an_agent_token_expires_at_its_leeway_and_not_before` and a 200-seed hostile sweep;
+    `dpop::tests::the_access_token_hash_is_rfc_9449s_own_example`;
+    `agenttoken::tests`, four; `chainproof::tests::with_agent_tokens_on_a_delegation_proof_is_single_use_and_names_its_token`;
+    `mcpbroker::tests::the_brokers_own_gateway_key_is_read_from_a_file_and_never_named`;
+    `tests/it/agent_token_is_the_door_credential.rs`, sixteen, `tests/it/mcp_agent_token.rs`, six,
+    `tests/it/agent_tokens_startup.rs`, four over the real binary. Red first in CI on the test-only
+    commits 40254d1 and 4c2c2f8 (PR #453). Mutants as teeth cases: `typ` unchecked, `ath` skipped,
+    the replay cache bypassed, the revocation hook not passed, the header's agent not compared,
+    `require` not enforced, an empty audience accepted, the door read in one process only.
+    Scenarios: `features/an-agent-token-is-the-door-credential.feature`, eighteen, each bound)*
+
+124. **The policy plane is told how the door knew the agent, from the door and never from a
+    header.** wardryx gained `identity_source` (`agent-token`, `client-key`, `none`) and a rule,
+    `require_identity_source`, that denies a request whose source is not listed (wardryx#110).
+
+    `@decided 2026-10-18`, paraphrased: wardryx keeps trusting its enforcement point and is told how
+    the enforcement point knew the agent, so a policy can require a verified agent.
+
+    `DecideContext::identity_source` carries it, and `decide` sends it as `identity_source`. The LLM
+    door sends `Caller::identity_source`: `agent-token` for a call an agent token admitted,
+    `client-key` for a static key, `none` with client authentication off. The broker sends
+    `agent-token` from the token door, `client-key` from the static key, CIMD and XAA doors, `none`
+    from the open door. `agenttoken::identity_source` is the one mapping. No header sets it.
+
+    `@claude` 2026-10-18: `client-key` names every credential vouchryx did not mint to the agent,
+    XAA included, because wardryx's vocabulary has three words. It is not part of the decision cache
+    key: wardryx answers `cacheable: false` for any request a `require_identity_source` rule read,
+    so no verdict that depended on it is stored. An older wardryx ignores the member (its decide
+    body is decoded leniently), so the two ship in either order.
+
+    **Where it says nothing.** wardryx still trusts its PEP (its invariant 13); a PEP that lies is
+    WAVE1-DESIGN's D3(b), not built.
+    *(test: `tests/it/agent_token_is_the_door_credential.rs::the_policy_plane_is_told_how_the_door_knew_the_agent`,
+    `tests/it/mcp_agent_token.rs::the_broker_admits_an_agent_token_and_tells_the_pdp_who_and_how`,
+    `agenttoken::tests::the_identity_source_is_the_door_that_admitted_the_call`. Mutant as a teeth
+    case: the token's call told `client-key`. Scenario: the policy-plane scenario of
+    `features/an-agent-token-is-the-door-credential.feature`)*

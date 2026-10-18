@@ -549,11 +549,6 @@ async fn mcp_broker() {
             "mcp broker XAA door: ON, TOKENFUSE_MCP_RESOURCE names this broker's resource"
         );
     }
-    // "Is there anything on the door" is a question about three variables
-    // now. Asked once, here, so the two bind conditions below cannot answer
-    // it differently: see `mcpbroker::something_on_the_door`.
-    let door_configured =
-        tokenfuse_gateway::mcpbroker::something_on_the_door(&keys, &clients, xaa.is_some());
     // Agent-event NDJSON export (agent-passport SPEC.md §6): the mcp-broker is
     // its own process invocation, so it reads TOKENFUSE_EVENTS_PATH at its own
     // startup, same as the gateway does in `serve()`.
@@ -575,6 +570,36 @@ async fn mcp_broker() {
         tokenfuse_gateway::sink::now_millis() / 1000,
     )
     .await;
+    // The agent's own token as a door credential (invariant 123), read after the
+    // delegation door and its revocation list, which it verifies against. The
+    // LLM proxy reads it through the same call.
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    if let Some(t) = &agent_tokens {
+        tracing::info!(
+            mode = t.mode().as_str(),
+            "agent-token door: ON, an agent's own token is a door credential here"
+        );
+    }
+    // The broker's own key for relaying an agent token to the taint gateway's
+    // check (invariant 123), from a file; a file it cannot use refuses to start.
+    let taint_gateway_key = tokenfuse_gateway::defaults::exit_on_refusal(
+        tokenfuse_gateway::mcpbroker::taint_gateway_key_from(
+            std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE")
+                .ok()
+                .as_deref(),
+            |p: &str| std::fs::read_to_string(p),
+        ),
+    );
+    // "Is there anything on the door" is a question about three variables
+    // now. Asked once, here, so the two bind conditions below cannot answer
+    // it differently: see `mcpbroker::something_on_the_door`. An agent-token
+    // door that REQUIRES a token refuses a caller presenting nothing, as XAA
+    // does, so it counts; one that only accepts leaves the open door open.
+    let door_configured = tokenfuse_gateway::mcpbroker::something_on_the_door(
+        &keys,
+        &clients,
+        xaa.is_some() || tokenfuse_gateway::agenttoken::required(&agent_tokens),
+    );
     // The SAME dial the LLM door reads, and read here through the same function,
     // so the two doors cannot drift into parsing one variable two ways.
     let identity_strict = tokenfuse_gateway::identitymap::StrictMode::from_env();
@@ -606,8 +631,8 @@ async fn mcp_broker() {
             .filter(|v| !v.trim().is_empty()),
         taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
-        agent_tokens: None,
-        taint_gateway_key: None,
+        agent_tokens,
+        taint_gateway_key,
     });
     if stdio {
         tracing::info!(%upstream, "mcp credential-broker on stdio");
@@ -1180,7 +1205,18 @@ async fn serve() {
         tokenfuse_gateway::sink::now_millis() / 1000,
     )
     .await;
-    state = state.with_chain_proof(chain_proof, revocations);
+    // The agent's own token as a door credential (invariant 123): the same call
+    // `mcp_broker` makes, against the delegation door just read.
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    if let Some(t) = &agent_tokens {
+        tracing::info!(
+            mode = t.mode().as_str(),
+            "agent-token door: ON, an agent's own token is a door credential here"
+        );
+    }
+    state = state
+        .with_chain_proof(chain_proof, revocations)
+        .with_agent_tokens(agent_tokens);
 
     // Compose the event sink: Parquet trace (TOKENFUSE_DATA_DIR) and/or OTLP
     // spans (TOKENFUSE_OTLP_ENDPOINT). Both optional; default is a no-op.
@@ -1415,7 +1451,9 @@ async fn serve() {
     // dir, the owners the journal holds are put back here, before the listener binds; a journal
     // that exists and cannot be read refuses to start, as the retained journal does.
     // process-local: the MCP broker opens no run, so it owns none.
-    if !state.client_keys.enabled() {
+    // An agent token is a principal too (invariant 123), so its runs are owned
+    // and journaled with client keys off.
+    if !state.client_keys.enabled() && state.agent_tokens.is_none() {
         tracing::info!("{}", tokenfuse_gateway::runowners::OFF_LINE);
     } else {
         match std::env::var("TOKENFUSE_DATA_DIR") {
