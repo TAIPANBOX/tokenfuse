@@ -337,22 +337,38 @@ pub fn log_refusal(door: &'static str, why: Why) {
     tracing::warn!(door, ?why, "refused an agent token");
 }
 
+/// The challenge the LLM door answers a refused agent token with.
+const REFUSED_CHALLENGE: &str = "DPoP algs=\"ES256\", error=\"invalid_token\"";
+/// The challenge the LLM door answers a call with no agent token with.
+const REQUIRED_CHALLENGE: &str = "DPoP algs=\"ES256\"";
+
 /// `401` for a presented agent token that was refused. Cause-free, as every
 /// door's refusal is: which check failed is an oracle.
 pub fn refused_response() -> Response {
+    refused_response_with(REFUSED_CHALLENGE)
+}
+
+/// [`refused_response`] with the challenge the caller gives. The MCP broker names
+/// the protected resource document in it (RFC 9728); the LLM door does not.
+pub fn refused_response_with(challenge: &str) -> Response {
     unauthorized_json(
         "agent_token_refused",
         "the agent token presented with this request was refused",
-        "DPoP algs=\"ES256\", error=\"invalid_token\"",
+        challenge,
     )
 }
 
 /// `401` for a call with no agent token when the door requires one.
 pub fn required_response() -> Response {
+    required_response_with(REQUIRED_CHALLENGE)
+}
+
+/// [`required_response`] with the challenge the caller gives.
+pub fn required_response_with(challenge: &str) -> Response {
     unauthorized_json(
         "agent_token_required",
         "this gateway requires an agent token: `Authorization: DPoP <token>` with a DPoP proof",
-        "DPoP algs=\"ES256\"",
+        challenge,
     )
 }
 

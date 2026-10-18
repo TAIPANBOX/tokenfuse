@@ -7901,3 +7901,55 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `test_a_token_request_nonce_challenge_is_retried_once` and `test_the_token_and_the_key_never_reach_a_log_or_an_error`,
     and the same names in `sdk/js/test.js`, which run against the stub vouchryx and the stub door of those files.
     Scenarios: `features/the-sdk-holds-an-agent-token.feature`. Not a script gate.)*
+
+126. **The broker publishes the protected resource document whenever the agent door is on, and a
+    refused agent token is challenged from configuration.** The MCP authorization specification
+    (revision 2026-07-28) requires an MCP server to publish RFC 9728 protected resource metadata.
+    The broker published it only for XAA (invariant 62), so an agent meeting the broker with its
+    own token (invariant 123) found no document, and a refusal named none. `@decided 2026-10-18`,
+    paraphrased: the document is published whenever the agent-token door is on, and a refused
+    agent token is challenged with the DPoP scheme naming it.
+
+    **What is published.** `crate::resourcemeta::document` builds one document for whichever doors
+    are on. The agent door alone gives `resource` (`TOKENFUSE_DELEGATION_AUDIENCE`),
+    `authorization_servers` (the delegation issuer), `dpop_signing_alg_values_supported` (`ES256`)
+    and `dpop_bound_access_tokens_required` (true under `require`, false under `accept`). XAA alone
+    gives XAA's body unchanged. Both give XAA's body with the agent fields added.
+    `mcpbroker::app` registers the bare well-known route, and for a resource with a path its
+    suffixed twin, once. With both doors off nothing is registered, so the paths answer 404 as they
+    did before.
+
+    **What a refusal says.** A presented agent token that does not verify is answered `401` with
+    `WWW-Authenticate: DPoP algs="ES256", error="invalid_token", resource_metadata="..."`. A call
+    with no credential under `require` gets the same challenge without the `error` parameter. The
+    URL is built from the configured resource, never from a `Host` header. The bodies are the agent
+    door's own, `agent_token_refused` and `agent_token_required`. The LLM door keeps its own
+    challenge, because it is not a protected resource at this level.
+
+    **What the process refuses to start with.** `resourcemeta::startup_refusal`, read by `main.rs`
+    before the listener binds, exits 2 for an agent audience that is not an absolute https URL with
+    a host, no query or fragment, and printable ASCII without a quote or backslash. It also exits 2
+    for XAA on with a resource other than the audience, since one document cannot name two resources.
+
+    `@claude` 2026-10-18, choices the brief left open, open to reversal: the challenge takes its
+    origin and path from the configured resource, not from `TOKENFUSE_DELEGATION_URL` (RFC 9728
+    section 3.1, and the XAA precedent); `error="invalid_token"` goes only with a presented token
+    (RFC 6750 section 3.1); XAA and the agent door share one document, which never says bound tokens
+    are required, because XAA's bearer tokens are unbound and `require` admits them; and an audience
+    that is not https is refused at startup, which is breaking for a deployment with an opaque
+    audience.
+
+    **Where it says nothing.** The document names one resource, so a broker that serves several is
+    not covered. The challenge points at the document and nothing more: the authorization server's
+    own metadata is not served here. With XAA on and `require`, a call with no credential now gets
+    the agent challenge and body instead of the XAA ones.
+    *(test: `crates/gateway/tests/it/protected_resource_metadata.rs`, sixteen, among them
+    `a_refused_token_is_challenged_with_dpop_and_invalid_token`,
+    `with_xaa_the_document_adds_the_agent_fields_and_never_requires_bound_tokens`,
+    `an_agent_audience_that_is_not_https_refuses_to_start` and
+    `an_xaa_resource_that_differs_from_the_agent_audience_refuses_to_start`, the last two over the
+    real binary; `resourcemeta::tests`, nine. Red first on 4c9c8ef, CI run 39149651145: eight of the
+    nine unit tests failed on their assertions, and the integration binary did not run because cargo
+    stopped at the library binary. Scenarios: `features/a-protected-resource-document-names-the-agent-door.feature`,
+    seven, each bound. Not a script gate: the rule is `resourcemeta` and the routes in
+    `mcpbroker::app`, held by `cargo test`.)*

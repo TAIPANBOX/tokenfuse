@@ -70,7 +70,7 @@ pub type Xaa = Option<Arc<XaaDoor>>;
 /// question: this is checked once at startup, not per request, but adding a
 /// dependency for four conditions is still a dependency the whole binary
 /// carries.
-fn valid_https_resource(s: &str) -> Option<(String, String)> {
+pub(crate) fn valid_https_resource(s: &str) -> Option<(String, String)> {
     let rest = s.strip_prefix("https://")?;
     if s.chars().any(char::is_whitespace) || s.contains('?') || s.contains('#') {
         return None;
