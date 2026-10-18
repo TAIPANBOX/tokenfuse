@@ -142,6 +142,9 @@ pub enum ChainRefusal {
     BadToken(Refusal),
     /// A token verified and the caller also declared a different chain.
     Contradicted,
+    /// With agent tokens on, the proof's `jti` was used before inside its
+    /// window: every proof this process verifies is then single-use.
+    Replayed,
 }
 
 /// Read a `DPoP`-scheme credential out of an `Authorization` header.
@@ -171,6 +174,7 @@ pub fn resolve(
     declared: &[String],
     now: i64,
     revoked: impl Fn(&str, &str, i64) -> bool,
+    tokens: &crate::agenttoken::Tokens,
 ) -> Chain {
     let (Some(proving), Some(token)) = (cfg.as_ref(), token) else {
         // Either the operator configured no issuer, or the caller presented no
@@ -196,9 +200,26 @@ pub fn resolve(
             | Refusal::NotBound
             | Refusal::NoProof
             | Refusal::WrongKey
-            | Refusal::Revoked),
+            | Refusal::Revoked
+            | Refusal::NotYetValid),
         ) => return Chain::Refused(ChainRefusal::BadToken(reason)),
     };
+
+    // With agent tokens on (invariant 123), every proof this process verifies
+    // is held to the agent-token door's rules: one that names an access token
+    // must name this one, and none is good twice. Off, nothing here changes.
+    if let Some(tokens) = tokens.as_ref() {
+        let names_another = verified
+            .proof_ath
+            .as_deref()
+            .is_some_and(|ath| ath != tokenfuse_dpop::access_token_hash(token));
+        if names_another {
+            return Chain::Refused(ChainRefusal::BadToken(Refusal::WrongKey));
+        }
+        if !tokens.first_use(&verified.proof_jti, now) {
+            return Chain::Refused(ChainRefusal::Replayed);
+        }
+    }
 
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
         return Chain::Refused(ChainRefusal::Contradicted);
@@ -281,6 +302,12 @@ pub(crate) fn log_delegation_refusal(door: &'static str, why: ChainRefusal) {
                 door,
                 "refused a delegation token: the declared chain contradicted \
                  the verified one"
+            );
+        }
+        ChainRefusal::Replayed => {
+            tracing::warn!(
+                door,
+                "refused a delegation token: its proof was used before"
             );
         }
     }
@@ -499,6 +526,7 @@ mod tests {
             &declared,
             0,
             |_, _, _| false,
+            &None,
         );
         assert_eq!(got, Chain::Claimed(declared));
     }
@@ -571,6 +599,7 @@ mod tests {
             &[],
             now,
             |_, _, _| false,
+            &None,
         );
 
         let Chain::Proven { chain, proof } = resolved else {
@@ -605,8 +634,64 @@ mod tests {
             &declared,
             1_800_000_000,
             |_, _, _| false,
+            &None,
         );
         assert_eq!(resolved, Chain::Claimed(declared));
+    }
+
+    /// With agent tokens on, the chain door holds every proof it verifies to
+    /// the rules the agent-token door holds: one use, and a proof that names
+    /// its access token must name this one.
+    #[test]
+    fn with_agent_tokens_on_a_delegation_proof_is_single_use_and_names_its_token() {
+        use tokenfuse_delegation::testing::{cfg, proof_at, proof_for, token, Key};
+        let (issuer, holder) = (Key::new(), Key::new());
+        let now = 1_800_000_000;
+        let origin = "https://tokenfuse.acme.example";
+        let url = format!("{origin}/v1/messages");
+        let proving: ChainProof = Some(Arc::new(Proving {
+            cfg: cfg(&issuer),
+            origin: origin.to_string(),
+        }));
+        let on: crate::agenttoken::Tokens = Some(Arc::new(crate::agenttoken::AgentTokens::new(
+            crate::agenttoken::Mode::Accept,
+        )));
+        let tok = token(&issuer, &holder, now, serde_json::json!({}));
+        let other = token(&issuer, &holder, now, serde_json::json!({"jti": "tok-2"}));
+        let go = |proof: &str, tokens: &crate::agenttoken::Tokens| {
+            resolve(
+                &proving,
+                Some(&tok),
+                Some(proof),
+                "POST",
+                "/v1/messages",
+                &[],
+                now,
+                |_, _, _| false,
+                tokens,
+            )
+        };
+        let once = proof_at(&holder, now, "POST", &url, "p-once");
+        assert!(matches!(go(&once, &on), Chain::Proven { .. }));
+        assert_eq!(
+            go(&once, &on),
+            Chain::Refused(ChainRefusal::Replayed),
+            "the same proof a second time"
+        );
+        let wrong = proof_for(&holder, now, "POST", &url, "p-wrong", &other);
+        assert_eq!(
+            go(&wrong, &on),
+            Chain::Refused(ChainRefusal::BadToken(Refusal::WrongKey)),
+            "a proof naming another token"
+        );
+        let named = proof_for(&holder, now, "POST", &url, "p-named", &tok);
+        assert!(matches!(go(&named, &on), Chain::Proven { .. }));
+        let off_twice = proof_at(&holder, now, "POST", &url, "p-off");
+        assert!(matches!(go(&off_twice, &None), Chain::Proven { .. }));
+        assert!(
+            matches!(go(&off_twice, &None), Chain::Proven { .. }),
+            "with agent tokens off nothing changes"
+        );
     }
 
     /// The measured defect, as a unit: a proven chain names its actor, so a

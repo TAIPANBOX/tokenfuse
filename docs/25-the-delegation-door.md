@@ -186,3 +186,43 @@ this as a cross-repo finding.
   live request that would prove the wiring has not been made.
 - **`prompt_hash` is null on a `taint_raised` at the `tool_result` stage**, a
   separate pre-existing gap found on 2026-08-26 and not fixed here.
+
+## 7. An agent's own token as the door credential
+
+Everything above is about a chain: whom a call acts for. Since wave 1 of the
+agent-security work, vouchryx also mints each enrolled agent a five-minute
+access token of its own (`client_credentials` with DPoP): header `typ: at+jwt`,
+`sub` and `client_id` the agent, one audience, bound to a key the agent holds,
+carrying its `unit` and `org`. With the agent-token door on, that token is a
+door credential (CLAUDE.md invariants 123 and 124).
+
+| Variable | Meaning |
+|---|---|
+| `TOKENFUSE_AGENT_TOKENS` | `off` (default): nothing changes. `accept`: a token is a door credential and every static client key keeps working beside it. `require`: every static client key is refused. Any other word refuses to start. |
+| `TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE` | The MCP broker only: a file holding the broker's own gateway client key (key id `broker` in the gateway's `TOKENFUSE_CLIENT_KEYS`), used only to relay a token to the gateway's tool-call check. |
+
+On, the process needs the delegation door above (issuer, JWKS, origin), a
+non-empty `TOKENFUSE_DELEGATION_AUDIENCE`, and a revocation list that fails
+closed, or it refuses to start naming what is missing.
+
+A call presents `Authorization: DPoP <token>` and a `DPoP` proof made for this
+request that names the token (`ath`). The door checks the type, the key the
+`kid` names and the algorithm from its type, the issuer, the audience exactly,
+the expiry with 30 seconds of leeway, that the subject is an agent and equals
+`client_id`, that the token acts for nobody, the binding, the proof, the
+revocation list, and that the proof was not used before. A token beside an
+`x-fuse-key` is refused. What it admits is filed under `tok:<agent>`: the
+record's key, the run's owner, the agent and the unit all come from the token,
+and a header naming another agent, or an identity map that binds the agent to
+another unit, is refused in every strict mode. The policy plane is told
+`identity_source: agent-token` (`client-key` for a static key, `none` with no
+credential).
+
+With the door on, a delegation proof at this chain door is single-use too, and
+one that names a token must name the one it came with.
+
+What it does not do: a delegation token is still not a door credential, so
+under `require` a delegated call is refused. The key set is read at startup, so
+a vouchryx key rotation needs a restart. The replay cache is per process.
+Nothing here has run against a live vouchryx; the tests mint what vouchryx
+mints (`tokenfuse_delegation::testing::agent_token`).

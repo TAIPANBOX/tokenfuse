@@ -167,6 +167,21 @@ pub struct VerifiedProof {
     pub jkt: String,
     /// RFC 9449 `jti`: what makes it single-use, given a [`ReplayCache`].
     pub jti: String,
+    /// RFC 9449 section 4.2 `ath`: the hash of the access token this proof was
+    /// made to accompany, or `None` when the proof names none. Read here and
+    /// compared by the caller, which is the one holding the token: see
+    /// [`access_token_hash`].
+    pub ath: Option<String>,
+}
+
+/// RFC 9449 section 4.2: the `ath` a proof presented with `token` must carry,
+/// the base64url (no padding) SHA-256 of the token's ASCII bytes.
+///
+/// Without it a proof binds a request to a KEY and not to a token, so a proof
+/// the holder made for one of its tokens is good beside any other token bound
+/// to the same key. The door that holds the token computes this and compares.
+pub fn access_token_hash(token: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
 /// Why a proof was refused.
@@ -287,10 +302,17 @@ pub fn verify_proof(
     if jti.is_empty() || jti.len() > MAX_JTI_BYTES {
         return Err(ProofRefusal::WrongRequest);
     }
+    // RFC 9449 4.2's `ath`, read and handed back, never judged here: only the
+    // caller holds the token it must name.
+    let ath = claims
+        .get("ath")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(VerifiedProof {
         jkt: thumbprint(jwk).ok_or(ProofRefusal::BadSignature)?,
         jti: jti.to_string(),
+        ath,
     })
 }
 
@@ -516,6 +538,35 @@ yyuNSwNVs/LTnw7nI9Ius8M=
         assert_eq!(v.jti, "p1");
         let jwk: Jwk = serde_json::from_value(k.jwk_value()).expect("a jwk");
         assert_eq!(v.jkt, thumbprint(&jwk).expect("a thumbprint"));
+    }
+
+    /// RFC 9449 section 7.1's own example: this access token and this `ath`.
+    /// Written out from the RFC rather than computed here, so the expectation
+    /// cannot come from the function under test.
+    #[test]
+    fn the_access_token_hash_is_rfc_9449s_own_example() {
+        assert_eq!(
+            access_token_hash("Kz~8mXK1EalYznwH-LC-1fBAo.4Ljp~zsPE_NeO.gxU"),
+            "fUHyO2r2Z3DZ53EsNrWBb0xWXoaNy59IiKCAqksmQEo"
+        );
+    }
+
+    /// A proof names the token it was made for, and the verifier hands that
+    /// name to the caller unchanged; a proof that names none says so.
+    #[test]
+    fn a_proof_carries_the_access_token_hash_it_was_made_with() {
+        let (k, now) = (Key::new(), 1_800_000_000);
+        let mut claims = good(now);
+        claims["ath"] = serde_json::json!(access_token_hash("tok-a"));
+        let v = verify_proof(&k.proof(claims), "POST", URL, now).expect("a good proof");
+        assert_eq!(v.ath.as_deref(), Some(access_token_hash("tok-a").as_str()));
+        assert_ne!(
+            v.ath.as_deref(),
+            Some(access_token_hash("tok-b").as_str()),
+            "two tokens must not share a hash"
+        );
+        let none = verify_proof(&k.proof(good(now)), "POST", URL, now).expect("a good proof");
+        assert_eq!(none.ath, None, "a proof that names no token says so");
     }
 
     /// RFC 9449 4.2 makes `jti` REQUIRED, and a proof without one cannot be made

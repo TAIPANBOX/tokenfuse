@@ -1360,7 +1360,7 @@ for p in paths:
 # mutant is a way a key scan goes quiet again, floods the bus, or leaks the key.
 run_case "refused-key: the refusal never reported" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "        report_refused_key(&st, &headers);", "        if false { report_refused_key(&st, &headers); }")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                report_refused_key(st, headers);", "                if false { report_refused_key(st, headers); }")')" \
 	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
 
 run_case "refused-key: the per-source limit removed" fail \
@@ -1503,7 +1503,7 @@ run_case "unclassified: an unmapped tool requests nothing again" fail \
 
 run_case "attestation: the LLM path reads the caller's header again" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact wardryx::a_client_attestation_header_never_reaches_the_pdp" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "let attestation_method = Some(crate::attestation::from_door(chain_proven).to_string());", "let attestation_method = header_str(&headers, \"x-fuse-attestation-method\").or(Some(crate::attestation::from_door(chain_proven).to_string()));")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::attestation::from_door(chain_proven || caller.proved_possession()).to_string(),", "header_str(&headers, \"x-fuse-attestation-method\").unwrap_or_else(|| crate::attestation::from_door(chain_proven || caller.proved_possession()).to_string()),")')" \
 	"a_client_attestation_header_never_reaches_the_pdp ... FAILED"
 
 run_case "attestation: the broker's proof door is not counted" fail \
@@ -1518,7 +1518,7 @@ run_case "failmode: an enforcing hook nobody configured fails open again" fail \
 
 run_case "tool-check: the key is not asked for" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact toolcheck::tests::with_client_keys_a_check_without_a_key_is_refused" \
-	"$(py 'edit("crates/gateway/src/toolcheck.rs", "crate::proxy::resolve_client_key(&st, &headers) else {", "crate::proxy::resolve_client_key(&st, &headers).or(Some(String::new())) else {")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers) {", "crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers).or(Some(String::new())) {")')" \
 	"with_client_keys_a_check_without_a_key_is_refused ... FAILED"
 
 run_case "tool-check: another key's run is described" fail \
@@ -1544,7 +1544,7 @@ run_case "open-bind: the warning is never printed" fail \
 # foreign parent adopted, the journal not replayed, the held parent unchecked.
 run_case "run-owner-first: the run's tool blocks recorded before the claim" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    st.taint.note_blocks(&run_id, &[]);\n    let principal = crate::runowners::key_principal(&key_id);\n")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = caller.principal.clone();\n", "    st.taint.note_blocks(&run_id, &[]);\n    let principal = caller.principal.clone();\n")')" \
 	"TOUCHES THE RUN BEFORE ITS OWNER"
 
 run_case "run-owner-first: the metered door never claims" fail \
@@ -1604,12 +1604,12 @@ run_case "upstream-key: a stock SDK's key header is no longer read" fail \
 
 run_case "run-owner-first: the check reads the taint before the owner" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = crate::runowners::key_principal(caller);\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = crate::runowners::key_principal(caller);\n")')" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = caller.principal.as_str();\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = caller.principal.as_str();\n")')" \
 	"TOUCHES THE RUN BEFORE ITS OWNER"
 
 run_case "run-owner-first: a comment naming open_run above the claim passes" pass \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    // st.ledger.open_run(..) and st.taint.note_blocks(..) come after the claim\n    let principal = crate::runowners::key_principal(&key_id);\n")')"
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = caller.principal.clone();\n", "    // st.ledger.open_run(..) and st.taint.note_blocks(..) come after the claim\n    let principal = caller.principal.clone();\n")')"
 
 run_case "run-owner-first: handle_call renamed, so it measured nothing" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
@@ -1635,6 +1635,56 @@ run_case "run-ownership: the parent the ledger holds is not checked" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact run_belongs_to_its_principal::a_parent_held_by_the_ledger_is_checked_when_the_header_is_omitted" \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "    if parent.is_none() && !parent_run_id.is_empty() {", "    if false && parent.is_none() && !parent_run_id.is_empty() {")')" \
 	"a_parent_held_by_the_ledger_is_checked_when_the_header_is_omitted ... FAILED"
+
+# --- invariants 123 and 124: an agent's own token at every door ------------
+#
+# Product mutants, held by cargo test: each is a way the agent-token door
+# admits a token it should refuse, or lets a header or a static key back in.
+# The first is the both-processes gate's case for the new switch.
+run_case "agent-tokens: the door read in one process only" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);\n", "    let agent_tokens: tokenfuse_gateway::agenttoken::Tokens = None;\n")')" \
+	"agenttoken"
+
+run_case "agent-tokens: typ unchecked, a delegation token read as an agent token" fail \
+	"cargo test -p tokenfuse-delegation --lib -- --exact tests::a_delegation_token_is_never_an_agent_token_and_the_reverse" \
+	"$(py 'edit("crates/delegation/src/lib.rs", "    if typ.as_deref() != Some(AGENT_TOKEN_TYP) {", "    if false && typ.as_deref() != Some(AGENT_TOKEN_TYP) {")')" \
+	"a_delegation_token_is_never_an_agent_token_and_the_reverse ... FAILED"
+
+run_case "agent-tokens: the proof's ath skipped" fail \
+	"cargo test -p tokenfuse-delegation --lib -- --exact tests::a_proof_that_does_not_name_this_token_is_refused" \
+	"$(py 'edit("crates/delegation/src/lib.rs", "    if presented.ath.as_deref() != Some(", "    if false && presented.ath.as_deref() != Some(")')" \
+	"a_proof_that_does_not_name_this_token_is_refused ... FAILED"
+
+run_case "agent-tokens: the replay cache bypassed at the LLM door" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_replayed_agent_token_proof_is_refused_the_second_time" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if !agent.proof_jti.is_empty() && !tokens.first_use(", "    if false && !agent.proof_jti.is_empty() && !tokens.first_use(")')" \
+	"a_replayed_agent_token_proof_is_refused_the_second_time ... FAILED"
+
+run_case "agent-tokens: the revocation hook not passed" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_revoked_agent_is_refused_at_the_door" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "        crate::revocations::hook(feed, now),", "        crate::revocations::hook(&feed.clone().filter(|_| false), now),")')" \
+	"a_revoked_agent_is_refused_at_the_door ... FAILED"
+
+run_case "agent-tokens: the header's agent not compared with the token's" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::a_header_naming_another_agent_beside_its_token_is_refused_whatever_the_strict_mode" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if !header_agent.is_empty() && header_agent != agent.subject {", "    if false && !header_agent.is_empty() && header_agent != agent.subject {")')" \
+	"a_header_naming_another_agent_beside_its_token_is_refused_whatever_the_strict_mode ... FAILED"
+
+run_case "agent-tokens: require lets a static key in" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::require_refuses_a_static_key_and_admits_an_agent_token" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "Door::NotPresented if crate::agenttoken::required(&st.agent_tokens) => {", "Door::NotPresented if false && crate::agenttoken::required(&st.agent_tokens) => {")')" \
+	"require_refuses_a_static_key_and_admits_an_agent_token ... FAILED"
+
+run_case "agent-tokens: an empty audience accepted at startup" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact agenttoken::tests::agent_tokens_on_need_the_door_a_named_audience_and_a_list_that_fails_closed" \
+	"$(py 'edit("crates/gateway/src/agenttoken.rs", "    if proving.cfg.audience.trim().is_empty() {", "    if false && proving.cfg.audience.trim().is_empty() {")')" \
+	"agent_tokens_on_need_the_door_a_named_audience_and_a_list_that_fails_closed ... FAILED"
+
+run_case "identity-source: a token's call told client-key" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact agent_token_is_the_door_credential::the_policy_plane_is_told_how_the_door_knew_the_agent" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::agenttoken::identity_source(self.agent.is_some(),", "crate::agenttoken::identity_source(false && self.agent.is_some(),")')" \
+	"the_policy_plane_is_told_how_the_door_knew_the_agent ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #

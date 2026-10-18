@@ -82,6 +82,9 @@ pub struct AppState {
     /// The revocation list this gateway polls, or `None` when it polls none.
     /// See `crate::revocations`.
     pub revocations: crate::revocations::Feed,
+    /// The agent-token door (`TOKENFUSE_AGENT_TOKENS`), or `None` when it is
+    /// off, which is the default and changes nothing. See `crate::agenttoken`.
+    pub agent_tokens: crate::agenttoken::Tokens,
     history: History,
     killed: Killed,
     /// Run taint, shared so the MCP broker judges against the same state.
@@ -591,6 +594,8 @@ impl AppState {
             chain_proof: None,
             // No poller until `serve` configures one, so nothing is refused.
             revocations: None,
+            // The agent-token door is off until `serve` turns it on.
+            agent_tokens: None,
             // Wrap the in-process ledger as the default backend. `with_ledger`
             // swaps in a raft-replicated backend for HA (cluster feature).
             ledger: Arc::new(LocalLedger(ledger)),
@@ -893,6 +898,15 @@ impl AppState {
     ) -> Self {
         self.chain_proof = chain_proof;
         self.revocations = revocations;
+        self
+    }
+
+    /// Turn the agent-token door on (`crate::agenttoken`). Chainable. It
+    /// verifies against the delegation door's own issuer, key set, audience
+    /// and origin, so `with_chain_proof` is what gives it something to verify
+    /// with.
+    pub fn with_agent_tokens(mut self, tokens: crate::agenttoken::Tokens) -> Self {
+        self.agent_tokens = tokens;
         self
     }
 

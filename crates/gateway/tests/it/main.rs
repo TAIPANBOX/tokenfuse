@@ -16,6 +16,8 @@
 mod common;
 
 mod admin_gate;
+mod agent_token_is_the_door_credential;
+mod agent_tokens_startup;
 mod cache_default_startup;
 mod check_tool_call_answers_its_callers_runs;
 mod closure_reaches_the_cloud;
@@ -29,6 +31,7 @@ mod image_user_group;
 mod keys_endpoint;
 mod long_prompt_is_priced_at_its_long_rate;
 mod manifest;
+mod mcp_agent_token;
 mod mcp_broker;
 mod mcp_client_redirect;
 mod mcp_door;

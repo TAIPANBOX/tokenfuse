@@ -103,20 +103,28 @@ pub async fn check_tool_call(
     headers: HeaderMap,
     Json(req): Json<CheckRequest>,
 ) -> Response {
-    let Some(caller) = crate::proxy::resolve_client_key(&st, &headers) else {
-        crate::proxy::report_refused_key(&st, &headers);
-        return crate::proxy::unauthorized(&st.keystats);
+    // The metered doors' own door: a client key, or with agent tokens on an
+    // agent token proved for this path, or one the MCP broker relays beside
+    // its own key (invariant 118's rule, one credential wider).
+    let caller = match crate::proxy::resolve_caller(&st, &headers, CHECK_PATH, true) {
+        Ok(caller) => caller,
+        Err(refused) => return refused,
     };
     answer(&st, &headers, &caller, req).into_response()
 }
 
+/// The route this check is served at, which a proof presented to it names.
+pub const CHECK_PATH: &str = "/v1/fuse/check-tool-call";
+
 fn answer(
     st: &AppState,
     headers: &HeaderMap,
-    caller: &str,
+    caller: &crate::proxy::Caller,
     req: CheckRequest,
 ) -> Json<serde_json::Value> {
-    let agent_id = crate::proxy::header_str(headers, "x-fuse-agent-id").unwrap_or_default();
+    let agent_id = caller.agent_id().unwrap_or_else(|| {
+        crate::proxy::header_str(headers, "x-fuse-agent-id").unwrap_or_default()
+    });
     let unit = String::new();
 
     if st.firewall.mode == FirewallMode::Off {
@@ -151,7 +159,7 @@ fn answer(
     // door claims runs for, so the two doors cannot disagree about whose run it
     // is. An empty principal is a gateway without client keys, where no run
     // has an owner.
-    let principal = crate::runowners::key_principal(caller);
+    let principal = caller.principal.as_str();
     let foreign = !principal.is_empty()
         && st
             .run_owner(&req.run_id)

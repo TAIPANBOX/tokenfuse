@@ -55,6 +55,10 @@
           "TOKENFUSE_AGENT_ID_MODE": {
             "required": false
           },
+          "TOKENFUSE_AGENT_TOKENS": {
+            "required": false,
+            "default": "off"
+          },
           "TOKENFUSE_ALLOW_OPEN_OBS": {
             "required": false
           },
@@ -223,6 +227,9 @@
             "required": false
           },
           "TOKENFUSE_MCP_TAINT_GATEWAY": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE": {
             "required": false
           },
           "TOKENFUSE_MCP_UPSTREAM": {

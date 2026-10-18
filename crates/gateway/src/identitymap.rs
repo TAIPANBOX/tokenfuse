@@ -762,6 +762,34 @@ impl IdentityMap {
         self.keys.len()
     }
 
+    /// Every unit this map binds `agent_id` to: the unit of each `keys[]`
+    /// binding whose `agents` patterns match it, and of each `prefixes[]` entry
+    /// that matches it (the bindings in key-id order, then the prefixes in
+    /// document order), without repeats. Empty when the map
+    /// names the agent nowhere. An agent token carries its own unit, and this
+    /// is what the map is allowed to say against it (`agenttoken::contradiction`).
+    #[must_use]
+    pub fn units_naming(&self, agent_id: &str) -> Vec<&str> {
+        let mut keys: Vec<(&String, &KeyBinding)> = self.keys.iter().collect();
+        keys.sort_by_key(|(id, _)| *id);
+        let mut units: Vec<&str> = Vec::new();
+        let from_keys = keys
+            .into_iter()
+            .filter(|(_, b)| b.agents.iter().any(|p| p.matches(agent_id)))
+            .map(|(_, b)| b.unit.as_str());
+        let from_prefixes = self
+            .prefixes
+            .iter()
+            .filter(|p| p.pattern.matches(agent_id))
+            .map(|p| p.unit.as_str());
+        for unit in from_keys.chain(from_prefixes) {
+            if !units.contains(&unit) {
+                units.push(unit);
+            }
+        }
+        units
+    }
+
     /// Whether a run owned by client key `parent_key` may be named as the
     /// parent of a run owned by client key `child_key` (invariant 120): the
     /// map binds `parent_key` and lists `child_key` under its `may_parent`.

@@ -293,6 +293,16 @@ pub struct DecideContext {
     /// `decide` from the door that authenticated the request
     /// ([`crate::attestation`], invariant 116), never from a request header.
     pub attestation_method: Option<String>,
+    /// How the door knew the agent, in wardryx's words (`agent-token`,
+    /// `client-key`, `none`), set by the caller of `decide` from the door that
+    /// admitted the request ([`crate::agenttoken`]) and never from a header.
+    /// `None` sends nothing, which wardryx reads as `none`.
+    ///
+    /// Not part of the decision cache key: wardryx answers `cacheable: false`
+    /// for any request a `require_identity_source` rule read (its
+    /// `pdp.go`, the per-request rules), so no verdict that depended on it is
+    /// ever stored here.
+    pub identity_source: Option<String>,
     /// Whether THIS gateway verified a delegation token for this request, per
     /// agent-passport SPEC 5.2, and took `on_behalf_of` from it.
     ///
@@ -408,6 +418,8 @@ struct DecideWireRequest<'a> {
     model: &'a str,
     est_cost_usd: f64,
     attestation_method: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_source: Option<&'a str>,
     approval_token: Option<&'a str>,
     chain_proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1086,6 +1098,7 @@ impl Wardryx {
             model: &ctx.model,
             est_cost_usd: ctx.est_cost_usd,
             attestation_method: ctx.attestation_method.as_deref(),
+            identity_source: ctx.identity_source.as_deref(),
             approval_token: ctx.approval_token.as_deref(),
             chain_proven: ctx.chain_proven,
             tool_call: ctx.tool_call.as_ref().map(|t| ToolCallWire {
@@ -1450,6 +1463,7 @@ mod tests {
                 model: "m".into(),
                 est_cost_usd: 0.0,
                 attestation_method: None,
+                identity_source: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1473,6 +1487,7 @@ mod tests {
                 model: "m".into(),
                 est_cost_usd: 0.0,
                 attestation_method: None,
+                identity_source: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1500,6 +1515,7 @@ mod tests {
             model: "m".into(),
             est_cost_usd: 0.0,
             attestation_method: None,
+            identity_source: None,
             approval_token: None,
             tool_call: None,
         }
