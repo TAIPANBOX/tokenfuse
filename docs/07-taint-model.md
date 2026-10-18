@@ -124,12 +124,12 @@ live upstream.
 | B.4 gate 1, human-approve | Built 2026-08-26. `POST /v1/fuse/declassify`. A review is recorded against the tool BLOCKS a person read, by the id both wire shapes carry, so resending the conversation does not spend it. |
 | B.4 gates 2 and 3, extraction and allowlist transforms | **Not built here, and cannot be**: both declassify a VALUE, and B.3 refuses per-value tracking on purpose. Their run-level expression is B.3 P4's quarantined sub-run, which works and is now asserted. See below. |
 | B.10's "semantic content analysis complements this" | Built 2026-08-26, as a taint SOURCE and never as a decision. See below. |
-| B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names three of the spec's seven: `exec`, `write`, `network_egress`. A tool named in neither the source map nor the capability map exercises `unclassified` since 2026-10-17, and the starter rule denies it after untrusted input (CLAUDE.md invariant 115); until then such a tool requested nothing. |
+| B.5 capabilities | Built as a `tool -> capability` map, configurable. The built-in policy names `exec`, `write`, `network_egress` and `network_read`. `network_read` goes to the three known read tools (`fetch_url`, `browse`, `web_search`), which are also sources labelled `web`; `http_get` and `fetch` are named in neither map and so are unclassified; `remember` is a `write`. A tool named in neither the source map nor the capability map exercises `unclassified` since 2026-10-17, and the starter rule denies it after untrusted input (CLAUDE.md invariant 115); an enforce-mode policy file gets the same floor (invariant 121). |
 | B.6 policy file | Built, in JSON rather than YAML (see below). `mode` and named `rules` with `when_any`/`deny`. `action:` is not built: every rule blocks. `require_approval` and `sanitize_gate` do not exist, so `sanitizers:` and `approval:` are unimplemented. |
 | B.7 level 1, proxy advisory | Built. |
 | B.7 level 2, SDK `POST /v1/fuse/check-tool-call` | Built 2026-08-26. Judges and does not accumulate. HTTP 200 with the decision in the body. Since 2026-10-17, with client keys configured, a caller presents one or gets `401`, and a run another key opened is answered `deny` with nothing of it (CLAUDE.md invariant 118). |
 | B.7 level 3, MCP gateway enforcement | Built 2026-08-26, as a CLIENT of level 2. `tokenfuse mcp-broker` is a separate process invocation with no taint state of its own, so it asks the gateway rather than judging; one judge, reached from both doors. Off unless `TOKENFUSE_MCP_TAINT_GATEWAY` names one. |
-| B.9 anti-exfiltration on and undisableable | Built, in enforce mode, including against a policy file that omits it. |
+| B.9 anti-exfiltration on and undisableable | Built, in enforce mode, including against a policy file that omits it. Since 2026-10-18 it denies `network_read` as well as `network_egress` after `secrets`, so a run that read a secret cannot fetch (CLAUDE.md invariant 121). |
 | B.9 the firewall on by default | **`shadow` since 2026-08-26**, `off` before it. Shadow refuses nothing, so no request that worked yesterday fails today; what it does is write. `TOKENFUSE_FIREWALL=off` restores the old silence exactly. `enforce` stays an operator decision. |
 
 ### JSON, not YAML
@@ -166,7 +166,9 @@ pins, the MCP tool lock. The SHAPE is B.2/B.5/B.6's.
   is a firewall that classifies nothing and refuses nothing. Merging would mean
   a rule you deleted is still live.
 - **Except anti-exfiltration**, which B.9 locks on: a file that omits it gets
-  it back, first in the order, in enforce mode only.
+  it back, first in the order, in enforce mode only. An enforce-mode file that
+  denies no `unclassified` capability also gets the unmapped-tool floor, which
+  refuses an unmapped tool after untrusted input (CLAUDE.md invariant 121).
 - A named config that cannot be read, does not parse, has an unknown mode, an
   unnamed rule, or a misspelled key **aborts the process with exit 2** and
   names the field. A gateway running the starter policy while its operator
@@ -353,7 +355,8 @@ labels:
 - **By the tool that returned it.** The built-in source map classifies
   Engram's MCP memory tools `recall` and `why` as `memory`. Those are the two
   that return stored content; `remember` and `forget` return nothing a model
-  reads back, so they are left unmapped.
+  reads back, so they are left unmapped as sources. `remember` is a `write`
+  capability, so a run that carries taint cannot write to memory (invariant 121).
 - **By the framework that put it in the prompt.** A framework that injects
   memory itself declares it with the existing `x-fuse-taint` request header:
   `x-fuse-taint: memory`. No new header.

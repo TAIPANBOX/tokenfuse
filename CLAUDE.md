@@ -7687,3 +7687,53 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     (`Claim::Elsewhere` never returned), a foreign parent adopted, the journal not replayed, the
     held parent unchecked. Scenarios: `features/a-run-belongs-to-the-principal-that-opened-it.feature`,
     fifteen, each bound)*
+
+121. **A read of another system's data carries nothing the run's private data can be hidden in.**
+   The agent-security review of 2026-10-17 (F-001, design 4.2) found that a read tool (`fetch_url`,
+   `browse`, `web_search`) was a source and nothing else: nothing judged what its request carried, so
+   a run that had read a secret or a private file could put that data in a URL and fetch it.
+   `@decided 2026-10-17`, paraphrased: a read is also a network read; a run that read a secret cannot
+   fetch; after private data a read is judged on what its arguments carry; an operator's enforce-mode
+   policy gets the floor that refuses an unmapped tool after untrusted input; remember is a write.
+
+   What the starter policy now does. `fetch_url`, `browse` and `web_search` exercise `network_read` and
+   are sources labelled `web`. `http_get` and `fetch` are named in neither map, so they are unclassified,
+   and the starter rule refuses them after untrusted input like any unmapped tool (invariant 115). Naming
+   them as network reads would have let them run after web input, which the starter rule does not deny.
+   This departs from the design's list of five (WAVE1-DESIGN 4.2 point 1). `remember` exercises `write`.
+   `anti-exfiltration`
+   denies `network_read` as well as `network_egress` after `secrets`, and is the same rule in the floor
+   and in the starter policy. A rule `read-tool-carries-data` denies `network_read` after `file`, `email`
+   or `memory`, and `evaluate` never refuses it on its labels alone: `read_argument_verdict` judges the
+   arguments of the call. The findings are the DLP secret kinds at any depth of the arguments, the PII
+   kinds when `TOKENFUSE_DLP_PII` is `block`, and three shape caps. `@claude`, chosen as the least a
+   legitimate read needs, open to reversal: URL path and query at most 512 bytes inclusive; no run of 64
+   characters from the base64 alphabet (hex included, `=` excluded); at most 8 query parameters. A finding
+   names the kind and never the text.
+
+   The floor. An enforce-mode file that denies no `unclassified` capability gets
+   `no-unmapped-action-after-untrusted`, which denies `unclassified` after the untrusted labels, and is
+   inserted before the injection and memory floors. `@claude`: this supersedes the sentence of invariant
+   115 that adds no floor to an operator's policy file; the rest of 115 stands. Shadow adds nothing and
+   judges as enforce would.
+
+   Where it is wired. The buffered LLM path judges the arguments of the model's tool calls
+   (`taint::tool_arguments_in`, `proxy::judge_model_tool_calls`). The streamed path judges names only,
+   because the hold keeps names and not arguments (`streamgate::tool_names`), and the MCP broker's
+   `tools/call` and `/v1/fuse/check-tool-call` carry no arguments at all. Those two are named gaps in the
+   pull request, not closed here.
+
+   Tests: `core::taint::tests`, the argument judgement, a seeded sweep of 200 URL shapes against the caps
+   written out again independently, and the rule that labels alone never refuse the read rule;
+   `gateway::firewall::read_tools_carry_no_data_tests`, the starter map, the floors and the operator file;
+   `features/read-tools-carry-no-data.feature`, twenty-one scenarios, each bound. The red commit
+   b7e5309 failed nine tests in `-p tokenfuse-core --lib` on CI, as the supervisor reported; this text
+   does not re-run them. Mutants are described, not run: the cap off by one, the label group ignored,
+   the floor not added, `network_read` left out of the anti-exfiltration deny. Not a script gate: held by
+   `cargo test`.
+   *(not proven: the streamed and MCP argument paths; the cap values, which are a choice; PII findings
+   under `observe`, which are not refused; a read tool with a secret in its arguments when its labels
+   are `web` only, which is judged by no rule of this invariant; and operator files that replace the
+   starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
+   the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
+   refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
