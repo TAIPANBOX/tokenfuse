@@ -1906,9 +1906,12 @@ build)`, `cloud apns (feature build)`.
    fetch; after private data a read is judged on what its arguments carry; an operator's enforce-mode
    policy gets the floor that refuses an unmapped tool after untrusted input; remember is a write.
 
-   What the starter policy now does. `fetch_url`, `browse`, `web_search`, `http_get` and `fetch` exercise
-   `network_read`, and the first three stay sources labelled `web`. `http_get` and `fetch` are
-   capability-only, so their output stays `unclassified`. `remember` exercises `write`. `anti-exfiltration`
+   What the starter policy now does. `fetch_url`, `browse` and `web_search` exercise `network_read` and
+   are sources labelled `web`. `http_get` and `fetch` are named in neither map, so they are unclassified,
+   and the starter rule refuses them after untrusted input like any unmapped tool (invariant 115). Naming
+   them as network reads would have let them run after web input, which the starter rule does not deny.
+   This departs from the design's list of five (WAVE1-DESIGN 4.2 point 1). `remember` exercises `write`.
+   `anti-exfiltration`
    denies `network_read` as well as `network_egress` after `secrets`, and is the same rule in the floor
    and in the starter policy. A rule `read-tool-carries-data` denies `network_read` after `file`, `email`
    or `memory`, and `evaluate` never refuses it on its labels alone: `read_argument_verdict` judges the
@@ -1942,7 +1945,8 @@ build)`, `cloud apns (feature build)`.
    under `observe`, which are not refused; a read tool with a secret in its arguments when its labels
    are `web` only, which is judged by no rule of this invariant; and operator files that replace the
    starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
-   the argument judgement.)*
+   the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
+   refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
 
 ## Decisions that have no gate yet
 

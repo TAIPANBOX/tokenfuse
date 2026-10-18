@@ -79,16 +79,17 @@ impl FirewallConfig {
             ("send_message".to_string(), "network_egress".to_string()),
             // A read is a network read as well as a source (design 4.2, invariant
             // 120): its request goes out, and its arguments can carry what the run
-            // has read. `http_get` and `fetch` are capability-only, not sources, so
-            // their output is unclassified and is refused whatever it could feed.
+            // has read. Only the three reads the starter names are known. `http_get`
+            // and `fetch` are named in neither map, so they are unclassified, and
+            // after untrusted input the starter rule refuses them as any unmapped
+            // tool is refused (invariant 115). Naming them here as network reads
+            // would let them run after web input, which the starter rule does not deny.
             ("fetch_url".to_string(), NETWORK_READ_CAPABILITY.to_string()),
             ("browse".to_string(), NETWORK_READ_CAPABILITY.to_string()),
             (
                 "web_search".to_string(),
                 NETWORK_READ_CAPABILITY.to_string(),
             ),
-            ("http_get".to_string(), NETWORK_READ_CAPABILITY.to_string()),
-            ("fetch".to_string(), NETWORK_READ_CAPABILITY.to_string()),
             // Engram's `remember` writes to the agent's memory: a write, not an
             // unmapped tool (invariant 120).
             ("remember".to_string(), "write".to_string()),
@@ -1171,27 +1172,30 @@ mod read_tools_carry_no_data_tests {
         // Dual classification: a read tool is a source (its output is labelled
         // web) and a capability (its request is a network read).
         let c = FirewallConfig::defaults(FirewallMode::Enforce);
-        for tool in ["fetch_url", "browse", "web_search", "http_get", "fetch"] {
+        for tool in ["fetch_url", "browse", "web_search"] {
             assert_eq!(
                 c.capabilities.get(tool).map(String::as_str),
                 Some(NETWORK_READ_CAPABILITY),
                 "{tool} is a read, so its request is a network read"
             );
-        }
-        // The three the starter names as sources are web-labelled. `http_get` and
-        // `fetch` are not sources: their output is unclassified, which is the
-        // fail-closed reading, so they are capability-only (design 4.2 point 1).
-        for tool in ["fetch_url", "browse", "web_search"] {
             assert_eq!(
                 c.sources.get(tool),
                 Some(&vec!["web".to_string()]),
                 "{tool} is a read, so its output is web-labelled"
             );
         }
+        // `http_get` and `fetch` are named in neither map. They are not known reads,
+        // so they stay unclassified and are refused after untrusted input, as any
+        // unmapped tool is (invariant 115). They must not be network reads here:
+        // a known read is not refused after web input, and these must be.
         for tool in ["http_get", "fetch"] {
             assert!(
+                !c.capabilities.contains_key(tool),
+                "{tool} is unmapped, so it is unclassified, not a network read"
+            );
+            assert!(
                 !c.sources.contains_key(tool),
-                "{tool} is capability-only: its output must stay unclassified"
+                "{tool} is unmapped, so its output is unclassified"
             );
         }
     }

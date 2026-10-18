@@ -19,8 +19,8 @@ Feature: A read of another system's data does not carry the run's private data o
     Given the starter policy in enforce mode
     When the policy is asked about fetch_url, browse, web_search, http_get and fetch
     Then fetch_url, browse and web_search are sources that label their output web
-    And each of the five exercises the capability network_read
-    And http_get and fetch are not sources, so their output stays unclassified
+    And each of fetch_url, browse and web_search exercises the capability network_read
+    And http_get and fetch are named in neither map, so they are unclassified and refused after untrusted input
 
   # @test:anti_exfiltration_denies_a_read_after_secrets
   Scenario: A run that read a secret cannot fetch
