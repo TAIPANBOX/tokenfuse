@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn hostile_journal_bytes_never_panic_and_never_invent_an_owner() {
-        let mut seed: u64 = 0x5eed_0f_0e4e_45;
+        let mut seed: u64 = 0x5eed_0f0e_4e45;
         let mut next = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
