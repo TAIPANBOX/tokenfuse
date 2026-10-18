@@ -142,8 +142,11 @@ impl KeySource {
     pub fn find(&self, kid: &str) -> Option<Jwk> {
         match self {
             KeySource::Fixed(set) => set.find(kid).cloned(),
-            // Red stage: a live set is not consulted yet.
-            KeySource::Live(_) => None,
+            KeySource::Live(set) => set
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .find(kid)
+                .cloned(),
         }
     }
 
@@ -151,7 +154,7 @@ impl KeySource {
     pub fn key_count(&self) -> usize {
         match self {
             KeySource::Fixed(set) => set.keys.len(),
-            KeySource::Live(_) => 0,
+            KeySource::Live(set) => set.read().unwrap_or_else(|p| p.into_inner()).keys.len(),
         }
     }
 }

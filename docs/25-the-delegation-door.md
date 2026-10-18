@@ -100,6 +100,8 @@ the door was on. That is the failure `firewall::from_env` and
 |---|---|
 | `TOKENFUSE_DELEGATION_ISSUER` | The exact `iss` to trust. Not a prefix. |
 | `TOKENFUSE_DELEGATION_JWKS` | Path to a FILE holding the issuer's JWKS, read once at startup. |
+| `TOKENFUSE_DELEGATION_JWKS_URL` | Absolute http(s) URL serving the issuer's JWKS. Fetched at startup, which must succeed, then polled, and a successful poll replaces the set whole. A failed poll keeps the keys already held. Needs `TOKENFUSE_DELEGATION_ISSUER`. Set together with `TOKENFUSE_DELEGATION_JWKS` it refuses to start. |
+| `TOKENFUSE_DELEGATION_JWKS_INTERVAL_MS` | Poll interval for the URL form. Default 60000. |
 | `TOKENFUSE_DELEGATION_AUDIENCE` | The `aud` this deployment answers to. Empty accepts any, which is a real single-tenant choice and is distinct from unset. |
 | `TOKENFUSE_DELEGATION_URL` | The absolute origin this process is reached at, so a proof's `htu` has something to compare against. |
 | `TOKENFUSE_DELEGATION_REVOCATIONS` | Absolute http(s) URL of the revocation list. Unset means no polling and no refusals. |

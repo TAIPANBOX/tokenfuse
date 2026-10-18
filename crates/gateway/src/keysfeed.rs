@@ -22,6 +22,7 @@
 //! the cache the design asks for (KEYRYX-DESIGN section 2.6).
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use jsonwebtoken::jwk::JwkSet;
 use tokenfuse_delegation::KeySource;
@@ -50,15 +51,63 @@ pub enum Wanted {
 
 /// Read the environment: the URL, the file variable, the issuer and the interval.
 pub fn wanted(get: impl Fn(&str) -> Option<String>) -> Wanted {
-    // Red stage: the URL is not read yet, so every configuration keeps today's behaviour.
-    let _ = get;
-    Wanted::Off
+    let url = get("TOKENFUSE_DELEGATION_JWKS_URL")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Wanted::Off;
+    }
+    if get("TOKENFUSE_DELEGATION_JWKS").is_some_and(|f| !f.trim().is_empty()) {
+        return Wanted::Refused(
+            "TOKENFUSE_DELEGATION_JWKS_URL and TOKENFUSE_DELEGATION_JWKS both name a key set. \
+             Name one: the file is read once at start, the URL is fetched and polled."
+                .to_string(),
+        );
+    }
+    let issuer = get("TOKENFUSE_DELEGATION_ISSUER").unwrap_or_default();
+    if issuer.trim().is_empty() {
+        return Wanted::Refused(format!(
+            "TOKENFUSE_DELEGATION_JWKS_URL ({url}) names a key set, but \
+             TOKENFUSE_DELEGATION_ISSUER is not set. A key set with no issuer verifies nothing."
+        ));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Wanted::Refused(format!(
+            "TOKENFUSE_DELEGATION_JWKS_URL ({url}) is not an absolute http(s) URL."
+        ));
+    }
+    let interval_ms =
+        match get("TOKENFUSE_DELEGATION_JWKS_INTERVAL_MS").filter(|v| !v.trim().is_empty()) {
+            None => DEFAULT_INTERVAL_MS,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    return Wanted::Refused(format!(
+                        "TOKENFUSE_DELEGATION_JWKS_INTERVAL_MS ({v}) is not a positive number of \
+                     milliseconds."
+                    ));
+                }
+            },
+        };
+    Wanted::On { url, interval_ms }
 }
 
-/// A key set from a body. Refuses a body that is not a JWKS and a set with no
-/// keys, which would refuse every token while the door reports itself as on.
+/// A key set from a body. Refuses a body over the cap, a body that is not a
+/// JWKS, and a set with no keys, which would refuse every token while the door
+/// reports itself as on.
 pub fn accept(body: &str) -> Result<JwkSet, String> {
-    tokenfuse_delegation::parse_jwks(body).map_err(|e| format!("not a JWKS: {e}"))
+    if body.len() > MAX_KEYSET_BYTES {
+        return Err(format!(
+            "the key set is {} bytes, over the {MAX_KEYSET_BYTES} cap",
+            body.len()
+        ));
+    }
+    let set = tokenfuse_delegation::parse_jwks(body).map_err(|e| format!("not a JWKS: {e}"))?;
+    if set.keys.is_empty() {
+        return Err("the key set holds no keys".to_string());
+    }
+    Ok(set)
 }
 
 async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, String> {
@@ -88,17 +137,44 @@ pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<JwkSet, String
     accept(&fetch_body(client, url).await?).map_err(|why| format!("{url}: {why}"))
 }
 
-/// The first fetch, which must succeed. Red stage: the fetch is not made yet.
+/// The first fetch, which must succeed. Only then does the poller start, so a
+/// door never holds a set nobody has read.
 pub async fn start(client: &reqwest::Client, url: &str, interval_ms: u64) -> Result<Live, String> {
-    let _ = (client, url, interval_ms);
-    Ok(Arc::new(RwLock::new(JwkSet { keys: Vec::new() })))
+    let live: Live = Arc::new(RwLock::new(fetch(client, url).await?));
+    spawn_poller(live.clone(), client.clone(), url.to_string(), interval_ms);
+    Ok(live)
 }
 
 /// One poll: fetch, and replace the held set only if the body was accepted.
-/// Red stage: the held set is never replaced.
+/// A refused or failed poll leaves the held set exactly as it was.
 pub async fn poll_once(client: &reqwest::Client, url: &str, live: &Live) -> Result<(), String> {
-    let _ = (client, url, live);
+    let set = fetch(client, url).await?;
+    install(live, set);
     Ok(())
+}
+
+/// Replace the whole held set. Whole, not merged: a key the set no longer names
+/// stops verifying with the poll that stopped naming it.
+fn install(live: &Live, set: JwkSet) {
+    *live.write().unwrap_or_else(|p| p.into_inner()) = set;
+}
+
+/// The background poll, one task per process. A failed poll is logged and the
+/// held set is kept.
+pub fn spawn_poller(live: Live, client: reqwest::Client, url: String, interval_ms: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        ticker.tick().await; // fires at once; the first fetch has already run
+        loop {
+            ticker.tick().await;
+            if let Err(why) = poll_once(&client, &url, &live).await {
+                tracing::warn!(
+                    url = %url,
+                    "key set poll failed, holding the keys already held: {why}"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]

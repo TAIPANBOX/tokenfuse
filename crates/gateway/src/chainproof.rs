@@ -44,7 +44,7 @@
 
 use std::sync::Arc;
 
-use tokenfuse_delegation::{verify_delegation, DelegationConfig, Refusal};
+use tokenfuse_delegation::{verify_delegation, DelegationConfig, KeySource, Refusal};
 
 /// The most entries a declared chain may carry: agent-passport SPEC 5.1's
 /// "Maximum chain depth is 32 entries", read from the delegation crate rather
@@ -416,14 +416,38 @@ pub(crate) fn base_config_from_env() -> Result<Option<DelegationConfig>, String>
     base_config_from_values(&issuer, &jwks_path, |p: &str| std::fs::read_to_string(p))
 }
 
-pub fn from_env() -> ChainProof {
-    let base = match base_config_from_env() {
-        Ok(None) => return None,
-        Ok(Some(cfg)) => cfg,
-        Err(msg) => {
+pub async fn from_env(client: &reqwest::Client) -> ChainProof {
+    let base = match crate::keysfeed::wanted(|k| std::env::var(k).ok()) {
+        crate::keysfeed::Wanted::Refused(msg) => {
             eprintln!("tokenfuse: {msg}");
             std::process::exit(2);
         }
+        crate::keysfeed::Wanted::On { url, interval_ms } => {
+            let issuer = std::env::var("TOKENFUSE_DELEGATION_ISSUER").unwrap_or_default();
+            match crate::keysfeed::start(client, &url, interval_ms).await {
+                Ok(live) => DelegationConfig {
+                    jwks: KeySource::Live(live),
+                    issuer: issuer.trim().to_string(),
+                    audience: String::new(),
+                },
+                Err(why) => {
+                    eprintln!(
+                        "tokenfuse: {why}. A door that has never fetched its key set cannot \
+                         verify a token, and would refuse every delegation while reporting \
+                         itself as on."
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        crate::keysfeed::Wanted::Off => match base_config_from_env() {
+            Ok(None) => return None,
+            Ok(Some(cfg)) => cfg,
+            Err(msg) => {
+                eprintln!("tokenfuse: {msg}");
+                std::process::exit(2);
+            }
+        },
     };
     let origin = std::env::var("TOKENFUSE_DELEGATION_URL").unwrap_or_default();
     if origin.trim().is_empty() {

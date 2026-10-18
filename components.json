@@ -112,6 +112,12 @@
           "TOKENFUSE_DELEGATION_JWKS": {
             "required": false
           },
+          "TOKENFUSE_DELEGATION_JWKS_INTERVAL_MS": {
+            "required": false
+          },
+          "TOKENFUSE_DELEGATION_JWKS_URL": {
+            "required": false
+          },
           "TOKENFUSE_DELEGATION_REVOCATIONS": {
             "required": false
           },
