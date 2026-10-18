@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **2148 passing** (core 433, dpop 23, delegation 72,
-gateway 1332, cloud 287, umbrella 1, by `cargo test -p <crate>`). The agent's own token at every
+`cargo test --all` runs **2162 passing** (core 433, dpop 23, delegation 75,
+gateway 1343, cloud 287, umbrella 1, by `cargo test -p <crate>`). The key set fetched from a URL and polled (invariant 126) adds 14: 11 in `gateway::keysfeed` and 3 in `delegation::key_source_tests`, counted from the diff against main (2148, not measured again on this branch). The agent's own token at every
 door (invariants 123 and 124) adds 46: 2 in `dpop`, 12 in `delegation`, and in `gateway` 6 unit tests
 (`agenttoken`, `chainproof`, `mcpbroker`) and 26 in `tests/it`; counted from the diff against
 main, 2102. Gateway grew by 15 with the gateway-held provider key (invariant 122: 15 in `tests/it/the_gateway_holds_the_provider_key.rs`, counted from the suite at 18fbe9d). Gateway grew by 25 with run

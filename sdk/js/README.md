@@ -54,6 +54,33 @@ const client = new OpenAI({
 - `openaiBaseUrl(gateway?)`: `baseURL` for an OpenAI-shaped client (the gateway root plus `/v1`).
 - `chatCompletionsUrl(gateway?)`: the OpenAI-style chat completions endpoint.
 - `runHeaders(runId, { budgetUsd, taskType, parentRunId, tags })`: the `X-Fuse-*` headers.
+- `createAgentFetch({ issuer, key, clientId, clientSecret, workloadToken, audience, fetch, now })`: a `fetch` that signs each request for an agent (see below).
+- `AgentTokenError`: thrown when vouchryx refuses the token request.
+
+### Agent tokens
+
+`createAgentFetch` returns a `fetch`-compatible function that holds an agent's ES256
+key, asks vouchryx for a short-lived token, and signs each request to a TokenFuse door:
+
+```js
+const { createAgentFetch } = require("tokenfuse");
+
+const agentFetch = createAgentFetch({
+  issuer: "https://vouchryx.example.com",
+  key: pemKey,                      // the agent's ES256 (P-256) private key, PEM
+  clientId: "agent://acme/triage",
+  clientSecret: enrolmentKey,       // or workloadToken: () => readProjectedToken()
+});
+const res = await agentFetch("https://tokenfuse.example.com/v1/messages", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body,
+});
+```
+
+The token is asked for again at 80 percent of its life, every request carries a fresh
+proof, and a DPoP nonce challenge is answered by one retry. The module uses `node:crypto`
+only. It needs `fetch`: Node 18 or later, or an `options.fetch` of your own.
 
 Versions: from 0.5.0 this package versions with the gateway.
 

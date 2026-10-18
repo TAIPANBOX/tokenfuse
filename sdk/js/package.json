@@ -15,7 +15,7 @@
   "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts", "README.md"],
+  "files": ["index.js", "agent.js", "index.d.ts", "README.md"],
   "engines": { "node": ">=16" },
   "publishConfig": { "access": "public" },
   "scripts": {
