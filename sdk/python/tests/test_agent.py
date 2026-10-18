@@ -398,7 +398,7 @@ def test_the_token_and_the_key_never_reach_a_log_or_an_error(caplog, capsys):
     door.refuse_all = True
     assert client.get(f"{DOOR}/v1/messages").status_code == 401
 
-    wrong = StubVouchryx(client_secret="wrongsecret-xyz")
+    wrong = StubVouchryx()  # holds the real secret, so the wrong one is refused
     client2, _ = _wire(
         wrong,
         StubDoor(wrong),

@@ -25,6 +25,12 @@ Homepage = "https://github.com/TAIPANBOX/tokenfuse"
 Repository = "https://github.com/TAIPANBOX/tokenfuse"
 Issues = "https://github.com/TAIPANBOX/tokenfuse/issues"
 
+# The base package stays dependency-free. The agent token helper (tokenfuse.agent)
+# needs httpx for httpx.Auth and cryptography for the ES256 signature:
+#   pip install "tokenfuse-sdk[agent]"
+[project.optional-dependencies]
+agent = ["httpx>=0.28.1", "cryptography>=46.0.7"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tokenfuse*"]

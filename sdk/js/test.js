@@ -393,8 +393,7 @@ async function test_the_token_and_the_key_never_reach_a_log_or_an_error() {
     door.refuseAll = true;
     assert.strictEqual((await agentFetch(`${DOOR}/v1/messages`)).status, 401);
 
-    const wrong = new StubVouchryx();
-    wrong.clientSecret = "wrongsecret-xyz";
+    const wrong = new StubVouchryx(); // holds the real secret, so the wrong one is refused
     const clock = clockFrom(1_000_000);
     const badFetch = wire(wrong, new StubDoor(wrong), clock, pem, {
       clientId: AGENT,
@@ -409,8 +408,7 @@ async function test_the_token_and_the_key_never_reach_a_log_or_an_error() {
     assert.ok(thrown instanceof AgentTokenError);
 
     const keyBody = pem.toString("utf8").split("\n")[1].slice(0, 24);
-    const text = [captured.join("\n"), String(thrown && thrown.message), vouchryx.lastToken]
-      .join("\n");
+    const text = [captured.join("\n"), String(thrown && thrown.message)].join("\n");
     assert.ok(!text.includes(vouchryx.lastToken));
     assert.ok(!text.includes(SECRET));
     assert.ok(!text.includes("wrongsecret-xyz"));
