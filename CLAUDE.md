@@ -7887,3 +7887,17 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `agenttoken::tests::the_identity_source_is_the_door_that_admitted_the_call`. Mutant as a teeth
     case: the token's call told `client-key`. Scenario: the policy-plane scenario of
     `features/an-agent-token-is-the-door-credential.feature`)*
+
+125. **An SDK's agent helper answers each nonce challenge once, and its key and token never reach a log or an error.**
+    `@decided 2026-10-18`, paraphrased: the agent token helper in the Python and JS SDKs (wave 1 T5) answers a DPoP
+    nonce challenge, from a door or from vouchryx's token endpoint, with one retry that carries the newest nonce that
+    server sent; a second challenge is returned to the caller and not retried; the enrolment key, the workload token and
+    the agent token appear in no log line and no error message.
+    `@claude` 2026-10-18, the choices the decision left open, open to reversal: the refresh at 80 percent of the
+    lifetime, a 128-bit `jti`, the form encoding of the enrolment key before the Basic encoding, and the bound of two
+    requests on the token endpoint.
+    *(test: `sdk/python/tests/test_agent.py` `test_a_nonce_challenge_is_retried_once_with_the_nonce`,
+    `test_the_newest_nonce_is_used_next`, `test_a_second_challenge_is_not_retried`,
+    `test_a_token_request_nonce_challenge_is_retried_once` and `test_the_token_and_the_key_never_reach_a_log_or_an_error`,
+    and the same names in `sdk/js/test.js`, which run against the stub vouchryx and the stub door of those files.
+    Scenarios: `features/the-sdk-holds-an-agent-token.feature`. Not a script gate.)*

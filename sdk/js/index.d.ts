@@ -30,3 +30,32 @@ export declare function runHeaders(
   runId: string,
   opts?: RunHeaderOptions,
 ): Record<string, string>;
+
+/** Thrown when vouchryx refuses the agent token request. Its message carries no token or key. */
+export declare class AgentTokenError extends Error {}
+
+export interface AgentFetchOptions {
+  /** The vouchryx issuer, for example https://vouchryx.example.com. */
+  issuer: string;
+  /** The agent's ES256 (P-256) private key, as PEM or a KeyObject. */
+  key: string | Buffer | import("node:crypto").KeyObject;
+  /** The agent id, for example agent://acme/triage, with clientSecret (the enrolment key). */
+  clientId?: string;
+  clientSecret?: string;
+  /** Returns the projected workload token at the time it is called. */
+  workloadToken?: () => string;
+  /** Sent as the token request's resource. */
+  audience?: string;
+  /** The fetch to use; defaults to the global fetch. */
+  fetch?: typeof fetch;
+  /** The clock in milliseconds, used to measure the token's age. */
+  now?: () => number;
+}
+
+export type AgentFetch = (
+  input: string | URL,
+  init?: Parameters<typeof fetch>[1],
+) => ReturnType<typeof fetch>;
+
+/** A fetch that signs each request with the agent's token and a fresh DPoP proof. */
+export declare function createAgentFetch(options: AgentFetchOptions): AgentFetch;

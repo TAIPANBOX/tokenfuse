@@ -62,6 +62,8 @@ function runHeaders(runId, opts = {}) {
   return headers;
 }
 
+const agent = require("./agent.js");
+
 module.exports = {
   VERSION: "1.0.1",
   DEFAULT_GATEWAY,
@@ -70,4 +72,6 @@ module.exports = {
   chatCompletionsUrl,
   openaiBaseUrl,
   runHeaders,
+  AgentTokenError: agent.AgentTokenError,
+  createAgentFetch: agent.createAgentFetch,
 };
