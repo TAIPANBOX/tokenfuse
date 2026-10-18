@@ -1523,7 +1523,7 @@ run_case "tool-check: the key is not asked for" fail \
 
 run_case "tool-check: another key's run is described" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact check_tool_call_answers_its_callers_runs::a_check_about_another_keys_run_says_nothing_about_it" \
-	"$(py 'edit("crates/gateway/src/toolcheck.rs", "let foreign = !caller.is_empty()", "let foreign = false && !caller.is_empty()")')" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "let foreign = !principal.is_empty()", "let foreign = false && !principal.is_empty()")')" \
 	"a_check_about_another_keys_run_says_nothing_about_it ... FAILED"
 
 run_case "tool-check: the broker reads a refusal as an answer" fail \
@@ -1535,6 +1535,61 @@ run_case "open-bind: the warning is never printed" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact open_bind_without_client_keys::an_open_bind_with_no_client_keys_is_said_at_startup" \
 	"$(py 'edit("crates/gateway/src/main.rs", "open_bind_warning(&addr, client_keys.enabled())", "open_bind_warning(&addr, true)")')" \
 	"an_open_bind_with_no_client_keys_is_said_at_startup ... FAILED"
+
+# --- invariant 120: a run belongs to the principal that opened it -----------
+#
+# The script gate holds the ORDER (the owner settled before the run is touched,
+# a declared parent judged before anything is opened); the product mutants are
+# the ways the residual comes back silently: another key's run answered, a
+# foreign parent adopted, the journal not replayed, the held parent unchecked.
+run_case "run-owner-first: the run's tool blocks recorded before the claim" fail \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    st.taint.note_blocks(&run_id, &[]);\n    let principal = crate::runowners::key_principal(&key_id);\n")')" \
+	"TOUCHES THE RUN BEFORE ITS OWNER"
+
+run_case "run-owner-first: the metered door never claims" fail \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "st.run_owners.claim(&run_id, &principal)", "crate::runowners::Claim::Opened")')" \
+	"NEVER CLAIMS"
+
+run_case "run-owner-first: the declared parent judged only after it is opened" fail \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
+	"PARENT JUDGED ONLY AFTER IT IS OPENED"
+
+run_case "run-owner-first: the check reads the taint before the owner" fail \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "    let principal = crate::runowners::key_principal(caller);\n", "    let _ = st.inherited_taint(&req.run_id);\n    let principal = crate::runowners::key_principal(caller);\n")')" \
+	"TOUCHES THE RUN BEFORE ITS OWNER"
+
+run_case "run-owner-first: a comment naming open_run above the claim passes" pass \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let principal = crate::runowners::key_principal(&key_id);\n", "    // st.ledger.open_run(..) and st.taint.note_blocks(..) come after the claim\n    let principal = crate::runowners::key_principal(&key_id);\n")')"
+
+run_case "run-owner-first: handle_call renamed, so it measured nothing" fail \
+	"./scripts/run-owner-is-checked-first.sh" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "async fn handle_call(", "async fn handle_one_call(")')" \
+	"measured nothing"
+
+run_case "run-ownership: another principal's run is answered" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact run_belongs_to_its_principal::another_keys_run_is_refused_and_says_nothing_about_it" \
+	"$(py 'edit("crates/gateway/src/runowners.rs", "Some(o) => return Claim::Elsewhere(o.clone()),", "Some(_) => return Claim::Own,")')" \
+	"another_keys_run_is_refused_and_says_nothing_about_it ... FAILED"
+
+run_case "run-ownership: a foreign parent is adopted" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact run_belongs_to_its_principal::a_child_naming_another_keys_run_as_parent_is_refused_and_inherits_nothing" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if owner == principal || delegated {", "    if true || owner == principal || delegated {")')" \
+	"a_child_naming_another_keys_run_as_parent_is_refused_and_inherits_nothing ... FAILED"
+
+run_case "run-ownership: the journal is not replayed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact runowners::tests::a_claim_is_journaled_and_replayed_first_owner_wins" \
+	"$(py 'edit("crates/gateway/src/runowners.rs", "    let loaded = owners.load(&kept);", "    let loaded = owners.load(&[]);")')" \
+	"a_claim_is_journaled_and_replayed_first_owner_wins ... FAILED"
+
+run_case "run-ownership: the parent the ledger holds is not checked" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact run_belongs_to_its_principal::a_parent_held_by_the_ledger_is_checked_when_the_header_is_omitted" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if parent.is_none() && !parent_run_id.is_empty() {", "    if false && parent.is_none() && !parent_run_id.is_empty() {")')" \
+	"a_parent_held_by_the_ledger_is_checked_when_the_header_is_omitted ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #

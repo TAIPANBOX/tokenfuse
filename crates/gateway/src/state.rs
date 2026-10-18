@@ -151,6 +151,11 @@ pub struct AppState {
     /// Per-unit monthly budget counters (docs/20). Uncapped units are not
     /// accounted; disabled entirely when the identity map is off.
     pub units: Arc<UnitLedger>,
+    /// Run id -> the principal whose metered call first named it (invariant
+    /// 120), journaled under `TOKENFUSE_DATA_DIR` when `serve` gives it a
+    /// journal. Empty while client keys are not configured. See
+    /// `crate::runowners`.
+    pub run_owners: Arc<crate::runowners::RunOwners>,
     /// Reservations kept outstanding on purpose because the provider held
     /// the request when the caller left (invariant 50). Process-local;
     /// `GET /v1/runs` shows them per run.
@@ -225,10 +230,6 @@ pub struct TaintStore {
     /// Per run: the tool blocks this gateway has carried, and which of them a
     /// human has signed for. See [`BlockLedger`] and [`TaintStore::split_history`].
     blocks: Mutex<HashMap<String, BlockLedger>>,
-    /// Run -> the client key id whose metered call first named it, so
-    /// `/v1/fuse/check-tool-call` answers only the run's own caller (invariant
-    /// 118). Empty while client keys are not configured.
-    owners: Mutex<HashMap<String, String>>,
 }
 
 /// How many tool blocks are tracked per run.
@@ -301,28 +302,6 @@ pub struct HistorySplit {
 }
 
 impl TaintStore {
-    /// Record that the client key `key_id` named `run_id` on a metered call.
-    ///
-    /// First write wins (invariant 118): a run belongs to the credential that
-    /// opened it, and a later caller naming the same run id does not take it
-    /// over. An empty `key_id`, the value when client keys are off, records
-    /// nothing, so a gateway without keys keeps no owners at all.
-    pub fn note_owner(&self, run_id: &str, key_id: &str) {
-        if run_id.is_empty() || key_id.is_empty() {
-            return;
-        }
-        self.owners
-            .lock()
-            .unwrap()
-            .entry(run_id.to_string())
-            .or_insert_with(|| key_id.to_string());
-    }
-
-    /// The client key id that owns `run_id`, if a keyed metered call named it.
-    pub fn owner(&self, run_id: &str) -> Option<String> {
-        self.owners.lock().unwrap().get(run_id).cloned()
-    }
-
     /// Record which run a child declared as its parent.
     ///
     /// Last write wins, deliberately: the value comes off a request header, so
@@ -656,6 +635,7 @@ impl AppState {
             identity: Arc::new(IdentityMap::default()),
             identity_strict: StrictMode::Off,
             units: Arc::new(UnitLedger::default()),
+            run_owners: Arc::new(crate::runowners::RunOwners::default()),
             retained: Arc::new(crate::settle::Retained::default()),
             keystats: Arc::new(KeyStats::default()),
             refused_keys: Arc::new(crate::refusedkeys::RefusedKeys::default()),
@@ -831,6 +811,13 @@ impl AppState {
         self
     }
 
+    /// Replace the run-owner map, to give it a journal and the owners replayed
+    /// from it (invariant 120). Chainable; before serving.
+    pub fn with_run_owners(mut self, owners: Arc<crate::runowners::RunOwners>) -> Self {
+        self.run_owners = owners;
+        self
+    }
+
     /// Replace the retained-reservation registry, to give it a journal (W03). Chainable;
     /// before serving, since every guard clones the registry it finds here.
     pub fn with_retained(mut self, retained: Arc<crate::settle::Retained>) -> Self {
@@ -930,14 +917,10 @@ impl AppState {
         self.taint.inherited(run_id)
     }
 
-    /// See [`TaintStore::note_owner`].
-    pub fn note_run_owner(&self, run_id: &str, key_id: &str) {
-        self.taint.note_owner(run_id, key_id);
-    }
-
-    /// See [`TaintStore::owner`].
+    /// The principal that owns `run_id` (`key:<key_id>` or `tok:<subject>`),
+    /// if a keyed metered call named it. See [`crate::runowners::RunOwners`].
     pub fn run_owner(&self, run_id: &str) -> Option<String> {
-        self.taint.owner(run_id)
+        self.run_owners.owner(run_id)
     }
 
     /// Attach an event sink (e.g. the Parquet trace). Chainable.

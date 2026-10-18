@@ -68,6 +68,16 @@ artifacts - passports, descriptors - are JSON already):
   parses it as a date or enforces anything from it; a blank/whitespace
   value normalizes to absent. Read by `GET /v1/keys` so an operator can
   compare how old a binding is against how recently it was actually used.
+- `keys[].may_parent` (optional, added by invariant 120) lists the client key
+  ids whose runs may declare this key's runs as their parent
+  (`x-fuse-parent-run-id`). Absent or empty, the default, no other key's run
+  may roll up into this key's runs: such a call is refused `403`
+  `parent_owned_elsewhere` before anything is opened, so it neither spends
+  this key's budget nor inherits its runs' labels. One way only: listing
+  `worker` under `coordinator` lets worker runs roll up into coordinator runs,
+  not the reverse. Literal key ids only; a blank entry or one containing `*`
+  refuses to load. Example: `{"key_id": "coordinator", "unit": "ops",
+  "may_parent": ["worker-1", "worker-2"]}`.
 - `prefixes` is the fallback for traffic with no key: pure attribution, never
   a mismatch, because nothing is authenticated to check against.
 

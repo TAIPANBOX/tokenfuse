@@ -144,14 +144,18 @@ fn answer(
         }));
     }
 
-    // Another key's run is not described, not even by whether it read
+    // Another principal's run is not described, not even by whether it read
     // anything (invariant 118). `deny` rather than a bare refusal, so an
-    // executor that reads only the decision fails closed. An empty `caller` is
-    // a gateway without client keys, where no run has an owner.
-    let foreign = !caller.is_empty()
+    // executor that reads only the decision fails closed. Owners are
+    // principals (invariant 120, `crate::runowners`), the same ones the metered
+    // door claims runs for, so the two doors cannot disagree about whose run it
+    // is. An empty principal is a gateway without client keys, where no run
+    // has an owner.
+    let principal = crate::runowners::key_principal(caller);
+    let foreign = !principal.is_empty()
         && st
             .run_owner(&req.run_id)
-            .is_some_and(|owner| owner != caller);
+            .is_some_and(|owner| owner != principal);
     if foreign {
         return Json(serde_json::json!({
             "decision": "deny",

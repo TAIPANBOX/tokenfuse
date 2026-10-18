@@ -46,6 +46,7 @@ pub mod refusedkeys;
 pub mod retainedjournal;
 pub mod revocations;
 pub mod router;
+pub mod runowners;
 pub mod savingscli;
 pub mod seedgate;
 pub mod settle;
