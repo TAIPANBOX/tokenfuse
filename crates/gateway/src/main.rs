@@ -557,7 +557,8 @@ async fn mcp_broker() {
     let events = Arc::new(tokenfuse_gateway::events::from_env());
     // The delegation issuer, or nothing, in which case every chain the PDP is
     // asked about stays a claim and says so.
-    let chain_proof = tokenfuse_gateway::chainproof::from_env();
+    let broker_client = reqwest::Client::new();
+    let chain_proof = tokenfuse_gateway::chainproof::from_env(&broker_client).await;
     if chain_proof.is_some() {
         tracing::info!("delegation door: ON, chains reaching the PDP are verified here");
     }
@@ -565,7 +566,6 @@ async fn mcp_broker() {
     // must succeed: a door holding no list refuses every delegated call under
     // the default fail mode, and doing that while the log says the door is on
     // is the failure this exits rather than enters.
-    let broker_client = reqwest::Client::new();
     let revocations = tokenfuse_gateway::revocations::from_env(
         &broker_client,
         chain_proof.is_some(),
@@ -1271,7 +1271,7 @@ async fn serve() {
     // chain reaching the PDP from the LLM proxy was a claim while the code at
     // the door read as though it were verified. `scripts/both-processes-
     // configure-the-same-doors.sh` is what now says so.
-    let chain_proof = tokenfuse_gateway::chainproof::from_env();
+    let chain_proof = tokenfuse_gateway::chainproof::from_env(&reqwest::Client::new()).await;
     if chain_proof.is_some() {
         tracing::info!("delegation door: ON, chains reaching the PDP are verified here");
     }

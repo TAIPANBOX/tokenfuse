@@ -13,7 +13,7 @@
 use base64::Engine as _;
 use p256::ecdsa::signature::Signer;
 
-use crate::{thumbprint, DelegationConfig};
+use crate::{thumbprint, DelegationConfig, KeySource};
 
 pub const ISS: &str = "https://vouchryx.acme.example";
 pub const AUD: &str = "https://tokenfuse.acme.example";
@@ -66,7 +66,7 @@ impl Key {
 pub fn cfg(issuer_key: &Key) -> DelegationConfig {
     let set = serde_json::json!({"keys": [issuer_key.jwk_value(Some("v-1"))]});
     DelegationConfig {
-        jwks: serde_json::from_value(set).expect("a jwk set"),
+        jwks: KeySource::Fixed(serde_json::from_value(set).expect("a jwk set")),
         issuer: ISS.into(),
         audience: AUD.into(),
     }

@@ -49,7 +49,9 @@
 //! nobody. [`revocations::Revocations`] is the local cache and the staleness
 //! policy that fills it, still with no client in this crate.
 
-use jsonwebtoken::jwk::JwkSet;
+use std::sync::{Arc, RwLock};
+
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -67,6 +69,28 @@ pub use tokenfuse_dpop::{algorithms_for_key, thumbprint, PROOF_WINDOW_SECS};
 /// detail of verification rather than something two crates now know about.
 pub fn parse_jwks(raw: &str) -> Result<JwkSet, serde_json::Error> {
     serde_json::from_str(raw)
+}
+
+/// The keys a verifier holds, indexed by `kid`. Named here so a caller that
+/// holds a key set (a poller, a file reader) never has to name `jsonwebtoken`.
+pub type KeySet = JwkSet;
+
+/// Parse an issuer's key set from a document that is at most `max_bytes` long,
+/// that is a JWKS, and that holds at least one key. Every source of a key set
+/// (a file, a fetched URL, a poll) goes through this one rule, so they cannot
+/// disagree about what they accept.
+pub fn parse_key_set(raw: &str, max_bytes: usize) -> Result<KeySet, String> {
+    if raw.len() > max_bytes {
+        return Err(format!(
+            "the key set is {} bytes, over the {max_bytes} cap",
+            raw.len()
+        ));
+    }
+    let set: KeySet = parse_jwks(raw).map_err(|e| format!("not a JWKS: {e}"))?;
+    if set.keys.is_empty() {
+        return Err("the key set holds no keys".to_string());
+    }
+    Ok(set)
 }
 
 /// Why a delegation was refused.
@@ -122,10 +146,51 @@ pub struct VerifiedDelegation {
     pub proof_ath: Option<String>,
 }
 
+/// Where the verifier reads the issuer's keys: a set fixed at startup, or a set
+/// a poller replaces (`TOKENFUSE_DELEGATION_JWKS_URL`). A lookup answers from
+/// the set as it stands at the moment of the lookup.
+#[derive(Debug)]
+pub enum KeySource {
+    /// Read once, from the file `TOKENFUSE_DELEGATION_JWKS` names.
+    Fixed(JwkSet),
+    /// Replaced whole by each successful poll, so a key a poll no longer names
+    /// stops verifying at that poll.
+    Live(Arc<RwLock<JwkSet>>),
+}
+
+impl KeySource {
+    /// The key a `kid` names in the set as it stands now. A copy, because a live
+    /// set can be replaced while a token is being checked.
+    pub fn find(&self, kid: &str) -> Option<Jwk> {
+        match self {
+            KeySource::Fixed(set) => set.find(kid).cloned(),
+            KeySource::Live(set) => set
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .find(kid)
+                .cloned(),
+        }
+    }
+
+    /// How many keys the set holds now.
+    pub fn key_count(&self) -> usize {
+        match self {
+            KeySource::Fixed(set) => set.keys.len(),
+            KeySource::Live(set) => set.read().unwrap_or_else(|p| p.into_inner()).keys.len(),
+        }
+    }
+}
+
+impl From<JwkSet> for KeySource {
+    fn from(set: JwkSet) -> Self {
+        KeySource::Fixed(set)
+    }
+}
+
 /// Everything the process already holds. No client, no URL, no timeout.
 #[derive(Debug)]
 pub struct DelegationConfig {
-    pub jwks: JwkSet,
+    pub jwks: KeySource,
     /// The exact `iss` required. Not a prefix: a prefix is how a service ends
     /// up trusting `vouchryx.acme.example.evil.test`.
     pub issuer: String,
@@ -233,8 +298,8 @@ fn decode_claims<T: DeserializeOwned>(
     let jwk = cfg.jwks.find(&kid).ok_or(Refusal::BadSignature)?;
 
     // The single copy of the alg rule. See `oidc::algorithms_for_key`.
-    let algorithms = tokenfuse_dpop::algorithms_for_key(jwk).ok_or(Refusal::BadSignature)?;
-    let key = DecodingKey::from_jwk(jwk).map_err(|_| Refusal::BadSignature)?;
+    let algorithms = tokenfuse_dpop::algorithms_for_key(&jwk).ok_or(Refusal::BadSignature)?;
+    let key = DecodingKey::from_jwk(&jwk).map_err(|_| Refusal::BadSignature)?;
 
     let mut validation = Validation::new(algorithms[0]);
     validation.algorithms = algorithms;
@@ -2145,5 +2210,92 @@ mod tests {
             let _ = verify_agent_token(&cfg(&issuer), &candidate, None, "POST", URL, now, never);
             let _ = verify_relayed_agent_token(&cfg(&issuer), &candidate, now, never);
         }
+    }
+}
+
+#[cfg(test)]
+mod key_source_tests {
+    use super::*;
+    use crate::testing::{proof, token, Key, AUD, ISS, URL};
+    use jsonwebtoken::jwk::JwkSet;
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// A key set held the way a poller holds it: replaceable behind a lock.
+    fn cell(set: serde_json::Value) -> Arc<RwLock<JwkSet>> {
+        Arc::new(RwLock::new(serde_json::from_value(set).expect("a jwk set")))
+    }
+
+    /// Whether a token signed by `issuer`, presented by `holder`, verifies
+    /// against the set `held` holds at this moment.
+    fn verifies(held: &Arc<RwLock<JwkSet>>, issuer: &Key, holder: &Key) -> bool {
+        let cfg = DelegationConfig {
+            jwks: KeySource::Live(held.clone()),
+            issuer: ISS.into(),
+            audience: AUD.into(),
+        };
+        let tok = token(issuer, holder, NOW, serde_json::json!({}));
+        let prf = proof(holder, NOW);
+        verify_delegation(
+            &cfg,
+            &tok,
+            Some(prf.as_str()),
+            "POST",
+            URL,
+            NOW,
+            |_, _, _| false,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn a_key_the_live_set_names_verifies_and_a_different_key_under_its_kid_does_not() {
+        let issuer = Key::default();
+        let holder = Key::default();
+        let held = cell(serde_json::json!({"keys": [issuer.jwk_value(Some("v-1"))]}));
+        assert!(
+            verifies(&held, &issuer, &holder),
+            "the key the live set names must verify"
+        );
+
+        let other = Key::default();
+        let held = cell(serde_json::json!({"keys": [other.jwk_value(Some("v-1"))]}));
+        assert!(
+            !verifies(&held, &issuer, &holder),
+            "a different key under the same kid must not verify"
+        );
+    }
+
+    #[test]
+    fn an_unknown_kid_is_refused_even_when_the_only_key_held_would_verify() {
+        let issuer = Key::default();
+        let holder = Key::default();
+        // The token names kid "v-1"; the set holds this issuer's key under "v-9".
+        let held = cell(serde_json::json!({"keys": [issuer.jwk_value(Some("v-9"))]}));
+        assert!(
+            !verifies(&held, &issuer, &holder),
+            "a token whose kid the set does not name must be refused"
+        );
+    }
+
+    #[test]
+    fn a_key_the_set_no_longer_names_stops_verifying() {
+        let old = Key::default();
+        let holder = Key::default();
+        let held = cell(serde_json::json!({"keys": [old.jwk_value(Some("v-1"))]}));
+        assert!(
+            verifies(&held, &old, &holder),
+            "before the replacement it verifies"
+        );
+
+        let successor = Key::default();
+        let replacement: JwkSet =
+            serde_json::from_value(serde_json::json!({"keys": [successor.jwk_value(Some("v-2"))]}))
+                .expect("a jwk set");
+        *held.write().unwrap_or_else(|p| p.into_inner()) = replacement;
+        assert!(
+            !verifies(&held, &old, &holder),
+            "a key the replaced set does not name must stop verifying"
+        );
     }
 }
