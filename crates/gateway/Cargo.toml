@@ -31,6 +31,13 @@ subtle = "2.6"
 hmac = "0.12"
 sha2.workspace = true
 getrandom = "0.2"
+# The checkpoint key (crate::checkpoints, invariant 128): an ES256 key this
+# process generates and keeps in memory, signing SPEC 6.5.1 records; base64 for
+# keyryx's proof of possession. Both were dev-dependencies for the MCP door's
+# tests and are in Cargo.lock through crates/cloud and crates/delegation, so
+# nothing new enters the tree.
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 axum.workspace = true
 serde.workspace = true
@@ -68,11 +75,6 @@ tokenfuse-delegation = { workspace = true, features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# The MCP door's tests mint real RFC 9449 proofs, so they exercise the same
-# verifier a client would rather than a stub of it. Both crates are already in
-# this workspace's lockfile (crates/cloud), so nothing new enters the tree.
-p256 = { version = "0.13", features = ["ecdsa"] }
-base64 = "0.22"
 
 [features]
 cluster = ["dep:tokenfuse-cluster"]

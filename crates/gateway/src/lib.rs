@@ -8,6 +8,7 @@ pub mod agenttoken;
 pub mod attestation;
 pub mod backtestcli;
 pub mod chainproof;
+pub mod checkpoints;
 pub mod clientkeys;
 pub mod closure;
 pub mod cloudsink;

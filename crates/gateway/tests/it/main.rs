@@ -25,6 +25,7 @@ mod codex_money_review;
 mod declared_tools_are_read;
 mod delegation_htu_matches_wire;
 mod dlp_shadow_on_the_bus;
+mod event_checkpoints;
 mod firewall_mode_startup;
 mod focus_names_price_basis_and_pii;
 mod image_user_group;

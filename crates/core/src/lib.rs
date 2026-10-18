@@ -7,6 +7,7 @@ pub mod audit;
 pub mod backtest;
 pub mod breaker;
 pub mod cache;
+pub mod checkpoint;
 pub mod compliance;
 pub mod dlp;
 pub mod firewallstats;

@@ -332,6 +332,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - the max_tokens clamp against the remaining budget that docs/02 ADR-4 describes does not exist (docs/26 section 8); the pre-flight estimate reads the field and never rewrites it
 - Cross App Access (TOKENFUSE_MCP_ACCEPT_XAA, TOKENFUSE_MCP_RESOURCE): the MCP broker's bearer door for a vouchryx-issued XAA access token and the RFC 9728 metadata it publishes while on; the grant is draft-ietf-oauth-identity-assertion-authz-grant-04, not a published RFC, and the shape may still move
 - the agent-token door (TOKENFUSE_AGENT_TOKENS, TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE): an agent's own vouchryx access token (typ at+jwt, DPoP-bound) as a door credential at both doors and the tool-call check, the agent_token_refused and agent_token_required error types, and the identity_source member told to the policy plane; new in the first wave of the agent-security work, so the shape may still move
+- signed checkpoints of the agent-event stream (TOKENFUSE_CHECKPOINTS_DIR, TOKENFUSE_CHECKPOINT_KEYRYX_URL, TOKENFUSE_CHECKPOINT_KEYRYX_CONSUMER, TOKENFUSE_CHECKPOINT_KEYRYX_CREDENTIAL_FILE, TOKENFUSE_CHECKPOINT_KEY_NAME, TOKENFUSE_CHECKPOINT_KEY_LIFETIME_SECS): the <stream>.ckpt.ndjson sidecar of agent-passport SPEC 6.5.1 format v1, signed by a key keyryx certifies (invariant 128); the record bytes are SPEC 6.5.1's, and the variable names and the keyryx exchange are new in this release, so the shape may still move
 
 ## Support
 
