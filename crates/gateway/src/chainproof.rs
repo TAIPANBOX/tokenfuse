@@ -401,7 +401,7 @@ pub(crate) fn base_config_from_values(
         ));
     }
     Ok(Some(DelegationConfig {
-        jwks,
+        jwks: jwks.into(),
         issuer: issuer.to_string(),
         audience: String::new(),
     }))
@@ -875,6 +875,6 @@ mod tests {
             cfg.audience, "",
             "the caller sets the audience, not this function"
         );
-        assert_eq!(cfg.jwks.keys.len(), 1);
+        assert_eq!(cfg.jwks.key_count(), 1);
     }
 }

@@ -23,6 +23,7 @@ pub mod firewall;
 pub mod firewallcli;
 pub mod focusexport;
 pub mod identitymap;
+pub mod keysfeed;
 pub mod keysreport;
 pub mod keystats;
 pub mod ledger_backend;
