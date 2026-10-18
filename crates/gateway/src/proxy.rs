@@ -546,8 +546,14 @@ pub async fn healthz(
     }
     let client_auth = st.client_keys.enabled();
     let loopback = crate::mcpbroker::is_loopback(&st.bind_addr);
+    // Invariant 122: a gateway that forwards the caller's provider credential says so here too.
+    let provider_key = st
+        .provider
+        .forwards_caller_credential()
+        .then(|| crate::provider::UNBROKERED_WARNING.to_string());
     let warnings: Vec<String> = crate::clientkeys::open_bind_warning(&st.bind_addr, client_auth)
         .into_iter()
+        .chain(provider_key)
         .collect();
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -684,6 +690,16 @@ async fn handle_call(
     // still reaches the provider and still spends the operator's provider
     // credential, so an operator who turned this on to control who may use the
     // gateway would be surprised to find "omit the run id" is a way around it.
+    // Invariant 122: with the provider key held here, a provider credential the caller sent that
+    // is not a gateway credential is refused, and nothing it sent is forwarded.
+    if let Some(header) = crate::provider::refused_caller_credential(
+        st.provider.brokers_key(),
+        &st.client_keys,
+        &headers,
+    ) {
+        report_caller_provider_credential(&st, &headers, header);
+        return provider_credential_refused();
+    }
     let Some(key_id) = resolve_client_key(&st, &headers) else {
         report_refused_key(&st, &headers);
         return unauthorized(&st.keystats);
@@ -2945,9 +2961,67 @@ pub(crate) fn resolve_client_key(st: &AppState, headers: &HeaderMap) -> Option<S
         return Some(String::new());
     }
     let presented = header_str(headers, crate::clientkeys::CLIENT_KEY_HEADER).unwrap_or_default();
+    // Invariant 122: with the provider key held here, a stock SDK's own key header carries the
+    // gateway credential when no `x-fuse-key` was sent.
+    if presented.trim().is_empty() && st.provider.brokers_key() {
+        return crate::provider::gateway_credential_in_provider_headers(&st.client_keys, headers);
+    }
     st.client_keys
         .resolve(presented.trim())
         .map(ToString::to_string)
+}
+
+/// Invariant 122: a provider credential the caller sent while the gateway holds the provider key
+/// is refused. The record names the header that carried it, never the credential, and is
+/// rate-limited per source like the refused client keys (invariant 105).
+pub(crate) fn report_caller_provider_credential(st: &AppState, headers: &HeaderMap, header: &str) {
+    let claimed_agent = header_str(headers, "x-fuse-agent-id").unwrap_or_default();
+    let source = format!("provider-credential|{header}|{claimed_agent}");
+    let Some(unreported) = st.refused_keys.admit(&source, now_millis()) else {
+        return;
+    };
+    let run_id = header_str(headers, "x-fuse-run-id");
+    let subject = if claimed_agent.is_empty() {
+        crate::refusedkeys::UNIDENTIFIED_CALLER
+    } else {
+        claimed_agent.as_str()
+    };
+    let mut data = crate::refusedkeys::refused_key_data(
+        "caller_sent_a_provider_key",
+        None,
+        &claimed_agent,
+        unreported,
+    );
+    data["header"] = serde_json::json!(header);
+    let outcome = st.events.emit(
+        EventType::IdentityMismatch,
+        now_millis(),
+        Some(subject),
+        run_id.as_deref(),
+        None,
+        data,
+    );
+    crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+}
+
+/// `401` for a call that presented the provider's own credential to a gateway that holds it
+/// (invariant 122). It names the header to fix and not the credential.
+pub(crate) fn provider_credential_refused() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "provider_credential_refused",
+            "reason": "this gateway holds the provider key for its upstream; send your gateway \
+                       credential in the `x-fuse-key` header, or as `x-api-key` or \
+                       `Authorization: Bearer`, and never the provider's own key",
+            "retryable": false,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-fuse", "provider_credential_refused")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
 }
 
 /// `401` for a metered call with no usable client credential. Never echoes the
