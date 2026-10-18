@@ -1,55 +1,118 @@
 //! Who opened a run (CLAUDE.md invariant 120).
 //!
-//! SCAFFOLD for the red-first commit: the names the tests use exist and keep
-//! today's behaviour (the owner is the raw key id, first write wins, nobody is
-//! refused, nothing is journaled). The next commit fills them in.
+//! A run id is chosen by the caller, so possession of one proves nothing: until 2026-10-18 a
+//! caller holding client key B could name a run key A had opened, spend in it, read its labels
+//! in a taint `403`, and declare it as the parent of a run of its own, which rolled B's spend
+//! into A's budget and gave B's run A's labels. The tool-call check already answered a caller
+//! only about its own runs (invariant 118); the metered door recorded the owner and checked
+//! nothing.
+//!
+//! A run belongs to the PRINCIPAL whose metered call first named it. A principal is the
+//! credential the door verified, never anything the caller wrote: `key:<key_id>` for a static
+//! client key, `tok:<sub>` for an agent token (the token door is a later change; the namespace
+//! is fixed here so a key and a token that happen to share a name can never be one owner). With
+//! client keys off the principal is empty and nothing is recorded, so a gateway that
+//! authenticates nobody behaves exactly as before.
+//!
+//! With `TOKENFUSE_DATA_DIR` set, each first claim of a run appends one NDJSON line to
+//! `<dir>/run-owners.ndjson` and syncs it before the call goes on, and startup reads the file
+//! back before the listener binds, so a restart does not hand every run to whoever names it
+//! first afterwards. The file is read as hostile input, the shape of the retained-reservation
+//! journal (`crate::retainedjournal`, whose bounded line reader this shares): a line over the
+//! bound is skipped unread, a line that does not parse or names no principal is skipped and
+//! counted, a torn final line is terminated on open so it never fuses with the next record, and
+//! the first record for a run wins, as the first claim did. Startup rewrites the file with one
+//! line per run. A journal that exists and cannot be read refuses to start.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// The journal's file name inside the data directory.
 pub const FILE_NAME: &str = "run-owners.ndjson";
+
+/// The temp file a startup rewrite builds before renaming it over the journal.
 pub const TEMP_FILE_NAME: &str = "run-owners.ndjson.tmp";
+
+/// The namespace of a static client key's principal.
 pub const KEY_PREFIX: &str = "key:";
+
+/// The namespace of an agent token's principal (the subject the token names).
 pub const TOKEN_PREFIX: &str = "tok:";
-pub const PROCESS_LOCAL_LINE: &str = "";
-pub const OFF_LINE: &str = "";
 
+/// The startup line when client keys are configured and no data dir is.
+pub const PROCESS_LOCAL_LINE: &str = "run ownership is process-local: TOKENFUSE_DATA_DIR is not set, so a restart forgets which principal opened each run and the first caller to name a run after it owns it";
+
+/// The startup line when client keys are not configured.
+pub const OFF_LINE: &str = "run ownership off: TOKENFUSE_CLIENT_KEYS is not set, so no run has an owner and any caller may name any run or parent";
+
+/// The principal a static client key authenticates as, or empty when there is no key (client
+/// authentication off).
 pub fn key_principal(key_id: &str) -> String {
-    key_id.to_string()
+    if key_id.is_empty() {
+        String::new()
+    } else {
+        format!("{KEY_PREFIX}{key_id}")
+    }
 }
 
+/// The principal an agent token authenticates as, from its subject, or empty for none.
 pub fn token_principal(subject: &str) -> String {
-    subject.to_string()
+    if subject.is_empty() {
+        String::new()
+    } else {
+        format!("{TOKEN_PREFIX}{subject}")
+    }
 }
 
+/// The client key id a `key:` principal names, or `None` for any other principal.
 pub fn key_of(principal: &str) -> Option<&str> {
-    Some(principal).filter(|p| !p.is_empty())
+    principal
+        .strip_prefix(KEY_PREFIX)
+        .filter(|rest| !rest.is_empty())
 }
 
+/// Whether `s` is a principal this module can have written: a known namespace and a name.
 pub fn is_principal(s: &str) -> bool {
-    !s.is_empty()
+    [KEY_PREFIX, TOKEN_PREFIX]
+        .iter()
+        .any(|p| s.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
 }
 
+/// What [`RunOwners::claim`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
+    /// The caller has no principal (client authentication off): nothing is recorded.
     Unowned,
+    /// No principal had named the run; the caller owns it now.
     Opened,
+    /// The run was already the caller's.
     Own,
+    /// The run belongs to the principal named here. For the operator's log, never the caller's
+    /// answer.
     Elsewhere(String),
 }
 
+/// One journal line: a run and the principal that opened it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
+    /// Format version, written as 1. Not checked on read.
     pub v: u32,
     pub run_id: String,
     pub owner: String,
     pub at_millis: i64,
 }
 
+impl Record {
+    fn is_valid(&self) -> bool {
+        !self.run_id.is_empty() && is_principal(&self.owner)
+    }
+}
+
+/// Run id to the principal that opened it, first claim wins.
 #[derive(Debug, Default)]
 pub struct RunOwners {
     owners: Mutex<HashMap<String, String>>,
@@ -57,6 +120,7 @@ pub struct RunOwners {
 }
 
 impl RunOwners {
+    /// An owner map whose first claims are appended to `journal`.
     pub fn with_journal(journal: Journal) -> Self {
         RunOwners {
             owners: Mutex::new(HashMap::new()),
@@ -68,28 +132,70 @@ impl RunOwners {
         self.journal.as_ref()
     }
 
+    /// Claim `run_id` for `principal`, or say whose it is.
+    ///
+    /// First claim wins: a later principal naming the same run never takes it over. A first
+    /// claim is appended to the journal and synced before this returns, outside the map's
+    /// lock, so one slow disk does not hold every other caller's lookup. A write that fails is
+    /// one error line and the claim stands for this process.
     pub fn claim(&self, run_id: &str, principal: &str) -> Claim {
         if run_id.is_empty() || principal.is_empty() {
             return Claim::Unowned;
         }
+        {
+            let mut owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+            match owners.get(run_id) {
+                Some(o) if o == principal => return Claim::Own,
+                Some(o) => return Claim::Elsewhere(o.clone()),
+                None => {
+                    owners.insert(run_id.to_string(), principal.to_string());
+                }
+            }
+        }
+        if let Some(journal) = &self.journal {
+            let record = Record {
+                v: 1,
+                run_id: run_id.to_string(),
+                owner: principal.to_string(),
+                at_millis: crate::sink::now_millis(),
+            };
+            if let Err(e) = journal.append(&record) {
+                tracing::error!(
+                    path = %journal.path().display(),
+                    run = %run_id,
+                    error = %e,
+                    "the run-owner journal could not take this run's owner; the run is owned in this process only"
+                );
+            }
+        }
+        Claim::Opened
+    }
+
+    /// The principal that owns `run_id`, if any keyed call has named it.
+    pub fn owner(&self, run_id: &str) -> Option<String> {
         self.owners
             .lock()
-            .unwrap()
-            .entry(run_id.to_string())
-            .or_insert_with(|| principal.to_string());
-        Claim::Own
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run_id)
+            .cloned()
     }
 
-    pub fn owner(&self, run_id: &str) -> Option<String> {
-        self.owners.lock().unwrap().get(run_id).cloned()
-    }
-
-    pub fn load(&self, _records: &[Record]) -> usize {
-        0
+    /// Load replayed records, first per run wins, without journaling them again. Returns how
+    /// many runs were loaded.
+    pub fn load(&self, records: &[Record]) -> usize {
+        let mut owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        let mut loaded = 0;
+        for r in records.iter().filter(|r| r.is_valid()) {
+            if let std::collections::hash_map::Entry::Vacant(e) = owners.entry(r.run_id.clone()) {
+                e.insert(r.owner.clone());
+                loaded += 1;
+            }
+        }
+        loaded
     }
 
     pub fn len(&self) -> usize {
-        self.owners.lock().unwrap().len()
+        self.owners.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -97,18 +203,36 @@ impl RunOwners {
     }
 }
 
+/// An open, append-only run-owner journal.
 #[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
-    #[allow(dead_code)]
     file: Mutex<File>,
 }
 
 impl Journal {
+    /// Open (creating) `<dir>/run-owners.ndjson` for appending. A file that ends in a torn
+    /// line gets a newline first, so the next record starts a line of its own.
     pub fn open(dir: &Path) -> io::Result<Journal> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(FILE_NAME);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let len = file.metadata()?.len();
+        if len > 0 {
+            file.seek(SeekFrom::Start(len - 1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+                file.sync_data()?;
+            }
+        } else if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
         Ok(Journal {
             path,
             file: Mutex::new(file),
@@ -119,35 +243,118 @@ impl Journal {
         &self.path
     }
 
-    pub fn append(&self, _record: &Record) -> io::Result<()> {
-        Ok(())
+    /// Append one record and sync it before returning, one `write_all` under the lock.
+    pub fn append(&self, record: &Record) -> io::Result<()> {
+        let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+        line.push(b'\n');
+        if line.len() > crate::retainedjournal::MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "record is {} bytes, over the {}-byte line limit",
+                    line.len(),
+                    crate::retainedjournal::MAX_LINE_BYTES
+                ),
+            ));
+        }
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        file.write_all(&line)?;
+        file.sync_data()
     }
 
-    pub fn rewrite(&self, _records: &[Record]) -> io::Result<()> {
+    /// Replace the journal with exactly `records`, atomically: a temp file beside it, synced,
+    /// renamed over it, the directory synced, the append handle reopened, all under the append
+    /// lock. On any error the journal is left as it was.
+    pub fn rewrite(&self, records: &[Record]) -> io::Result<()> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let temp = dir.join(TEMP_FILE_NAME);
+        let mut file = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut t = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp)?;
+            for r in records {
+                let mut line = serde_json::to_vec(r).map_err(io::Error::other)?;
+                line.push(b'\n');
+                t.write_all(&line)?;
+            }
+            t.sync_all()?;
+        }
+        std::fs::rename(&temp, &self.path)?;
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        *file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
         Ok(())
     }
 }
 
+/// What reading a journal found, every skip counted.
 #[derive(Debug, Default)]
 pub struct ReadReport {
+    /// Every valid record, in file order, duplicates included.
     pub records: Vec<Record>,
+    /// Lines that are not a record (a torn final line among them).
     pub malformed: usize,
+    /// Lines over the bound, skipped unread.
     pub oversized: usize,
+    /// Records that parse and name no run or no known principal.
     pub invalid: usize,
 }
 
-pub fn read(_dir: &Path) -> io::Result<ReadReport> {
-    Ok(ReadReport::default())
+/// Read `<dir>/run-owners.ndjson`. A missing file is an empty report.
+pub fn read(dir: &Path) -> io::Result<ReadReport> {
+    match File::open(dir.join(FILE_NAME)) {
+        Ok(f) => parse(BufReader::new(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ReadReport::default()),
+        Err(e) => Err(e),
+    }
 }
 
-pub fn parse<R: BufRead>(_reader: R) -> io::Result<ReadReport> {
-    Ok(ReadReport::default())
+/// Parse journal lines from any reader, bounded per line.
+pub fn parse<R: BufRead>(mut reader: R) -> io::Result<ReadReport> {
+    let mut report = ReadReport::default();
+    let mut line = Vec::new();
+    while let Some(oversized) = crate::retainedjournal::next_line(&mut reader, &mut line)? {
+        if oversized {
+            report.oversized += 1;
+            continue;
+        }
+        let trimmed = line.trim_ascii();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Record>(trimmed) {
+            Ok(r) if r.is_valid() => report.records.push(r),
+            Ok(_) => report.invalid += 1,
+            Err(_) => report.malformed += 1,
+        }
+    }
+    Ok(report)
 }
 
+/// The first record per run, in file order, and how many later ones were dropped.
 pub fn distinct(records: &[Record]) -> (Vec<Record>, usize) {
-    (records.to_vec(), 0)
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut duplicate = 0;
+    for r in records {
+        if seen.insert(r.run_id.clone()) {
+            out.push(r.clone());
+        } else {
+            duplicate += 1;
+        }
+    }
+    (out, duplicate)
 }
 
+/// What startup's replay did.
 #[derive(Debug, Default)]
 pub struct ReplayReport {
     pub read: ReadReport,
@@ -155,12 +362,47 @@ pub struct ReplayReport {
     pub duplicate: usize,
 }
 
-pub fn replay_at_startup(_owners: &RunOwners, _dir: &Path) -> io::Result<ReplayReport> {
-    Ok(ReplayReport::default())
+/// Put every owner the journal holds back into `owners`, then rewrite the journal with one line
+/// per run. Called once, before the listener binds. A journal that exists and cannot be read is
+/// the error, and the caller refuses to start ([`startup_refusal`]): serving without it would
+/// hand every run it names to the first caller after the restart. A failed rewrite leaves the
+/// old file, which reads the same way, and is one error line.
+pub fn replay_at_startup(owners: &RunOwners, dir: &Path) -> io::Result<ReplayReport> {
+    let read = read(dir)?;
+    let (kept, duplicate) = distinct(&read.records);
+    let loaded = owners.load(&kept);
+    if let Some(journal) = owners.journal() {
+        if let Err(e) = journal.rewrite(&kept) {
+            tracing::error!(
+                path = %journal.path().display(),
+                error = %e,
+                "the run-owner journal could not be rewritten; it keeps its duplicate lines until the next start"
+            );
+        }
+    }
+    let line = format!(
+        "run-owner journal replayed: {loaded} runs owned, {duplicate} duplicate lines dropped; skipped {} malformed, {} oversized, {} naming no principal",
+        read.malformed, read.oversized, read.invalid
+    );
+    if read.malformed + read.oversized + read.invalid > 0 {
+        tracing::warn!(path = %dir.join(FILE_NAME).display(), "{line}");
+    } else {
+        tracing::info!(path = %dir.join(FILE_NAME).display(), "{line}");
+    }
+    Ok(ReplayReport {
+        read,
+        loaded,
+        duplicate,
+    })
 }
 
-pub fn startup_refusal(path: &Path, _error: &io::Error) -> String {
-    path.display().to_string()
+/// The line `serve` prints before it exits 2 on a run-owner journal that exists and cannot be
+/// opened or read.
+pub fn startup_refusal(path: &Path, error: &io::Error) -> String {
+    format!(
+        "the run-owner journal {} exists and cannot be read ({error}); refusing to start, because serving without it would let the first caller after this restart own every run it names. Fix the file so it can be read. Moving it away is not a fix: the gateway then starts with no run owned by anybody",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -367,6 +609,7 @@ mod tests {
                 .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
                 .collect();
             if round % 3 == 0 {
+                bytes.push(b'\n');
                 bytes.extend(line(&record("real", "key:real")));
             }
             let report = parse(&bytes[..]).unwrap();

@@ -150,6 +150,12 @@ jobs:
       - name: the attestation is derived, never read from the caller
         run: ./scripts/attestation-is-derived.sh
 
+      # A run belongs to the principal that opened it, and the metered door
+      # settles the owner before it reads or writes the run; a declared parent
+      # is judged before anything is opened (invariant 120).
+      - name: a run's owner is settled before the run is touched
+        run: ./scripts/run-owner-is-checked-first.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04

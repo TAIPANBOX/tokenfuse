@@ -99,6 +99,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/no-html-from-data.sh   # invariant 102
 ./scripts/teeth-shards-cover-every-case.sh  # invariant 113
 ./scripts/attestation-is-derived.sh  # invariant 116
+./scripts/run-owner-is-checked-first.sh  # invariant 120
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7547,7 +7548,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     **Where it says nothing.** The metered doors still let key B name a run key A opened, and a call
     refused there for taint says the run's labels in its `403`; binding a run to its key at the metered
     door is a separate decision. A child run declaring another key's run as its parent inherits that
-    parent's labels, here and at the metered door. A first key that names a run id before its real
+    parent's labels, here and at the metered door. (Since 2026-10-18 both are closed by invariant 120,
+    which also journals the owner map; this paragraph is kept as what was true when 118 was written.) A first key that names a run id before its real
     owner does takes it, which costs the owner its checks, not its labels; run ids are the caller's own
     and usually random. The owner map is in memory, like the rest of the taint store, and gone on
     restart. An XAA caller of the broker presents no client key, so with gateway keys on its checks are
@@ -7588,3 +7590,100 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `the_health_detail_says_the_gateway_is_open_to_the_network`, red first, and three guards. Mutant as a
     teeth case: the warning never printed. Scenarios:
     `features/an-open-bind-without-client-keys-says-so.feature`, five, each bound)*
+
+120. **A run belongs to the principal that opened it: another principal cannot spend in it, read
+    it, or roll up into it, and the owner survives a restart.** Invariant 118 answered the
+    tool-call check only for the caller's own runs and left the metered doors as they were: the
+    owner was recorded (first write wins) and checked by nothing, so key B could name a run key A
+    had opened, reserve against its budget, and read its labels in the taint `403`
+    (`tainted context [web]`); a run of B's declaring A's run in `x-fuse-parent-run-id` rolled B's
+    spend into A's budget and inherited A's labels; and the owner map lived in memory, so after a
+    restart the first caller to name a run owned it (the wave-0 residual of the agent-security
+    review of 2026-10-17, read in code at `5a0ca90`).
+
+    `@decided 2026-10-17` (the same decision as 115), as designed for the wave: a run belongs to the
+    principal that opened it; a call naming a run opened under another principal is refused `403`
+    without revealing that run's labels; a parent run must be the caller's own or delegated to it;
+    owners survive a restart through a journal replayed at startup; without client keys behaviour
+    is unchanged and documented.
+
+    `crate::runowners` is the one place. A principal is the credential the door verified, never a
+    header: `key:<key_id>` for a static client key, `tok:<subject>` for an agent token (named here so
+    a key and a token sharing a name are two principals; no door produces a token principal yet).
+    With client keys off the principal is empty, nothing is recorded and nothing is refused.
+    `proxy::handle_call` claims the run (`RunOwners::claim`, first claim wins) before it reads or
+    writes anything of it: the budget, the tool blocks, the seed gate, the taint, the ledger. A
+    run another principal owns is answered by `identity_block` with reason `run_owned_elsewhere`
+    (`403`, `type: identity_mismatch`, no label, no budget figure). A declared parent is then
+    judged (`foreign_parent_refusal`) before the parent can be opened on first sight and before
+    the ledger adopts it, and the parent the ledger already holds is judged after `open_run` when
+    the header is omitted (it was accepted while it had no owner and another principal has opened
+    it since), before anything is reserved: a parent another principal owns is refused with reason
+    `parent_owned_elsewhere`, unless the identity map lists the caller's key under the parent
+    owner's `may_parent`. A parent with no owner is accepted: no keyed call has named it, so it
+    carries no labels, and its budget is the operator's (a Cloud budget opened on first sight).
+    `/v1/fuse/check-tool-call` compares the same principals, so the two doors cannot disagree about
+    whose run it is.
+
+    Each refusal writes one `identity_mismatch` on the bus, under the caller's `x-fuse-agent-id`
+    (or `refusedkeys::UNIDENTIFIED_CALLER`), whose `data` names `key_id`, `principal`, `reason`, the
+    contested `run_id`, its `owner`, and `parent_run_id` for a parent; a contested run is not the
+    envelope's run, a refused parent is filed under the caller's own run. One warn line, and the
+    key's identity-mismatch count on `GET /v1/keys`.
+
+    With `TOKENFUSE_DATA_DIR` set and client keys on, each first claim appends one NDJSON line to
+    `<dir>/run-owners.ndjson` (`{v, run_id, owner, at_millis}`) and `sync_data`s it before the call
+    goes on, outside the map's lock. `serve` replays the file before the listener binds: the first
+    record per run wins, a line over 16 MiB is skipped unread (the retained journal's bounded
+    reader, `retainedjournal::next_line`), a line that does not parse or names no principal is
+    skipped and counted, a torn final line is terminated on open so it never fuses with the next
+    record, and the file is rewritten with one line per run (temp file, sync, rename, directory
+    sync). A journal that exists and cannot be opened or read exits 2 before the listener binds,
+    naming the path and the operating system's error (`runowners::startup_refusal`). A journal that
+    cannot be created, and a write that fails, are one error line, and the claim holds for this
+    process. Without a data dir the gateway logs that ownership is process-local; without client
+    keys it logs that ownership is off and does not touch the journal.
+
+    `@claude` 2026-10-18, choices the decision left open, open to reversal. `may_parent` sits on the
+    PARENT owner's key, because the parent's budget and labels are what is at stake; one way only;
+    literal key ids, a blank entry or a `*` refuses to load. The ownership refusal does not depend
+    on `TOKENFUSE_MODE`, `TOKENFUSE_FIREWALL` or `TOKENFUSE_IDENTITY_STRICT`: it is not a money, a
+    taint or a binding decision, and a shadow week that let another key into a run would let it in.
+    No trace row is written for either refusal: a row under a run another principal owns would
+    count a refusal on that run's record (invariant 86), so a caller could make somebody else's run
+    read as refused. The run is claimed before the parent is judged, so a call refused for its
+    parent has still claimed its own new run id, which was the caller's to take.
+
+    **Upgrade effect.** A deployment with client keys where two keys share a run id, or a worker key
+    names a coordinator key's run as its parent, now gets `403`s. Each key keeps its own run ids, or
+    the coordinator's key lists the worker's under `may_parent`.
+
+    **Where it says nothing.** The delegated arm for agent tokens (a verified token chain naming the
+    parent owner's agent) is not built: no door produces a token principal yet, and the token door
+    is its own change. A first claim and a second call of the same new run by its owner can race,
+    and the second may be admitted before the first's line is synced, so a crash in that window
+    loses the owner. The owner map and the journal are bounded by nothing but the run ids
+    authenticated callers send, as the ledger is. A first key that names a run id before its real
+    owner does takes it (run ids are the caller's own and usually random): it costs the owner the
+    run, not its labels. Two gateways sharing one data dir each replay the other's owners and their
+    first-wins orders can differ. Cloud budgets, kills, closures and the console act by run id as
+    operators and are unchanged. An XAA caller of the MCP broker presents no client key, as
+    invariant 118 says.
+    *(gate: `scripts/run-owner-is-checked-first.sh`: in `proxy::handle_call`, with comments masked,
+    `run_owners.claim(` comes before every call that touches the run (`.note_blocks(`,
+    `.pending_reason(`, `.open_run(`, `.snapshot(`, `accumulate_taint(`, `note_taint_parent(`,
+    `inherited_taint(`, `cloud_budget(`) and `foreign_parent_refusal(` before the first
+    `.open_run(`; in `toolcheck::answer` the owner is read before the taint; either function gone is
+    "measured nothing". Teeth: tool blocks recorded before the claim, the claim removed, the parent
+    judged only after it is opened, the check reading the taint first (each must fail), a comment
+    naming `open_run` above the claim (must pass), `handle_call` renamed (measured nothing).
+    test: `tests/it/run_belongs_to_its_principal.rs`, ten, and `tests/it/run_owners_survive_restart.rs`,
+    four over the real binary (a SIGKILL restart, an unreadable journal, the two startup lines);
+    `runowners::tests`, eight, among them `a_truncated_journal_replays_every_whole_line_and_never_a_torn_one`
+    (every byte of a five-record journal as the cut, then an append) and a 200-seed hostile sweep;
+    `identitymap::tests`, three. Red first in CI on the test-only commit a6a1f3d (PR #450): the ten
+    lib tests failed on their assertions; the integration tests were not reached, because cargo
+    stopped at the lib binary. Mutants as teeth cases: another principal's run answered
+    (`Claim::Elsewhere` never returned), a foreign parent adopted, the journal not replayed, the
+    held parent unchecked. Scenarios: `features/a-run-belongs-to-the-principal-that-opened-it.feature`,
+    fifteen, each bound)*

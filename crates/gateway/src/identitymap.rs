@@ -56,6 +56,9 @@
 //!   `created` (`docs/22-key-lifecycle.md`) is a free-form, informational
 //!   date string (convention `YYYY-MM-DD`) - not parsed, not validated
 //!   beyond the empty-string check, read only by `GET /v1/keys`.
+//!   `may_parent` (invariant 120) lists the client key ids whose runs may
+//!   declare this key's runs as their parent; literal ids, one way, empty by
+//!   default, read only by `IdentityMap::may_parent`.
 //! - `prefixes[]`: `{match: pattern, unit}`. The fallback for calls with no
 //!   (or no mapped) key: pure attribution, never a mismatch.
 //!
@@ -213,6 +216,10 @@ struct KeyBinding {
     /// `IdentityMap::build`. `None` on every map written before this field
     /// existed. Read-only: nothing in this module parses or enforces it.
     created: Option<String>,
+    /// The client key ids whose runs may name this key's runs as their parent
+    /// (invariant 120). Empty, the default, lets no other key's run roll up
+    /// into this key's runs.
+    may_parent: Vec<String>,
 }
 
 /// A `prefixes[]` entry, resolved.
@@ -390,6 +397,11 @@ struct WireKey {
     /// to `None` on [`KeyBinding`], identical to an old map's result.
     #[serde(default)]
     created: Option<String>,
+    /// Invariant 120: the client key ids whose runs may declare this key's
+    /// runs as their parent. Literal key ids only; absent on every map
+    /// written before this field existed, which is "none".
+    #[serde(default)]
+    may_parent: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,12 +526,25 @@ impl IdentityMap {
                 Some(s) if !s.trim().is_empty() => Some(s),
                 _ => None,
             };
+            // Invariant 120: literal client key ids, because a pattern here
+            // would let a key nobody configured yet roll up into this key's
+            // runs, and a blank entry is a typo, not a decision.
+            for child in &k.may_parent {
+                if child.trim().is_empty() || child.contains('*') {
+                    return Err(LoadError::Invalid(format!(
+                        "keys[].key_id {:?} has may_parent entry {child:?}, which must be a \
+                         literal client key id (no blank entry, no '*')",
+                        k.key_id
+                    )));
+                }
+            }
             keys.insert(
                 k.key_id,
                 KeyBinding {
                     unit: k.unit,
                     agents,
                     created,
+                    may_parent: k.may_parent,
                 },
             );
         }
@@ -737,12 +762,17 @@ impl IdentityMap {
         self.keys.len()
     }
 
-    /// SCAFFOLD (red-first commit): whether `parent_key`'s runs may be named as
-    /// the parent of `child_key`'s runs. Today nothing is checked, so nothing
-    /// is listed.
+    /// Whether a run owned by client key `parent_key` may be named as the
+    /// parent of a run owned by client key `child_key` (invariant 120): the
+    /// map binds `parent_key` and lists `child_key` under its `may_parent`.
+    /// One way only, and never for an empty key.
     #[must_use]
-    pub fn may_parent(&self, _parent_key: &str, _child_key: &str) -> bool {
-        false
+    pub fn may_parent(&self, parent_key: &str, child_key: &str) -> bool {
+        !child_key.is_empty()
+            && self
+                .keys
+                .get(parent_key)
+                .is_some_and(|b| b.may_parent.iter().any(|k| k == child_key))
     }
 }
 

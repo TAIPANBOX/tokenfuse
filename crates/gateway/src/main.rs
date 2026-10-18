@@ -1407,6 +1407,50 @@ async fn serve() {
         ),
     }
 
+    // Invariant 120: a run belongs to the principal that opened it, and a restart does not hand
+    // every run to whoever names it first afterwards. With client keys off there is no principal,
+    // so nothing is recorded, the journal is not touched, and the gateway says so. With a data
+    // dir, the owners the journal holds are put back here, before the listener binds; a journal
+    // that exists and cannot be read refuses to start, as the retained journal does.
+    // process-local: the MCP broker opens no run, so it owns none.
+    if !state.client_keys.enabled() {
+        tracing::info!("{}", tokenfuse_gateway::runowners::OFF_LINE);
+    } else {
+        match std::env::var("TOKENFUSE_DATA_DIR") {
+            Ok(dir) if !dir.is_empty() => {
+                let dir = std::path::PathBuf::from(dir);
+                let path = dir.join(tokenfuse_gateway::runowners::FILE_NAME);
+                let refuse = |e: &std::io::Error| -> ! {
+                    eprintln!(
+                        "tokenfuse: {}",
+                        tokenfuse_gateway::runowners::startup_refusal(&path, e)
+                    );
+                    std::process::exit(2);
+                };
+                match tokenfuse_gateway::runowners::Journal::open(&dir) {
+                    Ok(journal) => {
+                        let owners = Arc::new(
+                            tokenfuse_gateway::runowners::RunOwners::with_journal(journal),
+                        );
+                        if let Err(e) =
+                            tokenfuse_gateway::runowners::replay_at_startup(&owners, &dir)
+                        {
+                            refuse(&e);
+                        }
+                        state = state.with_run_owners(owners);
+                    }
+                    Err(e) if std::fs::symlink_metadata(&path).is_ok() => refuse(&e),
+                    Err(e) => tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "the run-owner journal could not be created; run owners will not survive a restart"
+                    ),
+                }
+            }
+            _ => tracing::warn!("{}", tokenfuse_gateway::runowners::PROCESS_LOCAL_LINE),
+        }
+    }
+
     // Invariant 103: after the replay, so a late seed is credited to the runs it recreated, and
     // before the listener binds, so the state the retry opens is the state that serves.
     if let Some((base, key, parts)) = seed_retry {

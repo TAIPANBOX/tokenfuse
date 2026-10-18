@@ -712,10 +712,39 @@ async fn handle_call(
             Err(e) => upstream_error(e),
         };
     };
-    // The run belongs to the credential that first named it (invariant 118),
-    // so the tool-call check can answer this caller about it and nobody else.
-    // Nothing is recorded when client keys are off: `key_id` is empty.
-    st.note_run_owner(&run_id, &key_id);
+    // Invariant 120: the run belongs to the principal whose metered call first
+    // named it. Claimed FIRST, before anything reads or writes the run (its
+    // budget, its tool blocks, its taint, its ledger entry), so a call naming a
+    // run another principal opened is refused having learnt nothing about it
+    // and changed nothing in it. With client keys off the principal is empty,
+    // nothing is recorded and nothing is refused (`scripts/run-owner-is-checked-first.sh`).
+    let principal = crate::runowners::key_principal(&key_id);
+    if let crate::runowners::Claim::Elsewhere(owner) = st.run_owners.claim(&run_id, &principal) {
+        return foreign_run_refused(
+            &st,
+            &headers,
+            ForeignRun {
+                key_id: &key_id,
+                principal: &principal,
+                run_id: &run_id,
+                owner: &owner,
+                parent: None,
+            },
+        );
+    }
+    // A sub-agent's run rolls up into its parent's budget (hierarchical budgets, invariant 49).
+    // An empty header is no declaration. Invariant 120: a declared parent must be the caller's
+    // own run or one the identity map lets it roll up into, checked here, before the parent can
+    // be opened on first sight below and before the ledger adopts it, so a refused parent leaves
+    // nothing behind: no hierarchy, no spend on its budget, no inherited labels.
+    let parent = header_str(&headers, "x-fuse-parent-run-id").filter(|p| !p.is_empty());
+    if let Some(p) = parent.as_deref() {
+        if let Some(refusal) =
+            foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)
+        {
+            return refusal;
+        }
+    }
 
     // A Cloud-managed budget (set by an operator) overrides the client-supplied
     // header; otherwise use the header, then the policy default.
@@ -778,9 +807,6 @@ async fn handle_call(
         seed_pending_note = Some(format!("seed_pending: {reason}"));
     }
 
-    // A sub-agent's run rolls up into its parent's budget (hierarchical budgets, invariant 49).
-    // An empty header is no declaration.
-    let parent = header_str(&headers, "x-fuse-parent-run-id").filter(|p| !p.is_empty());
     // D1's one exception: a parent this gateway has not opened, for which an operator set a budget
     // in the Cloud, is opened at that budget on first sight, as a root (the Cloud budget map has no
     // hierarchy). The policy default is never used to open a parent.
@@ -835,6 +861,17 @@ async fn handle_call(
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
     let parent_run_id = opened.parent.clone().unwrap_or_default();
+    // Invariant 120: a call that omits the header still rolls up into the parent the ledger
+    // holds, so that parent is checked too. It was accepted when it had no owner (a parent
+    // opened at its Cloud budget on first sight) and another principal has opened it since.
+    // Nothing of the parent's has been touched yet: the child is open, nothing is reserved.
+    if parent.is_none() && !parent_run_id.is_empty() {
+        if let Some(refusal) =
+            foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, &parent_run_id)
+        {
+            return refusal;
+        }
+    }
 
     // Attribution only: which logical agent made this call. Request-scoped like
     // `model` — it rides along into every CallRecord and never touches the
@@ -3350,6 +3387,104 @@ fn firewall_block(run_id: &str, reason: &str) -> Response {
         .header("x-fuse-taint", format!("blocked: {reason}"))
         .body(Body::from(body.to_string()))
         .expect("valid response")
+}
+
+/// A call naming a run, or a parent, that another principal opened (invariant 120).
+struct ForeignRun<'a> {
+    key_id: &'a str,
+    principal: &'a str,
+    /// The run the call named.
+    run_id: &'a str,
+    /// The principal that owns the contested run.
+    owner: &'a str,
+    /// `Some` when the contested run is the declared or held parent of the caller's own run.
+    parent: Option<&'a str>,
+}
+
+/// Invariant 120: a declared or held parent the caller may not roll up into, refused, or `None`
+/// when the parent is the caller's own, has no owner (a parent no keyed call has named carries no
+/// labels, and its budget is the operator's), or the identity map lists the caller's key under
+/// the parent owner's `may_parent`. A gateway without client keys checks nothing.
+fn foreign_parent_refusal(
+    st: &AppState,
+    headers: &HeaderMap,
+    key_id: &str,
+    principal: &str,
+    run_id: &str,
+    parent: &str,
+) -> Option<Response> {
+    if principal.is_empty() || parent == run_id {
+        return None;
+    }
+    let owner = st.run_owners.owner(parent)?;
+    let delegated = crate::runowners::key_of(&owner)
+        .is_some_and(|parent_key| st.identity.may_parent(parent_key, key_id));
+    if owner == principal || delegated {
+        return None;
+    }
+    Some(foreign_run_refused(
+        st,
+        headers,
+        ForeignRun {
+            key_id,
+            principal,
+            run_id,
+            owner: &owner,
+            parent: Some(parent),
+        },
+    ))
+}
+
+/// The refusal for [`ForeignRun`]: `403 identity_mismatch` with reason `run_owned_elsewhere` or
+/// `parent_owned_elsewhere`, carrying no label, no budget figure and no owner, and one
+/// `identity_mismatch` on the bus filed under the caller. No trace row: a row for a run another
+/// principal owns would count a refusal on that run's record, so a caller could make somebody
+/// else's run read as refused (invariant 86).
+fn foreign_run_refused(st: &AppState, headers: &HeaderMap, f: ForeignRun<'_>) -> Response {
+    let reason = if f.parent.is_some() {
+        "parent_owned_elsewhere"
+    } else {
+        "run_owned_elsewhere"
+    };
+    tracing::warn!(
+        run = %f.run_id,
+        parent = f.parent.unwrap_or(""),
+        principal = %f.principal,
+        owner = %f.owner,
+        reason,
+        "refused: the call names a run another principal opened"
+    );
+    st.keystats.record_identity_mismatch(f.key_id);
+    let agent_id = header_str(headers, "x-fuse-agent-id").unwrap_or_default();
+    let subject = if agent_id.is_empty() {
+        crate::refusedkeys::UNIDENTIFIED_CALLER.to_string()
+    } else {
+        agent_id.clone()
+    };
+    let mut data = serde_json::json!({
+        "key_id": f.key_id,
+        "principal": f.principal,
+        "agent_id": (!agent_id.is_empty()).then_some(&agent_id),
+        "reason": reason,
+        "run_id": f.run_id,
+        "owner": f.owner,
+    });
+    if let Some(p) = f.parent {
+        data["parent_run_id"] = serde_json::Value::from(p);
+    }
+    // The contested run is not the caller's, so the event is filed under no run; a refused
+    // parent is filed under the caller's own run, which is.
+    let envelope_run = f.parent.map(|_| f.run_id);
+    let outcome = st.events.emit(
+        EventType::IdentityMismatch,
+        now_millis(),
+        Some(&subject),
+        envelope_run,
+        None,
+        data,
+    );
+    crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+    identity_block(f.run_id, reason)
 }
 
 /// Identity mismatch (docs/20): strict mode refused to let the presented
