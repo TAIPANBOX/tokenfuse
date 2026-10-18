@@ -50,8 +50,12 @@ while IFS= read -r file; do
 			bindings=$((bindings + 1))
 			# `fn name(` covers both the in-module `#[test]`/`#[tokio::test]`
 			# functions and the ones in crates/*/tests/. `async fn` matches
-			# too, because the needle is the `fn name(` substring.
-			if ! grep -rq --include='*.rs' "fn ${t}(" crates/ 2>/dev/null; then
+			# too, because the needle is the `fn name(` substring. The SDK helpers are
+				# tested in Python and in JS: a scenario binds to a `def name(` under
+				# sdk/python/tests or a `function name(` under sdk/js.
+			if ! grep -rq --include='*.rs' "fn ${t}(" crates/ 2>/dev/null \
+					&& ! grep -rq --include='*.py' "def ${t}(" sdk/python/tests 2>/dev/null \
+					&& ! grep -rq --include='*.js' "function ${t}(" sdk/js 2>/dev/null; then
 				printf 'DANGLING  %s:%s\n          @test:%s names no test\n' \
 					"$file" "$lineno" "$t"
 				fail=$((fail + 1))
