@@ -3,7 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use tokenfuse_core::taint::{is_unclassified, FirewallMode, TaintRule};
+use tokenfuse_core::taint::{
+    is_unclassified, FirewallMode, TaintRule, NETWORK_READ_CAPABILITY, PRIVATE_DATA_LABELS,
+    READ_TOOL_RULE, UNCLASSIFIED_CAPABILITY,
+};
 
 /// The taint label a run carries once its prompt holds the agent's memory
 /// (CLAUDE.md invariant 95). Named once, here, because three places read it:
@@ -74,6 +77,21 @@ impl FirewallConfig {
             ("send_email".to_string(), "network_egress".to_string()),
             ("http_post".to_string(), "network_egress".to_string()),
             ("send_message".to_string(), "network_egress".to_string()),
+            // A read is a network read as well as a source (design 4.2, invariant
+            // 120): its request goes out, and its arguments can carry what the run
+            // has read. `http_get` and `fetch` are capability-only, not sources, so
+            // their output is unclassified and is refused whatever it could feed.
+            ("fetch_url".to_string(), NETWORK_READ_CAPABILITY.to_string()),
+            ("browse".to_string(), NETWORK_READ_CAPABILITY.to_string()),
+            (
+                "web_search".to_string(),
+                NETWORK_READ_CAPABILITY.to_string(),
+            ),
+            ("http_get".to_string(), NETWORK_READ_CAPABILITY.to_string()),
+            ("fetch".to_string(), NETWORK_READ_CAPABILITY.to_string()),
+            // Engram's `remember` writes to the agent's memory: a write, not an
+            // unmapped tool (invariant 120).
+            ("remember".to_string(), "write".to_string()),
         ]);
         let rules = vec![
             TaintRule {
@@ -81,23 +99,7 @@ impl FirewallConfig {
                 // silently splits every count somebody has been keeping, so
                 // they are treated as wire strings, not labels.
                 name: "no-exec-after-untrusted".into(),
-                when_any: vec![
-                    "web".into(),
-                    "email".into(),
-                    "file".into(),
-                    "unclassified".into(),
-                    // A tool result that read like an instruction, whatever
-                    // the source map says about the tool that produced it.
-                    // In the starter policy rather than left for an operator
-                    // to add, because a label nothing denies is a label that
-                    // does nothing, and the case this covers is one the source
-                    // map cannot: a source they classified as TRUSTED carrying
-                    // something the world put in it.
-                    tokenfuse_core::injection::SUSPECTED_INJECTION.into(),
-                    // The agent's own memory, which an instruction can be planted
-                    // in (invariant 95). Judged like a web read.
-                    MEMORY_LABEL.into(),
-                ],
+                when_any: untrusted_labels(),
                 deny: vec![
                     "exec".into(),
                     "write".into(),
@@ -108,11 +110,8 @@ impl FirewallConfig {
                     tokenfuse_core::taint::UNCLASSIFIED_CAPABILITY.into(),
                 ],
             },
-            TaintRule {
-                name: "anti-exfiltration".into(),
-                when_any: vec!["secrets".into()],
-                deny: vec!["network_egress".into()],
-            },
+            anti_exfiltration_rule(),
+            read_tool_rule(),
         ];
         FirewallConfig {
             mode,
@@ -150,11 +149,66 @@ fn memory_rule() -> TaintRule {
     }
 }
 
+/// The labels that make a run untrusted for the starter rule, and for the floor
+/// that refuses an unmapped tool (invariant 120).
+///
+/// The injection label is in the starter rule because a label nothing denies is a
+/// label that does nothing, and the case this covers is one the source map cannot
+/// see: a source they classified as TRUSTED carrying something the world put in
+/// it. The memory label is there because the agent's own memory is a place an
+/// instruction can be planted in (invariant 95).
+fn untrusted_labels() -> Vec<String> {
+    vec![
+        "web".into(),
+        "email".into(),
+        "file".into(),
+        "unclassified".into(),
+        tokenfuse_core::injection::SUSPECTED_INJECTION.into(),
+        MEMORY_LABEL.into(),
+    ]
+}
+
+/// The starter's anti-exfiltration rule, which is also the floor (docs/07 B.9).
+///
+/// A read after secrets is an exfiltration channel as much as a send: `fetch_url`
+/// carries what it is asked to in its URL, so it is denied with `network_egress`
+/// (design 4.2, invariant 120).
 fn anti_exfiltration_rule() -> TaintRule {
     TaintRule {
         name: "anti-exfiltration".into(),
         when_any: vec!["secrets".into()],
-        deny: vec!["network_egress".into()],
+        deny: vec!["network_egress".into(), NETWORK_READ_CAPABILITY.into()],
+    }
+}
+
+/// The starter's read rule (design 4.2 point 3, invariant 120): after any private-data
+/// label, a network read is judged on what its arguments carry, not refused on its
+/// labels. `evaluate` never refuses it on labels alone; `read_argument_verdict` does.
+fn read_tool_rule() -> TaintRule {
+    TaintRule {
+        name: READ_TOOL_RULE.into(),
+        when_any: PRIVATE_DATA_LABELS.iter().map(|l| l.to_string()).collect(),
+        deny: vec![NETWORK_READ_CAPABILITY.into()],
+    }
+}
+
+/// The floor for an unmapped tool (design 4.2 point 4, invariant 120), added in
+/// enforce mode when no rule of the operator's denies the `unclassified`
+/// capability. Same reasoning as [`memory_rule`]: a policy file written before
+/// this rule existed cannot have named it, and reading its silence as consent
+/// would let an unmapped tool run after untrusted input.
+///
+/// Without the injection label when the scan is off: a label nothing attaches is
+/// not one a rule should read.
+fn unmapped_rule(detect_injection: bool) -> TaintRule {
+    let mut when_any = untrusted_labels();
+    if !detect_injection {
+        when_any.retain(|l| l != tokenfuse_core::injection::SUSPECTED_INJECTION);
+    }
+    TaintRule {
+        name: "no-unmapped-action-after-untrusted".into(),
+        when_any,
+        deny: vec![UNCLASSIFIED_CAPABILITY.into()],
     }
 }
 
@@ -376,25 +430,37 @@ fn ensure_floors(mode: FirewallMode, detect_injection: bool, rules: &mut Vec<Tai
         // that cannot fire. Off is off.
         return;
     }
-    if detect_injection
+    // Every floor is decided from the operator's rules BEFORE any is inserted. The
+    // unmapped floor names the injection and memory labels in its own `when_any`,
+    // so checking after it went in would read those two floors as already present
+    // and silently drop them.
+    let injection = detect_injection
         && !rules.iter().any(|r| {
             r.when_any
                 .iter()
                 .any(|l| l == tokenfuse_core::injection::SUSPECTED_INJECTION)
-        })
-    {
+        });
+    let memory = !rules
+        .iter()
+        .any(|r| r.when_any.iter().any(|l| l == MEMORY_LABEL));
+    let anti = !rules
+        .iter()
+        .any(|r| r.name == anti_exfiltration_rule().name);
+    let unmapped = !rules
+        .iter()
+        .any(|r| r.deny.iter().any(|d| d == UNCLASSIFIED_CAPABILITY));
+    // Each insert goes to the front, so the last one made is the first rule:
+    // anti-exfiltration, memory, injection, unmapped.
+    if unmapped {
+        rules.insert(0, unmapped_rule(detect_injection));
+    }
+    if injection {
         rules.insert(0, injection_rule());
     }
-    if !rules
-        .iter()
-        .any(|r| r.when_any.iter().any(|l| l == MEMORY_LABEL))
-    {
+    if memory {
         rules.insert(0, memory_rule());
     }
-    if !rules
-        .iter()
-        .any(|r| r.name == anti_exfiltration_rule().name)
-    {
+    if anti {
         rules.insert(0, anti_exfiltration_rule());
     }
 }
@@ -966,8 +1032,10 @@ mod memory_and_unclassified_tests {
             .expect("the floor");
         assert_eq!(
             anti.deny,
-            vec!["network_egress".to_string()],
-            "a sensitivity label is not an untrusted source; that rule is unchanged"
+            vec!["network_egress".to_string(), "network_read".to_string()],
+            "a sensitivity label is not an untrusted source, so the rule gains no \
+             untrusted-input denial; it gains network_read as a read is also an \
+             exfiltration channel (invariant 120)"
         );
     }
 
@@ -1109,10 +1177,21 @@ mod read_tools_carry_no_data_tests {
                 Some(NETWORK_READ_CAPABILITY),
                 "{tool} is a read, so its request is a network read"
             );
+        }
+        // The three the starter names as sources are web-labelled. `http_get` and
+        // `fetch` are not sources: their output is unclassified, which is the
+        // fail-closed reading, so they are capability-only (design 4.2 point 1).
+        for tool in ["fetch_url", "browse", "web_search"] {
             assert_eq!(
                 c.sources.get(tool),
                 Some(&vec!["web".to_string()]),
                 "{tool} is a read, so its output is web-labelled"
+            );
+        }
+        for tool in ["http_get", "fetch"] {
+            assert!(
+                !c.sources.contains_key(tool),
+                "{tool} is capability-only: its output must stay unclassified"
             );
         }
     }

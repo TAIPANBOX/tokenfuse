@@ -325,10 +325,15 @@ pub fn evaluate(
         if !label_hit {
             continue;
         }
+        // The read rule is never judged on its labels alone: whether a read after
+        // private data is refused depends on what its arguments carry, which only
+        // `read_argument_verdict` can see (design 4.2). Its other capabilities, if
+        // an operator gives it any, are judged here as usual.
         let denied: Vec<String> = rule
             .deny
             .iter()
             .filter(|c| requested.contains(*c))
+            .filter(|c| !(rule.name == READ_TOOL_RULE && c.as_str() == NETWORK_READ_CAPABILITY))
             .cloned()
             .collect();
         if !denied.is_empty() {
@@ -369,21 +374,112 @@ pub const READ_ENCODED_RUN_CHARS: usize = 64;
 /// The most query parameters a read may carry after private data.
 pub const READ_QUERY_PARAMS_CAP: usize = 8;
 
-/// What a read's arguments carry, by name: a secret or PII kind from `dlp`, or
-/// one of `url_too_long`, `encoded_run`, `too_many_params`. Empty when the
-/// arguments carry nothing. The names, never the text.
-///
-/// Scaffold for the red commit: it reports nothing until the T4 fix lands.
-pub fn argument_findings(args: &serde_json::Value, pii_blocks: bool) -> Vec<String> {
-    let _ = (args, pii_blocks);
-    Vec::new()
+/// Every string value in a JSON document, at any depth. Object keys are not
+/// values, so they are not read.
+fn strings_in(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|i| strings_in(i, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|i| strings_in(i, out)),
+        _ => {}
+    }
 }
 
-/// Judge a read's arguments after private data (design 4.2): the first
-/// [`READ_TOOL_RULE`] whose labels the run carries and whose capability the read
-/// requests, refused when the arguments carry anything.
+/// The path and query of an http(s) URL string: everything from the `/` that
+/// follows the host, or the empty string when there is none. `None` when the
+/// text is not an http(s) URL at all.
+fn path_and_query(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let head: String = trimmed
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let scheme = if head.starts_with("https://") {
+        8
+    } else if head.starts_with("http://") {
+        7
+    } else {
+        return None;
+    };
+    let after = &trimmed[scheme..];
+    Some(match after.find('/') {
+        Some(i) => &after[i..],
+        None => "",
+    })
+}
+
+/// Query parameters in a path and query: the `&`-separated, non-empty pieces
+/// after the first `?`.
+fn query_params(path_and_query: &str) -> usize {
+    match path_and_query.split_once('?') {
+        Some((_, query)) => query.split('&').filter(|p| !p.is_empty()).count(),
+        None => 0,
+    }
+}
+
+/// Whether the text holds a run of [`READ_ENCODED_RUN_CHARS`] or more characters
+/// from the base64 alphabet (letters, digits, `+` and `/`). A hex string is a
+/// run of that alphabet too. `=` is not in the run: it is padding, and a query
+/// written `d=...` must not join its name to its value.
+fn has_encoded_run(text: &str) -> bool {
+    let mut run = 0usize;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '+' || c == '/' {
+            run += 1;
+            if run >= READ_ENCODED_RUN_CHARS {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// What a read's arguments carry, by name: a secret kind from `dlp` (every
+/// string, at any depth), a PII kind when `pii_blocks` says PII is refused, or
+/// one of `url_too_long`, `encoded_run` and `too_many_params`. Empty when the
+/// arguments carry nothing. The names, never the text.
+pub fn argument_findings(args: &serde_json::Value, pii_blocks: bool) -> Vec<String> {
+    let mut texts = Vec::new();
+    strings_in(args, &mut texts);
+    let mut found = BTreeSet::new();
+    for text in &texts {
+        found.extend(
+            crate::dlp::scan(text)
+                .into_iter()
+                .map(|f| f.kind.to_string()),
+        );
+        if pii_blocks {
+            found.extend(
+                crate::dlp::scan_pii(text)
+                    .into_iter()
+                    .map(|f| f.kind.to_string()),
+            );
+        }
+        if let Some(pq) = path_and_query(text) {
+            if pq.len() > READ_URL_CAP_BYTES {
+                found.insert("url_too_long".to_string());
+            }
+            if query_params(pq) > READ_QUERY_PARAMS_CAP {
+                found.insert("too_many_params".to_string());
+            }
+        }
+        if has_encoded_run(text) {
+            found.insert("encoded_run".to_string());
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Judge a read's arguments after private data (design 4.2): refused when a
+/// [`READ_TOOL_RULE`] whose labels the run carries denies the network read the
+/// call requests, and the arguments carry anything [`argument_findings`] names.
 ///
-/// Scaffold for the red commit: it refuses nothing until the T4 fix lands.
+/// `None` when the call is not a network read, when no such rule applies to the
+/// run's labels, or when the arguments carry nothing. A read after web input
+/// alone is not judged here: the label is not private data.
 pub fn read_argument_verdict(
     labels: &Labels,
     requested: &BTreeSet<String>,
@@ -391,8 +487,55 @@ pub fn read_argument_verdict(
     pii_blocks: bool,
     rules: &[TaintRule],
 ) -> Option<TaintVerdict> {
-    let _ = (labels, requested, args, pii_blocks, rules);
-    None
+    if !requested.contains(NETWORK_READ_CAPABILITY) {
+        return None;
+    }
+    let rule = rules.iter().find(|r| {
+        r.name == READ_TOOL_RULE
+            && r.when_any.iter().any(|l| labels.contains(l))
+            && r.deny.iter().any(|d| d == NETWORK_READ_CAPABILITY)
+    })?;
+    if argument_findings(args, pii_blocks).is_empty() {
+        return None;
+    }
+    Some(TaintVerdict {
+        rule: rule.name.clone(),
+        labels: labels.iter().cloned().collect(),
+        requested: requested.iter().cloned().collect(),
+        denied: vec![NETWORK_READ_CAPABILITY.to_string()],
+    })
+}
+
+/// The arguments of every tool a response asks for, in the order they appear: an
+/// Anthropic `tool_use.input` object, or an OpenAI `tool_calls[].function`
+/// `arguments` string parsed as JSON. A string that does not parse is read as no
+/// arguments, which is the same as "nothing to find".
+pub fn tool_arguments_in(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                out.push(b.get("input").cloned().unwrap_or(serde_json::Value::Null));
+            }
+        }
+    }
+    if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
+        for ch in choices {
+            let calls = ch
+                .get("message")
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|c| c.as_array());
+            for tc in calls.into_iter().flatten() {
+                let raw = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                out.push(serde_json::from_str(raw).unwrap_or(serde_json::Value::Null));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
