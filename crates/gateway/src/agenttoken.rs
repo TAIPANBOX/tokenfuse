@@ -361,16 +361,15 @@ mod tests {
             if names.is_empty() {
                 assert_eq!(mode_of(got), Ok(Some(Mode::Accept)));
             } else {
-                let err = got
-                    .err()
-                    .unwrap_or_else(|| panic!("{names} missing must refuse"));
+                let Err(err) = got else {
+                    panic!("{names} missing must refuse");
+                };
                 assert!(err.contains(names), "{err}");
             }
         }
         for audience in ["", "   "] {
             let err = from_values(Some("require"), Some(&proving(audience)), &closed)
-                .err()
-                .expect("an empty audience must refuse");
+                .expect_err("an empty audience must refuse");
             assert!(err.contains("TOKENFUSE_DELEGATION_AUDIENCE"), "{err}");
         }
         assert_eq!(

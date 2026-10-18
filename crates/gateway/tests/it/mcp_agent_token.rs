@@ -167,7 +167,7 @@ async fn the_broker_admits_an_agent_token_and_tells_the_pdp_who_and_how() {
     let resp = tools_call(&url, &h).await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["ok"], true, "{body}");
+    assert_eq!(body["result"]["ok"], json!(true), "{body}");
     let asked = seen
         .bodies
         .lock()

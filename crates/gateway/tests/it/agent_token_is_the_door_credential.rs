@@ -216,7 +216,7 @@ async fn a_proof_that_does_not_name_the_agent_token_is_refused_at_the_door() {
     let at = now();
     let tok = agent_token(&g.issuer, &g.holder, at, json!({}));
     let pf = proof_at(&g.holder, at, "POST", &format!("{ORIGIN}{MESSAGES}"), "p-5");
-    let h = vec![("authorization", format!("DPoP {tok}")), (PROOF_HEADER, pf)];
+    let h = [("authorization", format!("DPoP {tok}")), (PROOF_HEADER, pf)];
     let (status, _, body) = send(&g.st, call(MESSAGES, "r-tok-5", &h)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["error"]["type"], "agent_token_refused");
@@ -368,7 +368,7 @@ async fn with_agent_tokens_on_a_delegation_proof_is_single_use_too() {
         &format!("{ORIGIN}{MESSAGES}"),
         "pd-1",
     );
-    let h = vec![
+    let h = [
         key("sk-a"),
         ("authorization", format!("DPoP {tok}")),
         (PROOF_HEADER, pf),
@@ -422,7 +422,7 @@ async fn the_tool_check_answers_a_relayed_agent_token_about_its_runs_only() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let tok = agent_token(&g.issuer, &g.holder, now(), json!({}));
-    let relayed = vec![key("sk-broker"), ("authorization", format!("DPoP {tok}"))];
+    let relayed = [key("sk-broker"), ("authorization", format!("DPoP {tok}"))];
     let (status, _, body) = send(&g.st, check("r-rel-1", &relayed)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -434,7 +434,7 @@ async fn the_tool_check_answers_a_relayed_agent_token_about_its_runs_only() {
         body["decision"], "deny",
         "the broker's key alone owns nothing: {body}"
     );
-    let beside_another = vec![key("sk-a"), ("authorization", format!("DPoP {tok}"))];
+    let beside_another = [key("sk-a"), ("authorization", format!("DPoP {tok}"))];
     let (status, _, body) = send(&g.st, check("r-rel-1", &beside_another)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
