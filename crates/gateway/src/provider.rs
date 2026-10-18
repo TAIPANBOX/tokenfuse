@@ -63,6 +63,12 @@ pub trait Provider: Send + Sync {
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<ProviderResponse, ProviderError>;
+
+    /// Whether this provider holds the provider key itself (invariant 122). A provider
+    /// that forwards the caller's own credential answers `false`, the default.
+    fn brokers_key(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +580,67 @@ fn is_dpop_scheme(v: &axum::http::HeaderValue) -> bool {
         .ok()
         .and_then(|s| s.split_whitespace().next())
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("dpop"))
+}
+
+/// The header a brokered gateway puts its provider key in (invariant 122).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamAuth {
+    /// `x-api-key: <key>`, Anthropic's own header.
+    XApiKey,
+    /// `Authorization: Bearer <key>`, the OpenAI shape.
+    Bearer,
+}
+
+impl UpstreamAuth {
+    /// Reads the word `TOKENFUSE_UPSTREAM_AUTH` names. Scaffold: nothing is read yet.
+    pub fn parse(_word: &str) -> Option<UpstreamAuth> {
+        None
+    }
+
+    /// The header a wire's upstream expects when `TOKENFUSE_UPSTREAM_AUTH` is unset.
+    /// Scaffold: every wire gets `x-api-key`.
+    pub fn default_for(_wire: crate::wire::Wire) -> UpstreamAuth {
+        UpstreamAuth::XApiKey
+    }
+}
+
+/// A provider key the gateway holds for one upstream (invariant 122).
+#[derive(Debug)]
+pub struct UpstreamKey {
+    auth: UpstreamAuth,
+    value: String,
+}
+
+impl UpstreamKey {
+    /// Scaffold: the value is kept as given, with no check.
+    pub fn new(value: &str, auth: UpstreamAuth) -> Result<UpstreamKey, String> {
+        Ok(UpstreamKey {
+            auth,
+            value: value.to_string(),
+        })
+    }
+
+    /// Scaffold: the file is read and its contents kept as they are.
+    pub fn from_file(path: &std::path::Path, auth: UpstreamAuth) -> Result<UpstreamKey, String> {
+        let value = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Ok(UpstreamKey { auth, value })
+    }
+
+    /// The header name and the full value the gateway sends upstream with it.
+    pub fn header(&self) -> (&'static str, String) {
+        match self.auth {
+            UpstreamAuth::XApiKey => ("x-api-key", self.value.clone()),
+            UpstreamAuth::Bearer => ("authorization", format!("Bearer {}", self.value)),
+        }
+    }
+}
+
+impl HttpProvider {
+    /// Holds `key` as this upstream's provider credential (invariant 122). Scaffold: the
+    /// key is accepted and not yet used, so the caller's credential is still forwarded.
+    pub fn with_upstream_key(self, _key: UpstreamKey) -> HttpProvider {
+        self
+    }
 }
 
 /// Forwards requests to a real upstream endpoint and streams the response back,

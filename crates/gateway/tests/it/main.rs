@@ -67,6 +67,7 @@ mod streamed_tool_calls_are_judged;
 mod spend_reports_survive_a_stop;
 mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
+mod the_gateway_holds_the_provider_key;
 mod unmapped_tool_after_untrusted;
 mod version_and_help;
 mod wardryx;
