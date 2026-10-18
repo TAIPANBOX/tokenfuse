@@ -100,6 +100,16 @@ impl AgentTokens {
     }
 }
 
+/// The mode only: the replay cache is a set of proof identifiers, which a log
+/// line has no use for.
+impl std::fmt::Debug for AgentTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentTokens")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `None` is the door off.
 pub type Tokens = Option<Arc<AgentTokens>>;
 

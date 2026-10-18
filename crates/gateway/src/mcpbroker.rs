@@ -1319,6 +1319,7 @@ async fn handle(
         &declared,
         now,
         crate::revocations::hook(&st.revocations, now),
+        &st.agent_tokens,
     );
     let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
     let (on_behalf_of, delegation_proof) = match resolved {
