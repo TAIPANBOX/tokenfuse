@@ -71,6 +71,28 @@ pub fn parse_jwks(raw: &str) -> Result<JwkSet, serde_json::Error> {
     serde_json::from_str(raw)
 }
 
+/// The keys a verifier holds, indexed by `kid`. Named here so a caller that
+/// holds a key set (a poller, a file reader) never has to name `jsonwebtoken`.
+pub type KeySet = JwkSet;
+
+/// Parse an issuer's key set from a document that is at most `max_bytes` long,
+/// that is a JWKS, and that holds at least one key. Every source of a key set
+/// (a file, a fetched URL, a poll) goes through this one rule, so they cannot
+/// disagree about what they accept.
+pub fn parse_key_set(raw: &str, max_bytes: usize) -> Result<KeySet, String> {
+    if raw.len() > max_bytes {
+        return Err(format!(
+            "the key set is {} bytes, over the {max_bytes} cap",
+            raw.len()
+        ));
+    }
+    let set: KeySet = parse_jwks(raw).map_err(|e| format!("not a JWKS: {e}"))?;
+    if set.keys.is_empty() {
+        return Err("the key set holds no keys".to_string());
+    }
+    Ok(set)
+}
+
 /// Why a delegation was refused.
 ///
 /// Distinct because each sends an operator somewhere different: a signature

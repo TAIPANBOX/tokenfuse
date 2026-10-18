@@ -24,8 +24,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use jsonwebtoken::jwk::JwkSet;
-use tokenfuse_delegation::KeySource;
+use tokenfuse_delegation::{parse_key_set, KeySet};
 
 /// How often the poller asks, when the operator names no interval. A set is
 /// rotated with an overlap window far longer than a minute, so a minute of lag
@@ -36,7 +35,7 @@ pub const DEFAULT_INTERVAL_MS: u64 = 60_000;
 pub const MAX_KEYSET_BYTES: usize = 4 << 20;
 
 /// The set a door holds, shared with the poller that replaces it.
-pub type Live = Arc<RwLock<JwkSet>>;
+pub type Live = Arc<RwLock<KeySet>>;
 
 /// What the environment asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,18 +95,8 @@ pub fn wanted(get: impl Fn(&str) -> Option<String>) -> Wanted {
 /// A key set from a body. Refuses a body over the cap, a body that is not a
 /// JWKS, and a set with no keys, which would refuse every token while the door
 /// reports itself as on.
-pub fn accept(body: &str) -> Result<JwkSet, String> {
-    if body.len() > MAX_KEYSET_BYTES {
-        return Err(format!(
-            "the key set is {} bytes, over the {MAX_KEYSET_BYTES} cap",
-            body.len()
-        ));
-    }
-    let set = tokenfuse_delegation::parse_jwks(body).map_err(|e| format!("not a JWKS: {e}"))?;
-    if set.keys.is_empty() {
-        return Err("the key set holds no keys".to_string());
-    }
-    Ok(set)
+pub fn accept(body: &str) -> Result<KeySet, String> {
+    parse_key_set(body, MAX_KEYSET_BYTES)
 }
 
 async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, String> {
@@ -133,7 +122,7 @@ async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, Strin
 }
 
 /// One fetch, and the same acceptance rule for the first fetch and every poll.
-pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<JwkSet, String> {
+pub async fn fetch(client: &reqwest::Client, url: &str) -> Result<KeySet, String> {
     accept(&fetch_body(client, url).await?).map_err(|why| format!("{url}: {why}"))
 }
 
@@ -155,7 +144,7 @@ pub async fn poll_once(client: &reqwest::Client, url: &str, live: &Live) -> Resu
 
 /// Replace the whole held set. Whole, not merged: a key the set no longer names
 /// stops verifying with the poll that stopped naming it.
-fn install(live: &Live, set: JwkSet) {
+fn install(live: &Live, set: KeySet) {
     *live.write().unwrap_or_else(|p| p.into_inner()) = set;
 }
 
@@ -182,7 +171,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tokenfuse_delegation::testing::{proof, token, Key, AUD, ISS, URL};
-    use tokenfuse_delegation::{verify_delegation, DelegationConfig};
+    use tokenfuse_delegation::{verify_delegation, DelegationConfig, KeySource};
 
     const NOW: i64 = 1_800_000_000;
     const KEYS_URL: &str = "https://vouchryx.internal/.well-known/jwks.json";
@@ -244,9 +233,8 @@ mod tests {
                     let reply = match body {
                         Some(b) => format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{b}",
                             b.len(),
-                            b
                         ),
                         None => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
                                  Connection: close\r\n\r\n"
