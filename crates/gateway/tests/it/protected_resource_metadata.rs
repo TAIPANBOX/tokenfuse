@@ -1,7 +1,6 @@
-//! RFC 9728 protected resource metadata at the MCP broker (WAVE1-DESIGN 1.5),
-//! written red first. The scaffold in `crate::resourcemeta` answers nothing yet,
-//! so the document is absent, the challenges name no metadata, and the two
-//! startup refusals do not happen. Each assertion says what the change must do.
+//! RFC 9728 protected resource metadata at the MCP broker (WAVE1-DESIGN 1.5): the
+//! document at the well-known path, the challenge a refused agent token is answered
+//! with, the XAA document it shares a process with, and the two startup refusals.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -13,7 +12,7 @@ use std::time::{Duration, Instant};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tokenfuse_delegation::testing::{cfg, Key, AUD, ISS};
+use tokenfuse_delegation::testing::{agent_token, cfg, Key, AUD, ISS};
 use tokenfuse_gateway::agenttoken::{AgentTokens, Mode};
 use tokenfuse_gateway::chainproof::Proving;
 use tokenfuse_gateway::clientkeys::ClientKeys;
@@ -110,22 +109,32 @@ async fn fetch(url: &str, path: &str) -> reqwest::Response {
 }
 
 /// A `tools/call` posted to `target` with the given headers.
-async fn call(target: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+async fn call(target: &str, headers: &[(&str, String)]) -> reqwest::Response {
     let mut req = reqwest::Client::new().post(target).json(&json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "gh_api", "arguments": {}}
     }));
     for (k, v) in headers {
-        req = req.header(*k, *v);
+        req = req.header(*k, v.as_str());
     }
     req.send().await.unwrap()
 }
 
-/// A presented agent token that is not one: the door refuses it, it is not ignored.
-fn refused_token() -> Vec<(&'static str, &'static str)> {
+/// An agent token the door refuses. The issuer really minted it, for another
+/// audience, so it is `typ: at+jwt` (the agent door judges that type alone, and
+/// anything else goes to the delegation door) and its signature verifies; the
+/// audience check is what refuses it. The proof names nothing, and is not reached.
+fn refused_token(issuer: &Key) -> Vec<(&'static str, String)> {
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let tok = agent_token(
+        issuer,
+        &Key::new(),
+        now,
+        json!({"aud": "https://elsewhere.example"}),
+    );
     vec![
-        ("authorization", "DPoP not-a-real-agent-token"),
-        (PROOF_HEADER, "not-a-proof"),
+        ("authorization", format!("DPoP {tok}")),
+        (PROOF_HEADER, "not-a-proof".to_string()),
     ]
 }
 
@@ -203,8 +212,9 @@ async fn with_both_doors_off_no_document_is_served() {
 /// metadata URL built from the configured resource.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_token_is_challenged_with_dpop_and_invalid_token() {
-    let url = Door::new(Some(Mode::Accept)).serve().await;
-    let resp = call(&url, &refused_token()).await;
+    let door = Door::new(Some(Mode::Accept));
+    let url = door.serve().await;
+    let resp = call(&url, &refused_token(&door.issuer)).await;
     assert_eq!(resp.status(), 401);
     let expected = format!(
         "DPoP algs=\"ES256\", error=\"invalid_token\", resource_metadata=\"{RESOURCE_METADATA}\""
@@ -229,7 +239,7 @@ async fn a_missing_credential_under_require_is_challenged_without_an_error_param
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_challenge_origin_comes_from_configuration_not_the_host_header() {
     let url = Door::new(Some(Mode::Require)).serve().await;
-    let resp = call(&url, &[("host", "evil.example")]).await;
+    let resp = call(&url, &[("host", "evil.example".to_string())]).await;
     assert_eq!(resp.status(), 401);
     let value = challenge(&resp).unwrap_or_default();
     assert!(value.contains(RESOURCE_METADATA), "{value}");
@@ -298,7 +308,7 @@ async fn with_xaa_a_refused_agent_token_is_still_challenged_with_dpop() {
     let mut door = Door::new(Some(Mode::Accept));
     door.xaa = true;
     let url = door.serve().await;
-    let resp = call(&url, &refused_token()).await;
+    let resp = call(&url, &refused_token(&door.issuer)).await;
     assert_eq!(resp.status(), 401);
     let value = challenge(&resp).unwrap_or_default();
     assert!(value.contains("DPoP algs=\"ES256\""), "{value}");
@@ -309,8 +319,9 @@ async fn with_xaa_a_refused_agent_token_is_still_challenged_with_dpop() {
 /// gets at the LLM door, not the generic unauthorized body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_token_gets_the_agent_token_refused_body() {
-    let url = Door::new(Some(Mode::Accept)).serve().await;
-    let resp = call(&url, &refused_token()).await;
+    let door = Door::new(Some(Mode::Accept));
+    let url = door.serve().await;
+    let resp = call(&url, &refused_token(&door.issuer)).await;
     assert_eq!(resp.status(), 401);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
@@ -338,7 +349,8 @@ async fn a_missing_credential_under_require_gets_the_agent_token_required_body()
 /// resource, because both are built from one configuration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_document_and_the_challenge_name_the_same_resource() {
-    let url = Door::new(Some(Mode::Accept)).serve().await;
+    let door = Door::new(Some(Mode::Accept));
+    let url = door.serve().await;
     let resp = fetch(&url, WELL_KNOWN).await;
     assert_eq!(resp.status(), 200);
     let doc: Value = resp.json().await.unwrap();
@@ -347,7 +359,7 @@ async fn the_document_and_the_challenge_name_the_same_resource() {
         !resource.is_empty(),
         "the document names no resource: {doc}"
     );
-    let refused = call(&url, &refused_token()).await;
+    let refused = call(&url, &refused_token(&door.issuer)).await;
     let value = challenge(&refused).unwrap_or_default();
     let expected = format!("resource_metadata=\"{resource}/.well-known/oauth-protected-resource\"");
     assert!(value.contains(&expected), "{value}");

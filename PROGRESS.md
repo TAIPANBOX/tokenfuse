@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **2148 passing** (core 433, dpop 23, delegation 72,
-gateway 1332, cloud 287, umbrella 1, by `cargo test -p <crate>`). The agent's own token at every
+`cargo test --all` runs **2173 passing** (core 433, dpop 23, delegation 72,
+gateway 1357, cloud 287, umbrella 1, by `cargo test -p <crate>`). The RFC 9728 document for the agent-token door (invariant 125) adds 25 to `gateway`: 9 in `gateway::resourcemeta` and 16 in `tests/it/protected_resource_metadata.rs`. The base of 2148 is the `cargo test --all` total of CI run 39147674340 on b553c44, and the 25 are the counts CI run 39153658106 gave for the red commit (gateway lib 924, `tests/it` 433). The agent's own token at every
 door (invariants 123 and 124) adds 46: 2 in `dpop`, 12 in `delegation`, and in `gateway` 6 unit tests
 (`agenttoken`, `chainproof`, `mcpbroker`) and 26 in `tests/it`; counted from the diff against
 main, 2102. Gateway grew by 15 with the gateway-held provider key (invariant 122: 15 in `tests/it/the_gateway_holds_the_provider_key.rs`, counted from the suite at 18fbe9d). Gateway grew by 25 with run
