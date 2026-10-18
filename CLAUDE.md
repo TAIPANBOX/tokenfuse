@@ -100,6 +100,7 @@ cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
 ./scripts/teeth-shards-cover-every-case.sh  # invariant 113
 ./scripts/attestation-is-derived.sh  # invariant 116
 ./scripts/run-owner-is-checked-first.sh  # invariant 120
+./scripts/upstream-key-is-never-forwarded.sh  # invariant 122
 ./scripts/gates-have-teeth.sh   # needs a clean tree; see below
 ```
 
@@ -7738,6 +7739,46 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
    the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
    refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
+
+122. **The gateway holds the provider key, and a caller's own provider credential never leaves the process.**
+   Finding F-002 of the agent-security review of 2026-10-17. Until this invariant the gateway forwarded the
+   caller's `authorization` and `x-api-key` upstream unchanged and held no provider key of its own, so an agent
+   that held the key could call the provider directly, and nothing metered that call.
+
+   `@decided 2026-10-17`, paraphrased: the gateway holds the provider key of each door in a file and sends it
+   upstream itself; a caller's provider credential is never forwarded, and is refused unless it is a gateway
+   credential, so a stock SDK given its gateway key works unchanged; an unbrokered gateway says so at startup
+   and on its health detail.
+
+   What the code does. `TOKENFUSE_UPSTREAM_KEY_FILE` names the file, read once at startup. It must be a
+   non-empty HTTP header value of at most 4096 bytes, a trailing line break counted; any other file refuses to
+   start with exit 2, naming the variable and never the key. `TOKENFUSE_UPSTREAM_AUTH` names the header, `x-api-key`
+   or `bearer` (the closed word set of invariant 98); unset, the Anthropic door sends `x-api-key` and the OpenAI
+   door sends `Authorization: Bearer`. An auth word without a key file, or a key file without `TOKENFUSE_UPSTREAM`,
+   refuses to start. When the key is held, `HttpProvider::send` takes `authorization` and `x-api-key` out of the
+   forwarded set and sends the gateway's own key instead; an unbrokered gateway forwards exactly as before. A
+   caller's `x-api-key` or `Authorization` that is not a gateway credential is refused with `401
+   provider_credential_refused` before anything is reserved or forwarded. The bus carries one `identity_mismatch`
+   with `data.reason` `caller_sent_a_provider_key` and `data.header` naming the header, never the credential,
+   rate-limited per source as invariant 105 is. A gateway credential in `x-api-key` or `Authorization: Bearer` is
+   accepted when the call sends no `x-fuse-key`. Startup logs that the key is held, naming the header and the
+   variable; without a key file it prints `UNBROKERED_WARNING`, which `GET /healthz?detail=1` also carries.
+   `Authorization` in the DPoP scheme is a delegation credential and is not judged here (invariant 69).
+
+   Upgrade effect. An unbrokered deployment is unchanged. A deployment that sets the key file refuses a caller's
+   own provider key: such a caller sends its gateway key instead.
+
+   Where it says nothing. With the key held and no client keys configured, no gateway credential exists, so any
+   provider credential a caller sends is refused, and a stock SDK must run with client keys on to work. The key is
+   read once, so a rotation needs a restart. The key lives
+   in the file, whose mode is the operator's to set. The unbrokered default remains, and launchers are expected to
+   broker. The MCP broker's own upstream forward never carried the caller's credential (invariant 69), unchanged.
+   *(gate: `scripts/upstream-key-is-never-forwarded.sh`, six teeth cases in `scripts/gates-have-teeth.sh`:
+   the skip made unconditional, the skip removed, the gateway's own key not sent, the credential list shortened,
+   a comment that must pass, and the file gone, which must read as measured nothing; plus the two product mutants
+   that bring the bypass back, the refusal disabled and the stock SDK's key header ignored, each caught by a test
+   named in the teeth cases. test: `tests/it/the_gateway_holds_the_provider_key.rs`, fifteen, each bound by
+   `features/the-gateway-holds-the-provider-key.feature`, six scenarios.)*
 
 123. **An agent's own token is a door credential at every door, and the agent, its unit and its run
     principal come from the token, never from a header.** The agent-security review of 2026-10-17

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tokenfuse_core::{AnomalyConfig, Growth, Ledger, Policy, Window};
 use tokenfuse_gateway::app;
 use tokenfuse_gateway::pricebook::default_price_book;
-use tokenfuse_gateway::provider::{HttpProvider, Provider, StubProvider};
+use tokenfuse_gateway::provider::{
+    HttpProvider, Provider, StubProvider, UpstreamAuth, UpstreamKey, UNBROKERED_WARNING,
+};
 use tokenfuse_gateway::state::AppState;
 use tokenfuse_gateway::wire::Wire;
 use tracing_subscriber::EnvFilter;
@@ -681,6 +683,45 @@ async fn mcp_broker() {
         .expect("server error");
 }
 
+/// Reads the provider key the operator holds for the upstream (invariant 122), or refuses to
+/// start: a key file that cannot be used, an auth word the gateway cannot read, an auth word with
+/// no key file, or a key file with no upstream to send it to. The message names the variable and
+/// never the key.
+fn upstream_key_from_env(has_upstream: bool, wire: Wire) -> Option<UpstreamKey> {
+    let auth = tokenfuse_gateway::defaults::upstream_auth_from_env();
+    let file = std::env::var("TOKENFUSE_UPSTREAM_KEY_FILE")
+        .ok()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+    let Some(path) = file else {
+        if auth.is_some() {
+            refuse_start(
+                "TOKENFUSE_UPSTREAM_AUTH is set but TOKENFUSE_UPSTREAM_KEY_FILE is not: \
+                 the auth word names the header of a provider key this gateway holds, \
+                 and none is held",
+            );
+        }
+        return None;
+    };
+    if !has_upstream {
+        refuse_start(
+            "TOKENFUSE_UPSTREAM_KEY_FILE holds the provider key for TOKENFUSE_UPSTREAM, \
+             and TOKENFUSE_UPSTREAM is not set",
+        );
+    }
+    let auth = auth.unwrap_or_else(|| UpstreamAuth::default_for(wire));
+    match UpstreamKey::from_file(std::path::Path::new(&path), auth) {
+        Ok(key) => Some(key),
+        Err(e) => refuse_start(&format!("TOKENFUSE_UPSTREAM_KEY_FILE cannot be used: {e}")),
+    }
+}
+
+/// Prints why the gateway will not start, and exits 2 before the listener binds.
+fn refuse_start(message: &str) -> ! {
+    eprintln!("tokenfuse: refusing to start: {message}");
+    std::process::exit(2);
+}
+
 async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -752,10 +793,40 @@ async fn serve() {
     // the URL too, so it needs its own copy rather than the one the match
     // moves into `HttpProvider::new`.
     let upstream_url = upstream.clone();
+    // Which front door this process serves (docs/26-the-openai-door.md): what
+    // the operator declared in TOKENFUSE_WIRE, else what TOKENFUSE_UPSTREAM's
+    // path implies, else Anthropic, which is what every deployment that
+    // predates this variable already is. The other door refuses rather than
+    // forwarding a body the upstream cannot read. Read before the provider,
+    // because the header a held provider key goes in defaults from it (invariant 122).
+    let declared = std::env::var("TOKENFUSE_WIRE").ok();
+    let wire = Wire::from_declaration(declared.as_deref(), upstream_url.as_deref());
+    // The provider key the gateway holds for the upstream, if the operator gave one (invariant
+    // 122). Refuses to start on a key file it cannot use.
+    let upstream_key = upstream_key_from_env(upstream_url.is_some(), wire);
     let provider: Arc<dyn Provider> = match (upstream, allow_stub) {
         (Some(url), _) => {
             tracing::info!(%url, "forwarding to real upstream");
-            Arc::new(HttpProvider::new(url))
+            match upstream_key {
+                Some(key) => {
+                    tracing::info!(
+                        "upstream provider key held by the gateway, sent as the {} header, read from TOKENFUSE_UPSTREAM_KEY_FILE",
+                        key.header_name()
+                    );
+                    Arc::new(HttpProvider::new(url).with_upstream_key(key))
+                }
+                None => {
+                    eprintln!(
+                        "tokenfuse: WARNING ************************************************"
+                    );
+                    eprintln!("tokenfuse: WARNING {}", UNBROKERED_WARNING);
+                    eprintln!(
+                        "tokenfuse: WARNING ************************************************"
+                    );
+                    tracing::warn!("{}", UNBROKERED_WARNING);
+                    Arc::new(HttpProvider::new(url))
+                }
+            }
         }
         (None, true) => {
             tracing::warn!(
@@ -784,13 +855,6 @@ async fn serve() {
         }
     };
 
-    // Which front door this process serves (docs/26-the-openai-door.md): what
-    // the operator declared in TOKENFUSE_WIRE, else what TOKENFUSE_UPSTREAM's
-    // path implies, else Anthropic, which is what every deployment that
-    // predates this variable already is. The other door refuses rather than
-    // forwarding a body the upstream cannot read.
-    let declared = std::env::var("TOKENFUSE_WIRE").ok();
-    let wire = Wire::from_declaration(declared.as_deref(), upstream_url.as_deref());
     if let Some(d) = declared.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         if !d.eq_ignore_ascii_case("openai") && !d.eq_ignore_ascii_case("anthropic") {
             tracing::warn!(

@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.15.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2133-brightgreen)
+![tests](https://img.shields.io/badge/tests-2148-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -342,7 +342,7 @@ Or skip the build: grab a prebuilt binary from the [Releases page](https://githu
 
 ### Step 2. Point it at your real LLM provider
 
-Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your agent's traffic to `localhost:4100`. Your provider API key is passed straight through, so TokenFuse never needs it.
+Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your agent's traffic to `localhost:4100`. Put the provider key in a file and point `TOKENFUSE_UPSTREAM_KEY_FILE` at it: TokenFuse then sends the key upstream itself, and your agents need only a TokenFuse key, never the provider's. Without that file the caller's own key is passed straight through, as before, and the gateway says so at startup (CLAUDE.md invariant 122).
 
 ```bash
 docker run -p 4100:4100 \
