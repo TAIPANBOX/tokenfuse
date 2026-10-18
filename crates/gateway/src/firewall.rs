@@ -78,7 +78,7 @@ impl FirewallConfig {
             ("http_post".to_string(), "network_egress".to_string()),
             ("send_message".to_string(), "network_egress".to_string()),
             // A read is a network read as well as a source (design 4.2, invariant
-            // 120): its request goes out, and its arguments can carry what the run
+            // 121): its request goes out, and its arguments can carry what the run
             // has read. Only the three reads the starter names are known. `http_get`
             // and `fetch` are named in neither map, so they are unclassified, and
             // after untrusted input the starter rule refuses them as any unmapped
@@ -91,7 +91,7 @@ impl FirewallConfig {
                 NETWORK_READ_CAPABILITY.to_string(),
             ),
             // Engram's `remember` writes to the agent's memory: a write, not an
-            // unmapped tool (invariant 120).
+            // unmapped tool (invariant 121).
             ("remember".to_string(), "write".to_string()),
         ]);
         let rules = vec![
@@ -151,7 +151,7 @@ fn memory_rule() -> TaintRule {
 }
 
 /// The labels that make a run untrusted for the starter rule, and for the floor
-/// that refuses an unmapped tool (invariant 120).
+/// that refuses an unmapped tool (invariant 121).
 ///
 /// The injection label is in the starter rule because a label nothing denies is a
 /// label that does nothing, and the case this covers is one the source map cannot
@@ -173,7 +173,7 @@ fn untrusted_labels() -> Vec<String> {
 ///
 /// A read after secrets is an exfiltration channel as much as a send: `fetch_url`
 /// carries what it is asked to in its URL, so it is denied with `network_egress`
-/// (design 4.2, invariant 120).
+/// (design 4.2, invariant 121).
 fn anti_exfiltration_rule() -> TaintRule {
     TaintRule {
         name: "anti-exfiltration".into(),
@@ -182,7 +182,7 @@ fn anti_exfiltration_rule() -> TaintRule {
     }
 }
 
-/// The starter's read rule (design 4.2 point 3, invariant 120): after any private-data
+/// The starter's read rule (design 4.2 point 3, invariant 121): after any private-data
 /// label, a network read is judged on what its arguments carry, not refused on its
 /// labels. `evaluate` never refuses it on labels alone; `read_argument_verdict` does.
 fn read_tool_rule() -> TaintRule {
@@ -193,7 +193,7 @@ fn read_tool_rule() -> TaintRule {
     }
 }
 
-/// The floor for an unmapped tool (design 4.2 point 4, invariant 120), added in
+/// The floor for an unmapped tool (design 4.2 point 4, invariant 121), added in
 /// enforce mode when no rule of the operator's denies the `unclassified`
 /// capability. Same reasoning as [`memory_rule`]: a policy file written before
 /// this rule existed cannot have named it, and reading its silence as consent
@@ -1036,7 +1036,7 @@ mod memory_and_unclassified_tests {
             vec!["network_egress".to_string(), "network_read".to_string()],
             "a sensitivity label is not an untrusted source, so the rule gains no \
              untrusted-input denial; it gains network_read as a read is also an \
-             exfiltration channel (invariant 120)"
+             exfiltration channel (invariant 121)"
         );
     }
 

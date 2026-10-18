@@ -2443,7 +2443,7 @@ fn judge_model_tool_calls(
         taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
     // A read after private data is judged on what its arguments carry (design 4.2,
-    // invariant 120). `evaluate` never refuses it on its labels alone.
+    // invariant 121). `evaluate` never refuses it on its labels alone.
     let pii_blocks = st.dlp_pii == DlpMode::Block;
     let verdict = taint::evaluate(labels, &requested, &st.firewall.rules).or_else(|| {
         resp_args.iter().find_map(|a| {
@@ -2644,7 +2644,7 @@ fn stream_managed(
                 &held.tools,
                 // The streamed hold keeps tool NAMES only, not their arguments
                 // (streamgate::tool_names), so a streamed read is not yet judged on
-                // what it carries. Named as a gap in invariant 120.
+                // what it carries. Named as a gap in invariant 121.
                 &[],
                 move || CallRecord { ts_millis: now_millis(), ..blocked_row },
                 &ev_agent_id,
