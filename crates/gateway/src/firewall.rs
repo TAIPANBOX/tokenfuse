@@ -1071,3 +1071,179 @@ mod memory_and_unclassified_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod read_tools_carry_no_data_tests {
+    //! Agent-security wave 1, T4 (design 4.2), at the level of the policy: which
+    //! capability a read exercises, which rule refuses it, and what an operator's
+    //! file inherits. The argument judgement itself is tested in
+    //! `tokenfuse_core::taint`, where it is defined.
+
+    use super::*;
+    use std::collections::BTreeSet;
+    use tokenfuse_core::taint::{
+        capabilities_for_tools, evaluate, Labels, NETWORK_READ_CAPABILITY, PRIVATE_DATA_LABELS,
+        READ_TOOL_RULE, UNCLASSIFIED_CAPABILITY,
+    };
+
+    fn labels_of(names: &[&str]) -> Labels {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn requested_of(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn from_file(text: &str) -> FirewallConfig {
+        FirewallConfig::from_json(text).expect("a valid policy file")
+    }
+
+    #[test]
+    fn read_tools_are_network_read_as_well_as_sources() {
+        // Dual classification: a read tool is a source (its output is labelled
+        // web) and a capability (its request is a network read).
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        for tool in ["fetch_url", "browse", "web_search", "http_get", "fetch"] {
+            assert_eq!(
+                c.capabilities.get(tool).map(String::as_str),
+                Some(NETWORK_READ_CAPABILITY),
+                "{tool} is a read, so its request is a network read"
+            );
+            assert_eq!(
+                c.sources.get(tool),
+                Some(&vec!["web".to_string()]),
+                "{tool} is a read, so its output is web-labelled"
+            );
+        }
+    }
+
+    #[test]
+    fn anti_exfiltration_denies_a_read_after_secrets() {
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        let v = evaluate(
+            &labels_of(&["secrets"]),
+            &requested_of(&[NETWORK_READ_CAPABILITY]),
+            &c.rules,
+        )
+        .expect("a run that read a secret cannot fetch");
+        assert_eq!(v.rule, "anti-exfiltration");
+        assert_eq!(v.denied, vec![NETWORK_READ_CAPABILITY.to_string()]);
+    }
+
+    #[test]
+    fn the_anti_exfiltration_floor_also_denies_a_read() {
+        // A policy file replaces the starter policy, and the floor comes back
+        // with it: a file that names no anti-exfiltration rule must still refuse
+        // a read after secrets.
+        let c = from_file(
+            r#"{"mode":"enforce","rules":[{"name":"mine","when_any":["web"],"deny":["exec"]}]}"#,
+        );
+        let anti = c
+            .rules
+            .iter()
+            .find(|r| r.name == "anti-exfiltration")
+            .expect("the floor");
+        assert!(
+            anti.deny.iter().any(|d| d == NETWORK_READ_CAPABILITY),
+            "{:?}",
+            anti.deny
+        );
+        assert!(
+            anti.deny.iter().any(|d| d == "network_egress"),
+            "{:?}",
+            anti.deny
+        );
+    }
+
+    #[test]
+    fn the_starter_policy_carries_the_read_rule() {
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        let read = c
+            .rules
+            .iter()
+            .find(|r| r.name == READ_TOOL_RULE)
+            .expect("the read rule");
+        assert_eq!(
+            read.when_any,
+            PRIVATE_DATA_LABELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(read.deny, vec![NETWORK_READ_CAPABILITY.to_string()]);
+    }
+
+    #[test]
+    fn remember_is_a_write_not_an_unmapped_tool() {
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        assert_eq!(
+            c.capabilities.get("remember").map(String::as_str),
+            Some("write")
+        );
+    }
+
+    #[test]
+    fn a_tainted_run_that_remembers_is_refused_as_a_write() {
+        // A rule that names the capability says what the refusal is about: a
+        // write, under the starter rule, not an unmapped tool.
+        let c = FirewallConfig::defaults(FirewallMode::Enforce);
+        let requested =
+            capabilities_for_tools(&["remember".to_string()], &c.capabilities, &c.sources);
+        let v = evaluate(&labels_of(&["web"]), &requested, &c.rules)
+            .expect("a tainted run cannot write");
+        assert_eq!(v.rule, "no-exec-after-untrusted");
+        assert_eq!(v.denied, vec!["write".to_string()]);
+    }
+
+    #[test]
+    fn an_operator_file_with_no_unmapped_rule_gets_the_untrusted_floor() {
+        let c = from_file(
+            r#"{"mode":"enforce","rules":[{"name":"mine","when_any":["secrets"],"deny":["exec"]}]}"#,
+        );
+        assert!(
+            c.rules
+                .iter()
+                .any(|r| r.deny.iter().any(|d| d == UNCLASSIFIED_CAPABILITY)),
+            "a file that names no rule denying unclassified lets an unmapped tool through after web input: {:?}",
+            c.rules
+        );
+    }
+
+    #[test]
+    fn the_floor_refuses_an_unmapped_tool_after_web_taint() {
+        let c = from_file(
+            r#"{"mode":"enforce","rules":[{"name":"mine","when_any":["secrets"],"deny":["exec"]}]}"#,
+        );
+        let requested =
+            capabilities_for_tools(&["http_request".to_string()], &c.capabilities, &c.sources);
+        assert!(
+            evaluate(&labels_of(&["web"]), &requested, &c.rules).is_some(),
+            "web taint and an unmapped tool is refused by the floor"
+        );
+    }
+
+    #[test]
+    fn shadow_files_get_no_unmapped_floor() {
+        // Shadow refuses nothing, so a floor there would be a rule that cannot fire.
+        let c = from_file(
+            r#"{"mode":"shadow","rules":[{"name":"mine","when_any":["secrets"],"deny":["exec"]}]}"#,
+        );
+        assert!(!c
+            .rules
+            .iter()
+            .any(|r| r.deny.iter().any(|d| d == UNCLASSIFIED_CAPABILITY)));
+    }
+
+    #[test]
+    fn an_operator_rule_that_already_denies_unmapped_tools_gets_no_second_floor() {
+        let c = from_file(
+            r#"{"mode":"enforce","rules":[{"name":"mine","when_any":["web"],"deny":["unclassified"]}]}"#,
+        );
+        let count = c
+            .rules
+            .iter()
+            .filter(|r| r.deny.iter().any(|d| d == UNCLASSIFIED_CAPABILITY))
+            .count();
+        assert_eq!(count, 1, "{:?}", c.rules);
+    }
+}

