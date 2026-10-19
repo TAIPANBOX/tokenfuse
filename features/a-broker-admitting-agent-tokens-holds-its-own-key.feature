@@ -7,7 +7,9 @@ Feature: A broker that admits agent tokens holds its own key for the taint check
   with client keys answered 401, and the taint fail mode, open by default, then
   let the call through with nothing judging it.
 
-  @decided 2026-10-19: such a broker refuses to start, before it listens,
+  @decided 2026-10-17: the agent-security review's findings close in their
+  wave. @claude 2026-10-19, how this one closes: such a broker refuses to
+  start, before it listens,
   naming TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE.
 
   The choices inside it are @claude: the refusal holds in accept and in require

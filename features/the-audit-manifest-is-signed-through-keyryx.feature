@@ -5,7 +5,8 @@ Feature: The audit manifest can be signed by keyryx custody
   lived in the control plane's own environment, the last of this repository's
   signatures not held by keyryx custody.
 
-  @decided 2026-10-19: TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx signs the manifest
+  @decided 2026-10-17: the estate's signing keys move into keyryx custody.
+  @claude 2026-10-19, how the manifest follows it: TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx signs the manifest
   through keyryx's sign API with a key keyryx holds, beside today's key in the
   environment; unset keeps today's behaviour; a keyryx that cannot be reached
   when a manifest is signed fails closed for that manifest and says so.
