@@ -201,6 +201,8 @@ door credential (CLAUDE.md invariants 123 and 124).
 | Variable | Meaning |
 |---|---|
 | `TOKENFUSE_AGENT_TOKENS` | `off` (default): nothing changes. `accept`: a token is a door credential and every static client key keeps working beside it. `require`: every static client key is refused. Any other word refuses to start. |
+| `TOKENFUSE_AGENT_TOKENS_STATIC_KEYS` | Under `require` only: a comma-separated list of client key ids (the `key_id` of a `TOKENFUSE_CLIENT_KEYS` entry, never a secret) whose static key is still admitted, for a client that cannot sign a DPoP proof. Set outside `require`, or naming an id the key set does not configure, it refuses to start, naming its position in the list. |
+| `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS` | The same list at the MCP broker, naming ids of `TOKENFUSE_MCP_KEYS`, with the same rules. |
 | `TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE` | The MCP broker only: a file holding the broker's own gateway client key (key id `broker` in the gateway's `TOKENFUSE_CLIENT_KEYS`), used only to relay a token to the gateway's tool-call check. Required when the agent-token door is on and `TOKENFUSE_MCP_TAINT_GATEWAY` names a gateway: without it the broker refuses to start (CLAUDE.md invariant 129), because a token's call would reach the check with no credential and fall to `TOKENFUSE_MCP_TAINT_FAILMODE`. |
 
 On, the process needs the delegation door above (issuer, JWKS, origin), a
@@ -222,6 +224,34 @@ credential).
 
 With the door on, a delegation proof at this chain door is single-use too, and
 one that names a token must name the one it came with.
+
+Under `require`, a static key is admitted only when its id is in
+`TOKENFUSE_AGENT_TOKENS_STATIC_KEYS` (the broker's list is
+`TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS`). A listed key is admitted exactly as
+`accept` admits one. An unlisted key, an unknown key and no key all get the same
+`401 agent_token_required`, whose body names the list variable. CLAUDE.md
+invariants 138 and 139 hold these rules.
+
+The policy plane is also given the token itself. For a call an agent token
+admitted, the decide request carries `agent_token`, the compact token exactly as
+presented, and `agent_dpop_proof`, the DPoP proof that came with it, exactly as
+presented. Each is bounded at 4 KiB and never logged. A static-key call sends
+neither member. The token is DPoP-bound. A policy plane holding the token and the proof
+can check the proof's freshness, its thumbprint against the token, and its
+audience itself, so a gateway that relays the token can hand it on for at most
+the proof's freshness window, not the token's whole life. That needs a policy
+plane that verifies the proof. A policy
+that reads the token must answer `cacheable: false`, because a verdict reached on
+a token is otherwise served again for the same agent and tools inside the cache
+TTL. CLAUDE.md invariant 140 holds the rule.
+
+**Upgrade.** `require` already refused every static key, so an operator who
+already runs `require` loses nothing by upgrading. To keep a client that cannot
+sign a proof: set `TOKENFUSE_AGENT_TOKENS_STATIC_KEYS` to that client's key id
+(the gateway refuses to start if the id is not in `TOKENFUSE_CLIENT_KEYS`), and
+for the broker set `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS` the same way against
+`TOKENFUSE_MCP_KEYS`. Move each client to a token as it can, and drop it from the
+list when it has.
 
 What it does not do: a delegation token is still not a door credential, so
 under `require` a delegated call is refused. The key set is read at startup, so

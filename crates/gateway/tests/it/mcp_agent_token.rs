@@ -10,8 +10,10 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use tokenfuse_delegation::testing::{agent_token, cfg, proof_for, Key, AGENT};
-use tokenfuse_gateway::agenttoken::{AgentTokens, Mode};
+
+use tokenfuse_gateway::agenttoken::{AgentTokens, Mode, BROKER_STATIC_KEYS_VAR};
 use tokenfuse_gateway::chainproof::Proving;
 use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
@@ -59,6 +61,8 @@ struct Broker {
     wardryx: Option<String>,
     taint_gateway: Option<String>,
     taint_gateway_key: Option<String>,
+    /// `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS`: the key ids admitted under require.
+    listed: Vec<&'static str>,
 }
 
 impl Broker {
@@ -71,6 +75,7 @@ impl Broker {
             wardryx: None,
             taint_gateway: None,
             taint_gateway_key: None,
+            listed: Vec::new(),
         }
     }
 
@@ -110,7 +115,13 @@ impl Broker {
             taint_gateway: self.taint_gateway.clone(),
             taint_failclosed: true,
             xaa: None,
-            agent_tokens: Some(Arc::new(AgentTokens::new(self.tokens))),
+            agent_tokens: Some(Arc::new(AgentTokens::with_static_keys(
+                self.tokens,
+                self.listed
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<BTreeSet<_>>(),
+            ))),
             taint_gateway_key: self.taint_gateway_key.clone(),
         });
         let url = spawn(app(state)).await;
@@ -271,4 +282,101 @@ async fn the_broker_relays_an_agent_token_to_the_taint_gateway_with_its_own_key(
         asked.get("authorization").and_then(|v| v.to_str().ok()),
         Some(format!("DPoP {tok}").as_str())
     );
+}
+
+/// Under `require`, a static key the broker's list names is admitted as it is
+/// under `accept` (invariant 139).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_admits_an_allow_listed_brokers_static_key() {
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Require);
+    b.keys = "sk-b:bkey";
+    b.listed = vec!["bkey"];
+    let url = b.serve(upstream).await;
+    let resp = tools_call(&url, &[(CLIENT_KEY_HEADER, "sk-b".to_string())]).await;
+    assert_eq!(resp.status(), 200, "a listed static key under require");
+}
+
+/// An unlisted static key at the broker is refused, and the body names the
+/// broker's list variable, the same body an unknown key gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_refuses_an_unlisted_brokers_static_key_naming_its_variable() {
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Require);
+    b.keys = "sk-b:bkey";
+    b.listed = vec![];
+    let url = b.serve(upstream).await;
+    let resp = tools_call(&url, &[(CLIENT_KEY_HEADER, "sk-b".to_string())]).await;
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "agent_token_required", "{body}");
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains(BROKER_STATIC_KEYS_VAR),
+        "the body names the variable: {reason}"
+    );
+}
+
+/// The broker's policy question carries the token that admitted the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_broker_sends_the_agent_token_to_the_pdp() {
+    let seen = Seen::default();
+    let pdp = spawn(
+        Router::new()
+            .route("/v1/decide", post(decide))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Accept);
+    b.wardryx = Some(pdp);
+    let url = b.serve(upstream).await;
+    let (tok, h) = b.token_headers("pm-7");
+    let proof = h[1].1.clone();
+    let resp = tools_call(&url, &h).await;
+    assert_eq!(resp.status(), 200);
+    let asked = seen
+        .bodies
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the PDP was asked");
+    assert_eq!(asked["agent_token"], tok, "{asked}");
+    assert_eq!(asked["agent_dpop_proof"], proof, "{asked}");
+}
+
+/// A static-key call at the broker sends the policy plane no token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_broker_sends_no_agent_token_for_a_static_key_call() {
+    let seen = Seen::default();
+    let pdp = spawn(
+        Router::new()
+            .route("/v1/decide", post(decide))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Accept);
+    b.keys = "sk-b:bkey";
+    b.wardryx = Some(pdp);
+    let url = b.serve(upstream).await;
+    let resp = tools_call(
+        &url,
+        &[
+            (CLIENT_KEY_HEADER, "sk-b".to_string()),
+            ("x-fuse-agent-id", "agent://acme/keyed".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let asked = seen
+        .bodies
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the PDP was asked");
+    assert!(asked.get("agent_token").is_none(), "{asked}");
+    assert!(asked.get("agent_dpop_proof").is_none(), "{asked}");
 }

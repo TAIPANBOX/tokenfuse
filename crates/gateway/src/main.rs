@@ -604,12 +604,27 @@ async fn mcp_broker() {
     // The agent's own token as a door credential (invariant 123), read after the
     // delegation door and its revocation list, which it verifies against. The
     // LLM proxy reads it through the same call.
-    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    // The broker's own static key set, which its list is checked against
+    // (invariant 139): read here, before `keys` moves into the state.
+    let configured: Vec<&str> = keys.key_ids().collect();
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(
+        &chain_proof,
+        tokenfuse_gateway::agenttoken::BROKER_STATIC_KEYS_VAR,
+        "TOKENFUSE_MCP_KEYS",
+        &configured,
+    );
     if let Some(t) = &agent_tokens {
         tracing::info!(
             mode = t.mode().as_str(),
             "agent-token door: ON, an agent's own token is a door credential here"
         );
+        let listed = t.static_key_ids();
+        if !listed.is_empty() {
+            tracing::info!(
+                static_keys = ?listed,
+                "agent-token door: under require these static keys are still admitted, as listed in TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS"
+            );
+        }
     }
     // One protected resource document names one resource (RFC 9728 section 2), and
     // this process alone publishes it: the agent door's audience must be a URL it
@@ -1387,12 +1402,27 @@ async fn serve() {
     .await;
     // The agent's own token as a door credential (invariant 123): the same call
     // `mcp_broker` makes, against the delegation door just read.
-    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    // The gateway's own client key set, which its list is checked against
+    // (invariant 138). `state` holds it, the key set having moved into it.
+    let configured: Vec<&str> = state.client_keys.key_ids().collect();
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(
+        &chain_proof,
+        tokenfuse_gateway::agenttoken::STATIC_KEYS_VAR,
+        "TOKENFUSE_CLIENT_KEYS",
+        &configured,
+    );
     if let Some(t) = &agent_tokens {
         tracing::info!(
             mode = t.mode().as_str(),
             "agent-token door: ON, an agent's own token is a door credential here"
         );
+        let listed = t.static_key_ids();
+        if !listed.is_empty() {
+            tracing::info!(
+                static_keys = ?listed,
+                "agent-token door: under require these static keys are still admitted, as listed in TOKENFUSE_AGENT_TOKENS_STATIC_KEYS"
+            );
+        }
     }
     state = state
         .with_chain_proof(chain_proof, revocations)

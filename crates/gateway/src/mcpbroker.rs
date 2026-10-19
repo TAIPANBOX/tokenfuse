@@ -270,6 +270,11 @@ pub struct CallContext {
     /// How the door knew the agent, for the policy plane: `agent-token`,
     /// `client-key` or `none`, from the door and never from a header.
     pub identity_source: Option<String>,
+    /// The agent's own token, as presented, when it admitted this call
+    /// (invariant 140). Read by the policy question only.
+    pub agent_token: Option<String>,
+    /// The agent's DPoP proof, as presented, for the policy question (invariant 140).
+    pub agent_dpop_proof: Option<String>,
 }
 
 /// Where a call's session id came from, which decides whether it is trusted.
@@ -1004,7 +1009,10 @@ fn agent_refusal(st: &BrokerState, token_refused: bool) -> Response {
     if token_refused {
         crate::agenttoken::refused_response_with(&challenge)
     } else {
-        crate::agenttoken::required_response_with(&challenge)
+        crate::agenttoken::required_response_with(
+            &challenge,
+            crate::agenttoken::BROKER_STATIC_KEYS_VAR,
+        )
     }
 }
 
@@ -1224,6 +1232,10 @@ async fn handle(
             };
             let token = crate::chainproof::dpop_credential(header("authorization").as_deref())
                 .map(str::to_string);
+            // The token the policy plane is shown (invariant 140), within the cap.
+            let pdp_token = token.as_deref().and_then(crate::agenttoken::for_pdp);
+            // The DPoP proof the door verified this call with, as presented (invariant 140).
+            let pdp_proof = crate::agenttoken::proof_for_pdp(&headers);
             let ctx = CallContext {
                 agent_id: Some(agent.subject.clone()),
                 // The token proves the agent, not a delegation: a declared
@@ -1244,6 +1256,8 @@ async fn handle(
                 gateway_key: None,
                 gateway_token: token,
                 identity_source: Some(crate::agenttoken::IDENTITY_AGENT_TOKEN.to_string()),
+                agent_token: pdp_token,
+                agent_dpop_proof: pdp_proof,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1332,6 +1346,8 @@ async fn handle(
                 // A credential vouchryx minted for a person and an agent, not
                 // the agent's own token.
                 identity_source: Some(crate::agenttoken::IDENTITY_CLIENT_KEY.to_string()),
+                agent_token: None,
+                agent_dpop_proof: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1349,7 +1365,7 @@ async fn handle(
     // `door_proof`: whether the door itself verified a proof of possession on
     // this request, one of the two facts the attestation method is derived
     // from (invariant 116).
-    let (principal, door_proof) = match crate::mcpdoor::admit(
+    let (principal, door_proof, static_listed) = match crate::mcpdoor::admit(
         crate::mcpdoor::Door {
             keys: &st.keys,
             clients: &st.clients,
@@ -1386,16 +1402,21 @@ async fn handle(
         }
         crate::mcpdoor::Admission::Proof(client_id) => {
             tracing::debug!(%client_id, "mcp broker: admitted by proof of possession");
-            (format!("proof:{client_id}"), true)
+            (format!("proof:{client_id}"), true, false)
         }
         // What a session is bound to (invariant 77): the key's id, never the
-        // secret that resolved to it.
-        crate::mcpdoor::Admission::Bearer(key_id) => (format!("key:{key_id}"), false),
-        crate::mcpdoor::Admission::Open => (String::new(), false),
+        // secret that resolved to it. Under require, the key is admitted only
+        // when `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS` lists it (invariant 139).
+        crate::mcpdoor::Admission::Bearer(key_id) => {
+            let listed = crate::agenttoken::static_key_listed(&st.agent_tokens, &key_id);
+            (format!("key:{key_id}"), false, listed)
+        }
+        crate::mcpdoor::Admission::Open => (String::new(), false, false),
     };
     // `require` (invariant 123) closes the static key door and the open one; a
-    // client that proved possession of a key it published stays admitted.
-    if crate::agenttoken::required(&st.agent_tokens) && !door_proof {
+    // client that proved possession of a key it published stays admitted, and so
+    // does a static key the broker's list names (invariant 139).
+    if crate::agenttoken::required(&st.agent_tokens) && !door_proof && !static_listed {
         tracing::warn!(
             "mcp broker: refused a call with no agent token while TOKENFUSE_AGENT_TOKENS=require"
         );
@@ -1471,6 +1492,8 @@ async fn handle(
         gateway_key: header(CLIENT_KEY_HEADER),
         gateway_token: None,
         identity_source: Some(identity_source),
+        agent_token: None,
+        agent_dpop_proof: None,
     };
     finish(&st, req, ctx).await
 }
@@ -1936,6 +1959,8 @@ async fn process_into(
                         est_cost_usd: 0.0,
                         attestation_method: ctx.attestation_method.clone(),
                         identity_source: ctx.identity_source.clone(),
+                        agent_token: ctx.agent_token.clone(),
+                        agent_dpop_proof: ctx.agent_dpop_proof.clone(),
                         approval_token: ctx.approval_token.clone(),
                         // The call itself, as the agent sent it: this is the
                         // site that runs BEFORE secret injection, so a

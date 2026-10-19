@@ -59,6 +59,9 @@
             "required": false,
             "default": "off"
           },
+          "TOKENFUSE_AGENT_TOKENS_STATIC_KEYS": {
+            "required": false
+          },
           "TOKENFUSE_ALLOW_OPEN_OBS": {
             "required": false
           },
@@ -197,6 +200,9 @@
             "default": "127.0.0.1:4200"
           },
           "TOKENFUSE_MCP_ALLOW_OPEN_BIND": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS": {
             "required": false
           },
           "TOKENFUSE_MCP_CLIENT_IDS": {

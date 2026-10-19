@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.18.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2364-brightgreen)
+![tests](https://img.shields.io/badge/tests-2391-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -546,7 +546,7 @@ did. The second is deliberately hard: it stays false until a deployment drill
 sends one call the policy must refuse, which is the point, because a check that
 cannot fail reports zero forever. The endpoint carries no prompt content. It sits behind the admin keys described below: on a loopback bind it needs nothing, and on a wide bind it is refused with `403 admin_keys_required` until `TOKENFUSE_ADMIN_KEYS` is set, so set that before you publish the port.
 
-**An agent's own token.** With `TOKENFUSE_AGENT_TOKENS=accept`, an agent can present the five-minute token [vouchryx](https://github.com/TAIPANBOX/vouchryx) mints it (`Authorization: DPoP`, with a proof of possession that names the token) instead of a static `x-fuse-key`, at both doors, the MCP broker and the tool-call check. The agent, its unit and its run's owner then come from the token, never from `x-fuse-agent-id`, and the policy plane is told the agent was proven. Static keys keep working beside it; `require` refuses them. It needs the delegation door's issuer, key set, origin and audience and a revocation list that fails closed, or the process refuses to start. [docs/25](docs/25-the-delegation-door.md) section 7 has the rules; CLAUDE.md invariants 123 and 124 hold them.
+**An agent's own token.** With `TOKENFUSE_AGENT_TOKENS=accept`, an agent can present the five-minute token [vouchryx](https://github.com/TAIPANBOX/vouchryx) mints it (`Authorization: DPoP`, with a proof of possession that names the token) instead of a static `x-fuse-key`, at both doors, the MCP broker and the tool-call check. The agent, its unit and its run's owner then come from the token, never from `x-fuse-agent-id`, and the policy plane is told the agent was proven. Static keys keep working beside it. Under `require` a static key is refused unless `TOKENFUSE_AGENT_TOKENS_STATIC_KEYS` (or, at the MCP broker, `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS`) lists its key id, for a client that cannot sign a proof. The policy plane is given the token as presented, never the proof. It needs the delegation door's issuer, key set, origin and audience and a revocation list that fails closed, or the process refuses to start. [docs/25](docs/25-the-delegation-door.md) section 7 has the rules; CLAUDE.md invariants 123, 124, 138, 139 and 140 hold them.
 
 **The protected resource document.** With the agent-token door on, the broker publishes RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource`, and at the path-suffixed twin of its resource's own path, as the MCP authorization specification requires. A refused agent token is answered with a DPoP challenge that names that document. Two configurations refuse to start: an agent audience that is not an absolute https URL, and XAA naming a resource other than the audience. CLAUDE.md invariant 126 holds the rules.
 
