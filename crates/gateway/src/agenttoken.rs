@@ -386,8 +386,17 @@ pub fn token_for_pdp(headers: &HeaderMap) -> Option<String> {
 /// The DPoP proof this request presented, for the policy plane, within the cap
 /// (invariant 140). Never logged.
 pub fn proof_for_pdp(headers: &HeaderMap) -> Option<String> {
-    let _ = headers;
-    None
+    let proof = headers.get(crate::mcpdoor::PROOF_HEADER)?.to_str().ok()?;
+    if proof.len() > TOKEN_FOR_PDP_CAP_BYTES {
+        // The proof's value is never logged, only its size and the cap.
+        tracing::warn!(
+            bytes = proof.len(),
+            cap = TOKEN_FOR_PDP_CAP_BYTES,
+            "a DPoP proof over the policy plane's size cap is admitted but not forwarded"
+        );
+        return None;
+    }
+    Some(proof.to_string())
 }
 
 /// A token for the policy plane when it is an agent token within the cap.

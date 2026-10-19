@@ -251,9 +251,9 @@ async fn the_policy_plane_is_sent_the_agent_token_when_a_token_admitted_the_call
     assert_eq!(asked["agent_token"], tok, "{asked}");
     assert_eq!(asked["agent_dpop_proof"], h[1].1, "{asked}");
     assert_eq!(asked["agent_id"], AGENT, "{asked}");
-    assert!(
-        !asked.to_string().contains(&h[1].1),
-        "the proof of possession is never sent to the policy plane"
+    assert_ne!(
+        asked["agent_token"], asked["agent_dpop_proof"],
+        "the token and the proof are two fields, never one"
     );
 }
 
@@ -271,6 +271,8 @@ async fn a_static_key_call_is_never_sent_an_agent_token() {
             &[
                 key("sk-a"),
                 ("x-fuse-agent-id", "agent://acme/keyed".to_string()),
+                // A stray proof beside a static key is still not the agent's proof.
+                (PROOF_HEADER, "stray.proof.value".to_string()),
             ],
         ),
     )

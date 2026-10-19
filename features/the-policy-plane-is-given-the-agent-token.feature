@@ -8,13 +8,14 @@ Feature: The policy plane is given the agent token that admitted the call
   instead of trusting the gateway's word for who the agent is. Paraphrased here.
 
   The choices inside it are @claude, under delegated authority: the token is sent
-  exactly as presented, without the DPoP proof; it is sent only for a call an
+  exactly as presented, with the DPoP proof that came with it in a field of its own; both are sent only for a call an
   agent token admitted, never for a static-key call; a token over 4 KiB is not
   sent (a policy that needs it then denies, since the plane finds none); and the
   field is omitted rather than null when there is no token, so a wardryx that
   predates it sees the same body as before.
 
   # @test:the_wire_body_carries_the_agent_token_only_when_the_call_had_one
+  # @test:a_proof_for_the_policy_plane_is_the_dpop_header_within_the_cap
   # @test:the_policy_plane_is_sent_the_agent_token_when_a_token_admitted_the_call
   # @test:a_static_key_call_is_never_sent_an_agent_token
   # @test:the_broker_sends_the_agent_token_to_the_pdp
@@ -25,7 +26,7 @@ Feature: The policy plane is given the agent token that admitted the call
     Given the agent-token door admits an agent's call
     When the call reaches the policy decision point
     Then the decide request carries the agent's token exactly as presented
-    And it carries no DPoP proof
+    And it carries the DPoP proof that came with it, as presented, in its own field
 
   # @test:a_static_key_call_is_never_sent_an_agent_token
   # @test:the_broker_sends_no_agent_token_for_a_static_key_call

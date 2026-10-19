@@ -1234,6 +1234,8 @@ async fn handle(
                 .map(str::to_string);
             // The token the policy plane is shown (invariant 140), within the cap.
             let pdp_token = token.as_deref().and_then(crate::agenttoken::for_pdp);
+            // The DPoP proof the door verified this call with, as presented (invariant 140).
+            let pdp_proof = crate::agenttoken::proof_for_pdp(&headers);
             let ctx = CallContext {
                 agent_id: Some(agent.subject.clone()),
                 // The token proves the agent, not a delegation: a declared
@@ -1255,7 +1257,7 @@ async fn handle(
                 gateway_token: token,
                 identity_source: Some(crate::agenttoken::IDENTITY_AGENT_TOKEN.to_string()),
                 agent_token: pdp_token,
-                agent_dpop_proof: None,
+                agent_dpop_proof: pdp_proof,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1958,7 +1960,7 @@ async fn process_into(
                         attestation_method: ctx.attestation_method.clone(),
                         identity_source: ctx.identity_source.clone(),
                         agent_token: ctx.agent_token.clone(),
-                        agent_dpop_proof: None,
+                        agent_dpop_proof: ctx.agent_dpop_proof.clone(),
                         approval_token: ctx.approval_token.clone(),
                         // The call itself, as the agent sent it: this is the
                         // site that runs BEFORE secret injection, so a

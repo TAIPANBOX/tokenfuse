@@ -233,10 +233,14 @@ Under `require`, a static key is admitted only when its id is in
 invariants 138 and 139 hold these rules.
 
 The policy plane is also given the token itself. For a call an agent token
-admitted, the decide request carries `agent_token`: the compact token exactly as
-presented, never the DPoP proof, and only within 4 KiB. A static-key call sends
-no such member. The token is DPoP-bound, so a policy plane holding it cannot
-present it to this gateway without a proof made with the agent's key. A policy
+admitted, the decide request carries `agent_token`, the compact token exactly as
+presented, and `agent_dpop_proof`, the DPoP proof that came with it, exactly as
+presented. Each is bounded at 4 KiB and never logged. A static-key call sends
+neither member. The token is DPoP-bound. A policy plane holding the token and the proof
+can check the proof's freshness, its thumbprint against the token, and its
+audience itself, so a gateway that relays the token can hand it on for at most
+the proof's freshness window, not the token's whole life. That needs a policy
+plane that verifies the proof. A policy
 that reads the token must answer `cacheable: false`, because a verdict reached on
 a token is otherwise served again for the same agent and tools inside the cache
 TTL. CLAUDE.md invariant 140 holds the rule.

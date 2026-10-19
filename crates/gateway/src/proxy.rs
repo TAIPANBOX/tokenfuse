@@ -1778,7 +1778,11 @@ async fn handle_call(
                 } else {
                     None
                 },
-                agent_dpop_proof: None,
+                agent_dpop_proof: if caller.agent.is_some() {
+                    crate::agenttoken::proof_for_pdp(&headers)
+                } else {
+                    None
+                },
                 approval_token,
                 // The LLM path has no pending call to name: the tools in the
                 // request are only OFFERED. See `DecideContext::tool_call`.
