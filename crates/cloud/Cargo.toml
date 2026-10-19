@@ -35,8 +35,10 @@ getrandom = "0.2"
 # against a static JWKS. No network — the JWKS is supplied from env. Cloud-only;
 # never pulled into tokenfuse-core.
 jsonwebtoken.workspace = true
-# APNs push (real sender) — only pulled in with `--features apns`.
-reqwest = { version = "0.12", optional = true, default-features = false, features = [
+# The HTTP client for keyryx custody, which signs the audit manifest when
+# TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx (invariant 130), and for the APNs sender
+# under `--features apns`. Already in the workspace graph through the gateway.
+reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
     "http2",
@@ -53,5 +55,6 @@ base64 = "0.22"
 
 [features]
 # Build the real APNs client; needs `p256` PKCS#8/PEM for the provider JWT key
-# (already enabled unconditionally above for the audit-manifest signing key).
-apns = ["dep:reqwest"]
+# (already enabled unconditionally above for the audit-manifest signing key)
+# and `reqwest`, which the keyryx signer made unconditional.
+apns = []

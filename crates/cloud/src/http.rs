@@ -135,6 +135,10 @@ pub struct AppState {
     /// (`404`); the rest of the audit trail is unaffected. Loaded once at
     /// construction from `TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY`.
     pub audit_signing_key: Option<Arc<SigningKey>>,
+    /// The keyryx signer for audit manifests (`TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx`,
+    /// invariant 130), or `None`. Never set beside [`Self::audit_signing_key`]
+    /// by `main`, which refuses that configuration; were both set, keyryx signs.
+    pub audit_keyryx: Option<Arc<crate::audit_keyryx::KeyryxSigner>>,
     /// Optional path to the agent-event NDJSON export `GET /v1/replay/{run}`
     /// reads (wave 2). `None` when unconfigured: the endpoint still returns
     /// the store-derived incidents/audit for the run, just zero events. Read
@@ -150,6 +154,7 @@ impl AppState {
             alert_pct,
             oidc: None,
             audit_signing_key: None,
+            audit_keyryx: None,
             replay_events_path: None,
         }
     }
@@ -169,6 +174,14 @@ impl AppState {
     /// reports not-configured.
     pub fn with_audit_signing_key(mut self, key: Option<SigningKey>) -> Self {
         self.audit_signing_key = key.map(Arc::new);
+        self
+    }
+
+    /// Attach the keyryx signer for audit manifests (from
+    /// [`crate::audit_keyryx::signer_from`]). Kept off `new` like
+    /// [`Self::with_audit_signing_key`].
+    pub fn with_audit_keyryx(mut self, signer: Option<crate::audit_keyryx::KeyryxSigner>) -> Self {
+        self.audit_keyryx = signer.map(Arc::new);
         self
     }
 
@@ -1903,12 +1916,18 @@ async fn audit_verify(State(st): State<AppState>, headers: HeaderMap) -> Respons
 /// audit reads). When no signing key is configured the server returns
 /// `404 {"error":"audit manifest signing not configured"}` (never a `500`);
 /// the rest of the audit trail is unaffected.
+///
+/// With `TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx` keyryx custody signs, the
+/// manifest names its `kid`, and a manifest keyryx did not sign is never
+/// served: an unreachable or refusing keyryx, or an answer that does not
+/// verify, is `503` saying why (invariant 130).
 #[utoipa::path(
     get, path = "/v1/audit/manifest",
     responses(
         (status = 200, description = "signed manifest over the chain tip", body = AuditManifest),
         (status = 401, description = "unauthorized", body = ErrorResponse),
         (status = 404, description = "manifest signing not configured", body = ErrorResponse),
+        (status = 503, description = "keyryx did not sign this manifest (unreachable, refusing, or answering with a signature that does not verify); nothing unsigned is served", body = ErrorResponse),
     ),
     tag = "reads"
 )]
@@ -1916,6 +1935,25 @@ async fn audit_manifest(State(st): State<AppState>, headers: HeaderMap) -> Respo
     let Some(org) = st.org_for(&headers) else {
         return unauthorized();
     };
+    if let Some(signer) = st.audit_keyryx.as_ref() {
+        let tip = st.store.audit_tip(&org);
+        return match signer.manifest(&org, tip, now_millis()).await {
+            Ok(manifest) => (StatusCode::OK, Json(manifest)).into_response(),
+            Err(not_signed) => {
+                tracing::warn!(
+                    org = %org,
+                    keyryx = signer.base_url(),
+                    key = signer.key_name(),
+                    "audit manifest not signed: {}",
+                    not_signed.detail
+                );
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("audit manifest not signed: {}", not_signed.reason),
+                )
+            }
+        };
+    }
     let Some(key) = st.audit_signing_key.as_ref() else {
         return error(
             StatusCode::NOT_FOUND,

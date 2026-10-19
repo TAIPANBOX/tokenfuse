@@ -4,6 +4,7 @@
 
 #[cfg(feature = "apns")]
 pub mod apns;
+pub mod audit_keyryx;
 pub mod audit_sign;
 // Delegation verification moved to its own crate so the GATEWAY can use it:
 // the gateway must not depend on this one, which would put the control-plane
@@ -18,6 +19,7 @@ pub mod push;
 pub mod replay;
 pub mod store;
 
+pub use audit_keyryx::{signer_from as audit_signer_from, AuditSigner, KeyryxSigner};
 pub use audit_sign::{signing_key_from_env as audit_signing_key_from_env, AuditManifest};
 pub use http::{app, openapi_spec, AppState, RUNS_WINDOW_HEADER};
 pub use keys::{parse_keys, Principal};

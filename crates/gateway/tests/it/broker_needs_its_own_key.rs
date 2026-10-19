@@ -8,7 +8,7 @@
 //! `mcpbroker` proves the decision; only the binary proves `main.rs` asks it.
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -152,17 +152,15 @@ async fn list_server() -> String {
 /// A file only the test with this label names: every test in this binary
 /// shares one process id.
 fn scratch(label: &str, contents: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "tf-broker-own-key-{label}-{}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("tf-broker-own-key-{label}-{}", std::process::id()));
     std::fs::write(&path, contents).unwrap();
     path
 }
 
 /// Everything the agent-token door needs to be on in `mode`, a key set and a
 /// revocation list included.
-fn agent_door(mode: &str, jwks: &PathBuf, list: &str) -> Vec<(&'static str, String)> {
+fn agent_door(mode: &str, jwks: &Path, list: &str) -> Vec<(&'static str, String)> {
     vec![
         ("TOKENFUSE_AGENT_TOKENS", mode.to_string()),
         ("TOKENFUSE_DELEGATION_ISSUER", ISS.to_string()),
@@ -192,14 +190,21 @@ async fn agent_tokens_and_a_taint_gateway_without_the_brokers_key_stop_the_broke
     let jwks = jwks_file("refused-jwks.json");
     for mode in ["accept", "require"] {
         let mut env = agent_door(mode, &jwks, &list);
-        env.push(("TOKENFUSE_MCP_TAINT_GATEWAY", "http://127.0.0.1:4100".into()));
+        env.push((
+            "TOKENFUSE_MCP_TAINT_GATEWAY",
+            "http://127.0.0.1:4100".into(),
+        ));
         let child = spawn(broker(&env));
         let what = format!("agent tokens {mode}, a taint gateway, no broker key");
         let result = tokio::task::spawn_blocking(move || {
             assert_refused(
                 child,
                 &what,
-                &[KEY_FILE, "TOKENFUSE_MCP_TAINT_GATEWAY", "TOKENFUSE_AGENT_TOKENS"],
+                &[
+                    KEY_FILE,
+                    "TOKENFUSE_MCP_TAINT_GATEWAY",
+                    "TOKENFUSE_AGENT_TOKENS",
+                ],
             )
         })
         .await;
@@ -219,7 +224,10 @@ async fn with_the_brokers_own_key_the_broker_starts() {
     let jwks = jwks_file("keyed-jwks.json");
     let key = scratch("keyed-key", "sk-broker-1\n");
     let mut env = agent_door("accept", &jwks, &list);
-    env.push(("TOKENFUSE_MCP_TAINT_GATEWAY", "http://127.0.0.1:4100".into()));
+    env.push((
+        "TOKENFUSE_MCP_TAINT_GATEWAY",
+        "http://127.0.0.1:4100".into(),
+    ));
     env.push((KEY_FILE, key.display().to_string()));
     let child = spawn(broker(&env));
     let seen = tokio::task::spawn_blocking(move || listens(child))

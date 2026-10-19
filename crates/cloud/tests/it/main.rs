@@ -14,6 +14,7 @@
 
 mod audit;
 mod audit_manifest;
+mod audit_manifest_keyryx;
 mod compliance_evidence;
 mod dashboard_page;
 mod devkey_refused;
