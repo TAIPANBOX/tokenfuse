@@ -144,8 +144,8 @@ pub struct AppState {
     /// the store-derived incidents/audit for the run, just zero events. Read
     /// once at construction from `TOKENFUSE_CLOUD_REPLAY_EVENTS`.
     pub replay_events_path: Option<Arc<String>>,
-    /// The browser origins this plane answers (invariant 131). Stub in the red
-    /// commit: stored, not yet read by the middleware.
+    /// The browser origins this plane answers (invariant 131), read by the
+    /// `cors` middleware. Unset, it is loopback only.
     pub cors: Arc<crate::cors::CorsPolicy>,
 }
 
