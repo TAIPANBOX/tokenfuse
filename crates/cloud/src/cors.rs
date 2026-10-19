@@ -43,6 +43,19 @@ impl CorsPolicy {
         })
     }
 
+    /// The policy in words, for the startup log: what an operator reads when a
+    /// dashboard stops being answered after an upgrade.
+    pub fn describe(&self) -> String {
+        match &self.configured {
+            Some(list) => format!(
+                "the origins named in TOKENFUSE_CLOUD_CORS_ORIGINS: {}",
+                list.join(", ")
+            ),
+            None => "loopback origins only (set TOKENFUSE_CLOUD_CORS_ORIGINS to name others)"
+                .to_string(),
+        }
+    }
+
     /// Whether `origin` (as a browser sends it in `Origin`) may call the plane.
     pub fn allows(&self, origin: &str) -> bool {
         let origin = origin.to_ascii_lowercase();

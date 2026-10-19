@@ -76,14 +76,11 @@ async fn an_origin_nobody_named_gets_no_allow_origin_header() {
 async fn a_refused_origin_is_marked_vary_too() {
     // A cache must not hand a refusal to a dashboard that was allowed, or an
     // allowed answer to a stranger, so the refusal varies on Origin as well.
-    let resp = from_origin(
-        &state(),
-        Method::GET,
-        "/healthz",
-        "https://evil.example",
-    )
-    .await;
-    assert!(vary_names_origin(&resp), "a refusal must vary on Origin too");
+    let resp = from_origin(&state(), Method::GET, "/healthz", "https://evil.example").await;
+    assert!(
+        vary_names_origin(&resp),
+        "a refusal must vary on Origin too"
+    );
 }
 
 #[tokio::test]

@@ -43,7 +43,8 @@ enforcement.
   named a different model from the one before it (CLAUDE.md invariant 111).
 - **`GET /v1/summary`** — org totals (runs, calls, spend).
 - **`GET /`** — an embedded, dependency-free dashboard (vanilla JS; enter your
-  org key, auto-refreshes every 3 s).
+  org key, auto-refreshes every 3 s). Browsers may call the API only from the
+  origins in `TOKENFUSE_CLOUD_CORS_ORIGINS` (loopback when unset, invariant 131).
 - **`GET /healthz`**.
 
 Storage is concurrency-safe, keyed `org → run`, and **durable**: set
@@ -53,7 +54,7 @@ backend (Postgres/ClickHouse) for scale + retention is a drop-in behind the same
 `Store` methods.
 
 **Auth + RBAC.** Org API keys come from
-`TOKENFUSE_CLOUD_KEYS="key:org[:role][:plan],…"`. The optional role is `admin`
+`TOKENFUSE_CLOUD_KEYS="key:org[:role][:plan],…"` (the control plane holds each key by its SHA-256 digest, invariant 133). The optional role is `admin`
 (default) or `viewer`. Reads (`/v1/runs`, `/v1/summary`, `/v1/kills`,
 `/v1/budgets`, `/v1/alerts`) work for any valid key of the org; **writes**
 (`POST …/kill`, `POST …/budget`, `POST /v1/findings`, `POST /v1/ingest`)
@@ -200,10 +201,17 @@ budget set here.
 - **Next.js app** (`cloud/dashboard`, App Router, TypeScript, static export) —
   the richer UI: summary cards, a spend-by-run chart, the runs table with kill +
   budget actions, auto-refresh. Talks to the control plane's API from the
-  browser (a base-URL + org-key connect form); the control plane sends CORS
-  headers so a cross-origin dashboard works. Built to static files and served by
-  nginx — published as `ghcr.io/taipanbox/tokenfuse-dashboard` and wired into
-  `docker compose` on `:3000`.
+  browser (a base-URL + org-key connect form). The control plane answers a
+  browser only from the origins it names: loopback by default, and any other
+  dashboard origin (a hosted one, another machine) must be listed in
+  `TOKENFUSE_CLOUD_CORS_ORIGINS=https://dash.example.com,...` (exact origins;
+  an entry that is not one stops the control plane at startup). Open the
+  dashboard with its key in the URL fragment, `…/#key=<org-key>`: a fragment is
+  never sent to any server, and the page removes it from the address bar once it
+  has read it (invariant 133). A `?key=` query still works for old links. Built
+  to static files and served by nginx — published as
+  `ghcr.io/taipanbox/tokenfuse-dashboard` and wired into `docker compose` on
+  `:3000`.
 
 ## Not yet (follow-ups)
 - **SQL/columnar store** (Postgres/ClickHouse) for scale + retention (today: durable JSON snapshot).

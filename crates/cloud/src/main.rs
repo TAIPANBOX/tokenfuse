@@ -259,6 +259,7 @@ async fn main() {
         }
     };
 
+    tracing::info!("browser origins answered: {}", cors.describe());
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct)
         .with_cors(cors)
         .with_oidc(oidc)
