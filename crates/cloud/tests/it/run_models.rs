@@ -16,12 +16,13 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn state(store: Arc<Store>) -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "k".to_string(),
+        digest("k"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),

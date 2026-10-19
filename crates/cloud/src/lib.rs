@@ -6,6 +6,7 @@
 pub mod apns;
 pub mod audit_keyryx;
 pub mod audit_sign;
+pub mod cors;
 // Delegation verification moved to its own crate so the GATEWAY can use it:
 // the gateway must not depend on this one, which would put the control-plane
 // API surface inside the data-plane binary. Same reasoning, and the same

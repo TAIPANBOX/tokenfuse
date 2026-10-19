@@ -244,7 +244,24 @@ async fn main() {
         tracing::info!("replay events configured for /v1/replay");
     }
 
+    // The browser origins this plane answers (invariant 131). Unset is the
+    // loopback default; a list that is not all exact origins refuses to start,
+    // naming the entry, before the listener binds.
+    let cors = match tokenfuse_cloud::cors::CorsPolicy::from_spec(
+        std::env::var("TOKENFUSE_CLOUD_CORS_ORIGINS")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(policy) => policy,
+        Err(refusal) => {
+            tracing::error!("{refusal}: refusing to start");
+            std::process::exit(2);
+        }
+    };
+
+    tracing::info!("browser origins answered: {}", cors.describe());
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct)
+        .with_cors(cors)
         .with_oidc(oidc)
         .with_audit_signing_key(audit_signing_key)
         .with_audit_keyryx(audit_keyryx)

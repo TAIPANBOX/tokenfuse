@@ -8,13 +8,14 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, FindingInput, Principal, Store};
 
 fn test_state() -> (AppState, Arc<Store>) {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -22,7 +23,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         },
     );
     keys.insert(
-        "viewerkey".into(),
+        digest("viewerkey"),
         Principal {
             org: "acme".into(),
             role: "viewer".into(),

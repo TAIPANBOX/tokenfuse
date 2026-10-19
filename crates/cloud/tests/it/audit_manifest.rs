@@ -16,6 +16,7 @@ use http_body_util::BodyExt;
 use p256::ecdsa::{signature::Verifier, Signature, SigningKey, VerifyingKey};
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 /// A deterministic P-256 signing key for tests (fixed scalar, no RNG), matching
@@ -27,7 +28,7 @@ fn test_key() -> SigningKey {
 fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -35,7 +36,7 @@ fn keys() -> HashMap<String, Principal> {
         },
     );
     keys.insert(
-        "viewerkey".into(),
+        digest("viewerkey"),
         Principal {
             org: "acme".into(),
             role: "viewer".into(),

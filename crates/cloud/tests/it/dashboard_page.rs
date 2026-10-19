@@ -90,3 +90,32 @@ async fn the_served_page_names_no_removed_key_and_calls_its_savings_all_time() {
         "the savings breakdown no longer says the figure is all time"
     );
 }
+
+/// The standalone Next.js dashboard's connect page (CLAUDE.md invariant 133).
+/// It is a separate application with no test harness of its own, so its source
+/// is read here at build time: the key it connects with must come from the URL
+/// fragment first, which a browser never sends to the server, before the
+/// query, and must leave the address bar once it has been read.
+const DASHBOARD_PAGE: &str = include_str!("../../../../cloud/dashboard/app/page.tsx");
+
+#[test]
+fn the_dashboard_reads_its_key_from_the_fragment_before_the_query() {
+    let fragment = DASHBOARD_PAGE
+        .find("location.hash")
+        .expect("the dashboard reads the URL fragment, which is never sent to the server");
+    let query = DASHBOARD_PAGE
+        .find("location.search")
+        .expect("the dashboard still reads the query, for old links");
+    assert!(
+        fragment < query,
+        "the fragment must be read before the query, so a fragment key wins"
+    );
+}
+
+#[test]
+fn the_dashboard_takes_the_key_out_of_the_address_bar_once_it_has_read_it() {
+    assert!(
+        DASHBOARD_PAGE.contains("history.replaceState"),
+        "a key read from the URL must be stripped from the address bar"
+    );
+}

@@ -10,12 +10,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, CallRecord, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "k".into(),
+        digest("k"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -105,7 +106,7 @@ async fn stream_emits_incident_event() {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
     keys.insert(
-        "k".into(),
+        digest("k"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),

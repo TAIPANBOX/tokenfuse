@@ -13,12 +13,13 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
