@@ -304,8 +304,8 @@ comparison in #132.
 
 **Counts re-measured 2026-10-05**, each by the command named, because the set
 here once said 100 where the workspace ran 747 and nothing had been watching:
-`cargo test --all` runs **2329 passing** (core 462, dpop 23, delegation 75,
-gateway 1425, cloud 343, umbrella 1, by `cargo test -p <crate>`). The static-key allow-list and the agent token and DPoP proof to the policy plane (invariants 138 to 140) add 25 to `gateway`: 10 in `gateway::agenttoken` and `wardryx`, 15 in `tests/it` (`static_key_allow_list`, `static_key_allow_list_startup`, `mcp_agent_token`), counted from the diff against main (2304, so 2329). @measured `cargo test --all --no-fail-fast` on this branch 2026-10-19 as root: 2327 passed, and the two root-only tests failed as invariant 78 records; they pass as any other user, so 2329 is the CI figure. The CORS allow-list, the digested device credentials and org keys, and the dashboard's
+`cargo test --all` runs **2330 passing** (core 462, dpop 23, delegation 75,
+gateway 1426, cloud 343, umbrella 1, by `cargo test -p <crate>`). The static-key allow-list and the agent token and DPoP proof to the policy plane (invariants 138 to 140) add 26 to `gateway`: 11 in `gateway::agenttoken` and `wardryx`, 15 in `tests/it` (`static_key_allow_list`, `static_key_allow_list_startup`, `mcp_agent_token`), counted from the diff against main (2304, so 2330). @measured `cargo test --all --no-fail-fast` on this branch 2026-10-19 as root: 2327 passed, and the two root-only tests failed as invariant 78 records; they pass as any other user, so 2330 is the CI figure. The CORS allow-list, the digested device credentials and org keys, and the dashboard's
 fragment key (invariants 131 to 133) add 28 to `cloud`, all of them new tests: 9 in its library
 and 19 in `tests/it` (8 CORS, 2 startup refusal, 7 device credentials, nonces and the restart second, 2 dashboard),
 counted from the diff against main (2276, so 2304). @measured `cargo test --all --no-fail-fast`

@@ -298,14 +298,14 @@ pub struct DecideContext {
     /// admitted the request ([`crate::agenttoken`]) and never from a header.
     /// `None` sends nothing, which wardryx reads as `none`.
     ///
-    /// Not part of the decision cache key: wardryx answers `cacheable: false`
-    /// for any request a `require_identity_source` rule read (its
-    /// `pdp.go`, the per-request rules), so no verdict that depended on it is
-    /// ever stored here.
+    /// Part of the decision cache key, as `attestation_method` is: a verdict
+    /// reached on an agent token must not answer a static-key call for the same
+    /// agent and tools inside the TTL.
     pub identity_source: Option<String>,
     /// The agent's own token, exactly as presented, when an agent token admitted
     /// this call (invariant 140). Sent to the policy plane as `agent_token` and
-    /// never for a call a static key admitted. The DPoP proof is not sent.
+    /// never for a call a static key admitted. Its DPoP proof travels in
+    /// `agent_dpop_proof`, beside it.
     pub agent_token: Option<String>,
     /// The agent's DPoP proof for this call, exactly as presented (invariant 140).
     pub agent_dpop_proof: Option<String>,
@@ -831,6 +831,7 @@ impl Cache {
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        identity_source: Option<&str>,
         chain_proven: bool,
     ) -> (String, u64) {
         let mut sorted: Vec<&str> = tool_names.iter().map(String::as_str).collect();
@@ -849,6 +850,11 @@ impl Cache {
         // entry. Whichever landed first would answer for the other, which on
         // this field means an unproven caller inheriting a proven "allow".
         chain_proven.hash(&mut hasher);
+        // And `identity_source`, one field over again: how the door knew the
+        // agent. A verdict reached on an agent token must not answer a
+        // static-key or unauthenticated call for the same agent and tools, even
+        // if wardryx marked it cacheable.
+        identity_source.hash(&mut hasher);
         (agent_id.to_string(), hasher.finish())
     }
 
@@ -857,9 +863,16 @@ impl Cache {
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        identity_source: Option<&str>,
         chain_proven: bool,
     ) -> Option<WardryxOutcome> {
-        let key = Self::key(agent_id, tool_names, attestation_method, chain_proven);
+        let key = Self::key(
+            agent_id,
+            tool_names,
+            attestation_method,
+            identity_source,
+            chain_proven,
+        );
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&key)?;
         if entry.cached_at.elapsed() >= self.ttl {
@@ -886,11 +899,13 @@ impl Cache {
     /// `DecideWireResponse::cacheable`): Wardryx, not this cache, is the
     /// source of truth for whether a decision generalizes beyond the one
     /// request that produced it.
+    #[allow(clippy::too_many_arguments)]
     fn put(
         &self,
         agent_id: &str,
         tool_names: &[String],
         attestation_method: Option<&str>,
+        identity_source: Option<&str>,
         chain_proven: bool,
         outcome: &WardryxOutcome,
         cacheable: bool,
@@ -909,7 +924,13 @@ impl Cache {
         if !cacheable {
             return;
         }
-        let key = Self::key(agent_id, tool_names, attestation_method, chain_proven);
+        let key = Self::key(
+            agent_id,
+            tool_names,
+            attestation_method,
+            identity_source,
+            chain_proven,
+        );
         let entry = CacheEntry {
             decision: outcome.decision,
             policy_version: outcome.policy_version.clone(),
@@ -1094,6 +1115,7 @@ impl Wardryx {
             &ctx.agent_id,
             &ctx.tool_names,
             ctx.attestation_method.as_deref(),
+            ctx.identity_source.as_deref(),
             ctx.chain_proven,
         ) {
             return cached;
@@ -1140,6 +1162,7 @@ impl Wardryx {
                     &ctx.agent_id,
                     &ctx.tool_names,
                     ctx.attestation_method.as_deref(),
+                    ctx.identity_source.as_deref(),
                     ctx.chain_proven,
                     &outcome,
                     cacheable,
@@ -1324,15 +1347,27 @@ mod tests {
 
     #[test]
     fn cache_key_is_order_independent() {
-        let a = Cache::key("agent-1", &["b".to_string(), "a".to_string()], None, false);
-        let b = Cache::key("agent-1", &["a".to_string(), "b".to_string()], None, false);
+        let a = Cache::key(
+            "agent-1",
+            &["b".to_string(), "a".to_string()],
+            None,
+            None,
+            false,
+        );
+        let b = Cache::key(
+            "agent-1",
+            &["a".to_string(), "b".to_string()],
+            None,
+            None,
+            false,
+        );
         assert_eq!(a, b, "tool order must not change the cache key");
     }
 
     #[test]
     fn cache_key_differs_by_agent() {
-        let a = Cache::key("agent-1", &["a".to_string()], None, false);
-        let b = Cache::key("agent-2", &["a".to_string()], None, false);
+        let a = Cache::key("agent-1", &["a".to_string()], None, None, false);
+        let b = Cache::key("agent-2", &["a".to_string()], None, None, false);
         assert_ne!(a, b);
     }
 
@@ -1342,8 +1377,8 @@ mod tests {
         // attestation states. An attested and an unattested request for the
         // same agent + tool-set must land on different cache keys, so one can
         // never inherit the other's cached decision inside the TTL.
-        let unattested = Cache::key("agent-1", &["a".to_string()], None, false);
-        let attested = Cache::key("agent-1", &["a".to_string()], Some("spiffe"), false);
+        let unattested = Cache::key("agent-1", &["a".to_string()], None, None, false);
+        let attested = Cache::key("agent-1", &["a".to_string()], Some("spiffe"), None, false);
         assert_ne!(
             unattested, attested,
             "attestation must be part of the decision-cache key"
@@ -1365,12 +1400,13 @@ mod tests {
             "agent-1",
             &["grep".to_string()],
             None,
+            None,
             false,
             &outcome,
             true,
         );
         let hit = cache
-            .get("agent-1", &["grep".to_string()], None, false)
+            .get("agent-1", &["grep".to_string()], None, None, false)
             .unwrap();
         assert_eq!(hit.decision, WardryxDecision::Deny);
         assert_eq!(hit.policy_version.as_deref(), Some("v1"));
@@ -1393,12 +1429,13 @@ mod tests {
             "agent-1",
             &["grep".to_string()],
             None,
+            None,
             false,
             &outcome,
             true,
         );
         assert!(cache
-            .get("agent-1", &["grep".to_string()], None, false)
+            .get("agent-1", &["grep".to_string()], None, None, false)
             .is_none());
     }
 
@@ -1421,12 +1458,13 @@ mod tests {
             "agent-1",
             &["grep".to_string()],
             None,
+            None,
             false,
             &outcome,
             false,
         );
         assert!(cache
-            .get("agent-1", &["grep".to_string()], None, false)
+            .get("agent-1", &["grep".to_string()], None, None, false)
             .is_none());
     }
 
@@ -1445,13 +1483,14 @@ mod tests {
             "agent-1",
             &["grep".to_string()],
             None,
+            None,
             false,
             &outcome,
             true,
         );
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache
-            .get("agent-1", &["grep".to_string()], None, false)
+            .get("agent-1", &["grep".to_string()], None, None, false)
             .is_none());
     }
 
@@ -1763,11 +1802,8 @@ mod tests {
         // reached on an agent token must not answer a static-key call for the
         // same agent and tools inside the TTL. The control: a repeat with the
         // same identity source IS a cache hit.
-        let (url, calls) = answering_pdp(
-            200,
-            r#"{"decision":"allow","cacheable":true}"#.to_string(),
-        )
-        .await;
+        let (url, calls) =
+            answering_pdp(200, r#"{"decision":"allow","cacheable":true}"#.to_string()).await;
         let w = hook(url, FailMode::Open, Duration::from_secs(60));
         let token_ctx = || {
             let mut c = ctx_for("agent://t/a");

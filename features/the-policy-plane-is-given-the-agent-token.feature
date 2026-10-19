@@ -48,3 +48,9 @@ Feature: The policy plane is given the agent token that admitted the call
     Given the MCP broker admits an agent by its token
     When the broker asks the policy plane about a tools/call
     Then the decide request carries the agent's token
+
+  # @test:a_token_admitted_allow_is_not_served_to_a_client_key_call
+  Scenario: A verdict reached on a token is not served to a static-key call
+    Given the policy plane answered an agent token's call for an agent and its tools
+    When a static-key call for the same agent and tools arrives inside the cache TTL
+    Then the policy plane is asked again for the static-key call
