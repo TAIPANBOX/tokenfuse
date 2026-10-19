@@ -30,6 +30,7 @@ mod event_checkpoints;
 mod firewall_mode_startup;
 mod focus_names_price_basis_and_pii;
 mod governed_profile;
+mod governed_profile_scope;
 mod image_user_group;
 mod keys_endpoint;
 mod long_prompt_is_priced_at_its_long_rate;
