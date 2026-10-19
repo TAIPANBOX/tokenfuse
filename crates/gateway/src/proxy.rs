@@ -1778,6 +1778,7 @@ async fn handle_call(
                 } else {
                     None
                 },
+                agent_dpop_proof: None,
                 approval_token,
                 // The LLM path has no pending call to name: the tools in the
                 // request are only OFFERED. See `DecideContext::tool_call`.

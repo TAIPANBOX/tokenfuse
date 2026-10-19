@@ -307,6 +307,8 @@ pub struct DecideContext {
     /// this call (invariant 140). Sent to the policy plane as `agent_token` and
     /// never for a call a static key admitted. The DPoP proof is not sent.
     pub agent_token: Option<String>,
+    /// The agent's DPoP proof for this call, exactly as presented (invariant 140).
+    pub agent_dpop_proof: Option<String>,
     /// Whether THIS gateway verified a delegation token for this request, per
     /// agent-passport SPEC 5.2, and took `on_behalf_of` from it.
     ///
@@ -1474,6 +1476,7 @@ mod tests {
                 attestation_method: None,
                 identity_source: None,
                 agent_token: None,
+                agent_dpop_proof: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1499,6 +1502,7 @@ mod tests {
                 attestation_method: None,
                 identity_source: None,
                 agent_token: None,
+                agent_dpop_proof: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1528,6 +1532,7 @@ mod tests {
             attestation_method: None,
             identity_source: None,
             agent_token: None,
+            agent_dpop_proof: None,
             approval_token: None,
             tool_call: None,
         }
@@ -2056,13 +2061,20 @@ mod tests {
         let w = hook(url, FailMode::Closed, Duration::from_secs(0));
         let mut with = ctx_for("agent://t/a");
         with.agent_token = Some("eyJ.tok.sig".to_string());
+        with.agent_dpop_proof = Some("eyJ.prf.sig".to_string());
         w.decide(with).await;
         let b = bodies.lock().unwrap().pop().expect("asked");
         assert_eq!(b["agent_token"], serde_json::json!("eyJ.tok.sig"), "{b}");
+        assert_eq!(
+            b["agent_dpop_proof"],
+            serde_json::json!("eyJ.prf.sig"),
+            "{b}"
+        );
         w.decide(ctx_for("agent://t/b")).await;
         let b = bodies.lock().unwrap().pop().expect("asked");
         assert!(
-            !b.as_object().unwrap().contains_key("agent_token"),
+            !b.as_object().unwrap().contains_key("agent_token")
+                && !b.as_object().unwrap().contains_key("agent_dpop_proof"),
             "a call with no token must send no member: {b}"
         );
     }

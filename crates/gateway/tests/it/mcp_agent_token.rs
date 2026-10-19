@@ -332,6 +332,7 @@ async fn the_broker_sends_the_agent_token_to_the_pdp() {
     b.wardryx = Some(pdp);
     let url = b.serve(upstream).await;
     let (tok, h) = b.token_headers("pm-7");
+    let proof = h[1].1.clone();
     let resp = tools_call(&url, &h).await;
     assert_eq!(resp.status(), 200);
     let asked = seen
@@ -342,6 +343,7 @@ async fn the_broker_sends_the_agent_token_to_the_pdp() {
         .cloned()
         .expect("the PDP was asked");
     assert_eq!(asked["agent_token"], tok, "{asked}");
+    assert_eq!(asked["agent_dpop_proof"], proof, "{asked}");
 }
 
 /// A static-key call at the broker sends the policy plane no token.
@@ -376,4 +378,5 @@ async fn the_broker_sends_no_agent_token_for_a_static_key_call() {
         .cloned()
         .expect("the PDP was asked");
     assert!(asked.get("agent_token").is_none(), "{asked}");
+    assert!(asked.get("agent_dpop_proof").is_none(), "{asked}");
 }

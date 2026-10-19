@@ -249,6 +249,7 @@ async fn the_policy_plane_is_sent_the_agent_token_when_a_token_admitted_the_call
     assert_eq!(status, StatusCode::OK, "{body}");
     let asked = last_asked(&pdp);
     assert_eq!(asked["agent_token"], tok, "{asked}");
+    assert_eq!(asked["agent_dpop_proof"], h[1].1, "{asked}");
     assert_eq!(asked["agent_id"], AGENT, "{asked}");
     assert!(
         !asked.to_string().contains(&h[1].1),
@@ -279,6 +280,10 @@ async fn a_static_key_call_is_never_sent_an_agent_token() {
     assert!(
         asked.get("agent_token").is_none(),
         "a static-key call sends no token: {asked}"
+    );
+    assert!(
+        asked.get("agent_dpop_proof").is_none(),
+        "a static-key call sends no proof: {asked}"
     );
 }
 

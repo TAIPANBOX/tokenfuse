@@ -273,6 +273,8 @@ pub struct CallContext {
     /// The agent's own token, as presented, when it admitted this call
     /// (invariant 140). Read by the policy question only.
     pub agent_token: Option<String>,
+    /// The agent's DPoP proof, as presented, for the policy question (invariant 140).
+    pub agent_dpop_proof: Option<String>,
 }
 
 /// Where a call's session id came from, which decides whether it is trusted.
@@ -1253,6 +1255,7 @@ async fn handle(
                 gateway_token: token,
                 identity_source: Some(crate::agenttoken::IDENTITY_AGENT_TOKEN.to_string()),
                 agent_token: pdp_token,
+                agent_dpop_proof: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1342,6 +1345,7 @@ async fn handle(
                 // the agent's own token.
                 identity_source: Some(crate::agenttoken::IDENTITY_CLIENT_KEY.to_string()),
                 agent_token: None,
+                agent_dpop_proof: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1487,6 +1491,7 @@ async fn handle(
         gateway_token: None,
         identity_source: Some(identity_source),
         agent_token: None,
+        agent_dpop_proof: None,
     };
     finish(&st, req, ctx).await
 }
@@ -1953,6 +1958,7 @@ async fn process_into(
                         attestation_method: ctx.attestation_method.clone(),
                         identity_source: ctx.identity_source.clone(),
                         agent_token: ctx.agent_token.clone(),
+                        agent_dpop_proof: None,
                         approval_token: ctx.approval_token.clone(),
                         // The call itself, as the agent sent it: this is the
                         // site that runs BEFORE secret injection, so a

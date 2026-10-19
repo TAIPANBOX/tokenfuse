@@ -383,6 +383,13 @@ pub fn token_for_pdp(headers: &HeaderMap) -> Option<String> {
     agent_token_in(headers).and_then(for_pdp)
 }
 
+/// The DPoP proof this request presented, for the policy plane, within the cap
+/// (invariant 140). Never logged.
+pub fn proof_for_pdp(headers: &HeaderMap) -> Option<String> {
+    let _ = headers;
+    None
+}
+
 /// A token for the policy plane when it is an agent token within the cap.
 ///
 /// Over the cap the token is admitted and not forwarded, and one warn line says
@@ -903,5 +910,21 @@ mod tests {
             under.len()
         );
         assert_eq!(for_pdp(&over), None, "{} bytes", over.len());
+    }
+
+    /// The proof travels beside the token, exactly as presented, and is bounded
+    /// by the same cap; absent is absent.
+    #[test]
+    fn a_proof_for_the_policy_plane_is_the_dpop_header_within_the_cap() {
+        let mut h = HeaderMap::new();
+        h.insert("dpop", "a.b.c".parse().unwrap());
+        assert_eq!(proof_for_pdp(&h), Some("a.b.c".to_string()));
+        let mut big = HeaderMap::new();
+        big.insert(
+            "dpop",
+            "a".repeat(TOKEN_FOR_PDP_CAP_BYTES + 1).parse().unwrap(),
+        );
+        assert_eq!(proof_for_pdp(&big), None);
+        assert_eq!(proof_for_pdp(&HeaderMap::new()), None);
     }
 }
