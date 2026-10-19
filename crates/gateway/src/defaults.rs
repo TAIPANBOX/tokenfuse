@@ -861,7 +861,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// RED-FIRST (CLAUDE.md invariant 136): a policy file that names no `mode`
     /// takes this value, and it was off under both profiles before the profile
     /// existed. Mutant: `Profile::Governed => Off` here, which keeps the file off
@@ -879,6 +878,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn governed_resolves_every_default_to_enforce_with_a_closed_failmode() {
         assert_eq!(
             policy_mode_under(Profile::Governed, None),
