@@ -67,17 +67,14 @@ fn start_with_cors(spec: &str) -> (Option<i32>, String) {
             }
             return (status.code(), log);
         }
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(line) => {
-                log.push_str(&line);
-                log.push('\n');
-                if line.contains("listening on") {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return (None, log);
-                }
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
+            log.push_str(&line);
+            log.push('\n');
+            if line.contains("listening on") {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (None, log);
             }
-            Err(_) => {}
         }
         if Instant::now() > deadline {
             let _ = child.kill();

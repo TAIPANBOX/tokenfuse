@@ -60,7 +60,7 @@ impl CorsPolicy {
     pub fn allows(&self, origin: &str) -> bool {
         let origin = origin.to_ascii_lowercase();
         match &self.configured {
-            Some(list) => list.iter().any(|allowed| *allowed == origin),
+            Some(list) => list.contains(&origin),
             None => is_loopback_origin(&origin),
         }
     }
