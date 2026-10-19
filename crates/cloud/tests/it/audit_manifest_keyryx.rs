@@ -30,6 +30,12 @@ use tower::ServiceExt;
 use tokenfuse_cloud::{app, audit_signer_from, AppState, AuditSigner, Principal, Store};
 
 const KEY_NAME: &str = "tokenfuse-audit";
+/// The kid keyryx gives the stub's key (scalar 32 bytes of `0x33`) and another
+/// key (`0x22`): their RFC 7638 thumbprints. Written out, not computed here:
+/// @measured 2026-10-19 by running keyryx's own path for an EC key (`kidFor`,
+/// keyryx 9bf76ec, through agent-stack-go v2.0.1's `delegation.Thumbprint`).
+const KEYRYX_KID: &str = "iAzi3C-OjPVWNyPopGebSBzQGxyqWSYHSp2clxH5mSI";
+const ANOTHER_KEYS_KID: &str = "IYSTfWVkEEZyrkea6dxuW3QW2EKDRcVFfBIUXpYO0Rc";
 
 /// How the stub answers a sign.
 #[derive(Clone, Copy, PartialEq)]
@@ -42,6 +48,8 @@ enum Answer {
     SignsOtherBytes,
     /// A signature labelled ES384, as an ES384 key's would be.
     SaysEs384,
+    /// A valid signature by the stub's key, under another key's kid.
+    NamesAnotherKey,
 }
 
 /// One sign the stub was asked for, as it arrived.
@@ -99,11 +107,16 @@ async fn sign(
     } else {
         "ES256"
     };
+    let kid = if answer == Answer::NamesAnotherKey {
+        ANOTHER_KEYS_KID
+    } else {
+        KEYRYX_KID
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "alg": alg,
-            "kid": "kid-audit-1",
+            "kid": kid,
             "signature_b64": STANDARD.encode(sig.to_bytes()),
             "public_key_b64": STANDARD.encode(
                 stub.key.verifying_key().to_encoded_point(false).as_bytes()
@@ -245,7 +258,7 @@ async fn a_manifest_keyryx_signed_verifies_and_names_its_kid() {
     let _ = std::fs::remove_file(&cred);
     assert_eq!(status, StatusCode::OK, "{m}");
     assert_eq!(m["algorithm"], "ES256");
-    assert_eq!(m["kid"], "kid-audit-1");
+    assert_eq!(m["kid"], KEYRYX_KID, "the kid keyryx gives its key");
     assert_eq!(m["entry_count"], 1);
     assert!(verifies(&m), "the manifest must verify offline: {m}");
     let keyryx_key = STANDARD.encode(stub.key.verifying_key().to_encoded_point(false).as_bytes());
@@ -327,6 +340,26 @@ async fn an_answer_that_does_not_verify_or_is_not_es256_is_never_served() {
         );
         assert!(body.get("signature_b64").is_none(), "{said}: {body}");
     }
+}
+
+/// A signature that verifies under the key keyryx sent, beside a kid that names
+/// another key: an auditor anchoring the key by that kid would anchor the wrong
+/// key, so nothing is served.
+#[tokio::test]
+async fn a_kid_that_names_another_key_is_never_served() {
+    let (url, stub) = keyryx(Answer::NamesAnotherKey, "sk-cloud-1").await;
+    let cred = scratch("another-kid", "sk-cloud-1\n");
+    let st = state(&url, &cred);
+    mutate(&st, "run-1").await;
+    let (status, body) = send(&st, "GET", "/v1/audit/manifest", "viewerkey").await;
+    let _ = std::fs::remove_file(&cred);
+    assert_eq!(stub.calls.lock().unwrap().len(), 1, "keyryx was asked");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let said = body["error"].as_str().unwrap_or_default();
+    assert!(said.contains("not signed"), "{body}");
+    assert!(said.contains("kid"), "{body}");
+    assert!(body.get("signature_b64").is_none(), "{body}");
+    assert!(body.get("kid").is_none(), "{body}");
 }
 
 /// A viewer asking again while the tip is unchanged is served the manifest

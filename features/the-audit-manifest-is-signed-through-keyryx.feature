@@ -12,7 +12,8 @@ Feature: The audit manifest can be signed by keyryx custody
   when a manifest is signed fails closed for that manifest and says so.
 
   The choices inside it are @claude: keyryx's answer is verified before it is
-  served, and only ES256 is taken; the manifest names keyryx's kid; the failure
+  served, and only ES256 is taken; the manifest names keyryx's kid, and only
+  when that kid is the RFC 7638 thumbprint of the key that signed; the failure
   is a 503; a manifest keyryx signed is reused for an unchanged tip for at most
   sixty seconds; the credential is read from a file on every sign; and a signer
   configuration that cannot be used refuses to start.
@@ -49,6 +50,16 @@ Feature: The audit manifest can be signed by keyryx custody
     Given the signer is keyryx
     When keyryx answers with a signature over other bytes, a key that did not sign, another algorithm, or noise
     Then the answer is 503 saying why, and nothing keyryx answered is served
+
+  # @test:a_kid_that_names_another_key_is_never_served
+  # @test:a_kid_that_names_another_key_is_refused
+  # @test:a_kid_that_is_the_keys_thumbprint_is_taken
+  # @test:hostile_answers_never_panic_and_never_verify
+  Scenario: A kid that does not name the key that signed is never served
+    Given the signer is keyryx, which names an EC key by its RFC 7638 thumbprint
+    When keyryx answers with a signature that verifies under the key it sent, beside a kid that is not that key's thumbprint
+    Then the answer is 503 saying the kid is not the thumbprint of the key that signed
+    And a kid that is the key's thumbprint is served, whichever encoding keyryx sent the key in
 
   # @test:an_unchanged_tip_reuses_the_signed_manifest_and_a_new_tip_signs_again
   # @test:a_reused_manifest_is_signed_again_after_sixty_seconds
