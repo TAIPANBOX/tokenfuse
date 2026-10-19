@@ -144,6 +144,9 @@ pub struct AppState {
     /// the store-derived incidents/audit for the run, just zero events. Read
     /// once at construction from `TOKENFUSE_CLOUD_REPLAY_EVENTS`.
     pub replay_events_path: Option<Arc<String>>,
+    /// The browser origins this plane answers (invariant 131). Stub in the red
+    /// commit: stored, not yet read by the middleware.
+    pub cors: Arc<crate::cors::CorsPolicy>,
 }
 
 impl AppState {
@@ -156,7 +159,15 @@ impl AppState {
             audit_signing_key: None,
             audit_keyryx: None,
             replay_events_path: None,
+            cors: Arc::new(crate::cors::CorsPolicy::default()),
         }
+    }
+
+    /// Attach the browser-origin policy (from `TOKENFUSE_CLOUD_CORS_ORIGINS`,
+    /// invariant 131). Kept off `new` like the other optional attachments.
+    pub fn with_cors(mut self, policy: crate::cors::CorsPolicy) -> Self {
+        self.cors = Arc::new(policy);
+        self
     }
 
     /// Attach an optional OIDC config (from [`OidcConfig::from_env`]). Kept off
@@ -266,7 +277,7 @@ impl AppState {
         if !devices::verify_signature(&device.pubkey_b64, &canonical, sig) {
             return Err(AuthError::SignatureInvalid);
         }
-        if !self.store.check_and_record_nonce(&device.device_id, nonce) {
+        if !self.store.check_and_record_nonce(&device.device_id, nonce, ts_num) {
             return Err(AuthError::SignatureInvalid);
         }
         Ok(device)

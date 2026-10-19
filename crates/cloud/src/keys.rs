@@ -12,6 +12,20 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+
+/// The form a credential is stored and looked up by (invariant 133): `sha256:`
+/// and the lowercase hex SHA-256 of the secret. Org keys and device tokens are
+/// both held this way, so a copy of the control plane's state carries no
+/// credential it could present.
+pub fn digest(secret: &str) -> String {
+    let mut out = String::from("sha256:");
+    for byte in Sha256::digest(secret.as_bytes()) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// Who a key belongs to: an organization, a role (`admin` | `viewer` |
 /// `ingest`, or any other string - see [`parse_keys`]), and, optionally, the
 /// site (gateway) it is bound to (invariant 65).
@@ -194,6 +208,27 @@ mod tests {
     fn five_segments_are_malformed_and_skipped() {
         let k = parse_keys("s:acme:admin:site-a:extra");
         assert!(k.is_empty());
+    }
+
+    // -- invariant 133: the map is keyed by digest, never by the secret -----
+
+    #[test]
+    fn the_map_is_keyed_by_digest_and_never_by_the_raw_secret() {
+        let k = parse_keys("s:acme");
+        assert!(
+            !k.contains_key("s"),
+            "the raw secret must not be a key of the map: {k:?}"
+        );
+        assert!(k.contains_key(&digest("s")));
+    }
+
+    #[test]
+    fn digest_is_sha256_hex_with_a_prefix() {
+        // SHA-256("abc") is a published test vector.
+        assert_eq!(
+            digest("abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

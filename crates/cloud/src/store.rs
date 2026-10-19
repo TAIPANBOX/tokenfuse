@@ -3993,6 +3993,12 @@ impl Store {
         Some(device)
     }
 
+    /// Unix seconds at which this process started (invariant 132). STUB in the
+    /// red commit: always `0`, so no request is refused as older than the start.
+    pub fn started_unix(&self) -> i64 {
+        0
+    }
+
     /// The device a bearer `token` maps to, if any.
     pub fn device_by_token(&self, token: &str) -> Option<Device> {
         self.inner.read().unwrap().devices.get(token).cloned()
@@ -4000,7 +4006,9 @@ impl Store {
 
     /// Record a nonce for a device; returns `false` if it was already seen
     /// (replay). Keeps the most recent [`NONCE_CAP`] per device.
-    pub fn check_and_record_nonce(&self, device_id: &str, nonce: &str) -> bool {
+    pub fn check_and_record_nonce(&self, device_id: &str, nonce: &str, ts: i64) -> bool {
+        // STUB (red commit): `ts` is not kept yet, so nonces die with the process.
+        let _ = ts;
         let mut inner = self.inner.write().unwrap();
         let seen = inner.nonces.entry(device_id.to_string()).or_default();
         if seen.iter().any(|n| n == nonce) {
@@ -4490,6 +4498,39 @@ fn write_file_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- invariant 132: nonces survive a restart, and an old one is forgotten --
+
+    #[test]
+    fn a_nonce_outside_the_window_is_forgotten_and_one_inside_it_survives_a_load() {
+        // A snapshot written with the nonce ring persisted: one entry older than
+        // the 120 s window, one recent. The window is what the verifier checks,
+        // so the old entry has no replay value left and the recent one must
+        // still refuse a replay after the load.
+        let now = now_millis() / 1000;
+        let snap = format!(
+            r#"{{"orgs":{{}},"killed":{{}},"budgets":{{}},"nonces":{{"d1":[["old",{}],["fresh",{}]]}}}}"#,
+            now - 600,
+            now
+        );
+        let path = std::env::temp_dir().join(format!(
+            "tf-store-nonces-{}-window.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, snap).unwrap();
+        let store = Store::new();
+        store.load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            store.check_and_record_nonce("d1", "old", now - 600),
+            "an entry outside the window is pruned on load, so it no longer refuses"
+        );
+        assert!(
+            !store.check_and_record_nonce("d1", "fresh", now),
+            "an entry inside the window is still refused after the load"
+        );
+    }
 
     /// Invariant 106: only the scanner's shape is read from a gateway's
     /// `pii_findings`; anything else is dropped, and the read is bounded.

@@ -4,6 +4,7 @@
 
 #[cfg(feature = "apns")]
 pub mod apns;
+pub mod cors;
 pub mod audit_keyryx;
 pub mod audit_sign;
 // Delegation verification moved to its own crate so the GATEWAY can use it:
