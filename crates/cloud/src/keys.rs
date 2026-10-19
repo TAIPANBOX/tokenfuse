@@ -12,6 +12,20 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+
+/// The form a credential is stored and looked up by (invariant 133): `sha256:`
+/// and the lowercase hex SHA-256 of the secret. Org keys and device tokens are
+/// both held this way, so a copy of the control plane's state carries no
+/// credential it could present.
+pub fn digest(secret: &str) -> String {
+    let mut out = String::from("sha256:");
+    for byte in Sha256::digest(secret.as_bytes()) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// Who a key belongs to: an organization, a role (`admin` | `viewer` |
 /// `ingest`, or any other string - see [`parse_keys`]), and, optionally, the
 /// site (gateway) it is bound to (invariant 65).
@@ -54,6 +68,10 @@ fn is_valid_site_name(s: &str) -> bool {
 /// caller nobody asked to authenticate under that shape. Present and empty
 /// (`k:o:admin:`) means no site, same as the segment being absent.
 ///
+/// The map is keyed by [`digest`] of each secret, never by the secret itself
+/// (invariant 133): a bearer is looked up by the digest of what was presented,
+/// so the map a copy of the process holds names no credential.
+///
 /// With no valid entries, this **fails closed**: an empty map is returned, so
 /// every request gets `401`. There is no fallback credential.
 pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
@@ -82,7 +100,7 @@ pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
             Some(_) => continue, // invalid site name: skip the whole entry
         };
         keys.insert(
-            parts[0].trim().to_string(),
+            digest(parts[0].trim()),
             Principal {
                 org: parts[1].trim().to_string(),
                 role: role.to_string(),
@@ -101,7 +119,7 @@ mod tests {
     fn parses_org_and_role() {
         let k = parse_keys("a:acme,b:globex:viewer");
         assert_eq!(
-            k["a"],
+            k[&digest("a")],
             Principal {
                 org: "acme".into(),
                 role: "admin".into(),
@@ -109,7 +127,7 @@ mod tests {
             }
         );
         assert_eq!(
-            k["b"],
+            k[&digest("b")],
             Principal {
                 org: "globex".into(),
                 role: "viewer".into(),
@@ -122,7 +140,7 @@ mod tests {
     fn skips_malformed_entries() {
         let k = parse_keys("nokey, :noorg , good:org");
         assert_eq!(k.len(), 1);
-        assert!(k.contains_key("good"));
+        assert!(k.contains_key(&digest("good")));
     }
 
     // -- fails closed: there is no fallback credential ---------------------
@@ -155,7 +173,7 @@ mod tests {
         let k = parse_keys("a:acme");
         assert_eq!(k.len(), 1);
         assert!(!k.contains_key("devkey"));
-        assert_eq!(k["a"].org, "acme");
+        assert_eq!(k[&digest("a")].org, "acme");
     }
 
     // -- invariant 65: the 4th segment names a site -------------------------
@@ -163,15 +181,15 @@ mod tests {
     #[test]
     fn a_fourth_segment_is_parsed_as_the_site() {
         let k = parse_keys("s:acme:ingest:site-a");
-        assert_eq!(k["s"].org, "acme");
-        assert_eq!(k["s"].role, "ingest");
-        assert_eq!(k["s"].site.as_deref(), Some("site-a"));
+        assert_eq!(k[&digest("s")].org, "acme");
+        assert_eq!(k[&digest("s")].role, "ingest");
+        assert_eq!(k[&digest("s")].site.as_deref(), Some("site-a"));
     }
 
     #[test]
     fn an_empty_fourth_segment_means_no_site() {
         let k = parse_keys("s:acme:admin:");
-        assert_eq!(k["s"].site, None);
+        assert_eq!(k[&digest("s")].site, None);
     }
 
     #[test]
@@ -196,10 +214,31 @@ mod tests {
         assert!(k.is_empty());
     }
 
+    // -- invariant 133: the map is keyed by digest, never by the secret -----
+
+    #[test]
+    fn the_map_is_keyed_by_digest_and_never_by_the_raw_secret() {
+        let k = parse_keys("s:acme");
+        assert!(
+            !k.contains_key("s"),
+            "the raw secret must not be a key of the map: {k:?}"
+        );
+        assert!(k.contains_key(&digest("s")));
+    }
+
+    #[test]
+    fn digest_is_sha256_hex_with_a_prefix() {
+        // SHA-256("abc") is a published test vector.
+        assert_eq!(
+            digest("abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     #[test]
     fn three_segment_specs_parse_exactly_as_before() {
         let k = parse_keys("a:acme:viewer");
-        assert_eq!(k["a"].role, "viewer");
-        assert_eq!(k["a"].site, None);
+        assert_eq!(k[&digest("a")].role, "viewer");
+        assert_eq!(k[&digest("a")].site, None);
     }
 }

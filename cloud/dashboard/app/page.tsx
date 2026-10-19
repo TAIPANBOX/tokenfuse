@@ -274,11 +274,24 @@ export default function Page() {
   const [armed, setArmed] = useState<string | null>(null);
 
   useEffect(() => {
-    // URL params (?base=&key=) let you connect via a shareable link; they take
-    // precedence over the last-used values persisted in localStorage.
+    // A shareable link can carry the org key in the URL fragment (`#key=`),
+    // which a browser never sends to the server, so it stays out of access
+    // logs and Referer headers. The query (`?key=`) is still read, for links
+    // made before the fragment existed. The fragment is read first, so it
+    // wins. Either way the key is taken out of the address bar once read
+    // (invariant 133). `base` still comes from the query, else last-used
+    // localStorage.
+    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
     const q = new URLSearchParams(window.location.search);
+    const fromFragment = fragment.get("key");
+    const fromQuery = q.get("key");
     const b = q.get("base") || localStorage.getItem("tf_base") || "http://localhost:8080";
-    const k = q.get("key") || localStorage.getItem("tf_key") || "";
+    const k = fromFragment || fromQuery || localStorage.getItem("tf_key") || "";
+    if (fromFragment || fromQuery) {
+      q.delete("key");
+      const rest = q.toString();
+      window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : ""));
+    }
     setBase(b);
     setKey(k);
     if (k) {

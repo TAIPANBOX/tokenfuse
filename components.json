@@ -389,6 +389,9 @@
           "TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_CORS_ORIGINS": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_DATA": {
             "required": false
           },

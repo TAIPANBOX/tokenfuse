@@ -35,7 +35,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::audit_sign::AuditManifest;
 use crate::devices::{self, Device};
-use crate::keys::Principal;
+use crate::keys::{digest, Principal};
 use crate::oidc::{self, OidcConfig};
 use crate::replay::{read_run_events, ReplayEvent};
 use crate::store::{
@@ -144,6 +144,9 @@ pub struct AppState {
     /// the store-derived incidents/audit for the run, just zero events. Read
     /// once at construction from `TOKENFUSE_CLOUD_REPLAY_EVENTS`.
     pub replay_events_path: Option<Arc<String>>,
+    /// The browser origins this plane answers (invariant 131), read by the
+    /// `cors` middleware. Unset, it is loopback only.
+    pub cors: Arc<crate::cors::CorsPolicy>,
 }
 
 impl AppState {
@@ -156,7 +159,15 @@ impl AppState {
             audit_signing_key: None,
             audit_keyryx: None,
             replay_events_path: None,
+            cors: Arc::new(crate::cors::CorsPolicy::default()),
         }
+    }
+
+    /// Attach the browser-origin policy (from `TOKENFUSE_CLOUD_CORS_ORIGINS`,
+    /// invariant 131). Kept off `new` like the other optional attachments.
+    pub fn with_cors(mut self, policy: crate::cors::CorsPolicy) -> Self {
+        self.cors = Arc::new(policy);
+        self
     }
 
     /// Attach an optional OIDC config (from [`OidcConfig::from_env`]). Kept off
@@ -203,7 +214,7 @@ impl AppState {
 
     /// Resolve the bearer token to an org-key principal (org keys only).
     fn principal_for(&self, headers: &HeaderMap) -> Option<&Principal> {
-        self.keys.get(bearer(headers)?)
+        self.keys.get(&digest(bearer(headers)?))
     }
 
     /// Resolve the bearer token to an org — an org key, a paired device token,
@@ -212,7 +223,7 @@ impl AppState {
     /// tried when neither matched, so keys-only behavior is unchanged.
     fn org_for(&self, headers: &HeaderMap) -> Option<String> {
         let token = bearer(headers)?;
-        if let Some(p) = self.keys.get(token) {
+        if let Some(p) = self.keys.get(&digest(token)) {
             return Some(p.org.clone());
         }
         if let Some(d) = self.store.device_by_token(token) {
@@ -234,8 +245,9 @@ impl AppState {
 
     /// Verify a paired device's ES256 signature over the canonical string
     /// (docs/14 §4.2): device known, `X-Fuse-Device` matches, `|now-ts| <= 120s`,
-    /// signature valid, and nonce unseen (checked last, so only valid requests
-    /// spend a nonce). Returns the device on success.
+    /// signed no earlier than this process started (invariant 132), signature
+    /// valid, and nonce unseen (checked last, so only valid requests spend a
+    /// nonce). Returns the device on success.
     fn verify_device_signature(
         &self,
         method: &str,
@@ -258,7 +270,15 @@ impl AppState {
         let sig = header_str(headers, "x-fuse-sig").ok_or(AuthError::SignatureInvalid)?;
 
         let ts_num: i64 = ts.parse().map_err(|_| AuthError::SignatureInvalid)?;
-        if (now_unix() - ts_num).abs() > 120 {
+        if (now_unix() - ts_num).abs() > devices::SIGNATURE_WINDOW_SECS {
+            return Err(AuthError::SignatureInvalid);
+        }
+        // A request signed no later than the second this process started was
+        // signed before, or in the same second as, the restart. The nonce ring
+        // is persisted too (invariant 132), but a request at or before the start
+        // is refused outright, so a ring lost in a crash between autosaves
+        // cannot reopen the window. The device retries with a fresh timestamp.
+        if ts_num <= self.store.started_unix() {
             return Err(AuthError::SignatureInvalid);
         }
 
@@ -266,7 +286,10 @@ impl AppState {
         if !devices::verify_signature(&device.pubkey_b64, &canonical, sig) {
             return Err(AuthError::SignatureInvalid);
         }
-        if !self.store.check_and_record_nonce(&device.device_id, nonce) {
+        if !self
+            .store
+            .check_and_record_nonce(&device.device_id, nonce, ts_num)
+        {
             return Err(AuthError::SignatureInvalid);
         }
         Ok(device)
@@ -287,7 +310,7 @@ impl AppState {
         headers: &HeaderMap,
     ) -> Result<Mutator, AuthError> {
         let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
-        if let Some(p) = self.keys.get(token) {
+        if let Some(p) = self.keys.get(&digest(token)) {
             if p.role != "admin" {
                 return Err(AuthError::Forbidden);
             }
@@ -341,7 +364,7 @@ impl AppState {
         headers: &HeaderMap,
     ) -> Result<Mutator, AuthError> {
         let token = bearer(headers).ok_or(AuthError::Unauthorized)?;
-        if let Some(p) = self.keys.get(token) {
+        if let Some(p) = self.keys.get(&digest(token)) {
             if p.role != "admin" && p.role != "ingest" {
                 return Err(AuthError::Forbidden);
             }
@@ -436,7 +459,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/pair", post(pair))
         .route("/v1/devices/{id}/apns", post(register_apns))
         .route("/v1/devices/{id}/activity", post(register_activity))
-        .layer(middleware::from_fn(cors))
+        .layer(middleware::from_fn_with_state(state.clone(), cors))
         .with_state(state)
 }
 
@@ -2297,25 +2320,39 @@ fn bad_json() -> Response {
     error(StatusCode::BAD_REQUEST, "bad json")
 }
 
-/// Allow the standalone (Next.js) dashboard, served from another origin, to call
-/// the API from the browser. Auth is a Bearer token (not cookies), so a wildcard
-/// origin is safe. Ported from the Go plane's hand-rolled CORS.
-async fn cors(req: Request, next: Next) -> Response {
+/// Let the standalone (Next.js) dashboard, served from another origin, call the
+/// API from the browser. Auth is a Bearer token rather than a cookie, but an
+/// open origin would still let any page an operator visits read the fleet with
+/// the key the operator stored, so an origin is answered only when the
+/// operator's list (or, unset, loopback) names it (invariant 131). The answer
+/// varies with `Origin` in every case, so a cache never serves one origin's
+/// answer to another.
+async fn cors(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let allowed = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|origin| state.cors.allows(origin))
+        .map(str::to_string);
     if req.method() == Method::OPTIONS {
         let mut resp = StatusCode::NO_CONTENT.into_response();
-        set_cors_headers(resp.headers_mut());
+        set_cors_headers(resp.headers_mut(), allowed.as_deref());
         return resp;
     }
     let mut resp = next.run(req).await;
-    set_cors_headers(resp.headers_mut());
+    set_cors_headers(resp.headers_mut(), allowed.as_deref());
     resp
 }
 
-fn set_cors_headers(headers: &mut HeaderMap) {
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
+/// Vary on Origin always; grant the origin only when it was allowed.
+fn set_cors_headers(headers: &mut HeaderMap, allowed: Option<&str>) {
+    headers.append(header::VARY, HeaderValue::from_static("Origin"));
+    let Some(origin) = allowed else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(origin) {
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+    }
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         HeaderValue::from_static("GET, POST, OPTIONS"),

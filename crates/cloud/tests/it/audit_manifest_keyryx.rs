@@ -27,6 +27,7 @@ use http_body_util::BodyExt;
 use p256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, audit_signer_from, AppState, AuditSigner, Principal, Store};
 
 const KEY_NAME: &str = "tokenfuse-audit";
@@ -159,7 +160,7 @@ fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     for (k, role) in [("adminkey", "admin"), ("viewerkey", "viewer")] {
         keys.insert(
-            k.into(),
+            digest(k),
             Principal {
                 org: "acme".into(),
                 role: role.into(),

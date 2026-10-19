@@ -1578,6 +1578,57 @@ run_case "upstream-key: the gateway's own key is not sent upstream" fail \
 	"$(py 'edit("crates/gateway/src/provider.rs", "let (name, value) = key.header();", "let (name, value) = (\"x-api-key\", String::new());")')" \
 	"no longer takes the upstream header"
 
+# --- invariants 132 and 133: credentials are held by digest, and the dashboard's
+# key is read from the fragment and stripped from the address bar ---------------
+
+run_case "cloud-credentials: an org-key lookup by the raw bearer" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/http.rs", "if let Some(p) = self.keys.get(&digest(token)) {", "if let Some(p) = self.keys.get(token) {")')" \
+	"looked up or stored by something other than a digest"
+
+run_case "cloud-credentials: a device stored under the raw token" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/store.rs", "inner.devices.insert(digest(&token), device.clone());", "inner.devices.insert(token.clone(), device.clone());")')" \
+	"looked up or stored by something other than a digest"
+
+run_case "cloud-credentials: parse_keys keys the map by the raw secret" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/keys.rs", "            digest(parts[0].trim()),", "            parts[0].trim().to_string(),")')" \
+	"parse_keys keys the map by something other than a digest"
+
+run_case "cloud-credentials: the digest function is gone, so it measured nothing" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/keys.rs", "pub fn digest(", "pub fn digest_removed(")')" \
+	"defines no digest function"
+
+run_case "cloud-credentials: a comment naming the old raw lookup is not a fault" pass \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/http.rs", "fn principal_for(", "// was: self.keys.get(token)\n    fn principal_for(")')"
+
+run_case "dashboard-key: the query is read before the fragment" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, \"\"));\n    const q = new URLSearchParams(window.location.search);", "    const q = new URLSearchParams(window.location.search);\n    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, \"\"));")')" \
+	"before the fragment"
+
+run_case "dashboard-key: the key is pushed into the history instead of stripped" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "window.history.replaceState(null", "window.history.pushState(null")')" \
+	"never strips the key from the address bar"
+
+run_case "dashboard-key: the query is no longer read, so old links break" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "const q = new URLSearchParams(window.location.search);", "const q = new URLSearchParams(window.location.href);")')" \
+	"no longer reads location.search"
+
+run_case "dashboard-key: the page is gone, so it measured nothing" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"import os; os.remove('cloud/dashboard/app/page.tsx')" \
+	"measured nothing"
+
+run_case "dashboard-key: a comment naming location.hash above the code is not a fault" pass \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "export default function Page() {", "// location.hash is read first; this comment is not a fault\nexport default function Page() {")')"
+
 run_case "upstream-key: the credential list drops x-api-key" fail \
 	"./scripts/upstream-key-is-never-forwarded.sh" \
 	"$(py 'edit("crates/gateway/src/provider.rs", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\", \"x-api-key\"];", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\"];")')" \
