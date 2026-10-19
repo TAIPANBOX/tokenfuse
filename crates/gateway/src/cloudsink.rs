@@ -2007,7 +2007,25 @@ mod tests {
                     Ok(pair) => pair,
                     Err(_) => break,
                 };
-                let mode = *t.mode.lock().unwrap();
+                // `up_for` is counted here, when the connection is accepted, and
+                // never after the answer is written: the client reads the 200 and
+                // opens its next connection at once, and a flip to `Down` made
+                // after the write raced that accept, so a second connection was
+                // sometimes served `Up` too. That is the CI flake of
+                // `a_drain_that_fails_midway_keeps_the_rest_in_order` (2026-10-19:
+                // batch B arrived beside A, so 20 received ids were never seen).
+                let mode = {
+                    let mut mode = t.mode.lock().unwrap();
+                    let now = *mode;
+                    if now == Plane::Up && t.up_for.load(Ordering::SeqCst) != usize::MAX {
+                        let prev = t.up_for.fetch_sub(1, Ordering::SeqCst);
+                        if prev <= 1 {
+                            t.up_for.store(usize::MAX, Ordering::SeqCst);
+                            *mode = Plane::Down;
+                        }
+                    }
+                    now
+                };
                 match mode {
                     Plane::Down => drop(sock),
                     Plane::Stall => {
@@ -2054,12 +2072,6 @@ mod tests {
                                 )
                                 .await;
                             let _ = sock.shutdown().await;
-                            if t2.up_for.load(Ordering::SeqCst) != usize::MAX {
-                                let prev = t2.up_for.fetch_sub(1, Ordering::SeqCst);
-                                if prev == 1 {
-                                    t2.set(Plane::Down);
-                                }
-                            }
                         });
                     }
                 }
