@@ -248,7 +248,7 @@ pub struct ClientRegistry {
     /// with any trailing slash removed. Server-side and operator-supplied on
     /// purpose: reconstructing it from a `Host` header would let the caller make
     /// `htu` agree with anything it liked, which turns the check into decoration.
-    origin: String,
+    origins: Vec<String>,
     replay: ReplayCache,
 }
 
@@ -256,7 +256,7 @@ impl Default for ClientRegistry {
     fn default() -> Self {
         ClientRegistry {
             by_jkt: HashMap::new(),
-            origin: String::new(),
+            origins: Vec::new(),
             replay: ReplayCache::new(REPLAY_CAP),
         }
     }
@@ -368,7 +368,7 @@ impl ClientRegistry {
 
         Ok(ClientRegistry {
             by_jkt,
-            origin: origin.to_string(),
+            origins: vec![origin.to_string()],
             replay: ReplayCache::new(REPLAY_CAP),
         })
     }
@@ -399,7 +399,11 @@ impl ClientRegistry {
     /// anything, which is what makes refusing at the cap a self-inflicted wound
     /// rather than something a stranger can do to a deployment.
     pub fn authenticate(&self, proof: &str, path: &str, now: i64) -> Result<&str, DoorRefusal> {
-        let expected = format!("{}{}", self.origin, path);
+        let expected = format!(
+            "{}{}",
+            self.origins.first().map(String::as_str).unwrap_or_default(),
+            path
+        );
         // POST because that is the only method this door ever sees: `mcpbroker::app`
         // routes `/` and `/mcp` with `post` and nothing else.
         let verified =

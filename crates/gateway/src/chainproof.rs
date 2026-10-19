@@ -108,7 +108,7 @@ pub struct Proving {
     /// fact the code knows and the origin is a fact only the deployment knows.
     /// A gateway behind a proxy cannot read its own external origin off the
     /// request, and letting it try is how `htu` ends up agreeing with anything.
-    pub origin: String,
+    pub origins: Vec<String>,
 }
 
 pub type ChainProof = Option<Arc<Proving>>;
@@ -183,7 +183,16 @@ pub fn resolve(
         return Chain::Claimed(declared.to_vec());
     };
 
-    let url = format!("{}{}", proving.origin.trim_end_matches('/'), url);
+    let url = format!(
+        "{}{}",
+        proving
+            .origins
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default()
+            .trim_end_matches('/'),
+        url
+    );
     let verified = match verify_delegation(&proving.cfg, token, proof, method, &url, now, revoked) {
         Ok(v) => v,
         // Every refusal is the same answer on the wire, for the reason
@@ -458,13 +467,30 @@ pub async fn from_env(client: &reqwest::Client) -> ChainProof {
         );
         std::process::exit(2);
     }
+    let origins = match origins_from_values(
+        &origin,
+        &std::env::var("TOKENFUSE_DELEGATION_ORIGINS").unwrap_or_default(),
+    ) {
+        Ok(origins) => origins,
+        Err(msg) => {
+            eprintln!("tokenfuse: {msg}");
+            std::process::exit(2);
+        }
+    };
     Some(Arc::new(Proving {
         cfg: DelegationConfig {
             audience: std::env::var("TOKENFUSE_DELEGATION_AUDIENCE").unwrap_or_default(),
             ..base
         },
-        origin,
+        origins,
     }))
+}
+
+/// The origins a `Proving` is configured with, from the single origin and the list.
+///
+/// STUB for the red-first commit: the single origin only, unnormalised.
+pub(crate) fn origins_from_values(single: &str, _list: &str) -> Result<Vec<String>, String> {
+    Ok(vec![single.to_string()])
 }
 
 #[cfg(test)]
@@ -593,7 +619,7 @@ mod tests {
         let issuer_configured = cfg.issuer.clone();
         let proving: ChainProof = Some(Arc::new(Proving {
             cfg,
-            origin: origin.to_string(),
+            origins: vec![origin.to_string()],
         }));
         let tok = token(
             &issuer,
@@ -675,7 +701,7 @@ mod tests {
         let url = format!("{origin}/v1/messages");
         let proving: ChainProof = Some(Arc::new(Proving {
             cfg: cfg(&issuer),
-            origin: origin.to_string(),
+            origins: vec![origin.to_string()],
         }));
         let on: crate::agenttoken::Tokens = Some(Arc::new(crate::agenttoken::AgentTokens::new(
             crate::agenttoken::Mode::Accept,
@@ -900,5 +926,52 @@ mod tests {
             "the caller sets the audience, not this function"
         );
         assert_eq!(cfg.jwks.key_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod origin_list_tests {
+    use super::*;
+
+    /// The single origin and the list are read as one set, normalised, and a bad
+    /// entry names the variable it came from (CLAUDE.md invariant 138).
+    #[test]
+    fn the_single_origin_and_the_list_are_one_set_and_a_bad_entry_names_its_variable() {
+        assert_eq!(
+            origins_from_values("https://tokenfuse.acme.example", "").unwrap(),
+            vec!["https://tokenfuse.acme.example:443".to_string()]
+        );
+        assert_eq!(
+            origins_from_values(
+                "",
+                "http://tokenfuse-gateway:4100,https://tokenfuse.acme.example"
+            )
+            .unwrap(),
+            vec![
+                "http://tokenfuse-gateway:4100".to_string(),
+                "https://tokenfuse.acme.example:443".to_string()
+            ]
+        );
+        assert_eq!(
+            origins_from_values(
+                "https://tokenfuse.acme.example",
+                "https://tokenfuse.acme.example:443"
+            )
+            .unwrap()
+            .len(),
+            1,
+            "the same origin named twice is one origin"
+        );
+        assert!(origins_from_values("", "")
+            .unwrap_err()
+            .contains("TOKENFUSE_DELEGATION_URL"));
+        assert!(
+            origins_from_values("https://tokenfuse.acme.example/prefix", "")
+                .unwrap_err()
+                .contains("TOKENFUSE_DELEGATION_URL")
+        );
+        assert!(origins_from_values("", "https://a.example,")
+            .unwrap_err()
+            .contains("TOKENFUSE_DELEGATION_ORIGINS"));
     }
 }

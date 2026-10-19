@@ -46,6 +46,8 @@
 //! to the caller: `delegation` does it from a token's `cnf.jkt`, `mcpdoor` from
 //! a CIMD client metadata document.
 
+pub mod origin;
+
 use base64::Engine as _;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};

@@ -139,6 +139,9 @@
           "TOKENFUSE_DELEGATION_JWKS_URL": {
             "required": false
           },
+          "TOKENFUSE_DELEGATION_ORIGINS": {
+            "required": false
+          },
           "TOKENFUSE_DELEGATION_REVOCATIONS": {
             "required": false
           },

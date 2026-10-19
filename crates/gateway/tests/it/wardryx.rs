@@ -947,7 +947,7 @@ async fn a_proven_chain_reaches_the_pdp_from_the_token() {
         cfg: cfg(&issuer),
         // The origin the fixture's own URL names, so the two agree by
         // construction rather than by a string retyped in two places.
-        origin: URL.trim_end_matches("/v1/messages").to_string(),
+        origins: vec![URL.trim_end_matches("/v1/messages").to_string()],
     }));
 
     let now = tokenfuse_gateway::sink::now_millis() / 1000;
@@ -1182,7 +1182,7 @@ async fn a_proven_delegation_is_attested_as_dpop_key_whatever_the_header_says() 
     let holder = Key::new();
     st.chain_proof = Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
         cfg: cfg(&issuer),
-        origin: URL.trim_end_matches("/v1/messages").to_string(),
+        origins: vec![URL.trim_end_matches("/v1/messages").to_string()],
     }));
     let now = tokenfuse_gateway::sink::now_millis() / 1000;
     let tok = token(

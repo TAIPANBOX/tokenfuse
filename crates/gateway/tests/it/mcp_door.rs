@@ -446,3 +446,131 @@ fn the_documents_are_read_from_a_file_when_the_spec_is_a_path() {
 fn a_path_that_cannot_be_read_refuses_rather_than_reading_as_off() {
     assert!(ClientRegistry::from_spec("/no/such/file/clients.json", ORIGIN).is_err());
 }
+
+// --- a LIST of public origins (CLAUDE.md invariant 138) --------------------
+
+/// A second address this broker is reached at: the one its own container network
+/// calls, which is not the public name the first origin is.
+const SECOND_ORIGIN: &str = "http://tokenfuse-gateway:4100";
+
+/// A registry for `holder` whose origins are `origins`, read as the comma-separated
+/// list `TOKENFUSE_MCP_PROOF_URL` and `TOKENFUSE_MCP_PROOF_ORIGINS` are joined into.
+fn registry_at(holder: &Key, origins: &str) -> ClientRegistry {
+    let docs = serde_json::json!([document(CLIENT, holder)]).to_string();
+    ClientRegistry::from_spec(&docs, origins).expect("a usable client spec and origin list")
+}
+
+/// A proof of possession by `holder` naming `htu`, made at `NOW`.
+fn proof_naming(holder: &Key, htu: &str, jti: &str) -> String {
+    holder.sign(
+        serde_json::json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": holder.jwk()}),
+        serde_json::json!({"htm": "POST", "htu": htu, "iat": NOW, "jti": jti}),
+    )
+}
+
+/// A proof addressed to a configured origin other than the first opens the door, with
+/// the identity of the client that published its key. Red before the fix: the broker
+/// compared every proof against one origin, and the list was one string.
+#[test]
+fn a_proof_addressed_to_a_second_configured_origin_opens_the_door() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, &format!("{ORIGIN},{SECOND_ORIGIN}"));
+    let proof = proof_naming(&holder, &format!("{SECOND_ORIGIN}{PATH}"), "list-second-1");
+    match admit(door(&k, &c, false), None, Some(&proof), PATH, NOW) {
+        Admission::Proof(client_id) => assert_eq!(client_id, CLIENT),
+        other => panic!("a proof for a configured origin must open the door: {other:?}"),
+    }
+}
+
+/// The first origin still works beside a list (red today for the same reason as above).
+#[test]
+fn a_proof_addressed_to_the_first_origin_still_opens_the_door_with_a_list() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, &format!("{ORIGIN},{SECOND_ORIGIN}"));
+    let proof = proof_naming(&holder, &format!("{ORIGIN}{PATH}"), "list-first-1");
+    assert!(matches!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Proof(_)
+    ));
+}
+
+/// An origin spelled with its default port is the same origin.
+#[test]
+fn the_first_origin_spelled_with_its_default_port_is_the_same_origin() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, ORIGIN);
+    let proof = proof_naming(&holder, "https://mcp.acme.example:443/mcp", "port-1");
+    assert!(matches!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Proof(_)
+    ));
+}
+
+/// An origin nobody listed is refused, whatever path it names.
+#[test]
+fn a_proof_naming_an_unlisted_origin_is_refused() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, &format!("{ORIGIN},{SECOND_ORIGIN}"));
+    let proof = proof_naming(&holder, "https://evil.example/mcp", "unlisted-1");
+    assert_eq!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Refused(DoorRefusal::BadProof)
+    );
+}
+
+/// User information in the htu is refused, even when the host after it is listed.
+#[test]
+fn a_proof_with_user_information_in_its_htu_is_refused() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, ORIGIN);
+    let proof = proof_naming(&holder, "https://user@mcp.acme.example/mcp", "userinfo-1");
+    assert_eq!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Refused(DoorRefusal::BadProof)
+    );
+}
+
+/// A fragment is never part of the URI a request was made to. Red before the fix: the
+/// verifier trimmed everything after the `#` and admitted the proof.
+#[test]
+fn a_proof_with_a_fragment_in_its_htu_is_refused() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, ORIGIN);
+    let proof = proof_naming(&holder, &format!("{ORIGIN}{PATH}#frag"), "fragment-1");
+    assert_eq!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Refused(DoorRefusal::BadProof)
+    );
+}
+
+/// A configured origin at a path other than the route's is refused.
+#[test]
+fn a_configured_origin_at_another_path_is_refused() {
+    let (holder, k) = (Key::new(), keys(""));
+    let c = registry_at(&holder, &format!("{ORIGIN},{SECOND_ORIGIN}"));
+    let proof = proof_naming(&holder, &format!("{SECOND_ORIGIN}{PATH}/extra"), "path-1");
+    assert_eq!(
+        admit(door(&k, &c, false), None, Some(&proof), PATH, NOW),
+        Admission::Refused(DoorRefusal::BadProof)
+    );
+}
+
+/// A list with one entry that is not an origin refuses to start, naming nothing but
+/// the list: a trailing comma is an empty entry, not a shorter list.
+#[test]
+fn a_list_with_a_bad_entry_refuses_to_start_at_the_mcp_door() {
+    let holder = Key::new();
+    let docs = serde_json::json!([document(CLIENT, &holder)]).to_string();
+    for bad in [
+        format!("{ORIGIN},"),
+        format!("{ORIGIN}/mcp"),
+        "https://user@mcp.acme.example".to_string(),
+        "http://tokenfuse-gateway:99999".to_string(),
+        "mcp.acme.example".to_string(),
+    ] {
+        assert!(
+            ClientRegistry::from_spec(&docs, &bad).is_err(),
+            "{bad:?} must refuse the whole list"
+        );
+    }
+}
