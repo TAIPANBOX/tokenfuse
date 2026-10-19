@@ -219,6 +219,71 @@ async fn a_device_request_signed_before_a_restart_is_refused_after_it() {
 }
 
 #[tokio::test]
+async fn a_request_signed_in_the_restart_second_is_refused_even_with_a_new_nonce() {
+    // The boundary second (invariant 132): ts == started is refused. The nonce
+    // is new, so only the `<=` in the start rule decides it. A device retries
+    // with a fresh timestamp.
+    let store = Arc::new(Store::new());
+    let state = state_over(Arc::clone(&store));
+    let (sk, pubkey) = keypair();
+    let (device_id, token) = pair(&state, &pubkey).await;
+    let snap = scratch("boundary-second");
+    store.save(&snap).unwrap();
+
+    let restarted = Arc::new(Store::new());
+    restarted.load(&snap).unwrap();
+    let _ = std::fs::remove_file(&snap);
+    let started = restarted.started_unix();
+    let after = state_over(restarted);
+
+    let (st, v) = send(
+        &after,
+        signed_kill(&sk, &device_id, &token, started, "restart-second-nonce"),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a request signed in the second this process started must be refused: {v}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_signed_one_second_after_the_restart_is_accepted_with_a_new_nonce() {
+    // The other side of the boundary: ts == started + 1 is past the start, so
+    // with a new nonce it is accepted. Green on both sides of `<` and `<=`.
+    let store = Arc::new(Store::new());
+    let state = state_over(Arc::clone(&store));
+    let (sk, pubkey) = keypair();
+    let (device_id, token) = pair(&state, &pubkey).await;
+    let snap = scratch("one-second-after");
+    store.save(&snap).unwrap();
+
+    let restarted = Arc::new(Store::new());
+    restarted.load(&snap).unwrap();
+    let _ = std::fs::remove_file(&snap);
+    let started = restarted.started_unix();
+    let after = state_over(restarted);
+
+    let (st, v) = send(
+        &after,
+        signed_kill(
+            &sk,
+            &device_id,
+            &token,
+            started + 1,
+            "one-second-after-nonce",
+        ),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a request signed one second after the start is accepted: {v}"
+    );
+}
+
+#[tokio::test]
 async fn a_device_request_signed_after_the_restart_is_accepted() {
     // The control: the same restart, a request signed after it. Green both ways.
     let store = Arc::new(Store::new());
@@ -231,11 +296,12 @@ async fn a_device_request_signed_after_the_restart_is_accepted() {
     let restarted = Arc::new(Store::new());
     restarted.load(&snap).unwrap();
     let _ = std::fs::remove_file(&snap);
+    let started = restarted.started_unix();
     let after = state_over(restarted);
 
     let (st, v) = send(
         &after,
-        signed_kill(&sk, &device_id, &token, now_unix(), "post-restart-nonce"),
+        signed_kill(&sk, &device_id, &token, started + 1, "post-restart-nonce"),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "a fresh request is accepted: {v}");
@@ -248,25 +314,29 @@ async fn a_nonce_recorded_before_a_restart_is_refused_after_it() {
     let (sk, pubkey) = keypair();
     let (device_id, token) = pair(&state, &pubkey).await;
 
-    // Accepted once, before the restart, with a nonce the ring keeps.
+    // Accepted once, before the restart, with a nonce the ring keeps. The
+    // timestamp is one second past this process's start, so the start rule
+    // does not decide it.
+    let started_before = store.started_unix();
     let (st, v) = send(
         &state,
-        signed_kill(&sk, &device_id, &token, now_unix(), "kept-nonce"),
+        signed_kill(&sk, &device_id, &token, started_before + 1, "kept-nonce"),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "first use is accepted: {v}");
     let snap = scratch("nonce-restart");
     store.save(&snap).unwrap();
 
-    // Restart, then replay the same signed request. The ts is taken after the
-    // new process started, so the start rule does not decide it: the nonce does.
+    // Restart, then reuse the nonce. The timestamp is one second past the new
+    // start, so the start rule does not decide it either: the ring does.
     let restarted = Arc::new(Store::new());
     restarted.load(&snap).unwrap();
     let _ = std::fs::remove_file(&snap);
+    let started_after = restarted.started_unix();
     let after = state_over(restarted);
     let (st, v) = send(
         &after,
-        signed_kill(&sk, &device_id, &token, now_unix(), "kept-nonce"),
+        signed_kill(&sk, &device_id, &token, started_after + 1, "kept-nonce"),
     )
     .await;
     assert_eq!(

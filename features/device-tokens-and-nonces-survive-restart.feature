@@ -29,6 +29,13 @@ Feature: A paired device's credential is held as a digest, and a restart does no
     When the replacement process receives it
     Then the request is refused, and a fresh one from the same device is accepted
 
+  # @test:a_request_signed_in_the_restart_second_is_refused_even_with_a_new_nonce
+  # @test:a_request_signed_one_second_after_the_restart_is_accepted_with_a_new_nonce
+  Scenario: A request signed in the second the process started is refused, the next second is not
+    Given a device request whose timestamp is the second the replacement process started
+    When that request arrives with a nonce the process has never seen
+    Then it is refused, and the same request one second later is accepted
+
   # @test:a_nonce_recorded_before_a_restart_is_refused_after_it
   # @test:a_nonce_outside_the_window_is_forgotten_and_one_inside_it_survives_a_load
   Scenario: A nonce seen before a restart is still refused after it, within the window
