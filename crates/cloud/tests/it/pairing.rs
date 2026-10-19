@@ -44,6 +44,14 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// A signed timestamp one second ahead of now. A device request signed no later
+/// than the second its process started is refused (invariant 132, `ts <=
+/// started`), and a store built earlier in the same test starts at or before
+/// now, so now + 1 is strictly after the start. The window still accepts it.
+fn signed_now() -> i64 {
+    now_unix() + 1
+}
+
 async fn send(state: &AppState, req: Request<Body>) -> (StatusCode, serde_json::Value) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
@@ -129,7 +137,7 @@ async fn signed_mutation_happy_path_and_replay() {
     // A correctly signed kill is accepted.
     let (st, v) = send(
         &state,
-        signed_kill(&sk, &device_id, &token, "r1", now_unix(), "nonce-1"),
+        signed_kill(&sk, &device_id, &token, "r1", signed_now(), "nonce-1"),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "signed kill rejected: {v}");
@@ -138,7 +146,7 @@ async fn signed_mutation_happy_path_and_replay() {
     // Replaying the same nonce is rejected.
     let (st, _) = send(
         &state,
-        signed_kill(&sk, &device_id, &token, "r1", now_unix(), "nonce-1"),
+        signed_kill(&sk, &device_id, &token, "r1", signed_now(), "nonce-1"),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -167,7 +175,7 @@ async fn wrong_key_signature_is_rejected() {
     let attacker = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
     let (st, _) = send(
         &state,
-        signed_kill(&attacker, &device_id, &token, "r1", now_unix(), "nonce-y"),
+        signed_kill(&attacker, &device_id, &token, "r1", signed_now(), "nonce-y"),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -181,7 +189,7 @@ async fn viewer_device_cannot_mutate() {
     // Even a correctly signed request is forbidden for a viewer device.
     let (st, _) = send(
         &state,
-        signed_kill(&sk, &device_id, &token, "r1", now_unix(), "nonce-z"),
+        signed_kill(&sk, &device_id, &token, "r1", signed_now(), "nonce-z"),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -244,7 +252,7 @@ async fn device_registers_its_apns_token() {
     let path = format!("/v1/devices/{device_id}/apns");
     let (st, v) = send(
         &state,
-        signed_post(&sk, &device_id, &token, &path, body, now_unix(), "n-apns"),
+        signed_post(&sk, &device_id, &token, &path, body, signed_now(), "n-apns"),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "apns register failed: {v}");
@@ -265,7 +273,7 @@ async fn cannot_register_apns_for_a_different_device_id() {
     let path = "/v1/devices/someone-else/apns";
     let (st, _) = send(
         &state,
-        signed_post(&sk, &device_id, &token, path, body, now_unix(), "n-apns2"),
+        signed_post(&sk, &device_id, &token, path, body, signed_now(), "n-apns2"),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
