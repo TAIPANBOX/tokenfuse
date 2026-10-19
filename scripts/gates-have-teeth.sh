@@ -1643,7 +1643,7 @@ run_case "run-ownership: the parent the ledger holds is not checked" fail \
 # The first is the both-processes gate's case for the new switch.
 run_case "agent-tokens: the door read in one process only" fail \
 	"./scripts/both-processes-configure-the-same-doors.sh" \
-	"$(py 'edit("crates/gateway/src/main.rs", "    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);\n", "    let agent_tokens: tokenfuse_gateway::agenttoken::Tokens = None;\n")')" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(\n        &chain_proof,\n        tokenfuse_gateway::agenttoken::STATIC_KEYS_VAR,\n        \"TOKENFUSE_CLIENT_KEYS\",\n        &configured,\n    );\n", "    let agent_tokens: tokenfuse_gateway::agenttoken::Tokens = None;\n")')" \
 	"agenttoken"
 
 run_case "agent-tokens: typ unchecked, a delegation token read as an agent token" fail \
