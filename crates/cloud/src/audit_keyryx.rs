@@ -405,7 +405,10 @@ fn verify_answer(raw: &[u8], bytes: &[u8]) -> Result<KeyryxSignature, NotSigned>
     if alg != "ES256" {
         return Err(NotSigned::same(format!(
             "keyryx signed with '{}', and a manifest is ES256; give {KEYRYX_KEY_ENV} an ES256 key",
-            alg.chars().take(32).collect::<String>()
+            alg.chars()
+                .filter(char::is_ascii_graphic)
+                .take(32)
+                .collect::<String>()
         )));
     }
     let kid = field("kid");

@@ -246,6 +246,10 @@ fn an_answer_in_another_algorithm_is_refused() {
         let why = verify_answer(&answer(&test_key(), alg, bytes, false), bytes).unwrap_err();
         assert!(why.reason.contains("ES256"), "{alg}: {why:?}");
     }
+    // What keyryx answered is named, but never a byte that could break a log line.
+    let why =
+        verify_answer(&answer(&test_key(), "ES\n384\u{1b}", bytes, false), bytes).unwrap_err();
+    assert!(why.reason.contains("'ES384'"), "{why:?}");
 }
 
 #[test]
