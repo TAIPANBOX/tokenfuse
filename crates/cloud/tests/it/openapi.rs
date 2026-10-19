@@ -9,12 +9,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, openapi_spec, AppState, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "k".into(),
+        digest("k"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),

@@ -15,12 +15,13 @@ use axum::response::Response;
 use tower::ServiceExt;
 
 use tokenfuse_cloud::cors::CorsPolicy;
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "adm".into(),
+        digest("adm"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -62,13 +63,7 @@ fn vary_names_origin(resp: &Response) -> bool {
 
 #[tokio::test]
 async fn an_origin_nobody_named_gets_no_allow_origin_header() {
-    let resp = from_origin(
-        &state(),
-        Method::GET,
-        "/healthz",
-        "https://evil.example",
-    )
-    .await;
+    let resp = from_origin(&state(), Method::GET, "/healthz", "https://evil.example").await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         allow_origin(&resp),
@@ -79,14 +74,11 @@ async fn an_origin_nobody_named_gets_no_allow_origin_header() {
 
 #[tokio::test]
 async fn a_loopback_origin_is_reflected_exactly_and_marked_vary() {
-    let resp = from_origin(
-        &state(),
-        Method::GET,
-        "/healthz",
-        "http://localhost:3000",
-    )
-    .await;
-    assert_eq!(allow_origin(&resp).as_deref(), Some("http://localhost:3000"));
+    let resp = from_origin(&state(), Method::GET, "/healthz", "http://localhost:3000").await;
+    assert_eq!(
+        allow_origin(&resp).as_deref(),
+        Some("http://localhost:3000")
+    );
     assert!(vary_names_origin(&resp), "a cache must key on Origin");
 }
 
@@ -129,7 +121,10 @@ async fn a_preflight_from_a_loopback_origin_is_allowed() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(allow_origin(&resp).as_deref(), Some("http://localhost:3000"));
+    assert_eq!(
+        allow_origin(&resp).as_deref(),
+        Some("http://localhost:3000")
+    );
 }
 
 #[tokio::test]

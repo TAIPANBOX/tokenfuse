@@ -15,7 +15,8 @@ use tokenfuse_core::audit::{self, AuditEntry};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
-use crate::devices::{Device, Pairing};
+use crate::devices::{self, Device, Pairing};
+use crate::keys::digest;
 
 /// Anti-replay nonce ring size, per device (docs/14 §4.2).
 const NONCE_CAP: usize = 4096;
@@ -1479,12 +1480,16 @@ struct Inner {
     /// falls back to an arbitrary member if the index has nothing to offer, so
     /// the cap is never structurally violated.
     break_recency: HashMap<String, RecencyIndex<String>>,
-    /// device_token → paired device (persisted)
+    /// `sha256:<hex>` of a device token → paired device (persisted). Keyed by
+    /// digest, never by the token, so the state file holds no live credential
+    /// (invariant 132).
     devices: HashMap<String, Device>,
     /// one-time pairing code → pending pairing (ephemeral)
     pairings: HashMap<String, Pairing>,
-    /// device_id → recent nonces for replay defense (ephemeral)
-    nonces: HashMap<String, VecDeque<String>>,
+    /// device_id → recent `(nonce, ts)` pairs for replay defense. Persisted
+    /// with each nonce's device timestamp, and pruned to the signature window on
+    /// load (invariant 132), so a restart does not reopen a captured request.
+    nonces: HashMap<String, VecDeque<(String, i64)>>,
     /// org → run → Live Activity push tokens (ephemeral)
     activities: HashMap<String, HashMap<String, Vec<String>>>,
     /// set on any mutation, cleared by autosave — avoids writing an unchanged file
@@ -1500,6 +1505,7 @@ struct SnapshotRef<'a> {
     budgets: &'a HashMap<String, HashMap<String, i64>>,
     unit_budgets: &'a HashMap<String, HashMap<String, i64>>,
     devices: &'a HashMap<String, Device>,
+    nonces: &'a HashMap<String, VecDeque<(String, i64)>>,
     savings: &'a HashMap<String, SavingsAcc>,
     spend_days: &'a HashMap<String, HashMap<i64, HashMap<String, DaySpend>>>,
     unit_months: &'a HashMap<String, HashMap<String, UnitMonthAcc>>,
@@ -1525,6 +1531,10 @@ struct SnapshotOwned {
     unit_budgets: HashMap<String, HashMap<String, i64>>,
     #[serde(default)]
     devices: HashMap<String, Device>,
+    /// Missing on snapshots from before invariant 132, which kept no nonces
+    /// across a restart: `default` loads empty, as they always did.
+    #[serde(default)]
+    nonces: HashMap<String, VecDeque<(String, i64)>>,
     /// Missing on pre-P2 snapshots — `default` yields an empty map, so
     /// `savings()` reports zeros until fresh telemetry accumulates.
     #[serde(default)]
@@ -1597,6 +1607,9 @@ pub struct Store {
     /// broadcasts `StreamEvent::Incident` (see `ingest_at`), and `run_stalled`
     /// from the sweep's own copy of that loop (`sweep_stalled_at`).
     event_exporter: Arc<EventExporter>,
+    /// Unix seconds at which this store was built, i.e. this process started
+    /// (invariant 132). Read by [`Store::started_unix`].
+    started_unix: i64,
 }
 
 /// Map an `Incident.kind` string to the corresponding agent-event
@@ -1712,6 +1725,7 @@ impl Store {
             incident_cfg,
             alert_pct,
             event_exporter: Arc::new(EventExporter::disabled()),
+            started_unix: now_millis() / 1000,
         }
     }
 
@@ -3782,6 +3796,7 @@ impl Store {
                 budgets: &inner.budgets,
                 unit_budgets: &inner.unit_budgets,
                 devices: &inner.devices,
+                nonces: &inner.nonces,
                 savings: &inner.savings,
                 spend_days: &inner.spend_days,
                 unit_months: &inner.unit_months,
@@ -3814,7 +3829,39 @@ impl Store {
         inner.killed = snap.killed;
         inner.budgets = snap.budgets;
         inner.unit_budgets = snap.unit_budgets;
-        inner.devices = snap.devices;
+        // Invariant 132: a snapshot from before the digest keying holds each
+        // device under its raw token. Hash those now and mark the state dirty,
+        // so the next save writes the digest form and the token leaves the file.
+        let mut migrated = false;
+        inner.devices = snap
+            .devices
+            .into_iter()
+            .map(|(key, device)| {
+                if key.starts_with("sha256:") {
+                    (key, device)
+                } else {
+                    migrated = true;
+                    (digest(&key), device)
+                }
+            })
+            .collect();
+        if migrated {
+            inner.dirty = true;
+        }
+        // Nonces outside the signature window can no longer be replayed inside
+        // it, so they are dropped here rather than kept forever.
+        let now = now_millis() / 1000;
+        inner.nonces = snap
+            .nonces
+            .into_iter()
+            .filter_map(|(device, ring)| {
+                let kept: VecDeque<(String, i64)> = ring
+                    .into_iter()
+                    .filter(|(_, ts)| (now - ts).abs() <= devices::SIGNATURE_WINDOW_SECS)
+                    .collect();
+                (!kept.is_empty()).then_some((device, kept))
+            })
+            .collect();
         inner.savings = snap.savings;
         inner.spend_days = snap.spend_days;
         inner.unit_months = snap.unit_months;
@@ -3944,7 +3991,7 @@ impl Store {
             apns_token: None,
         };
         inner.dirty = true;
-        inner.devices.insert(token, device.clone());
+        inner.devices.insert(digest(&token), device.clone());
         Some(device)
     }
 
@@ -3979,7 +4026,7 @@ impl Store {
             apns_token: None,
         };
         inner.dirty = true;
-        inner.devices.insert(token, device.clone());
+        inner.devices.insert(digest(&token), device.clone());
         let actor = format!("device:{}", device.device_id);
         let detail = format!("role={};platform={}", device.role, device.platform);
         append_audit_locked(
@@ -3993,31 +4040,32 @@ impl Store {
         Some(device)
     }
 
-    /// Unix seconds at which this process started (invariant 132). STUB in the
-    /// red commit: always `0`, so no request is refused as older than the start.
+    /// Unix seconds at which this process started. A device-signed request
+    /// older than this was signed before a restart (invariant 132).
     pub fn started_unix(&self) -> i64 {
-        0
+        self.started_unix
     }
 
     /// The device a bearer `token` maps to, if any.
     pub fn device_by_token(&self, token: &str) -> Option<Device> {
-        self.inner.read().unwrap().devices.get(token).cloned()
+        let inner = self.inner.read().unwrap();
+        inner.devices.get(&digest(token)).cloned()
     }
 
     /// Record a nonce for a device; returns `false` if it was already seen
     /// (replay). Keeps the most recent [`NONCE_CAP`] per device.
     pub fn check_and_record_nonce(&self, device_id: &str, nonce: &str, ts: i64) -> bool {
-        // STUB (red commit): `ts` is not kept yet, so nonces die with the process.
-        let _ = ts;
         let mut inner = self.inner.write().unwrap();
         let seen = inner.nonces.entry(device_id.to_string()).or_default();
-        if seen.iter().any(|n| n == nonce) {
+        if seen.iter().any(|(n, _)| n == nonce) {
             return false;
         }
-        seen.push_back(nonce.to_string());
+        seen.push_back((nonce.to_string(), ts));
         while seen.len() > NONCE_CAP {
             seen.pop_front();
         }
+        // Persisted with the ring, so a restart keeps refusing it (invariant 132).
+        inner.dirty = true;
         true
     }
 

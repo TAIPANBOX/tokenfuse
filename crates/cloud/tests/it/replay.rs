@@ -12,12 +12,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn keys() -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -25,7 +26,7 @@ fn keys() -> HashMap<String, Principal> {
         },
     );
     keys.insert(
-        "otherorg".into(),
+        digest("otherorg"),
         Principal {
             org: "beta".into(),
             role: "admin".into(),

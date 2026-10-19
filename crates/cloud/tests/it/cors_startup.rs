@@ -33,8 +33,14 @@ fn start_with_cors(spec: &str) -> (Option<i32>, String) {
     // The subscriber writes to stdout; collect both streams on one channel.
     let (tx, rx) = mpsc::channel::<String>();
     for stream in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ]
     .into_iter()
     .flatten()

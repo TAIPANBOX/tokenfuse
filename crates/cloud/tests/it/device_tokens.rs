@@ -40,7 +40,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 fn state_over(store: Arc<Store>) -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "adm".into(),
+        digest("adm"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -79,7 +79,11 @@ async fn pair(state: &AppState, pubkey_b64: &str) -> (String, String) {
     let body = format!(
         r#"{{"code":"{code}","pubkey_b64":"{pubkey_b64}","platform":"linux","name":"test device"}}"#
     );
-    let (st, v) = send(state, Request::post("/v1/pair").body(Body::from(body)).unwrap()).await;
+    let (st, v) = send(
+        state,
+        Request::post("/v1/pair").body(Body::from(body)).unwrap(),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "pair failed: {v}");
     (
         v["device_id"].as_str().unwrap().to_string(),
@@ -88,7 +92,13 @@ async fn pair(state: &AppState, pubkey_b64: &str) -> (String, String) {
 }
 
 /// A device-signed kill of run `r1` at `ts` with `nonce`.
-fn signed_kill(sk: &SigningKey, device_id: &str, token: &str, ts: i64, nonce: &str) -> Request<Body> {
+fn signed_kill(
+    sk: &SigningKey,
+    device_id: &str,
+    token: &str,
+    ts: i64,
+    nonce: &str,
+) -> Request<Body> {
     let path = "/v1/runs/r1/kill";
     let canonical = canonical_string("POST", path, b"", &ts.to_string(), nonce);
     let sig: Signature = sk.sign(canonical.as_bytes());
@@ -134,7 +144,10 @@ async fn a_device_token_is_stored_as_its_digest_and_never_in_the_snapshot() {
         !on_disk.contains(&token),
         "the raw device token must not be in the snapshot"
     );
-    assert!(on_disk.contains(&digest(&token)), "the digest is what is stored");
+    assert!(
+        on_disk.contains(&digest(&token)),
+        "the digest is what is stored"
+    );
 }
 
 #[tokio::test]
@@ -161,11 +174,18 @@ async fn a_snapshot_with_raw_device_tokens_is_migrated_and_rewritten_hashed() {
             .unwrap(),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "a migrated device must still authenticate");
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a migrated device must still authenticate"
+    );
 
     // The next save writes it hashed, and the raw token is gone from the file.
     let on_disk = save_and_read(&store, "migrate-written");
-    assert!(!on_disk.contains(&raw), "the raw token survives the rewrite");
+    assert!(
+        !on_disk.contains(&raw),
+        "the raw token survives the rewrite"
+    );
     assert!(on_disk.contains(&digest(&raw)));
 }
 

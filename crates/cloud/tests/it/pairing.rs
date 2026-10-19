@@ -15,12 +15,13 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use tower::ServiceExt;
 
 use tokenfuse_cloud::devices::canonical_string;
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn state() -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "adm".into(),
+        digest("adm"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),

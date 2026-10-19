@@ -68,6 +68,10 @@ fn is_valid_site_name(s: &str) -> bool {
 /// caller nobody asked to authenticate under that shape. Present and empty
 /// (`k:o:admin:`) means no site, same as the segment being absent.
 ///
+/// The map is keyed by [`digest`] of each secret, never by the secret itself
+/// (invariant 133): a bearer is looked up by the digest of what was presented,
+/// so the map a copy of the process holds names no credential.
+///
 /// With no valid entries, this **fails closed**: an empty map is returned, so
 /// every request gets `401`. There is no fallback credential.
 pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
@@ -96,7 +100,7 @@ pub fn parse_keys(spec: &str) -> HashMap<String, Principal> {
             Some(_) => continue, // invalid site name: skip the whole entry
         };
         keys.insert(
-            parts[0].trim().to_string(),
+            digest(parts[0].trim()),
             Principal {
                 org: parts[1].trim().to_string(),
                 role: role.to_string(),
@@ -115,7 +119,7 @@ mod tests {
     fn parses_org_and_role() {
         let k = parse_keys("a:acme,b:globex:viewer");
         assert_eq!(
-            k["a"],
+            k[&digest("a")],
             Principal {
                 org: "acme".into(),
                 role: "admin".into(),
@@ -123,7 +127,7 @@ mod tests {
             }
         );
         assert_eq!(
-            k["b"],
+            k[&digest("b")],
             Principal {
                 org: "globex".into(),
                 role: "viewer".into(),
@@ -136,7 +140,7 @@ mod tests {
     fn skips_malformed_entries() {
         let k = parse_keys("nokey, :noorg , good:org");
         assert_eq!(k.len(), 1);
-        assert!(k.contains_key("good"));
+        assert!(k.contains_key(&digest("good")));
     }
 
     // -- fails closed: there is no fallback credential ---------------------
@@ -169,7 +173,7 @@ mod tests {
         let k = parse_keys("a:acme");
         assert_eq!(k.len(), 1);
         assert!(!k.contains_key("devkey"));
-        assert_eq!(k["a"].org, "acme");
+        assert_eq!(k[&digest("a")].org, "acme");
     }
 
     // -- invariant 65: the 4th segment names a site -------------------------
@@ -177,15 +181,15 @@ mod tests {
     #[test]
     fn a_fourth_segment_is_parsed_as_the_site() {
         let k = parse_keys("s:acme:ingest:site-a");
-        assert_eq!(k["s"].org, "acme");
-        assert_eq!(k["s"].role, "ingest");
-        assert_eq!(k["s"].site.as_deref(), Some("site-a"));
+        assert_eq!(k[&digest("s")].org, "acme");
+        assert_eq!(k[&digest("s")].role, "ingest");
+        assert_eq!(k[&digest("s")].site.as_deref(), Some("site-a"));
     }
 
     #[test]
     fn an_empty_fourth_segment_means_no_site() {
         let k = parse_keys("s:acme:admin:");
-        assert_eq!(k["s"].site, None);
+        assert_eq!(k[&digest("s")].site, None);
     }
 
     #[test]
@@ -234,7 +238,7 @@ mod tests {
     #[test]
     fn three_segment_specs_parse_exactly_as_before() {
         let k = parse_keys("a:acme:viewer");
-        assert_eq!(k["a"].role, "viewer");
-        assert_eq!(k["a"].site, None);
+        assert_eq!(k[&digest("a")].role, "viewer");
+        assert_eq!(k[&digest("a")].site, None);
     }
 }
