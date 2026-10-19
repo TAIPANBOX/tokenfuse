@@ -607,6 +607,26 @@ async fn mcp_broker() {
             |p: &str| std::fs::read_to_string(p),
         ),
     );
+    // docs/07 B.7 level 3. Off unless an operator names the gateway whose
+    // firewall should judge: the broker is a separate process invocation with
+    // no taint state of its own, so with nothing to ask it can only let calls
+    // through, and pretending otherwise would be worse than being plainly off.
+    let taint_gateway = std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    // Agent tokens on and a taint gateway named, with no key of the broker's own
+    // to relay a token with: every call a token admits would reach the check with
+    // no credential and fall to the taint fail mode (invariant 129). Refused here,
+    // before the listener binds.
+    let relay_refusal = tokenfuse_gateway::mcpbroker::refuse_agent_tokens_without_relay_key(
+        &agent_tokens,
+        taint_gateway.as_deref(),
+        taint_gateway_key.as_deref(),
+    );
+    if let Some(refusal) = relay_refusal {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
     // "Is there anything on the door" is a question about three variables
     // now. Asked once, here, so the two bind conditions below cannot answer
     // it differently: see `mcpbroker::something_on_the_door`. An agent-token
@@ -638,14 +658,7 @@ async fn mcp_broker() {
         require_proof,
         client: broker_client,
         events,
-        // docs/07 B.7 level 3. Off unless an operator names the gateway whose
-        // firewall should judge: the broker is a separate process invocation
-        // with no taint state of its own, so with nothing to ask it can only
-        // let calls through, and pretending otherwise would be worse than
-        // being plainly off.
-        taint_gateway: std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY")
-            .ok()
-            .filter(|v| !v.trim().is_empty()),
+        taint_gateway,
         taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
         agent_tokens,
