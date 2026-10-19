@@ -201,7 +201,7 @@ door credential (CLAUDE.md invariants 123 and 124).
 | Variable | Meaning |
 |---|---|
 | `TOKENFUSE_AGENT_TOKENS` | `off` (default): nothing changes. `accept`: a token is a door credential and every static client key keeps working beside it. `require`: every static client key is refused. Any other word refuses to start. |
-| `TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE` | The MCP broker only: a file holding the broker's own gateway client key (key id `broker` in the gateway's `TOKENFUSE_CLIENT_KEYS`), used only to relay a token to the gateway's tool-call check. |
+| `TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE` | The MCP broker only: a file holding the broker's own gateway client key (key id `broker` in the gateway's `TOKENFUSE_CLIENT_KEYS`), used only to relay a token to the gateway's tool-call check. Required when the agent-token door is on and `TOKENFUSE_MCP_TAINT_GATEWAY` names a gateway: without it the broker refuses to start (CLAUDE.md invariant 129), because a token's call would reach the check with no credential and fall to `TOKENFUSE_MCP_TAINT_FAILMODE`. |
 
 On, the process needs the delegation door above (issuer, JWKS, origin), a
 non-empty `TOKENFUSE_DELEGATION_AUDIENCE`, and a revocation list that fails

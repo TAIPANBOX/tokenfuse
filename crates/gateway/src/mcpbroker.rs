@@ -575,6 +575,39 @@ pub fn taint_gateway_key_from(
     Ok(Some(key))
 }
 
+/// The startup refusal for a broker that admits agent tokens and asks a taint
+/// gateway about tool calls but holds no key of its own to ask with (invariant
+/// 129), or `None` when there is nothing to refuse.
+///
+/// [`taint_gate`] relays a call an agent token admitted only beside the
+/// broker's own key, so without one the check goes out with no credential at
+/// all. A gateway with client keys answers that `401`, and
+/// `TOKENFUSE_MCP_TAINT_FAILMODE` then decides the call with nothing judging
+/// it: open, the default, forwards it, and the only trace is a
+/// `dependency_failed` event. A configuration that cannot do what it names is
+/// refused here, before the listener binds, rather than discovered call by call.
+pub fn refuse_agent_tokens_without_relay_key(
+    agent_tokens: &crate::agenttoken::Tokens,
+    taint_gateway: Option<&str>,
+    relay_key: Option<&str>,
+) -> Option<String> {
+    let mode = agent_tokens.as_ref()?.mode().as_str();
+    if taint_gateway.is_none_or(|g| g.trim().is_empty()) || relay_key.is_some() {
+        return None;
+    }
+    Some(format!(
+        "refusing to start: {}={mode} and TOKENFUSE_MCP_TAINT_GATEWAY names a taint gateway, \
+         but TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE is not set. Without the broker's own key a \
+         call an agent token admitted is sent to the tool-call check with no credential, a \
+         gateway with client keys answers 401, and TOKENFUSE_MCP_TAINT_FAILMODE decides the call \
+         with nothing judging it (open, the default, forwards it). Set \
+         TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE to a file holding the broker's key (key id `{}` in \
+         the gateway's TOKENFUSE_CLIENT_KEYS), or unset TOKENFUSE_MCP_TAINT_GATEWAY.",
+        crate::agenttoken::SWITCH,
+        crate::agenttoken::BROKER_KEY_ID,
+    ))
+}
+
 /// The startup warning for a broker with BOTH doors configured and the bearer
 /// one still open, or `None` when there is nothing to say.
 ///
@@ -2904,5 +2937,48 @@ mod tests {
         })
         .unwrap_err();
         assert!(gone.contains("/nope"), "{gone}");
+    }
+
+    /// Invariant 129: agent tokens on and a taint gateway named, with no key of
+    /// the broker's own to relay a token with, is refused in either mode, and
+    /// the refusal names the variable that fixes it and never a key. Every other
+    /// combination starts as it did.
+    #[test]
+    fn agent_tokens_and_a_taint_gateway_need_the_brokers_own_key() {
+        use crate::agenttoken::{AgentTokens, Mode};
+        let on = |mode| -> crate::agenttoken::Tokens { Some(Arc::new(AgentTokens::new(mode))) };
+        let gateway = Some("http://127.0.0.1:4100");
+        for mode in [Mode::Accept, Mode::Require] {
+            let refusal = refuse_agent_tokens_without_relay_key(&on(mode), gateway, None)
+                .unwrap_or_else(|| panic!("{mode:?} with a taint gateway and no key must refuse"));
+            for name in [
+                "TOKENFUSE_MCP_TAINT_GATEWAY_KEY_FILE",
+                "TOKENFUSE_MCP_TAINT_GATEWAY",
+                "TOKENFUSE_AGENT_TOKENS",
+                mode.as_str(),
+            ] {
+                assert!(refusal.contains(name), "{mode:?}: {refusal}");
+            }
+            assert_eq!(
+                refuse_agent_tokens_without_relay_key(&on(mode), gateway, Some("sk-broker-1")),
+                None,
+                "{mode:?} with the broker's own key starts"
+            );
+            assert_eq!(
+                refuse_agent_tokens_without_relay_key(&on(mode), None, None),
+                None,
+                "{mode:?} with no taint gateway has nothing to relay to"
+            );
+            assert_eq!(
+                refuse_agent_tokens_without_relay_key(&on(mode), Some("  "), None),
+                None,
+                "{mode:?}: a blank gateway is no gateway, as main.rs reads it"
+            );
+        }
+        assert_eq!(
+            refuse_agent_tokens_without_relay_key(&None, gateway, None),
+            None,
+            "agent tokens off: a taint gateway asked with the caller's own key, as before"
+        );
     }
 }

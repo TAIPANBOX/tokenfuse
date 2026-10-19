@@ -374,6 +374,18 @@
           "TOKENFUSE_CLOUD_ALLOW_DEVKEY": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_AUDIT_KEYRYX_CREDENTIAL_FILE": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_AUDIT_KEYRYX_KEY": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_AUDIT_KEYRYX_URL": {
+            "required": false
+          },
+          "TOKENFUSE_CLOUD_AUDIT_SIGNER": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_AUDIT_SIGNING_KEY": {
             "required": false
           },

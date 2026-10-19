@@ -3535,6 +3535,13 @@ impl Store {
         }
     }
 
+    /// `org`'s chain tip, for a manifest signed outside the store's lock (the
+    /// keyryx signer, invariant 130). The zero tip for an org with no chain.
+    pub fn audit_tip(&self, org: &str) -> crate::audit_sign::ChainTip {
+        let inner = self.inner.read().unwrap();
+        crate::audit_sign::ChainTip::of(inner.audit.get(org).map(Vec::as_slice).unwrap_or(&[]))
+    }
+
     /// A cryptographically-signed manifest over `org`'s audit chain tip, signed
     /// with `key` and stamped `now_ms`. Derived on demand from the persisted
     /// chain (nothing new is stored); an empty chain still yields a valid signed

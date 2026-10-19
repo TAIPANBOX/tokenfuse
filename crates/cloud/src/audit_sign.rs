@@ -50,6 +50,52 @@ pub struct AuditManifest {
     /// base64 (standard) of the SEC1/X9.63 *uncompressed* public point, so an
     /// auditor can verify with any standard ECDSA tool.
     pub public_key_b64: String,
+    /// The key id keyryx custody names for the key that signed, when keyryx
+    /// signed (invariant 130): an auditor finds the same key, with this id, in
+    /// keyryx's `GET /v1/jwks/{name}` rather than taking `public_key_b64` on the
+    /// manifest's word. Absent when the in-process key signed, so that manifest
+    /// is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+}
+
+/// An org's chain tip, the three fields of the signed bytes a chain decides:
+/// the last entry's `seq` and `entry_hash` and the entry count, or the zero tip
+/// (`0`, `""`, `0`) for an empty chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainTip {
+    pub tip_seq: u64,
+    pub tip_hash: String,
+    pub entry_count: u64,
+}
+
+impl ChainTip {
+    /// The tip of `entries` (an org's chain, oldest first).
+    pub fn of(entries: &[AuditEntry]) -> Self {
+        match entries.last() {
+            Some(tip) => ChainTip {
+                tip_seq: tip.seq,
+                tip_hash: tip.entry_hash.clone(),
+                entry_count: entries.len() as u64,
+            },
+            None => ChainTip {
+                tip_seq: 0,
+                tip_hash: String::new(),
+                entry_count: 0,
+            },
+        }
+    }
+
+    /// The canonical bytes a manifest over this tip signs.
+    pub fn signing_bytes(&self, org: &str, signed_at_millis: i64) -> Vec<u8> {
+        audit::manifest_signing_bytes(
+            org,
+            self.tip_seq,
+            &self.tip_hash,
+            self.entry_count,
+            signed_at_millis,
+        )
+    }
 }
 
 /// Load the audit-manifest signing key from [`AUDIT_SIGNING_KEY_ENV`], or
@@ -63,7 +109,7 @@ pub fn signing_key_from_env() -> Option<SigningKey> {
 
 /// Parse a P-256 signing key from PEM (PKCS#8 or SEC1) or base64 (raw 32-byte
 /// scalar, PKCS#8 DER, or SEC1 DER). Returns `None` on any decode failure.
-fn parse_signing_key(s: &str) -> Option<SigningKey> {
+pub(crate) fn parse_signing_key(s: &str) -> Option<SigningKey> {
     if s.is_empty() {
         return None;
     }
@@ -104,22 +150,19 @@ pub fn build_signed_manifest(
     key: &SigningKey,
     now_ms: i64,
 ) -> AuditManifest {
-    let (tip_seq, tip_hash, entry_count) = match entries.last() {
-        Some(tip) => (tip.seq, tip.entry_hash.clone(), entries.len() as u64),
-        None => (0, String::new(), 0),
-    };
-    let bytes = audit::manifest_signing_bytes(org, tip_seq, &tip_hash, entry_count, now_ms);
-    let sig: Signature = key.sign(&bytes);
+    let tip = ChainTip::of(entries);
+    let sig: Signature = key.sign(&tip.signing_bytes(org, now_ms));
     let public_key_b64 = STANDARD.encode(key.verifying_key().to_encoded_point(false).as_bytes());
     AuditManifest {
         org: org.to_string(),
-        tip_seq,
-        tip_hash,
-        entry_count,
+        tip_seq: tip.tip_seq,
+        tip_hash: tip.tip_hash,
+        entry_count: tip.entry_count,
         signed_at_millis: now_ms,
         algorithm: "ES256".to_string(),
         signature_b64: STANDARD.encode(sig.to_bytes()),
         public_key_b64,
+        kid: None,
     }
 }
 
@@ -210,6 +253,16 @@ mod tests {
         // Flip the pinned tip without re-signing: verification must fail.
         m.tip_hash = "deadbeef".to_string();
         assert!(!manifest_verifies(&m));
+    }
+
+    /// The in-process signer's manifest is the shape it always was: no `kid`
+    /// member at all, not a `null` one (invariant 130).
+    #[test]
+    fn an_in_process_manifest_carries_no_kid_member() {
+        let m = build_signed_manifest("acme", &chain(1), &test_key(), 1);
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v.get("kid").is_none(), "{v}");
+        assert_eq!(v.as_object().unwrap().len(), 8, "{v}");
     }
 
     #[test]

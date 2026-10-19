@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokenfuse_cloud::{
-    app, openapi_spec, parse_keys, AppState, IncidentConfig, NullSender, OidcConfig, PushPipeline,
-    PushSender, Store,
+    app, openapi_spec, parse_keys, AppState, AuditSigner, IncidentConfig, NullSender, OidcConfig,
+    PushPipeline, PushSender, Store,
 };
 
 #[tokio::main]
@@ -209,10 +209,29 @@ async fn main() {
     // Optional server P-256 key for signing audit manifests (P3 WS2).
     // Unconfigured ⇒ `None`, and `/v1/audit/manifest` reports not-configured;
     // the rest of the audit trail is unaffected.
-    let audit_signing_key = tokenfuse_cloud::audit_signing_key_from_env();
-    if audit_signing_key.is_some() {
-        tracing::info!("audit manifest signing enabled (ES256)");
-    }
+    // Or keyryx custody signs (invariant 130): TOKENFUSE_CLOUD_AUDIT_SIGNER=keyryx.
+    // A signer configuration that cannot be used refuses to start; unset, the
+    // in-process key above behaves exactly as it always has.
+    let (audit_signing_key, audit_keyryx) =
+        match tokenfuse_cloud::audit_signer_from(|k| std::env::var(k).ok()) {
+            Ok(None) => (None, None),
+            Ok(Some(AuditSigner::Env(key))) => {
+                tracing::info!("audit manifest signing enabled (ES256)");
+                (Some(key), None)
+            }
+            Ok(Some(AuditSigner::Keyryx(signer))) => {
+                tracing::info!(
+                    keyryx = signer.base_url(),
+                    key = signer.key_name(),
+                    "audit manifest signing enabled (ES256), signed by keyryx custody"
+                );
+                (None, Some(signer))
+            }
+            Err(refusal) => {
+                tracing::error!("{refusal}");
+                std::process::exit(2);
+            }
+        };
 
     // Agent-event NDJSON replay source for `GET /v1/replay/{run}` (read-only,
     // additive: incident replay). Independent of `TOKENFUSE_EVENTS_PATH` above
@@ -228,6 +247,7 @@ async fn main() {
     let state = AppState::new(Arc::clone(&store), Arc::new(keys), alert_pct)
         .with_oidc(oidc)
         .with_audit_signing_key(audit_signing_key)
+        .with_audit_keyryx(audit_keyryx)
         .with_replay_events_path(replay_events_path);
 
     // Bind to loopback by DEFAULT so a naive run never exposes the money-plane

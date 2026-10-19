@@ -18,6 +18,7 @@ mod common;
 mod admin_gate;
 mod agent_token_is_the_door_credential;
 mod agent_tokens_startup;
+mod broker_needs_its_own_key;
 mod cache_default_startup;
 mod check_tool_call_answers_its_callers_runs;
 mod closure_reaches_the_cloud;
