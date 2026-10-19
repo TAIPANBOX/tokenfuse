@@ -229,6 +229,17 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_secret_is_never_kept_in_the_map() {
+        // Invariant 134: the map is keyed by a digest of each secret, so a Debug
+        // print of the whole value cannot disclose a configured secret.
+        let keys = ClientKeys::from_spec("sk-live-zq9-distinct:billing-agent").expect("valid spec");
+        assert!(
+            !format!("{keys:?}").contains("sk-live-zq9-distinct"),
+            "the configured secret must not be stored in the lookup map"
+        );
+    }
+
+    #[test]
     fn resolves_a_known_secret_and_rejects_an_unknown_one() {
         let keys = ClientKeys::from_spec("sk-live-abc:billing-agent,sk-live-def:research-agent")
             .expect("valid spec");

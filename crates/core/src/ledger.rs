@@ -2097,3 +2097,109 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod budget_basis_tests {
+    //! Invariant 134: the budget of a run is fixed once the run is open. A caller
+    //! may lower an open run's budget and never raise it; an operator (a
+    //! Cloud-managed budget) moves it either way.
+    use super::*;
+
+    fn usd(x: f64) -> Microusd {
+        Microusd::from_usd(x)
+    }
+
+    #[test]
+    fn a_caller_may_lower_an_open_budget() {
+        let l = Ledger::new();
+        l.open_run("r", usd(5.0), None).unwrap();
+        let o = l.open_run_as("r", usd(0.5), None, BudgetBasis::Caller).unwrap();
+        assert_eq!(o.budget, usd(0.5));
+        assert_eq!(o.raise_refused, None);
+        assert_eq!(l.snapshot("r").unwrap().budget, usd(0.5));
+    }
+
+    #[test]
+    fn a_caller_may_not_raise_an_open_budget() {
+        let l = Ledger::new();
+        l.open_run("r", usd(0.5), None).unwrap();
+        let o = l
+            .open_run_as("r", usd(1000.0), None, BudgetBasis::Caller)
+            .unwrap();
+        assert_eq!(o.budget, usd(0.5), "the run keeps the budget it opened at");
+        assert_eq!(o.raise_refused, Some(usd(1000.0)));
+        assert_eq!(l.snapshot("r").unwrap().budget, usd(0.5));
+    }
+
+    #[test]
+    fn an_operator_budget_moves_an_open_run_either_way() {
+        let l = Ledger::new();
+        l.open_run("r", usd(0.5), None).unwrap();
+        let up = l
+            .open_run_as("r", usd(5.0), None, BudgetBasis::Operator)
+            .unwrap();
+        assert_eq!((up.budget, up.raise_refused), (usd(5.0), None));
+        let down = l
+            .open_run_as("r", usd(0.25), None, BudgetBasis::Operator)
+            .unwrap();
+        assert_eq!((down.budget, down.raise_refused), (usd(0.25), None));
+        assert_eq!(l.snapshot("r").unwrap().budget, usd(0.25));
+    }
+
+    #[test]
+    fn a_fresh_run_takes_the_callers_budget() {
+        let l = Ledger::new();
+        let o = l
+            .open_run_as("fresh", usd(0.5), None, BudgetBasis::Caller)
+            .unwrap();
+        assert_eq!((o.budget, o.raise_refused), (usd(0.5), None));
+        assert_eq!(l.snapshot("fresh").unwrap().budget, usd(0.5));
+    }
+
+    #[test]
+    fn a_closed_run_reopened_by_a_caller_is_a_new_run_at_the_declared_budget() {
+        let l = Ledger::new();
+        l.open_run("r", usd(0.5), None).unwrap();
+        l.close_run("r");
+        let o = l
+            .open_run_as("r", usd(2.0), None, BudgetBasis::Caller)
+            .unwrap();
+        assert!(o.reopened);
+        assert_eq!((o.budget, o.raise_refused), (usd(2.0), None));
+    }
+
+    #[test]
+    fn open_run_keeps_its_operator_semantics() {
+        // The older entry point is what Cloud-managed parents and the tests use:
+        // it always sets the budget it is given.
+        let l = Ledger::new();
+        l.open_run("r", usd(0.5), None).unwrap();
+        l.open_run("r", usd(1000.0), None).unwrap();
+        assert_eq!(l.snapshot("r").unwrap().budget, usd(1000.0));
+    }
+
+    /// Two hundred seeded sequences of caller declarations on one open run: the
+    /// budget after each call is the lowest the run has been declared at so far,
+    /// the first declaration included, so no sequence of raises moves it up.
+    #[test]
+    fn the_caller_budget_is_the_lowest_declared_across_a_sweep() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..200 {
+            let l = Ledger::new();
+            let mut lowest: Option<i64> = None;
+            for _ in 0..24 {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let micros = 1 + ((seed >> 33) % 10_000_000) as i64;
+                let o = l
+                    .open_run_as("sweep", Microusd(micros), None, BudgetBasis::Caller)
+                    .unwrap();
+                let expect = lowest.map_or(micros, |m| m.min(micros));
+                lowest = Some(expect);
+                assert_eq!(o.budget, Microusd(expect), "declared {micros}");
+                assert_eq!(l.snapshot("sweep").unwrap().budget, Microusd(expect));
+            }
+        }
+    }
+}

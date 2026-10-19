@@ -4756,6 +4756,111 @@ pub(crate) mod tests {
         assert_eq!(resp.headers().get("x-fuse-budget-clamped").unwrap(), "1.00");
     }
 
+    // --- invariant 134: a run's budget is fixed once the run is open ----------
+
+    /// A caller that raises its own budget on an open run is refused: the run keeps the
+    /// budget its first call declared, so a reservation past it is a 402. On the
+    /// unfixed code the second call's declaration overwrites the first.
+    #[tokio::test]
+    async fn a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        let first = call_on(&st, "raise-refused", Some("0.50"), SMALL_CALL, false).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = call_on(&st, "raise-refused", Some("1000"), SMALL_CALL, false).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "a refused raise refuses the raise, not the call"
+        );
+        assert_eq!(
+            st.ledger.snapshot("raise-refused").await.unwrap().budget,
+            Microusd(500_000),
+            "a raise on an open run must not move its budget"
+        );
+        let third = call_on(&st, "raise-refused", Some("1000"), BIG_CALL, false).await;
+        assert_eq!(
+            third.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "a USD 1.50 reservation must not fit a run opened at USD 0.50"
+        );
+    }
+
+    /// A lower declaration on an open run is accepted: the run takes it.
+    #[tokio::test]
+    async fn a_lower_budget_on_an_open_run_is_accepted() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        call_on(&st, "lower-ok", Some("5.0"), SMALL_CALL, false).await;
+        let resp = call_on(&st, "lower-ok", Some("0.50"), SMALL_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            st.ledger.snapshot("lower-ok").await.unwrap().budget,
+            Microusd(500_000)
+        );
+    }
+
+    /// A call that declares nothing gets the built-in default, which is a raise on a
+    /// run opened lower. It must not raise it.
+    #[tokio::test]
+    async fn a_call_that_declares_nothing_cannot_raise_an_open_run() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        call_on(&st, "no-header", Some("0.50"), SMALL_CALL, false).await;
+        let resp = call_on(&st, "no-header", None, SMALL_CALL, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            st.ledger.snapshot("no-header").await.unwrap().budget,
+            Microusd(500_000),
+            "the built-in default must not raise the run"
+        );
+    }
+
+    /// A Cloud-managed budget is the operator's word and moves the run both ways,
+    /// whatever the caller declared.
+    #[tokio::test]
+    async fn a_cloud_budget_moves_an_open_run_in_both_directions() {
+        let st = state(Mode::Enforce, StubProvider::default());
+        call_on(&st, "cloud-both", Some("0.50"), SMALL_CALL, false).await;
+        st.set_cloud_budgets(HashMap::from([(
+            "cloud-both".to_string(),
+            Microusd::from_usd(5.0),
+        )]));
+        call_on(&st, "cloud-both", Some("0.50"), SMALL_CALL, false).await;
+        assert_eq!(
+            st.ledger.snapshot("cloud-both").await.unwrap().budget,
+            Microusd(5_000_000),
+            "the operator raised it"
+        );
+        st.set_cloud_budgets(HashMap::from([(
+            "cloud-both".to_string(),
+            Microusd::from_usd(0.25),
+        )]));
+        call_on(&st, "cloud-both", Some("0.50"), SMALL_CALL, false).await;
+        assert_eq!(
+            st.ledger.snapshot("cloud-both").await.unwrap().budget,
+            Microusd(250_000),
+            "the operator lowered it"
+        );
+    }
+
+    /// The refused raise is said once per run, not once per call.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refused_raise_is_logged_once_per_run() {
+        let _serial = crate::testlog::log_lock();
+        crate::testlog::captured_log().lock().unwrap().clear();
+        let st = state(Mode::Enforce, StubProvider::default());
+        call_on(&st, "raise-log", Some("0.50"), SMALL_CALL, false).await;
+        for _ in 0..3 {
+            call_on(&st, "raise-log", Some("1000"), SMALL_CALL, false).await;
+        }
+        let log =
+            String::from_utf8_lossy(&crate::testlog::captured_log().lock().unwrap()).to_string();
+        let said = log
+            .lines()
+            .filter(|l| l.contains("refused to raise") && l.contains("raise-log"))
+            .count();
+        assert_eq!(said, 1, "{log}");
+    }
+
     /// Widening is the one release valve for a retained reservation (D7/D8)
     /// and stays: it just stops at the ceiling.
     #[tokio::test]
