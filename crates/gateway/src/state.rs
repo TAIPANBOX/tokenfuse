@@ -56,6 +56,11 @@ pub struct AppState {
     /// a deployment whose whole claim is that every call is accounted for.
     /// Setting this turns "unmetered" into a 400 rather than a silence.
     pub require_run_id: bool,
+    /// The governance profile in effect (CLAUDE.md invariant 136). The
+    /// constructor's default is `Observe`: the defaults every test written
+    /// before the profile existed was written against. `serve()` sets the
+    /// binary's default, `Governed`, with [`AppState::with_profile`].
+    pub profile: crate::defaults::Profile,
     /// PII-masking mode: a separate, opt-in extension of the DLP scanner
     /// (email/card/phone, regex-only, see `tokenfuse_core::dlp`'s module
     /// doc). Off by default, and switched independently of `dlp` so an
@@ -116,6 +121,9 @@ pub struct AppState {
     /// is cleared and a run may log once more, which costs a repeated line
     /// and never memory.
     budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
+    /// Runs whose refused budget raise has been said once (invariant 135). Bounded like
+    /// `budget_clamp_logged`.
+    budget_raise_logged: Arc<Mutex<HashSet<String>>>,
     /// Model ids the fallback rate has priced and that have been logged, so
     /// the warning is once per model id and not once per call (tokenfuse#305).
     /// Bounded the same way as `budget_clamp_logged`: model ids are
@@ -615,6 +623,7 @@ impl AppState {
             // the ones that needed it least.
             dlp: DlpMode::Block,
             require_run_id: true,
+            profile: crate::defaults::Profile::Observe,
             dlp_pii: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
@@ -628,6 +637,7 @@ impl AppState {
             restored_unbudgeted: Arc::new(Mutex::new(HashSet::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
+            budget_raise_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             unclassified_named: Arc::new(Mutex::new(Default::default())),
             price_book_source: Arc::new(crate::pricebookreport::PriceBookSource {
@@ -770,6 +780,17 @@ impl AppState {
         seen.insert(run_id.to_string())
     }
 
+    /// Record that `run_id` refused a caller's raise of its open budget and say
+    /// whether this is the first time this process has noted it (invariant 135).
+    /// The caller logs once per run, as for the ceiling clamp.
+    pub fn note_budget_raise_refused(&self, run_id: &str) -> bool {
+        let mut seen = self.budget_raise_logged.lock().unwrap();
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains(run_id) {
+            seen.clear();
+        }
+        seen.insert(run_id.to_string())
+    }
+
     /// Name, once per process, each of `names` the firewall leaves unclassified
     /// (invariant 96). Called wherever the taint labels of a tool list are
     /// derived, so a tool is named at the first place the gateway judges it.
@@ -846,6 +867,15 @@ impl AppState {
     /// thing that happens.
     pub fn with_require_run_id(mut self, require: bool) -> Self {
         self.require_run_id = require;
+        self
+    }
+
+    /// Set the governance profile (CLAUDE.md invariant 136). Chainable. The
+    /// budget, firewall, policy-hook and admin defaults are decided where they
+    /// are built, from the same profile; this carries it to the handlers that
+    /// read it at request time (declassification, the health detail).
+    pub fn with_profile(mut self, profile: crate::defaults::Profile) -> Self {
+        self.profile = profile;
         self
     }
 

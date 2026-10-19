@@ -52,6 +52,7 @@ fn strip_ansi(s: &str) -> String {
 
 fn spawn(addr: &str, upstream: &str, data_dir: &str, events: &str, map: &str) -> Gateway {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_CLOUD_URL")

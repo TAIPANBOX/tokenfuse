@@ -23,17 +23,21 @@ was not enforced is the failure these scripts exist to catch.
 ## Run them
 
 Start a gateway on each door in front of a free local provider. Ollama serves
-both wires from one process:
+both wires from one process. Both containers run with `TOKENFUSE_PROFILE=observe`,
+which accepts calls without client keys, so their ports are published to
+`127.0.0.1` only. Set `TOKENFUSE_CLIENT_KEYS` before publishing either anywhere else.
 
 ```bash
 ollama pull qwen2.5:3b
 
-docker run -d --name tf-openai -p 4101:4100 \
+docker run -d --name tf-openai -p 127.0.0.1:4101:4100 \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_MODE=enforce -e TOKENFUSE_WIRE=openai \
   -e TOKENFUSE_UPSTREAM=http://host.docker.internal:11434/v1/chat/completions \
   ghcr.io/taipanbox/tokenfuse:v0.5.0
 
-docker run -d --name tf-messages -p 4102:4100 \
+docker run -d --name tf-messages -p 127.0.0.1:4102:4100 \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_MODE=enforce \
   -e TOKENFUSE_UPSTREAM=http://host.docker.internal:11434/v1/messages \
   ghcr.io/taipanbox/tokenfuse:v0.5.0

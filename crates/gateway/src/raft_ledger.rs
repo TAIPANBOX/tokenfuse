@@ -210,6 +210,8 @@ impl LedgerBackend for RaftLedger {
                 ParentDisposition::Kept
             },
             reopened: false,
+            budget,
+            raise_refused: None,
         })
     }
 

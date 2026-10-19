@@ -311,6 +311,7 @@ fn free_addr() -> String {
 
 fn start(env: &[(&str, &str)]) -> Startup {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tokenfuse"));
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     for name in CLEARED {
         cmd.env_remove(*name);
     }

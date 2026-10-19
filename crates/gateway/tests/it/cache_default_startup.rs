@@ -119,6 +119,7 @@ fn wait_for_stdout_line(child: &mut Child, needle: &str, timeout: Duration) -> S
 /// process, and returns the full line plus every stdout line seen.
 fn run_and_capture_cache_line(cache_value: Option<&str>) -> StdoutWait {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_UPSTREAM")
         .env("TOKENFUSE_ALLOW_STUB", "1")
         .env("TOKENFUSE_ADDR", "127.0.0.1:0")
@@ -168,6 +169,7 @@ fn unset_cache_resolves_to_off_in_the_real_binary() {
 #[test]
 fn a_typo_cache_value_resolves_to_off_and_warns_in_the_real_binary() {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_UPSTREAM")
         .env("TOKENFUSE_ALLOW_STUB", "1")
         .env("TOKENFUSE_ADDR", "127.0.0.1:0")

@@ -278,6 +278,10 @@
           "TOKENFUSE_OTLP_ENDPOINT": {
             "required": false
           },
+          "TOKENFUSE_PROFILE": {
+            "required": false,
+            "default": "governed"
+          },
           "TOKENFUSE_PRICE_BOOK": {
             "required": false
           },

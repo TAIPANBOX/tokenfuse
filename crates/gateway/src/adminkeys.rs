@@ -171,13 +171,34 @@ impl Default for AdminGate {
 }
 
 impl AdminGate {
-    /// Decide the gate from configuration, mirroring
-    /// `mcpbroker::refuse_open_bind`'s three-way split.
+    /// Decide the gate from configuration under the observe defaults, mirroring
+    /// `mcpbroker::refuse_open_bind`'s three-way split. The governed profile
+    /// (invariant 136) is [`AdminGate::resolve_for`].
     #[must_use]
     pub fn resolve(admin_keys: AdminKeys, is_loopback: bool, allow_open_obs: bool) -> Self {
+        Self::resolve_for(
+            admin_keys,
+            is_loopback,
+            allow_open_obs,
+            crate::defaults::Profile::Observe,
+        )
+    }
+
+    /// [`AdminGate::resolve`] under `profile`. Governed refuses the five routes
+    /// with no key on loopback as well as on a wide bind: a process on the same
+    /// host is not a trusted caller once the gateway can refuse, kill and clear
+    /// on its word. `TOKENFUSE_ALLOW_OPEN_OBS=1` still opens them under either
+    /// profile, because it is the operator's explicit word.
+    #[must_use]
+    pub fn resolve_for(
+        admin_keys: AdminKeys,
+        is_loopback: bool,
+        allow_open_obs: bool,
+        profile: crate::defaults::Profile,
+    ) -> Self {
         if admin_keys.enabled() {
             AdminGate::Keyed(Arc::new(admin_keys))
-        } else if is_loopback || allow_open_obs {
+        } else if allow_open_obs || (is_loopback && !profile.is_governed()) {
             AdminGate::Open
         } else {
             AdminGate::Forbidden
@@ -275,6 +296,27 @@ pub async fn admin_gate(State(st): State<AppState>, req: Request, next: Next) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn governed_refuses_a_loopback_request_with_no_admin_key() {
+        use crate::defaults::Profile;
+        let gate = AdminGate::resolve_for(AdminKeys::default(), true, false, Profile::Governed);
+        assert!(matches!(gate, AdminGate::Forbidden));
+    }
+
+    #[test]
+    fn observe_keeps_the_loopback_routes_open_without_a_key() {
+        use crate::defaults::Profile;
+        let gate = AdminGate::resolve_for(AdminKeys::default(), true, false, Profile::Observe);
+        assert!(matches!(gate, AdminGate::Open));
+    }
+
+    #[test]
+    fn allow_open_obs_opens_the_routes_under_governed_too() {
+        use crate::defaults::Profile;
+        let gate = AdminGate::resolve_for(AdminKeys::default(), false, true, Profile::Governed);
+        assert!(matches!(gate, AdminGate::Open));
+    }
+
     use super::*;
 
     // --- AdminKeys::from_spec ------------------------------------------

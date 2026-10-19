@@ -106,6 +106,7 @@ fn an_unreadable_run_owner_journal_refuses_to_start() {
     let journal = dir.join(JOURNAL);
     std::fs::create_dir(&journal).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_CLOUD_URL")
         .env("TOKENFUSE_ALLOW_STUB", "1")

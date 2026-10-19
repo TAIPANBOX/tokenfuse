@@ -402,8 +402,21 @@ run_case "honest-claims: a relevance row reworded but not moved" pass \
 
 run_case "runnable-quickstart: the headline command loses its flag" fail \
 	"./scripts/runnable-quickstart.sh" \
-	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse")')" \
+	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse")')" \
 	"cannot start a gateway"
+
+# Invariant 136: the image binds 0.0.0.0, and the governed profile refuses that
+# with nothing authenticating its callers. A command that drops the profile and
+# names no auth must be named, even though it still names the stub.
+run_case "runnable-quickstart: the headline command loses its profile" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse")')" \
+	"authenticates its callers"
+
+run_case "runnable-quickstart: the compose gateway loses its profile" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "      TOKENFUSE_PROFILE: \"observe\"", "")')" \
+	"authenticates its callers"
 
 # The compose stack is the case that would have failed on somebody else's
 # machine rather than in a document, so it gets its own case.
@@ -698,6 +711,21 @@ run_case "same-doors: a door configured in one process only" fail \
 run_case "same-doors: an exception written in a form nothing reads" fail \
 	"./scripts/both-processes-configure-the-same-doors.sh" \
 	"$(py 'edit_all("crates/gateway/src/main.rs", "process-local:", "process local:")')" \
+	"and not in"
+
+# Once the broker reads the governance profile, its policy hook is configured in
+# both processes. A `process-local:` exception left above that call is stale: it
+# was true when written and is now a claim nobody checks. The gate must say so.
+run_case "same-doors: a stale process-local exception on a door both processes configure" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));", "    // process-local: the broker keeps the observe defaults.\n    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));")')" \
+	"stale exception"
+
+# The same door with its broker call removed: the hook is configured in `serve`
+# alone, and nothing in the broker says why.
+run_case "same-doors: the broker's policy hook removed while serve keeps its own" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::disabled());")')" \
 	"and not in"
 
 # The subject list is DISCOVERED, so a gate that can no longer find any door
@@ -1800,6 +1828,58 @@ run_case "audit-keyryx: a kid that is not the signing key's thumbprint served" f
 	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::a_kid_that_names_another_key_is_never_served" \
 	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    if kid != thumbprint {", "    if kid != thumbprint && false {")')" \
 	"a_kid_that_names_another_key_is_never_served ... FAILED"
+
+# --- invariant 134: client keys are looked up by digest (F-023) ----------------
+
+run_case "client-keys: the map keyed by a raw secret again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "by_digest: HashMap<[u8; 32], String>,", "by_digest: HashMap<[u8; 32], String>,\n    by_secret: HashMap<String, String>,")')" \
+	"keyed by text"
+
+run_case "client-keys: the lookup key no longer SHA-256 of the secret" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "Sha256::digest(secret.as_bytes()).into()", "secret.as_bytes().try_into().unwrap_or([0u8; 32])")')" \
+	"does not compute the lookup key"
+
+run_case "client-keys: the declassify key compared with == again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/declassify.rs", "(Some(want), Some(got)) if crate::clientkeys::secret_eq(want, got) => true,", "(Some(want), Some(got)) if want == got => true,")')" \
+	"compares the declassify key with =="
+
+run_case "client-keys: a comment naming the old map passes" pass \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "pub struct ClientKeys {", "// The old shape was HashMap<String, String>, keyed by the raw secret.\npub struct ClientKeys {")')"
+
+run_case "client-keys: clientkeys.rs gone, so the gate measured nothing" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'import os; os.rename("crates/gateway/src/clientkeys.rs", "crates/gateway/src/clientkeys.rs.moved")')" \
+	"measured nothing"
+
+# --- invariant 135: a run's budget is fixed once open (F-025) -----------------
+#
+# These run the rule's own tests against a mutated product file. Each mutant is a
+# silent fault: the request still succeeds, so only an assertion on the budget
+# (or the refused raise) can see it.
+
+run_case "run-budget: the proxy hands a caller's budget the operator's basis" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        tokenfuse_core::BudgetBasis::Caller\n    };", "        tokenfuse_core::BudgetBasis::Operator\n    };")')" \
+	"a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget ... FAILED"
+
+run_case "run-budget: the in-process ledger applies a caller's raise" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::a_caller_may_not_raise_an_open_budget" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Caller => (s.budget, Some(budget)),", "BudgetBasis::Caller => (budget, None),")')" \
+	"a_caller_may_not_raise_an_open_budget ... FAILED"
+
+run_case "run-budget: an operator's raise capped at the held budget" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::an_operator_budget_moves_an_open_run_either_way" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Operator => (budget, None),", "BudgetBasis::Operator if budget > s.budget => (s.budget, None),\n                    BudgetBasis::Operator => (budget, None),")')" \
+	"an_operator_budget_moves_an_open_run_either_way ... FAILED"
+
+run_case "run-budget: the answer names the declared budget instead of the kept one" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_raise_on_the_wire::anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "*raise_kept = Some(budget);", "*raise_kept = Some(refused);")')" \
+	"anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #

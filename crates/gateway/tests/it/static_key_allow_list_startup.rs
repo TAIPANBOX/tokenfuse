@@ -232,3 +232,82 @@ async fn a_listed_key_on_a_fully_configured_gateway_starts_and_names_the_list_at
         "the startup lines name the listed key id: {lines:?}"
     );
 }
+
+/// Invariant 137 under the governed profile: a listener beyond loopback needs
+/// something that authenticates its callers. Under `require` the agent-token
+/// door is that authentication, and a listed static key is one of its
+/// callers, so a wide bind with a listed key starts. A list naming a key the
+/// key set does not configure still refuses, before the wide-bind check runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_governed_a_wide_bind_starts_when_a_listed_key_authenticates() {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let list = Router::new().route(
+        "/v1/revocations",
+        get(|| async {
+            let now = tokenfuse_gateway::sink::now_millis() / 1000;
+            Json(serde_json::json!({"revocations": [], "as_of": now}))
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(l, list).await;
+    });
+    let jwks = std::env::temp_dir().join(format!(
+        "tf-governed-wide-bind-jwks-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &jwks,
+        serde_json::json!({"keys": [Key::new().jwk_value(Some("v-1"))]}).to_string(),
+    )
+    .unwrap();
+    let wide = format!("0.0.0.0:{}", free_addr().rsplit(':').next().unwrap());
+    let door = |list: &str| {
+        vec![
+            ("TOKENFUSE_PROFILE", "governed".to_string()),
+            ("TOKENFUSE_ADDR", wide.clone()),
+            ("TOKENFUSE_AGENT_TOKENS", "require".to_string()),
+            ("TOKENFUSE_CLIENT_KEYS", "sk-a:key-a".to_string()),
+            ("TOKENFUSE_AGENT_TOKENS_STATIC_KEYS", list.to_string()),
+            (
+                "TOKENFUSE_DELEGATION_ISSUER",
+                "https://vouchryx.acme.example".to_string(),
+            ),
+            ("TOKENFUSE_DELEGATION_JWKS", jwks.display().to_string()),
+            (
+                "TOKENFUSE_DELEGATION_URL",
+                "https://tokenfuse.acme.example".to_string(),
+            ),
+            (
+                "TOKENFUSE_DELEGATION_AUDIENCE",
+                "https://tokenfuse.acme.example".to_string(),
+            ),
+            (
+                "TOKENFUSE_DELEGATION_REVOCATIONS",
+                format!("http://{addr}/v1/revocations"),
+            ),
+        ]
+    };
+    let mut child = spawn(gateway(&door("key-a")));
+    let lines = tokio::task::spawn_blocking(move || {
+        let lines = lines_until_listening(&mut child);
+        child.kill().ok();
+        child.wait().ok();
+        lines
+    })
+    .await
+    .unwrap();
+    let lines = lines.expect("a wide bind with a listed key must start under governed");
+    assert!(
+        lines.iter().any(|l| l.contains("key-a")),
+        "the startup lines name the listed key id: {lines:?}"
+    );
+
+    let refused = spawn(gateway(&door("key-zz")));
+    assert_refused(
+        refused,
+        "a wide bind whose list names no configured key",
+        &["number 1", "TOKENFUSE_CLIENT_KEYS"],
+    );
+    let _ = std::fs::remove_file(&jwks);
+}

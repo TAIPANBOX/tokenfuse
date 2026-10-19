@@ -3974,6 +3974,7 @@ fn spawn_broker_process(env: &[(&str, &str)]) -> BrokerProcess {
         a.to_string()
     };
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tokenfuse"));
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.arg("mcp-broker")
         .env_clear()
         .env("RUST_LOG", "info")

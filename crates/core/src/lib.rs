@@ -38,8 +38,8 @@ pub use compliance::{
 };
 pub use dlp::DlpMode;
 pub use ledger::{
-    BudgetError, ChainLink, Ledger, OpenError, Opened, Outstanding, ParentDisposition, Reservation,
-    Restored, RunInfo, RunSnapshot, Settlement,
+    BudgetBasis, BudgetError, ChainLink, Ledger, OpenError, Opened, Outstanding, ParentDisposition,
+    Reservation, Restored, RunInfo, RunSnapshot, Settlement,
 };
 pub use loops::{AnomalyConfig, Growth, Window};
 pub use mcpreport::{to_sarif, Finding, ScanReport, Severity};

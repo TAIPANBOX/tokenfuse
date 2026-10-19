@@ -62,6 +62,11 @@ services:
     image: ghcr.io/taipanbox/tokenfuse:v1.18.0
     environment:
       TOKENFUSE_ADDR: "0.0.0.0:4100"
+      # This is a local demo, reached only through the 127.0.0.1 port below, and it
+      # accepts calls without client keys. The observe profile says so explicitly:
+      # under the governed default a wide listener with nothing authenticating its
+      # callers refuses to start. For anything else, set TOKENFUSE_CLIENT_KEYS.
+      TOKENFUSE_PROFILE: "observe"
       # This stack is a demo, so it runs offline against the built-in stub.
       # The stub answers every call itself and meters a fixed 1000 input / 500
       # output tokens, so THE SPEND ON THE DASHBOARD IS INVENTED: it shows the

@@ -1034,25 +1034,40 @@ impl Wardryx {
     /// full list). A missing/empty `TOKENFUSE_WARDRYX_URL` forces `Off`
     /// regardless of `TOKENFUSE_WARDRYX_MODE`: with nothing to call there is
     /// nothing to enforce or shadow.
-    pub fn from_env() -> Self {
-        crate::defaults::exit_on_refusal(Self::from_vars(|name| std::env::var(name).ok()))
+    ///
+    /// `profile` decides an unset `TOKENFUSE_WARDRYX_MODE`: enforce under
+    /// governed, off under observe (CLAUDE.md invariant 136). The MCP broker
+    /// passes observe, the defaults it has always had.
+    pub fn from_env(profile: crate::defaults::Profile) -> Self {
+        crate::defaults::exit_on_refusal(Self::from_vars(|name| std::env::var(name).ok(), profile))
+    }
+
+    /// The unit tests' constructor: the observe defaults, which are the ones
+    /// every test written before the profile existed was written against.
+    #[cfg(test)]
+    fn from_vars_observe(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        Self::from_vars(var, crate::defaults::Profile::Observe)
     }
 
     /// [`Self::from_env`] over any source of variables, so a test can state
     /// the whole configuration without touching the process environment that
     /// every other test in this binary shares.
-    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    fn from_vars(
+        var: impl Fn(&str) -> Option<String>,
+        profile: crate::defaults::Profile,
+    ) -> Result<Self, String> {
         // Both switches are parsed before the URL check, so a mistyped word is
         // refused whether or not the hook has a URL (invariant 98).
         let requested_mode =
-            crate::defaults::wardryx_mode_from(var("TOKENFUSE_WARDRYX_MODE").as_deref())?;
+            crate::defaults::wardryx_mode_under(profile, var("TOKENFUSE_WARDRYX_MODE").as_deref())?;
         let failmode = crate::defaults::wardryx_failmode_from(
             requested_mode,
             var("TOKENFUSE_WARDRYX_FAILMODE").as_deref(),
         )?;
         let url = var("TOKENFUSE_WARDRYX_URL").filter(|s| !s.is_empty());
         let Some(url) = url else {
-            if requested_mode != WardryxMode::Off {
+            let set = var("TOKENFUSE_WARDRYX_MODE").is_some_and(|v| !v.trim().is_empty());
+            if set && requested_mode != WardryxMode::Off {
                 tracing::warn!(
                     "TOKENFUSE_WARDRYX_MODE is set but TOKENFUSE_WARDRYX_URL is not; \
                      the wardryx hook stays off"
@@ -1498,7 +1513,7 @@ mod tests {
     async fn from_env_stays_off_without_a_url() {
         std::env::remove_var("TOKENFUSE_WARDRYX_URL");
         std::env::set_var("TOKENFUSE_WARDRYX_MODE", "enforce");
-        let w = Wardryx::from_env();
+        let w = Wardryx::from_env(crate::defaults::Profile::Observe);
         assert_eq!(w.mode, WardryxMode::Off);
         std::env::remove_var("TOKENFUSE_WARDRYX_MODE");
     }
@@ -2199,7 +2214,7 @@ mod tests {
 
     #[test]
     fn the_environment_names_reach_the_tool_timeout() {
-        let w = Wardryx::from_vars(vars(&[
+        let w = Wardryx::from_vars_observe(vars(&[
             ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
             ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
@@ -2215,7 +2230,7 @@ mod tests {
 
     #[test]
     fn with_only_the_shared_timeout_set_the_tool_path_gets_it_too() {
-        let w = Wardryx::from_vars(vars(&[
+        let w = Wardryx::from_vars_observe(vars(&[
             ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
             ("TOKENFUSE_WARDRYX_TIMEOUT_MS", "80"),
@@ -2271,7 +2286,7 @@ mod tests {
             ("TOKENFUSE_WARDRYX_MODE", "enforce"),
         ];
         all.extend_from_slice(pairs);
-        Wardryx::from_vars(vars(&all)).unwrap()
+        Wardryx::from_vars_observe(vars(&all)).unwrap()
     }
 
     /// (model path, tool path), in milliseconds.
@@ -2438,7 +2453,7 @@ mod tests {
     fn shadow_with_no_failmode_is_unchanged() {
         // Shadow blocks nothing whatever the failmode says, so its default is
         // left where it was.
-        let w = Wardryx::from_vars(vars(&[
+        let w = Wardryx::from_vars_observe(vars(&[
             ("TOKENFUSE_WARDRYX_URL", "http://pdp"),
             ("TOKENFUSE_WARDRYX_MODE", "shadow"),
         ]))

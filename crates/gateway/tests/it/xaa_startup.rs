@@ -20,6 +20,7 @@ fn bin() -> &'static str {
 /// test set", not "happened to inherit a variable from this shell".
 fn run_mcp_broker(extra_env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.arg("mcp-broker")
         .env("TOKENFUSE_MCP_UPSTREAM", "http://127.0.0.1:1")
         .env_remove("TOKENFUSE_MCP_ACCEPT_XAA")
