@@ -1711,6 +1711,40 @@ run_case "checkpoints: a key used after its statement expired" fail \
 	"$(py 'edit("crates/gateway/src/checkpoints.rs", ".filter(|k| k.not_before <= at && at < k.not_after)", ".filter(|k| k.not_before <= at)")')" \
 	"a_key_past_its_statement_is_never_used_and_the_record_is_unsigned ... FAILED"
 
+# --- invariant 129: the broker's own key for the taint check --------------
+#
+# Product mutants, held by cargo test: the refusal removed from the broker's
+# main.rs (what main did before), and the decision that never refuses.
+run_case "broker-key: the refusal removed, the broker listens without its own key" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact broker_needs_its_own_key::agent_tokens_and_a_taint_gateway_without_the_brokers_key_stop_the_broker" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    if let Some(refusal) = relay_refusal {", "    if let Some(refusal) = relay_refusal.filter(|_| false) {")')" \
+	"agent_tokens_and_a_taint_gateway_without_the_brokers_key_stop_the_broker ... FAILED"
+
+run_case "broker-key: the decision never refuses" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact mcpbroker::tests::agent_tokens_and_a_taint_gateway_need_the_brokers_own_key" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    if taint_gateway.is_none_or(|g| g.trim().is_empty()) || relay_key.is_some() {", "    if true || taint_gateway.is_none_or(|g| g.trim().is_empty()) || relay_key.is_some() {")')" \
+	"agent_tokens_and_a_taint_gateway_need_the_brokers_own_key ... FAILED"
+
+# --- invariant 130: the audit manifest signed by keyryx custody -------------
+#
+# Product mutants, held by cargo test: an unusable signer left running, keyryx's
+# answer served unverified, and an unreachable keyryx replaced by the key in the
+# environment.
+run_case "audit-keyryx: an unusable signer configuration left running" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::the_keyryx_signer_with_nothing_else_refuses_to_start" \
+	"$(py 'edit("crates/cloud/src/main.rs", "            Err(refusal) => {\n                tracing::error!(\"{refusal}\");\n                std::process::exit(2);\n            }", "            Err(_refusal) => (None, None),")')" \
+	"the_keyryx_signer_with_nothing_else_refuses_to_start ... FAILED"
+
+run_case "audit-keyryx: keyryx's signature served unverified" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::an_answer_that_does_not_verify_or_is_not_es256_is_never_served" \
+	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    public.verify(bytes, &sig).map_err(|_| {", "    Ok::<(), p256::ecdsa::Error>(()).map_err(|_| {")')" \
+	"an_answer_that_does_not_verify_or_is_not_es256_is_never_served ... FAILED"
+
+run_case "audit-keyryx: an unreachable keyryx replaced by the key in the environment" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::an_unreachable_keyryx_fails_closed_and_no_other_key_signs_instead" \
+	"$(py 'edit("crates/cloud/src/http.rs", "    if let Some(signer) = st.audit_keyryx.as_ref() {", "    if let Some(signer) = st.audit_keyryx.as_ref().filter(|_| st.audit_signing_key.is_none()) {")')" \
+	"an_unreachable_keyryx_fails_closed_and_no_other_key_signs_instead ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes
