@@ -515,9 +515,7 @@ build)`, `cloud apns (feature build)`.
    the sentence stops being true without saying so and the entry then protects
    nothing while looking like a decision.
 
-   Today's single entry is rkyv (RUSTSEC-2026-0235), which reaches the
-   lockfile through openraft, byte-unit and rust_decimal, sits behind an
-   optional rust_decimal feature nothing enables, and is therefore never built.
+   Today's single entry is rkyv (RUSTSEC-2026-0235). It no longer reaches any lockfile: rust_decimal 1.43.0 dropped its rkyv dependency, so `cargo update -p rust_decimal --precise 1.43.0` in crates/cluster removed rkyv from that lockfile (`@measured` 2026-10-19), and the entry is stale until its follow-up removes it.
    That is a checkable fact rather than a judgement, so `scripts/audit.sh`
    asserts it: the crate must be absent from the build graph of both manifests
    under `--all-features --target all`, and an ignore with no recorded crate is
