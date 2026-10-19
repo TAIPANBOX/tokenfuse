@@ -209,7 +209,7 @@ budget set here.
   dashboard with its key in the URL fragment, `…/#key=<org-key>`: a fragment is
   never sent to any server, and the page removes it from the address bar once it
   has read it (invariant 133). A `?key=` query still works for old links. Built
-  to static files and served by nginx — published as
+  to static files and served by nginx, published as
   `ghcr.io/taipanbox/tokenfuse-dashboard` and wired into `docker compose` on
   `:3000`.
 
