@@ -104,8 +104,10 @@ impl AgentTokens {
 
     /// [`AgentTokens::new`] with the static key ids admitted under `require`.
     pub fn with_static_keys(mode: Mode, allow: BTreeSet<String>) -> Self {
-        let _ = allow;
-        Self::new(mode)
+        AgentTokens {
+            allow,
+            ..Self::new(mode)
+        }
     }
 
     /// The static key ids this door admits under `require`, sorted.
@@ -146,8 +148,9 @@ pub fn required(tokens: &Tokens) -> bool {
 /// Whether a static client key with this id is admitted under `require`
 /// (invariant 138 at the gateway's doors, 139 at the broker's).
 pub fn static_key_listed(tokens: &Tokens, key_id: &str) -> bool {
-    let _ = (tokens, key_id);
-    false
+    tokens.as_ref().is_some_and(|t| {
+        t.mode() == Mode::Require && !key_id.is_empty() && t.allow.contains(key_id)
+    })
 }
 
 /// The names one static-key list is read under, and the key ids it may name.
@@ -164,9 +167,47 @@ pub struct StaticKeys<'a> {
 
 /// Read a static-key list for `mode`: empty when unset or blank, an error when
 /// it is set outside `require` or names an id the key set does not configure.
+///
+/// An entry is never echoed into the error, only its position in the list: an
+/// operator who pasted a secret into the list instead of a key id would
+/// otherwise have it written to stderr.
 pub fn parse_static_keys(spec: &StaticKeys<'_>, mode: Mode) -> Result<BTreeSet<String>, String> {
-    let _ = (spec, mode);
-    Ok(BTreeSet::new())
+    let Some(raw) = spec.value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(BTreeSet::new());
+    };
+    let (list, keys) = (spec.list_var, spec.keys_var);
+    if mode != Mode::Require {
+        return Err(format!(
+            "tokenfuse: {list} is set, but {SWITCH}={} admits no static key by it: the list \
+             names the static client keys that still work under require. Remove it, or set \
+             {SWITCH}=require",
+            mode.as_str()
+        ));
+    }
+    let mut out = BTreeSet::new();
+    for (position, entry) in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .enumerate()
+    {
+        if !spec.configured.contains(&entry) {
+            return Err(format!(
+                "tokenfuse: {list} names entry number {} of its list, which {keys} does not \
+                 configure. The entry is named by position and never echoed: it is a key id, \
+                 and a secret pasted there must not be printed",
+                position + 1
+            ));
+        }
+        out.insert(entry.to_string());
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "tokenfuse: {list} is set but names no key id: list the key ids {keys} names, \
+             or unset it"
+        ));
+    }
+    Ok(out)
 }
 
 /// The pure startup decision: the switch's value, the delegation door this
@@ -178,11 +219,16 @@ pub fn from_values(
     statics: &StaticKeys<'_>,
 ) -> Result<Tokens, String> {
     let mode = match crate::defaults::switch_word(SWITCH, value, WORDS)? {
-        None | Some("off") => return Ok(None),
+        None | Some("off") => Mode::Off,
         Some("require") => Mode::Require,
         Some(_) => Mode::Accept,
     };
-    let _ = statics;
+    // Read before the switch's own answer: a list set while the door is off is a
+    // refusal too, and a list is checked without the delegation door's config.
+    let allow = parse_static_keys(statics, mode)?;
+    if mode == Mode::Off {
+        return Ok(None);
+    }
     let on = mode.as_str();
     let Some(proving) = proving else {
         return Err(format!(
@@ -219,7 +265,7 @@ pub fn from_values(
         }
         crate::revocations::Wanted::Refused(why) => return Err(why.clone()),
     }
-    Ok(Some(Arc::new(AgentTokens::new(mode))))
+    Ok(Some(Arc::new(AgentTokens::with_static_keys(mode, allow))))
 }
 
 /// [`from_values`] against the process environment; exits 2 on a refusal,
@@ -334,14 +380,27 @@ fn agent_token_in(headers: &HeaderMap) -> Option<&str> {
 /// The agent token this request presented, for the policy plane, when it is
 /// within [`TOKEN_FOR_PDP_CAP_BYTES`] (invariant 140).
 pub fn token_for_pdp(headers: &HeaderMap) -> Option<String> {
-    let _ = headers;
-    None
+    agent_token_in(headers).and_then(for_pdp)
 }
 
 /// A token for the policy plane when it is an agent token within the cap.
+///
+/// Over the cap the token is admitted and not forwarded, and one warn line says
+/// so: the policy plane then finds no token, and a policy that needs one denies.
+/// The line never carries the token.
 pub fn for_pdp(token: &str) -> Option<String> {
-    let _ = token;
-    None
+    if !tokenfuse_delegation::is_agent_token(token) {
+        return None;
+    }
+    if token.len() > TOKEN_FOR_PDP_CAP_BYTES {
+        tracing::warn!(
+            bytes = token.len(),
+            cap = TOKEN_FOR_PDP_CAP_BYTES,
+            "an agent token over the policy plane's size cap is admitted but not forwarded"
+        );
+        return None;
+    }
+    Some(token.to_string())
 }
 
 /// Judge an agent token the MCP broker relays to the tool-call check beside
@@ -448,11 +507,17 @@ pub fn required_response() -> Response {
 }
 
 /// [`required_response`] with the challenge the caller gives.
+///
+/// The body is the same for an unknown key, an unlisted key and no key at all,
+/// and it names the list that admits a static key: a caller learns which door
+/// it needs, never which of its keys are real.
 pub fn required_response_with(challenge: &str, list_var: &str) -> Response {
-    let _ = list_var;
     unauthorized_json(
         "agent_token_required",
-        "this gateway requires an agent token: `Authorization: DPoP <token>` with a DPoP proof",
+        &format!(
+            "this gateway requires an agent token: `Authorization: DPoP <token>` with a DPoP \
+             proof, or a static client key that {list_var} lists"
+        ),
         challenge,
     )
 }
@@ -504,9 +569,9 @@ mod tests {
     use super::*;
     use crate::chainproof::Proving;
     use crate::revocations::Wanted;
+    use serde_json::json;
     use tokenfuse_delegation::revocations::FailMode;
     use tokenfuse_delegation::testing::{agent_token, cfg, token, Key};
-    use serde_json::json;
 
     fn proving(audience: &str) -> Proving {
         let mut c = cfg(&Key::new());
@@ -590,15 +655,23 @@ mod tests {
             }
         }
         for audience in ["", "   "] {
-            let err = from_values(Some("require"), Some(&proving(audience)), &closed, &no_list())
-                .expect_err("an empty audience must refuse");
+            let err = from_values(
+                Some("require"),
+                Some(&proving(audience)),
+                &closed,
+                &no_list(),
+            )
+            .expect_err("an empty audience must refuse");
             assert!(err.contains("TOKENFUSE_DELEGATION_AUDIENCE"), "{err}");
         }
         assert_eq!(
             mode_of(from_values(Some("off"), None, &Wanted::Off, &no_list())),
             Ok(None)
         );
-        assert_eq!(mode_of(from_values(None, None, &Wanted::Off, &no_list())), Ok(None));
+        assert_eq!(
+            mode_of(from_values(None, None, &Wanted::Off, &no_list())),
+            Ok(None)
+        );
     }
 
     /// wardryx is told how the door knew the agent, from the door alone.
@@ -698,21 +771,27 @@ mod tests {
                 .expect_err("a list outside require must refuse");
             assert!(err.contains(STATIC_KEYS_VAR), "{value:?}: {err}");
         }
-        let err = from_values(Some("accept"), None, &Wanted::Off, &list("key-a", &configured))
-            .expect_err("a list refuses before the delegation door is asked about");
+        let err = from_values(
+            Some("accept"),
+            None,
+            &Wanted::Off,
+            &list("key-a", &configured),
+        )
+        .expect_err("a list refuses before the delegation door is asked about");
         assert!(err.contains(STATIC_KEYS_VAR), "{err}");
     }
 
-    /// An id the key set does not configure is refused, naming the id and the
-    /// key set's variable: a list naming a key nobody holds is a typo or a
-    /// removed key, and either way the operator must hear it at startup.
+    /// An id the key set does not configure is refused, naming its position and
+    /// the key set's variable, and never the value itself: the list may have
+    /// been given a secret, and a refusal must not print one.
     #[test]
     fn the_static_key_list_names_an_id_the_key_set_does_not_configure() {
         let configured = ["key-a"];
         let err = parse_static_keys(&list("key-a,key-zz", &configured), Mode::Require)
             .expect_err("an id the key set does not configure must refuse");
-        assert!(err.contains("key-zz"), "{err}");
+        assert!(err.contains("number 2"), "{err}");
         assert!(err.contains("TOKENFUSE_CLIENT_KEYS"), "{err}");
+        assert!(!err.contains("key-zz"), "the value is never echoed: {err}");
     }
 
     /// A value that names no key id at all is refused rather than read as an
@@ -733,7 +812,10 @@ mod tests {
     fn the_static_key_list_reads_its_entries_trimmed() {
         let configured = ["key-a", "key-b"];
         let got = parse_static_keys(&list(" key-b , key-a,key-a ", &configured), Mode::Require);
-        assert_eq!(got.map(ids), Ok(vec!["key-a".to_string(), "key-b".to_string()]));
+        assert_eq!(
+            got.map(ids),
+            Ok(vec!["key-a".to_string(), "key-b".to_string()])
+        );
     }
 
     /// Unset, empty and blank are no list in every mode, as the switch's own
@@ -748,7 +830,11 @@ mod tests {
                     value,
                     configured: &[],
                 };
-                assert_eq!(parse_static_keys(&spec, mode), Ok(BTreeSet::new()), "{mode:?} {value:?}");
+                assert_eq!(
+                    parse_static_keys(&spec, mode),
+                    Ok(BTreeSet::new()),
+                    "{mode:?} {value:?}"
+                );
             }
         }
     }
@@ -757,7 +843,10 @@ mod tests {
     #[test]
     fn static_key_listed_is_true_only_for_a_listed_id_under_require() {
         let allow: BTreeSet<String> = ["key-a".to_string()].into_iter().collect();
-        let require = Some(Arc::new(AgentTokens::with_static_keys(Mode::Require, allow.clone())));
+        let require = Some(Arc::new(AgentTokens::with_static_keys(
+            Mode::Require,
+            allow.clone(),
+        )));
         assert!(static_key_listed(&require, "key-a"));
         assert!(!static_key_listed(&require, "key-b"));
         assert!(!static_key_listed(&require, ""));
@@ -807,7 +896,12 @@ mod tests {
         }
         let under = last_under.expect("a token under the cap");
         let over = first_over.expect("a token over the cap");
-        assert_eq!(for_pdp(&under), Some(under.clone()), "{} bytes", under.len());
+        assert_eq!(
+            for_pdp(&under),
+            Some(under.clone()),
+            "{} bytes",
+            under.len()
+        );
         assert_eq!(for_pdp(&over), None, "{} bytes", over.len());
     }
 }

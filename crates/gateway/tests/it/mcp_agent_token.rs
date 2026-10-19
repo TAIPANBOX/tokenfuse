@@ -10,8 +10,8 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tokenfuse_delegation::testing::{agent_token, cfg, proof_for, Key, AGENT};
 use std::collections::BTreeSet;
+use tokenfuse_delegation::testing::{agent_token, cfg, proof_for, Key, AGENT};
 
 use tokenfuse_gateway::agenttoken::{AgentTokens, Mode, BROKER_STATIC_KEYS_VAR};
 use tokenfuse_gateway::chainproof::Proving;
@@ -117,7 +117,10 @@ impl Broker {
             xaa: None,
             agent_tokens: Some(Arc::new(AgentTokens::with_static_keys(
                 self.tokens,
-                self.listed.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+                self.listed
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<BTreeSet<_>>(),
             ))),
             taint_gateway_key: self.taint_gateway_key.clone(),
         });

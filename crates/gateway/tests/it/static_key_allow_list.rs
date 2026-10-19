@@ -131,7 +131,11 @@ async fn require_admits_an_allow_listed_static_key_as_accept_does() {
     let g = gate(Mode::Require, &["key-a"]);
     let (status, _, body) = send(&g.st, call("r-list-1", &[key("sk-a")])).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(g.rows.last().key_id, "key-a", "the record files it under the key");
+    assert_eq!(
+        g.rows.last().key_id,
+        "key-a",
+        "the record files it under the key"
+    );
 }
 
 /// An unlisted key and an unknown key are refused with the same body, and the
@@ -142,7 +146,10 @@ async fn require_refuses_an_unlisted_static_key_and_an_unknown_one_the_same_way(
     let g = gate(Mode::Require, &["key-a"]);
     let (status, headers, unlisted) = send(&g.st, call("r-list-2", &[key("sk-b")])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{unlisted}");
-    assert_eq!(unlisted["error"]["type"], "agent_token_required", "{unlisted}");
+    assert_eq!(
+        unlisted["error"]["type"], "agent_token_required",
+        "{unlisted}"
+    );
     assert!(
         headers
             .get("www-authenticate")
@@ -152,7 +159,10 @@ async fn require_refuses_an_unlisted_static_key_and_an_unknown_one_the_same_way(
     );
     let (status, _, unknown) = send(&g.st, call("r-list-3", &[key("sk-zzz")])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{unknown}");
-    assert_eq!(unlisted, unknown, "the two refusals must not tell a caller apart");
+    assert_eq!(
+        unlisted, unknown,
+        "the two refusals must not tell a caller apart"
+    );
     let reason = unlisted["error"]["reason"].as_str().unwrap_or_default();
     assert!(
         reason.contains(STATIC_KEYS_VAR),
@@ -257,7 +267,10 @@ async fn a_static_key_call_is_never_sent_an_agent_token() {
         &g.st,
         call(
             "r-pdp-key",
-            &[key("sk-a"), ("x-fuse-agent-id", "agent://acme/keyed".to_string())],
+            &[
+                key("sk-a"),
+                ("x-fuse-agent-id", "agent://acme/keyed".to_string()),
+            ],
         ),
     )
     .await;
@@ -279,12 +292,7 @@ async fn an_oversized_agent_token_is_admitted_but_not_forwarded() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let g = with_pdp(gate(Mode::Accept, &[]), &url);
     let at = now();
-    let big = agent_token(
-        &g.issuer,
-        &g.holder,
-        at,
-        json!({ "pad": "x".repeat(5000) }),
-    );
+    let big = agent_token(&g.issuer, &g.holder, at, json!({ "pad": "x".repeat(5000) }));
     assert!(big.len() > tokenfuse_gateway::agenttoken::TOKEN_FOR_PDP_CAP_BYTES);
     let pf = proof_for(
         &g.holder,

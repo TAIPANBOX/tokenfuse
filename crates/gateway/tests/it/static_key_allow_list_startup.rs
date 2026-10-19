@@ -141,6 +141,8 @@ fn a_static_key_list_outside_require_stops_the_gateway_naming_it() {
     );
 }
 
+/// The refusal names the entry by its position and the key set's variable, and
+/// the value is not printed: the list may have been given a secret.
 #[test]
 fn a_static_key_list_naming_an_unconfigured_key_stops_the_gateway_naming_the_id() {
     let child = spawn(gateway(&[
@@ -148,17 +150,18 @@ fn a_static_key_list_naming_an_unconfigured_key_stops_the_gateway_naming_the_id(
         ("TOKENFUSE_CLIENT_KEYS", "sk-a:key-a".to_string()),
         ("TOKENFUSE_AGENT_TOKENS_STATIC_KEYS", "key-zz".to_string()),
     ]));
-    assert_refused(child, "a listed id no key configures", &["key-zz"]);
+    assert_refused(
+        child,
+        "a listed id no key configures",
+        &["number 1", "TOKENFUSE_CLIENT_KEYS"],
+    );
 }
 
 #[test]
 fn a_static_key_list_outside_require_stops_the_broker_naming_it() {
     let child = spawn(broker(&[
         ("TOKENFUSE_AGENT_TOKENS", "accept".to_string()),
-        (
-            "TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS",
-            "bkey".to_string(),
-        ),
+        ("TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS", "bkey".to_string()),
     ]));
     assert_refused(
         child,

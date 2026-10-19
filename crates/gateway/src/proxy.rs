@@ -1771,7 +1771,13 @@ async fn handle_call(
                 est_cost_usd: estimate.as_usd(),
                 attestation_method,
                 identity_source: caller.identity_source(),
-                agent_token: None,
+                // The agent's own token, as presented, when it admitted this call
+                // (invariant 140). Never for a static-key call.
+                agent_token: if caller.agent.is_some() {
+                    crate::agenttoken::token_for_pdp(&headers)
+                } else {
+                    None
+                },
                 approval_token,
                 // The LLM path has no pending call to name: the tools in the
                 // request are only OFFERED. See `DecideContext::tool_call`.
@@ -3065,12 +3071,33 @@ pub(crate) fn resolve_caller(
                 agent: Some(agent),
             })
         }
-        // `require` (invariant 123): every static key is refused, and so is a
-        // call with no credential, because the door that would admit it is the
-        // one this mode closes.
+        // `require` (invariant 123): a static key is refused unless the list
+        // names it (invariant 138), and a call with no credential is refused,
+        // because the door that would admit it is the one this mode closes. The
+        // refusal is one body for an unknown key, an unlisted key and no key, so
+        // a caller learns nothing about which of its keys are real.
         crate::agenttoken::Door::NotPresented if crate::agenttoken::required(&st.agent_tokens) => {
-            st.keystats.record_unauthorized();
-            Err(crate::agenttoken::required_response())
+            match resolve_client_key(st, headers) {
+                Some(key_id) if crate::agenttoken::static_key_listed(&st.agent_tokens, &key_id) => {
+                    Ok(Caller {
+                        principal: crate::runowners::key_principal(&key_id),
+                        key_id,
+                        agent: None,
+                    })
+                }
+                Some(key_id) if !key_id.is_empty() => {
+                    tracing::warn!(
+                        key_id = %key_id,
+                        "refused a static client key that TOKENFUSE_AGENT_TOKENS_STATIC_KEYS does not list"
+                    );
+                    st.keystats.record_unauthorized();
+                    Err(crate::agenttoken::required_response())
+                }
+                _ => {
+                    st.keystats.record_unauthorized();
+                    Err(crate::agenttoken::required_response())
+                }
+            }
         }
         crate::agenttoken::Door::NotPresented => match resolve_client_key(st, headers) {
             Some(key_id) => Ok(Caller {

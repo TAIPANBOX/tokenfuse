@@ -424,6 +424,10 @@ struct DecideWireRequest<'a> {
     attestation_method: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_source: Option<&'a str>,
+    /// The agent's own token as presented, for a call an agent token admitted
+    /// (invariant 140). Absent otherwise, so a static-key body is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_token: Option<&'a str>,
     approval_token: Option<&'a str>,
     chain_proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1103,6 +1107,7 @@ impl Wardryx {
             est_cost_usd: ctx.est_cost_usd,
             attestation_method: ctx.attestation_method.as_deref(),
             identity_source: ctx.identity_source.as_deref(),
+            agent_token: ctx.agent_token.as_deref(),
             approval_token: ctx.approval_token.as_deref(),
             chain_proven: ctx.chain_proven,
             tool_call: ctx.tool_call.as_ref().map(|t| ToolCallWire {
