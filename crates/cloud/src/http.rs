@@ -273,11 +273,12 @@ impl AppState {
         if (now_unix() - ts_num).abs() > devices::SIGNATURE_WINDOW_SECS {
             return Err(AuthError::SignatureInvalid);
         }
-        // A request signed before this process started was signed before a
-        // restart. The nonce ring is persisted too (invariant 132), but a
-        // request older than the process is refused outright, so a ring lost
-        // in a crash between autosaves cannot reopen the window.
-        if ts_num < self.store.started_unix() {
+        // A request signed no later than the second this process started was
+        // signed before, or in the same second as, the restart. The nonce ring
+        // is persisted too (invariant 132), but a request at or before the start
+        // is refused outright, so a ring lost in a crash between autosaves
+        // cannot reopen the window. The device retries with a fresh timestamp.
+        if ts_num <= self.store.started_unix() {
             return Err(AuthError::SignatureInvalid);
         }
 
