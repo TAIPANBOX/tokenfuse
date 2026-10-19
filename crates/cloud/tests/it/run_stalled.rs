@@ -12,6 +12,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, CallRecord, IncidentConfig, Principal, Store};
 
 const PLANNER: &str = "agent://acme.example/planner";
@@ -45,7 +46,7 @@ fn state_with_a_fast_stall_floor() -> (AppState, Arc<Store>) {
     }));
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -53,7 +54,7 @@ fn state_with_a_fast_stall_floor() -> (AppState, Arc<Store>) {
         },
     );
     keys.insert(
-        "viewerkey".into(),
+        digest("viewerkey"),
         Principal {
             org: "acme".into(),
             role: "viewer".into(),

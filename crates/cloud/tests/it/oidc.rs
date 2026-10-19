@@ -15,6 +15,7 @@ use http_body_util::BodyExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, verify_id_token, AppState, OidcConfig, Principal, Store};
 
 const ISSUER: &str = "https://idp.example.com";
@@ -124,7 +125,7 @@ fn state_with_oidc() -> AppState {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".to_string(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -139,7 +140,7 @@ fn state_keys_only() -> AppState {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".to_string(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),

@@ -9,13 +9,14 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, CallRecord, Principal, Store};
 
 fn test_state() -> (AppState, Arc<Store>) {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
     keys.insert(
-        "devkey".into(),
+        digest("devkey"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -23,7 +24,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         },
     );
     keys.insert(
-        "viewerkey".into(),
+        digest("viewerkey"),
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
@@ -31,7 +32,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         },
     );
     keys.insert(
-        "otherorg".into(),
+        digest("otherorg"),
         Principal {
             org: "beta".into(),
             role: "admin".into(),
@@ -681,6 +682,11 @@ async fn dashboard_is_served_at_root() {
     );
 }
 
+/// A preflight from a loopback origin (the local dashboard) is answered 204 and
+/// names that origin. This test asserted `*` for every caller until invariant
+/// 131 (1.19.0), which replaced the wildcard with an allow-list; the origin
+/// rules themselves are in `cors.rs`, and the refusal cases are in `cors.rs`
+/// and `cors_startup.rs`.
 #[tokio::test]
 async fn cors_preflight_is_answered() {
     let (state, _) = test_state();
@@ -689,6 +695,7 @@ async fn cors_preflight_is_answered() {
             Request::builder()
                 .method("OPTIONS")
                 .uri("/v1/runs")
+                .header("origin", "http://localhost:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -697,7 +704,7 @@ async fn cors_preflight_is_answered() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
         resp.headers().get("access-control-allow-origin").unwrap(),
-        "*"
+        "http://localhost:3000"
     );
 }
 
