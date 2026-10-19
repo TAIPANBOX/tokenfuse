@@ -1737,7 +1737,7 @@ run_case "audit-keyryx: an unusable signer configuration left running" fail \
 
 run_case "audit-keyryx: keyryx's signature served unverified" fail \
 	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::an_answer_that_does_not_verify_or_is_not_es256_is_never_served" \
-	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    public.verify(bytes, &sig).map_err(|_| {", "    Ok::<(), p256::ecdsa::Error>(()).map_err(|_| {")')" \
+	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    public.verify(bytes, &sig).map_err(|_| {", "    public.verify(bytes, &sig).or(Ok::<(), p256::ecdsa::Error>(())).map_err(|_| {")')" \
 	"an_answer_that_does_not_verify_or_is_not_es256_is_never_served ... FAILED"
 
 run_case "audit-keyryx: an unreachable keyryx replaced by the key in the environment" fail \
