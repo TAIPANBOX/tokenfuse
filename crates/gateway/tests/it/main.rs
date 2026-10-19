@@ -71,6 +71,8 @@ mod shadow_tool_pruning;
 mod streamed_tool_calls_are_judged;
 
 mod spend_reports_survive_a_stop;
+mod static_key_allow_list;
+mod static_key_allow_list_startup;
 mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
 mod the_gateway_holds_the_provider_key;

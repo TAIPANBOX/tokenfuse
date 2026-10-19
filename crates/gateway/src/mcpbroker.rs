@@ -270,6 +270,9 @@ pub struct CallContext {
     /// How the door knew the agent, for the policy plane: `agent-token`,
     /// `client-key` or `none`, from the door and never from a header.
     pub identity_source: Option<String>,
+    /// The agent's own token, as presented, when it admitted this call
+    /// (invariant 140). Read by the policy question only.
+    pub agent_token: Option<String>,
 }
 
 /// Where a call's session id came from, which decides whether it is trusted.
@@ -1004,7 +1007,7 @@ fn agent_refusal(st: &BrokerState, token_refused: bool) -> Response {
     if token_refused {
         crate::agenttoken::refused_response_with(&challenge)
     } else {
-        crate::agenttoken::required_response_with(&challenge)
+        crate::agenttoken::required_response_with(&challenge, crate::agenttoken::BROKER_STATIC_KEYS_VAR)
     }
 }
 
@@ -1244,6 +1247,7 @@ async fn handle(
                 gateway_key: None,
                 gateway_token: token,
                 identity_source: Some(crate::agenttoken::IDENTITY_AGENT_TOKEN.to_string()),
+                agent_token: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1332,6 +1336,7 @@ async fn handle(
                 // A credential vouchryx minted for a person and an agent, not
                 // the agent's own token.
                 identity_source: Some(crate::agenttoken::IDENTITY_CLIENT_KEY.to_string()),
+                agent_token: None,
             };
             return finish(&st, req, ctx).await;
         }
@@ -1471,6 +1476,7 @@ async fn handle(
         gateway_key: header(CLIENT_KEY_HEADER),
         gateway_token: None,
         identity_source: Some(identity_source),
+        agent_token: None,
     };
     finish(&st, req, ctx).await
 }
@@ -1936,6 +1942,7 @@ async fn process_into(
                         est_cost_usd: 0.0,
                         attestation_method: ctx.attestation_method.clone(),
                         identity_source: ctx.identity_source.clone(),
+                        agent_token: None,
                         approval_token: ctx.approval_token.clone(),
                         // The call itself, as the agent sent it: this is the
                         // site that runs BEFORE secret injection, so a

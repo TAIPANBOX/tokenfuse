@@ -578,7 +578,12 @@ async fn mcp_broker() {
     // The agent's own token as a door credential (invariant 123), read after the
     // delegation door and its revocation list, which it verifies against. The
     // LLM proxy reads it through the same call.
-    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(
+        &chain_proof,
+        "TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS",
+        "TOKENFUSE_MCP_KEYS",
+        &[],
+    );
     if let Some(t) = &agent_tokens {
         tracing::info!(
             mode = t.mode().as_str(),
@@ -1314,7 +1319,12 @@ async fn serve() {
     .await;
     // The agent's own token as a door credential (invariant 123): the same call
     // `mcp_broker` makes, against the delegation door just read.
-    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(&chain_proof);
+    let agent_tokens = tokenfuse_gateway::agenttoken::from_env(
+        &chain_proof,
+        "TOKENFUSE_AGENT_TOKENS_STATIC_KEYS",
+        "TOKENFUSE_CLIENT_KEYS",
+        &[],
+    );
     if let Some(t) = &agent_tokens {
         tracing::info!(
             mode = t.mode().as_str(),

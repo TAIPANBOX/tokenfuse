@@ -22,6 +22,7 @@
 //! door (issuer, JWKS, origin), a named audience, and a revocation list that
 //! fails closed.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -38,6 +39,17 @@ pub const WORDS: &[&str] = &["off", "accept", "require"];
 /// The key id the MCP broker's own gateway key must resolve to for the
 /// tool-call check to take an agent token the broker relays without a proof.
 pub const BROKER_KEY_ID: &str = "broker";
+
+/// The variable naming the static client keys still admitted under `require`
+/// at the gateway's doors (`TOKENFUSE_CLIENT_KEYS`).
+pub const STATIC_KEYS_VAR: &str = "TOKENFUSE_AGENT_TOKENS_STATIC_KEYS";
+
+/// The same list at the MCP broker, whose static keys are `TOKENFUSE_MCP_KEYS`.
+pub const BROKER_STATIC_KEYS_VAR: &str = "TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS";
+
+/// The most bytes of an agent token the policy plane is sent. Above it the token
+/// is admitted and not forwarded (invariant 140).
+pub const TOKEN_FOR_PDP_CAP_BYTES: usize = 4 * 1024;
 
 /// How many proof `jti` values one generation of the replay cache holds (two
 /// generations are kept). Only a proof that already verified reaches it, so it
@@ -78,6 +90,7 @@ impl Mode {
 pub struct AgentTokens {
     mode: Mode,
     replay: tokenfuse_dpop::ReplayCache,
+    allow: BTreeSet<String>,
 }
 
 impl AgentTokens {
@@ -85,7 +98,19 @@ impl AgentTokens {
         AgentTokens {
             mode,
             replay: tokenfuse_dpop::ReplayCache::new(REPLAY_CAP),
+            allow: BTreeSet::new(),
         }
+    }
+
+    /// [`AgentTokens::new`] with the static key ids admitted under `require`.
+    pub fn with_static_keys(mode: Mode, allow: BTreeSet<String>) -> Self {
+        let _ = allow;
+        Self::new(mode)
+    }
+
+    /// The static key ids this door admits under `require`, sorted.
+    pub fn static_key_ids(&self) -> Vec<String> {
+        self.allow.iter().cloned().collect()
     }
 
     pub fn mode(&self) -> Mode {
@@ -118,18 +143,46 @@ pub fn required(tokens: &Tokens) -> bool {
     tokens.as_ref().is_some_and(|t| t.mode() == Mode::Require)
 }
 
+/// Whether a static client key with this id is admitted under `require`
+/// (invariant 138 at the gateway's doors, 139 at the broker's).
+pub fn static_key_listed(tokens: &Tokens, key_id: &str) -> bool {
+    let _ = (tokens, key_id);
+    false
+}
+
+/// The names one static-key list is read under, and the key ids it may name.
+pub struct StaticKeys<'a> {
+    /// The variable the list is read from, named in every refusal about it.
+    pub list_var: &'a str,
+    /// The variable the key set is read from, named when a listed id is not in it.
+    pub keys_var: &'a str,
+    /// The list's value, `None` when the variable is unset.
+    pub value: Option<&'a str>,
+    /// The key ids the key set configures.
+    pub configured: &'a [&'a str],
+}
+
+/// Read a static-key list for `mode`: empty when unset or blank, an error when
+/// it is set outside `require` or names an id the key set does not configure.
+pub fn parse_static_keys(spec: &StaticKeys<'_>, mode: Mode) -> Result<BTreeSet<String>, String> {
+    let _ = (spec, mode);
+    Ok(BTreeSet::new())
+}
+
 /// The pure startup decision: the switch's value, the delegation door this
 /// process built, and what the revocation variables asked for.
 pub fn from_values(
     value: Option<&str>,
     proving: Option<&crate::chainproof::Proving>,
     revocations: &crate::revocations::Wanted,
+    statics: &StaticKeys<'_>,
 ) -> Result<Tokens, String> {
     let mode = match crate::defaults::switch_word(SWITCH, value, WORDS)? {
         None | Some("off") => return Ok(None),
         Some("require") => Mode::Require,
         Some(_) => Mode::Accept,
     };
+    let _ = statics;
     let on = mode.as_str();
     let Some(proving) = proving else {
         return Err(format!(
@@ -170,11 +223,29 @@ pub fn from_values(
 }
 
 /// [`from_values`] against the process environment; exits 2 on a refusal,
-/// before the listener binds.
-pub fn from_env(proving: &crate::chainproof::ChainProof) -> Tokens {
+/// before the listener binds. `list_var` and `keys_var` name the static-key
+/// list and the key set it is checked against (the gateway's or the broker's).
+pub fn from_env(
+    proving: &crate::chainproof::ChainProof,
+    list_var: &str,
+    keys_var: &str,
+    configured: &[&str],
+) -> Tokens {
     let value = std::env::var(SWITCH).ok();
+    let list = std::env::var(list_var).ok();
     let wanted = crate::revocations::wanted(|k| std::env::var(k).ok(), proving.is_some());
-    crate::defaults::exit_on_refusal(from_values(value.as_deref(), proving.as_deref(), &wanted))
+    let statics = StaticKeys {
+        list_var,
+        keys_var,
+        value: list.as_deref(),
+        configured,
+    };
+    crate::defaults::exit_on_refusal(from_values(
+        value.as_deref(),
+        proving.as_deref(),
+        &wanted,
+        &statics,
+    ))
 }
 
 /// What a request's credentials said about this door.
@@ -258,6 +329,19 @@ fn admitted(tokens: &AgentTokens, agent: VerifiedAgent, now: i64) -> Door {
 fn agent_token_in(headers: &HeaderMap) -> Option<&str> {
     crate::chainproof::dpop_credential(headers.get("authorization").and_then(|v| v.to_str().ok()))
         .filter(|t| tokenfuse_delegation::is_agent_token(t))
+}
+
+/// The agent token this request presented, for the policy plane, when it is
+/// within [`TOKEN_FOR_PDP_CAP_BYTES`] (invariant 140).
+pub fn token_for_pdp(headers: &HeaderMap) -> Option<String> {
+    let _ = headers;
+    None
+}
+
+/// A token for the policy plane when it is an agent token within the cap.
+pub fn for_pdp(token: &str) -> Option<String> {
+    let _ = token;
+    None
 }
 
 /// Judge an agent token the MCP broker relays to the tool-call check beside
@@ -360,11 +444,12 @@ pub fn refused_response_with(challenge: &str) -> Response {
 
 /// `401` for a call with no agent token when the door requires one.
 pub fn required_response() -> Response {
-    required_response_with(REQUIRED_CHALLENGE)
+    required_response_with(REQUIRED_CHALLENGE, STATIC_KEYS_VAR)
 }
 
 /// [`required_response`] with the challenge the caller gives.
-pub fn required_response_with(challenge: &str) -> Response {
+pub fn required_response_with(challenge: &str, list_var: &str) -> Response {
+    let _ = list_var;
     unauthorized_json(
         "agent_token_required",
         "this gateway requires an agent token: `Authorization: DPoP <token>` with a DPoP proof",
@@ -420,7 +505,8 @@ mod tests {
     use crate::chainproof::Proving;
     use crate::revocations::Wanted;
     use tokenfuse_delegation::revocations::FailMode;
-    use tokenfuse_delegation::testing::{cfg, Key};
+    use tokenfuse_delegation::testing::{agent_token, cfg, token, Key};
+    use serde_json::json;
 
     fn proving(audience: &str) -> Proving {
         let mut c = cfg(&Key::new());
@@ -460,12 +546,12 @@ mod tests {
             (Some(" require "), Some(Mode::Require)),
         ] {
             assert_eq!(
-                mode_of(from_values(value, Some(&p), &on)),
+                mode_of(from_values(value, Some(&p), &on, &no_list())),
                 Ok(want),
                 "{value:?}"
             );
         }
-        let err = from_values(Some("acept"), Some(&p), &on).unwrap_err();
+        let err = from_values(Some("acept"), Some(&p), &on, &no_list()).unwrap_err();
         assert!(err.contains(SWITCH), "{err}");
         assert!(err.contains("acept"), "{err}");
         assert!(err.contains("off|accept|require"), "{err}");
@@ -493,7 +579,7 @@ mod tests {
             (Some(&p), &closed, ""),
         ];
         for (proving, wanted, names) in cases {
-            let got = from_values(Some("accept"), proving, wanted);
+            let got = from_values(Some("accept"), proving, wanted, &no_list());
             if names.is_empty() {
                 assert_eq!(mode_of(got), Ok(Some(Mode::Accept)));
             } else {
@@ -504,15 +590,15 @@ mod tests {
             }
         }
         for audience in ["", "   "] {
-            let err = from_values(Some("require"), Some(&proving(audience)), &closed)
+            let err = from_values(Some("require"), Some(&proving(audience)), &closed, &no_list())
                 .expect_err("an empty audience must refuse");
             assert!(err.contains("TOKENFUSE_DELEGATION_AUDIENCE"), "{err}");
         }
         assert_eq!(
-            mode_of(from_values(Some("off"), None, &Wanted::Off)),
+            mode_of(from_values(Some("off"), None, &Wanted::Off, &no_list())),
             Ok(None)
         );
-        assert_eq!(mode_of(from_values(None, None, &Wanted::Off)), Ok(None));
+        assert_eq!(mode_of(from_values(None, None, &Wanted::Off, &no_list())), Ok(None));
     }
 
     /// wardryx is told how the door knew the agent, from the door alone.
@@ -575,5 +661,153 @@ mod tests {
             "elsewhere",
         );
         assert_eq!(contradiction(&elsewhere, &agent, ""), None);
+    }
+
+    fn no_list() -> StaticKeys<'static> {
+        StaticKeys {
+            list_var: STATIC_KEYS_VAR,
+            keys_var: "TOKENFUSE_CLIENT_KEYS",
+            value: None,
+            configured: &[],
+        }
+    }
+
+    fn list<'a>(value: &'a str, configured: &'a [&'a str]) -> StaticKeys<'a> {
+        StaticKeys {
+            list_var: STATIC_KEYS_VAR,
+            keys_var: "TOKENFUSE_CLIENT_KEYS",
+            value: Some(value),
+            configured,
+        }
+    }
+
+    fn ids(set: BTreeSet<String>) -> Vec<String> {
+        set.into_iter().collect()
+    }
+
+    /// The list is read under require and nowhere else: set while the switch is
+    /// off or accept, it refuses and names the variable. Checked before the
+    /// delegation door is, so the refusal is the one a reader meets first.
+    #[test]
+    fn the_static_key_list_is_refused_unless_require_is_on() {
+        let p = proving("https://tokenfuse.acme.example");
+        let on = polling(FailMode::Closed);
+        let configured = ["key-a"];
+        for value in [None, Some("off"), Some("accept")] {
+            let err = from_values(value, Some(&p), &on, &list("key-a", &configured))
+                .expect_err("a list outside require must refuse");
+            assert!(err.contains(STATIC_KEYS_VAR), "{value:?}: {err}");
+        }
+        let err = from_values(Some("accept"), None, &Wanted::Off, &list("key-a", &configured))
+            .expect_err("a list refuses before the delegation door is asked about");
+        assert!(err.contains(STATIC_KEYS_VAR), "{err}");
+    }
+
+    /// An id the key set does not configure is refused, naming the id and the
+    /// key set's variable: a list naming a key nobody holds is a typo or a
+    /// removed key, and either way the operator must hear it at startup.
+    #[test]
+    fn the_static_key_list_names_an_id_the_key_set_does_not_configure() {
+        let configured = ["key-a"];
+        let err = parse_static_keys(&list("key-a,key-zz", &configured), Mode::Require)
+            .expect_err("an id the key set does not configure must refuse");
+        assert!(err.contains("key-zz"), "{err}");
+        assert!(err.contains("TOKENFUSE_CLIENT_KEYS"), "{err}");
+    }
+
+    /// A value that names no key id at all is refused rather than read as an
+    /// empty list: an operator who wrote separators meant a list.
+    #[test]
+    fn a_list_of_separators_alone_names_no_key_and_is_refused() {
+        let configured = ["key-a"];
+        for value in [",", " , ,", " , "] {
+            assert!(
+                parse_static_keys(&list(value, &configured), Mode::Require).is_err(),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Entries are trimmed and a repeated id is one id.
+    #[test]
+    fn the_static_key_list_reads_its_entries_trimmed() {
+        let configured = ["key-a", "key-b"];
+        let got = parse_static_keys(&list(" key-b , key-a,key-a ", &configured), Mode::Require);
+        assert_eq!(got.map(ids), Ok(vec!["key-a".to_string(), "key-b".to_string()]));
+    }
+
+    /// Unset, empty and blank are no list in every mode, as the switch's own
+    /// blank handling reads them.
+    #[test]
+    fn a_blank_static_key_list_is_no_list_in_any_mode() {
+        for mode in [Mode::Off, Mode::Accept, Mode::Require] {
+            for value in [None, Some(""), Some("   ")] {
+                let spec = StaticKeys {
+                    list_var: STATIC_KEYS_VAR,
+                    keys_var: "TOKENFUSE_CLIENT_KEYS",
+                    value,
+                    configured: &[],
+                };
+                assert_eq!(parse_static_keys(&spec, mode), Ok(BTreeSet::new()), "{mode:?} {value:?}");
+            }
+        }
+    }
+
+    /// Under require, only a listed id is admitted; off the mode, nothing is.
+    #[test]
+    fn static_key_listed_is_true_only_for_a_listed_id_under_require() {
+        let allow: BTreeSet<String> = ["key-a".to_string()].into_iter().collect();
+        let require = Some(Arc::new(AgentTokens::with_static_keys(Mode::Require, allow.clone())));
+        assert!(static_key_listed(&require, "key-a"));
+        assert!(!static_key_listed(&require, "key-b"));
+        assert!(!static_key_listed(&require, ""));
+        let accept = Some(Arc::new(AgentTokens::with_static_keys(Mode::Accept, allow)));
+        assert!(!static_key_listed(&accept, "key-a"));
+        assert!(!static_key_listed(&None, "key-a"));
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("DPoP {token}").parse().unwrap());
+        h
+    }
+
+    /// Only an agent token is forwarded: a delegation token is a chain proof,
+    /// and the policy plane is not told about it through this field.
+    #[test]
+    fn a_token_for_the_policy_plane_is_only_an_agent_token() {
+        let issuer = Key::new();
+        let holder = Key::new();
+        let at = crate::sink::now_millis() / 1000;
+        let agent = agent_token(&issuer, &holder, at, json!({}));
+        let delegation = token(&issuer, &holder, at, json!({}));
+        assert_eq!(token_for_pdp(&bearer(&agent)), Some(agent.clone()));
+        assert_eq!(token_for_pdp(&bearer(&delegation)), None);
+        assert_eq!(token_for_pdp(&HeaderMap::new()), None);
+    }
+
+    /// At the cap a token is forwarded and one byte past it is not: grow the
+    /// token's padding one byte at a time until it crosses the cap, and check
+    /// the boundary on both sides of the crossing.
+    #[test]
+    fn a_token_for_the_policy_plane_is_bounded_at_4_kib() {
+        let issuer = Key::new();
+        let holder = Key::new();
+        let at = crate::sink::now_millis() / 1000;
+        let mut pad = 0usize;
+        let (mut last_under, mut first_over) = (None, None);
+        while first_over.is_none() {
+            let tok = agent_token(&issuer, &holder, at, json!({ "pad": "x".repeat(pad) }));
+            if tok.len() <= TOKEN_FOR_PDP_CAP_BYTES {
+                last_under = Some(tok);
+            } else {
+                first_over = Some(tok);
+            }
+            pad += 1;
+        }
+        let under = last_under.expect("a token under the cap");
+        let over = first_over.expect("a token over the cap");
+        assert_eq!(for_pdp(&under), Some(under.clone()), "{} bytes", under.len());
+        assert_eq!(for_pdp(&over), None, "{} bytes", over.len());
     }
 }

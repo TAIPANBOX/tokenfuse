@@ -303,6 +303,10 @@ pub struct DecideContext {
     /// `pdp.go`, the per-request rules), so no verdict that depended on it is
     /// ever stored here.
     pub identity_source: Option<String>,
+    /// The agent's own token, exactly as presented, when an agent token admitted
+    /// this call (invariant 140). Sent to the policy plane as `agent_token` and
+    /// never for a call a static key admitted. The DPoP proof is not sent.
+    pub agent_token: Option<String>,
     /// Whether THIS gateway verified a delegation token for this request, per
     /// agent-passport SPEC 5.2, and took `on_behalf_of` from it.
     ///
@@ -1464,6 +1468,7 @@ mod tests {
                 est_cost_usd: 0.0,
                 attestation_method: None,
                 identity_source: None,
+                agent_token: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1488,6 +1493,7 @@ mod tests {
                 est_cost_usd: 0.0,
                 attestation_method: None,
                 identity_source: None,
+                agent_token: None,
                 approval_token: None,
                 tool_call: None,
             })
@@ -1516,6 +1522,7 @@ mod tests {
             est_cost_usd: 0.0,
             attestation_method: None,
             identity_source: None,
+            agent_token: None,
             approval_token: None,
             tool_call: None,
         }
@@ -2032,6 +2039,26 @@ mod tests {
         assert!(
             !b.as_object().unwrap().contains_key("tool_call"),
             "the LLM path's body must be unchanged: {b}"
+        );
+    }
+
+    /// The agent's token is sent exactly as the context carries it, and a
+    /// context that carries none sends no member at all, so a static-key
+    /// decide's body is what it was before the field existed (invariant 140).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wire_body_carries_the_agent_token_only_when_the_call_had_one() {
+        let (url, bodies) = capturing(Duration::ZERO).await;
+        let w = hook(url, FailMode::Closed, Duration::from_secs(0));
+        let mut with = ctx_for("agent://t/a");
+        with.agent_token = Some("eyJ.tok.sig".to_string());
+        w.decide(with).await;
+        let b = bodies.lock().unwrap().pop().expect("asked");
+        assert_eq!(b["agent_token"], serde_json::json!("eyJ.tok.sig"), "{b}");
+        w.decide(ctx_for("agent://t/b")).await;
+        let b = bodies.lock().unwrap().pop().expect("asked");
+        assert!(
+            !b.as_object().unwrap().contains_key("agent_token"),
+            "a call with no token must send no member: {b}"
         );
     }
 

@@ -1771,6 +1771,7 @@ async fn handle_call(
                 est_cost_usd: estimate.as_usd(),
                 attestation_method,
                 identity_source: caller.identity_source(),
+                agent_token: None,
                 approval_token,
                 // The LLM path has no pending call to name: the tools in the
                 // request are only OFFERED. See `DecideContext::tool_call`.
