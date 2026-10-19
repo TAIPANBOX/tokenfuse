@@ -637,9 +637,9 @@ fn apply_run_budget_ceiling(
     }
 }
 
-/// A ceiling as dollars for the `x-fuse-budget-clamped` header: exact integer
-/// arithmetic, at least two decimals, trailing zeros past the second trimmed
-/// (`1.00`, `0.50`, `2.345678`).
+/// A dollar figure for the `x-fuse-budget-clamped` and `x-fuse-budget` headers:
+/// exact integer arithmetic, at least two decimals, trailing zeros past the
+/// second trimmed (`1.00`, `0.50`, `2.345678`).
 fn ceiling_usd_string(ceiling: Microusd) -> String {
     let micro = ceiling.0.max(0);
     let frac = format!("{:06}", micro % 1_000_000);
@@ -649,16 +649,25 @@ fn ceiling_usd_string(ceiling: Microusd) -> String {
 
 /// The shared handler. A thin wrapper: [`handle_call`] decides everything and
 /// reports through `clamped` when the operator's run-budget ceiling reduced
-/// the budget the caller (or a default) asked for, and this stamps
-/// `x-fuse-budget-clamped: <ceiling>` on whatever answer it produced, a
-/// refusal and a stream included, so no return path inside `handle_call`
-/// can forget it.
+/// the budget the caller (or a default) asked for, and through `raise_kept`
+/// when a caller's raise of an open run's budget was refused (invariant 135).
+/// This stamps `x-fuse-budget-clamped: <ceiling>` and
+/// `x-fuse-budget: raise-refused; kept=<usd>` on whatever answer it produced,
+/// a refusal and a stream included, so no return path inside `handle_call`
+/// can forget either.
 async fn handle(wire: Wire, st: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let mut clamped: Option<Microusd> = None;
-    let mut resp = handle_call(wire, st, headers, body, &mut clamped).await;
+    let mut raise_kept: Option<Microusd> = None;
+    let mut resp = handle_call(wire, st, headers, body, &mut clamped, &mut raise_kept).await;
     if let Some(ceiling) = clamped {
         if let Ok(v) = HeaderValue::from_str(&ceiling_usd_string(ceiling)) {
             resp.headers_mut().insert("x-fuse-budget-clamped", v);
+        }
+    }
+    if let Some(kept) = raise_kept {
+        let value = format!("raise-refused; kept={}", ceiling_usd_string(kept));
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            resp.headers_mut().insert("x-fuse-budget", v);
         }
     }
     resp
@@ -670,6 +679,7 @@ async fn handle_call(
     headers: HeaderMap,
     mut body: Bytes,
     clamped: &mut Option<Microusd>,
+    raise_kept: &mut Option<Microusd>,
 ) -> Response {
     // A process forwards to one upstream endpoint, so it serves the door
     // matching that upstream's shape and refuses the other one loudly, before
@@ -893,6 +903,8 @@ async fn handle_call(
     // open run may be lower than the declared one (invariant 135).
     let budget = opened.budget;
     if let Some(refused) = opened.raise_refused {
+        // The answer to this call names the refusal and the budget the run kept (invariant 135).
+        *raise_kept = Some(budget);
         if st.note_budget_raise_refused(&run_id) {
             tracing::warn!(
                 run = %run_id,

@@ -57,3 +57,27 @@ Feature: A caller can cap its own run's budget but cannot widen it once the run 
     Given a run was closed
     When a caller opens it again declaring 2 dollars
     Then the reopened run's budget is 2 dollars and nothing was refused
+
+  # @test:anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget
+  Scenario: A refused raise is named on a buffered answer on the Anthropic door
+    Given a run was opened by a call that declared a budget of 0.50 dollar
+    When the agent's next call declares a budget of 1000 dollars
+    Then the answer carries x-fuse-budget: raise-refused; kept=0.50
+
+  # @test:openai_streamed_answer_names_the_refused_raise_and_the_kept_budget
+  Scenario: A refused raise is named on a streamed answer on the OpenAI door
+    Given a run was opened by a call that declared a budget of 0.50 dollar on the OpenAI door
+    When the agent's next streamed call declares a budget of 1000 dollars
+    Then the streamed answer carries x-fuse-budget: raise-refused; kept=0.50
+
+  # @test:the_header_rides_a_refusal_that_the_kept_budget_then_causes
+  Scenario: The header rides the 402 that the kept budget then causes
+    Given a run was opened by a call that declared a budget of 0.50 dollar
+    When the agent's next call declares 1000 dollars and reserves 1.50 dollars
+    Then the call is refused with 402 and the refusal carries x-fuse-budget: raise-refused; kept=0.50
+
+  # @test:no_header_when_no_raise_was_refused
+  Scenario: A lower declaration is not reported as a refusal
+    Given a run was opened by a call that declared a budget of 0.50 dollar
+    When the agent's next call declares a budget of 0.25 dollar
+    Then the answer carries no x-fuse-budget header

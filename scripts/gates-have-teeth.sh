@@ -1797,6 +1797,11 @@ run_case "run-budget: an operator's raise capped at the held budget" fail \
 	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Operator => (budget, None),", "BudgetBasis::Operator if budget > s.budget => (s.budget, None),\n                    BudgetBasis::Operator => (budget, None),")')" \
 	"an_operator_budget_moves_an_open_run_either_way ... FAILED"
 
+run_case "run-budget: the answer names the declared budget instead of the kept one" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_raise_on_the_wire::anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "*raise_kept = Some(budget);", "*raise_kept = Some(refused);")')" \
+	"anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

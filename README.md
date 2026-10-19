@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.18.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2290-brightgreen)
+![tests](https://img.shields.io/badge/tests-2296-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -404,7 +404,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_US
   ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
 
-A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling. An open run never moves up on a caller's declaration, so a later call cannot widen it, to the ceiling or otherwise (invariant 135). A budget an operator set in the Cloud is the operator's own word and is not clamped, and it moves the run either way. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
+A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling. An open run never moves up on a caller's declaration, so a later call cannot widen it, to the ceiling or otherwise (invariant 135); the answer to a call whose raise was refused carries `x-fuse-budget: raise-refused; kept=<usd>`, naming the budget the run kept, on both doors and on a stream too. A budget an operator set in the Cloud is the operator's own word and is not clamped, and it moves the run either way. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
 
 **Which price a call is charged at.** Every metered answer, streamed or not, carries `x-fuse-price`: `known` when the price book (built-in rows plus any `TOKENFUSE_PRICE_BOOK` rows) has a row for the model id, `fallback` when it did not and the call was priced at the conservative fallback of USD 15 / 75 per million tokens. That is the safe direction for a cap: it is at or above the input and output base rate of every row in the book (the dearest there is o1, at 15 / 60), and about 150 times the list price of Claude Haiku 5.5 (0.10 / 0.50). The first fallback-priced call of each model id is also logged at warn. `x-fuse-cost-usd` is this call's settled cost and `x-fuse-spent-usd` the run's running total, so a reader recording per-call charges wants the first.
 

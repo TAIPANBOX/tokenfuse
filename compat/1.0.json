@@ -158,7 +158,8 @@
       "x-fuse-similarity",
       "x-fuse-saved-usd",
       "x-fuse-price",
-      "x-fuse-approval-id"
+      "x-fuse-approval-id",
+      "x-fuse-budget"
     ],
     "http.cloud_routes": [
       "/",

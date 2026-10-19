@@ -57,7 +57,10 @@ async fn call(st: &AppState, wire: Wire, run: &str, budget: &str, stream: bool) 
         .header("x-fuse-budget-usd", budget)
         .body(Body::from(body.to_string()))
         .unwrap();
-    tokenfuse_gateway::app(st.clone()).oneshot(req).await.unwrap()
+    tokenfuse_gateway::app(st.clone())
+        .oneshot(req)
+        .await
+        .unwrap()
 }
 
 fn budget_header(resp: &Response<Body>) -> Option<String> {
@@ -77,7 +80,11 @@ async fn refused_raise(wire: Wire, run: &str, stream: bool) -> Response<Body> {
 #[tokio::test]
 async fn anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget() {
     let resp = refused_raise(Wire::Anthropic, "wire-a-buf", false).await;
-    assert_eq!(resp.status(), StatusCode::OK, "a refused raise refuses the raise, not the call");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a refused raise refuses the raise, not the call"
+    );
     assert_eq!(
         budget_header(&resp).as_deref(),
         Some("raise-refused; kept=0.50"),
@@ -123,7 +130,10 @@ async fn openai_streamed_answer_names_the_refused_raise_and_the_kept_budget() {
 async fn no_header_when_no_raise_was_refused() {
     let st = gateway(Wire::Anthropic);
     let first = call(&st, Wire::Anthropic, "wire-none", "0.50", false).await;
-    assert!(budget_header(&first).is_none(), "the opening call raised nothing");
+    assert!(
+        budget_header(&first).is_none(),
+        "the opening call raised nothing"
+    );
     let lower = call(&st, Wire::Anthropic, "wire-none", "0.25", false).await;
     assert_eq!(lower.status(), StatusCode::OK);
     assert!(
@@ -140,7 +150,10 @@ async fn the_header_rides_a_refusal_that_the_kept_budget_then_causes() {
     call(&st, Wire::Anthropic, "wire-402", "0.50", false).await;
     let raised = call(&st, Wire::Anthropic, "wire-402", "1000", false).await;
     assert_eq!(raised.status(), StatusCode::OK);
-    assert_eq!(budget_header(&raised).as_deref(), Some("raise-refused; kept=0.50"));
+    assert_eq!(
+        budget_header(&raised).as_deref(),
+        Some("raise-refused; kept=0.50")
+    );
     // A USD 1.50 reservation does not fit a run kept at 0.50: a 402, with the header.
     let big = serde_json::json!({
         "model": "test-model", "max_tokens": 100000,
@@ -154,5 +167,8 @@ async fn the_header_rides_a_refusal_that_the_kept_budget_then_causes() {
         .unwrap();
     let refused = tokenfuse_gateway::app(st).oneshot(req).await.unwrap();
     assert_eq!(refused.status(), StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(budget_header(&refused).as_deref(), Some("raise-refused; kept=0.50"));
+    assert_eq!(
+        budget_header(&refused).as_deref(),
+        Some("raise-refused; kept=0.50")
+    );
 }
