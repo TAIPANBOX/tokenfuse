@@ -2,10 +2,10 @@ Feature: An operator can cap the run budget a caller declares for itself
 
   The budget of a run comes from the x-fuse-budget-usd header the agent sends,
   and an open run takes the budget of its latest call, so with no client keys
-  the per-run ceiling is whatever the agent declares and its next call can
-  widen it. Widening stays, because it is the one release valve for a
-  reservation kept after an unknown outcome. TOKENFUSE_MAX_RUN_BUDGET_USD
-  bounds it: a budget the caller or a default chose is clamped to the ceiling,
+  the per-run ceiling is whatever the agent declares. Invariant 135 fixes an
+  open run's budget at its first declaration: a later call may lower it and
+  never raise it. TOKENFUSE_MAX_RUN_BUDGET_USD bounds that first declaration:
+  a budget the caller or a default chose is clamped to the ceiling,
   and a budget an operator set in the Cloud is not.
 
   # @test:no_run_budget_ceiling_is_set_when_nothing_is_configured

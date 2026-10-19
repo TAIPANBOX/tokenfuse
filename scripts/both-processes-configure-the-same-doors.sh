@@ -52,12 +52,14 @@ for i, line in enumerate(lines, 1):
     fn_at[i] = current
 
 found = {}
+calls = {}
 for i, line in enumerate(lines, 1):
     if line.lstrip().startswith("//"):
         continue
     for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)::from_env\(", line):
         if fn_at[i] in PROCESSES:
             found.setdefault(m.group(1), {}).setdefault(fn_at[i], i)
+            calls.setdefault(m.group(1), []).append((fn_at[i], i))
 
 if not found:
     print(f"no `<module>::from_env(` call was found in {SRC} at all, so this")
@@ -85,6 +87,24 @@ for module in sorted(found):
     else:
         bad.append((module, sorted(where)[0], missing[0], line_no))
 
+# A `process-local:` exception on a door BOTH processes configure is stale.
+# It was true when written and is now false, and it still reads as a decision
+# that somebody made, so it fails: delete the comment or make the other process
+# stop configuring the door.
+stale = []
+for module in sorted(found):
+    if any(p not in found[module] for p in PROCESSES):
+        continue
+    for proc, line_no in calls[module]:
+        reason = reason_above(line_no)
+        if reason:
+            stale.append((module, proc, line_no, reason))
+
+for module, proc, line_no, reason in stale:
+    print(f"{SRC}:{line_no}: stale exception. `{module}::from_env()` is configured in both")
+    print(f"  processes, but `{proc}` carries `process-local: {reason}` above this call.")
+    print("  Delete the comment, or stop configuring the door in the other process.")
+
 for module, has, lacks, line_no in bad:
     print(f"{SRC}:{line_no}: `{module}::from_env()` is called in `{has}` and not in `{lacks}`.")
     print(f"  So one of the two processes runs with `{module}` unconfigured while the")
@@ -93,6 +113,10 @@ for module, has, lacks, line_no in bad:
     print("  within six lines above the call saying why that process does not need it.")
 
 n = len(found)
+if stale:
+    print()
+    print(f"{len(stale)} stale exception(s) on a door configured in both processes.")
+    sys.exit(1)
 if bad:
     print()
     print(f"{len(bad)} door(s) of {n} configured in one process and unexplained in the other.")

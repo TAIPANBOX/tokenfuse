@@ -25,6 +25,7 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 /// process was killed by a signal with no code).
 fn run_mcp_scan(args: &[&str]) -> i32 {
     let out = Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .arg("mcp-scan")
         .args(args)
         .output()
@@ -135,6 +136,7 @@ fn run_error_live_unreachable_exits_2() {
     // A --url scan against an unreachable endpoint is a run error → 2, not 0.
     // Port 1 on loopback refuses fast; keep the client timeout short.
     let out = Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .arg("mcp-scan")
         .args(["--url", "http://127.0.0.1:1/"])
         .env("TOKENFUSE_MCP_SCAN_CONNECT_TIMEOUT_SECS", "1")

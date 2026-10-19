@@ -73,6 +73,7 @@ async fn stub_cloud(hang: bool) -> (String, Cloud) {
 
 fn spawn(addr: &str, upstream: &str, cloud: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_MAX_RUN_BUDGET_USD")

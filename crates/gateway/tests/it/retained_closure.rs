@@ -134,6 +134,7 @@ fn spawn(
     secret: Option<&str>,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tokenfuse"));
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_CLOUD_URL")
@@ -624,6 +625,7 @@ async fn with_no_closure_secret_the_route_is_off() {
 #[test]
 fn a_closure_secret_too_short_refuses_to_start() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_DATA_DIR")
         .env_remove("TOKENFUSE_CLOUD_URL")

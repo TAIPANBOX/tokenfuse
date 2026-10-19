@@ -151,6 +151,14 @@ pub fn required_switch_from(name: &str, value: Option<&str>) -> Result<bool, Str
 /// who wrote the word in capitals meant it, and a deployment that did so before
 /// this change now enforces (see the feature file's upgrade note).
 pub fn wardryx_mode_from(value: Option<&str>) -> Result<crate::wardryx::WardryxMode, String> {
+    wardryx_mode_under(Profile::Observe, value)
+}
+
+/// [`wardryx_mode_from`] with the profile's default for an unset value.
+pub fn wardryx_mode_under(
+    profile: Profile,
+    value: Option<&str>,
+) -> Result<crate::wardryx::WardryxMode, String> {
     use crate::wardryx::WardryxMode;
     Ok(
         match switch_word(
@@ -160,7 +168,8 @@ pub fn wardryx_mode_from(value: Option<&str>) -> Result<crate::wardryx::WardryxM
         )? {
             Some("shadow") => WardryxMode::Shadow,
             Some("enforce") => WardryxMode::Enforce,
-            _ => WardryxMode::Off,
+            Some(_) => WardryxMode::Off,
+            None => profile.wardryx_mode(),
         },
     )
 }
@@ -237,6 +246,136 @@ pub fn exit_on_refusal<T>(result: Result<T, String>) -> T {
             std::process::exit(2);
         }
     }
+}
+
+/// The governance profile (`TOKENFUSE_PROFILE`, CLAUDE.md invariant 136).
+///
+/// **Governed is the default.** An unconfigured gateway used to be a
+/// pass-through: budgets shadowed, the firewall shadowed, the policy hook off,
+/// declassification open, and the admin routes answering anyone on loopback.
+/// The review of 2026-10-17 (F-010) found that a quickstart produced exactly
+/// that, an observer and not a control. `Observe` reproduces those defaults
+/// and says at startup that it enforces nothing that is not set explicitly.
+///
+/// The profile supplies DEFAULTS only. Every variable an operator sets wins
+/// over it, and so does a policy file's own `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Governed,
+    Observe,
+}
+
+impl Profile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Profile::Governed => "governed",
+            Profile::Observe => "observe",
+        }
+    }
+
+    pub fn is_governed(self) -> bool {
+        self == Profile::Governed
+    }
+
+    /// The budget mode an unset `TOKENFUSE_MODE` gets: enforce under governed,
+    /// shadow under observe (the drop-in default, as before).
+    pub fn policy_mode(self) -> Mode {
+        match self {
+            Profile::Governed => Mode::Enforce,
+            Profile::Observe => Mode::Shadow,
+        }
+    }
+
+    /// The firewall mode when neither `TOKENFUSE_FIREWALL` nor a policy file
+    /// names one: enforce under governed, shadow under observe.
+    pub fn firewall_mode(self) -> tokenfuse_core::taint::FirewallMode {
+        match self {
+            Profile::Governed => tokenfuse_core::taint::FirewallMode::Enforce,
+            Profile::Observe => tokenfuse_core::taint::FirewallMode::Shadow,
+        }
+    }
+
+    /// The mode a policy file gets when it names none (CLAUDE.md invariant 136):
+    /// enforce under governed, off under observe, which is what every file got
+    /// before the profile existed. A file that names a mode is never overridden.
+    pub fn absent_file_mode(self) -> tokenfuse_core::taint::FirewallMode {
+        match self {
+            Profile::Governed => tokenfuse_core::taint::FirewallMode::Enforce,
+            Profile::Observe => tokenfuse_core::taint::FirewallMode::Off,
+        }
+    }
+
+    /// The policy hook's mode when `TOKENFUSE_WARDRYX_MODE` is unset. Enforce
+    /// under governed; the hook still stays off without a `TOKENFUSE_WARDRYX_URL`
+    /// (`wardryx::Wardryx::from_vars`), and the startup line says so.
+    pub fn wardryx_mode(self) -> crate::wardryx::WardryxMode {
+        match self {
+            Profile::Governed => crate::wardryx::WardryxMode::Enforce,
+            Profile::Observe => crate::wardryx::WardryxMode::Off,
+        }
+    }
+}
+
+/// Whether a variable's value counts as unset: absent, empty, or only spaces.
+fn is_unset(value: Option<&str>) -> bool {
+    value.map(str::trim).unwrap_or_default().is_empty()
+}
+
+/// `TOKENFUSE_PROFILE`: `governed | observe`, any case. Unset, empty or only
+/// spaces is governed. Anything else is an `Err` naming both words, and the
+/// caller exits: a profile nobody can read must not start the gateway as
+/// whichever one happened to be the default.
+pub fn profile_from(value: Option<&str>) -> Result<Profile, String> {
+    Ok(
+        match switch_word("TOKENFUSE_PROFILE", value, &["governed", "observe"])? {
+            Some("observe") => Profile::Observe,
+            _ => Profile::Governed,
+        },
+    )
+}
+
+/// [`profile_from`] against the process environment, exiting 2 on a value it
+/// cannot read.
+pub fn profile_from_env() -> Profile {
+    exit_on_refusal(profile_from(
+        std::env::var("TOKENFUSE_PROFILE").ok().as_deref(),
+    ))
+}
+
+/// [`policy_mode_from`] with the profile's default for an unset value.
+pub fn policy_mode_under(profile: Profile, value: Option<&str>) -> Result<Mode, String> {
+    if is_unset(value) {
+        return Ok(profile.policy_mode());
+    }
+    policy_mode_from(value)
+}
+
+/// [`policy_mode_under`] against the process environment, exiting 2.
+pub fn policy_mode_under_env(profile: Profile) -> Mode {
+    exit_on_refusal(policy_mode_under(
+        profile,
+        std::env::var("TOKENFUSE_MODE").ok().as_deref(),
+    ))
+}
+
+/// Where a setting's value came from, for the startup line: `env` when the
+/// variable is set, `profile` when the profile's default stands.
+pub fn source_of(name: &str) -> &'static str {
+    match std::env::var(name).ok().as_deref() {
+        v if !is_unset(v) => "env",
+        _ => "profile",
+    }
+}
+
+/// The one startup line that names the profile and every governed setting
+/// with where it came from (CLAUDE.md invariant 136). `settings` is
+/// `(setting, value, source)`, in the order the caller computed them.
+pub fn governance_line(profile: Profile, settings: &[(&str, String, &str)]) -> String {
+    let mut line = format!("governance profile={}", profile.as_str());
+    for (name, value, source) in settings {
+        line.push_str(&format!(" {name}={value}({source})"));
+    }
+    line
 }
 
 /// [`dlp_pii_mode_from`] against the process environment.
@@ -504,8 +643,9 @@ pub fn firewall_mode_from_env() -> Option<tokenfuse_core::taint::FirewallMode> {
 /// AGENT sends, and `Ledger::open_run` rewrites an open run's budget on every
 /// call, so in a deployment with no client keys and no identity map the
 /// per-run ceiling was whatever the agent declared, widened again by its next
-/// call. Widening stays (it is the one release valve for a reservation kept
-/// open after an unknown outcome, invariant 50); this bounds it.
+/// call. Invariant 135 fixes that: the first declaration sets an open run's
+/// budget, a caller may lower it and never raise it, and the ceiling bounds
+/// what that first declaration can be.
 ///
 /// The value is a positive decimal number of dollars read as integers, never
 /// through `f64`: digits, optionally a point and one to six more digits.
@@ -678,6 +818,131 @@ mod tests {
         for typo in ["Shadow", "On", "enforce", "1", "true"] {
             assert_eq!(cache_mode_from(Some(typo)), CacheMode::Off, "{typo}");
         }
+    }
+
+    #[test]
+    fn the_profile_nobody_set_is_governed() {
+        assert_eq!(profile_from(None), Ok(Profile::Governed));
+        assert_eq!(profile_from(Some("")), Ok(Profile::Governed));
+        assert_eq!(profile_from(Some("   ")), Ok(Profile::Governed));
+    }
+
+    #[test]
+    fn every_named_profile_is_honoured_in_any_case() {
+        assert_eq!(profile_from(Some("observe")), Ok(Profile::Observe));
+        assert_eq!(profile_from(Some("OBSERVE")), Ok(Profile::Observe));
+        assert_eq!(profile_from(Some(" Governed ")), Ok(Profile::Governed));
+    }
+
+    #[test]
+    fn an_unknown_profile_value_is_refused_naming_both_profiles() {
+        let err = profile_from(Some("gov")).unwrap_err();
+        for needle in ["TOKENFUSE_PROFILE", "governed", "observe", "`gov`"] {
+            assert!(err.contains(needle), "{needle} missing from {err}");
+        }
+    }
+
+    #[test]
+    fn observe_resolves_every_default_to_what_it_always_was() {
+        // The v1.18.0 defaults table, written out here rather than read from the
+        // code under test: an unset variable under observe must mean exactly what
+        // it meant before the profile existed.
+        assert_eq!(policy_mode_under(Profile::Observe, None), Ok(Mode::Shadow));
+        assert_eq!(
+            wardryx_mode_under(Profile::Observe, None),
+            Ok(crate::wardryx::WardryxMode::Off)
+        );
+        assert_eq!(
+            Profile::Observe.firewall_mode(),
+            tokenfuse_core::taint::FirewallMode::Shadow
+        );
+        assert_eq!(
+            wardryx_failmode_from(crate::wardryx::WardryxMode::Off, None),
+            Ok(crate::wardryx::FailMode::Open)
+        );
+    }
+
+    /// RED-FIRST (CLAUDE.md invariant 136): a policy file that names no `mode`
+    /// takes this value, and it was off under both profiles before the profile
+    /// existed. Mutant: `Profile::Governed => Off` here, which keeps the file off
+    /// under governed; caught by this test and by the binary test
+    /// `a_policy_file_with_no_mode_is_enforce_under_governed`.
+    #[test]
+    fn the_absent_file_mode_is_enforce_under_governed_and_off_under_observe() {
+        assert_eq!(
+            Profile::Governed.absent_file_mode(),
+            tokenfuse_core::taint::FirewallMode::Enforce
+        );
+        assert_eq!(
+            Profile::Observe.absent_file_mode(),
+            tokenfuse_core::taint::FirewallMode::Off
+        );
+    }
+
+    #[test]
+    fn governed_resolves_every_default_to_enforce_with_a_closed_failmode() {
+        assert_eq!(
+            policy_mode_under(Profile::Governed, None),
+            Ok(Mode::Enforce)
+        );
+        assert_eq!(
+            wardryx_mode_under(Profile::Governed, None),
+            Ok(crate::wardryx::WardryxMode::Enforce)
+        );
+        assert_eq!(
+            Profile::Governed.firewall_mode(),
+            tokenfuse_core::taint::FirewallMode::Enforce
+        );
+        assert_eq!(
+            wardryx_failmode_from(crate::wardryx::WardryxMode::Enforce, None),
+            Ok(crate::wardryx::FailMode::Closed)
+        );
+    }
+
+    #[test]
+    fn an_explicit_budget_mode_wins_over_either_profile() {
+        assert_eq!(
+            policy_mode_under(Profile::Governed, Some("shadow")),
+            Ok(Mode::Shadow)
+        );
+        assert_eq!(
+            policy_mode_under(Profile::Governed, Some("warn")),
+            Ok(Mode::Warn)
+        );
+        assert_eq!(
+            policy_mode_under(Profile::Observe, Some("enforce")),
+            Ok(Mode::Enforce)
+        );
+        assert!(policy_mode_under(Profile::Governed, Some("enfroce")).is_err());
+    }
+
+    #[test]
+    fn an_explicit_policy_hook_mode_wins_over_either_profile() {
+        use crate::wardryx::WardryxMode;
+        assert_eq!(
+            wardryx_mode_under(Profile::Governed, Some("off")),
+            Ok(WardryxMode::Off)
+        );
+        assert_eq!(
+            wardryx_mode_under(Profile::Observe, Some("shadow")),
+            Ok(WardryxMode::Shadow)
+        );
+        assert!(wardryx_mode_under(Profile::Governed, Some("enfroce")).is_err());
+    }
+
+    #[test]
+    fn the_startup_line_names_the_profile_and_each_setting_with_its_source() {
+        let line = governance_line(
+            Profile::Governed,
+            &[
+                ("budget", "enforce".to_string(), "profile"),
+                ("policy_hook", "off".to_string(), "no-url"),
+            ],
+        );
+        assert_eq!(
+            line,
+            "governance profile=governed budget=enforce(profile) policy_hook=off(no-url)"
+        );
     }
 
     #[test]

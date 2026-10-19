@@ -56,6 +56,11 @@ pub struct AppState {
     /// a deployment whose whole claim is that every call is accounted for.
     /// Setting this turns "unmetered" into a 400 rather than a silence.
     pub require_run_id: bool,
+    /// The governance profile in effect (CLAUDE.md invariant 136). The
+    /// constructor's default is `Observe`: the defaults every test written
+    /// before the profile existed was written against. `serve()` sets the
+    /// binary's default, `Governed`, with [`AppState::with_profile`].
+    pub profile: crate::defaults::Profile,
     /// PII-masking mode: a separate, opt-in extension of the DLP scanner
     /// (email/card/phone, regex-only, see `tokenfuse_core::dlp`'s module
     /// doc). Off by default, and switched independently of `dlp` so an
@@ -618,6 +623,7 @@ impl AppState {
             // the ones that needed it least.
             dlp: DlpMode::Block,
             require_run_id: true,
+            profile: crate::defaults::Profile::Observe,
             dlp_pii: DlpMode::Off,
             router: Arc::new(Router::disabled()),
             wasm: None,
@@ -861,6 +867,15 @@ impl AppState {
     /// thing that happens.
     pub fn with_require_run_id(mut self, require: bool) -> Self {
         self.require_run_id = require;
+        self
+    }
+
+    /// Set the governance profile (CLAUDE.md invariant 136). Chainable. The
+    /// budget, firewall, policy-hook and admin defaults are decided where they
+    /// are built, from the same profile; this carries it to the handlers that
+    /// read it at request time (declassification, the health detail).
+    pub fn with_profile(mut self, profile: crate::defaults::Profile) -> Self {
+        self.profile = profile;
         self
     }
 

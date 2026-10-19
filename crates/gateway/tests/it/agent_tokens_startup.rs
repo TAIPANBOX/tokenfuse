@@ -29,6 +29,7 @@ fn free_addr() -> String {
 
 fn gateway(extra: &[(&str, String)]) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_DELEGATION_ISSUER")
@@ -46,6 +47,7 @@ fn gateway(extra: &[(&str, String)]) -> Command {
 
 fn broker(extra: &[(&str, String)]) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.arg("mcp-broker")
         .env("TOKENFUSE_MCP_UPSTREAM", "http://127.0.0.1:1")
         .env("TOKENFUSE_MCP_ADDR", free_addr())

@@ -402,7 +402,33 @@ async fn mcp_broker() {
     // The second PEP: the broker reuses the SAME Wardryx config the gateway
     // reads (TOKENFUSE_WARDRYX_*), so configuring Wardryx once gates both the
     // LLM path and MCP tool calls. Off unless TOKENFUSE_WARDRYX_MODE+URL are set.
-    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env());
+    // The governance profile applies to the broker too (CLAUDE.md invariant 136):
+    // an unset TOKENFUSE_WARDRYX_MODE is enforce under governed once a URL is
+    // set, and the broker says what it governs, as `serve` does for its own.
+    let profile = tokenfuse_gateway::defaults::profile_from_env();
+    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));
+    tracing::info!(mode = ?wardryx.mode, failmode = ?wardryx.failmode(), "wardryx enforcement hook");
+    let policy_hook_source =
+        if std::env::var("TOKENFUSE_WARDRYX_URL").map_or(true, |u| u.trim().is_empty()) {
+            "no-url"
+        } else {
+            tokenfuse_gateway::defaults::source_of("TOKENFUSE_WARDRYX_MODE")
+        };
+    let governance = tokenfuse_gateway::defaults::governance_line(
+        profile,
+        &[(
+            "policy_hook",
+            format!("{:?}", wardryx.mode).to_lowercase(),
+            policy_hook_source,
+        )],
+    );
+    if profile.is_governed() {
+        tracing::info!("{governance}");
+    } else {
+        tracing::warn!(
+            "{governance}: the observe profile enforces nothing that is not set explicitly"
+        );
+    }
     let mut vault = tokenfuse_core::SecretVault::from_pairs(
         &std::env::var("TOKENFUSE_MCP_SECRETS").unwrap_or_default(),
     );
@@ -777,6 +803,14 @@ async fn serve() {
     // process is about to listen on loopback.
     let addr = std::env::var("TOKENFUSE_ADDR").unwrap_or_else(|_| "127.0.0.1:4100".to_string());
 
+    // The governance profile (CLAUDE.md invariant 136): governed unless the operator
+    // says observe. Read before anything else is configured, so a value this process
+    // cannot read refuses to start whatever else is set. `governance` collects each
+    // governed setting with where its value came from, for the one startup line
+    // printed before the listener binds.
+    let profile = tokenfuse_gateway::defaults::profile_from_env();
+    let mut governance: Vec<(&str, String, &str)> = Vec::new();
+
     // Default price book: illustrative generic entries plus exact entries for
     // the current Anthropic/OpenAI lineup. See pricebook.rs for the per-model
     // rates and units notes, and where each was read.
@@ -958,8 +992,13 @@ async fn serve() {
     // shadow (safe to drop in: surfaces "would block" without changing
     // behavior); set enforce to actually return 402 and cut the circuit. A
     // value it cannot read exits here rather than starting as shadow.
-    let mode = tokenfuse_gateway::defaults::policy_mode_from_env();
+    let mode = tokenfuse_gateway::defaults::policy_mode_under_env(profile);
     tracing::info!(?mode, "policy mode");
+    governance.push((
+        "budget",
+        format!("{mode:?}").to_lowercase(),
+        tokenfuse_gateway::defaults::source_of("TOKENFUSE_MODE"),
+    ));
     let policy = Policy {
         mode,
         anomalies: AnomalyConfig {
@@ -996,6 +1035,11 @@ async fn serve() {
             std::process::exit(2);
         }
     };
+    governance.push((
+        "client_auth",
+        if client_keys.enabled() { "on" } else { "off" }.to_string(),
+        tokenfuse_gateway::defaults::source_of("TOKENFUSE_CLIENT_KEYS"),
+    ));
     if client_keys.enabled() {
         println!(
             "client auth: ON ({} key(s)); metered calls must send the `{}` header",
@@ -1130,7 +1174,8 @@ async fn serve() {
     .with_price_book_source(price_book_source)
     .with_identity(Arc::new(identity_map), identity_strict, units.clone())
     .with_agent_id_mode(agent_id_mode)
-    .with_wire(wire);
+    .with_wire(wire)
+    .with_profile(profile);
 
     // Who may call the observability/kill routes (CLAUDE.md invariant, see
     // `adminkeys`): TOKENFUSE_ADMIN_KEYS, comma-separated bearer keys, same
@@ -1164,11 +1209,25 @@ async fn serve() {
             "admin auth: ON for /v1/runs, /v1/runs/{{id}}/kill, /v1/keys, /v1/policy-plane, /v1/agent-ids"
         );
     }
-    let admin_gate = tokenfuse_gateway::adminkeys::AdminGate::resolve(
+    let admin_gate = tokenfuse_gateway::adminkeys::AdminGate::resolve_for(
         admin_keys,
         tokenfuse_gateway::adminkeys::bind_is_loopback(&addr),
         allow_open_obs,
+        profile,
     );
+    let admin_label = match &admin_gate {
+        tokenfuse_gateway::adminkeys::AdminGate::Keyed(_) => "keyed",
+        tokenfuse_gateway::adminkeys::AdminGate::Open => "open",
+        tokenfuse_gateway::adminkeys::AdminGate::Forbidden => "refused",
+    };
+    let admin_source = if tokenfuse_gateway::defaults::source_of("TOKENFUSE_ADMIN_KEYS") == "env"
+        || std::env::var("TOKENFUSE_ALLOW_OPEN_OBS").is_ok()
+    {
+        "env"
+    } else {
+        "profile"
+    };
+    governance.push(("admin_routes", admin_label.to_string(), admin_source));
     state = state.with_admin_gate(admin_gate);
 
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on. Default OFF since
@@ -1190,8 +1249,13 @@ async fn serve() {
     // process-local: the broker never sees a prompt. It brokers `tools/call`
     // and asks this gateway's firewall about a call through
     // TOKENFUSE_MCP_TAINT_GATEWAY rather than holding taint state of its own.
-    let firewall = tokenfuse_gateway::firewall::from_env();
+    let firewall = tokenfuse_gateway::firewall::from_env(profile);
     tracing::info!(mode = ?firewall.mode, "agent firewall");
+    governance.push((
+        "firewall",
+        format!("{:?}", firewall.mode).to_lowercase(),
+        firewall.mode_source,
+    ));
     state = state.with_firewall(Arc::new(firewall));
 
     // TOKENFUSE_REQUIRE_RUN_ID: refuse calls that carry no run id instead of
@@ -1263,8 +1327,17 @@ async fn serve() {
     // URL keeps the hook off no matter what mode says, so there is nothing
     // to call and nothing to enforce. See wardryx.rs for the full contract
     // (fail-open/closed, the decision cache, etc.).
-    let wardryx = tokenfuse_gateway::wardryx::Wardryx::from_env();
+    let wardryx = tokenfuse_gateway::wardryx::Wardryx::from_env(profile);
     tracing::info!(mode = ?wardryx.mode, failmode = ?wardryx.failmode(), "wardryx enforcement hook");
+    governance.push((
+        "policy_hook",
+        format!("{:?}", wardryx.mode).to_lowercase(),
+        if std::env::var("TOKENFUSE_WARDRYX_URL").map_or(true, |u| u.trim().is_empty()) {
+            "no-url"
+        } else {
+            tokenfuse_gateway::defaults::source_of("TOKENFUSE_WARDRYX_MODE")
+        },
+    ));
     state = state.with_wardryx(Arc::new(wardryx));
 
     // Shadow tool-pruning measurement (W2a, invariant 61): TOKENFUSE_TOOLS_PRUNE
@@ -1564,6 +1637,40 @@ async fn serve() {
     // process-local: the MCP broker opens no run, so it owns none.
     // An agent token is a principal too (invariant 123), so its runs are owned
     // and journaled with client keys off.
+    // Invariant 136: under governed, a gateway that listens beyond loopback needs something
+    // that authenticates its callers, or it does not start. Observe keeps the invariant-119
+    // warning instead, as before.
+    let client_auth_on = state.client_keys.enabled() || state.agent_tokens.is_some();
+    if profile.is_governed()
+        && !tokenfuse_gateway::adminkeys::bind_is_loopback(&addr)
+        && !client_auth_on
+    {
+        eprintln!(
+            "tokenfuse: refusing to start: {addr} is not a loopback address and nothing authenticates the callers of this gateway. \
+             Choose one: TOKENFUSE_CLIENT_KEYS (static client keys), TOKENFUSE_AGENT_TOKENS=accept or require \
+             (each agent's own token), or TOKENFUSE_PROFILE=observe (the old open defaults, with a warning)."
+        );
+        std::process::exit(2);
+    }
+    governance.push((
+        "declassify",
+        if std::env::var("TOKENFUSE_DECLASSIFY_KEY").is_ok_and(|k| !k.trim().is_empty()) {
+            "keyed"
+        } else if profile.is_governed() {
+            "closed"
+        } else {
+            "open"
+        }
+        .to_string(),
+        tokenfuse_gateway::defaults::source_of("TOKENFUSE_DECLASSIFY_KEY"),
+    ));
+    let line = tokenfuse_gateway::defaults::governance_line(profile, &governance);
+    if profile.is_governed() {
+        tracing::info!("{line}");
+    } else {
+        tracing::warn!("{line}: the observe profile enforces nothing that is not set explicitly");
+    }
+
     if !state.client_keys.enabled() && state.agent_tokens.is_none() {
         tracing::info!("{}", tokenfuse_gateway::runowners::OFF_LINE);
     } else {

@@ -22,6 +22,7 @@ fn bin() -> &'static str {
 /// "answered before the precondition check", not "happened to pass it".
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .args(args)
         .env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_ALLOW_STUB")

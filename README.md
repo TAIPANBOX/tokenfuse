@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.18.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2324-brightgreen)
+![tests](https://img.shields.io/badge/tests-2364-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -26,12 +26,14 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 > **⚡ Try it in one command**, no signup, no account:
 > ```bash
-> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.18.0
+> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.18.0
 > ```
 > `TOKENFUSE_ALLOW_STUB=1` is what makes this offline: with no provider behind
 > it, the gateway answers from a built-in stub and meters a fixed 1000/500
 > tokens, so **every figure it shows you is invented**. That flag is how you say
-> you know. Point it at a real provider and the numbers are real: see
+> you know. `TOKENFUSE_PROFILE=observe` is how you say the other thing: this
+> gateway listens on every interface of the container and authenticates nobody,
+> which the governed default refuses (see [Safe by default](#-safe-by-default)). Point it at a real provider and the numbers are real: see
 > [**🚀 Get started**](#-get-started). Nothing to install at all: the
 > [**live preview**](https://taipanbox.github.io/tokenfuse/preview/) runs the
 > fleet dashboard on sample data in your browser.
@@ -247,7 +249,7 @@ sequenceDiagram
 
 Three properties make this safe in production:
 
-1. **Shadow → Warn → Enforce.** Start in shadow mode (observe only); flip to enforce when you trust it.
+1. **Shadow → Warn → Enforce.** Start a budget in shadow mode (`TOKENFUSE_MODE=shadow`, observe only); flip to enforce when you trust it. Enforcement is the default now, so the first step is the one you take on purpose.
 2. **Fail-open by default.** If TokenFuse itself has trouble, your traffic keeps flowing, so it never becomes a single point of failure. (And for the reverse, never *losing* a budget, it can run as a raft-replicated [HA cluster](docs/10-ha-cluster.md).)
 3. **Metadata-only.** It measures cost and behavior; it does **not** store prompt contents by default.
 
@@ -315,11 +317,16 @@ TokenFuse is a **proxy**: start it, then point your agent at it instead of the p
 Published to GitHub Container Registry, so it runs anywhere with Docker, nothing to compile:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.18.0
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
 
 A working gateway on **http://localhost:4100**, answering from a built-in fake
-provider so you can try it offline.
+provider so you can try it offline. `TOKENFUSE_PROFILE=observe` keeps the
+defaults this release inherited from v1.18.0 (budgets, the firewall and the
+policy hook observe rather than enforce, and nothing authenticates callers),
+which a trial on your own machine wants. Leave it out and the gateway enforces
+by default, and refuses to start on this interface until something authenticates
+its callers (see [Safe by default](#-safe-by-default)).
 
 **Why that flag is not optional.** Without a provider the gateway would answer
 every call itself and meter a fixed 1000 input / 500 output tokens as real
@@ -347,9 +354,15 @@ Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your a
 
 ```bash
 docker run -p 4100:4100 \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
+
+`TOKENFUSE_PROFILE=observe` in that command is the choice to run **without client
+authentication** on this interface. Anyone who can reach port 4100 can spend
+through your provider key. For anything beyond your own machine, drop it and set
+`TOKENFUSE_CLIENT_KEYS` instead (see [Safe by default](#-safe-by-default)).
 
 Then change **one line** in your app, the base URL:
 
@@ -386,20 +399,22 @@ curl http://localhost:4100/v1/messages \
 - **No `x-fuse-run-id`?** The call is refused with `400 metering_required`, and `TOKENFUSE_REQUIRE_RUN_ID=0` brings back the old unmetered pass-through.
 - **Live view:** `docker exec <container> tokenfuse top` shows every run and its $/min.
 
-**Observe first, then enforce.** The BUDGET starts in **shadow** mode: it records what it *would* block (an `x-fuse-would-block` response header on the call, and, with `TOKENFUSE_EVENTS_PATH` set and an agent id on the request, a `breaker_shadow` event on the bus) but changes nothing, so a cap you are still tuning cannot stop a run. Flip to **enforce** when you trust it:
+**The budget is enforced by default.** Under the governed profile (the default since v1.19.0) a call that would take its run past its cap is refused with `402`. To watch first, set `TOKENFUSE_MODE=shadow`: the gateway then records what it *would* block (an `x-fuse-would-block` response header on the call, and, with `TOKENFUSE_EVENTS_PATH` set and an agent id on the request, a `breaker_shadow` event on the bus) and changes nothing, so a cap you are still tuning cannot stop a run. Flip back to `enforce` when you trust it:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+docker run -p 4100:4100 -e TOKENFUSE_MODE=shadow \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
 
-`TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
+`TOKENFUSE_MODE` = `enforce` (default under the governed profile) · `shadow` (default under `observe`) · `warn`.
 
 **Cap what an agent may declare.** The budget in `x-fuse-budget-usd` is whatever the calling agent sends. It sets the run's budget when the run opens, and a later call on that run can lower it but never raise it (invariant 135). With no client keys configured, that header is the only per-run ceiling there is. Set `TOKENFUSE_MAX_RUN_BUDGET_USD` to a positive decimal number of dollars (at most six decimals, for example `25` or `2.50`) and the gateway clamps every budget the caller declared, and the built-in USD 5 default used when it declared none, to that figure before the run is opened:
 
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_USD=25 \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
@@ -479,6 +494,20 @@ explicit variable away in each case.
 | `TOKENFUSE_DLP` | **`block`**: prompts are scanned and a call carrying a recognised secret is refused with `403 dlp_blocked` | `TOKENFUSE_DLP=off` |
 | `TOKENFUSE_REQUIRE_RUN_ID` | **on**: a call with no `x-fuse-run-id` is refused with `400 metering_required` rather than reaching the provider unmetered | `TOKENFUSE_REQUIRE_RUN_ID=0` |
 | `GET /v1/policy-plane` | new read-only report: what the policy PDP has actually answered | n/a, there was no such fact |
+| `TOKENFUSE_PROFILE` | **`governed`**: budgets and the firewall enforce, the policy hook enforces with a closed failmode once `TOKENFUSE_WARDRYX_URL` is set, declassification needs its key, the admin routes need `TOKENFUSE_ADMIN_KEYS` even on loopback, and a listener beyond loopback refuses to start until `TOKENFUSE_CLIENT_KEYS` or `TOKENFUSE_AGENT_TOKENS` authenticates its callers | `TOKENFUSE_PROFILE=observe`, which reproduces v1.18.0's defaults and prints one startup line saying it enforces nothing that is not set explicitly |
+
+Every variable you set still wins over the profile, so a deployment that chose `TOKENFUSE_MODE=shadow` keeps it. At startup one line lists the profile and each governed setting with where its value came from (`profile` or `env`), and `GET /healthz?detail=1` carries the profile.
+
+**Upgrading to v1.19.0 from v1.18.0.** An unconfigured gateway now enforces, and a
+gateway that listens beyond loopback with nothing authenticating its callers refuses
+to start. To keep v1.18.0's behaviour set `TOKENFUSE_PROFILE=observe`. Every other
+setting is unchanged, and the admin routes and the declassify endpoint now refuse
+what they used to answer on loopback until their keys are set.
+
+Two more changes follow from the profile. The MCP credential broker reads the same
+profile, so its policy hook enforces with a closed failmode once `TOKENFUSE_WARDRYX_URL`
+is set. A firewall policy file that names no `mode` now runs in enforce under `governed`,
+where it ran off before; name a mode in the file, or set `TOKENFUSE_PROFILE=observe`.
 
 **What this costs you on upgrade.** Both are behaviour changes on a live path.
 If your prompts legitimately carry things that match a secret pattern, those
@@ -486,7 +515,7 @@ calls now get a `403` where they used to succeed; `TOKENFUSE_DLP=mask` redacts
 instead of refusing, and `off` is unchanged from before. If any of your traffic
 reaches the gateway without a run id, it now gets a `400`; add the header or set
 `TOKENFUSE_REQUIRE_RUN_ID=0`. Neither default changes what `TOKENFUSE_MODE`
-governs: the budget still starts in shadow.
+governs: the budget is enforced by default under the governed profile (see the table above).
 
 **What the secret scanner does, stated plainly.** It reads contiguous text and
 matches patterns, so it **catches carelessness**: an agent that pasted a config
@@ -627,7 +656,7 @@ Since v0.4.0, on `main` and in the releases after it (see `docs/releases/`): Tok
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v1.18.0   # gateway, offline
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.18.0   # gateway, offline
 cd cloud && docker compose up                                                    # + Cloud dashboard (:3000)
 ```
 
@@ -710,7 +739,7 @@ Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). R
 | Env var | Values / default | Meaning |
 |---|---|---|
 | `TOKENFUSE_WARDRYX_URL` | URL (unset ⇒ hook off) | The PDP's `/v1/decide` base URL. Unset forces `off` regardless of mode. |
-| `TOKENFUSE_WARDRYX_MODE` | `off` (default) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
+| `TOKENFUSE_WARDRYX_MODE` | `off` (default under `observe`; `enforce` under the governed profile once `TOKENFUSE_WARDRYX_URL` is set) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
 | `TOKENFUSE_WARDRYX_FAILMODE` | `closed` (default under `enforce`) · `open` (default otherwise) | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. Unset under `enforce` it is `closed`, so an outage of the policy plane refuses what the policy would judge; an explicit `open` still works and is said once at startup. |
 | `TOKENFUSE_WARDRYX_KEY` | bearer token (optional) | Sent to the PDP. |
 | `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout on the model path. When set, it is also the MCP broker's timeout on a `tools/call` unless the next variable is set. |

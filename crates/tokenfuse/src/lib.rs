@@ -10,7 +10,7 @@
 //! images on GHCR.
 //!
 //! ```text
-//! docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+//! docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_PROFILE=observe \
 //!   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
 //!   ghcr.io/taipanbox/tokenfuse:v0.5.0
 //! ```
