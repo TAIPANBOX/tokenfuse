@@ -1,4 +1,4 @@
-//! The public origins a DPoP proof's `htu` may name (CLAUDE.md invariant 138).
+//! The public origins a DPoP proof's `htu` may name (CLAUDE.md invariant 141).
 //!
 //! A gateway is reached at one address by its clients and at another by the
 //! containers beside it, so one configured origin cannot describe every caller.
@@ -11,6 +11,8 @@
 //! list (`WARDRYX_AGENT_TOKEN_DOOR_ORIGINS`): scheme and host in lower case, the
 //! default port written out, and nothing after the port but an optional `/`.
 
+use base64::Engine as _;
+
 /// Why an origin was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginRefusal {
@@ -20,51 +22,170 @@ pub enum OriginRefusal {
     NotAnOrigin,
 }
 
-/// Normalise one configured origin written `scheme://host[:port]`.
+/// Normalise one configured origin written `scheme://host[:port]`, with nothing after the
+/// port but an optional `/`.
 ///
-/// STUB for the red-first commit: returns the trimmed input unchanged, which is
-/// what the code did before the list existed.
+/// The result is `scheme://host:port`, with the scheme and host in lower case and the
+/// default port (443 for https, 80 for http) written out, so two spellings of one origin
+/// compare equal. This is wardryx's `normalizeOrigin` (`internal/agenttoken/verifier.go`):
+/// the same inputs are accepted and refused. A port of zero is refused too, since nothing
+/// is served on it.
 pub fn normalize_origin(raw: &str) -> Result<String, OriginRefusal> {
-    Ok(raw.trim().to_string())
+    let raw = raw.trim();
+    let (scheme, rest) = raw.split_once("://").ok_or(OriginRefusal::NotAnOrigin)?;
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    if !(tail.is_empty() || tail == "/") || authority.contains('@') {
+        return Err(OriginRefusal::NotAnOrigin);
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => 443,
+        "http" => 80,
+        _ => return Err(OriginRefusal::NotAnOrigin),
+    };
+    let (host, port) = split_host_port(authority)?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!(
+        "{scheme}://{host}:{}",
+        port.unwrap_or(default_port)
+    ))
 }
 
-/// The normalised origin and the path of an absolute `htu`, query removed.
+/// The host (lower case, brackets removed) and the explicit port of an authority.
+fn split_host_port(authority: &str) -> Result<(String, Option<u16>), OriginRefusal> {
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let end = inner.find(']').ok_or(OriginRefusal::NotAnOrigin)?;
+        let host = &inner[..end];
+        let after = &inner[end + 1..];
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':').ok_or(OriginRefusal::NotAnOrigin)?),
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return Err(OriginRefusal::NotAnOrigin);
+        }
+        (host, port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            return Err(OriginRefusal::NotAnOrigin);
+        }
+        (host, port)
+    };
+    let port = match port {
+        None => None,
+        Some(p) => {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(OriginRefusal::NotAnOrigin);
+            }
+            match p.parse::<u16>() {
+                Ok(n) if n != 0 => Some(n),
+                _ => return Err(OriginRefusal::NotAnOrigin),
+            }
+        }
+    };
+    Ok((host.to_ascii_lowercase(), port))
+}
+
+/// The normalised origin and the path of an absolute `htu`, its query removed.
 ///
-/// STUB for the red-first commit: always `None`.
-pub fn origin_and_path(_htu: &str) -> Option<(String, String)> {
-    None
+/// `None` for a fragment, user information, a scheme other than http or https, or no host.
+/// RFC 9449 section 4.3: an `htu` names a URI without its query and fragment, and a proof
+/// whose `htu` names one of those is not for this request.
+pub fn origin_and_path(htu: &str) -> Option<(String, String)> {
+    if htu.contains('#') {
+        return None;
+    }
+    let bare = htu.split('?').next().unwrap_or_default();
+    let (scheme, rest) = bare.split_once("://")?;
+    let cut = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(cut);
+    let origin = normalize_origin(&format!("{scheme}://{authority}")).ok()?;
+    let path = if path.is_empty() { "/" } else { path };
+    Some((origin, path.to_string()))
 }
 
 /// The `htu` claim of a compact JWS payload, read WITHOUT checking the signature.
 ///
-/// STUB for the red-first commit: always `None`.
-pub fn unverified_htu(_proof: &str) -> Option<String> {
-    None
+/// Used only to choose which configured origin a proof is verified against. The verifier
+/// then checks the signature over the same claim, so a claim altered after the choice fails
+/// there.
+pub fn unverified_htu(proof: &str) -> Option<String> {
+    let payload = proof.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    claims.get("htu")?.as_str().map(str::to_string)
 }
 
-/// The URL a proof must name for a request on `path`.
+/// The URL a proof must name for a request on `path`, given the origins configured.
 ///
-/// STUB for the red-first commit: the first configured origin plus the path,
-/// which is what the single-origin code computed.
-pub fn expected_url(origins: &[String], _proof: Option<&str>, path: &str) -> String {
-    format!(
+/// When the proof's `htu`, read unverified, names one of `origins` (each normalised, as
+/// configured or not) at exactly `path`, the `htu` as the proof wrote it is returned. The
+/// verifier then checks the signature over that claim and compares it with itself, so the
+/// signature is the only thing that decides. Otherwise the first configured origin plus
+/// `path` is returned, which the verifier refuses, because the proof named something else.
+/// Never a `Host` header.
+///
+/// `origins` is never empty where this runs: both doors refuse to start without one.
+pub fn expected_url(origins: &[String], proof: Option<&str>, path: &str) -> String {
+    let fallback = format!(
         "{}{}",
         origins.first().map(String::as_str).unwrap_or_default(),
         path
-    )
+    );
+    let Some(htu) = proof.and_then(unverified_htu) else {
+        return fallback;
+    };
+    match origin_and_path(&htu) {
+        Some((origin, htu_path))
+            if htu_path == path
+                && origins
+                    .iter()
+                    .any(|o| normalize_origin(o).is_ok_and(|n| n == origin)) =>
+        {
+            htu
+        }
+        _ => fallback,
+    }
 }
 
 /// Parse a comma-separated list of origins, normalising each entry.
 ///
-/// STUB for the red-first commit: the whole value as one entry, trailing slash
-/// removed, which is what `TOKENFUSE_MCP_PROOF_URL` alone meant.
+/// A blank list is an empty list. An empty entry is refused, not skipped: a trailing comma
+/// is a typo, and a typo in an allow-list must not read as a shorter one. The error is the
+/// entry that was refused, as written.
 pub fn parse_origin_list(list: &str) -> Result<Vec<String>, String> {
-    let list = list.trim();
-    Ok(if list.is_empty() {
-        Vec::new()
-    } else {
-        vec![list.trim_end_matches('/').to_string()]
-    })
+    let mut origins: Vec<String> = Vec::new();
+    if list.trim().is_empty() {
+        return Ok(origins);
+    }
+    for entry in list.split(',') {
+        let origin = normalize_origin(entry).map_err(|_| entry.trim().to_string())?;
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
 }
 
 #[cfg(test)]

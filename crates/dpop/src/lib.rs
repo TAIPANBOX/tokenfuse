@@ -284,6 +284,11 @@ pub fn verify_proof(
         .get("htu")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    // RFC 9449 section 4.3: `htu` carries no fragment. Trimming one away would admit a proof
+    // for a URI this request was never made to.
+    if htu.contains('#') {
+        return Err(ProofRefusal::WrongRequest);
+    }
     if trim_query(htu) != trim_query(url) {
         return Err(ProofRefusal::WrongRequest);
     }

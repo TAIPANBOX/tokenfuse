@@ -343,16 +343,7 @@ pub fn admit(
         .and_then(|v| v.to_str().ok());
     // The origin is the deployment's, the path the route's: never a `Host`
     // header, which the caller writes (invariant 30's `htu` rule).
-    let url = format!(
-        "{}{}",
-        proving
-            .origins
-            .first()
-            .map(String::as_str)
-            .unwrap_or_default()
-            .trim_end_matches('/'),
-        path
-    );
+    let url = proving.expected_url(proof, path);
     let agent = match tokenfuse_delegation::verify_agent_token(
         &proving.cfg,
         token,

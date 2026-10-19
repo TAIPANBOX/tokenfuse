@@ -1,4 +1,4 @@
-//! The delegation door takes a LIST of public origins (CLAUDE.md invariant 138).
+//! The delegation door takes a LIST of public origins (CLAUDE.md invariant 141).
 //!
 //! A gateway is reached at a public name by its clients and at another name by the
 //! containers beside it. A proof is accepted when its `htu` names one configured

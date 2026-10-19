@@ -104,6 +104,7 @@ the door was on. That is the failure `firewall::from_env` and
 | `TOKENFUSE_DELEGATION_JWKS_INTERVAL_MS` | Poll interval for the URL form. Default 60000. |
 | `TOKENFUSE_DELEGATION_AUDIENCE` | The `aud` this deployment answers to. Empty accepts any, which is a real single-tenant choice and is distinct from unset. |
 | `TOKENFUSE_DELEGATION_URL` | The absolute origin this process is reached at, so a proof's `htu` has something to compare against. |
+| `TOKENFUSE_DELEGATION_ORIGINS` | A comma-separated list of absolute origins, each normalised as wardryx does, added to the one above (CLAUDE.md invariant 141). |
 | `TOKENFUSE_DELEGATION_REVOCATIONS` | Absolute http(s) URL of the revocation list. Unset means no polling and no refusals. |
 | `TOKENFUSE_DELEGATION_REVOCATIONS_INTERVAL_MS` | Poll interval. Default 12000, a fifth of the maximum age, so four consecutive failures are needed before a miss stops being answered from the list. |
 | `TOKENFUSE_DELEGATION_REVOCATIONS_MAX_AGE_SECS` | How old a held list may be and still answer a miss. Default 60. Zero or negative means only a hit counts, which is a real policy and is not corrected. |

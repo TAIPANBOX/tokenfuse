@@ -447,7 +447,7 @@ fn a_path_that_cannot_be_read_refuses_rather_than_reading_as_off() {
     assert!(ClientRegistry::from_spec("/no/such/file/clients.json", ORIGIN).is_err());
 }
 
-// --- a LIST of public origins (CLAUDE.md invariant 138) --------------------
+// --- a LIST of public origins (CLAUDE.md invariant 141) --------------------
 
 /// A second address this broker is reached at: the one its own container network
 /// calls, which is not the public name the first origin is.

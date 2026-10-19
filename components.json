@@ -223,6 +223,9 @@
           "TOKENFUSE_MCP_LOCK": {
             "required": false
           },
+          "TOKENFUSE_MCP_PROOF_ORIGINS": {
+            "required": false
+          },
           "TOKENFUSE_MCP_PROOF_URL": {
             "required": false
           },

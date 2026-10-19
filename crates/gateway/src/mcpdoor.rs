@@ -278,12 +278,17 @@ impl ClientRegistry {
         if trimmed.is_empty() {
             return Ok(Self::default());
         }
-        let origin = origin.trim().trim_end_matches('/');
-        if origin.is_empty() {
+        let origins = tokenfuse_dpop::origin::parse_origin_list(origin).map_err(|entry| {
+            ClientSpecError(format!(
+                "{entry:?} is not an origin: write scheme://host[:port] with nothing after the port, \
+                 in TOKENFUSE_MCP_PROOF_URL or TOKENFUSE_MCP_PROOF_ORIGINS"
+            ))
+        })?;
+        if origins.is_empty() {
             return Err(ClientSpecError(
-                "no TOKENFUSE_MCP_PROOF_URL is set, so a proof could not be checked against the \
-                 address clients actually call. Set it to the origin they address this broker at, \
-                 for example https://mcp.acme.example"
+                "no TOKENFUSE_MCP_PROOF_URL or TOKENFUSE_MCP_PROOF_ORIGINS is set, so a proof could \
+                 not be checked against the address clients actually call. Set one to the origin \
+                 they address this broker at, for example https://mcp.acme.example"
                     .into(),
             ));
         }
@@ -368,7 +373,7 @@ impl ClientRegistry {
 
         Ok(ClientRegistry {
             by_jkt,
-            origins: vec![origin.to_string()],
+            origins,
             replay: ReplayCache::new(REPLAY_CAP),
         })
     }
@@ -390,6 +395,12 @@ impl ClientRegistry {
         self.by_jkt.is_empty()
     }
 
+    /// The URL a proof must name for `path`: one configured origin plus the route, see
+    /// [`tokenfuse_dpop::origin::expected_url`]. Never a `Host` header.
+    fn expected_url(&self, proof: &str, path: &str) -> String {
+        tokenfuse_dpop::origin::expected_url(&self.origins, Some(proof), path)
+    }
+
     /// The `client_id` this proof belongs to, or why it does not.
     ///
     /// The order is deliberate and is the difference between a replay cache and
@@ -399,11 +410,7 @@ impl ClientRegistry {
     /// anything, which is what makes refusing at the cap a self-inflicted wound
     /// rather than something a stranger can do to a deployment.
     pub fn authenticate(&self, proof: &str, path: &str, now: i64) -> Result<&str, DoorRefusal> {
-        let expected = format!(
-            "{}{}",
-            self.origins.first().map(String::as_str).unwrap_or_default(),
-            path
-        );
+        let expected = self.expected_url(proof, path);
         // POST because that is the only method this door ever sees: `mcpbroker::app`
         // routes `/` and `/mcp` with `post` and nothing else.
         let verified =

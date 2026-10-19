@@ -111,6 +111,14 @@ pub struct Proving {
     pub origins: Vec<String>,
 }
 
+impl Proving {
+    /// The URL a proof on this request must name: one configured origin plus `path`, see
+    /// [`tokenfuse_dpop::origin::expected_url`]. Never a `Host` header.
+    pub fn expected_url(&self, proof: Option<&str>, path: &str) -> String {
+        tokenfuse_dpop::origin::expected_url(&self.origins, proof, path)
+    }
+}
+
 pub type ChainProof = Option<Arc<Proving>>;
 
 /// What one request's credentials resolved to.
@@ -183,16 +191,7 @@ pub fn resolve(
         return Chain::Claimed(declared.to_vec());
     };
 
-    let url = format!(
-        "{}{}",
-        proving
-            .origins
-            .first()
-            .map(String::as_str)
-            .unwrap_or_default()
-            .trim_end_matches('/'),
-        url
-    );
+    let url = proving.expected_url(proof, url);
     let verified = match verify_delegation(&proving.cfg, token, proof, method, &url, now, revoked) {
         Ok(v) => v,
         // Every refusal is the same answer on the wire, for the reason
@@ -459,14 +458,6 @@ pub async fn from_env(client: &reqwest::Client) -> ChainProof {
         },
     };
     let origin = std::env::var("TOKENFUSE_DELEGATION_URL").unwrap_or_default();
-    if origin.trim().is_empty() {
-        eprintln!(
-            "tokenfuse: TOKENFUSE_DELEGATION_URL must name the absolute origin this \
-             gateway is reached at, so a proof's `htu` has something to be compared \
-             against. Without it the binding to one request is decoration."
-        );
-        std::process::exit(2);
-    }
     let origins = match origins_from_values(
         &origin,
         &std::env::var("TOKENFUSE_DELEGATION_ORIGINS").unwrap_or_default(),
@@ -486,11 +477,39 @@ pub async fn from_env(client: &reqwest::Client) -> ChainProof {
     }))
 }
 
-/// The origins a `Proving` is configured with, from the single origin and the list.
-///
-/// STUB for the red-first commit: the single origin only, unnormalised.
-pub(crate) fn origins_from_values(single: &str, _list: &str) -> Result<Vec<String>, String> {
-    Ok(vec![single.to_string()])
+/// The origins a `Proving` is configured with: the single origin and the list, each
+/// normalised, the union kept in order with duplicates dropped. A value that is not an origin
+/// names the variable it came from, and no origin at all is refused by name.
+pub(crate) fn origins_from_values(single: &str, list: &str) -> Result<Vec<String>, String> {
+    let mut origins: Vec<String> = Vec::new();
+    if !single.trim().is_empty() {
+        let one = tokenfuse_dpop::origin::normalize_origin(single)
+            .map_err(|_| origin_refusal("TOKENFUSE_DELEGATION_URL", single))?;
+        origins.push(one);
+    }
+    let from_list = tokenfuse_dpop::origin::parse_origin_list(list)
+        .map_err(|entry| origin_refusal("TOKENFUSE_DELEGATION_ORIGINS", &entry))?;
+    for origin in from_list {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    if origins.is_empty() {
+        return Err(
+            "TOKENFUSE_DELEGATION_URL or TOKENFUSE_DELEGATION_ORIGINS must name the absolute \
+             origin this gateway is reached at, so a proof's `htu` has something to be compared \
+             against. Without one the binding to one request is decoration."
+                .to_string(),
+        );
+    }
+    Ok(origins)
+}
+
+fn origin_refusal(var: &str, raw: &str) -> String {
+    format!(
+        "{var}: {raw:?} is not an origin: write scheme://host[:port] with nothing after the port, \
+         for example https://tokenfuse.acme.example"
+    )
 }
 
 #[cfg(test)]
@@ -934,7 +953,7 @@ mod origin_list_tests {
     use super::*;
 
     /// The single origin and the list are read as one set, normalised, and a bad
-    /// entry names the variable it came from (CLAUDE.md invariant 138).
+    /// entry names the variable it came from (CLAUDE.md invariant 141).
     #[test]
     fn the_single_origin_and_the_list_are_one_set_and_a_bad_entry_names_its_variable() {
         assert_eq!(
