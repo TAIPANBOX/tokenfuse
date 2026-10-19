@@ -24,12 +24,12 @@ Feature: An operator can cap the run budget a caller declares for itself
     And the call is refused with 402 budget_exceeded
     And the response says x-fuse-budget-clamped: 1.00
 
-  # @test:widening_an_open_run_stops_at_the_ceiling
-  Scenario: Widening an open run stops at the ceiling
+  # @test:a_raise_past_the_ceiling_is_refused_on_an_open_run
+  Scenario: A raise past the ceiling is refused on an open run
     Given the ceiling is 1.00 dollar and a run is open at 0.50
     When the agent's next call declares 1000 dollars
-    Then the run's budget becomes 1.00 dollar and never 1000
-    And a reservation above 1.00 is refused with 402
+    Then the run's budget stays 0.50 dollar and never moves up
+    And a reservation above 0.50 is refused with 402
 
   # @test:a_cloud_budget_above_the_ceiling_is_honoured_unclamped
   Scenario: A Cloud budget is the operator's word and is not clamped

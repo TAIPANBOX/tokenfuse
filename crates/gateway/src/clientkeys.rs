@@ -46,19 +46,38 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
 /// The header carrying a client's gateway credential.
 pub const CLIENT_KEY_HEADER: &str = "x-fuse-key";
 
-/// Resolved client credentials: secret -> stable `key_id`.
+/// Resolved client credentials: SHA-256 of each secret -> stable `key_id`.
 ///
-/// Lookup is a plain `HashMap` get, matching `crates/cloud/src/keys.rs`'s own
-/// bearer resolution. That is a deliberate consistency choice with the sibling
-/// plane rather than an oversight: moving to a constant-time comparison is a
-/// posture change that belongs across both planes at once, not smuggled into
-/// one crate where it would silently diverge.
+/// The map is keyed by a digest, never by the configured secret (invariant 134,
+/// F-023). A presented secret is hashed and the digest looked up, so no
+/// comparison runs over a secret's bytes and a value of this type, Debug output
+/// included, holds no configured secret in the clear. Lookup cost depends only
+/// on the presented digest, which an attacker cannot choose to match a stored
+/// one. This is the same posture `crate::adminkeys` takes with a constant-time
+/// comparison, for a set that may hold many keys.
 #[derive(Debug, Clone, Default)]
 pub struct ClientKeys {
-    by_secret: HashMap<String, String>,
+    by_digest: HashMap<[u8; 32], String>,
+}
+
+/// SHA-256 of a secret, the key a [`ClientKeys`] map is indexed by.
+fn digest(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
+
+/// Whether two presented or configured secrets are equal, compared in constant
+/// time for same-length inputs (invariant 134). A length mismatch is not secret
+/// and short-circuits, as `crate::adminkeys` already does.
+#[must_use]
+pub fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// A `TOKENFUSE_CLIENT_KEYS` spec that was set but unusable. Startup refuses
@@ -95,7 +114,7 @@ impl ClientKeys {
         if trimmed.is_empty() {
             return Ok(Self::default());
         }
-        let mut by_secret = HashMap::new();
+        let mut by_digest = HashMap::new();
         for entry in trimmed.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
@@ -108,42 +127,42 @@ impl ClientKeys {
             if secret.is_empty() || key_id.is_empty() {
                 continue;
             }
-            by_secret.insert(secret.to_string(), key_id.to_string());
+            by_digest.insert(digest(secret), key_id.to_string());
         }
-        if by_secret.is_empty() {
+        if by_digest.is_empty() {
             return Err(EmptySpec);
         }
-        Ok(Self { by_secret })
+        Ok(Self { by_digest })
     }
 
     /// Whether client authentication is on at all.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        !self.by_secret.is_empty()
+        !self.by_digest.is_empty()
     }
 
     /// How many distinct credentials are configured (startup logging).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_secret.len()
+        self.by_digest.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_secret.is_empty()
+        self.by_digest.is_empty()
     }
 
     /// The `key_id` a presented secret resolves to, or `None` if unknown.
     #[must_use]
     pub fn resolve(&self, secret: &str) -> Option<&str> {
-        self.by_secret.get(secret).map(String::as_str)
+        self.by_digest.get(&digest(secret)).map(String::as_str)
     }
 
     /// Every configured `key_id` (startup cross-checks against the identity
     /// map, docs/20). Unordered; duplicates possible when two secrets share a
     /// `key_id`, which is legal.
     pub fn key_ids(&self) -> impl Iterator<Item = &str> {
-        self.by_secret.values().map(String::as_str)
+        self.by_digest.values().map(String::as_str)
     }
 }
 
@@ -226,6 +245,22 @@ mod tests {
                 "spec {spec:?} must be rejected, never silently disable auth"
             );
         }
+    }
+
+    #[test]
+    fn secret_eq_accepts_only_the_identical_secret() {
+        assert!(secret_eq("sk-live-abc", "sk-live-abc"));
+        assert!(!secret_eq("sk-live-abc", "sk-live-abd"), "one byte off");
+        assert!(!secret_eq("sk-live-abc", "sk-live-ab"), "a strict prefix");
+        assert!(
+            !secret_eq("sk-live-ab", "sk-live-abc"),
+            "a longer presented value"
+        );
+        assert!(!secret_eq("sk-live-abc", ""), "an absent secret");
+        assert!(
+            !secret_eq("SK-LIVE-ABC", "sk-live-abc"),
+            "case is part of the secret"
+        );
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub struct AppState {
     /// is cleared and a run may log once more, which costs a repeated line
     /// and never memory.
     budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
+    /// Runs whose refused budget raise has been said once (invariant 135). Bounded like
+    /// `budget_clamp_logged`.
+    budget_raise_logged: Arc<Mutex<HashSet<String>>>,
     /// Model ids the fallback rate has priced and that have been logged, so
     /// the warning is once per model id and not once per call (tokenfuse#305).
     /// Bounded the same way as `budget_clamp_logged`: model ids are
@@ -628,6 +631,7 @@ impl AppState {
             restored_unbudgeted: Arc::new(Mutex::new(HashSet::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
+            budget_raise_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             unclassified_named: Arc::new(Mutex::new(Default::default())),
             price_book_source: Arc::new(crate::pricebookreport::PriceBookSource {
@@ -764,6 +768,17 @@ impl AppState {
     /// caller logs once per run rather than once per call.
     pub fn note_budget_clamp(&self, run_id: &str) -> bool {
         let mut seen = self.budget_clamp_logged.lock().unwrap();
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains(run_id) {
+            seen.clear();
+        }
+        seen.insert(run_id.to_string())
+    }
+
+    /// Record that `run_id` refused a caller's raise of its open budget and say
+    /// whether this is the first time this process has noted it (invariant 135).
+    /// The caller logs once per run, as for the ceiling clamp.
+    pub fn note_budget_raise_refused(&self, run_id: &str) -> bool {
+        let mut seen = self.budget_raise_logged.lock().unwrap();
         if seen.len() >= CLAMP_LOG_CAP && !seen.contains(run_id) {
             seen.clear();
         }

@@ -114,6 +114,25 @@ pub struct Opened {
     pub parent_disposition: ParentDisposition,
     /// `close_run` had been called and this open started a new generation.
     pub reopened: bool,
+    /// The budget the run holds after this call (invariant 135). For an
+    /// operator's budget it is the one given; for a caller's on an open run it
+    /// is the lower of the declaration and what the run already held.
+    pub budget: Microusd,
+    /// A caller's declaration this open refused because it would have raised an
+    /// open run's budget (invariant 135). `None` when nothing was refused.
+    pub raise_refused: Option<Microusd>,
+}
+
+/// Whose word a run's budget is (invariant 135).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBasis {
+    /// An operator set it, as a Cloud-managed budget does. It replaces the
+    /// run's budget in either direction.
+    Operator,
+    /// A caller or a default chose it: the `x-fuse-budget-usd` header, the
+    /// policy default or the built-in default. On a fresh or closed run it is
+    /// the budget; on an open run it may lower the budget and never raise it.
+    Caller,
 }
 
 /// One run on an admitted chain, with the generation it had at admission.
@@ -319,6 +338,24 @@ impl Ledger {
         budget: Microusd,
         parent: Option<&str>,
     ) -> Result<Opened, OpenError> {
+        self.open_run_as(run_id, budget, parent, BudgetBasis::Operator)
+    }
+
+    /// [`Ledger::open_run`] with the basis of the budget made explicit.
+    ///
+    /// `BudgetBasis::Caller` on an open run keeps the lower of the held budget
+    /// and the declaration: a lower declaration is taken, a higher one is
+    /// refused and reported in [`Opened::raise_refused`], and the run keeps what
+    /// it had. That is the invariant-135 rule: a caller can cap its own run and
+    /// cannot widen it. The parent decision is made first, as before, so a
+    /// refusal of the parent changes nothing here either.
+    pub fn open_run_as(
+        &self,
+        run_id: impl Into<String>,
+        budget: Microusd,
+        parent: Option<&str>,
+        basis: BudgetBasis,
+    ) -> Result<Opened, OpenError> {
         let run_id = run_id.into();
         if parent == Some(run_id.as_str()) {
             return Err(OpenError::SelfParent { run_id });
@@ -362,6 +399,8 @@ impl Ledger {
                         ParentDisposition::Kept
                     },
                     reopened,
+                    budget,
+                    raise_refused: None,
                 })
             }
             Shape::Open => {
@@ -387,12 +426,19 @@ impl Ledger {
                         ParentDisposition::Adopted
                     }
                 };
-                s.budget = budget;
+                let (effective, raise_refused) = match basis {
+                    BudgetBasis::Operator => (budget, None),
+                    BudgetBasis::Caller if budget <= s.budget => (budget, None),
+                    BudgetBasis::Caller => (s.budget, Some(budget)),
+                };
+                s.budget = effective;
                 Ok(Opened {
                     generation: s.generation,
                     parent: s.parent.clone(),
                     parent_disposition: disposition,
                     reopened: false,
+                    budget: effective,
+                    raise_refused,
                 })
             }
         }
@@ -2100,7 +2146,7 @@ mod tests {
 
 #[cfg(test)]
 mod budget_basis_tests {
-    //! Invariant 134: the budget of a run is fixed once the run is open. A caller
+    //! Invariant 135: the budget of a run is fixed once the run is open. A caller
     //! may lower an open run's budget and never raise it; an operator (a
     //! Cloud-managed budget) moves it either way.
     use super::*;
@@ -2113,7 +2159,9 @@ mod budget_basis_tests {
     fn a_caller_may_lower_an_open_budget() {
         let l = Ledger::new();
         l.open_run("r", usd(5.0), None).unwrap();
-        let o = l.open_run_as("r", usd(0.5), None, BudgetBasis::Caller).unwrap();
+        let o = l
+            .open_run_as("r", usd(0.5), None, BudgetBasis::Caller)
+            .unwrap();
         assert_eq!(o.budget, usd(0.5));
         assert_eq!(o.raise_refused, None);
         assert_eq!(l.snapshot("r").unwrap().budget, usd(0.5));

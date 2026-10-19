@@ -1750,6 +1750,53 @@ run_case "audit-keyryx: a kid that is not the signing key's thumbprint served" f
 	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    if kid != thumbprint {", "    if kid != thumbprint && false {")')" \
 	"a_kid_that_names_another_key_is_never_served ... FAILED"
 
+# --- invariant 134: client keys are looked up by digest (F-023) ----------------
+
+run_case "client-keys: the map keyed by a raw secret again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "by_digest: HashMap<[u8; 32], String>,", "by_digest: HashMap<[u8; 32], String>,\n    by_secret: HashMap<String, String>,")')" \
+	"keyed by text"
+
+run_case "client-keys: the lookup key no longer SHA-256 of the secret" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "Sha256::digest(secret.as_bytes()).into()", "secret.as_bytes().try_into().unwrap_or([0u8; 32])")')" \
+	"does not compute the lookup key"
+
+run_case "client-keys: the declassify key compared with == again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/declassify.rs", "(Some(want), Some(got)) if crate::clientkeys::secret_eq(want, got) => true,", "(Some(want), Some(got)) if want == got => true,")')" \
+	"compares the declassify key with =="
+
+run_case "client-keys: a comment naming the old map passes" pass \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "pub struct ClientKeys {", "// The old shape was HashMap<String, String>, keyed by the raw secret.\npub struct ClientKeys {")')"
+
+run_case "client-keys: clientkeys.rs gone, so the gate measured nothing" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'import os; os.rename("crates/gateway/src/clientkeys.rs", "crates/gateway/src/clientkeys.rs.moved")')" \
+	"measured nothing"
+
+# --- invariant 135: a run's budget is fixed once open (F-025) -----------------
+#
+# These run the rule's own tests against a mutated product file. Each mutant is a
+# silent fault: the request still succeeds, so only an assertion on the budget
+# (or the refused raise) can see it.
+
+run_case "run-budget: the proxy hands a caller's budget the operator's basis" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        tokenfuse_core::BudgetBasis::Caller\n    };", "        tokenfuse_core::BudgetBasis::Operator\n    };")')" \
+	"a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget ... FAILED"
+
+run_case "run-budget: the in-process ledger applies a caller's raise" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact budget_basis_tests::a_caller_may_not_raise_an_open_budget" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Caller => (s.budget, Some(budget)),", "BudgetBasis::Caller => (budget, None),")')" \
+	"a_caller_may_not_raise_an_open_budget ... FAILED"
+
+run_case "run-budget: an operator's raise capped at the held budget" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact budget_basis_tests::an_operator_budget_moves_an_open_run_either_way" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Operator => (budget, None),", "BudgetBasis::Operator if budget > s.budget => (s.budget, None),\n                    BudgetBasis::Operator => (budget, None),")')" \
+	"an_operator_budget_moves_an_open_run_either_way ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

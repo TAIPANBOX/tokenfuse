@@ -768,6 +768,14 @@ async fn handle_call(
     // A Cloud-managed budget (set by an operator) overrides the client-supplied
     // header; otherwise use the header, then the policy default.
     let cloud_budget = st.cloud_budget(&run_id);
+    // Invariant 135: only an operator's word may raise an open run. A Cloud-managed
+    // budget is the operator's; the header, the policy default and the built-in default
+    // are the caller's, and on an open run they may lower the budget and never raise it.
+    let basis = if cloud_budget.is_some() {
+        tokenfuse_core::BudgetBasis::Operator
+    } else {
+        tokenfuse_core::BudgetBasis::Caller
+    };
     let requested = cloud_budget
         .or_else(|| header_f64(&headers, "x-fuse-budget-usd").map(Microusd::from_usd))
         .or(st.policy.budget_per_run)
@@ -867,7 +875,11 @@ async fn handle_call(
     // that point can no longer tell "just opened, never seen before" apart
     // from "already open, called again".
     let run_is_fresh = st.ledger.snapshot(&run_id).await.is_none();
-    let opened = match st.ledger.open_run(&run_id, budget, parent.as_deref()).await {
+    let opened = match st
+        .ledger
+        .open_run_as(&run_id, budget, parent.as_deref(), basis)
+        .await
+    {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(run = %run_id, error = %e, "refused: the request would move the run to another parent, or names an impossible one");
@@ -876,6 +888,20 @@ async fn handle_call(
     };
     if run_is_fresh {
         credit_run_seed_if_any(&st, &run_id, opened.generation).await;
+    }
+    // The budget this call is judged against is the one the run now holds, which for an
+    // open run may be lower than the declared one (invariant 135).
+    let budget = opened.budget;
+    if let Some(refused) = opened.raise_refused {
+        if st.note_budget_raise_refused(&run_id) {
+            tracing::warn!(
+                run = %run_id,
+                held_usd = budget.as_usd(),
+                declared_usd = refused.as_usd(),
+                "refused to raise an open run's budget: a caller may lower its own run's budget but not \
+                 raise it; the run keeps the budget it opened at (invariant 135); logged once per run"
+            );
+        }
     }
     // The run now holds the budget this call opened it at, so a restored entry is settled.
     st.clear_restored_unbudgeted(&run_id);
@@ -4756,7 +4782,7 @@ pub(crate) mod tests {
         assert_eq!(resp.headers().get("x-fuse-budget-clamped").unwrap(), "1.00");
     }
 
-    // --- invariant 134: a run's budget is fixed once the run is open ----------
+    // --- invariant 135: a run's budget is fixed once the run is open ----------
 
     /// A caller that raises its own budget on an open run is refused: the run keeps the
     /// budget its first call declared, so a reservation past it is a 402. On the
@@ -4861,10 +4887,14 @@ pub(crate) mod tests {
         assert_eq!(said, 1, "{log}");
     }
 
-    /// Widening is the one release valve for a retained reservation (D7/D8)
-    /// and stays: it just stops at the ceiling.
+    /// Invariant 135 (F-025): an open run keeps the budget its first declaration
+    /// gave it, and a later raise is refused, ceiling or not. The clamp still
+    /// applies to the declaration and is still reported, but the run holds at most
+    /// what it opened at. This test used to pin widening up to the ceiling as the
+    /// release valve for a retained reservation; that valve is now an operator's
+    /// Cloud budget or a closure (invariants 89 and 135), not the caller's header.
     #[tokio::test]
-    async fn widening_an_open_run_stops_at_the_ceiling() {
+    async fn a_raise_past_the_ceiling_is_refused_on_an_open_run() {
         let st = ceiling_state(Some(1.0));
         let first = call_on(&st, "ceil-widen", Some("0.50"), SMALL_CALL, false).await;
         assert_eq!(first.status(), StatusCode::OK);
@@ -4874,7 +4904,7 @@ pub(crate) mod tests {
             Microusd(500_000)
         );
 
-        // Widened to 1000 by the agent's next call: clamped, but still wider.
+        // The next call declares 1000: clamped to the ceiling, then refused as a raise.
         let second = call_on(&st, "ceil-widen", Some("1000"), SMALL_CALL, false).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
@@ -4883,8 +4913,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             st.ledger.snapshot("ceil-widen").await.unwrap().budget,
-            Microusd(1_000_000),
-            "widening reached the ceiling and not the declared 1000"
+            Microusd(500_000),
+            "a raise past the ceiling is refused too: the run keeps 0.50"
         );
 
         let third = call_on(&st, "ceil-widen", Some("1000"), BIG_CALL, false).await;
