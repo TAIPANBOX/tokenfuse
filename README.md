@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.18.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2304-brightgreen)
+![tests](https://img.shields.io/badge/tests-2324-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -253,7 +253,7 @@ Three properties make this safe in production:
 
 Because cost is *estimated* before the call and *settled* after it, TokenFuse's numbers are a fast pre-flight approximation reconciled against real usage, not a hard real-time guarantee - see the [FAQ](#-faq) for what that means in practice.
 
-One case is neither settled nor released: a call the gateway has already handed to the provider when the client disconnects, before any answer has come back. The provider may or may not have run it, so its reservation stays outstanding on the run and on the unit's monthly cap rather than being written off as free; `GET /v1/runs` lists it as `retained` / `retained_usd`, the log carries a warning naming the run and the amount, and the run's next call can widen its budget to absorb it. Nothing releases it on a timer: a person closes it with evidence through the operator console (`POST /v1/retained/close`, CLAUDE.md invariant 89; both routes are served only when `TOKENFUSE_CLOSURE_SECRET` is set). With `TOKENFUSE_EVENTS_PATH` set, the retained call is one `call_retained` event on the bus (medium) and its closure one `retained_closed` (high), so a person is told the money is held and told when it is released (invariant 90).
+One case is neither settled nor released: a call the gateway has already handed to the provider when the client disconnects, before any answer has come back. The provider may or may not have run it, so its reservation stays outstanding on the run and on the unit's monthly cap rather than being written off as free; `GET /v1/runs` lists it as `retained` / `retained_usd`, and the log carries a warning naming the run and the amount. The room it holds stays held: a caller's next call cannot widen its run to absorb it (invariant 135), so only a closure or an operator's Cloud budget moves it. Nothing releases it on a timer: a person closes it with evidence through the operator console (`POST /v1/retained/close`, CLAUDE.md invariant 89; both routes are served only when `TOKENFUSE_CLOSURE_SECRET` is set). With `TOKENFUSE_EVENTS_PATH` set, the retained call is one `call_retained` event on the bus (medium) and its closure one `retained_closed` (high), so a person is told the money is held and told when it is released (invariant 90).
 
 **Latency:** the enforcement decision adds **~0.4 µs p99** in-process; on the wire the gateway adds **~0.8 ms p50 / ~2 ms p99** over a direct provider call, negligible next to an LLM response measured in hundreds of ms to seconds. Method + numbers: [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -396,7 +396,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
 
 `TOKENFUSE_MODE` = `shadow` (default) · `warn` · `enforce`.
 
-**Cap what an agent may declare.** The budget in `x-fuse-budget-usd` is whatever the calling agent sends, and an agent that sends a larger one on its next call widens its own run. With no client keys configured, that header is the only per-run ceiling there is. Set `TOKENFUSE_MAX_RUN_BUDGET_USD` to a positive decimal number of dollars (at most six decimals, for example `25` or `2.50`) and the gateway clamps every budget the caller declared, and the built-in USD 5 default used when it declared none, to that figure before the run is opened:
+**Cap what an agent may declare.** The budget in `x-fuse-budget-usd` is whatever the calling agent sends. It sets the run's budget when the run opens, and a later call on that run can lower it but never raise it (invariant 135). With no client keys configured, that header is the only per-run ceiling there is. Set `TOKENFUSE_MAX_RUN_BUDGET_USD` to a positive decimal number of dollars (at most six decimals, for example `25` or `2.50`) and the gateway clamps every budget the caller declared, and the built-in USD 5 default used when it declared none, to that figure before the run is opened:
 
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_USD=25 \
@@ -404,7 +404,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_US
   ghcr.io/taipanbox/tokenfuse:v1.18.0
 ```
 
-A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling, widening an open run still works up to the ceiling and never past it, and a budget an operator set in the Cloud is the operator's own word and is not clamped. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
+A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling. An open run never moves up on a caller's declaration, so a later call cannot widen it, to the ceiling or otherwise (invariant 135); the answer to a call whose raise was refused carries `x-fuse-budget: raise-refused; kept=<usd>`, naming the budget the run kept, on both doors and on a stream too. A budget an operator set in the Cloud is the operator's own word and is not clamped, and it moves the run either way. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
 
 **Which price a call is charged at.** Every metered answer, streamed or not, carries `x-fuse-price`: `known` when the price book (built-in rows plus any `TOKENFUSE_PRICE_BOOK` rows) has a row for the model id, `fallback` when it did not and the call was priced at the conservative fallback of USD 15 / 75 per million tokens. That is the safe direction for a cap: it is at or above the input and output base rate of every row in the book (the dearest there is o1, at 15 / 60), and about 150 times the list price of Claude Haiku 5.5 (0.10 / 0.50). The first fallback-priced call of each model id is also logged at warn. `x-fuse-cost-usd` is this call's settled cost and `x-fuse-spent-usd` the run's running total, so a reader recording per-call charges wants the first.
 

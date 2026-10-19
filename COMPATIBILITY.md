@@ -243,7 +243,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - `x-fuse-mcp-upstream`
 - held in: `crates/gateway/src/proxy.rs`, `crates/gateway/src/clientkeys.rs`, `crates/gateway/src/declassify.rs`, `crates/gateway/src/mcpbroker.rs`, `crates/gateway/src/attestation.rs`
 
-### http.response_headers (16)
+### http.response_headers (17)
 
 - `x-fuse-mode`
 - `x-fuse-step`
@@ -261,6 +261,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - `x-fuse-saved-usd`
 - `x-fuse-price`
 - `x-fuse-approval-id`
+- `x-fuse-budget`
 - held in: `crates/gateway/src/proxy.rs`
 
 ### http.routes (10)
