@@ -1758,6 +1758,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_admitted_allow_is_not_served_to_a_client_key_call() {
+        // How the door knew the agent is part of the decision, so a verdict
+        // reached on an agent token must not answer a static-key call for the
+        // same agent and tools inside the TTL. The control: a repeat with the
+        // same identity source IS a cache hit.
+        let (url, calls) = answering_pdp(
+            200,
+            r#"{"decision":"allow","cacheable":true}"#.to_string(),
+        )
+        .await;
+        let w = hook(url, FailMode::Open, Duration::from_secs(60));
+        let token_ctx = || {
+            let mut c = ctx_for("agent://t/a");
+            c.identity_source = Some("agent-token".into());
+            c
+        };
+        let mut by_key = ctx_for("agent://t/a");
+        by_key.identity_source = Some("client-key".into());
+
+        w.decide(token_ctx()).await;
+        w.decide(by_key).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a client-key call must ask the PDP, not inherit a token-admitted allow"
+        );
+        w.decide(token_ctx()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a repeat with the same identity source is still a cache hit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_2xx_that_does_not_decode_stays_a_decode_error() {
         let (url, _) = answering_pdp(200, r#"{"not":"a decision"}"#.to_string()).await;
         let w = hook(url, FailMode::Open, Duration::from_secs(0));
