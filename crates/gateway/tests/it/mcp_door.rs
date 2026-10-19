@@ -496,7 +496,7 @@ fn a_proof_addressed_to_the_first_origin_still_opens_the_door_with_a_list() {
 
 /// An origin spelled with its default port is the same origin.
 #[test]
-fn the_first_origin_spelled_with_its_default_port_is_the_same_origin() {
+fn the_mcp_door_takes_the_first_origin_spelled_with_its_default_port() {
     let (holder, k) = (Key::new(), keys(""));
     let c = registry_at(&holder, ORIGIN);
     let proof = proof_naming(&holder, "https://mcp.acme.example:443/mcp", "port-1");
@@ -508,7 +508,7 @@ fn the_first_origin_spelled_with_its_default_port_is_the_same_origin() {
 
 /// An origin nobody listed is refused, whatever path it names.
 #[test]
-fn a_proof_naming_an_unlisted_origin_is_refused() {
+fn the_mcp_door_refuses_a_proof_naming_an_unlisted_origin() {
     let (holder, k) = (Key::new(), keys(""));
     let c = registry_at(&holder, &format!("{ORIGIN},{SECOND_ORIGIN}"));
     let proof = proof_naming(&holder, "https://evil.example/mcp", "unlisted-1");
@@ -520,7 +520,7 @@ fn a_proof_naming_an_unlisted_origin_is_refused() {
 
 /// User information in the htu is refused, even when the host after it is listed.
 #[test]
-fn a_proof_with_user_information_in_its_htu_is_refused() {
+fn the_mcp_door_refuses_a_proof_with_user_information_in_its_htu() {
     let (holder, k) = (Key::new(), keys(""));
     let c = registry_at(&holder, ORIGIN);
     let proof = proof_naming(&holder, "https://user@mcp.acme.example/mcp", "userinfo-1");
@@ -533,7 +533,7 @@ fn a_proof_with_user_information_in_its_htu_is_refused() {
 /// A fragment is never part of the URI a request was made to. Red before the fix: the
 /// verifier trimmed everything after the `#` and admitted the proof.
 #[test]
-fn a_proof_with_a_fragment_in_its_htu_is_refused() {
+fn the_mcp_door_refuses_a_proof_with_a_fragment_in_its_htu() {
     let (holder, k) = (Key::new(), keys(""));
     let c = registry_at(&holder, ORIGIN);
     let proof = proof_naming(&holder, &format!("{ORIGIN}{PATH}#frag"), "fragment-1");
