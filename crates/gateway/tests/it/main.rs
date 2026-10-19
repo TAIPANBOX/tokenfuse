@@ -28,6 +28,7 @@ mod delegation_htu_matches_wire;
 mod dlp_shadow_on_the_bus;
 mod event_checkpoints;
 mod firewall_mode_startup;
+mod governed_profile;
 mod focus_names_price_basis_and_pii;
 mod image_user_group;
 mod keys_endpoint;
