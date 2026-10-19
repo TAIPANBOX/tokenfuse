@@ -6409,7 +6409,7 @@ pub(crate) mod tests {
         let st = firewall_state(mode, resp_body).with_chain_proof(
             Some(std::sync::Arc::new(crate::chainproof::Proving {
                 cfg: cfg(&issuer),
-                origin: PROVING_ORIGIN.to_string(),
+                origins: vec![PROVING_ORIGIN.to_string()],
             })),
             None,
         );
@@ -11132,7 +11132,7 @@ pub(crate) mod tests {
             .with_chain_proof(
                 Some(Arc::new(crate::chainproof::Proving {
                     cfg: cfg(&issuer),
-                    origin: PROVING_ORIGIN.to_string(),
+                    origins: vec![PROVING_ORIGIN.to_string()],
                 })),
                 None,
             );

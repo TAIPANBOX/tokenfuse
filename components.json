@@ -139,6 +139,9 @@
           "TOKENFUSE_DELEGATION_JWKS_URL": {
             "required": false
           },
+          "TOKENFUSE_DELEGATION_ORIGINS": {
+            "required": false
+          },
           "TOKENFUSE_DELEGATION_REVOCATIONS": {
             "required": false
           },
@@ -218,6 +221,9 @@
             "required": false
           },
           "TOKENFUSE_MCP_LOCK": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_PROOF_ORIGINS": {
             "required": false
           },
           "TOKENFUSE_MCP_PROOF_URL": {

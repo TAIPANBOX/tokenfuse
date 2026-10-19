@@ -2050,7 +2050,7 @@ fn broker_proving_recording(
     Arc::get_mut(&mut st).unwrap().chain_proof =
         Some(Arc::new(tokenfuse_gateway::chainproof::Proving {
             cfg: cfg(&issuer),
-            origin,
+            origins: vec![origin],
         }));
     (app(st), issuer, holder)
 }

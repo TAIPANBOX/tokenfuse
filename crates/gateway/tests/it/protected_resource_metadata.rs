@@ -65,7 +65,7 @@ impl Door {
         let state = Arc::new(BrokerState {
             chain_proof: Some(Arc::new(Proving {
                 cfg: delegation,
-                origin: BROKER_ORIGIN.to_string(),
+                origins: vec![BROKER_ORIGIN.to_string()],
             })),
             revocations: None,
             identity_strict: tokenfuse_gateway::identitymap::StrictMode::Off,

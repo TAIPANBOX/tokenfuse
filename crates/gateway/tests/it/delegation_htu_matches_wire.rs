@@ -47,7 +47,7 @@ fn proving_state(wire: Wire) -> (tokenfuse_gateway::state::AppState, Key, Key) {
     let st = common::app_with_wire(wire).with_chain_proof(
         Some(Arc::new(Proving {
             cfg: cfg(&issuer),
-            origin: ORIGIN.to_string(),
+            origins: vec![ORIGIN.to_string()],
         })),
         None,
     );

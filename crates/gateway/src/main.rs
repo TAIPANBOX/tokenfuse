@@ -523,9 +523,20 @@ async fn mcp_broker() {
     // reached: reading a typo as "not configured" leaves the door in whatever
     // state the OTHER variable happens to be in, at the moment an operator
     // believed they had just tightened it.
+    // The single origin and the list are one set (CLAUDE.md invariant 141): joined here, and
+    // every entry validated by `from_spec`.
+    let proof_origins = [
+        std::env::var("TOKENFUSE_MCP_PROOF_URL").unwrap_or_default(),
+        std::env::var("TOKENFUSE_MCP_PROOF_ORIGINS").unwrap_or_default(),
+    ]
+    .into_iter()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(",");
     let clients = match tokenfuse_gateway::mcpdoor::ClientRegistry::from_spec(
         &std::env::var("TOKENFUSE_MCP_CLIENT_IDS").unwrap_or_default(),
-        &std::env::var("TOKENFUSE_MCP_PROOF_URL").unwrap_or_default(),
+        &proof_origins,
     ) {
         Ok(clients) => clients,
         Err(e) => {

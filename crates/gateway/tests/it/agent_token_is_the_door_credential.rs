@@ -78,7 +78,7 @@ fn gate(wire: Wire, mode: Option<Mode>, keys: Option<&str>) -> Gate {
         .with_chain_proof(
             Some(Arc::new(Proving {
                 cfg: cfg(&issuer),
-                origin: ORIGIN.to_string(),
+                origins: vec![ORIGIN.to_string()],
             })),
             None,
         )
