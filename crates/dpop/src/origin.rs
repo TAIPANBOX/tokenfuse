@@ -191,7 +191,6 @@ pub fn parse_origin_list(list: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     /// A compact JWS with an unchecked signature, carrying `claims`. Only the
     /// payload is read by `unverified_htu`, so the header and signature are
