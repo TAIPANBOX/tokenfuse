@@ -1728,8 +1728,8 @@ run_case "broker-key: the decision never refuses" fail \
 # --- invariant 130: the audit manifest signed by keyryx custody -------------
 #
 # Product mutants, held by cargo test: an unusable signer left running, keyryx's
-# answer served unverified, and an unreachable keyryx replaced by the key in the
-# environment.
+# answer served unverified, an unreachable keyryx replaced by the key in the
+# environment, and a kid served that does not name the key that signed.
 run_case "audit-keyryx: an unusable signer configuration left running" fail \
 	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::the_keyryx_signer_with_nothing_else_refuses_to_start" \
 	"$(py 'edit("crates/cloud/src/main.rs", "            Err(refusal) => {\n                tracing::error!(\"{refusal}\");\n                std::process::exit(2);\n            }", "            Err(_refusal) => (None, None),")')" \
@@ -1744,6 +1744,11 @@ run_case "audit-keyryx: an unreachable keyryx replaced by the key in the environ
 	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::an_unreachable_keyryx_fails_closed_and_no_other_key_signs_instead" \
 	"$(py 'edit("crates/cloud/src/http.rs", "    if let Some(signer) = st.audit_keyryx.as_ref() {", "    if let Some(signer) = st.audit_keyryx.as_ref().filter(|_| st.audit_signing_key.is_none()) {")')" \
 	"an_unreachable_keyryx_fails_closed_and_no_other_key_signs_instead ... FAILED"
+
+run_case "audit-keyryx: a kid that is not the signing key's thumbprint served" fail \
+	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::a_kid_that_names_another_key_is_never_served" \
+	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    if kid != thumbprint {", "    if kid != thumbprint && false {")')" \
+	"a_kid_that_names_another_key_is_never_served ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #

@@ -4,7 +4,9 @@
 //! process: keyryx holds it, and this process asks keyryx's sign route
 //! (`POST /v1/keys/{name}/sign`) to sign each manifest's canonical bytes. The
 //! answer is checked here before anything is served: an ES256 signature that
-//! verifies over exactly those bytes under the public key keyryx named. Any
+//! verifies over exactly those bytes under the public key keyryx named, and a
+//! `kid` that is that key's RFC 7638 thumbprint, which is how keyryx names an
+//! EC key and what an auditor looks the key up by in keyryx's published set. Any
 //! other answer, and a keyryx that cannot be reached, is a manifest not signed:
 //! the route answers `503` and says why, and nothing unsigned is served and no
 //! other key signs instead.
@@ -23,7 +25,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use p256::ecdsa::{signature::Verifier, Signature, SigningKey, VerifyingKey};
 
 use crate::audit_sign::{AuditManifest, ChainTip, AUDIT_SIGNING_KEY_ENV};
@@ -274,8 +279,9 @@ impl KeyryxSigner {
     }
 
     /// Ask keyryx to sign `bytes` and check what it answered: status 200, a
-    /// JSON body of keyryx's shape, `alg` ES256, a P-256 public key, and a
-    /// signature that verifies over `bytes` under it.
+    /// JSON body of keyryx's shape, `alg` ES256, a P-256 public key, a
+    /// signature that verifies over `bytes` under it, and a `kid` that is that
+    /// key's RFC 7638 thumbprint.
     pub async fn sign(&self, bytes: &[u8]) -> Result<KeyryxSignature, NotSigned> {
         if bytes.len() > MAX_STATEMENT {
             return Err(NotSigned::same(format!(
@@ -395,8 +401,9 @@ impl KeyryxSigner {
     }
 }
 
-/// keyryx's answer, checked: its four fields, ES256, a P-256 key, and a
-/// signature that verifies over `bytes`. Nothing is taken on its word.
+/// keyryx's answer, checked: its four fields, ES256, a P-256 key, a signature
+/// that verifies over `bytes`, and a kid that names that key. Nothing is taken
+/// on its word.
 fn verify_answer(raw: &[u8], bytes: &[u8]) -> Result<KeyryxSignature, NotSigned> {
     let v: serde_json::Value =
         serde_json::from_slice(raw).map_err(|_| NotSigned::same("keyryx's answer is not JSON"))?;
@@ -428,11 +435,47 @@ fn verify_answer(raw: &[u8], bytes: &[u8]) -> Result<KeyryxSignature, NotSigned>
     public.verify(bytes, &sig).map_err(|_| {
         NotSigned::same("keyryx's signature does not verify over this manifest's bytes")
     })?;
+    // An auditor anchors the manifest's key by its kid in keyryx's published
+    // set, so a kid naming another key points the anchor away from the key
+    // that signed while the manifest still verifies. keyryx names an EC key by
+    // its RFC 7638 thumbprint (`kidFor`, `internal/keystore/keystore.go`).
+    let thumbprint = thumbprint(&public)?;
+    if kid != thumbprint {
+        let reason = "keyryx's kid is not the RFC 7638 thumbprint of the key that signed";
+        return Err(NotSigned {
+            reason: reason.to_string(),
+            detail: format!(
+                "{reason}: keyryx named '{}', the key's thumbprint is '{thumbprint}'",
+                kid.chars()
+                    .filter(char::is_ascii_graphic)
+                    .take(64)
+                    .collect::<String>()
+            ),
+        });
+    }
     Ok(KeyryxSignature {
         kid: kid.to_string(),
         signature_b64: STANDARD.encode(sig.to_bytes()),
         public_key_b64: STANDARD.encode(public.to_encoded_point(false).as_bytes()),
     })
+}
+
+/// The RFC 7638 thumbprint of a P-256 key, by the one function this estate
+/// names a key with ([`tokenfuse_dpop::thumbprint_of_json`]).
+fn thumbprint(public: &VerifyingKey) -> Result<String, NotSigned> {
+    let point = public.to_encoded_point(false);
+    let (Some(x), Some(y)) = (point.x(), point.y()) else {
+        return Err(NotSigned::same(
+            "keyryx's answer carries no P-256 public key",
+        ));
+    };
+    tokenfuse_dpop::thumbprint_of_json(&serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(x),
+        "y": URL_SAFE_NO_PAD.encode(y),
+    }))
+    .map_err(|_| NotSigned::same("keyryx's public key has no RFC 7638 thumbprint"))
 }
 
 #[cfg(test)]
