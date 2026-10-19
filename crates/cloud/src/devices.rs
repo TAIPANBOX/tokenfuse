@@ -17,6 +17,10 @@ use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// How far a device's signed timestamp may sit from the server's clock, in
+/// seconds, and how long a nonce is remembered for replay (invariant 132).
+pub const SIGNATURE_WINDOW_SECS: i64 = 120;
+
 /// A paired device authorized to read (via its token) and, if `role == admin`,
 /// to sign mutations with its Enclave key.
 #[derive(Debug, Clone, Serialize, Deserialize)]

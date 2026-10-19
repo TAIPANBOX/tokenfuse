@@ -146,7 +146,7 @@ pub async fn declassify(
     }
     let presented = crate::proxy::header_str(&headers, "x-fuse-declassify-key");
     let authenticated = match (&expected, &presented) {
-        (Some(want), Some(got)) if want == got => true,
+        (Some(want), Some(got)) if crate::clientkeys::secret_eq(want, got) => true,
         // Configured and wrong, or configured and absent: refused. A key that
         // can be omitted is not a key.
         (Some(_), _) => {

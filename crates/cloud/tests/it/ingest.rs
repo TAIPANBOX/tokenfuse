@@ -10,12 +10,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, Principal, Store};
 
 fn state_with(store: Arc<Store>) -> AppState {
     let mut keys = HashMap::new();
     keys.insert(
-        "k".to_string(),
+        digest("k"),
         Principal {
             org: "acme".into(),
             role: "admin".into(),
@@ -26,7 +27,7 @@ fn state_with(store: Arc<Store>) -> AppState {
     // admin key; this one exists so the ingest route can be pinned against the
     // role that must not reach it.
     keys.insert(
-        "viewerkey".to_string(),
+        digest("viewerkey"),
         Principal {
             org: "acme".into(),
             role: "viewer".into(),
@@ -37,7 +38,7 @@ fn state_with(store: Arc<Store>) -> AppState {
     // gateway needs. Bound to "site-a", so a push made with it is attributed
     // there without the body naming anything.
     keys.insert(
-        "ingestkey".to_string(),
+        digest("ingestkey"),
         Principal {
             org: "acme".into(),
             role: "ingest".into(),

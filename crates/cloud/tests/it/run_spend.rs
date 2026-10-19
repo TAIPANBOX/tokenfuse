@@ -16,6 +16,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::{app, AppState, CallRecord, Principal, Store, RUNS_WINDOW_HEADER};
 
 fn key(org: &str, role: &str, site: Option<&str>) -> Principal {
@@ -29,13 +30,16 @@ fn key(org: &str, role: &str, site: Option<&str>) -> Principal {
 fn test_state() -> (AppState, Arc<Store>) {
     let store = Arc::new(Store::new());
     let mut keys = HashMap::new();
-    keys.insert("flint".into(), key("acme", "ingest", Some("flint")));
-    keys.insert("brume".into(), key("acme", "ingest", Some("brume")));
-    keys.insert("admin".into(), key("acme", "admin", None));
-    keys.insert("viewer".into(), key("acme", "viewer", None));
-    keys.insert("unbound-ingest".into(), key("acme", "ingest", None));
-    keys.insert("admin-at-flint".into(), key("acme", "admin", Some("flint")));
-    keys.insert("beta-flint".into(), key("beta", "ingest", Some("flint")));
+    keys.insert(digest("flint"), key("acme", "ingest", Some("flint")));
+    keys.insert(digest("brume"), key("acme", "ingest", Some("brume")));
+    keys.insert(digest("admin"), key("acme", "admin", None));
+    keys.insert(digest("viewer"), key("acme", "viewer", None));
+    keys.insert(digest("unbound-ingest"), key("acme", "ingest", None));
+    keys.insert(
+        digest("admin-at-flint"),
+        key("acme", "admin", Some("flint")),
+    );
+    keys.insert(digest("beta-flint"), key("beta", "ingest", Some("flint")));
     (
         AppState::new(Arc::clone(&store), Arc::new(keys), 0.8),
         store,

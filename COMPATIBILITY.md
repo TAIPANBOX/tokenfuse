@@ -243,7 +243,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - `x-fuse-mcp-upstream`
 - held in: `crates/gateway/src/proxy.rs`, `crates/gateway/src/clientkeys.rs`, `crates/gateway/src/declassify.rs`, `crates/gateway/src/mcpbroker.rs`, `crates/gateway/src/attestation.rs`
 
-### http.response_headers (16)
+### http.response_headers (17)
 
 - `x-fuse-mode`
 - `x-fuse-step`
@@ -261,6 +261,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 - `x-fuse-saved-usd`
 - `x-fuse-price`
 - `x-fuse-approval-id`
+- `x-fuse-budget`
 - held in: `crates/gateway/src/proxy.rs`
 
 ### http.routes (10)
@@ -311,6 +312,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 
 ## Additive within a major
 
+- a new TOKENFUSE_CLOUD_* environment name, such as TOKENFUSE_CLOUD_CORS_ORIGINS (1.19.0, invariant 131): a name is added, never renamed or removed within this major. Its default is stated where it is declared: unset, TOKENFUSE_CLOUD_CORS_ORIGINS answers loopback origins only, where the 1.18 control plane answered every origin, which is a deliberate security change recorded in invariant 131
 - a new BreakerReason wire string, a new agent-event type or a new x-fuse header: appended, published in contracts/tokenfuse-constants.json by scripts/constants.sh (invariant 14), never renamed
 - the agent-event envelope schema this emitter writes (taipanbox.dev/agent-event/v0.2 today): it moves with agent-passport's SPEC in its own release (SPEC 6.2/6.4), not with this repository's
 - a Parquet trace column: appended, nullable on read (invariant 6); a column is never removed or retyped within this major

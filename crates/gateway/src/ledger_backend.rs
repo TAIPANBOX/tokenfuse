@@ -31,7 +31,9 @@
 //! until both backends implement it, which is loud enough on its own.
 
 use async_trait::async_trait;
-use tokenfuse_core::{BudgetError, Ledger, Microusd, OpenError, Opened, Reservation, RunSnapshot};
+use tokenfuse_core::{
+    BudgetBasis, BudgetError, Ledger, Microusd, OpenError, Opened, Reservation, RunSnapshot,
+};
 
 /// A budget ledger the gateway can reserve/settle against.
 #[async_trait]
@@ -45,6 +47,32 @@ pub trait LedgerBackend: Send + Sync {
         budget: Microusd,
         parent: Option<&str>,
     ) -> Result<Opened, OpenError>;
+
+    /// [`LedgerBackend::open_run`] with whose word the budget is (invariant 135).
+    ///
+    /// A `Caller` declaration on an open run may lower the run's budget and
+    /// never raise it; the refused raise comes back in `Opened::raise_refused`.
+    /// This default reads the held budget and then opens at the lower figure,
+    /// which is not atomic with the write: a backend that can do the check
+    /// under its own lock overrides it (the in-process one does).
+    async fn open_run_as(
+        &self,
+        run_id: &str,
+        budget: Microusd,
+        parent: Option<&str>,
+        basis: BudgetBasis,
+    ) -> Result<Opened, OpenError> {
+        let (effective, raise_refused) = match (basis, self.snapshot(run_id).await) {
+            (BudgetBasis::Caller, Some(held)) if budget > held.budget => {
+                (held.budget, Some(budget))
+            }
+            _ => (budget, None),
+        };
+        let mut opened = self.open_run(run_id, effective, parent).await?;
+        opened.budget = effective;
+        opened.raise_refused = raise_refused;
+        Ok(opened)
+    }
 
     /// Reserve `estimate` if it fits the budget; otherwise return the error.
     async fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError>;
@@ -111,6 +139,16 @@ impl LedgerBackend for LocalLedger {
         parent: Option<&str>,
     ) -> Result<Opened, OpenError> {
         self.0.open_run(run_id, budget, parent)
+    }
+
+    async fn open_run_as(
+        &self,
+        run_id: &str,
+        budget: Microusd,
+        parent: Option<&str>,
+        basis: BudgetBasis,
+    ) -> Result<Opened, OpenError> {
+        self.0.open_run_as(run_id, budget, parent, basis)
     }
 
     async fn reserve(&self, run_id: &str, estimate: Microusd) -> Result<Reservation, BudgetError> {

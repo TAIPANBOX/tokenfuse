@@ -643,8 +643,9 @@ pub fn firewall_mode_from_env() -> Option<tokenfuse_core::taint::FirewallMode> {
 /// AGENT sends, and `Ledger::open_run` rewrites an open run's budget on every
 /// call, so in a deployment with no client keys and no identity map the
 /// per-run ceiling was whatever the agent declared, widened again by its next
-/// call. Widening stays (it is the one release valve for a reservation kept
-/// open after an unknown outcome, invariant 50); this bounds it.
+/// call. Invariant 135 fixes that: the first declaration sets an open run's
+/// budget, a caller may lower it and never raise it, and the ceiling bounds
+/// what that first declaration can be.
 ///
 /// The value is a positive decimal number of dollars read as integers, never
 /// through `f64`: digits, optionally a point and one to six more digits.

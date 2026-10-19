@@ -48,6 +48,7 @@ mod mcp_xaa;
 mod memory_and_unclassified;
 mod no_usage_stream_settles_on_the_estimate;
 mod pii_found_is_recorded;
+mod refused_raise_on_the_wire;
 
 mod open_bind_without_client_keys;
 mod openrouter_openai_ids_are_priced;

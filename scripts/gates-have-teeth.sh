@@ -1606,6 +1606,57 @@ run_case "upstream-key: the gateway's own key is not sent upstream" fail \
 	"$(py 'edit("crates/gateway/src/provider.rs", "let (name, value) = key.header();", "let (name, value) = (\"x-api-key\", String::new());")')" \
 	"no longer takes the upstream header"
 
+# --- invariants 132 and 133: credentials are held by digest, and the dashboard's
+# key is read from the fragment and stripped from the address bar ---------------
+
+run_case "cloud-credentials: an org-key lookup by the raw bearer" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/http.rs", "if let Some(p) = self.keys.get(&digest(token)) {", "if let Some(p) = self.keys.get(token) {")')" \
+	"looked up or stored by something other than a digest"
+
+run_case "cloud-credentials: a device stored under the raw token" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/store.rs", "inner.devices.insert(digest(&token), device.clone());", "inner.devices.insert(token.clone(), device.clone());")')" \
+	"looked up or stored by something other than a digest"
+
+run_case "cloud-credentials: parse_keys keys the map by the raw secret" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/keys.rs", "            digest(parts[0].trim()),", "            parts[0].trim().to_string(),")')" \
+	"parse_keys keys the map by something other than a digest"
+
+run_case "cloud-credentials: the digest function is gone, so it measured nothing" fail \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/keys.rs", "pub fn digest(", "pub fn digest_removed(")')" \
+	"defines no digest function"
+
+run_case "cloud-credentials: a comment naming the old raw lookup is not a fault" pass \
+	"./scripts/cloud-credentials-are-digested.sh" \
+	"$(py 'edit("crates/cloud/src/http.rs", "fn principal_for(", "// was: self.keys.get(token)\n    fn principal_for(")')"
+
+run_case "dashboard-key: the query is read before the fragment" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, \"\"));\n    const q = new URLSearchParams(window.location.search);", "    const q = new URLSearchParams(window.location.search);\n    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, \"\"));")')" \
+	"before the fragment"
+
+run_case "dashboard-key: the key is pushed into the history instead of stripped" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "window.history.replaceState(null", "window.history.pushState(null")')" \
+	"never strips the key from the address bar"
+
+run_case "dashboard-key: the query is no longer read, so old links break" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "const q = new URLSearchParams(window.location.search);", "const q = new URLSearchParams(window.location.href);")')" \
+	"no longer reads location.search"
+
+run_case "dashboard-key: the page is gone, so it measured nothing" fail \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"import os; os.remove('cloud/dashboard/app/page.tsx')" \
+	"measured nothing"
+
+run_case "dashboard-key: a comment naming location.hash above the code is not a fault" pass \
+	"./scripts/dashboard-key-stays-out-of-the-query.sh" \
+	"$(py 'edit("cloud/dashboard/app/page.tsx", "export default function Page() {", "// location.hash is read first; this comment is not a fault\nexport default function Page() {")')"
+
 run_case "upstream-key: the credential list drops x-api-key" fail \
 	"./scripts/upstream-key-is-never-forwarded.sh" \
 	"$(py 'edit("crates/gateway/src/provider.rs", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\", \"x-api-key\"];", "const PROVIDER_CREDENTIAL_HEADERS: &[&str] = &[\"authorization\"];")')" \
@@ -1777,6 +1828,58 @@ run_case "audit-keyryx: a kid that is not the signing key's thumbprint served" f
 	"cargo test -p tokenfuse-cloud --test it -- --exact audit_manifest_keyryx::a_kid_that_names_another_key_is_never_served" \
 	"$(py 'edit("crates/cloud/src/audit_keyryx.rs", "    if kid != thumbprint {", "    if kid != thumbprint && false {")')" \
 	"a_kid_that_names_another_key_is_never_served ... FAILED"
+
+# --- invariant 134: client keys are looked up by digest (F-023) ----------------
+
+run_case "client-keys: the map keyed by a raw secret again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "by_digest: HashMap<[u8; 32], String>,", "by_digest: HashMap<[u8; 32], String>,\n    by_secret: HashMap<String, String>,")')" \
+	"keyed by text"
+
+run_case "client-keys: the lookup key no longer SHA-256 of the secret" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "Sha256::digest(secret.as_bytes()).into()", "secret.as_bytes().try_into().unwrap_or([0u8; 32])")')" \
+	"does not compute the lookup key"
+
+run_case "client-keys: the declassify key compared with == again" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/declassify.rs", "(Some(want), Some(got)) if crate::clientkeys::secret_eq(want, got) => true,", "(Some(want), Some(got)) if want == got => true,")')" \
+	"compares the declassify key with =="
+
+run_case "client-keys: a comment naming the old map passes" pass \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'edit("crates/gateway/src/clientkeys.rs", "pub struct ClientKeys {", "// The old shape was HashMap<String, String>, keyed by the raw secret.\npub struct ClientKeys {")')"
+
+run_case "client-keys: clientkeys.rs gone, so the gate measured nothing" fail \
+	"./scripts/client-keys-are-digested.sh" \
+	"$(py 'import os; os.rename("crates/gateway/src/clientkeys.rs", "crates/gateway/src/clientkeys.rs.moved")')" \
+	"measured nothing"
+
+# --- invariant 135: a run's budget is fixed once open (F-025) -----------------
+#
+# These run the rule's own tests against a mutated product file. Each mutant is a
+# silent fault: the request still succeeds, so only an assertion on the budget
+# (or the refused raise) can see it.
+
+run_case "run-budget: the proxy hands a caller's budget the operator's basis" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        tokenfuse_core::BudgetBasis::Caller\n    };", "        tokenfuse_core::BudgetBasis::Operator\n    };")')" \
+	"a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget ... FAILED"
+
+run_case "run-budget: the in-process ledger applies a caller's raise" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::a_caller_may_not_raise_an_open_budget" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Caller => (s.budget, Some(budget)),", "BudgetBasis::Caller => (budget, None),")')" \
+	"a_caller_may_not_raise_an_open_budget ... FAILED"
+
+run_case "run-budget: an operator's raise capped at the held budget" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::an_operator_budget_moves_an_open_run_either_way" \
+	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Operator => (budget, None),", "BudgetBasis::Operator if budget > s.budget => (s.budget, None),\n                    BudgetBasis::Operator => (budget, None),")')" \
+	"an_operator_budget_moves_an_open_run_either_way ... FAILED"
+
+run_case "run-budget: the answer names the declared budget instead of the kept one" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_raise_on_the_wire::anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "*raise_kept = Some(budget);", "*raise_kept = Some(refused);")')" \
+	"anthropic_buffered_answer_names_the_refused_raise_and_the_kept_budget ... FAILED"
 
 # --- every gate in scripts/ has a case here ---------------------------------
 #
