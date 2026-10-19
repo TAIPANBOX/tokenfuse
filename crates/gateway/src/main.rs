@@ -402,11 +402,33 @@ async fn mcp_broker() {
     // The second PEP: the broker reuses the SAME Wardryx config the gateway
     // reads (TOKENFUSE_WARDRYX_*), so configuring Wardryx once gates both the
     // LLM path and MCP tool calls. Off unless TOKENFUSE_WARDRYX_MODE+URL are set.
-    // process-local: the broker is not governed by the profile (invariant 136), so
-    // it keeps the defaults it has always had: an unset mode is off.
-    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(
-        tokenfuse_gateway::defaults::Profile::Observe,
-    ));
+    // The governance profile applies to the broker too (CLAUDE.md invariant 136):
+    // an unset TOKENFUSE_WARDRYX_MODE is enforce under governed once a URL is
+    // set, and the broker says what it governs, as `serve` does for its own.
+    let profile = tokenfuse_gateway::defaults::profile_from_env();
+    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));
+    tracing::info!(mode = ?wardryx.mode, failmode = ?wardryx.failmode(), "wardryx enforcement hook");
+    let policy_hook_source =
+        if std::env::var("TOKENFUSE_WARDRYX_URL").map_or(true, |u| u.trim().is_empty()) {
+            "no-url"
+        } else {
+            tokenfuse_gateway::defaults::source_of("TOKENFUSE_WARDRYX_MODE")
+        };
+    let governance = tokenfuse_gateway::defaults::governance_line(
+        profile,
+        &[(
+            "policy_hook",
+            format!("{:?}", wardryx.mode).to_lowercase(),
+            policy_hook_source,
+        )],
+    );
+    if profile.is_governed() {
+        tracing::info!("{governance}");
+    } else {
+        tracing::warn!(
+            "{governance}: the observe profile enforces nothing that is not set explicitly"
+        );
+    }
     let mut vault = tokenfuse_core::SecretVault::from_pairs(
         &std::env::var("TOKENFUSE_MCP_SECRETS").unwrap_or_default(),
     );
@@ -1232,13 +1254,7 @@ async fn serve() {
     governance.push((
         "firewall",
         format!("{:?}", firewall.mode).to_lowercase(),
-        if tokenfuse_gateway::defaults::source_of("TOKENFUSE_FIREWALL") == "env" {
-            "env"
-        } else if tokenfuse_gateway::defaults::source_of("TOKENFUSE_FIREWALL_CONFIG") == "env" {
-            "file"
-        } else {
-            "profile"
-        },
+        firewall.mode_source,
     ));
     state = state.with_firewall(Arc::new(firewall));
 

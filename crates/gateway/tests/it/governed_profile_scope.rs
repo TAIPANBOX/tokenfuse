@@ -14,7 +14,7 @@
 //! Every test here names its profile, so the assertion never depends on what the
 //! default happens to be.
 
-use crate::common::binary::Running;
+use crate::common::binary::{strip_ansi, Running};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -129,7 +129,7 @@ fn start_broker(profile: &str, upstream: &str, extra: &[(&str, &str)]) -> Broker
         thread::spawn(move || {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 let mut out = into.lock().unwrap();
-                out.push_str(&line);
+                out.push_str(&strip_ansi(&line));
                 out.push('\n');
             }
         });
@@ -140,7 +140,10 @@ fn start_broker(profile: &str, upstream: &str, extra: &[(&str, &str)]) -> Broker
             break;
         }
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("the broker exited ({status}) before listening:\n{}", output.lock().unwrap());
+            panic!(
+                "the broker exited ({status}) before listening:\n{}",
+                output.lock().unwrap()
+            );
         }
         if Instant::now() >= deadline {
             child.kill().ok();
@@ -287,7 +290,10 @@ async fn a_policy_file_with_no_mode_is_enforce_under_governed() {
     let path = policy_file("governed", no_mode_file());
     let gw = Running::start(
         "127.0.0.1",
-        &[("TOKENFUSE_PROFILE", "governed"), ("TOKENFUSE_FIREWALL_CONFIG", &path)],
+        &[
+            ("TOKENFUSE_PROFILE", "governed"),
+            ("TOKENFUSE_FIREWALL_CONFIG", &path),
+        ],
     );
     let out = gw.output();
     assert!(out.contains("firewall=enforce(profile)"), "{out}");
@@ -302,7 +308,10 @@ async fn a_policy_file_with_no_mode_stays_off_under_observe() {
     let path = policy_file("observe", no_mode_file());
     let gw = Running::start(
         "127.0.0.1",
-        &[("TOKENFUSE_PROFILE", "observe"), ("TOKENFUSE_FIREWALL_CONFIG", &path)],
+        &[
+            ("TOKENFUSE_PROFILE", "observe"),
+            ("TOKENFUSE_FIREWALL_CONFIG", &path),
+        ],
     );
     let out = gw.output();
     assert!(out.contains("firewall=off(file)"), "{out}");
@@ -323,7 +332,10 @@ async fn a_policy_file_that_names_shadow_is_not_overridden_under_governed() {
     let path = policy_file("shadow", shadow);
     let gw = Running::start(
         "127.0.0.1",
-        &[("TOKENFUSE_PROFILE", "governed"), ("TOKENFUSE_FIREWALL_CONFIG", &path)],
+        &[
+            ("TOKENFUSE_PROFILE", "governed"),
+            ("TOKENFUSE_FIREWALL_CONFIG", &path),
+        ],
     );
     let out = gw.output();
     assert!(out.contains("firewall=shadow(file)"), "{out}");

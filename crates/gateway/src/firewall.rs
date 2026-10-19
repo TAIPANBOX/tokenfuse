@@ -40,6 +40,10 @@ pub struct FirewallConfig {
     /// tool name → capability it exercises.
     pub capabilities: HashMap<String, String>,
     pub rules: Vec<TaintRule>,
+    /// Where `mode` came from, for the startup line (CLAUDE.md invariant 136):
+    /// `env` when `TOKENFUSE_FIREWALL` decided it, `file` when the policy file
+    /// named its own mode, `profile` when the profile's default stands in.
+    pub mode_source: &'static str,
 }
 
 impl FirewallConfig {
@@ -120,6 +124,7 @@ impl FirewallConfig {
             sources,
             capabilities,
             rules,
+            mode_source: "profile",
         }
     }
 }
@@ -281,70 +286,95 @@ impl FirewallConfig {
     ///   loader is most likely to meet, and silently ignoring it leaves an
     ///   operator certain a rule is live when it is not.
     pub fn from_json(text: &str) -> Result<FirewallConfig, FirewallConfigError> {
-        let file: PolicyFile = serde_json::from_str(text).map_err(FirewallConfigError::NotJson)?;
+        from_json_absent_mode(text, FirewallMode::Off).map(|(cfg, _)| cfg)
+    }
 
-        let mode = match file.mode.as_deref() {
-            None | Some("off") => FirewallMode::Off,
-            Some("shadow") => FirewallMode::Shadow,
-            Some("enforce") => FirewallMode::Enforce,
-            Some(other) => return Err(FirewallConfigError::BadMode(other.to_string())),
-        };
+    /// Read and parse a policy file from disk.
+    pub fn from_path(path: &str) -> Result<FirewallConfig, FirewallConfigError> {
+        from_path_absent_mode(path, FirewallMode::Off).map(|(cfg, _)| cfg)
+    }
+}
 
-        let mut rules = Vec::with_capacity(file.rules.len() + 1);
-        for (i, r) in file.rules.into_iter().enumerate() {
-            let name = r.name.ok_or(FirewallConfigError::UnnamedRule(i))?;
-            if r.when_any.is_empty() {
-                return Err(FirewallConfigError::EmptyRuleField(name, "when_any"));
-            }
-            if r.deny.is_empty() {
-                return Err(FirewallConfigError::EmptyRuleField(name, "deny"));
-            }
-            rules.push(TaintRule {
-                name,
-                when_any: r.when_any,
-                deny: r.deny,
-            });
+/// [`FirewallConfig::from_json`] with the mode a file gets when it names NONE,
+/// and whether the file named one. Under governed the absent mode is enforce
+/// (CLAUDE.md invariant 136); under observe it stays off, as it always was.
+fn from_json_absent_mode(
+    text: &str,
+    absent: FirewallMode,
+) -> Result<(FirewallConfig, bool), FirewallConfigError> {
+    let file: PolicyFile = serde_json::from_str(text).map_err(FirewallConfigError::NotJson)?;
+    let named = file.mode.is_some();
+
+    let mode = match file.mode.as_deref() {
+        None => absent,
+        Some("off") => FirewallMode::Off,
+        Some("shadow") => FirewallMode::Shadow,
+        Some("enforce") => FirewallMode::Enforce,
+        Some(other) => return Err(FirewallConfigError::BadMode(other.to_string())),
+    };
+
+    let mut rules = Vec::with_capacity(file.rules.len() + 1);
+    for (i, r) in file.rules.into_iter().enumerate() {
+        let name = r.name.ok_or(FirewallConfigError::UnnamedRule(i))?;
+        if r.when_any.is_empty() {
+            return Err(FirewallConfigError::EmptyRuleField(name, "when_any"));
         }
+        if r.deny.is_empty() {
+            return Err(FirewallConfigError::EmptyRuleField(name, "deny"));
+        }
+        rules.push(TaintRule {
+            name,
+            when_any: r.when_any,
+            deny: r.deny,
+        });
+    }
 
-        // Two floors, and anti-exfiltration goes in LAST so it ends up first.
-        // They can both match only for a run carrying secrets AND an injection
-        // signal that tries to send data out, and first match wins, so the
-        // order decides which rule the record names. `anti-exfiltration` is the
-        // one docs/07 B.9 locks and the one an auditor comes looking for; the
-        // injection signal is still on the same event, in `data.signals`.
-        // The detector's label gets a rule when nothing else denies it, and the
-        // reasoning is different from anti-exfiltration's: that one is locked
-        // by docs/07 B.9, this one is a judgement.
-        //
-        // `@claude` 2026-08-26. A policy file written before this detector
-        // existed COULD NOT have mentioned the label, so reading its silence as
-        // consent would give every operator who already wrote a policy a
-        // detector that produces a label nothing acts on, which is the exact
-        // case it exists for: their source map says a tool is trusted, and the
-        // document it returned is not. They did not write "and if a page tells
-        // you to ignore your instructions, proceed".
-        //
-        // The exit is `"detect_injection": false`, which turns the scan off
-        // entirely rather than leaving a label with nothing behind it. A rule
-        // of their own naming the label also wins, so narrowing it is one line.
-        let detect_injection = file.detect_injection.unwrap_or(true);
-        ensure_floors(mode, detect_injection, &mut rules);
+    // Two floors, and anti-exfiltration goes in LAST so it ends up first.
+    // They can both match only for a run carrying secrets AND an injection
+    // signal that tries to send data out, and first match wins, so the
+    // order decides which rule the record names. `anti-exfiltration` is the
+    // one docs/07 B.9 locks and the one an auditor comes looking for; the
+    // injection signal is still on the same event, in `data.signals`.
+    // The detector's label gets a rule when nothing else denies it, and the
+    // reasoning is different from anti-exfiltration's: that one is locked
+    // by docs/07 B.9, this one is a judgement.
+    //
+    // `@claude` 2026-08-26. A policy file written before this detector
+    // existed COULD NOT have mentioned the label, so reading its silence as
+    // consent would give every operator who already wrote a policy a
+    // detector that produces a label nothing acts on, which is the exact
+    // case it exists for: their source map says a tool is trusted, and the
+    // document it returned is not. They did not write "and if a page tells
+    // you to ignore your instructions, proceed".
+    //
+    // The exit is `"detect_injection": false`, which turns the scan off
+    // entirely rather than leaving a label with nothing behind it. A rule
+    // of their own naming the label also wins, so narrowing it is one line.
+    let detect_injection = file.detect_injection.unwrap_or(true);
+    ensure_floors(mode, detect_injection, &mut rules);
 
-        Ok(FirewallConfig {
+    Ok((
+        FirewallConfig {
             mode,
             detect_injection,
             sources: file.sources,
             capabilities: file.capabilities,
             rules,
-        })
-    }
+            mode_source: "file",
+        },
+        named,
+    ))
+}
 
-    /// Read and parse a policy file from disk.
-    pub fn from_path(path: &str) -> Result<FirewallConfig, FirewallConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| FirewallConfigError::Unreadable(path.to_string(), e.to_string()))?;
-        FirewallConfig::from_json(&text)
-    }
+/// [`FirewallConfig::from_path`] with the absent-mode rule of
+/// [`from_json_absent_mode`].
+fn from_path_absent_mode(
+    path: &str,
+    absent: FirewallMode,
+) -> Result<(FirewallConfig, bool), FirewallConfigError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| FirewallConfigError::Unreadable(path.to_string(), e.to_string()))?;
+    from_json_absent_mode(&text, absent)
 }
 
 /// Build from the environment.
@@ -393,18 +423,28 @@ pub fn from_env(profile: crate::defaults::Profile) -> FirewallConfig {
     // the file says (CLAUDE.md invariant 94). `None` is no override.
     let forced = crate::defaults::firewall_mode_from_env();
     let mut cfg = match std::env::var("TOKENFUSE_FIREWALL_CONFIG") {
-        Ok(path) if !path.trim().is_empty() => match FirewallConfig::from_path(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("tokenfuse: refusing to start: {e}");
-                std::process::exit(2);
+        Ok(path) if !path.trim().is_empty() => {
+            match from_path_absent_mode(&path, profile.absent_file_mode()) {
+                Ok((mut c, named)) => {
+                    // A file that names no mode takes the profile's: enforce under
+                    // governed (CLAUDE.md invariant 136), off under observe as before.
+                    if !named && profile.is_governed() {
+                        c.mode_source = "profile";
+                    }
+                    c
+                }
+                Err(e) => {
+                    eprintln!("tokenfuse: refusing to start: {e}");
+                    std::process::exit(2);
+                }
             }
-        },
+        }
         // SHADOW under observe, not off, since 2026-08-26. See the note on this function.
         _ => FirewallConfig::defaults(profile.firewall_mode()),
     };
     if let Some(mode) = forced {
         cfg.mode = mode;
+        cfg.mode_source = "env";
     }
     // The floors again, because the env var can raise the mode to enforce after
     // a file was parsed in shadow: the guarantee is about the mode in effect,
@@ -1340,5 +1380,49 @@ mod read_tools_carry_no_data_tests {
             .filter(|r| r.deny.iter().any(|d| d == UNCLASSIFIED_CAPABILITY))
             .count();
         assert_eq!(count, 1, "{:?}", c.rules);
+    }
+}
+
+#[cfg(test)]
+mod absent_mode_tests {
+    use super::*;
+    use tokenfuse_core::taint::FirewallMode;
+
+    /// A file that names no mode takes the mode it is handed, and says it named
+    /// none. Mutant: the `None` arm returning `FirewallMode::Off` regardless of
+    /// `absent`; caught here and by the binary test
+    /// `a_policy_file_with_no_mode_is_enforce_under_governed`.
+    #[test]
+    fn a_file_with_no_mode_takes_the_absent_mode_it_is_given() {
+        let text = r#"{"rules": []}"#;
+        let (governed, named) = from_json_absent_mode(text, FirewallMode::Enforce).unwrap();
+        assert_eq!(governed.mode, FirewallMode::Enforce);
+        assert!(!named);
+        let (observe, named) = from_json_absent_mode(text, FirewallMode::Off).unwrap();
+        assert_eq!(observe.mode, FirewallMode::Off);
+        assert!(!named);
+    }
+
+    /// A named mode is never overridden by the absent one, whichever it is.
+    #[test]
+    fn a_file_that_names_a_mode_keeps_it_whatever_the_absent_mode_is() {
+        for (word, expected) in [
+            ("off", FirewallMode::Off),
+            ("shadow", FirewallMode::Shadow),
+            ("enforce", FirewallMode::Enforce),
+        ] {
+            let text = format!(r#"{{"mode": "{word}"}}"#);
+            let (cfg, named) = from_json_absent_mode(&text, FirewallMode::Enforce).unwrap();
+            assert_eq!(cfg.mode, expected, "{word}");
+            assert!(named, "{word}");
+        }
+    }
+
+    /// The source a loaded file reports is `file`; `from_env` relabels it
+    /// `profile` for governed when the file named no mode.
+    #[test]
+    fn a_loaded_file_says_its_mode_came_from_the_file() {
+        let (cfg, _) = from_json_absent_mode("{}", FirewallMode::Off).unwrap();
+        assert_eq!(cfg.mode_source, "file");
     }
 }

@@ -504,6 +504,11 @@ to start. To keep v1.18.0's behaviour set `TOKENFUSE_PROFILE=observe`. Every oth
 setting is unchanged, and the admin routes and the declassify endpoint now refuse
 what they used to answer on loopback until their keys are set.
 
+Two more changes follow from the profile. The MCP credential broker reads the same
+profile, so its policy hook enforces with a closed failmode once `TOKENFUSE_WARDRYX_URL`
+is set. A firewall policy file that names no `mode` now runs in enforce under `governed`,
+where it ran off before; name a mode in the file, or set `TOKENFUSE_PROFILE=observe`.
+
 **What this costs you on upgrade.** Both are behaviour changes on a live path.
 If your prompts legitimately carry things that match a secret pattern, those
 calls now get a `403` where they used to succeed; `TOKENFUSE_DLP=mask` redacts

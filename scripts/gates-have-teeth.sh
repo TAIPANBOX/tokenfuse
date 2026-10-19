@@ -713,6 +713,21 @@ run_case "same-doors: an exception written in a form nothing reads" fail \
 	"$(py 'edit_all("crates/gateway/src/main.rs", "process-local:", "process local:")')" \
 	"and not in"
 
+# Once the broker reads the governance profile, its policy hook is configured in
+# both processes. A `process-local:` exception left above that call is stale: it
+# was true when written and is now a claim nobody checks. The gate must say so.
+run_case "same-doors: a stale process-local exception on a door both processes configure" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));", "    // process-local: the broker keeps the observe defaults.\n    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));")')" \
+	"stale exception"
+
+# The same door with its broker call removed: the hook is configured in `serve`
+# alone, and nothing in the broker says why.
+run_case "same-doors: the broker's policy hook removed while serve keeps its own" fail \
+	"./scripts/both-processes-configure-the-same-doors.sh" \
+	"$(py 'edit("crates/gateway/src/main.rs", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::from_env(profile));", "    let wardryx = Arc::new(tokenfuse_gateway::wardryx::Wardryx::disabled());")')" \
+	"and not in"
+
 # The subject list is DISCOVERED, so a gate that can no longer find any door
 # must say it measured nothing rather than report success over an empty set.
 run_case "same-doors: the startup wiring it reads is gone" fail \

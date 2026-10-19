@@ -295,6 +295,16 @@ impl Profile {
         }
     }
 
+    /// The mode a policy file gets when it names none (CLAUDE.md invariant 136):
+    /// enforce under governed, off under observe, which is what every file got
+    /// before the profile existed. A file that names a mode is never overridden.
+    pub fn absent_file_mode(self) -> tokenfuse_core::taint::FirewallMode {
+        match self {
+            Profile::Governed => tokenfuse_core::taint::FirewallMode::Enforce,
+            Profile::Observe => tokenfuse_core::taint::FirewallMode::Off,
+        }
+    }
+
     /// The policy hook's mode when `TOKENFUSE_WARDRYX_MODE` is unset. Enforce
     /// under governed; the hook still stays off without a `TOKENFUSE_WARDRYX_URL`
     /// (`wardryx::Wardryx::from_vars`), and the startup line says so.
@@ -852,6 +862,23 @@ mod tests {
     }
 
     #[test]
+    /// RED-FIRST (CLAUDE.md invariant 136): a policy file that names no `mode`
+    /// takes this value, and it was off under both profiles before the profile
+    /// existed. Mutant: `Profile::Governed => Off` here, which keeps the file off
+    /// under governed; caught by this test and by the binary test
+    /// `a_policy_file_with_no_mode_is_enforce_under_governed`.
+    #[test]
+    fn the_absent_file_mode_is_enforce_under_governed_and_off_under_observe() {
+        assert_eq!(
+            Profile::Governed.absent_file_mode(),
+            tokenfuse_core::taint::FirewallMode::Enforce
+        );
+        assert_eq!(
+            Profile::Observe.absent_file_mode(),
+            tokenfuse_core::taint::FirewallMode::Off
+        );
+    }
+
     fn governed_resolves_every_default_to_enforce_with_a_closed_failmode() {
         assert_eq!(
             policy_mode_under(Profile::Governed, None),

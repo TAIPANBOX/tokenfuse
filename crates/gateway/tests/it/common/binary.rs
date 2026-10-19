@@ -58,7 +58,7 @@ pub struct Running {
 /// another escape and the value, so a plain substring match on a field fails
 /// on a line that is there. Every `ESC '[' ... letter` sequence is dropped, as
 /// `cache_default_startup.rs` does for the same reason.
-fn strip_ansi(s: &str) -> String {
+pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

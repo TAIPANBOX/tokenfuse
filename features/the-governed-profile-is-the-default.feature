@@ -121,3 +121,45 @@ Feature: The gateway enforces by default, and observation is a named choice
     Given TOKENFUSE_PROFILE is unset and TOKENFUSE_DECLASSIFY_KEY is set
     When a client asks to clear a run's taint without the key
     Then the clearance is refused and the answer says the key is required
+
+  # @test:the_governed_broker_enforces_its_policy_hook_once_a_plane_is_named
+  Scenario: The MCP broker enforces its policy hook under governed once a plane is named
+    Given TOKENFUSE_PROFILE is governed and TOKENFUSE_WARDRYX_URL names a policy plane
+    When the MCP broker starts
+    Then its startup line says the policy hook is enforce from the profile, with failmode Closed
+
+  # @test:a_policy_plane_deny_refuses_a_tool_call_under_the_governed_profile
+  Scenario: A policy plane's deny refuses a tool call under the governed broker
+    Given TOKENFUSE_PROFILE is governed and the policy plane denies the tool
+    When an agent calls that tool through the broker
+    Then the call is refused with -32004 and nothing reaches the upstream
+
+  # @test:an_explicit_shadow_hook_still_forwards_under_the_governed_broker
+  Scenario: An explicit shadow policy hook still forwards under the governed broker
+    Given TOKENFUSE_PROFILE is governed and TOKENFUSE_WARDRYX_MODE is "shadow"
+    When an agent calls a tool the policy plane denies
+    Then the call is forwarded to the upstream
+
+  # @test:the_governed_broker_with_no_policy_plane_says_so
+  Scenario: A governed broker with no policy plane says its hook is off and why
+    Given TOKENFUSE_PROFILE is governed and TOKENFUSE_WARDRYX_URL is unset
+    When the MCP broker starts
+    Then its startup line says the policy hook is off because there is no URL
+
+  # @test:a_policy_file_with_no_mode_is_enforce_under_governed
+  Scenario: A policy file that names no mode is enforce under governed
+    Given TOKENFUSE_PROFILE is governed and a policy file names no mode
+    When the gateway starts and a tool that writes is checked after a web read
+    Then the startup line says firewall enforce from the profile and the check is denied
+
+  # @test:a_policy_file_with_no_mode_stays_off_under_observe
+  Scenario: A policy file that names no mode stays off under observe
+    Given TOKENFUSE_PROFILE is observe and a policy file names no mode
+    When the gateway starts and a tool that writes is checked after a web read
+    Then the startup line says firewall off from the file and the check is allowed
+
+  # @test:a_policy_file_that_names_shadow_is_not_overridden_under_governed
+  Scenario: A policy file that names a mode is never overridden by the profile
+    Given TOKENFUSE_PROFILE is governed and a policy file names shadow
+    When the gateway starts
+    Then the startup line says firewall shadow from the file

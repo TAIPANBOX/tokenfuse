@@ -58,14 +58,21 @@ An unconfigured gateway now enforces. If you want v1.18.0's behaviour, set
 authenticating its callers will not start until you either set `TOKENFUSE_CLIENT_KEYS`
 or `TOKENFUSE_AGENT_TOKENS`, or set `TOKENFUSE_PROFILE=observe`.
 
+A policy file that names no `mode` now runs in enforce under `governed`, where it
+ran off before. Name `mode` in the file to choose, or set `TOKENFUSE_PROFILE=observe`
+to keep it off.
+
 ## Limits
 
-- The MCP credential broker is not governed by the profile. Its mode defaults are per
-  door, and it keeps the defaults it has always had.
+- The MCP credential broker reads the same profile in its own process. Under
+  `governed` its policy hook is enforce with a closed failmode once
+  `TOKENFUSE_WARDRYX_URL` is set, and off otherwise; under `observe` it keeps the
+  defaults it has always had. The broker's startup line names only what it governs.
 - A policy hook without a `TOKENFUSE_WARDRYX_URL` has nothing to call, so it stays off.
   The startup line says `no-url`.
-- A policy file that names no `mode` runs with the firewall off, as it always has. The
-  profile's firewall default applies only when neither `TOKENFUSE_FIREWALL` nor a
-  policy file is set.
+- A policy file that names no `mode` takes the profile's firewall mode: enforce under
+  `governed` (`firewall=enforce(profile)` in the startup line), off under `observe`, as
+  it always was. A file that names a mode keeps it, and `TOKENFUSE_FIREWALL` still wins
+  over both.
 - The gate that checks the documented commands reads the documents in this repository.
   It cannot see a port a container publishes on every interface.
