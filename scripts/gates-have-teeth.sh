@@ -1788,12 +1788,12 @@ run_case "run-budget: the proxy hands a caller's budget the operator's basis" fa
 	"a_raise_on_an_open_run_is_refused_and_the_run_keeps_its_budget ... FAILED"
 
 run_case "run-budget: the in-process ledger applies a caller's raise" fail \
-	"cargo test -p tokenfuse-core --lib -- --exact budget_basis_tests::a_caller_may_not_raise_an_open_budget" \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::a_caller_may_not_raise_an_open_budget" \
 	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Caller => (s.budget, Some(budget)),", "BudgetBasis::Caller => (budget, None),")')" \
 	"a_caller_may_not_raise_an_open_budget ... FAILED"
 
 run_case "run-budget: an operator's raise capped at the held budget" fail \
-	"cargo test -p tokenfuse-core --lib -- --exact budget_basis_tests::an_operator_budget_moves_an_open_run_either_way" \
+	"cargo test -p tokenfuse-core --lib -- --exact ledger::budget_basis_tests::an_operator_budget_moves_an_open_run_either_way" \
 	"$(py 'edit("crates/core/src/ledger.rs", "BudgetBasis::Operator => (budget, None),", "BudgetBasis::Operator if budget > s.budget => (s.budget, None),\n                    BudgetBasis::Operator => (budget, None),")')" \
 	"an_operator_budget_moves_an_open_run_either_way ... FAILED"
 
