@@ -12,6 +12,7 @@ as Docker images:
 
 ```bash
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce \
+  -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
   ghcr.io/taipanbox/tokenfuse
 ```

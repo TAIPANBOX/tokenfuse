@@ -31,6 +31,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 
 fn spawn(dir: &std::path::Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_CLOUD_URL")
         .env("TOKENFUSE_ALLOW_STUB", "1")

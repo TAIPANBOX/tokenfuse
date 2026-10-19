@@ -23,6 +23,7 @@ const CEILING: Duration = Duration::from_secs(10);
 
 fn base_cmd(addr: &str) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_MAX_RUN_BUDGET_USD")
         .env_remove("TOKENFUSE_CLIENT_KEYS")

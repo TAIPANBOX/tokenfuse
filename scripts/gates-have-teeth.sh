@@ -402,8 +402,21 @@ run_case "honest-claims: a relevance row reworded but not moved" pass \
 
 run_case "runnable-quickstart: the headline command loses its flag" fail \
 	"./scripts/runnable-quickstart.sh" \
-	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 ghcr.io/taipanbox/tokenfuse")')" \
+	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse")')" \
 	"cannot start a gateway"
+
+# Invariant 136: the image binds 0.0.0.0, and the governed profile refuses that
+# with nothing authenticating its callers. A command that drops the profile and
+# names no auth must be named, even though it still names the stub.
+run_case "runnable-quickstart: the headline command loses its profile" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("README.md", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse", "docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse")')" \
+	"authenticates its callers"
+
+run_case "runnable-quickstart: the compose gateway loses its profile" fail \
+	"./scripts/runnable-quickstart.sh" \
+	"$(py 'edit("cloud/docker-compose.yml", "      TOKENFUSE_PROFILE: \"observe\"", "")')" \
+	"authenticates its callers"
 
 # The compose stack is the case that would have failed on somebody else's
 # machine rather than in a document, so it gets its own case.

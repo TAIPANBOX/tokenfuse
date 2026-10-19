@@ -20,6 +20,7 @@ const CEILING: Duration = Duration::from_secs(15);
 /// Variables a test of a startup default must not inherit from the shell.
 const CLEARED: &[&str] = &[
     "TOKENFUSE_UPSTREAM",
+    "TOKENFUSE_PROFILE",
     "TOKENFUSE_CLIENT_KEYS",
     "TOKENFUSE_IDENTITY_MAP",
     "TOKENFUSE_ADMIN_KEYS",
@@ -96,6 +97,13 @@ impl Running {
         }
         cmd.env("TOKENFUSE_ALLOW_STUB", "1")
             .env("TOKENFUSE_ADDR", format!("{host}:{port}"));
+        // Tests of other subsystems start the gateway with the observe defaults
+        // every one of them was written against. The governed defaults are
+        // asserted in `governed_profile.rs`, which names its profile explicitly
+        // (CLAUDE.md invariant 136). A caller that names a profile here wins.
+        if !extra.iter().any(|(k, _)| *k == "TOKENFUSE_PROFILE") {
+            cmd.env("TOKENFUSE_PROFILE", "observe");
+        }
         for (k, v) in extra {
             cmd.env(k, v);
         }

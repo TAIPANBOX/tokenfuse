@@ -11,6 +11,14 @@
 //! the assertions here state the profile they mean rather than inheriting it.
 
 use crate::common::binary::{free_port, Running};
+
+/// The gateway started under the governed profile, named explicitly, with `extra`
+/// on top. The binary helper defaults other tests to observe.
+fn governed(host: &str, extra: &[(&str, &str)]) -> Running {
+    let mut all = vec![("TOKENFUSE_PROFILE", "governed")];
+    all.extend_from_slice(extra);
+    Running::start(host, &all)
+}
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -115,7 +123,7 @@ async fn an_unknown_profile_value_is_refused_naming_both_profiles() {
 /// RED-FIRST: today the default lets a call over its budget through in shadow.
 #[tokio::test]
 async fn under_the_governed_profile_a_call_over_its_budget_is_refused() {
-    let gw = Running::start("127.0.0.1", &[]);
+    let gw = governed("127.0.0.1", &[]);
     assert_eq!(
         call_over_budget(&gw).await,
         reqwest::StatusCode::PAYMENT_REQUIRED,
@@ -127,14 +135,14 @@ async fn under_the_governed_profile_a_call_over_its_budget_is_refused() {
 /// The guard: an operator who set a budget mode keeps it.
 #[tokio::test]
 async fn an_explicit_policy_mode_wins_over_the_governed_default() {
-    let gw = Running::start("127.0.0.1", &[("TOKENFUSE_MODE", "shadow")]);
+    let gw = governed("127.0.0.1", &[("TOKENFUSE_MODE", "shadow")]);
     assert_eq!(call_over_budget(&gw).await, reqwest::StatusCode::OK);
 }
 
 /// The guard: observe is today's default, byte for byte, and it says so.
 #[tokio::test]
 async fn under_the_observe_profile_a_call_over_its_budget_is_forwarded() {
-    let gw = Running::start("127.0.0.1", &[("TOKENFUSE_PROFILE", "observe")]);
+    let gw = governed("127.0.0.1", &[("TOKENFUSE_PROFILE", "observe")]);
     assert_eq!(call_over_budget(&gw).await, reqwest::StatusCode::OK);
     assert!(gw.output().contains("enforces nothing"), "{}", gw.output());
 }
@@ -142,7 +150,7 @@ async fn under_the_observe_profile_a_call_over_its_budget_is_forwarded() {
 /// RED-FIRST: today the hook starts in mode Off whatever the URL says.
 #[tokio::test]
 async fn under_the_governed_profile_the_wardryx_hook_enforces_when_a_pdp_is_named() {
-    let gw = Running::start(
+    let gw = governed(
         "127.0.0.1",
         &[("TOKENFUSE_WARDRYX_URL", "http://127.0.0.1:9")],
     );
@@ -151,13 +159,11 @@ async fn under_the_governed_profile_the_wardryx_hook_enforces_when_a_pdp_is_name
     assert!(out.contains("failmode=Closed"), "{out}");
 }
 
-/// RED-FIRST: today the firewall starts in shadow, so a write after the web is
-/// allowed at the check.
-#[tokio::test]
-async fn under_the_governed_profile_the_firewall_enforces_by_default() {
-    let gw = Running::start("127.0.0.1", &[]);
+/// Asks the tool-call check about a tool that writes, in a run that has read the
+/// web. The label is declared by the caller, as a framework declares it.
+async fn firewall_check(extra: &[(&str, &str)]) -> serde_json::Value {
+    let gw = governed("127.0.0.1", extra);
     let client = reqwest::Client::new();
-    // The run reads the web (the caller declares the label, as a framework does).
     let call = client
         .post(format!("{}/v1/messages", gw.url()))
         .header("x-fuse-run-id", "governed-firewall-run")
@@ -167,7 +173,7 @@ async fn under_the_governed_profile_the_firewall_enforces_by_default() {
         .await
         .unwrap();
     assert_eq!(call.status(), reqwest::StatusCode::OK, "{}", gw.output());
-    let check: serde_json::Value = client
+    client
         .post(format!("{}/v1/fuse/check-tool-call", gw.url()))
         .json(&serde_json::json!({
             "run_id": "governed-firewall-run",
@@ -178,14 +184,81 @@ async fn under_the_governed_profile_the_firewall_enforces_by_default() {
         .unwrap()
         .json()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// RED-FIRST: today the firewall starts in shadow, so a write after the web is
+/// allowed at the check.
+#[tokio::test]
+async fn under_the_governed_profile_the_firewall_enforces_by_default() {
+    let check = firewall_check(&[]).await;
     assert_eq!(check["decision"], "deny", "{check}");
+}
+
+/// The guard: an operator who set the firewall mode keeps it.
+#[tokio::test]
+async fn an_explicit_firewall_mode_wins_over_the_governed_default() {
+    let check = firewall_check(&[("TOKENFUSE_FIREWALL", "shadow")]).await;
+    assert_eq!(check["decision"], "allow", "{check}");
+    assert!(check["would_block"].is_string(), "{check}");
+}
+
+/// The guard: an explicit policy hook mode is read, not replaced by the profile.
+#[test]
+fn an_explicit_policy_hook_mode_wins_over_the_governed_default() {
+    let gw = governed(
+        "127.0.0.1",
+        &[
+            ("TOKENFUSE_WARDRYX_URL", "http://127.0.0.1:9"),
+            ("TOKENFUSE_WARDRYX_MODE", "shadow"),
+        ],
+    );
+    assert!(gw.output().contains("mode=Shadow"), "{}", gw.output());
+}
+
+/// The guard: an explicit failmode is read, not replaced by the profile's closed.
+#[test]
+fn an_explicit_policy_hook_failmode_wins_over_the_governed_default() {
+    let gw = governed(
+        "127.0.0.1",
+        &[
+            ("TOKENFUSE_WARDRYX_URL", "http://127.0.0.1:9"),
+            ("TOKENFUSE_WARDRYX_FAILMODE", "open"),
+        ],
+    );
+    assert!(gw.output().contains("failmode=Open"), "{}", gw.output());
+}
+
+/// The guard: a configured declassification key is still required.
+#[tokio::test]
+async fn an_explicit_declassify_key_is_required_under_governed() {
+    let gw = governed("127.0.0.1", &[("TOKENFUSE_DECLASSIFY_KEY", "clear-key")]);
+    let answer: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/v1/fuse/declassify", gw.url()))
+        .json(&serde_json::json!({
+            "run_id": "governed-declassify-run",
+            "agent_id": "agent://acme/a",
+            "labels": ["web"],
+            "actor": "user://ops/alice",
+            "reason": "reviewed the page",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let error = answer["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("x-fuse-declassify-key is required"),
+        "{answer}"
+    );
 }
 
 /// RED-FIRST: today the five admin routes answer anyone on loopback.
 #[tokio::test]
 async fn under_the_governed_profile_the_admin_routes_refuse_loopback_without_a_key() {
-    let gw = Running::start("127.0.0.1", &[]);
+    let gw = governed("127.0.0.1", &[]);
     let status = reqwest::get(format!("{}/v1/runs", gw.url()))
         .await
         .unwrap()
@@ -196,7 +269,7 @@ async fn under_the_governed_profile_the_admin_routes_refuse_loopback_without_a_k
 /// The guard: the existing escape hatch still restores the old behaviour.
 #[tokio::test]
 async fn allow_open_obs_still_restores_the_open_admin_routes_under_governed() {
-    let gw = Running::start("127.0.0.1", &[("TOKENFUSE_ALLOW_OPEN_OBS", "1")]);
+    let gw = governed("127.0.0.1", &[("TOKENFUSE_ALLOW_OPEN_OBS", "1")]);
     let status = reqwest::get(format!("{}/v1/runs", gw.url()))
         .await
         .unwrap()
@@ -208,7 +281,7 @@ async fn allow_open_obs_still_restores_the_open_admin_routes_under_governed() {
 /// error at all.
 #[tokio::test]
 async fn under_the_governed_profile_declassify_refuses_without_its_key() {
-    let gw = Running::start("127.0.0.1", &[]);
+    let gw = governed("127.0.0.1", &[]);
     let answer: serde_json::Value = reqwest::Client::new()
         .post(format!("{}/v1/fuse/declassify", gw.url()))
         .json(&serde_json::json!({
@@ -246,7 +319,7 @@ fn under_the_governed_profile_a_non_loopback_bind_without_client_auth_refuses_to
 /// enforces nothing. The warning from invariant 119 is still there.
 #[tokio::test]
 async fn under_the_observe_profile_a_non_loopback_bind_starts_with_the_warning() {
-    let gw = Running::start("0.0.0.0", &[("TOKENFUSE_PROFILE", "observe")]);
+    let gw = governed("0.0.0.0", &[("TOKENFUSE_PROFILE", "observe")]);
     let out = gw.output();
     assert!(out.contains("enforces nothing"), "{out}");
     assert!(out.contains("client authentication is OFF"), "{out}");
@@ -255,14 +328,14 @@ async fn under_the_observe_profile_a_non_loopback_bind_starts_with_the_warning()
 /// The guard: a loopback gateway with nothing else set still starts.
 #[test]
 fn a_loopback_bind_under_the_governed_profile_starts_without_client_keys() {
-    let gw = Running::start("127.0.0.1", &[]);
+    let gw = governed("127.0.0.1", &[]);
     assert!(gw.output().contains("tokenfuse gateway listening"));
 }
 
 /// RED-FIRST: today no line names the profile or the settings.
 #[test]
 fn the_startup_line_names_each_governed_setting_and_where_it_came_from() {
-    let gw = Running::start("127.0.0.1", &[("TOKENFUSE_MODE", "warn")]);
+    let gw = governed("127.0.0.1", &[("TOKENFUSE_MODE", "warn")]);
     let out = gw.output();
     assert!(out.contains("governance profile=governed"), "{out}");
     assert!(out.contains("budget=warn(env)"), "{out}");
@@ -272,7 +345,7 @@ fn the_startup_line_names_each_governed_setting_and_where_it_came_from() {
 /// RED-FIRST: today the health detail has no profile member.
 #[tokio::test]
 async fn the_health_detail_names_the_profile() {
-    let gw = Running::start("127.0.0.1", &[]);
+    let gw = governed("127.0.0.1", &[]);
     let detail: serde_json::Value = reqwest::get(format!("{}/healthz?detail=1", gw.url()))
         .await
         .unwrap()

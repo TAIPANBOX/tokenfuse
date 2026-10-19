@@ -383,7 +383,12 @@ impl FirewallConfig {
 /// alternative is a gateway running a starter policy while its operator
 /// believes their own rules are live, and a security control that silently did
 /// not load is worse than one that is plainly off.
-pub fn from_env() -> FirewallConfig {
+///
+/// With neither `TOKENFUSE_FIREWALL` nor a policy file the mode is the
+/// profile's (enforce under governed, shadow under observe, CLAUDE.md
+/// invariant 136). A policy file always decides for itself, including its
+/// own `mode` when it names one.
+pub fn from_env(profile: crate::defaults::Profile) -> FirewallConfig {
     // Read before the policy file, so a mistyped word refuses to start whatever
     // the file says (CLAUDE.md invariant 94). `None` is no override.
     let forced = crate::defaults::firewall_mode_from_env();
@@ -395,8 +400,8 @@ pub fn from_env() -> FirewallConfig {
                 std::process::exit(2);
             }
         },
-        // SHADOW, not off, since 2026-08-26. See the note on this function.
-        _ => FirewallConfig::defaults(FirewallMode::Shadow),
+        // SHADOW under observe, not off, since 2026-08-26. See the note on this function.
+        _ => FirewallConfig::defaults(profile.firewall_mode()),
     };
     if let Some(mode) = forced {
         cfg.mode = mode;
@@ -627,7 +632,7 @@ mod config_tests {
             std::env::remove_var("TOKENFUSE_FIREWALL");
             std::env::remove_var("TOKENFUSE_FIREWALL_CONFIG");
         }
-        let c = from_env();
+        let c = from_env(crate::defaults::Profile::Observe);
         assert_eq!(c.mode, FirewallMode::Shadow);
         assert!(
             !c.rules.is_empty() && !c.sources.is_empty(),
@@ -636,7 +641,10 @@ mod config_tests {
 
         // And the off switch still means off, or this default has no exit.
         unsafe { std::env::set_var("TOKENFUSE_FIREWALL", "off") };
-        assert_eq!(from_env().mode, FirewallMode::Off);
+        assert_eq!(
+            from_env(crate::defaults::Profile::Observe).mode,
+            FirewallMode::Off
+        );
 
         unsafe {
             match saved.0 {
@@ -679,11 +687,15 @@ mod config_tests {
             std::env::set_var("TOKENFUSE_FIREWALL_CONFIG", &shadow_file);
             std::env::set_var("TOKENFUSE_FIREWALL", "enforce");
         }
-        assert_eq!(from_env().mode, FirewallMode::Enforce, "lowercase enforce");
+        assert_eq!(
+            from_env(crate::defaults::Profile::Observe).mode,
+            FirewallMode::Enforce,
+            "lowercase enforce"
+        );
 
         unsafe { std::env::set_var("TOKENFUSE_FIREWALL", "ENFORCE") };
         assert_eq!(
-            from_env().mode,
+            from_env(crate::defaults::Profile::Observe).mode,
             FirewallMode::Enforce,
             "capitalised enforce"
         );
@@ -693,7 +705,7 @@ mod config_tests {
             std::env::set_var("TOKENFUSE_FIREWALL", "shadow");
         }
         assert_eq!(
-            from_env().mode,
+            from_env(crate::defaults::Profile::Observe).mode,
             FirewallMode::Shadow,
             "shadow beats a file's off"
         );

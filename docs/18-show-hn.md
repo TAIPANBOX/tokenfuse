@@ -5,7 +5,7 @@
 > the prepared first comment in immediately after submitting.
 >
 > HN "Show HN" rules require something people can try. We qualify:
-> `docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v0.5.0`
+> `docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v0.5.0`
 > works offline against the built-in fake provider (the flag is required, and
 > says out loud that the numbers it then reports are invented), and the
 > rug-pull demo is one `cargo run`.
@@ -84,7 +84,7 @@ dashboard. No seat limits, no time limit, no paid tier.
 Try it (offline, no signup, built-in fake provider; the flag is how the
 gateway makes you say you know its numbers are invented):
 
-    docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 ghcr.io/taipanbox/tokenfuse:v0.5.0
+    docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v0.5.0
 
 The whole stack, not just the proxy, is the second door: stack-single brings
 up every plane on a clean VM in 111 seconds (measured 2026-08-02).

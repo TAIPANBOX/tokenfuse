@@ -139,6 +139,7 @@ fn wait_for_stdout_line(child: &mut Child, needle: &str, timeout: Duration) -> S
 #[test]
 fn allow_stub_declaring_the_openai_wire_refuses_to_start() {
     let mut child = Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_UPSTREAM")
         .env("TOKENFUSE_ALLOW_STUB", "1")
         .env("TOKENFUSE_WIRE", "openai")
@@ -184,6 +185,7 @@ fn allow_stub_declaring_the_openai_wire_refuses_to_start() {
 #[test]
 fn allow_stub_declaring_anthropic_is_unaffected_and_the_server_starts() {
     let mut child = Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_UPSTREAM")
         .env("TOKENFUSE_ALLOW_STUB", "1")
         .env("TOKENFUSE_WIRE", "anthropic")
@@ -214,6 +216,7 @@ fn allow_stub_declaring_anthropic_is_unaffected_and_the_server_starts() {
 #[test]
 fn allow_stub_with_no_wire_declared_is_unaffected_and_the_server_starts() {
     let mut child = Command::new(bin())
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_WIRE")
         .env("TOKENFUSE_ALLOW_STUB", "1")

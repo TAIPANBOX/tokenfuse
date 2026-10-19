@@ -63,6 +63,18 @@ from pathlib import Path
 IMAGE = re.compile(r"ghcr\.io/taipanbox/tokenfuse(:[A-Za-z0-9._-]+)?(?![\w./-])")
 CARGO = re.compile(r"cargo run\b[^\n]*-p tokenfuse-gateway")
 REQUIRED = ("TOKENFUSE_UPSTREAM", "TOKENFUSE_ALLOW_STUB")
+# The second precondition, for the IMAGE only (invariant 136). The image binds
+# 0.0.0.0, and under the governed profile, which is the default, a wide bind that
+# nothing authenticates refuses to start. So a command or a service that runs the
+# image must name something that authenticates its callers, or the observe
+# profile. `=` or `:` between name and value, because compose writes the second.
+# `off` is refused as a value, since it authenticates nobody.
+AUTH = re.compile(
+    r"TOKENFUSE_CLIENT_KEYS\s*[=:]\s*[^\s\"']"
+    r"|TOKENFUSE_AGENT_TOKENS\s*[=:]\s*[\"']?(accept|require)\b"
+    r"|TOKENFUSE_PROFILE\s*[=:]\s*[\"']?observe\b",
+    re.IGNORECASE,
+)
 
 TEXT_SUFFIXES = {".md", ".yml", ".yaml", ".rs", ".sh", ".toml"}
 EXTRA_FILES = {"Dockerfile"}
@@ -157,6 +169,15 @@ for path in tracked_files():
                 "  or add TOKENFUSE_ALLOW_STUB=1 and say in the surrounding text that the\n"
                 "  numbers are then fictional."
             )
+        if docker and not AUTH.search(cmd):
+            note(
+                f"{path}: this command starts the gateway image without anything that\n"
+                f"    authenticates its callers:\n    {cmd.strip()}\n"
+                "  The image binds 0.0.0.0, and the governed profile (the default) refuses\n"
+                "  to start a wide bind with nothing authenticating it. Add\n"
+                "  TOKENFUSE_CLIENT_KEYS, TOKENFUSE_AGENT_TOKENS=accept, or\n"
+                "  TOKENFUSE_PROFILE=observe, and say in the surrounding text what that means."
+            )
 
 # --- the compose stack, which is the same claim in another syntax ------------
 
@@ -180,6 +201,14 @@ for b in gateway_blocks:
     # configured. The first version of this gate did exactly that and reported
     # a clean run on a service that could not start.
     live = "\n".join(line.split("#", 1)[0] for line in b.splitlines())
+    if not AUTH.search(live):
+        name = b.strip().split(":", 1)[0]
+        note(
+            f"{compose}: service `{name}` runs the gateway image with nothing that "
+            "authenticates its callers, so under the governed profile it refuses to "
+            "start on the image's 0.0.0.0 bind. Give it TOKENFUSE_CLIENT_KEYS, "
+            "TOKENFUSE_AGENT_TOKENS=accept, or TOKENFUSE_PROFILE=observe."
+        )
     if not any(v in live for v in REQUIRED):
         name = b.strip().split(":", 1)[0]
         note(

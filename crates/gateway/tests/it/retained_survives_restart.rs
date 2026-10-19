@@ -96,6 +96,7 @@ async fn read_post(socket: &mut tokio::net::TcpStream) -> bool {
 
 fn spawn(addr: &str, upstream: &str, data_dir: &str, identity_map: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_CLOUD_URL")
@@ -300,6 +301,7 @@ async fn cloud_with_parent_budget(parent_budget_micros: i64) -> (String, Arc<Ato
 
 fn spawn_with_cloud(addr: &str, upstream: &str, data_dir: &str, cloud: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .env_remove("TOKENFUSE_ALLOW_STUB")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_IDENTITY_MAP")

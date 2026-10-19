@@ -89,6 +89,7 @@ async fn the_export_names_the_price_basis_and_the_pii_let_through() {
 
     let out = dir.join("focus.csv");
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .args([
             "focus-export",
             "--traces",

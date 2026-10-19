@@ -166,6 +166,7 @@ fn spawn(
     needle: &'static str,
 ) -> (Child, Arc<Mutex<Vec<String>>>, bool) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tokenfuse"));
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.args(args)
         .env_clear()
         .env("RUST_LOG", "info")
@@ -400,6 +401,7 @@ async fn the_mcp_broker_signs_its_own_stream_and_closes_it_on_sigterm() {
 /// running (killed, so an unfixed binary fails this rather than hanging it).
 fn exit_code_within(args: &[&str], env: &[(String, String)]) -> (Option<i32>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokenfuse"))
+        .env("TOKENFUSE_PROFILE", "observe")
         .args(args)
         .env_clear()
         .envs(env.iter().cloned())

@@ -41,6 +41,7 @@ fn free_addr() -> String {
 /// a test names set on top.
 fn broker(extra: &[(&str, String)]) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.arg("mcp-broker")
         .env("TOKENFUSE_MCP_UPSTREAM", "http://127.0.0.1:1")
         .env("TOKENFUSE_MCP_ADDR", free_addr());

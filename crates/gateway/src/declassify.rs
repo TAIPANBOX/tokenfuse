@@ -137,6 +137,13 @@ pub async fn declassify(
     let expected = std::env::var("TOKENFUSE_DECLASSIFY_KEY")
         .ok()
         .filter(|v| !v.trim().is_empty());
+    // Invariant 136: under the governed profile a clearance needs its key. With no
+    // key configured the endpoint is closed rather than left to network placement.
+    if st.profile.is_governed() && expected.is_none() {
+        return refuse(
+            "declassification is closed on this gateway (governed profile): set TOKENFUSE_DECLASSIFY_KEY to allow it, or run with TOKENFUSE_PROFILE=observe",
+        );
+    }
     let presented = crate::proxy::header_str(&headers, "x-fuse-declassify-key");
     let authenticated = match (&expected, &presented) {
         (Some(want), Some(got)) if want == got => true,

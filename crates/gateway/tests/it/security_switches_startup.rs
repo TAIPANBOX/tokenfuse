@@ -34,6 +34,7 @@ fn free_addr() -> String {
 /// an upstream or the stub opt-in) and nothing else from this shell.
 fn gateway(extra: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.env_remove("TOKENFUSE_UPSTREAM")
         .env_remove("TOKENFUSE_CLIENT_KEYS")
         .env_remove("TOKENFUSE_IDENTITY_MAP")
@@ -49,6 +50,7 @@ fn gateway(extra: &[(&str, &str)]) -> Command {
 /// broker's own "no upstream" path and reaches the switches under test.
 fn broker(extra: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(bin());
+    cmd.env("TOKENFUSE_PROFILE", "observe");
     cmd.arg("mcp-broker")
         .env("TOKENFUSE_MCP_UPSTREAM", "http://127.0.0.1:1")
         .env("TOKENFUSE_MCP_ADDR", free_addr())

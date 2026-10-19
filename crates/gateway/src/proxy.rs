@@ -557,6 +557,7 @@ pub async fn healthz(
         .collect();
     axum::Json(serde_json::json!({
         "status": "ok",
+        "profile": st.profile.as_str(),
         "client_auth": if client_auth { "on" } else { "off" },
         "bind": if loopback { "loopback" } else { "not_loopback" },
         "warnings": warnings,
