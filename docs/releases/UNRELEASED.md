@@ -10,6 +10,7 @@
 
 - A deployment that names one origin and sends proofs for it keeps working unchanged.
 - A list with an entry that is not an origin, a trailing comma included, now refuses to start. Before, the broker read the whole value as one origin and refused every proof.
+- `TOKENFUSE_DELEGATION_URL` and `TOKENFUSE_MCP_PROOF_URL` must now be an origin, `scheme://host[:port]` with nothing after the port but an optional `/`. A value with a path, for example a gateway published under `https://host/tokenfuse`, used to be joined to the route's path and now refuses to start, naming the variable. The stack launchers set an origin without a path and are not affected.
 
 ## Not proven
 
