@@ -222,7 +222,7 @@ py() { printf 'import sys\ndef edit(p, a, b):\n    s = open(p).read()\n    asser
 # planted faults edit a COPY of this file, never this one: a case must not rewrite
 # the harness that is running it. The copy exists only after the edit, so these
 # cases skip the baseline (fail_env); the unmutated harness is judged by the first.
-run_case "teeth-shards: the four shards together run every case once" pass \
+run_case "teeth-shards: the shards together run every case once" pass \
 	"./scripts/teeth-shards-cover-every-case.sh" \
 	"pass"
 
@@ -243,6 +243,23 @@ edit("scripts/planted-teeth.sh", "-ne $(( shard_i - 1 )) ]; then", "-gt $(( shar
 run_case "teeth-shards: a harness that is gone, so the shards measured nothing" fail_env \
 	"./scripts/teeth-shards-cover-every-case.sh scripts/no-such-harness.sh" \
 	"pass" \
+	"measured nothing"
+
+# The shard count is read from ci.yml, where the matrix, TEETH_SHARD and the job
+# name each state it. These edit the workflow itself, which `restore` puts back.
+run_case "teeth-shards: a matrix that skips a shard disagrees with its divisor" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "shard: [1, 2, 3, 4, 5, 6, 7, 8]", "shard: [1, 2, 3, 4, 5, 6, 7, 9]")')" \
+	"disagrees with itself"
+
+run_case "teeth-shards: a divisor left at four under a matrix of eight" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "TEETH_SHARD: ${{ matrix.shard }}/8", "TEETH_SHARD: ${{ matrix.shard }}/4")')" \
+	"disagrees with itself"
+
+run_case "teeth-shards: the matrix gone from the workflow, so the count measured nothing" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'edit(".github/workflows/ci.yml", "shard: [1, 2, 3, 4, 5, 6, 7, 8]", "shard: all")')" \
 	"measured nothing"
 
 # --- invariant 1: core stays dependency-minimal ----------------------------

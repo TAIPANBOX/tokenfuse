@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Checks that the four CI shards of scripts/gates-have-teeth.sh run every case
-# exactly once: no case name is listed twice, no shard is empty, and the shards
-# together are the full list, with nothing dropped and nothing run in two shards.
+# Checks that the CI shards of scripts/gates-have-teeth.sh run every case exactly
+# once: no case name is listed twice, no shard is empty, and the shards together
+# are the full list, with nothing dropped and nothing run in two shards. The shard
+# count is read from the workflow, where the teeth job's matrix, the divisor each
+# shard filters by and the job's name all state it, and the three must agree.
 #
 # WHY THIS EXISTS
 #
-# The harness took 30 to 60 minutes as one job, so ci.yml runs it as four shards
-# (TEETH_SHARD=i/4). A filter that drops a case from every shard, or lets two
+# The harness took 30 to 60 minutes as one job, so ci.yml runs it as shards
+# (TEETH_SHARD=i/N). A filter that drops a case from every shard, or lets two
 # shards both run it, turns the harness green while a gate goes untested: each
 # shard passes on the cases it does run, so nothing else would show the gap.
+#
+# The count was written twice until 2026-10-26, as the matrix and as `shards=4`
+# here, and nothing checked that they agreed: a matrix of eight with a gate of four
+# would have proved a partition nobody ran. It is now written in the workflow only.
 #
 # HOW IT CHECKS WITHOUT RUNNING A CASE
 #
@@ -16,17 +22,45 @@
 # same filter, and stop. It mutates nothing, so this needs no cargo and no clean
 # tree.
 #
-# The optional argument is the harness to check. It defaults to the real one; the
-# planted-fault cases in gates-have-teeth.sh pass a copy with a broken filter.
+# The optional arguments are the harness and the workflow to check. They default
+# to the real ones; the planted-fault cases in gates-have-teeth.sh pass a copy of
+# the harness with a broken filter, and edit the workflow itself.
 
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
 harness="${1:-scripts/gates-have-teeth.sh}"
-shards=4
+workflow="${2:-.github/workflows/ci.yml}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+
+if [ ! -f "$workflow" ]; then
+	printf 'FAIL: %s does not exist, so the shard count measured nothing.\n' "$workflow"
+	exit 1
+fi
+
+# The one value a pattern captures in the workflow, or nothing when it matches no
+# line or more than one.
+one() {
+	local got
+	got="$(sed -nE "s#$1#\\1#p" "$workflow")"
+	[ "$(printf '%s' "$got" | grep -c .)" -eq 1 ] && printf '%s' "$got"
+}
+matrix="$(one '^[[:space:]]+shard: \[([0-9, ]+)\][[:space:]]*$' | tr -d ' ')"
+shards="$(one '^[[:space:]]+TEETH_SHARD: \$\{\{ matrix\.shard \}\}/([0-9]+)[[:space:]]*$')"
+named="$(one '^[[:space:]]+name: teeth \(shard \$\{\{ matrix\.shard \}\} of ([0-9]+)\)[[:space:]]*$')"
+if [ -z "$matrix" ] || [ -z "$shards" ] || [ -z "$named" ]; then
+	printf 'FAIL: %s has no single teeth matrix, TEETH_SHARD divisor and shard name, so the shard count measured nothing.\n' "$workflow"
+	exit 1
+fi
+expected=""
+for i in $(seq 1 "$shards"); do expected="${expected:+$expected,}$i"; done
+if [ "$matrix" != "$expected" ] || [ "$named" != "$shards" ]; then
+	printf 'FAIL: the shard count in %s disagrees with itself: matrix [%s], TEETH_SHARD divisor %s, job name "of %s".\n' \
+		"$workflow" "$matrix" "$shards" "$named"
+	exit 1
+fi
 
 if [ ! -f "$harness" ]; then
 	printf 'FAIL: %s does not exist, so the shards measured nothing.\n' "$harness"
@@ -86,4 +120,4 @@ if [ "$fail" -ne 0 ]; then
 	exit 1
 fi
 
-printf 'ok: %s cases, %s shards with%s cases, each run by exactly one shard\n' "$full" "$shards" "$sizes"
+printf 'ok: %s cases, %s shards (from %s) with%s cases, each run by exactly one shard\n' "$full" "$shards" "$workflow" "$sizes"
