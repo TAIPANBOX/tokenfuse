@@ -456,14 +456,14 @@ fn verify_answer(raw: &[u8], bytes: &[u8]) -> Result<KeyryxSignature, NotSigned>
     Ok(KeyryxSignature {
         kid: kid.to_string(),
         signature_b64: STANDARD.encode(sig.to_bytes()),
-        public_key_b64: STANDARD.encode(public.to_encoded_point(false).as_bytes()),
+        public_key_b64: STANDARD.encode(public.to_sec1_point(false).as_bytes()),
     })
 }
 
 /// The RFC 7638 thumbprint of a P-256 key, by the one function this estate
 /// names a key with ([`tokenfuse_dpop::thumbprint_of_json`]).
 fn thumbprint(public: &VerifyingKey) -> Result<String, NotSigned> {
-    let point = public.to_encoded_point(false);
+    let point = public.to_sec1_point(false);
     let (Some(x), Some(y)) = (point.x(), point.y()) else {
         return Err(NotSigned::same(
             "keyryx's answer carries no P-256 public key",

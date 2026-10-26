@@ -24,4 +24,4 @@ serde_json.workspace = true
 # These tests mint real proofs and verify them through the real code path,
 # rather than asserting against a stub of the wire. Same key type and same
 # crate the Cloud's delegation tests already use.
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
