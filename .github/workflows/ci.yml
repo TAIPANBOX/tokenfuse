@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request makes the older run's result moot, so the
+# older run is cancelled rather than left holding runners. A push to main is never
+# cancelled: its group is its own commit. A red-first commit's run is cancelled by
+# the next push too, so read its test job before pushing the fix.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # One archive snapshot for every apt step in this file. Bump it deliberately,
@@ -126,9 +134,10 @@ jobs:
       - name: one integration-test binary per crate
         run: ./scripts/one-test-binary-per-crate.sh
 
-      # The teeth harness runs as four shards (the teeth jobs below). This lists
-      # what each shard would run and requires the four to run every case exactly
-      # once. It runs no case and needs no cargo (invariant 113).
+      # The teeth harness runs as shards (the teeth jobs below). This reads their
+      # count from this file, lists what each shard would run and requires the
+      # shards to run every case exactly once. It runs no case and needs no cargo
+      # (invariant 113).
       - name: the teeth shards run every case exactly once
         run: ./scripts/teeth-shards-cover-every-case.sh
 
@@ -254,19 +263,21 @@ jobs:
         run: cargo test
 
   # The teeth harness is the slowest step in this repository, 30 to 60 minutes as
-  # one job, so it runs as four shards of the same case list. Shard i runs the
-  # cases at positions i, i+4, ..., and scripts/teeth-shards-cover-every-case.sh
-  # requires the four together to run each case exactly once (invariant 113).
-  # Standard runners: this repository is public, so they cost nothing.
+  # one job, so it runs as eight shards of the same case list. Shard i runs the
+  # cases at positions i, i+8, ..., and scripts/teeth-shards-cover-every-case.sh
+  # requires them together to run each case exactly once (invariant 113). The
+  # count is written here only, in the matrix, TEETH_SHARD and the name, and that
+  # gate reads it from here and requires the three to agree. Standard runners: this
+  # repository is public, so they cost nothing.
   teeth:
-    name: teeth (shard ${{ matrix.shard }} of 4)
+    name: teeth (shard ${{ matrix.shard }} of 8)
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
-      TEETH_SHARD: ${{ matrix.shard }}/4
+      TEETH_SHARD: ${{ matrix.shard }}/8
     steps:
       # fetch-depth: 0 here too: this job runs gates-have-teeth.sh, whose
       # stated-numbers cases call the version-badge check, and a checkout
@@ -325,7 +336,7 @@ jobs:
         run: ./scripts/audit.sh
 
   # The required check. Its name stays, because branch protection names it. It
-  # passes only when the audit job and all four teeth shards passed: a skipped
+  # passes only when the audit job and every teeth shard passed: a skipped
   # or cancelled need reads as not success, so it fails here too.
   security:
     name: security (cargo audit)
@@ -333,13 +344,13 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: audit and all four teeth shards passed
+      - name: audit and every teeth shard passed
         env:
           AUDIT: ${{ needs.audit.result }}
           TEETH: ${{ needs.teeth.result }}
         run: |
           echo "cargo audit: $AUDIT" >>"$GITHUB_STEP_SUMMARY"
-          echo "teeth, four shards: $TEETH" >>"$GITHUB_STEP_SUMMARY"
+          echo "teeth, every shard: $TEETH" >>"$GITHUB_STEP_SUMMARY"
           test "$AUDIT" = success
           test "$TEETH" = success
 
