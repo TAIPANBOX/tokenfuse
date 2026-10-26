@@ -120,7 +120,7 @@ async fn sign(
             "kid": kid,
             "signature_b64": STANDARD.encode(sig.to_bytes()),
             "public_key_b64": STANDARD.encode(
-                stub.key.verifying_key().to_encoded_point(false).as_bytes()
+                stub.key.verifying_key().to_sec1_point(false).as_bytes()
             ),
         })),
     )
@@ -262,7 +262,7 @@ async fn a_manifest_keyryx_signed_verifies_and_names_its_kid() {
     assert_eq!(m["kid"], KEYRYX_KID, "the kid keyryx gives its key");
     assert_eq!(m["entry_count"], 1);
     assert!(verifies(&m), "the manifest must verify offline: {m}");
-    let keyryx_key = STANDARD.encode(stub.key.verifying_key().to_encoded_point(false).as_bytes());
+    let keyryx_key = STANDARD.encode(stub.key.verifying_key().to_sec1_point(false).as_bytes());
     assert_eq!(m["public_key_b64"], keyryx_key, "signed by keyryx's key");
 
     let calls = stub.calls.lock().unwrap();

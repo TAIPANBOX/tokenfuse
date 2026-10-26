@@ -152,7 +152,7 @@ pub fn build_signed_manifest(
 ) -> AuditManifest {
     let tip = ChainTip::of(entries);
     let sig: Signature = key.sign(&tip.signing_bytes(org, now_ms));
-    let public_key_b64 = STANDARD.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+    let public_key_b64 = STANDARD.encode(key.verifying_key().to_sec1_point(false).as_bytes());
     AuditManifest {
         org: org.to_string(),
         tip_seq: tip.tip_seq,
@@ -273,11 +273,8 @@ mod tests {
         let key = parse_signing_key(&encoded).expect("parse raw scalar");
         // Signs the same as the direct scalar key.
         assert_eq!(
-            key.verifying_key().to_encoded_point(false).as_bytes(),
-            test_key()
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
+            key.verifying_key().to_sec1_point(false).as_bytes(),
+            test_key().verifying_key().to_sec1_point(false).as_bytes()
         );
     }
 

@@ -250,7 +250,7 @@ impl HeldKey {
     }
 
     fn from_signing_key(sk: SigningKey) -> Result<Self, String> {
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let (Some(x), Some(y)) = (point.x(), point.y()) else {
             return Err("the public key has no coordinates".into());
         };

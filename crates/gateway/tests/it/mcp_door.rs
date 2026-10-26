@@ -31,12 +31,12 @@ struct Key {
 impl Key {
     fn new() -> Self {
         Key {
-            signing: p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            signing: <p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate(),
         }
     }
 
     fn jwk(&self) -> serde_json::Value {
-        let point = self.signing.verifying_key().to_encoded_point(false);
+        let point = self.signing.verifying_key().to_sec1_point(false);
         serde_json::json!({
             "kty": "EC", "crv": "P-256",
             "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()),

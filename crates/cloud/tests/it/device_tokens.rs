@@ -52,7 +52,7 @@ fn state_over(store: Arc<Store>) -> AppState {
 
 fn keypair() -> (SigningKey, String) {
     let sk = SigningKey::from_slice(&[0x33u8; 32]).expect("valid scalar");
-    let pubkey_b64 = STANDARD.encode(sk.verifying_key().to_encoded_point(false).as_bytes());
+    let pubkey_b64 = STANDARD.encode(sk.verifying_key().to_sec1_point(false).as_bytes());
     (sk, pubkey_b64)
 }
 

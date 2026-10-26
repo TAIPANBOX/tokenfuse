@@ -1627,11 +1627,11 @@ struct ProofKey {
 impl ProofKey {
     fn new() -> Self {
         ProofKey {
-            signing: p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            signing: <p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate(),
         }
     }
     fn jwk(&self) -> Value {
-        let point = self.signing.verifying_key().to_encoded_point(false);
+        let point = self.signing.verifying_key().to_sec1_point(false);
         json!({"kty": "EC", "crv": "P-256", "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap())})
     }
     /// A proof for `POST {origin}/`, which is where these tests post.
