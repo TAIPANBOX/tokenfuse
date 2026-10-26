@@ -360,6 +360,8 @@ enum Mode {
     OtherOwner,
     OtherLife,
     TimesDiffer,
+    NoSignatures,
+    EmptySignatures,
     Refuse401,
     Redirect,
 }
@@ -462,10 +464,17 @@ async fn stub_delegate(
         _ => {}
     }
     st.certified.lock().unwrap().push(claims["jwk"].clone());
-    let statement = json!({
+    let mut statement = json!({
         "payload": b64url().encode(serde_json::to_vec(&claims).unwrap()),
         "signatures": [{"protected": "e30", "signature": "AA"}]
     });
+    match mode {
+        Mode::NoSignatures => {
+            statement.as_object_mut().unwrap().remove("signatures");
+        }
+        Mode::EmptySignatures => statement["signatures"] = json!([]),
+        _ => {}
+    }
     let (anb, ana) = if mode == Mode::TimesDiffer {
         (nb, na + 5)
     } else {
@@ -542,6 +551,22 @@ async fn a_statement_that_does_not_certify_this_key_is_refused() {
         let k = Keyryx::new(&cfg_for(&s.url, &dir, "consumer-key-0123")).unwrap();
         let err = k.certify("tokenfuse-stream", 3600).await.err().unwrap();
         assert!(err.contains(why), "{mode:?}: {err}");
+    }
+}
+
+/// The statement's signatures are the witness's to verify (invariant 128), so
+/// this writer only requires that there are some: a statement with no
+/// `signatures`, or an empty list, is not of the known shape and certifies
+/// nothing.
+#[tokio::test]
+async fn a_statement_with_no_signatures_is_refused() {
+    for mode in [Mode::NoSignatures, Mode::EmptySignatures] {
+        let s = stub(T0_SECS).await;
+        *s.state.mode.lock().unwrap() = mode;
+        let dir = temp_dir(&format!("unsigned-{mode:?}"));
+        let k = Keyryx::new(&cfg_for(&s.url, &dir, "consumer-key-0123")).unwrap();
+        let err = k.certify("tokenfuse-stream", 3600).await.err().unwrap();
+        assert!(err.contains("not of the known shape"), "{mode:?}: {err}");
     }
 }
 
