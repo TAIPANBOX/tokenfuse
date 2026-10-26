@@ -1,0 +1,48 @@
+# Throwaway: the new checkpoints test must fail when the presence check on
+# `signatures` is disabled. This branch is never merged.
+name: red-first
+
+on: pull_request
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: red first (presence check disabled)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1
+          save-if: false
+      - name: The new test against the disabled check
+        run: |
+          set +e
+          cargo test --workspace --lib -- checkpoints::tests::a_statement_with_no_signatures_is_refused >out.txt 2>&1
+          rc=$?
+          set -e
+          sed 's/\x1b\[[0-9;]*m//g' out.txt >plain.txt
+          tail -30 plain.txt
+          if [ "$rc" -ne 0 ] && grep -q 'test checkpoints::tests::a_statement_with_no_signatures_is_refused ... FAILED' plain.txt; then
+            echo "RED as required" | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -E 'panicked at|NoSignatures|EmptySignatures' plain.txt | head -4 | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "NOT RED: rc=$rc" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
