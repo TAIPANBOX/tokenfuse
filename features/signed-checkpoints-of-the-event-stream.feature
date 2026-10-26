@@ -77,6 +77,12 @@ Feature: The gateway signs checkpoints of its own event stream, and a witness ca
     When the gateway reads it
     Then the key is not kept and no record is signed with it
 
+  # @test:a_statement_with_no_signatures_is_refused
+  Scenario: A statement that carries no signatures is not used
+    Given keyryx answers with a statement whose signatures are missing or an empty list
+    When the gateway reads it
+    Then the key is not kept: the witness verifies a statement's signatures, and one with none has nothing to verify
+
   # @test:a_key_signs_only_inside_its_statement_window_in_whole_seconds
   # @test:a_key_past_its_statement_is_never_used_and_the_record_is_unsigned
   # @test:a_key_that_runs_out_mid_stream_gives_unsigned_records_not_stale_signatures
