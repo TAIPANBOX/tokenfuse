@@ -278,6 +278,50 @@ mod tests {
         );
     }
 
+    /// RFC 6979 appendix A.2.5's P-256 key in every encoding
+    /// [`AUDIT_SIGNING_KEY_ENV`] accepts, each one written out by Python
+    /// `cryptography` 50.0.1 from the RFC's scalar (2026-10-26), never by the
+    /// curve library under test. Every one must load as that key and sign the
+    /// empty-chain manifest for `acme` at 42 ms to the same bytes: the public key
+    /// is SEC1 uncompressed 04||Ux||Uy, the signature raw r||s, both standard
+    /// base64. The signature was computed by the same library with RFC 6979
+    /// deterministic ECDSA over `acme␟0␟␟0␟42`, and that library reproduces the
+    /// RFC's own "sample" signature for this key.
+    #[test]
+    fn the_rfc_6979_key_loads_from_every_accepted_encoding_and_signs_a_known_manifest() {
+        const PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgya+p2EW6dRZrXCFX
+Z7HWk05Qw9s26JsSe4piKxIPZyGhRANCAARg/tS6JVqdMclh63TGNW1owEm4kjth
++mzmaWIuYPKftnkD/hAIuLyZpBrp6VYovGTy8bIMLX6fUXejwpTURiKZ
+-----END PRIVATE KEY-----";
+        const SEC1_PEM: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIMmvqdhFunUWa1whV2ex1pNOUMPbNuibEnuKYisSD2choAoGCCqGSM49
+AwEHoUQDQgAEYP7UuiVanTHJYet0xjVtaMBJuJI7Yfps5mliLmDyn7Z5A/4QCLi8
+maQa6elWKLxk8vGyDC1+n1F3o8KU1EYimQ==
+-----END EC PRIVATE KEY-----";
+        const PKCS8_DER_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgya+p2EW6dRZrXCFXZ7HWk05Qw9s26JsSe4piKxIPZyGhRANCAARg/tS6JVqdMclh63TGNW1owEm4kjth+mzmaWIuYPKftnkD/hAIuLyZpBrp6VYovGTy8bIMLX6fUXejwpTURiKZ";
+        const SEC1_DER_B64: &str = "MHcCAQEEIMmvqdhFunUWa1whV2ex1pNOUMPbNuibEnuKYisSD2choAoGCCqGSM49AwEHoUQDQgAEYP7UuiVanTHJYet0xjVtaMBJuJI7Yfps5mliLmDyn7Z5A/4QCLi8maQa6elWKLxk8vGyDC1+n1F3o8KU1EYimQ==";
+        const SCALAR_B64: &str = "ya+p2EW6dRZrXCFXZ7HWk05Qw9s26JsSe4piKxIPZyE=";
+        const PUBLIC_KEY_B64: &str =
+            "BGD+1LolWp0xyWHrdMY1bWjASbiSO2H6bOZpYi5g8p+2eQP+EAi4vJmkGunpVii8ZPLxsgwtfp9Rd6PClNRGIpk=";
+        const SIGNATURE_B64: &str =
+            "eRt/XRM+xbJI6Y7bXWdfjdO/sNb9wZgb50dUSi+df19EjX3i3Jzmr1iY5Jhkrl9YzC7FLyqLVQBG9Xsxvcaz2g==";
+
+        for (name, encoded) in [
+            ("pkcs8 pem", PKCS8_PEM),
+            ("sec1 pem", SEC1_PEM),
+            ("pkcs8 der", PKCS8_DER_B64),
+            ("sec1 der", SEC1_DER_B64),
+            ("raw scalar", SCALAR_B64),
+        ] {
+            let key = parse_signing_key(encoded).unwrap_or_else(|| panic!("{name} must load"));
+            let m = build_signed_manifest("acme", &[], &key, 42);
+            assert_eq!(m.public_key_b64, PUBLIC_KEY_B64, "{name}");
+            assert_eq!(m.signature_b64, SIGNATURE_B64, "{name}");
+            assert!(manifest_verifies(&m), "{name}");
+        }
+    }
+
     #[test]
     fn garbage_key_material_is_none() {
         assert!(parse_signing_key("").is_none());

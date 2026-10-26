@@ -147,4 +147,30 @@ mod tests {
         assert!(!verify_signature("not-base64!!", "x", "y"));
         assert!(!verify_signature("", "x", ""));
     }
+
+    /// RFC 6979 appendix A.2.5's P-256 public point and its deterministic
+    /// SHA-256 signature over "sample", in the encodings a device sends: SEC1
+    /// (uncompressed and compressed) and raw r||s, standard base64. Encoded
+    /// outside this repository with Python `cryptography` 50.0.1 from the RFC's
+    /// hex (2026-10-26), never by the curve library under test. The same
+    /// signature with its halves swapped, or in DER, is refused: the wire form is
+    /// raw r||s and nothing else.
+    #[test]
+    fn a_published_rfc_6979_signature_verifies_and_no_other_encoding_of_it_does() {
+        const UNCOMPRESSED: &str =
+            "BGD+1LolWp0xyWHrdMY1bWjASbiSO2H6bOZpYi5g8p+2eQP+EAi4vJmkGunpVii8ZPLxsgwtfp9Rd6PClNRGIpk=";
+        const COMPRESSED: &str = "A2D+1LolWp0xyWHrdMY1bWjASbiSO2H6bOZpYi5g8p+2";
+        const RS: &str =
+            "79SLKqy2qP0RQN2c1F6B1p0sh3tWqvmRw00OqE6vNxb3yxyULWV8QdQ2x6G24p9l8+kA27mv9AZNxKsvhDrNqA==";
+        const SR: &str =
+            "98sclC1lfEHUNsehtuKfZfPpANu5r/QGTcSrL4Q6zajv1IsqrLao/RFA3ZzUXoHWnSyHe1aq+ZHDTQ6oTq83Fg==";
+        const DER: &str =
+            "MEYCIQDv1IsqrLao/RFA3ZzUXoHWnSyHe1aq+ZHDTQ6oTq83FgIhAPfLHJQtZXxB1DbHobbin2Xz6QDbua/0Bk3Eqy+EOs2o";
+
+        assert!(verify_signature(UNCOMPRESSED, "sample", RS));
+        assert!(verify_signature(COMPRESSED, "sample", RS));
+        assert!(!verify_signature(UNCOMPRESSED, "test", RS));
+        assert!(!verify_signature(UNCOMPRESSED, "sample", SR));
+        assert!(!verify_signature(UNCOMPRESSED, "sample", DER));
+    }
 }
