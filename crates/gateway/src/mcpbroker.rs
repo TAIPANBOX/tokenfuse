@@ -708,6 +708,42 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
+/// JSON-RPC's own code for a message that is not a valid request object.
+const INVALID_REQUEST_RPC_CODE: i64 = -32600;
+
+/// A batch, refused whole (invariant 142). MCP removed batching in its
+/// 2025-06-18 revision, so the remedy is the one the protocol already expects.
+const BATCH_RPC_MESSAGE: &str =
+    "invalid request: a JSON-RPC batch is not accepted; send each message on its own";
+
+/// A bare string, number, boolean or null: no message at all.
+const NOT_AN_OBJECT_RPC_MESSAGE: &str = "invalid request: not a JSON-RPC object";
+
+/// An object whose `method` is there and is not a string.
+const METHOD_RPC_MESSAGE: &str = "invalid request: the JSON-RPC method is not a string";
+
+/// Why `req` cannot be judged, or `None` when it is one message the broker
+/// reads the way an upstream will (invariant 142).
+///
+/// Every check this broker makes keys on `method` read from one JSON object:
+/// the Wardryx decision, the identity requirement, drift, the taint gate, the
+/// argument scans, the `tool_call` record, and the `tools/list` scans. A batch
+/// is an array, so its `method` read as empty, all of them were skipped, and
+/// the array was forwarded as it came. A `method` that is not a string reads as
+/// empty here and may read as something else upstream. An object with no
+/// `method` at all is a JSON-RPC response, a client answering the server's own
+/// request, and is still carried.
+fn unjudgeable(req: &Value) -> Option<&'static str> {
+    match req {
+        Value::Object(message) => match message.get("method") {
+            Some(method) if !method.is_string() => Some(METHOD_RPC_MESSAGE),
+            _ => None,
+        },
+        Value::Array(_) => Some(BATCH_RPC_MESSAGE),
+        _ => Some(NOT_AN_OBJECT_RPC_MESSAGE),
+    }
+}
+
 /// `" (reason)"` when the PDP gave a reason, else empty -- so a block message
 /// reads cleanly whether or not Wardryx explained itself.
 fn reason_suffix(reason: &Option<String>) -> String {
@@ -1711,6 +1747,18 @@ pub async fn process(st: &BrokerState, req: Value, ctx: &CallContext) -> Value {
 /// HTTP status, whether the message was a notification, and the session id
 /// the upstream named (invariant 77).
 pub async fn process_call(st: &BrokerState, req: Value, ctx: &CallContext) -> Outcome {
+    // First, before an upstream is resolved or a secret read (invariant 142):
+    // both transports arrive here, and a message whose `method` cannot be read
+    // from one object would otherwise pass every check below unjudged.
+    if let Some(why) = unjudgeable(&req) {
+        tracing::warn!(reason = %why, "mcp broker: refused a message it cannot judge; nothing was forwarded");
+        return Outcome {
+            reply: rpc_error(&Value::Null, INVALID_REQUEST_RPC_CODE, why),
+            notification: false,
+            status: Some(axum::http::StatusCode::BAD_REQUEST),
+            upstream_session: None,
+        };
+    }
     // A notification is a request with no `id`; JSON-RPC answers it with
     // nothing at all.
     let notification = req.get("method").is_some() && req.get("id").is_none();
