@@ -25,9 +25,11 @@ thiserror.workspace = true
 # built.
 subtle = "2.6"
 # The MCP broker binds a session id it relays to the upstream and the
-# credential that opened it (crate::mcpsession, invariant 77). All three are
-# already in Cargo.lock through crates/dpop, crates/delegation and crates/cloud;
-# naming them here adds direct edges, not crates.
+# credential that opened it (crate::mcpsession, invariant 77). sha2 and
+# getrandom are already in Cargo.lock through crates/dpop and crates/cloud.
+# hmac 0.12 arrived through p256 0.13's rfc6979 until p256 0.14 (which uses
+# hmac 0.13); since then this line is the only edge that keeps hmac 0.12 in
+# the lockfile.
 hmac = "0.12"
 sha2.workspace = true
 getrandom = "0.2"
@@ -36,7 +38,7 @@ getrandom = "0.2"
 # keyryx's proof of possession. Both were dev-dependencies for the MCP door's
 # tests and are in Cargo.lock through crates/cloud and crates/delegation, so
 # nothing new enters the tree.
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 base64 = "0.22"
 tokio = { workspace = true, features = ["io-std", "io-util"] }
 axum.workspace = true

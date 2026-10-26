@@ -55,7 +55,7 @@ fn answer_from(key: &SigningKey, kid: &str, alg: &str, bytes: &[u8], compressed:
         "alg": alg,
         "kid": kid,
         "signature_b64": STANDARD.encode(sig.to_bytes()),
-        "public_key_b64": STANDARD.encode(key.verifying_key().to_encoded_point(compressed).as_bytes()),
+        "public_key_b64": STANDARD.encode(key.verifying_key().to_sec1_point(compressed).as_bytes()),
     })
     .to_string()
     .into_bytes()
@@ -282,7 +282,7 @@ fn a_public_key_that_did_not_sign_is_refused() {
     let mut v: serde_json::Value = serde_json::from_slice(&answer("ES256", bytes, false)).unwrap();
     let other = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
     v["public_key_b64"] = STANDARD
-        .encode(other.verifying_key().to_encoded_point(false).as_bytes())
+        .encode(other.verifying_key().to_sec1_point(false).as_bytes())
         .into();
     let why = verify_answer(v.to_string().as_bytes(), bytes).unwrap_err();
     assert!(why.reason.contains("does not verify"), "{why:?}");
