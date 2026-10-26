@@ -4626,3 +4626,200 @@ async fn arguments_of_exactly_12_kib_are_sent_whole_and_one_byte_more_is_truncat
     );
     assert_eq!(upstream_seen.lock().unwrap().len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// A message the broker cannot judge is never forwarded (invariant 142).
+//
+// The gate reads `method` from one JSON-RPC object. A batch is an array, so it
+// has no `method` the broker could read: every check keyed on `tools/call` was
+// skipped and the array went to the upstream as it came. A batch of two
+// `tools/call` reached the upstream with no policy decision and no `tool_call`
+// record. MCP removed batching in its 2025-06-18 revision, and its HTTP
+// transport carries one message per POST, so a batch is refused whole.
+// ---------------------------------------------------------------------------
+
+fn a_batch_of_two_tool_calls() -> Value {
+    json!([
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "shell_exec", "arguments": { "cmd": "id" } }
+        },
+        {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "gh_api", "arguments": { "auth": "Bearer {{secret:gh}}" } }
+        }
+    ])
+}
+
+/// The PDP denies every tool here, so a batch that reached the upstream can
+/// only have gone around the gate. The assertion that matters is the first:
+/// the upstream saw nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_of_tool_calls_is_refused_and_nothing_reaches_the_upstream() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, asked) = recording_pdp("deny").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let (status, _, body) = post_with(
+        &broker_url,
+        &[("x-fuse-agent-id", "agent://acme.example/bot")],
+        &a_batch_of_two_tool_calls(),
+    )
+    .await;
+
+    let forwarded = seen.lock().expect("upstream log").clone();
+    assert!(
+        forwarded.is_empty(),
+        "a batch must not reach the upstream around the policy gate: {forwarded:?}"
+    );
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    let err = as_json(&body);
+    assert_eq!(err["error"]["code"], json!(-32600), "{err}");
+    assert_eq!(err["id"], Value::Null, "{err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("batch"),
+        "the refusal has to say what was refused: {err}"
+    );
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "nothing in a refused batch is put to the PDP"
+    );
+}
+
+/// stdio reaches the same `process_call`, and there an enforcing gate also
+/// refuses an unattributed `tools/call`; a batch skipped that refusal as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stdio_transport_refuses_a_batch_too() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let pdp = stub_pdp("deny").await;
+    let state = broker_state(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let out = stdio_lines(state, &[a_batch_of_two_tool_calls()]).await;
+
+    let forwarded = seen.lock().expect("upstream log").clone();
+    assert!(
+        forwarded.is_empty(),
+        "a batch must not reach the upstream over stdio: {forwarded:?}"
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(out[0]["error"]["code"], json!(-32600), "{out:?}");
+    assert_eq!(out[0]["id"], Value::Null, "{out:?}");
+}
+
+/// The same rule one step out: whatever the broker cannot read as one request
+/// with a string `method` is refused, because the gate keys on that string and
+/// an upstream may read the message differently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_the_broker_cannot_read_as_one_request_is_refused() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let pdp = stub_pdp("deny").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for message in [
+        json!("tools/call"),
+        json!(42),
+        Value::Null,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": ["tools/call"],
+            "params": { "name": "shell_exec", "arguments": {} }
+        }),
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": { "name": "tools/call" },
+            "params": { "name": "shell_exec", "arguments": {} }
+        }),
+    ] {
+        let (status, _, body) = post_with(
+            &broker_url,
+            &[("x-fuse-agent-id", "agent://acme.example/bot")],
+            &message,
+        )
+        .await;
+        let forwarded = seen.lock().expect("upstream log").clone();
+        assert!(
+            forwarded.is_empty(),
+            "{message} must not reach the upstream: {forwarded:?}"
+        );
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{message} was not refused: {body}"
+        );
+        assert_eq!(
+            as_json(&body)["error"]["code"],
+            json!(-32600),
+            "{message}: {body}"
+        );
+    }
+}
+
+/// The refusal must not fire on what the broker can read. One request still
+/// passes, and so does a client's answer to a server's own request (a JSON-RPC
+/// response, as elicitation sends): it has an `id` and a `result` and no
+/// `method`, and the HTTP transport carries it in a POST like any other
+/// message. A fix that refused every message without a `method` would break it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_request_and_a_clients_response_still_reach_the_upstream() {
+    let (seen, upstream_router) = recording_upstream();
+    let upstream = spawn_server(upstream_router).await;
+    let (pdp, asked) = recording_pdp("allow").await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let agent = [("x-fuse-agent-id", "agent://acme.example/bot")];
+
+    let call = json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": { "name": "gh_api", "arguments": {} }
+    });
+    let (status, _, body) = post_with(&broker_url, &agent, &call).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert!(as_json(&body).get("error").is_none(), "{body}");
+    assert_eq!(asked.lock().unwrap().len(), 1, "{body}");
+
+    let answer = json!({ "jsonrpc": "2.0", "id": "srv-1", "result": { "action": "accept" } });
+    let (status, _, body) = post_with(&broker_url, &agent, &answer).await;
+    assert_ne!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+
+    let forwarded = seen.lock().expect("upstream log").clone();
+    assert_eq!(forwarded.len(), 2, "{forwarded:?}");
+    assert_eq!(forwarded[1], answer, "{forwarded:?}");
+}
