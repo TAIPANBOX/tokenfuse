@@ -1,0 +1,70 @@
+# Throwaway: mutation run for PR #478, on a branch that is never merged.
+name: mutants
+
+on: pull_request
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Job id `test` and prefix-key v1, as in ci.yml, so every mutant restores the
+  # cache main's test job saved instead of building from nothing.
+  test:
+    name: mutant ${{ matrix.m }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        m: [none, M1, M2, M3, M4, M5, M6, M7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1
+          save-if: false
+      - name: Apply the mutant
+        run: python3 scripts/apply-mutant.py "${{ matrix.m }}"
+      - name: The four tests against it
+        env:
+          M: ${{ matrix.m }}
+        run: |
+          set +e
+          cargo test --workspace --test it -- \
+            a_batch_of_tool_calls_is_refused_and_nothing_reaches_the_upstream \
+            the_stdio_transport_refuses_a_batch_too \
+            a_message_the_broker_cannot_read_as_one_request_is_refused \
+            a_single_request_and_a_clients_response_still_reach_the_upstream \
+            >out.txt 2>&1
+          rc=$?
+          set -e
+          sed 's/\x1b\[[0-9;]*m//g' out.txt >plain.txt
+          failed=$(grep -E '^test mcp_broker::[a-z_]+ \.\.\. FAILED$' plain.txt | sed -E 's/^test mcp_broker::([a-z_]+) .*/\1/' | sort | tr '\n' ' ')
+          passed=$(grep -cE '^test mcp_broker::[a-z_]+ \.\.\. ok$' plain.txt || true)
+          grep -E 'panicked at crates/gateway/tests/it/mcp_broker.rs' plain.txt | sed -E 's/.*(mcp_broker\.rs:[0-9]+).*/\1/' | sort -u >lines.txt || true
+          if [ "$M" = none ]; then
+            if [ "$rc" -eq 0 ] && [ "$passed" -eq 4 ]; then verdict="BASELINE ok: 4 passed"; else verdict="BASELINE broken: rc=$rc passed=$passed"; fi
+          elif [ "$rc" -eq 0 ]; then
+            verdict="SURVIVED: all of the four passed"
+          elif grep -q 'test result: FAILED' plain.txt; then
+            verdict="KILLED by: $failed(at $(tr '\n' ' ' <lines.txt))"
+          else
+            verdict="ERROR: no test result (did it compile?)"
+          fi
+          echo "$M $verdict"
+          echo "$M $verdict" >>"$GITHUB_STEP_SUMMARY"
+          tail -40 plain.txt
+          case "$verdict" in "BASELINE ok"*|KILLED*) exit 0 ;; *) exit 1 ;; esac
