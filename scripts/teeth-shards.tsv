@@ -1,0 +1,264 @@
+# Which CI shard of scripts/gates-have-teeth.sh runs which case.
+# Columns, tab separated: shard, seconds, case name. Lines starting with # are comments.
+# The seconds are what the case (and the baseline it needed) took in CI; the shards were
+# filled longest case first so each carries about the same. Regenerate from the logs of a
+# CI run with: python3 scripts/teeth-rebalance.py LOG... > scripts/teeth-shards.tsv
+# A case this file does not name runs in the shard its position gives it, so adding a
+# case needs no edit here; scripts/teeth-shards-cover-every-case.sh checks the result.
+2	3	teeth-shards: the shards together run every case once
+8	2	teeth-shards: a filter that drops every fifth case is not a partition
+1	2	teeth-shards: a filter that runs a case in every shard up to its own is not a partition
+5	0	teeth-shards: a harness that is gone, so the shards measured nothing
+7	2	teeth-shards: a matrix that skips a shard disagrees with its divisor
+3	1	teeth-shards: a divisor left at four under a matrix of eight
+4	2	teeth-shards: the matrix gone from the workflow, so the count measured nothing
+6	8	teeth-shards: a map line naming a case that does not exist
+1	8	teeth-shards: a map line putting a case in a shard that does not exist
+5	8	teeth-shards: a map that names one case twice
+4	8	teeth-shards: a map that is gone, so the balance measured nothing
+3	8	teeth-shards: a case the map does not name still runs in exactly one shard
+7	0	core-deps: a dependency core is not allowed
+2	0	core-deps: an allowed dependency removed
+7	0	core-deps: cargo missing, so it measured nothing
+4	0	dto-boundary: a core type on a DTO through value_type
+7	0	dto-boundary: an exception whose reason stopped holding
+2	0	replicated-shape: a field added to the replicated state
+8	0	replicated-shape: a type renamed, so it measured nothing
+1	150	stated-numbers: the badge disagrees with the suite
+1	3	stated-numbers: the version badge disagrees with the newest tag
+1	3	stated-numbers: an old count quoted in prose elsewhere
+1	3	stated-numbers: a suite output that counts fewer tests than the badge says
+1	3	stated-numbers: a suite output with no result line in it, so it measured nothing
+1	3	stated-numbers: a suite output that agrees with the badge passes without a second run
+6	0	honest-claims: a control upgraded, which is over-claiming
+8	0	honest-claims: the MCP door row upgraded to Enforced, which is over-claiming
+3	0	honest-claims: the OWASP MCP framework id renamed in FRAMEWORK_VERSIONS
+5	0	honest-claims: README stops stating a limitation
+7	0	honest-claims: the catalog parse broke, so it measured nothing
+4	0	honest-claims: a merely-relevant framework promoted to enforced
+7	0	honest-claims: a new relevance claim nobody recorded
+4	0	honest-claims: the relevance category emptied, so it measured nothing
+5	0	honest-claims: a relevance row reworded but not moved
+8	1	runnable-quickstart: the headline command loses its flag
+2	1	runnable-quickstart: the headline command loses its profile
+5	0	runnable-quickstart: the compose gateway loses its profile
+8	0	runnable-quickstart: the compose gateway loses its flag
+1	0	runnable-quickstart: a subcommand and a prose ellipsis
+6	0	runnable-quickstart: the compose image renamed, so it measured nothing
+4	1	runnable-quickstart: the compose control plane loses its host
+7	1	runnable-quickstart: the control plane published on every interface
+1	0	runnable-quickstart: a key written into the compose file
+2	0	runnable-quickstart: the control-plane image renamed, so it measured nothing
+5	0	runnable-quickstart: a compose image back on latest
+5	63	constants: a wire string changed without regenerating
+4	10	audit: the same answer under a hook's environment
+2	9	audit: an ignore with no reason recorded
+4	9	audit: a recorded crate that is actually built
+4	6	audit: no ignore list left to check
+7	12	audit: the zstd ignores hold on the lock as it stands
+2	7	audit: the zstd ignores outlive parquet 60
+5	7	audit: the zstd ignores outlive arrow-ipc 60
+1	10	audit: zstd moved out of the range its ignore was argued for
+1	5	audit: zstd-safe moved out of the range its ignore was argued for
+3	0	audit: a new dependent of zstd that the ignore does not cover
+4	0	audit: a new dependent of zstd-safe that the ignore does not cover
+7	0	audit: zstd in no lockfile, so its ignore matches nothing
+6	2	audit: the zstd ignores removed, so the advisories surface
+1	3	stated-numbers: no badge left to compare against
+1	3	stated-numbers: the version badge line removed, so it measured nothing
+8	6	constants: the published artifact deleted
+4	7	features-are-bound: a binding names a test that is gone
+5	6	features-are-bound: a scenario with nothing behind it
+7	3	features-are-bound: the subject taken away entirely
+8	8	features-are-bound: an integration-test binding is still a binding
+1	0	pinned-installs: a cargo install loses its version
+5	0	pinned-installs: a cargo install loses --locked
+1	0	pinned-installs: a pip install loses its ==
+8	0	pinned-installs: a toolchain channel is not a tool install
+6	0	pinned-installs: an unpinned command quoted in a comment
+3	0	pinned-installs: no install commands left, so it measured nothing
+2	0	apt-snapshot-probe: the service is unreachable
+1	1	apt-snapshot-probe: the service answers, so it must not fire
+5	0	apt-snapshot-probe: no pin given, so it measured nothing
+2	0	pinned-installs: an apt install loses its snapshot
+8	0	pinned-installs: a runner label goes back to -latest
+5	0	same-doors: a door configured in one process only
+4	0	same-doors: an exception written in a form nothing reads
+2	0	same-doors: a stale process-local exception on a door both processes configure
+6	0	same-doors: the broker's policy hook removed while serve keeps its own
+3	0	same-doors: the startup wiring it reads is gone
+8	0	same-doors: an explained one-sided door, reworded
+4	66	the-openai-door: serve the mismatched door instead of refusing
+3	4	hierarchical-budgets: an unknown parent walked past silently
+8	17	settlement-owns-the-call: a retained reservation released instead
+8	51	usage-is-read-from-events: a data field replaces the buffer instead of appending
+8	0	compat-surface: a frozen route renamed in lib.rs
+3	0	compat-surface: an env name gone from components.json
+4	0	compat-surface: a subcommand renamed in main.rs
+6	0	compat-surface: COMPATIBILITY.md edited by hand
+3	0	compat-surface: an additive name added
+4	0	compat-surface: the manifest is gone
+5	0	compat-surface: a file a where entry names is gone
+3	21	D9: all send errors release
+6	57	D9: a followed redirect
+8	49	D9: a refused connection retained
+3	69	D9: request-build failure retained
+2	75	D9: harmless source comment
+3	12	D9: suite removed
+1	0	one-test-binary: a second tests/*.rs planted
+8	0	one-test-binary: a module file under tests/it is not a binary
+1	0	one-test-binary: an allowed binary that no longer exists
+8	0	one-test-binary: no crates at all, so it measured nothing
+6	17	price-book: claude-sonnet-5 loses its row and falls back
+1	19	price-book: the operator file's rate cap is gone
+6	19	reasoning-is-output: the output read from completion_tokens alone
+3	19	reasoning-is-output: the reasoning detail added on top of completion
+7	55	reasoning-is-output: the gap taken against the prompt net of the cache
+4	17	focus-export: an identity refusal filed under the claimed agent
+5	17	focus-export: a block reason on a row the Breaker did not block
+6	16	focus-export: the key dropped from the export
+2	17	gemini-price-book: gemini-2.5-flash loses its row and falls back
+8	18	gemini-price-book: gemini-2.5-pro loses its long-prompt tier
+6	9	long-prompt: the tier ignored in cost
+8	9	long-prompt: a prompt AT the threshold priced long
+2	17	long-prompt: an OpenAI cache write not netted out of input
+3	9	cloud-evidence: the known decisions cut back to the first seven reasons
+5	10	cloud-identity: a refusal filed under the claimed agent
+1	9	cloud-identity: the claimed agent reaches the incident detectors
+7	9	cloud-identity: a credential counted among an owner's agents
+2	22	price-book-route: served outside the admin gate
+1	14	price-book-route: the operator's replaced rows lost after startup
+7	20	price-book-route: no bound on the caller-chosen ids listed
+1	17	warn-identity: the forwarded call's row loses the reason
+7	17	warn-identity: the export drops the reason
+3	7	warn-identity: the Cloud shows a reason outside the vocabulary
+7	7	visible: a late record replaces a later call's decision
+4	7	visible: a refused call counted as a fallback charge
+3	18	visible: the gateway names a basis on a refusal
+4	13	tool-timeout: the tool path's default reverted to the shared 50 ms
+3	22	tool-timeout: the precedence ignores a shared value the operator set
+3	17	tool-timeout: the model path's default moved to 1000 ms
+7	20	drifted-tool: the state keyed by tool name only
+4	20	drifted-tool: a refusal that never clears
+4	18	drifted-tool: warn mode refuses
+8	20	drifted-tool: a listing's changes are never recorded
+6	2	no-owner-quotes: a planted marker line is refused
+3	2	no-owner-quotes: a clean line passes
+2	2	no-owner-quotes: non-Latin test input in a Rust raw string with inner quotes passes
+5	1	no-owner-quotes: the same text in a Rust comment is refused
+5	0	no-owner-quotes: an empty index, so it measured nothing
+2	20	seed-gate: the gate never consulted on the request path
+8	11	seed-gate: a failed startup seed leaves the gate open
+7	37	seed-gate: the retry reads the seed and never opens the gate
+4	22	seed-gate: shadow forwards and does not say so
+2	19	seed-gate: a restored reservation refuses the late unit seed
+6	23	streamed-tools: the hold never engaged
+7	20	streamed-tools: the OpenAI wire's tool calls not read
+5	20	streamed-tools: the Anthropic wire's tool calls not read
+1	20	streamed-tools: the held call leaks before the refusal
+6	11	streamed-tools: only the event that opened the call is held
+3	0	no-html-from-data: a run field interpolated into innerHTML
+3	0	no-html-from-data: a run field concatenated into insertAdjacentHTML
+7	0	no-html-from-data: a run field set as textContent passes
+8	0	no-html-from-data: the page as committed passes
+2	0	no-html-from-data: a sink named in a comment or a string passes
+1	0	no-html-from-data: a second embedded script with a sink is found
+6	0	no-html-from-data: a constant string no ALLOW entry names
+6	0	no-html-from-data: a constant string the ALLOW list names with a reason passes
+4	0	no-html-from-data: an ALLOW entry with no reason
+2	0	no-html-from-data: an ALLOW entry that matches no sink
+6	0	no-html-from-data: the served page deleted, so it measured nothing
+7	0	no-html-from-data: no page embedded at all, so it measured nothing
+6	0	no-html-from-data: the page's script moved out of the page, so it measured nothing
+3	0	no-html-from-data: a script it cannot read to the end, so it measured nothing
+1	0	no-html-from-data: dangerouslySetInnerHTML in the dashboard
+3	0	no-html-from-data: the dashboard sources gone, so it measured nothing
+5	20	refused-key: the refusal never reported
+8	22	refused-key: the per-source limit removed
+3	22	refused-key: the fingerprint carries the key
+5	22	pii-recorded: shadow never sets the counts
+7	8	pii-recorded: the Cloud counts a refused record
+3	7	pii-recorded: the Cloud reads any string as a kind
+3	19	openrouter-ids: the openai/ twin not inserted
+5	15	openrouter-ids: the twin's long tier not inserted
+4	21	broker-run-id: the record names no run
+6	22	focus-basis-pii: the basis never set on the attribution
+4	22	focus-basis-pii: the export reads the PII column as the basis
+5	9	pii-iban: the checksum skipped
+6	8	pii-card: the decimal rule removed
+8	7	run-models: the model taken in arrival order
+1	7	run-models: a refusal counted as a model used
+6	6	run-models: the gateway's kill not read
+2	20	dlp-shadow: the queue never written
+2	22	dlp-shadow: a mask finding reported as shadow
+5	22	dlp-shadow: written before the PII scan could refuse
+6	0	attestation-derived: a planted read of the header in the broker
+8	0	attestation-derived: a read through the constant in the proxy
+4	0	attestation-derived: a comment naming the header passes
+1	0	attestation-derived: the module deleted, so it measured nothing
+5	18	unclassified: the starter rule no longer denies it
+8	8	unclassified: an unmapped tool requests nothing again
+5	22	attestation: the LLM path reads the caller's header again
+2	22	attestation: the broker's proof door is not counted
+3	20	failmode: an enforcing hook nobody configured fails open again
+7	18	tool-check: the key is not asked for
+5	21	tool-check: another key's run is described
+4	20	tool-check: the broker reads a refusal as an answer
+2	11	open-bind: the warning is never printed
+2	0	run-owner-first: the run's tool blocks recorded before the claim
+7	0	run-owner-first: the metered door never claims
+1	0	run-owner-first: the declared parent judged only after it is opened
+8	0	upstream-key: the copy loop skips the caller's credential unconditionally
+3	0	upstream-key: the copy loop never skips the caller's credential
+4	0	upstream-key: the gateway's own key is not sent upstream
+5	0	cloud-credentials: an org-key lookup by the raw bearer
+6	0	cloud-credentials: a device stored under the raw token
+7	0	cloud-credentials: parse_keys keys the map by the raw secret
+4	0	cloud-credentials: the digest function is gone, so it measured nothing
+2	0	cloud-credentials: a comment naming the old raw lookup is not a fault
+5	0	dashboard-key: the query is read before the fragment
+4	0	dashboard-key: the key is pushed into the history instead of stripped
+6	0	dashboard-key: the query is no longer read, so old links break
+2	0	dashboard-key: the page is gone, so it measured nothing
+3	0	dashboard-key: a comment naming location.hash above the code is not a fault
+1	0	upstream-key: the credential list drops x-api-key
+2	0	upstream-key: a comment naming the list passes
+1	0	upstream-key: provider.rs gone, so the gate measured nothing
+4	22	upstream-key: the caller's provider credential is not refused
+8	20	upstream-key: a stock SDK's key header is no longer read
+8	0	run-owner-first: the check reads the taint before the owner
+5	0	run-owner-first: a comment naming open_run above the claim passes
+2	0	run-owner-first: handle_call renamed, so it measured nothing
+8	21	run-ownership: another principal's run is answered
+7	22	run-ownership: a foreign parent is adopted
+5	19	run-ownership: the journal is not replayed
+3	22	run-ownership: the parent the ledger holds is not checked
+5	0	agent-tokens: the door read in one process only
+8	2	agent-tokens: typ unchecked, a delegation token read as an agent token
+7	2	agent-tokens: the proof's ath skipped
+4	19	agent-tokens: the replay cache bypassed at the LLM door
+6	20	agent-tokens: the revocation hook not passed
+7	22	agent-tokens: the header's agent not compared with the token's
+6	22	agent-tokens: require lets a static key in
+6	18	agent-tokens: an empty audience accepted at startup
+6	20	identity-source: a token's call told client-key
+7	8	checkpoints: prefix over the wrong bytes, the LF left out
+2	8	checkpoints: prev not chained to the record before
+7	7	checkpoints: an unsigned record counted as signed
+2	8	checkpoints: the signature over non-canonical bytes
+2	18	checkpoints: a key used after its statement expired
+7	18	broker-key: the refusal removed, the broker listens without its own key
+1	18	broker-key: the decision never refuses
+8	16	audit-keyryx: an unusable signer configuration left running
+3	8	audit-keyryx: keyryx's signature served unverified
+5	8	audit-keyryx: an unreachable keyryx replaced by the key in the environment
+6	7	audit-keyryx: a kid that is not the signing key's thumbprint served
+7	0	client-keys: the map keyed by a raw secret again
+1	0	client-keys: the lookup key no longer SHA-256 of the secret
+7	0	client-keys: the declassify key compared with == again
+6	0	client-keys: a comment naming the old map passes
+3	0	client-keys: clientkeys.rs gone, so the gate measured nothing
+8	19	run-budget: the proxy hands a caller's budget the operator's basis
+1	8	run-budget: the in-process ledger applies a caller's raise
+2	7	run-budget: an operator's raise capped at the held budget
+6	21	run-budget: the answer names the declared budget instead of the kept one

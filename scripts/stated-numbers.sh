@@ -33,7 +33,9 @@
 # It runs the suite, unlike its Go siblings, because cargo has no cheap
 # enumeration equivalent to `go test -list`. So a red suite fails this check
 # too. That is a side effect and not the point: `cargo test --all` in CI is what
-# says they pass.
+# says they pass. A caller that has already run it can hand the output in
+# (STATED_NUMBERS_SUITE_OUTPUT, below) and is then counted from that run instead
+# of a second one; the CI test job and the teeth harness both do.
 #
 # The cluster crate is deliberately NOT included. It is its own workspace behind
 # the `cluster` feature with its own CI job, and folding it in would make this
@@ -70,8 +72,29 @@ note() {
 	problems=$((problems + 1))
 }
 
-actual=$(cargo test --all --quiet 2>/dev/null |
-	grep -E '^test result' | awk '{s += $4} END {print s + 0}')
+# The suite's output can be handed in, so a caller that has already run
+# `cargo test --all` does not pay for a second run of the whole workspace only
+# to count it. STATED_NUMBERS_SUITE_OUTPUT names a file holding that output:
+#
+#   - set, and the file is not empty: the count is read from it and no suite runs;
+#   - set, and the file is missing or empty: the suite runs once here and its
+#     output is kept at that path for the next caller;
+#   - unset: the suite runs, as it always did.
+#
+# What is counted is the same in all three: every `test result:` line, summed. A
+# file with no such line is a count of zero and the check below refuses it as
+# measuring nothing, exactly as it refuses a suite that printed none. The file is
+# only ever as good as the run that wrote it, and a wrong count fails the
+# comparison below rather than passing it; it cannot make a stale figure look true.
+suite_out="${STATED_NUMBERS_SUITE_OUTPUT:-}"
+if [ -z "$suite_out" ]; then
+	suite_out="$(mktemp)" || exit 1
+	trap 'rm -f "$suite_out"' EXIT
+fi
+if [ ! -s "$suite_out" ]; then
+	cargo test --all --quiet 2>/dev/null >"$suite_out"
+fi
+actual=$(grep -E '^test result' "$suite_out" | awk '{s += $4} END {print s + 0}')
 
 if [ "${actual:-0}" -eq 0 ]; then
 	note "the suite reported no tests at all, which means this check measured nothing"

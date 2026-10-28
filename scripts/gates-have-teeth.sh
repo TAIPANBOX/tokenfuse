@@ -77,11 +77,22 @@
 
 set -uo pipefail
 
+# This file's own path, taken before the cd below, because the baseline pass
+# (further down) runs this file again.
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
-# TEETH_SHARD=i/N runs only the cases at positions i, i+N, i+2N, ... (1-based), so
-# CI can split the harness across N jobs. Unset runs every case, as before.
-# TEETH_LIST=1 prints the names this run would run, in order, and stops. It
+# TEETH_PHASE=baseline marks the second run of this file that a normal run starts
+# for itself (see the baseline pass below); it is read once and removed from the
+# environment, so that no gate run from here sees it and takes it for its own.
+phase="${TEETH_PHASE:-}"
+baseline_in="${TEETH_BASELINE_DIR:-}"
+unset TEETH_PHASE TEETH_BASELINE_DIR
+
+# TEETH_SHARD=i/N runs only the cases the shard map gives to shard i (see shard_of
+# below), so CI can split the harness across N jobs. Unset runs every case, as
+# before. TEETH_LIST=1 prints the names this run would run, in order, and stops. It
 # mutates nothing, so it needs no clean tree and no restore trap: a nested list
 # run that restored the tree would undo the edit its caller had just planted.
 if [ -n "${TEETH_SHARD:-}" ]; then
@@ -93,6 +104,55 @@ if [ -n "${TEETH_SHARD:-}" ]; then
 	shard_i="${BASH_REMATCH[1]}"
 	shard_n="${BASH_REMATCH[2]}"
 fi
+
+# Which shard runs which case. scripts/teeth-shards.tsv gives each case a shard BY
+# NAME, balanced by the seconds each case took in CI (scripts/teeth-rebalance.py
+# writes it; the cover gate checks it). A case the file does not name falls back to
+# its position, the way the shards were cut before the file existed, so a case
+# added without touching the file still runs in exactly one shard and the
+# partition the cover gate requires holds either way. The file is read once into
+# two arrays; the lookup is a compare in the shell, not a process, because it runs
+# for every case of every list the cover gate takes (and a glob over one big string
+# was seconds per list on the bash 3.2 a Mac ships). The file lists the cases in the
+# order this one calls them, so the lookup tries the entry after the last one found
+# before it searches the rest.
+shard_map="scripts/teeth-shards.tsv"
+map_names=()
+map_shards=()
+if [ -f "$shard_map" ]; then
+	while IFS=$'\t' read -r map_shard map_secs map_name; do
+		case "$map_shard" in '' | '#'*) continue ;; esac
+		map_names+=("$map_name")
+		map_shards+=("$map_shard")
+	done <"$shard_map"
+fi
+map_count=${#map_names[@]}
+map_next=0
+# Sets shard_for to the shard that runs the case called $1 (it sets a variable and
+# prints nothing, so that no call forks).
+shard_for=""
+shard_of() {
+	local s="" k
+	if [ "$map_next" -lt "$map_count" ] && [ "${map_names[$map_next]}" = "$1" ]; then
+		s="${map_shards[$map_next]}"
+		map_next=$((map_next + 1))
+	else
+		k=0
+		while [ "$k" -lt "$map_count" ]; do
+			if [ "${map_names[$k]}" = "$1" ]; then
+				s="${map_shards[$k]}"
+				map_next=$((k + 1))
+				break
+			fi
+			k=$((k + 1))
+		done
+	fi
+	case "$s" in
+	'' | *[!0-9]*) s=$(( (case_no - 1) % shard_n + 1 )) ;;
+	*) if [ "$s" -lt 1 ] || [ "$s" -gt "$shard_n" ]; then s=$(( (case_no - 1) % shard_n + 1 )); fi ;;
+	esac
+	shard_for="$s"
+}
 
 if [ -z "${TEETH_LIST:-}" ] && [ -n "$(git status --porcelain)" ]; then
 	printf 'this script mutates tracked files, so it needs a clean tree.\n'
@@ -119,9 +179,11 @@ cleanup() {
 	rm -rf "$baseline_dir"
 }
 # Made in every mode: a case's gate string names $baseline_dir, and that string is
-# expanded when the case is called, before run_case has any chance to skip it.
-baseline_dir="$(mktemp -d)"
-if [ -z "${TEETH_LIST:-}" ]; then
+# expanded when the case is called, before run_case has any chance to skip it. The
+# baseline pass runs with the directory of the run that started it, and neither
+# removes it nor installs the trap that would.
+baseline_dir="${baseline_in:-$(mktemp -d)}"
+if [ -z "${TEETH_LIST:-}" ] && [ -z "$phase" ]; then
 	trap cleanup EXIT INT TERM
 fi
 
@@ -140,14 +202,18 @@ run_case() {
 	# Every call takes a position, in a run, a shard and a list alike, so that the
 	# shards and the list agree on which case is which.
 	case_no=$((case_no + 1))
-	if [ -n "${TEETH_SHARD:-}" ] && [ $(( (case_no - 1) % shard_n )) -ne $(( shard_i - 1 )) ]; then
-		return
+	if [ -n "${TEETH_SHARD:-}" ]; then
+		shard_of "$name"
+		if [ "$shard_for" -ne "$shard_i" ]; then
+			return
+		fi
 	fi
 	if [ -n "${TEETH_LIST:-}" ]; then
 		printf '%s\n' "$name"
 		return
 	fi
 	cases=$((cases + 1))
+	local began=$SECONDS
 
 	# The baseline applies to EVERY case, not only the ones expecting a failure.
 	# It was `fail`-only until 2026-08-09, which left the mirror of the bug it was
@@ -163,18 +229,39 @@ run_case() {
 		skip_baseline=1
 	fi
 
+	# The baseline pass (see below) is this same file run once before the cases,
+	# with TEETH_PHASE=baseline: it takes every baseline on the clean tree, keeps
+	# them in $baseline_dir, and mutates nothing. A case then finds its baseline
+	# already taken. Taken inside the case, as it was until 2026-10-28, a baseline
+	# came right after the previous case's restore, which gives every file it put
+	# back a new modification time, so cargo rebuilt the crate once for the
+	# baseline and a second time for the mutation: two builds per case where one
+	# is the case. The verdicts are the same: the baseline is still the gate on
+	# the unmutated tree, taken before any mutation instead of between them.
 	if [ "$skip_baseline" = 0 ]; then
 		local key base_out
 		key="$baseline_dir/$(printf '%s' "$gate" | cksum | tr -d ' ')"
 		if [ ! -f "$key" ]; then
+			local base_began=$SECONDS
 			if eval "$gate" >/dev/null 2>&1; then printf 'green' >"$key"; else printf 'red' >"$key"; fi
+			# Whatever a gate left behind on the clean tree must not ride into the
+			# case that mutates it next.
+			restore
+			if [ -n "$phase" ]; then
+				printf 'baseline  %s  %ss\n' "$name" "$((SECONDS - base_began))"
+			fi
 		fi
-		base_out="$(cat "$key")"
-		if [ "$base_out" = red ]; then
-			printf 'UNJUDGEABLE  %s\n             the gate is already failing on a clean tree, so neither a\n             failure nor a pass after the mutation would prove anything\n' "$name"
-			failures=$((failures + 1))
-			return
+		if [ -z "$phase" ]; then
+			base_out="$(cat "$key")"
+			if [ "$base_out" = red ]; then
+				printf 'UNJUDGEABLE  %s\n             the gate is already failing on a clean tree, so neither a\n             failure nor a pass after the mutation would prove anything\n' "$name"
+				failures=$((failures + 1))
+				return
+			fi
 		fi
+	fi
+	if [ -n "$phase" ]; then
+		return
 	fi
 
 	if ! python3 -c "$edit"; then
@@ -208,12 +295,31 @@ run_case() {
 		printf 'OVEREAGER  %s\n           the gate failed on something it must not catch\n' "$name"
 		failures=$((failures + 1))
 	else
-		printf 'ok  %-58s (%s)\n' "$name" "$expect"
+		# The seconds are what scripts/teeth-rebalance.py reads from a CI log to
+		# balance the shards; they are the case itself, its baseline is the
+		# `baseline` line the baseline pass printed.
+		printf 'ok  %-58s (%s)  %ss\n' "$name" "$expect" "$((SECONDS - began))"
 	fi
 }
 
 # A tiny helper for the edits: replace once, and prove it happened.
 py() { printf 'import sys\ndef edit(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b, 1))\ndef edit_all(p, a, b):\n    s = open(p).read()\n    assert a in s, "pattern not found in " + p\n    open(p, "w").write(s.replace(a, b))\n%s\n' "$1"; }
+
+# --- the baseline pass ---------------------------------------------------------
+#
+# Before the first case, the baseline of every case this run will judge is taken
+# on the unmutated tree, by running this file once more with TEETH_PHASE=baseline
+# (see run_case). It runs the gates and prints a `baseline` line for each one it
+# took, and it neither mutates nor judges. A baseline already kept is not taken
+# again, so a gate several cases share is run once, as before. A list run takes none.
+if [ -z "${TEETH_LIST:-}" ] && [ -z "$phase" ]; then
+	pass_began=$SECONDS
+	if ! TEETH_PHASE=baseline TEETH_BASELINE_DIR="$baseline_dir" bash "$self"; then
+		printf 'BROKEN  the baseline pass did not finish, so no case can be judged\n'
+		exit 1
+	fi
+	printf 'baselines taken on the clean tree in %ss\n' "$((SECONDS - pass_began))"
+fi
 
 # --- the teeth run is split into shards, and the split must cover every case ---
 #
@@ -230,14 +336,14 @@ run_case "teeth-shards: a filter that drops every fifth case is not a partition"
 	"./scripts/teeth-shards-cover-every-case.sh scripts/planted-teeth.sh" \
 	"$(py 'import shutil
 shutil.copy("scripts/gates-have-teeth.sh", "scripts/planted-teeth.sh")
-edit("scripts/planted-teeth.sh", "% shard_n )) -ne", "% (shard_n + 1) )) -ne")')" \
+edit("scripts/planted-teeth.sh", "if [ \"$shard_for\" -ne \"$shard_i\" ]; then", "if [ \"$shard_for\" -ne \"$shard_i\" ] || [ $(( case_no % 5 )) -eq 0 ]; then")')" \
 	"not a partition"
 
 run_case "teeth-shards: a filter that runs a case in every shard up to its own is not a partition" fail_env \
 	"./scripts/teeth-shards-cover-every-case.sh scripts/planted-teeth.sh" \
 	"$(py 'import shutil
 shutil.copy("scripts/gates-have-teeth.sh", "scripts/planted-teeth.sh")
-edit("scripts/planted-teeth.sh", "-ne $(( shard_i - 1 )) ]; then", "-gt $(( shard_i - 1 )) ]; then")')" \
+edit("scripts/planted-teeth.sh", "if [ \"$shard_for\" -ne \"$shard_i\" ]; then", "if [ \"$shard_for\" -gt \"$shard_i\" ]; then")')" \
 	"not a partition"
 
 run_case "teeth-shards: a harness that is gone, so the shards measured nothing" fail_env \
@@ -261,6 +367,54 @@ run_case "teeth-shards: the matrix gone from the workflow, so the count measured
 	"./scripts/teeth-shards-cover-every-case.sh" \
 	"$(py 'edit(".github/workflows/ci.yml", "shard: [1, 2, 3, 4, 5, 6, 7, 8]", "shard: all")')" \
 	"measured nothing"
+
+# The shard map (scripts/teeth-shards.tsv) decides which shard runs which case, so it
+# is a second place a case can be dropped or doubled. The partition checks above judge
+# what the shards LIST and catch a map that drops or doubles a case; these cover what
+# only the map can get wrong without changing a list, and the one thing it must not
+# break: a case it does not name still runs, once.
+run_case "teeth-shards: a map line naming a case that does not exist" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'p = "scripts/teeth-shards.tsv"
+s = open(p).read()
+open(p, "w").write(s + "1\t5\ta case that was renamed away\n")')" \
+	"names no case"
+
+run_case "teeth-shards: a map line putting a case in a shard that does not exist" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'p = "scripts/teeth-shards.tsv"
+lines = open(p).read().split("\n")
+i = next(n for n, l in enumerate(lines) if l and not l.startswith("#"))
+f = lines[i].split("\t")
+f[0] = "9"
+lines[i] = "\t".join(f)
+open(p, "w").write("\n".join(lines))')" \
+	"is not a shard"
+
+run_case "teeth-shards: a map that names one case twice" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'p = "scripts/teeth-shards.tsv"
+lines = open(p).read().split("\n")
+i = next(n for n, l in enumerate(lines) if l and not l.startswith("#"))
+lines.insert(i, lines[i])
+open(p, "w").write("\n".join(lines))')" \
+	"more than once"
+
+run_case "teeth-shards: a map that is gone, so the balance measured nothing" fail \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'import os
+os.remove("scripts/teeth-shards.tsv")')" \
+	"measured nothing"
+
+# Must NOT fail: a case the map does not name is placed by its position, so it runs in
+# exactly one shard. This is what lets somebody add a case without touching the map.
+run_case "teeth-shards: a case the map does not name still runs in exactly one shard" pass \
+	"./scripts/teeth-shards-cover-every-case.sh" \
+	"$(py 'p = "scripts/teeth-shards.tsv"
+lines = open(p).read().split("\n")
+i = next(n for n, l in enumerate(lines) if l and not l.startswith("#"))
+del lines[i]
+open(p, "w").write("\n".join(lines))')"
 
 # --- invariant 1: core stays dependency-minimal ----------------------------
 
@@ -303,6 +457,14 @@ run_case "replicated-shape: a type renamed, so it measured nothing" fail \
 
 # --- invariant 12: stated numbers match the repository ---------------------
 
+# The gate counts the suite by running `cargo test --all`, which is the whole
+# workspace, and each case below used to run it twice (the baseline, then the
+# mutation): 300 seconds a case. None of these mutations touches a line of Rust, so
+# the count is the same for every one of them, and the gate can be handed the output
+# of one run. The first case in a run that needs it makes the file; the rest read it.
+# The count is still the real one: the gate runs the suite itself when it has no file.
+stated_gate="STATED_NUMBERS_SUITE_OUTPUT=$baseline_dir/suite-output.txt ./scripts/stated-numbers.sh"
+
 # The mutant reads the badge and adds one, rather than naming today's figure.
 # It used to name it, and that made this case break every time the suite grew:
 # the count moved to 757, the pattern stopped matching, and the harness reported
@@ -312,7 +474,7 @@ badge_now=$(grep -o 'badge/tests-[0-9]*-' README.md | head -1)
 badge_next="badge/tests-$(($(printf '%s' "$badge_now" | tr -dc '0-9') + 1))-"
 
 run_case "stated-numbers: the badge disagrees with the suite" fail \
-	"./scripts/stated-numbers.sh" \
+	"$stated_gate" \
 	"$(py "edit(\"README.md\", \"$badge_now\", \"$badge_next\")")"
 
 # The version badge, planted the same way: read today's value rather than
@@ -322,7 +484,7 @@ run_case "stated-numbers: the badge disagrees with the suite" fail \
 version_badge_now=$(grep -oE 'badge/release-v[0-9]+\.[0-9]+\.[0-9]+-brightgreen' README.md | head -1)
 
 run_case "stated-numbers: the version badge disagrees with the newest tag" fail \
-	"./scripts/stated-numbers.sh" \
+	"$stated_gate" \
 	"$(py "edit(\"README.md\", \"$version_badge_now\", \"badge/release-v0.0.1-brightgreen\")")" \
 	"the release badge says"
 
@@ -330,8 +492,30 @@ run_case "stated-numbers: the version badge disagrees with the newest tag" fail 
 # older counts while explaining how they drifted, and reading the whole file
 # once made this gate fail on a paragraph recording its own history lesson.
 run_case "stated-numbers: an old count quoted in prose elsewhere" pass \
-	"./scripts/stated-numbers.sh" \
+	"$stated_gate" \
 	"$(py 'edit("PROGRESS.md", "## Current stage", "Once **512 passing**, now more.\n\n## Current stage")')"
+
+# The suite output the gate is handed is read, and counted exactly as a run of its own
+# would be. These three take the suite out of the picture, so they run no cargo: a count
+# that disagrees with the badge fails (and the real suite, which agrees with it, would
+# have passed, so a gate that ignored the file would be caught here), an output with no
+# result line in it measured nothing, and an output that agrees passes. The first two
+# are the fault itself and not a mutation, so they skip the baseline (fail_env).
+badge_count="$(printf '%s' "$badge_now" | tr -dc '0-9')"
+
+run_case "stated-numbers: a suite output that counts fewer tests than the badge says" fail_env \
+	"printf 'test result: ok. 1 passed; 0 failed\n' >\"$baseline_dir/short-suite.txt\" && STATED_NUMBERS_SUITE_OUTPUT=\"$baseline_dir/short-suite.txt\" ./scripts/stated-numbers.sh" \
+	"pass" \
+	"the badge says"
+
+run_case "stated-numbers: a suite output with no result line in it, so it measured nothing" fail_env \
+	"printf 'Compiling tokenfuse-core\n' >\"$baseline_dir/empty-suite.txt\" && STATED_NUMBERS_SUITE_OUTPUT=\"$baseline_dir/empty-suite.txt\" ./scripts/stated-numbers.sh" \
+	"pass" \
+	"measured nothing"
+
+run_case "stated-numbers: a suite output that agrees with the badge passes without a second run" pass \
+	"printf 'test result: ok. $badge_count passed; 0 failed\n' >\"$baseline_dir/agreeing-suite.txt\" && STATED_NUMBERS_SUITE_OUTPUT=\"$baseline_dir/agreeing-suite.txt\" ./scripts/stated-numbers.sh" \
+	"pass"
 
 # --- invariant 4: claims about coverage stay recorded ----------------------
 
@@ -632,7 +816,7 @@ open(".cargo/audit.toml", "w").write(s[:i] + s[j:])')" \
 # difference between a property and a property somebody has watched hold.
 
 run_case "stated-numbers: no badge left to compare against" fail \
-	"./scripts/stated-numbers.sh" \
+	"$stated_gate" \
 	"$(py 'import re
 s = open("README.md").read()
 m = re.search(r"!\[[^]]*\]\(https://img.shields.io/badge/tests-\d+-[a-z]+[^)]*\)", s)
@@ -641,7 +825,7 @@ open("README.md","w").write(s.replace(m.group(0), "", 1))')" \
 	"nothing to compare against"
 
 run_case "stated-numbers: the version badge line removed, so it measured nothing" fail \
-	"./scripts/stated-numbers.sh" \
+	"$stated_gate" \
 	"$(py 'import re
 s = open("README.md").read()
 m = re.search(r"!\[release\]\(https://img.shields.io/badge/release-v\d+\.\d+\.\d+-[a-z]+\)", s)
@@ -1976,6 +2160,12 @@ run_case "run-budget: the answer names the declared budget instead of the kept o
 # stale silently: a gate added without a case looks exactly like a gate with
 # nothing to catch, and that is the whole thing this file exists to deny. So
 # the list is checked against what is actually on disk.
+# The baseline pass stops here: it has taken its baselines and judged nothing, and
+# the run that started it owns the baseline directory and the restore.
+if [ -n "$phase" ]; then
+	exit 0
+fi
+
 # A list run stops here: it has printed its names, and nothing else may be printed.
 if [ -n "${TEETH_LIST:-}" ]; then
 	rm -rf "$baseline_dir"

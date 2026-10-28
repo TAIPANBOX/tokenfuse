@@ -22,6 +22,17 @@
 # same filter, and stop. It mutates nothing, so this needs no cargo and no clean
 # tree.
 #
+# THE SHARD MAP
+#
+# Which shard runs which case is not the case's position any more: scripts/
+# teeth-shards.tsv names a shard for each case, balanced by the seconds each took in
+# CI (scripts/teeth-rebalance.py writes it from the logs). A case the map does not
+# name is placed by its position and still runs once, so the partition below holds
+# with or without an entry. What the map can get wrong that the partition does not
+# show is checked here: an entry for a case that no longer exists (renamed away,
+# so its weight now balances nothing), a shard that does not exist, a case named
+# twice, and a map that is gone.
+#
 # The optional arguments are the harness and the workflow to check. They default
 # to the real ones; the planted-fault cases in gates-have-teeth.sh pass a copy of
 # the harness with a broken filter, and edit the workflow itself.
@@ -67,6 +78,12 @@ if [ ! -f "$harness" ]; then
 	exit 1
 fi
 
+map="scripts/teeth-shards.tsv"
+if [ ! -f "$map" ]; then
+	printf 'FAIL: %s does not exist, so the balance of the shards measured nothing.\n' "$map"
+	exit 1
+fi
+
 # The full list is taken with TEETH_SHARD unset: when this gate runs inside a teeth
 # shard, the shard's own setting is in the environment and would filter the list.
 if ! env -u TEETH_SHARD TEETH_LIST=1 bash "$harness" >"$work/all" 2>"$work/all.err"; then
@@ -106,7 +123,29 @@ for i in $(seq 1 "$shards"); do
 	cat "$work/shard$i" >>"$work/union"
 done
 
+# The map: every entry names a shard that exists, a case the harness has, and
+# names it once. Entries are `shard<TAB>seconds<TAB>case`; lines starting with # are
+# comments.
+awk -F'\t' -v n="$shards" '
+	$0 ~ /^#/ || $0 == "" { next }
+	NF < 3 || $3 == "" { printf "FAIL: %s line %d does not have shard, seconds and a case name.\n", FILENAME, NR; bad = 1; next }
+	$1 !~ /^[0-9]+$/ || $1 + 0 < 1 || $1 + 0 > n { printf "FAIL: %s line %d: \"%s\" is not a shard (the shards are 1 to %d).\n", FILENAME, NR, $1, n; bad = 1 }
+	$2 !~ /^[0-9]+(\.[0-9]+)?$/ { printf "FAIL: %s line %d: \"%s\" is not a number of seconds.\n", FILENAME, NR, $2; bad = 1 }
+	END { exit bad }
+' "$map" || fail=1
+awk -F'\t' '$0 !~ /^#/ && NF >= 3 && $3 != "" { print $3 }' "$map" | sort >"$work/map.names"
+mapdups="$(uniq -d "$work/map.names")"
+if [ -n "$mapdups" ]; then
+	printf 'FAIL: %s names a case more than once, so its weight is counted twice:\n%s\n' "$map" "$mapdups"
+	fail=1
+fi
 sort "$work/all" >"$work/all.sorted"
+stale="$(comm -13 "$work/all.sorted" <(uniq "$work/map.names"))"
+if [ -n "$stale" ]; then
+	printf 'FAIL: %s names no case the harness has (renamed or removed since the map was made):\n%s\n' "$map" "$stale"
+	fail=1
+fi
+
 sort "$work/union" >"$work/union.sorted"
 if ! cmp -s "$work/all.sorted" "$work/union.sorted"; then
 	union_n="$(grep -c . "$work/union")"
@@ -120,4 +159,12 @@ if [ "$fail" -ne 0 ]; then
 	exit 1
 fi
 
+# What the map says each shard weighs, in seconds: a figure to read, not a limit.
+weights=""
+for i in $(seq 1 "$shards"); do
+	w="$(awk -F'\t' 'NR == FNR { if ($0 !~ /^#/ && NF >= 3) t[$3] = $2; next } ($0 in t) { s += t[$0] } END { printf "%d", s + 0 }' "$map" "$work/shard$i")"
+	weights="$weights $w"
+done
+
 printf 'ok: %s cases, %s shards (from %s) with%s cases, each run by exactly one shard\n' "$full" "$shards" "$workflow" "$sizes"
+printf 'the map (%s) weighs them, in seconds:%s\n' "$map" "$weights"
