@@ -1056,6 +1056,11 @@ mod tests {
                 "gpt-6.1-sol",
                 (2_000_000, 10_000_000, 100_000, 2_500_000, 2_500_000),
             ),
+            // Read 2026-10-28: 1.00 / 5.00, cached 0.05, 30m write 1.25.
+            (
+                "gpt-6.1-terra",
+                (1_000_000, 5_000_000, 50_000, 1_250_000, 1_250_000),
+            ),
             (
                 "gpt-6-sol",
                 (2_000_000, 10_000_000, 200_000, 2_500_000, 2_500_000),
@@ -1298,6 +1303,32 @@ mod tests {
         assert_eq!(book.cost("gpt-6.1-sol", &usage), Some(Microusd(1_215_000)));
     }
 
+    /// gpt-6.1-terra is a current OpenAI model (its page lists it, read
+    /// 2026-10-28), so it is priced at its own row and not at the fallback's
+    /// 15 / 75. Short call, 100000 input and 10000 output at 1 / 5:
+    /// 100,000 + 50,000 = 150,000 micro-USD. Long call, 300000 input and 1000
+    /// output, over 272K, at 2 / 7.5: 600,000 + 7,500 = 607,500 micro-USD. The
+    /// OpenRouter name is the same price.
+    #[test]
+    fn gpt_6_1_terra_is_priced_at_its_own_row_not_the_fallback() {
+        let book = default_price_book();
+        let short = Usage {
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        };
+        let long = Usage {
+            input_tokens: 300_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        for id in ["gpt-6.1-terra", "openai/gpt-6.1-terra"] {
+            assert!(book.is_known(id), "{id}");
+            assert_eq!(book.cost(id, &short), Some(Microusd(150_000)), "{id}");
+            assert_eq!(book.cost(id, &long), Some(Microusd(607_500)), "{id}");
+        }
+    }
+
     /// A model nobody has priced still says so: no invented row, the
     /// conservative fallback, and `is_known` false (which is what makes the
     /// gateway answer `x-fuse-price: fallback`).
@@ -1447,6 +1478,11 @@ mod tests {
                 "gpt-6.1-sol",
                 272_000,
                 (4_000_000, 15_000_000, 200_000, 5_000_000, 5_000_000),
+            ),
+            (
+                "gpt-6.1-terra",
+                272_000,
+                (2_000_000, 7_500_000, 100_000, 2_500_000, 2_500_000),
             ),
         ];
         let book = default_price_book();
