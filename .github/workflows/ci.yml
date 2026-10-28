@@ -35,16 +35,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Free runner disk
+      - name: Free runner disk (in the background)
         # This job builds three full profiles (clippy --all-features, debug
         # tests, and the cluster-feature test graph); with a warm cache the
         # 14 GB runner disk runs dry mid-link (ld dies with SIGBUS). Drop the
         # preinstalled bundles we never use (~25 GB) instead of a third-party
         # cleanup action.
+        #
+        # Started here and waited for before the first test build, not run to
+        # completion first: the removal took 66 to 175 seconds with nothing else
+        # running (measured in the step timings of CI runs 40739697227 and
+        # 40744615283, 2026-10-28), and the toolchain, the cache restore, fmt and
+        # clippy before the test build need none of the space. The bundles are
+        # removed in parallel, since the Android SDK alone is most of the time.
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" || true
           df -h /
+          rm -f "$RUNNER_TEMP/disk-freed"
+          nohup bash -c '
+            for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+              /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+              sudo rm -rf "$d" &
+            done
+            wait
+            touch "$RUNNER_TEMP/disk-freed"
+          ' >/dev/null 2>&1 &
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
@@ -60,8 +74,24 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features
+      - name: Wait for the disk to be freed
+        # The test build below is the one that links the large binaries. The
+        # removal started at the top of the job is normally done by now; this
+        # waits for it (at most five minutes) and fails if it never finishes,
+        # rather than letting the link run dry.
+        run: |
+          for _ in $(seq 1 150); do
+            [ -e "$RUNNER_TEMP/disk-freed" ] && break
+            sleep 2
+          done
+          test -e "$RUNNER_TEMP/disk-freed"
+          df -h /
       - name: Test
-        run: cargo test --all
+        # The output is kept: the stated-numbers gate below counts the tests from
+        # THIS run instead of running the whole suite a second time to count it.
+        run: |
+          set -o pipefail
+          cargo test --all 2>&1 | tee "$RUNNER_TEMP/cargo-test-all.txt"
       - name: Test (cluster feature, raft-backed ledger)
         run: cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
       - name: tokenfuse-core stays dependency-minimal
@@ -107,6 +137,12 @@ jobs:
       # badge left the same figure in prose one file over saying 100 where the
       # workspace ran 747, and reading is what caught it rather than any check.
       - name: the numbers this repo states about itself are true
+        # Counted from the Test step's own output (the same `cargo test --all`,
+        # every `test result:` line summed), which cost a second run of the whole
+        # suite, 43 to 51 seconds on a warm cache. With no such file the gate runs
+        # the suite itself, as it always did.
+        env:
+          STATED_NUMBERS_SUITE_OUTPUT: ${{ runner.temp }}/cargo-test-all.txt
         run: ./scripts/stated-numbers.sh
 
       # The surface compat/1.0.json says this repository's 1.0 froze, against
@@ -264,11 +300,13 @@ jobs:
 
   # The teeth harness is the slowest step in this repository, 30 to 60 minutes as
   # one job, so it runs as eight shards of the same case list. Shard i runs the
-  # cases at positions i, i+8, ..., and scripts/teeth-shards-cover-every-case.sh
-  # requires them together to run each case exactly once (invariant 113). The
-  # count is written here only, in the matrix, TEETH_SHARD and the name, and that
-  # gate reads it from here and requires the three to agree. Standard runners: this
-  # repository is public, so they cost nothing.
+  # cases scripts/teeth-shards.tsv gives it (balanced by the seconds each case took
+  # in CI; a case the file does not name runs where its position puts it), and
+  # scripts/teeth-shards-cover-every-case.sh requires the shards together to run
+  # each case exactly once (invariant 113). The count is written here only, in the
+  # matrix, TEETH_SHARD and the name, and that gate reads it from here and requires
+  # the three to agree. Standard runners: this repository is public, so they cost
+  # nothing.
   teeth:
     name: teeth (shard ${{ matrix.shard }} of 8)
     runs-on: ubuntu-24.04
