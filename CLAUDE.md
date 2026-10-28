@@ -521,6 +521,32 @@ build)`, `cloud apns (feature build)`.
    under `--all-features --target all`, and an ignore with no recorded crate is
    refused outright rather than trusted.
 
+   **A second kind of ignore is allowed, and it carries an expiry.** Two
+   entries, RUSTSEC-2026-0391 (zstd 0.13.3) and RUSTSEC-2026-0403 (zstd-safe
+   7.2.1), are a temporary accepted risk and not an absence: zstd IS built.
+   `@decided` 2026-10-28: accept both until DataFusion 56 (parquet and
+   arrow-ipc 60) can be taken, rather than leave main red or take unreleased
+   DataFusion; the fixed zstd 0.14.3 and zstd-safe 8.2.0 need parquet and
+   arrow-ipc 60, and DataFusion 55.2.0 pins them to ^59.2.0. The same change
+   moves zstd-sys to 2.1.2, which clears RUSTSEC-2026-0410 for real.
+   `@claude` reading, not run: parquet and arrow-ipc 59.3.0 are the only crates
+   that depend on zstd, and their library code calls only `zstd::bulk`,
+   `zstd::compression_level_range` and `zstd_safe::{get_frame_content_size,
+   compress_bound}`, which neither advisory touches. Do not move zstd-safe
+   within 7.x: 7.2.2 and later sit inside the affected range of a further
+   advisory that 7.2.1 does not.
+   The reason is bounded, so `scripts/audit.sh` reads the three lockfiles as
+   text and fails when any part stops holding: parquet or arrow-ipc 60 or later
+   is present (the ignore has expired and must be deleted), zstd leaves 0.13.x
+   or zstd-safe leaves 7.x, zstd or zstd-safe is absent from every lockfile
+   (the ignore matches nothing), or a crate other than parquet and arrow-ipc
+   (for zstd-safe: other than zstd) depends on them.
+   *(gate: `scripts/audit.sh`, `BOUNDED` and `EXPIRES_AT`; teeth cases in
+   `gates-have-teeth.sh` plant each of those faults in the lockfile, require
+   the gate to stay green on the lockfile as it stands, and require
+   cargo-audit itself to name the two advisories again once the ignores are
+   removed.)*
+
    **The same script refuses to audit against a dirty advisory database, and
    that is a different failure worth naming.** `cargo audit` fetches by pulling
    into `~/.cargo/advisory-db`, and `git pull` never removes an untracked file.
@@ -2040,7 +2066,8 @@ it, because later is where the drift lives.
   says nothing about the other, so it PASSES while CI goes red, which is the
   dangerous direction for a check to be wrong in. It also does not know about
   the allowances `scripts/audit.sh` carries (currently RUSTSEC-2026-0235,
-  rkyv, "is in no build graph, only in the lockfile"), so it reports a failure
+  rkyv, "is in no build graph, only in the lockfile"; and, until DataFusion 56,
+  RUSTSEC-2026-0391 and RUSTSEC-2026-0403, zstd and zstd-safe), so it reports a failure
   the gate has already judged. Run `./scripts/audit.sh`. This cost a red CI on
   2026-08-20, when the h2 fix for RUSTSEC-2026-0258 landed in the root
   lockfile and left `crates/cluster` on the vulnerable version.

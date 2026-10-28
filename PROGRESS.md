@@ -593,7 +593,8 @@ reads, redb durability; excluded crate, own CI job). `cargo clippy
 --all-targets --all-features` clean with `-D warnings` across the workspace,
 radar, and cluster. **`cargo audit` via `scripts/audit.sh`: 0 vulnerabilities**
 across both manifests, unmaintained-crate warnings only (`number_prefix`,
-`paste`, `rustls-pemfile`), plus one recorded ignore (rkyv, RUSTSEC-2026-0235)
+`paste`, `rustls-pemfile`), plus three recorded ignores (rkyv, RUSTSEC-2026-0235; and, temporarily until
+DataFusion 56, zstd and zstd-safe, RUSTSEC-2026-0391 and RUSTSEC-2026-0403)
 whose justification the script re-establishes on every run (invariant 11).
 
 The live-verification claims below were NOT re-checked in that pass and are
