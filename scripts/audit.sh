@@ -16,12 +16,23 @@
 #
 # An ignore is a claim that an advisory cannot reach us. The claim is usually
 # true when it is written and there is nothing that notices when it stops being
-# true, so it silently turns into protection against nothing. Today's entry
-# (rkyv, RUSTSEC-2026-0235) rests on a specific fact: the crate is recorded in
-# Cargo.lock behind an optional feature nothing enables, so it is never
-# compiled. That fact is checkable, so it is checked here on every run, with the
-# cluster feature explicitly on because that is the only graph the crate can
-# enter through.
+# true, so it silently turns into protection against nothing. There are two
+# kinds of reason here, and each is a checkable fact, so each is checked on
+# every run:
+#
+#   * "the crate is never built". rkyv (RUSTSEC-2026-0235) is recorded in
+#     Cargo.lock behind an optional feature nothing enables, so it is never
+#     compiled. Checked with the cluster feature explicitly on, because that is
+#     the only graph the crate can enter through.
+#
+#   * "the crate is built, but only through callers the advisory does not touch,
+#     and only until a named release". zstd and zstd-safe (RUSTSEC-2026-0391 and
+#     RUSTSEC-2026-0403) are built through parquet and arrow-ipc 59, which call
+#     only zstd::bulk. The fixed versions need parquet and arrow-ipc 60, which
+#     no DataFusion release takes yet. Checked against the lockfiles as text: the
+#     crate stays inside the version range the reason was argued for, nothing
+#     but the named callers depends on it, and the ignore EXPIRES the day
+#     parquet or arrow-ipc 60 is in a lockfile.
 #
 # This file is the ONE copy of this check. CI calls it; run it by hand the same
 # way.
@@ -135,60 +146,173 @@ else
 fi
 echo
 
-# Every ignored crate must be absent from the BUILT graph. cargo-audit reads the
-# lockfile, which is the right thing for it to do; this asserts the narrower
-# claim the ignore actually rests on.
+# What each ignore rests on is re-established here, in this order, and an ignore
+# that fits neither table is refused rather than trusted.
 #
-# `--all-features --target all` is deliberately the widest possible reading: if
-# the crate cannot get in under every feature of every target, it cannot get in.
-echo "checking that each ignored advisory's crate stays out of the build graph"
+# 1. Every ignored advisory has a recorded reason of one of the two kinds.
+# 2. The bounded ones are judged from the lockfiles AS TEXT, before cargo is
+#    asked anything: a lockfile edited by hand, or by a bump that has not yet
+#    been built, is a thing `cargo tree` would try to resolve again, and the
+#    expiry has to be reported as the expiry rather than as a resolver error.
+# 3. A "never built" crate must be absent from the BUILT graph. cargo-audit reads
+#    the lockfile, which is the right thing for it to do; this asserts the
+#    narrower claim the ignore actually rests on. `--all-features --target all`
+#    is deliberately the widest possible reading: if the crate cannot get in
+#    under every feature of every target, it cannot get in.
+echo "checking that each ignored advisory's reason still holds"
 python3 - "$ids" <<'PY'
 import re
 import subprocess
 import sys
 
-# Crate per advisory. An ignore with no entry here is refused rather than
-# trusted: the point of the file is that a reason exists and is checked.
+# "Never built": the crate this advisory concerns must be in no build graph.
+# An ignore with no entry in either table is refused rather than trusted: the
+# point of the file is that a reason exists and is checked.
 REACHABILITY = {
     "RUSTSEC-2026-0235": "rkyv",
 }
 
+# "Built, but only through callers the advisory does not touch, until a named
+# release". Per advisory: the crate, the half-open version range [low, high) the
+# reason was argued for, and the only crates allowed to depend on it.
+#
+# zstd-safe stays below 8 AND is not to be moved within 7.x: 7.2.2 and later are
+# inside the affected range of a further advisory that 7.2.1 sits outside of, so
+# a plain `cargo update` would trade two ignored findings for a new live one.
+# cargo-audit reports that on its own; the range is the half this table owns.
+BOUNDED = {
+    "RUSTSEC-2026-0391": ("zstd", (0, 13, 0), (0, 14, 0), {"arrow-ipc", "parquet"}),
+    "RUSTSEC-2026-0403": ("zstd-safe", (7, 0, 0), (8, 0, 0), {"zstd"}),
+}
+
+# The release that retires the BOUNDED ignores: parquet or arrow-ipc at this
+# major or later means the fixed zstd is reachable, and the ignore has expired.
+EXPIRES_AT = {"parquet": 60, "arrow-ipc": 60}
+
+LOCKS = ["Cargo.lock", "crates/cluster/Cargo.lock", "crates/radar/Cargo.lock"]
+
 ids = [i for i in sys.argv[1].split() if i]
 fail = False
 
+
+def version_tuple(version):
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", version)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def read_lock(path):
+    """[(name, version, [dependency names])] from a Cargo.lock, read as text."""
+    out = []
+    for block in re.split(r"(?m)^\[\[package\]\]\s*$", open(path).read())[1:]:
+        name = re.search(r'(?m)^name = "([^"]+)"', block)
+        version = re.search(r'(?m)^version = "([^"]+)"', block)
+        if not (name and version):
+            continue
+        # Entries of `dependencies = [ ... ]`: ` "zstd",` or ` "zstd 0.13.3",`.
+        deps = [d.split(" ")[0] for d in re.findall(r'(?m)^ "([^"]+)",?$', block)]
+        out.append((name.group(1), version.group(1), deps))
+    return out
+
+
+# 1. a recorded reason, of one kind or the other
 for advisory in ids:
-    crate = REACHABILITY.get(advisory)
-    if crate is None:
+    if advisory not in REACHABILITY and advisory not in BOUNDED:
         print(f"FAIL: {advisory} is ignored but this script has no reason recorded for it.")
-        print("      Add the crate it concerns to REACHABILITY, or stop ignoring it.")
+        print("      Add the crate it concerns to REACHABILITY or BOUNDED, or stop ignoring it.")
         fail = True
-        continue
 
-    found = False
-    for manifest in ["Cargo.toml", "crates/cluster/Cargo.toml"]:
-        out = subprocess.run(
-            [
-                "cargo", "tree",
-                "--manifest-path", manifest,
-                "-i", crate,
-                "--all-features",
-                "--target", "all",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        # A crate outside the graph makes `cargo tree -i` say so on stderr and
-        # print nothing; a crate inside it prints the dependents.
-        if out.returncode == 0 and re.search(rf"^{re.escape(crate)} v", out.stdout, re.M):
-            print(f"FAIL: {advisory} is ignored because '{crate}' is never built, "
-                  f"but it IS in the build graph of {manifest}:")
-            print(out.stdout.strip()[:800])
-            found = True
+# 2. the bounded reasons, from the lockfiles as text
+bounded = [a for a in ids if a in BOUNDED]
+if bounded and not fail:
+    locks = {}
+    for path in LOCKS:
+        try:
+            locks[path] = read_lock(path)
+        except FileNotFoundError:
+            # crates/radar is audited below and fails there if its lockfile is gone;
+            # the root one is the subject here, and without it nothing was measured.
+            if path == "Cargo.lock":
+                print("FAIL: Cargo.lock is missing, so the bounded ignores measured nothing.")
+                fail = True
 
-    if found:
+    expired = sorted(
+        (path, name, version)
+        for path, pkgs in locks.items()
+        for name, version, _ in pkgs
+        if name in EXPIRES_AT
+        and (version_tuple(version) or (0,))[0] >= EXPIRES_AT[name]
+    )
+    for path, name, version in expired:
+        print(f"FAIL: {', '.join(bounded)} {'is' if len(bounded) == 1 else 'are'} ignored only until "
+              f"{name} {EXPIRES_AT[name]}, and {path} has {name} {version}: the ignore has expired.")
+        print("      The fixed zstd is reachable now. Remove the ignore from .cargo/audit.toml and the")
+        print("      entry from BOUNDED in this script, and let cargo-audit judge what is left.")
         fail = True
-    else:
-        print(f"  ok  {advisory}: '{crate}' is in no build graph, only in the lockfile")
+
+    for advisory in bounded:
+        crate, low, high, callers = BOUNDED[advisory]
+        seen = [(path, version) for path, pkgs in locks.items()
+                for name, version, _ in pkgs if name == crate]
+        if not seen:
+            print(f"FAIL: {advisory} is ignored for '{crate}', but '{crate}' is in no lockfile: "
+                  "the ignore matches nothing.")
+            print("      Remove it from .cargo/audit.toml and from BOUNDED in this script.")
+            fail = True
+            continue
+        ok = True
+        for path, version in seen:
+            v = version_tuple(version)
+            if v is None or not (low <= v < high):
+                print(f"FAIL: {advisory} is ignored for {crate} "
+                      f"{'.'.join(map(str, low))} up to (not including) {'.'.join(map(str, high))}, "
+                      f"but {path} has {crate} {version}, outside the range the reason was argued for.")
+                print("      Argue it again, or remove the ignore if this version is the fix.")
+                fail = True
+                ok = False
+        for path, pkgs in locks.items():
+            for name, version, deps in pkgs:
+                if crate in deps and name not in callers:
+                    print(f"FAIL: {advisory} is ignored on the reasoning that '{crate}' is used only "
+                          f"through {', '.join(sorted(callers))}, but {name} {version} in {path} depends on it too.")
+                    print("      The reason covers the callers it names; read what this one calls.")
+                    fail = True
+                    ok = False
+        if ok and not expired:
+            versions = ", ".join(sorted({v for _, v in seen}))
+            print(f"  ok  {advisory}: '{crate}' {versions} is inside its range, "
+                  f"its only dependents are {', '.join(sorted(callers))}, and no ignored-until release is in a lockfile")
+
+# 3. the "never built" reasons
+if not fail:
+    for advisory in ids:
+        crate = REACHABILITY.get(advisory)
+        if crate is None:
+            continue
+        found = False
+        for manifest in ["Cargo.toml", "crates/cluster/Cargo.toml"]:
+            out = subprocess.run(
+                [
+                    "cargo", "tree",
+                    "--manifest-path", manifest,
+                    "-i", crate,
+                    "--all-features",
+                    "--target", "all",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            # A crate outside the graph makes `cargo tree -i` say so on stderr and
+            # print nothing; a crate inside it prints the dependents.
+            if out.returncode == 0 and re.search(rf"^{re.escape(crate)} v", out.stdout, re.M):
+                print(f"FAIL: {advisory} is ignored because '{crate}' is never built, "
+                      f"but it IS in the build graph of {manifest}:")
+                print(out.stdout.strip()[:800])
+                found = True
+
+        if found:
+            fail = True
+        else:
+            print(f"  ok  {advisory}: '{crate}' is in no build graph, only in the lockfile")
 
 if fail:
     print()

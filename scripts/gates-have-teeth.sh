@@ -554,6 +554,78 @@ run_case "audit: no ignore list left to check" fail \
 	"$(py 'import os; os.remove(".cargo/audit.toml")')" \
 	"no single source"
 
+# The second kind of reason: the crate IS built, but only through callers the
+# advisory does not touch, and only until a named release (zstd and zstd-safe,
+# until parquet and arrow-ipc 60). Each case plants one way that reason stops
+# holding in the lockfile, which the gate reads as text, so every one fails
+# before `cargo audit` and costs no advisory-db fetch. The two exceptions are
+# the first, which runs the whole gate on the lockfile as it stands, and the
+# last, which takes the ignores away and requires cargo-audit itself to name
+# the advisories again.
+#
+# The expiry is the one that matters most and has two cases, one per crate: with
+# only one of them planted, the other half of EXPIRES_AT could be deleted and
+# every case here would still be red for the first.
+run_case "audit: the zstd ignores hold on the lock as it stands" pass \
+	"./scripts/audit.sh" \
+	""
+
+run_case "audit: the zstd ignores outlive parquet 60" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("Cargo.lock", "name = \"parquet\"\nversion = \"59.3.0\"", "name = \"parquet\"\nversion = \"60.0.0\"")')" \
+	"has expired"
+
+run_case "audit: the zstd ignores outlive arrow-ipc 60" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("Cargo.lock", "name = \"arrow-ipc\"\nversion = \"59.3.0\"", "name = \"arrow-ipc\"\nversion = \"60.0.0\"")')" \
+	"has expired"
+
+run_case "audit: zstd moved out of the range its ignore was argued for" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("Cargo.lock", "name = \"zstd\"\nversion = \"0.13.3\"", "name = \"zstd\"\nversion = \"0.14.3\"")')" \
+	"outside the range"
+
+run_case "audit: zstd-safe moved out of the range its ignore was argued for" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("Cargo.lock", "name = \"zstd-safe\"\nversion = \"7.2.1\"", "name = \"zstd-safe\"\nversion = \"8.2.0\"")')" \
+	"outside the range"
+
+run_case "audit: a new dependent of zstd that the ignore does not cover" fail \
+	"./scripts/audit.sh" \
+	"$(py 'import re
+s = open("Cargo.lock").read()
+t = re.sub(r"(name = \"arrow-select\"\nversion = \"[^\"]+\"\nsource = [^\n]+\nchecksum = [^\n]+\ndependencies = \[\n)", "\\1 \"zstd\",\n", s, count=1)
+assert t != s, "no arrow-select block in Cargo.lock"
+open("Cargo.lock", "w").write(t)')" \
+	"depends on it too"
+
+run_case "audit: a new dependent of zstd-safe that the ignore does not cover" fail \
+	"./scripts/audit.sh" \
+	"$(py 'import re
+s = open("Cargo.lock").read()
+t = re.sub(r"(name = \"arrow-select\"\nversion = \"[^\"]+\"\nsource = [^\n]+\nchecksum = [^\n]+\ndependencies = \[\n)", "\\1 \"zstd-safe\",\n", s, count=1)
+assert t != s, "no arrow-select block in Cargo.lock"
+open("Cargo.lock", "w").write(t)')" \
+	"depends on it too"
+
+# The subject taken away: zstd in no lockfile at all. An ignore that matches
+# nothing is the "measured nothing" answer, not a pass.
+run_case "audit: zstd in no lockfile, so its ignore matches nothing" fail \
+	"./scripts/audit.sh" \
+	"$(py 'edit("Cargo.lock", "name = \"zstd\"\nversion", "name = \"zstdx\"\nversion")')" \
+	"matches nothing"
+
+# What the ignores are holding back. Without them cargo-audit has to name the
+# two advisories again, which proves the lockfile still carries them and that
+# the ignore, not a clean lockfile, is what keeps this gate green.
+run_case "audit: the zstd ignores removed, so the advisories surface" fail \
+	"./scripts/audit.sh" \
+	"$(py 's = open(".cargo/audit.toml").read()
+i = s.index("  # TEMPORARY ACCEPTED RISK")
+j = s.index("]\n", s.index("\"RUSTSEC-2026-0403\""))
+open(".cargo/audit.toml", "w").write(s[:i] + s[j:])')" \
+	"RUSTSEC-2026-0391"
+
 # --- two subjects taken away, on gates that had no such case ----------------
 #
 # Both refuse correctly today. Neither had anything asserting it, which is the

@@ -3,9 +3,9 @@
 # An ignore here is a claim that an advisory does not reach us, and a claim
 # with nothing checking it is how a real exposure gets covered by a decision
 # somebody made about a different situation months earlier. So every entry
-# below names the reason, and `scripts/audit-ignores.sh` re-establishes that
-# reason on every CI run. If the reason stops holding, the script fails and
-# the entry has to be argued again rather than quietly protecting nothing.
+# below names the reason, and `scripts/audit.sh` re-establishes that reason on
+# every CI run. If the reason stops holding, the script fails and the entry has
+# to be argued again rather than quietly protecting nothing.
 
 [advisories]
 ignore = [
@@ -18,4 +18,28 @@ ignore = [
   # removes it, which also re-points the teeth cases that edit it. scripts/audit.sh still
   # asserts that rkyv is absent from the build graph.
   "RUSTSEC-2026-0235",
+
+  # TEMPORARY ACCEPTED RISK, until DataFusion 56 (parquet and arrow-ipc 60).
+  #
+  # RUSTSEC-2026-0391, zstd 0.13.3: data from an abandoned stream leaks into the next one when a
+  # context is reused through zstd::stream::raw::{Encoder,Decoder}::with_context.
+  # RUSTSEC-2026-0403, zstd-safe 7.2.1: uninitialized memory exposed when a legacy-frame
+  # decompress_stream call fails, through zstd::stream::write::Decoder.
+  #
+  # Fixed only in zstd 0.14.3 and zstd-safe 8.2.0, which need parquet and arrow-ipc 60. The newest
+  # DataFusion release (55.2.0) pins arrow and parquet to ^59.2.0, so the fix cannot be reached yet.
+  #
+  # Why it does not reach us: the only crates that depend on zstd are parquet and arrow-ipc 59.3.0
+  # (through datafusion 55). Their library code uses only zstd::bulk, zstd::compression_level_range
+  # and zstd_safe::{get_frame_content_size, compress_bound}, which neither advisory touches
+  # (`@claude`: read from the 59.3.0 sources, not run).
+  #
+  # Exit: DataFusion 56, or any release that takes parquet and arrow-ipc 60. scripts/audit.sh fails
+  # while these two lines stay and any of this stops holding: parquet or arrow-ipc 60 in a
+  # Cargo.lock (the ignore has expired), zstd outside 0.13.x or zstd-safe outside 7.x, or a
+  # dependent of zstd other than parquet and arrow-ipc. Do not move zstd-safe within 7.x on the
+  # side: 7.2.2 and later fall inside the affected range of a further advisory that 7.2.1 sits
+  # outside of.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0403",
 ]
