@@ -7417,8 +7417,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
 112. **A call the gateway answered just before it stops reaches the Cloud: the stop delivers what it holds, bounded, and names what it could not deliver.** On SIGTERM or SIGINT the server stops taking calls first; `flush_before_exit` then delivers the queue (in order) and the buffer within `EXIT_FLUSH_WITHIN`, waits for a push already on the wire, and starts nothing new while stopping. What is still undelivered at the bound is logged with its count. A SIGKILL, an out-of-memory kill or a lost node still loses what was not yet pushed, at most the last flush interval of calls plus the queue; a local spool is a follow-up, because replaying it needs the Cloud to recognise a record it already holds. `@decided 2026-10-14`: spend reports are made durable across a stop, and this change takes the delivery-before-exit half. *(test: `gateway::cloudsink::the_exit_flush_delivers_the_queue_then_the_buffer_in_order`, `gateway::cloudsink::the_exit_flush_is_bounded_and_says_what_it_could_not_deliver`, `gateway::cloudsink::a_push_on_the_wire_at_exit_is_counted_when_it_never_lands`, `tests/it/spend_reports_survive_a_stop.rs`: `a_call_served_just_before_sigterm_reaches_the_cloud`, `a_stop_while_the_cloud_does_not_answer_says_what_was_not_delivered`. Scenarios: `features/a-served-call-reaches-the-cloud-when-the-gateway-stops.feature`.)*
 
 113. **The teeth harness runs as CI shards, the shards together run every case exactly once, and their count is written once, in the workflow.**
-    One job took 30 to 60 minutes, the slowest step in this repository. `TEETH_SHARD=i/N` runs the cases at
-    positions `i`, `i+N`, ... of the list; `TEETH_LIST=1` prints the names through the same filter and runs none;
+    One job took 30 to 60 minutes, the slowest step in this repository. `TEETH_SHARD=i/N` runs the cases
+    `scripts/teeth-shards.tsv` gives to shard `i` (by case name; a case the file does not name runs in the shard
+    its position in the list gives it, so adding a case needs no edit there); `TEETH_LIST=1` prints the names
+    through the same filter and runs none;
     a shard that runs no case says it measured nothing. `scripts/teeth-shards-cover-every-case.sh` reads N from
     `.github/workflows/ci.yml`, where the teeth job's matrix, its `TEETH_SHARD` divisor and its name each state
     it, and refuses when the three disagree or the matrix is not `1..N`. It then lists the full harness and each
@@ -7432,13 +7434,34 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `stated-numbers` cases, because each runs the full suite. The same change makes CI cancel a pull request's
     older run when a newer push arrives (`concurrency` in `ci.yml`); a push to main is never cancelled.
 
+    `@claude` 2026-10-28, three changes to the same wall time, nothing removed or skipped. (1) The harness takes
+    every baseline of its shard once, on the clean tree, before the first mutation (it runs itself again with
+    `TEETH_PHASE=baseline`); taken inside the case, a baseline came right after the previous case's restore, which
+    gives every restored file a new modification time, so cargo built the crate for the baseline and again for
+    the mutation. (2) `scripts/stated-numbers.sh` can be handed the output of a suite run
+    (`STATED_NUMBERS_SUITE_OUTPUT`) and counts it the same way (every `test result:` line, summed); the harness
+    shares one run among its `stated-numbers` cases and the CI test job hands in its own `cargo test --all`
+    output. (3) The shards are cut by measured seconds instead of position: the harness prints `ok ... Ns` per
+    case and `baseline ... Ns` per baseline, and `python3 scripts/teeth-rebalance.py LOG... > scripts/teeth-shards.tsv`
+    deals the cases out longest first, keeping the `stated-numbers` cases together because the suite run is paid
+    once per shard that has one. The cover gate also refuses a map entry for a case that no longer exists, a shard
+    that does not exist, a case named twice and a map that is gone. `@measured` CI run 40760040303 (2026-10-28,
+    pull request, before the map was cut from it): the cases and baselines added up to 2422 seconds across the
+    eight shards, against 5430 in the four earlier runs (median per case, runs 40748837322, 40744615283,
+    40739697227, 40275834312), and the slowest shard was 8.4 minutes against 14 to 18.
+
     Not covered: the wall time with eight shards is measured in CI, not here; the shards compile the same
-    dependencies, each in its own runner; and how many jobs run at once is bounded by the account's concurrency
-    limit, which this repository cannot see, so two pull requests in flight may queue.
+    dependencies, each in its own runner; how many jobs run at once is bounded by the account's concurrency
+    limit, which this repository cannot see, so two pull requests in flight may queue; a map cut from one run
+    goes stale as cases are added (they still run once, by position, and `teeth-rebalance.py` re-cuts it); and
+    a suite output handed to `stated-numbers.sh` is only as current as the run that wrote it, though a wrong count
+    fails the comparison rather than passing it.
     *(gate: `scripts/teeth-shards-cover-every-case.sh`; teeth cases in `scripts/gates-have-teeth.sh`: the real
     harness partitions, a filter that drops every fifth case, a filter that runs a case in every shard up to its
-    own, a harness that is gone, a matrix that skips a shard, a divisor left at four under a matrix of eight, and
-    the matrix gone from the workflow)*
+    own, a harness that is gone, a matrix that skips a shard, a divisor left at four under a matrix of eight, the
+    matrix gone from the workflow, a map entry for a case that does not exist, a shard that does not exist, a case
+    named twice, a map that is gone, and one that must not fail: a case the map does not name; for the suite
+    output, a count below the badge, an output with no result line, and an agreeing one)*
 
 114. **A DLP finding the scanner lets through is one `dlp_shadow` on the bus per scanner, kinds and counts,
     never the text, and only when neither scanner refused the prompt.** agent-passport SPEC 6.2 registered
