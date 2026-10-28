@@ -1929,7 +1929,7 @@ build)`, `cloud apns (feature build)`.
 
 `TOKENFUSE_AGENT_TOKENS_STATIC_KEYS` is a comma-separated list of client key ids (each the `key_id` of a `TOKENFUSE_CLIENT_KEYS` entry, never a secret). `agenttoken::parse_static_keys` reads it for the mode, and `from_values` runs that read before the delegation door is asked about, so the list is checked without that door's configuration. Three things refuse to start, each exit 2 before the listener binds, naming the variable: a list set while the switch is `off` or `accept`; an entry the key set does not configure, named by its position in the list and never echoed, since a secret pasted there must not be printed; and a list of separators that names no id. A blank list is no list in every mode.
 
-Under require, `proxy::resolve_caller` admits a static key only when `agenttoken::static_key_listed` says so, and then exactly as `accept` admits one: the record files it under the key and the policy plane is told `client-key`. An unlisted key, an unknown key and no key all get one `401 agent_token_required` body, which names the list variable, so a caller learns nothing about which of its keys are real (the oracle `resolve_client_key` refuses to open, invariant 15). A token beside a listed key is still two credentials and is refused.
+Under require, `proxy::resolve_caller` admits a static key only when `agenttoken::static_key_listed` says so, and then exactly as `accept` admits one: the record files it under the key and the policy plane is told `client-key`. An unlisted key, an unknown key and no key all get one `401 agent_token_required` body, which names the list variable, so a caller learns nothing about which of its keys are real (the oracle `resolve_client_key` refuses to open, invariant 15). The operator's record is not that one body: an unknown key and no key are on the bus by reason and fingerprint as at the open door (invariant 105), and an unlisted key the gateway knows is a log line naming its id. A token beside a listed key is still two credentials and is refused.
 
 `@claude` 2026-10-19, under delegated authority, open to reversal: the list is read under `require` and nowhere else; the startup refusal names an entry's position rather than the entry, because the list may have been given a secret; and the 401 body is shared, rather than naming the variable only for a valid key that is unlisted, because the latter would tell a caller which keys are real. (test: `agenttoken::tests::the_static_key_list_is_refused_unless_require_is_on`, `the_static_key_list_names_an_id_the_key_set_does_not_configure`, `a_list_of_separators_alone_names_no_key_and_is_refused`, `the_static_key_list_reads_its_entries_trimmed`, `a_blank_static_key_list_is_no_list_in_any_mode`, `static_key_listed_is_true_only_for_a_listed_id_under_require`; `tests/it/static_key_allow_list.rs`: `require_admits_an_allow_listed_static_key_as_accept_does`, `require_refuses_an_unlisted_static_key_and_an_unknown_one_the_same_way`, `require_with_no_list_refuses_every_static_key_as_before`, `a_token_beside_a_listed_key_is_still_refused_under_require`; `tests/it/static_key_allow_list_startup.rs`, four over the real binary, one of which reads the startup line the binary writes. Not a script gate: the admission is two call sites, and a source-level check would be a fourth copy of the rule to keep true. Scenarios: `features/the-static-key-allow-list.feature`.)
 
@@ -7237,8 +7237,29 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     at most sixty a minute, the remembered sources bounded at 4096. The caller's `401` is
     byte-for-byte what it was: the two causes stay indistinguishable to the caller.
 
-    Not covered: the MCP broker's own door refuses through `mcpbroker::unauthorized` and writes
-    nothing yet; a source is not a network address (the gateway does not read one), so one client
+    **The door that requires an agent token reports the same two causes the same way.**
+    Measured 2026-10-28 on a v1.20.1 gateway with `TOKENFUSE_AGENT_TOKENS=require`: an unknown key
+    and a call with no key were answered `401 agent_token_required` and wrote nothing, while the
+    same two calls at the open door were on the bus, so a key scan against the managed door was
+    the one nobody could see. The require branch of `proxy::resolve_caller` (invariants 123 and
+    138) now calls `report_refused_key` for an unknown key and for no key, through the same
+    limiter, so the reason words, the fingerprint, the subject and the limits are the open
+    door's. The caller's `401` is the body `agenttoken::required_response` builds, byte for byte
+    (invariant 138), and the unknown key, the unlisted key and no key stay one answer.
+    `@claude` 2026-10-28, a reading of this invariant and not a new decision, open to reversal:
+    a key the gateway knows and the list does not name is refused as before and is NOT reported,
+    because it is not an unknown key, a record saying `unknown_key` would be false, and its
+    fingerprint would be that of a real secret; the warning in the log names its id. A gateway
+    that requires agent tokens and configures no client keys reports a call with no credential
+    as `missing_key` and a presented key as `unknown_key`, since the caller presented nothing the
+    door accepts and an operator wants those seen. The tool-call check endpoint reaches the same
+    branch through `resolve_caller`, so it reports too.
+
+    Not covered: the MCP broker's own door refuses through `mcpbroker::unauthorized` (and, under
+    `require`, `mcpbroker::agent_refusal`) and writes nothing yet, which invariant 30 names for its
+    proof and bearer doors and this one has not changed; a presented agent token that is refused
+    (`Door::Refused`) is logged and not on the bus at either door (`@claude` 2026-10-28, from
+    `resolve_caller` and `mcpbroker::handle`); a source is not a network address (the gateway does not read one), so one client
     rotating keys spends the global sixty; the fingerprint of a short guess is recoverable by
     guessing, which is not a secret; heraldyx alerts on `identity_mismatch` at `high`, so a client
     retrying one wrong key raises one alert a minute and a scan at most sixty, before heraldyx's own
@@ -7249,8 +7270,22 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_scan_that_names_no_agent_is_on_the_bus_too` (red first against the commit before the
     reserved subject, the scan skipped), and the control
     `a_good_key_writes_no_refusal`; `refusedkeys::tests` (six: the reserved subject, the fingerprint, the per-source
-    minute, the global sixty, the bound, the data). Mutants as cases in `scripts/gates-have-teeth.sh`:
-    the report never made, the per-source limit removed, the fingerprint replaced by the key.
+    minute, the global sixty, the bound, the data). At the require door, same file, eight:
+    `under_require_a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason` (which also holds the
+    answer byte for byte to `required_response`), `under_require_the_record_has_the_shape_the_open_door_gives`,
+    `under_require_the_same_key_tried_again_and_again_is_one_event`,
+    `under_require_a_scan_of_many_keys_cannot_flood_the_bus`,
+    `under_require_a_scan_that_names_no_agent_is_on_the_bus_too`,
+    `under_require_with_no_client_keys_a_call_with_no_credential_is_on_the_bus_too`, and the two controls
+    `under_require_a_listed_key_writes_no_refusal` and
+    `under_require_a_known_key_that_is_not_listed_is_never_filed_as_an_unknown_one`. Red first,
+    @measured `gh run view 40772937379 -R TAIPANBOX/tokenfuse --job 123114645752 --log` at `226887a`,
+    2026-10-28: the six reporting tests failed with no event at all (`left: 0 right: 2`, `right: 6`,
+    `right: 1`, and `a scan is seen, and at most sixty events a minute say so: 0`) and the two controls
+    and the byte-for-byte answer checks passed on the unfixed gateway. Mutants as cases in
+    `scripts/gates-have-teeth.sh`: the report never made, the per-source limit removed, the fingerprint
+    replaced by the key, the report never made at the require door, and a known unlisted key filed as an
+    unknown one.
     Scenarios: `features/a-refused-client-key-is-on-the-bus.feature`. Not a script gate)*
 
 106. **PII the scanner finds and lets through is on the call's trace row and in the fleet view,

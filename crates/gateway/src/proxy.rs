@@ -3137,7 +3137,14 @@ pub(crate) fn resolve_caller(
                     st.keystats.record_unauthorized();
                     Err(crate::agenttoken::required_response())
                 }
+                // An unknown key and no key are on the bus as at the open door
+                // (invariant 105). The answer is the same body as for an unlisted
+                // key above, so the caller still learns nothing; only the
+                // operator's record learns which cause it was. A known key that
+                // the list does not name is not reported here: it is not an
+                // unknown key, and its fingerprint would be a real secret's.
                 _ => {
+                    report_refused_key(st, headers);
                     st.keystats.record_unauthorized();
                     Err(crate::agenttoken::required_response())
                 }

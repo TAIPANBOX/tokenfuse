@@ -1661,8 +1661,23 @@ for p in paths:
 # mutant is a way a key scan goes quiet again, floods the bus, or leaks the key.
 run_case "refused-key: the refusal never reported" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "                report_refused_key(st, headers);", "                if false { report_refused_key(st, headers); }")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                report_refused_key(st, headers);\n                Err(unauthorized(&st.keystats))", "                if false { report_refused_key(st, headers); }\n                Err(unauthorized(&st.keystats))")')" \
 	"a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
+
+# The door that requires an agent token is the other place a missing or unknown
+# key is refused (invariant 105). The first mutant is the report left out there,
+# which is how a scan of the managed door went unseen; the second reports a key
+# the gateway knows but the list does not name as an unknown one, which writes a
+# false record and a fingerprint of a real secret.
+run_case "refused-key: the refusal at the require door never reported" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::under_require_a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                    report_refused_key(st, headers);\n                    st.keystats.record_unauthorized();", "                    if false { report_refused_key(st, headers); }\n                    st.keystats.record_unauthorized();")')" \
+	"under_require_a_missing_key_and_an_unknown_key_are_on_the_bus_by_reason ... FAILED"
+
+run_case "refused-key: a known key the list does not name is filed as an unknown one" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::under_require_a_known_key_that_is_not_listed_is_never_filed_as_an_unknown_one" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "does not list\"\n                    );\n                    st.keystats.record_unauthorized();", "does not list\"\n                    );\n                    report_refused_key(st, headers);\n                    st.keystats.record_unauthorized();")')" \
+	"under_require_a_known_key_that_is_not_listed_is_never_filed_as_an_unknown_one ... FAILED"
 
 run_case "refused-key: the per-source limit removed" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact refused_key_on_the_bus::the_same_key_tried_again_and_again_is_one_event" \
