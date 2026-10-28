@@ -6892,10 +6892,14 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     / 4; Haiku 5.5 new, `claude-haiku-5-5`, `anthropic/claude-haiku-5.5` at list,
     `anthropic.claude-haiku-5-5` at list plus 10 percent on both tiers, 0.10 / 0.50 / 0.01 / 0.125
     / 0.20 up to 100,000 prompt tokens and 0.50 / 2.50 / 0.05 / 0.625 / 1 above. OpenAI, Standard
-    tier, thirteen ids (gpt-6-astra, gpt-6.1-sol, gpt-6-sol, gpt-6-luna, gpt-5.6-sol,
+    tier, fourteen ids (gpt-6-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol,
     gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4 each with a > 272K tier; gpt-5.4-mini; gpt-4o,
     gpt-4o-mini, o1 re-confirmed), the 1-hour column the write rate, a "-" write column the input
-    rate. DeepSeek (`deepseek-flash` and its two legacy names, `deepseek-v4-pro`), Moonshot
+    rate. `gpt-6.1-terra` was added 2026-10-28 from the same page (1 / 5 / 0.05 / 1.25, and
+    2 / 7.50 / 0.10 / 2.50 above 272K); before that it was billed at the fallback's 15 / 75. `@claude`: the
+    page now also lists a "12h write" column (2.50 for this row), and the 1-hour column of every
+    OpenAI row, this one included, stays the write rate under the book's rule above; whether
+    that column is the 1-hour tier is not settled here. DeepSeek (`deepseek-flash` and its two legacy names, `deepseek-v4-pro`), Moonshot
     (`kimi-k3`, writes 3 / 6), Z.ai (`glm-5.3`, `glm-5.1`). Gemini 3.1 Pro Preview new
     (`google/gemini-3.1-pro-preview`, 2 / 12 / 0.20, > 200K 4 / 18 / 0.40); Gemini 2.5 Pro now 1.25
     / 10 / 0.125 with its > 200K rate as the tier. The Gemini 3.x Flash rows are unchanged.

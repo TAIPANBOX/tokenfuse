@@ -328,6 +328,15 @@
       },
       {
         "above_prompt_tokens": 272000,
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "gpt-6.1-terra",
+        "output_per_mtok_microusd": 7500000
+      },
+      {
+        "above_prompt_tokens": 272000,
         "cache_read_per_mtok_microusd": 500000,
         "cache_write_1h_per_mtok_microusd": 5000000,
         "cache_write_per_mtok_microusd": 5000000,
@@ -406,6 +415,15 @@
         "input_per_mtok_microusd": 4000000,
         "model": "openai/gpt-6.1-sol",
         "output_per_mtok_microusd": 15000000
+      },
+      {
+        "above_prompt_tokens": 272000,
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "openai/gpt-6.1-terra",
+        "output_per_mtok_microusd": 7500000
       }
     ],
     "models": [
@@ -1114,6 +1132,14 @@
         "output_per_mtok_microusd": 10000000
       },
       {
+        "cache_read_per_mtok_microusd": 50000,
+        "cache_write_1h_per_mtok_microusd": 1250000,
+        "cache_write_per_mtok_microusd": 1250000,
+        "input_per_mtok_microusd": 1000000,
+        "model": "gpt-6.1-terra",
+        "output_per_mtok_microusd": 5000000
+      },
+      {
         "cache_read_per_mtok_microusd": 550000,
         "cache_write_1h_per_mtok_microusd": 11000000,
         "cache_write_per_mtok_microusd": 6875000,
@@ -1272,6 +1298,14 @@
         "input_per_mtok_microusd": 2000000,
         "model": "openai/gpt-6.1-sol",
         "output_per_mtok_microusd": 10000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 50000,
+        "cache_write_1h_per_mtok_microusd": 1250000,
+        "cache_write_per_mtok_microusd": 1250000,
+        "input_per_mtok_microusd": 1000000,
+        "model": "openai/gpt-6.1-terra",
+        "output_per_mtok_microusd": 5000000
       },
       {
         "cache_read_per_mtok_microusd": 7500000,
