@@ -85,6 +85,7 @@ impl Door {
             events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
             taint_gateway: None,
             taint_failclosed: true,
+            upstream_labels: Default::default(),
             xaa: self.xaa.then(|| {
                 Arc::new(XaaDoor {
                     cfg: cfg(&self.issuer),

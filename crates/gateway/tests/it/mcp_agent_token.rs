@@ -114,6 +114,7 @@ impl Broker {
             events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
             taint_gateway: self.taint_gateway.clone(),
             taint_failclosed: true,
+            upstream_labels: Default::default(),
             xaa: None,
             agent_tokens: Some(Arc::new(AgentTokens::with_static_keys(
                 self.tokens,

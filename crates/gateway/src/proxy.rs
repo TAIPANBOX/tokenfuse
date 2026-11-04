@@ -2517,6 +2517,52 @@ enum ToolCallVerdict {
     Blocked(String),
 }
 
+/// Label the run from the tools the provider ran (invariant 143), and say what it
+/// carries now. Nothing to do, and nothing returned, when there were none.
+///
+/// The provider's own answer is the witness, so this is not a judgement: the tool
+/// already ran, on the provider's infrastructure, and there is nothing to refuse.
+fn record_provider_tools(
+    st: &AppState,
+    provider_tools: &[String],
+    event_agent_id: &str,
+    run_id: &str,
+    chain_on_record: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+    firewall_prompt: Option<&str>,
+    unit: &str,
+) -> Labels {
+    if provider_tools.is_empty() {
+        return Labels::new();
+    }
+    st.name_unclassified(provider_tools);
+    let delta = st.accumulate_taint(
+        run_id,
+        taint::labels_for_tools(provider_tools, &st.firewall.sources),
+    );
+    if !delta.added.is_empty() {
+        let added: Vec<String> = delta.added.iter().cloned().collect();
+        let carrying: Vec<String> = delta.carrying.iter().cloned().collect();
+        let outcome = st.events.emit(
+            EventType::TaintRaised,
+            now_millis(),
+            Some(event_agent_id),
+            Some(run_id),
+            chain_on_record,
+            taint_raised_data(
+                TaintStage::ModelToolCall,
+                &added,
+                provider_tools,
+                &carrying,
+                firewall_prompt,
+                &[],
+                unit,
+            ),
+        );
+        crate::events::log_outcome(EventType::TaintRaised, outcome);
+    }
+    delta.carrying
+}
+
 /// Judge the tool calls a model's answer asks for against the run's taint,
 /// and record what was decided: one function for the buffered answer and the
 /// streamed one (invariant 104), so the two paths cannot drift apart.
@@ -2527,6 +2573,7 @@ enum ToolCallVerdict {
 fn judge_model_tool_calls(
     st: &AppState,
     labels: &Labels,
+    provider_tools: &[String],
     resp_tools: &[String],
     resp_args: &[serde_json::Value],
     blocked_row: impl FnOnce() -> CallRecord,
@@ -2539,6 +2586,19 @@ fn judge_model_tool_calls(
     if st.firewall.mode == FirewallMode::Off {
         return ToolCallVerdict::Allowed;
     }
+    // Before this answer's tool calls are judged: a model that searched and asked
+    // for a shell in one answer read the page first.
+    let mut labels = labels.clone();
+    labels.extend(record_provider_tools(
+        st,
+        provider_tools,
+        event_agent_id,
+        run_id,
+        chain_on_record,
+        firewall_prompt,
+        unit,
+    ));
+    let labels = &labels;
     let requested =
         taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
@@ -2684,6 +2744,7 @@ fn stream_managed(
     let wrapped = async_stream::try_stream! {
         let guard = guard;
         let mut hold = hold;
+        let mut firewall_labels = firewall_labels;
         futures::pin_mut!(inner);
         while let Some(chunk) = inner.next().await {
             // Reported before it is propagated, and this is the one failure
@@ -2722,6 +2783,25 @@ fn stream_managed(
             match hold.as_mut() {
                 Some(h) => {
                     let now = h.push(&chunk);
+                    // Before these bytes go out (invariant 143): a client that has
+                    // what it wanted can close the connection, and the end of the
+                    // stream, where the rest is judged, then never comes.
+                    let seen = h.take_provider_tools();
+                    if !seen.is_empty() {
+                        let chain = (!ev_chain.is_empty()).then(|| match ev_proof.as_ref() {
+                            Some(p) => tokenfuse_core::agent_event::ChainOnRecord::proven(&ev_chain, p),
+                            None => tokenfuse_core::agent_event::ChainOnRecord::claimed(&ev_chain),
+                        });
+                        firewall_labels.extend(record_provider_tools(
+                            &fw_state,
+                            &seen,
+                            &ev_agent_id,
+                            &ev_run_id,
+                            chain,
+                            firewall_prompt.as_deref(),
+                            &unit,
+                        ));
+                    }
                     if !now.is_empty() {
                         yield Bytes::from(now);
                     }
@@ -2741,6 +2821,7 @@ fn stream_managed(
             let verdict = judge_model_tool_calls(
                 &fw_state,
                 &firewall_labels,
+                &held.provider_tools,
                 &held.tools,
                 // The streamed hold keeps tool NAMES only, not their arguments
                 // (streamgate::tool_names), so a streamed read is not yet judged on
@@ -2926,11 +3007,13 @@ async fn buffered_managed(
     if st.firewall.mode != FirewallMode::Off {
         let resp_json: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let provider_tools = taint::provider_tools_in(&resp_json);
         let resp_tools = taint::tool_names_in(&resp_json);
         let resp_args = taint::tool_arguments_in(&resp_json);
         let verdict = judge_model_tool_calls(
             st,
             &firewall_labels,
+            &provider_tools,
             &resp_tools,
             &resp_args,
             // The call already happened and its real cost was recorded as

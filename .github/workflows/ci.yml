@@ -201,6 +201,12 @@ jobs:
       - name: a run's owner is settled before the run is touched
         run: ./scripts/run-owner-is-checked-first.sh
 
+      # A label an enforcement point reports comes from the server that answered,
+      # never from a name, and reaches the run before the answer leaves (invariant
+      # 143).
+      - name: a label comes from the act, not from a name
+        run: ./scripts/taint-comes-from-the-act.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04

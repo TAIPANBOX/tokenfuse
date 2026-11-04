@@ -666,6 +666,28 @@ async fn mcp_broker() {
     let taint_gateway = std::env::var("TOKENFUSE_MCP_TAINT_GATEWAY")
         .ok()
         .filter(|v| !v.trim().is_empty());
+    // What each upstream's output carries (invariant 143), read after the taint
+    // gateway because a label lives on that gateway's run. A value that cannot be
+    // read refuses to start, and so does a classification with no gateway.
+    let upstream_labels = tokenfuse_gateway::defaults::exit_on_refusal(
+        tokenfuse_gateway::mcpbroker::upstream_labels_from(
+            std::env::var(tokenfuse_gateway::mcpbroker::UPSTREAM_LABELS_VAR)
+                .ok()
+                .as_deref(),
+            &upstream,
+            &named_upstreams,
+        ),
+    );
+    if let Some(refusal) = tokenfuse_gateway::mcpbroker::refuse_labels_without_a_gateway(
+        &upstream_labels,
+        taint_gateway.as_deref(),
+    ) {
+        eprintln!("tokenfuse: {refusal}");
+        std::process::exit(2);
+    }
+    for up in upstream_labels.values() {
+        tracing::info!(upstream = %up.name, labels = ?up.labels, "mcp broker: a read of this upstream labels its run");
+    }
     // Agent tokens on and a taint gateway named, with no key of the broker's own
     // to relay a token with: every call a token admits would reach the check with
     // no credential and fall to the taint fail mode (invariant 129). Refused here,
@@ -711,6 +733,7 @@ async fn mcp_broker() {
         client: broker_client,
         events,
         taint_gateway,
+        upstream_labels,
         taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
         agent_tokens,

@@ -131,6 +131,15 @@ Consequences worth naming rather than burying:
 The broker holds no signer and mutates no plane: it can refuse a call, never
 perform one.
 
+### Labels from the upstream
+
+`TOKENFUSE_MCP_UPSTREAM_LABELS="scopyx=web"` says what an upstream's output carries.
+The broker tells the taint gateway before it hands an answer back, so the label does
+not depend on the tool name or on what the conversation reports. It needs
+`TOKENFUSE_MCP_TAINT_GATEWAY`, a call naming no `x-fuse-run-id` is refused, and an
+answer whose label the gateway did not take is withheld. `default` names the default
+upstream. See docs/07, "A fourth taint source", and CLAUDE.md invariant 143.
+
 ## 3. `tool_call` audit events
 
 Every `tools/call` this broker acts on emits exactly one `tool_call`

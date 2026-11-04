@@ -138,6 +138,43 @@ pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
     tool_uses_in(v).into_iter().map(|t| t.name).collect()
 }
 
+/// The block types a provider's answer uses for a tool the PROVIDER ran: its
+/// built-in search or fetch (`server_tool_use`) and a remote MCP server it
+/// reached itself (`mcp_tool_use`).
+///
+/// Not [`tool_uses_in`]'s blocks, and that is the whole distinction. A `tool_use`
+/// is a request the client will carry out, so it is judged before the client gets
+/// it; one of these already happened by the time the gateway reads it, on the
+/// provider's infrastructure, and there is nothing left to refuse.
+pub const PROVIDER_TOOL_BLOCKS: [&str; 2] = ["server_tool_use", "mcp_tool_use"];
+
+/// Whether a content block records a tool the provider ran.
+pub fn is_provider_tool_block(block: &serde_json::Value) -> bool {
+    block
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| PROVIDER_TOOL_BLOCKS.contains(&t))
+}
+
+/// The tools the provider ran for this ANSWER, by the name the provider gave them
+/// (CLAUDE.md invariant 143).
+///
+/// Reads the top-level `content[]` of a response and nothing else. `messages[]` is
+/// deliberately not read: a conversation is written by the caller, and a provider's
+/// answer is the one place these blocks arrive that the caller has not had in its
+/// hands, which is what makes the label an observation rather than a claim.
+pub fn provider_tools_in(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
+        for b in blocks.iter().filter(|b| is_provider_tool_block(b)) {
+            if let Some(name) = b.get("name").and_then(|n| n.as_str()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Tool names a request DECLARES as available (the top-level `tools[]` array),
 /// as opposed to tools already invoked ([`tool_names_in`] reads `tool_use` /
 /// `tool_calls`). A request-path PEP (the Wardryx enforcement hook) must gate
@@ -636,6 +673,88 @@ mod tests {
             {"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"send_email"}}]}
         ]});
         assert_eq!(tool_names_in(&v), vec!["web_search", "send_email"]);
+    }
+
+    #[test]
+    fn a_tool_the_provider_ran_is_read_from_its_answer_by_the_providers_name() {
+        let answer = json!({"content":[
+            {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"x"}},
+            {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]},
+            {"type":"mcp_tool_use","id":"mcptoolu_1","name":"lookup","server_name":"crm","input":{}},
+            {"type":"text","text":"found it"}
+        ]});
+        assert_eq!(provider_tools_in(&answer), vec!["web_search", "lookup"]);
+    }
+
+    #[test]
+    fn a_tool_the_provider_ran_is_not_a_tool_the_client_will_run() {
+        // The two readers answer different questions, and neither may answer the
+        // other's: a provider's search is not an action to judge, and a client's
+        // `tool_use` is not something that already happened.
+        let answer = json!({"content":[
+            {"type":"server_tool_use","id":"s1","name":"web_search","input":{}},
+            {"type":"tool_use","id":"t1","name":"run_shell","input":{}}
+        ]});
+        assert_eq!(tool_names_in(&answer), vec!["run_shell"]);
+        assert_eq!(provider_tools_in(&answer), vec!["web_search"]);
+    }
+
+    #[test]
+    fn a_conversation_the_caller_wrote_is_never_read_as_a_providers_answer() {
+        // The history is the caller's to write, so a block in it observes nothing.
+        let request = json!({"messages":[{"role":"assistant","content":[
+            {"type":"server_tool_use","id":"s1","name":"web_search","input":{}}
+        ]}]});
+        assert!(provider_tools_in(&request).is_empty());
+    }
+
+    #[test]
+    fn provider_tools_in_survives_hostile_shapes() {
+        assert!(provider_tools_in(&json!({})).is_empty());
+        assert!(provider_tools_in(&json!({"content": "not-an-array"})).is_empty());
+        assert!(provider_tools_in(&json!({"content": [1, "x", null, true]})).is_empty());
+        assert!(provider_tools_in(&json!({"content": [{"type": 5}]})).is_empty());
+        assert!(
+            provider_tools_in(&json!({"content": [{"type": "server_tool_use"}]})).is_empty(),
+            "a block with no name names nothing"
+        );
+        assert!(
+            provider_tools_in(&json!({"content": [{"type": "server_tool_use", "name": 5}]}))
+                .is_empty()
+        );
+
+        // 200 seeded shapes: never panics, and every name returned came from a
+        // block of one of the two provider types.
+        let mut seed: u64 = 0x7a11_1104;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let n = (next() % 6) as usize;
+            let mut blocks = Vec::new();
+            let mut expected = Vec::new();
+            for _ in 0..n {
+                let name = format!("t{}", next() % 100);
+                blocks.push(match next() % 6 {
+                    0 => {
+                        expected.push(name.clone());
+                        json!({"type": "server_tool_use", "name": name})
+                    }
+                    1 => {
+                        expected.push(name.clone());
+                        json!({"type": "mcp_tool_use", "name": name})
+                    }
+                    2 => json!({"type": "tool_use", "name": name}),
+                    3 => json!({"type": "server_tool_use", "name": next() % 100}),
+                    4 => json!(null),
+                    _ => json!({"name": name}),
+                });
+            }
+            assert_eq!(provider_tools_in(&json!({ "content": blocks })), expected);
+        }
     }
 
     #[test]

@@ -78,6 +78,7 @@ fn state_with_keys(
         events: Arc::new(tokenfuse_core::agent_event::Exporter::disabled()),
         taint_gateway: None,
         taint_failclosed: false,
+        upstream_labels: Default::default(),
         xaa,
         agent_tokens: None,
         taint_gateway_key: None,

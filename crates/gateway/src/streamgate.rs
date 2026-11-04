@@ -46,6 +46,11 @@ pub struct Held {
     /// The tool names the held events carry, as `taint::tool_names_in` reads
     /// them from a buffered answer of the same shape.
     pub tools: Vec<String>,
+    /// The tools the provider ran that [`ToolCallHold::take_provider_tools`] had not
+    /// already handed over, as `taint::provider_tools_in` reads them from a buffered
+    /// answer (invariant 143). Their events are forwarded and never held: nothing
+    /// about one of these can be refused, because it already happened.
+    pub provider_tools: Vec<String>,
 }
 
 /// The stream-side half of invariant 104. See the module documentation.
@@ -62,6 +67,8 @@ pub struct ToolCallHold {
     held: Vec<u8>,
     /// Anthropic `tool_use` blocks, as each `content_block_start` opened them.
     anthropic_blocks: Vec<serde_json::Value>,
+    /// Blocks recording a tool the provider ran, opened the same way.
+    provider_blocks: Vec<serde_json::Value>,
     /// OpenAI tool calls by (choice index, tool call index): the id, and the
     /// name as its fragments arrived (a provider may split a name; OpenAI
     /// sends it whole in the first delta).
@@ -101,11 +108,25 @@ impl ToolCallHold {
             self.route(rest, &mut tail);
         }
         let tools = self.tool_names();
+        let provider_tools = self.take_provider_tools();
         Held {
             tail,
             held: self.held,
             tools,
+            provider_tools,
         }
+    }
+
+    /// The tools the provider ran that nobody has asked about yet, as
+    /// `taint::provider_tools_in` reads them.
+    ///
+    /// Asked after every chunk and before its bytes go out, not only at the end: a
+    /// client that has the text can close the connection, the end of the stream then
+    /// never comes, and a label read there would be a label that client chose to
+    /// avoid.
+    pub fn take_provider_tools(&mut self) -> Vec<String> {
+        let blocks = std::mem::take(&mut self.provider_blocks);
+        tokenfuse_core::taint::provider_tools_in(&serde_json::json!({ "content": blocks }))
     }
 
     /// One complete event: read it, then forward it or hold it.
@@ -136,6 +157,8 @@ impl ToolCallHold {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                     self.anthropic_blocks.push(block.clone());
                     carried = true;
+                } else if tokenfuse_core::taint::is_provider_tool_block(block) {
+                    self.provider_blocks.push(block.clone());
                 }
             }
         }
@@ -407,6 +430,24 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
             "the buffered path does not judge it either"
         );
         assert!(held.tools.is_empty());
+    }
+
+    #[test]
+    fn a_tool_the_provider_ran_is_named_at_the_end_and_never_held() {
+        let input = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"s1\",\"name\":\"web_search\",\"input\":{}}}\n\n";
+        let (forwarded, held) = run(input.as_bytes(), &[7]);
+        assert_eq!(forwarded, input.as_bytes(), "it already happened");
+        assert_eq!(held.provider_tools, vec!["web_search"]);
+    }
+
+    #[test]
+    fn a_tool_the_provider_ran_is_handed_over_once_and_as_soon_as_it_is_seen() {
+        let input = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"s1\",\"name\":\"web_search\",\"input\":{}}}\n\n";
+        let mut hold = ToolCallHold::new();
+        hold.push(input.as_bytes());
+        assert_eq!(hold.take_provider_tools(), vec!["web_search"]);
+        assert!(hold.take_provider_tools().is_empty());
+        assert!(hold.finish().provider_tools.is_empty());
     }
 
     /// Any chunking of the provider's bytes, on either wire, gives the same

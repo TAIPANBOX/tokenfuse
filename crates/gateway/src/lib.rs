@@ -35,6 +35,7 @@ pub mod mcpdoor;
 pub mod mcpexposure_probe;
 pub mod mcpsession;
 pub mod obs;
+pub mod observedact;
 pub mod otel;
 pub mod outcomescli;
 pub mod policyplane;
@@ -112,6 +113,12 @@ pub fn app(state: AppState) -> Router {
         .merge(admin)
         // docs/07 B.7 level 2: an executor asks BEFORE it runs a tool.
         .route("/v1/fuse/check-tool-call", post(toolcheck::check_tool_call))
+        // Invariant 143: an enforcement point saw the act, so the label is not
+        // the caller's to report.
+        .route(
+            observedact::OBSERVED_ACT_PATH,
+            post(observedact::observed_act),
+        )
         // docs/07 B.4 gate 1: a human reviewed it, so the label comes off.
         .route("/v1/fuse/declassify", post(declassify::declassify))
         .layer(DefaultBodyLimit::max(max_body))

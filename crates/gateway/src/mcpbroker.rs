@@ -29,6 +29,7 @@
 //! `tokenfuse_core::dlp`'s module doc), `_LOCK` (rug-pull baseline), `_ADDR`,
 //! `_KEYS` (the broker's own client credentials, off unless set), `_STDIO`,
 //! `_ALLOW_OPEN_BIND` (opt out of the refusal below, off unless set),
+//! `_UPSTREAM_LABELS` (what an upstream's output carries, invariant 143),
 //! `_SECRET_SCOPES` (which agent ids and/or tool names may resolve which
 //! secret, off unless set, see [`BrokerState::vault`] and
 //! `docs/23-mcp-broker-v2.md` section 4), `_REQUIRE_SECRET_SCOPES` (refuse to
@@ -197,6 +198,119 @@ pub struct BrokerState {
     /// no others. A caller admitted by a client key is still asked about with
     /// that caller's own key (invariant 118).
     pub taint_gateway_key: Option<String>,
+    /// What the output of each upstream carries, as the operator classified it
+    /// (`TOKENFUSE_MCP_UPSTREAM_LABELS`, invariant 143). Empty by default, and
+    /// then nothing here reports anything and nothing is refused for it.
+    pub upstream_labels: UpstreamLabels,
+}
+
+/// The name a classification uses for the default upstream, which has no other.
+/// A named upstream called this wins: it is the one the operator wrote down.
+pub const DEFAULT_UPSTREAM_NAME: &str = "default";
+
+/// The variable that classifies upstreams (invariant 143).
+pub const UPSTREAM_LABELS_VAR: &str = "TOKENFUSE_MCP_UPSTREAM_LABELS";
+
+/// One upstream an operator said something about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedUpstream {
+    /// The name the record carries: `name=` in the classification.
+    pub name: String,
+    /// The labels its output carries, sorted.
+    pub labels: Vec<String>,
+}
+
+/// Classified upstreams by SERVER, keyed by [`upstream_key`] and never by the name
+/// a request selected: a server reachable by a name and by the default route, or
+/// by two names, is one server, and a call that took the route nobody classified
+/// would otherwise read the same page with no label.
+pub type UpstreamLabels = BTreeMap<String, ClassifiedUpstream>;
+
+/// The form of an upstream URL a classification is looked up by, so `http://s:1`
+/// and `http://s:1/` are one server.
+fn upstream_key(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| url.to_string())
+}
+
+/// Read `TOKENFUSE_MCP_UPSTREAM_LABELS`: `name=label|label,name=label`.
+///
+/// ONE bad entry refuses the whole value, the conclusion
+/// `TOKENFUSE_MCP_SECRET_SCOPES` reached for the same reason: a dropped entry here
+/// would silently unclassify the server it was written for, and the operator would
+/// go on believing its reads are labelled.
+///
+/// A name no upstream carries is refused rather than ignored, for the same reason,
+/// and so is an entry with no labels: an upstream classified as carrying nothing is
+/// a half-finished config, and reading it as trusted would launder its output
+/// (`labels_for_tools` refuses the same reading of an empty source).
+pub fn upstream_labels_from(
+    spec: Option<&str>,
+    default_upstream: &str,
+    named: &BTreeMap<String, String>,
+) -> Result<UpstreamLabels, String> {
+    let mut out = UpstreamLabels::new();
+    let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
+        return Ok(out);
+    };
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((name, labels)) = entry.split_once('=') else {
+            return Err(format!(
+                "{UPSTREAM_LABELS_VAR}: entry {entry:?} is not name=label|label"
+            ));
+        };
+        let name = name.trim();
+        let url = match named.get(name) {
+            Some(url) => url.as_str(),
+            None if name == DEFAULT_UPSTREAM_NAME => default_upstream,
+            None => {
+                return Err(format!(
+                    "{UPSTREAM_LABELS_VAR}: {name:?} names no configured upstream \
+                     (TOKENFUSE_MCP_UPSTREAMS, or {DEFAULT_UPSTREAM_NAME:?} for \
+                     TOKENFUSE_MCP_UPSTREAM)"
+                ))
+            }
+        };
+        let labels: Vec<String> = labels
+            .split('|')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        if labels.is_empty() {
+            return Err(format!(
+                "{UPSTREAM_LABELS_VAR}: {name:?} names no label, and an upstream nobody \
+                 classified is not a trusted one"
+            ));
+        }
+        let held = out
+            .entry(upstream_key(url))
+            .or_insert_with(|| ClassifiedUpstream {
+                name: name.to_string(),
+                labels: Vec::new(),
+            });
+        held.labels.extend(labels);
+        held.labels.sort();
+        held.labels.dedup();
+    }
+    Ok(out)
+}
+
+/// A classification with no gateway to tell (invariant 143): every call to such an
+/// upstream would have to be refused, or labelled nowhere, so the broker refuses
+/// to start rather than look configured. `None` means it may start.
+pub fn refuse_labels_without_a_gateway(
+    labels: &UpstreamLabels,
+    taint_gateway: Option<&str>,
+) -> Option<String> {
+    if labels.is_empty() || taint_gateway.is_some_and(|g| !g.trim().is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "{UPSTREAM_LABELS_VAR} is set and TOKENFUSE_MCP_TAINT_GATEWAY is not: a label lives \
+         on the gateway's run, and this broker has no gateway to put it on"
+    ))
 }
 
 /// Per-request context the HTTP transport reads off headers and the stdio
@@ -1613,21 +1727,43 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
     };
 
     let url = format!("{}/v1/fuse/check-tool-call", base.trim_end_matches('/'));
-    // Serialized by hand rather than through reqwest's `json` feature: that
-    // feature is not on this crate's copy of reqwest, and turning it on for one
-    // call would add a codec to the dependency that carries every provider
-    // request in this process.
     let payload = serde_json::json!({
         "run_id": run_id,
         "tool": tool,
         "via": "mcp",
-    })
-    .to_string();
+    });
+    let answer = match ask_gateway(st, ctx, &url, &payload).await {
+        Ok(a) => a,
+        Err(what) => return taint_gate_unanswered(st, ctx, run_id, &url, &what),
+    };
+
+    if answer.get("decision").and_then(|d| d.as_str()) == Some("deny") {
+        let reason = answer
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("tainted context denies this capability");
+        return Err(format!("blocked: {reason}"));
+    }
+    Ok(())
+}
+
+/// One question to the gateway's firewall, under the caller's own credential.
+/// `Err` says how there was no answer.
+async fn ask_gateway(
+    st: &BrokerState,
+    ctx: &CallContext,
+    url: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    // Serialized by hand rather than through reqwest's `json` feature: that
+    // feature is not on this crate's copy of reqwest, and turning it on for one
+    // call would add a codec to the dependency that carries every provider
+    // request in this process.
     let mut req = st
         .client
-        .post(&url)
+        .post(url)
         .header("content-type", "application/json")
-        .body(payload);
+        .body(payload.to_string());
     // The RECORD identity, so the gateway's own taint events for this call are
     // filed under the agent a proven chain named rather than skipped. That
     // handler uses this header for nothing but the event: its `unit` is empty
@@ -1656,7 +1792,7 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
     // other, and a gateway's `401 {"error":"unauthorized"}` carries no
     // `decision`, so it was taken for "not deny" and the call went through
     // with nothing recorded (invariant 118).
-    let answer = match req.send().await {
+    match req.send().await {
         Ok(r) if r.status().is_success() => r
             .text()
             .await
@@ -1665,20 +1801,73 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
             .ok_or_else(|| "answered with a body that is not JSON".to_string()),
         Ok(r) => Err(format!("answered {}", r.status().as_u16())),
         Err(_) => Err("could not be reached".to_string()),
-    };
-    let answer = match answer {
-        Ok(a) => a,
-        Err(what) => return taint_gate_unanswered(st, ctx, run_id, &url, &what),
-    };
-
-    if answer.get("decision").and_then(|d| d.as_str()) == Some("deny") {
-        let reason = answer
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("tainted context denies this capability");
-        return Err(format!("blocked: {reason}"));
     }
-    Ok(())
+}
+
+/// The upstream this call reaches, when the operator classified it.
+fn classified<'a>(st: &'a BrokerState, upstream_url: &str) -> Option<&'a ClassifiedUpstream> {
+    if st.upstream_labels.is_empty() {
+        return None;
+    }
+    st.upstream_labels.get(&upstream_key(upstream_url))
+}
+
+/// Put what a classified upstream just answered on the caller's run, before the
+/// answer is handed back (invariant 143).
+///
+/// `Ok(())` means the answer may go. Everything else withholds it, and unlike
+/// [`taint_gate`] there is no fail-open mode: the call has happened and the page is
+/// in this process, so the choice here is whether it reaches a run nothing labelled.
+/// `TOKENFUSE_MCP_TAINT_FAILMODE` is older than this and open by default so that
+/// turning the gate on broke nothing. A classification is new configuration, so
+/// closed breaks nothing either.
+///
+/// The labels come from the upstream and the tool name is not an argument here,
+/// on purpose: `scripts/taint-comes-from-the-act.sh` holds that.
+async fn report_observed_act(
+    st: &BrokerState,
+    ctx: &CallContext,
+    up: &ClassifiedUpstream,
+) -> Result<(), String> {
+    let run_id = record_run_id(ctx).unwrap_or_default();
+    let Some(base) = st.taint_gateway.as_deref() else {
+        return Err(
+            "blocked: this upstream's output carries a label and no gateway can take it".into(),
+        );
+    };
+    let url = format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        crate::observedact::OBSERVED_ACT_PATH
+    );
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "labels": up.labels,
+        "source": format!("mcp:{}", up.name),
+    });
+    let answer = match ask_gateway(st, ctx, &url, &payload).await {
+        Ok(a) => a,
+        Err(what) => {
+            record_gateway_unanswered(
+                st,
+                ctx,
+                run_id,
+                DependencyEffect::DeniedUnasked,
+                &format!("mcp broker: the label gateway at {url} {what}"),
+            );
+            return Err(format!("blocked: the label gateway {what}"));
+        }
+    };
+    let recorded = answer.get("recorded").and_then(|r| r.as_bool()) == Some(true);
+    let ungoverned = answer.get("governed").and_then(|g| g.as_bool()) == Some(false);
+    if recorded || ungoverned {
+        return Ok(());
+    }
+    let reason = answer
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("the gateway did not take this upstream's label");
+    Err(format!("blocked: {reason}"))
 }
 
 /// The taint gate gave no answer: it could not be reached, or it answered
@@ -1701,6 +1890,29 @@ fn taint_gate_unanswered(
     } else {
         DependencyEffect::AllowedUngoverned
     };
+    record_gateway_unanswered(
+        st,
+        ctx,
+        run_id,
+        effect,
+        &format!("mcp broker: the taint gate at {url} {what}"),
+    );
+    if st.taint_failclosed {
+        Err(format!("blocked: the taint gate {what}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The gateway's firewall could not be asked, on the bus as what it is: a call
+/// nothing governed.
+fn record_gateway_unanswered(
+    st: &BrokerState,
+    ctx: &CallContext,
+    run_id: &str,
+    effect: DependencyEffect,
+    detail: &str,
+) {
     let outcome = st.events.emit(
         EventType::DependencyFailed,
         crate::sink::now_millis(),
@@ -1711,15 +1923,10 @@ fn taint_gate_unanswered(
             Dependency::PolicyPlane,
             DependencyStage::Decide,
             effect,
-            &format!("mcp broker: the taint gate at {url} {what}"),
+            detail,
         ),
     );
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
-    if st.taint_failclosed {
-        Err(format!("blocked: the taint gate {what}"))
-    } else {
-        Ok(())
-    }
 }
 
 /// Broker a single JSON-RPC request and return the response - shared by the HTTP
@@ -1856,8 +2063,27 @@ async fn process_into(
     // the call through; this carries that verdict to the response annotation.
     let mut wardryx_shadow: Option<&'static str> = None;
 
+    // The classification this call falls under, by the server it reaches and
+    // never by the tool it names (invariant 143).
+    let observed = (method == "tools/call")
+        .then(|| classified(st, &upstream_url))
+        .flatten();
+
     // 1. Credential brokering + the Wardryx policy gate on tool calls.
     if method == "tools/call" {
+        // A label lives on a run, so a read of a classified upstream that names
+        // none is a read the label cannot follow. Refused before anything is
+        // forwarded, whatever the taint gate's own fail mode says: the header is
+        // the caller's to send, and leaving it off must not be the way out.
+        if observed.is_some() && record_run_id(ctx).is_none() {
+            tracing::warn!(tool = %tool, "mcp broker: refused a call to a classified upstream with no x-fuse-run-id");
+            return rpc_error(
+                &id,
+                -32004,
+                "blocked: this upstream's output carries a label and this call names no run \
+                 (x-fuse-run-id)",
+            );
+        }
         // A tool this process has seen change since it was pinned (invariant
         // 91). First, before any argument is read or any secret resolved: the
         // cheapest refusal is the one that happens first. Block refuses, warn
@@ -2266,6 +2492,18 @@ async fn process_into(
         Ok(v) => v,
         Err(e) => return rpc_error(&id, -32000, &e),
     };
+
+    // The act the agent cannot rename: this server answered this call, so the run
+    // carries what its output carries before the answer leaves this process. Any
+    // answer counts, `isError` included: that flag is the upstream's word about
+    // what happened, the text still reaches the model, and scopyx itself sets it on
+    // a page it refused after fetching.
+    if let Some(up) = observed {
+        if let Err(msg) = report_observed_act(st, ctx, up).await {
+            tracing::warn!(tool = %tool, "mcp broker: withheld an answer whose label could not be recorded");
+            return rpc_error(&id, -32004, &msg);
+        }
+    }
 
     // 2. Poisoning + rug-pull checks on tool listings.
     if method == "tools/list" && st.scan != ScanMode::Off {
@@ -2989,6 +3227,136 @@ mod tests {
     /// The broker's own gateway key comes from a file: unset is no key, a
     /// file is its first line trimmed, and a file that cannot be read or holds
     /// nothing refuses with the variable and the path and never the key.
+    fn upstreams() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("scopyx".to_string(), "http://scopyx:4300".to_string()),
+            ("typryx".to_string(), "http://typryx:4320/mcp".to_string()),
+        ])
+    }
+
+    #[test]
+    fn with_no_classification_nothing_is_classified() {
+        for spec in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                upstream_labels_from(spec, "http://d:1", &upstreams()),
+                Ok(UpstreamLabels::new()),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_classification_is_held_by_the_server_and_not_by_the_name() {
+        let held = upstream_labels_from(
+            Some("scopyx=web|file, typryx=internal"),
+            "http://d:1",
+            &upstreams(),
+        )
+        .expect("a usable spec");
+        let scopyx = &held[&upstream_key("http://scopyx:4300")];
+        assert_eq!(scopyx.name, "scopyx");
+        assert_eq!(scopyx.labels, vec!["file", "web"]);
+        assert!(held.contains_key(&upstream_key("http://scopyx:4300/")));
+        assert_eq!(
+            held[&upstream_key("http://typryx:4320/mcp")].labels,
+            vec!["internal"]
+        );
+
+        // Two names for one server are one classification, and it carries both.
+        let mut aliased = upstreams();
+        aliased.insert("web".to_string(), "http://scopyx:4300/".to_string());
+        let one =
+            upstream_labels_from(Some("scopyx=web,web=file"), "http://d:1", &aliased).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            one.values().next().unwrap().labels,
+            vec!["file", "web"],
+            "the union, because a call may take either name"
+        );
+    }
+
+    #[test]
+    fn the_default_upstream_is_classified_by_its_reserved_name() {
+        let held = upstream_labels_from(Some("default=web"), "http://d:1", &upstreams()).unwrap();
+        assert_eq!(held[&upstream_key("http://d:1")].name, "default");
+
+        // A named upstream called `default` is the one the operator wrote down.
+        let mut named = upstreams();
+        named.insert("default".to_string(), "http://other:2".to_string());
+        let held = upstream_labels_from(Some("default=web"), "http://d:1", &named).unwrap();
+        assert!(held.contains_key(&upstream_key("http://other:2")));
+        assert!(!held.contains_key(&upstream_key("http://d:1")));
+    }
+
+    #[test]
+    fn one_bad_entry_refuses_the_whole_classification() {
+        for (spec, names) in [
+            ("scopyx=web,nosuch=web", "nosuch"),
+            ("scopyx=web,typryx", "typryx"),
+            ("scopyx=web,typryx=", "typryx"),
+            ("scopyx=||", "scopyx"),
+            ("=web", "\"\""),
+        ] {
+            let refusal =
+                upstream_labels_from(Some(spec), "http://d:1", &upstreams()).expect_err(spec);
+            assert!(refusal.contains(UPSTREAM_LABELS_VAR), "{spec}: {refusal}");
+            assert!(refusal.contains(names), "{spec}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_classification_with_no_gateway_is_refused_and_an_empty_one_never_is() {
+        let held = upstream_labels_from(Some("scopyx=web"), "http://d:1", &upstreams()).unwrap();
+        for gateway in [None, Some(""), Some("  ")] {
+            let refusal = refuse_labels_without_a_gateway(&held, gateway).expect("refused");
+            assert!(refusal.contains(UPSTREAM_LABELS_VAR), "{refusal}");
+            assert!(refusal.contains("TOKENFUSE_MCP_TAINT_GATEWAY"), "{refusal}");
+        }
+        assert_eq!(
+            refuse_labels_without_a_gateway(&held, Some("http://g:1")),
+            None
+        );
+        assert_eq!(
+            refuse_labels_without_a_gateway(&UpstreamLabels::new(), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hostile_classification_never_panics_and_never_half_applies() {
+        // 200 seeded values built from the bytes the grammar cares about. Each is
+        // refused whole or read whole: an entry the expected parse below calls bad
+        // must never leave the others standing.
+        let mut seed: u64 = 0x1ab3_1104_2026_0001;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = [
+            "scopyx", "typryx", "default", "nosuch", "=", "|", ",", " ", "web", "",
+        ];
+        for case in 0..200 {
+            let spec: String = (0..(next() % 9))
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            let got = upstream_labels_from(Some(&spec), "http://d:1", &upstreams());
+            let bad_entry = spec
+                .split(',')
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .any(|e| match e.split_once('=') {
+                    None => true,
+                    Some((name, labels)) => {
+                        !["scopyx", "typryx", "default"].contains(&name.trim())
+                            || labels.split('|').all(|l| l.trim().is_empty())
+                    }
+                });
+            assert_eq!(got.is_err(), bad_entry, "case {case}: {spec:?}");
+        }
+    }
+
     #[test]
     fn the_brokers_own_gateway_key_is_read_from_a_file_and_never_named() {
         assert_eq!(taint_gateway_key_from(None, |_| unreachable!()), Ok(None));
