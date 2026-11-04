@@ -153,6 +153,14 @@ Feature: A provider that keeps failing is one incident
     Then it is filed in the shared other bucket of its site with its own label in the summary
     And an acknowledgement of other is cleared by the new failure
 
+  # @test:a_finding_from_outside_cannot_file_in_the_provider_reserve
+  # @test:findings_in_the_provider_id_space_do_not_get_the_reserve_exemption
+  Scenario: A finding from outside cannot file in the provider reserve
+    Given a finding whose detector is dependency_failed and whose identity starts provider:
+    When it is posted to the findings route, or recorded through the store
+    Then it is refused, nothing in the report is recorded, and it opens no incident outside the org's cap
+    And a finding of that detector that names no provider is an ordinary one
+
   # @test:old_and_acknowledged_provider_incidents_free_their_place
   # @test:recent_provider_incidents_hold_their_place_even_when_acknowledged
   # @test:unacknowledged_provider_incidents_hold_their_place_however_old

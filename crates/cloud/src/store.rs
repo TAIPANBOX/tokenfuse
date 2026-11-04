@@ -1738,6 +1738,29 @@ impl Default for Store {
     }
 }
 
+/// Invariant 144. Whether a finding with this detector and subject would be
+/// filed under an incident id in the space the provider detector owns,
+/// `dependency_failed:provider:`. That space has a reserve of its own that
+/// the org's incident cap does not count, so only the detector that holds the
+/// reserve may file in it: `POST /v1/findings` lets a caller choose the id, and
+/// is refused there.
+pub fn is_reserved_incident_id(detector: &str, subject: &str) -> bool {
+    is_provider_incident_id(&incident_id(detector, subject))
+}
+
+/// A finding named an incident id in the space the provider detector reserves
+/// (see [`is_reserved_incident_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedIncidentId;
+
+impl std::fmt::Display for ReservedIncidentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("that detector and identity name an incident this plane files itself")
+    }
+}
+
+impl std::error::Error for ReservedIncidentId {}
+
 /// One externally detected finding, as [`Store::record_external_finding`]
 /// takes it. A struct rather than eight positional arguments: every field here
 /// is a string or a small scalar, and a call site that transposes `detector`
@@ -2923,19 +2946,7 @@ impl Store {
             let prior = incidents
                 .get(&incident_id("dependency_failed", &scope))
                 .map(|i| i.occurrences);
-            let mut inc = upsert_incident(
-                &mut inner.incidents,
-                org,
-                "dependency_failed",
-                // Fixed: the event type of this name is `high` on the wire
-                // (contracts/tokenfuse-constants.json), and a count past the
-                // threshold does not make a provider more down.
-                tokenfuse_core::Severity::High,
-                &scope,
-                None,
-                None,
-                now_ms,
-            );
+            let mut inc = upsert_provider_incident(&mut inner.incidents, org, &scope, now_ms);
             if let Some(stored) = inner
                 .incidents
                 .get_mut(org)
@@ -3689,7 +3700,7 @@ impl Store {
         org: &str,
         reported_by: &str,
         f: FindingInput<'_>,
-    ) -> Incident {
+    ) -> Result<Incident, ReservedIncidentId> {
         let FindingInput {
             source,
             detector,
@@ -3698,6 +3709,11 @@ impl Store {
             summary,
             ts_millis,
         } = f;
+        // Refused before anything is taken or written: see
+        // [`is_reserved_incident_id`].
+        if is_reserved_incident_id(detector, subject) {
+            return Err(ReservedIncidentId);
+        }
         let agent_id = subject.starts_with("agent://").then(|| subject.to_string());
         let mut inner = self.inner.write().unwrap();
         let inc = upsert_incident(
@@ -3729,10 +3745,10 @@ impl Store {
                 source,
             );
             inner.dirty = true;
-            return out;
+            return Ok(out);
         }
         inner.dirty = true;
-        inc
+        Ok(inc)
     }
 
     /// Atomically decide whether to push for an incident and, if so, stamp its
@@ -4842,6 +4858,53 @@ fn upsert_incident(
     agent_id: Option<String>,
     ts: i64,
 ) -> Incident {
+    upsert_incident_with(
+        incidents, org, kind, severity, scope, run_id, agent_id, ts, true,
+    )
+}
+
+/// The provider detector's own path (invariant 144), reachable only from
+/// `note_provider_failures_from_at`. It files in the space reserved for
+/// provider incidents and evicts nothing: the caller has already made room
+/// within the reserve, which the org's incident cap neither counts nor
+/// evicts from. Everything else files through [`upsert_incident`], which
+/// leaves that space out of its count and its eviction and which no caller
+/// outside this detector can reach with an id in it (`record_external_finding`
+/// refuses one).
+fn upsert_provider_incident(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    scope: &str,
+    ts: i64,
+) -> Incident {
+    upsert_incident_with(
+        incidents,
+        org,
+        "dependency_failed",
+        // Fixed: the event type of this name is `high` on the wire
+        // (contracts/tokenfuse-constants.json), and a count past the threshold
+        // does not make a provider more down.
+        tokenfuse_core::Severity::High,
+        scope,
+        None,
+        None,
+        ts,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_incident_with(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    kind: &str,
+    severity: tokenfuse_core::Severity,
+    scope: &str,
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    ts: i64,
+    evicts: bool,
+) -> Incident {
     let id = incident_id(kind, scope);
     let per_org = incidents.entry(org.to_string()).or_default();
     // C1: bound `per_org`'s cardinality: a `run_id` is caller-chosen, so nothing
@@ -4862,10 +4925,7 @@ fn upsert_incident(
     // eviction: they have a reserve of their own, so a stream of them cannot
     // push out an incident of another kind, and a stream of those cannot push
     // out a provider incident. The caller holds the provider reserve.
-    if !is_provider_incident_id(&id)
-        && !per_org.contains_key(&id)
-        && per_org.len() >= MAX_INCIDENTS_PER_ORG
-    {
+    if evicts && !per_org.contains_key(&id) && per_org.len() >= MAX_INCIDENTS_PER_ORG {
         let others = per_org
             .keys()
             .filter(|k| !is_provider_incident_id(k))

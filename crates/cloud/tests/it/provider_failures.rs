@@ -347,7 +347,8 @@ fn fill_with_other_incidents(s: &Store, n: usize) {
                 summary: "",
                 ts_millis: T0,
             },
-        );
+        )
+        .unwrap();
     }
 }
 

@@ -1533,6 +1533,18 @@ async fn external_findings(
                 .into_response()
         }
     };
+    // A finding may not name an incident id in the space the provider detector
+    // reserves (invariant 144). Checked for the whole report before any of it
+    // is recorded, so a refused report records nothing.
+    if findings
+        .iter()
+        .any(|f| crate::store::is_reserved_incident_id(&f.detector, &f.identity))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "that detector and identity name an incident this plane files itself",
+        );
+    }
     let source = sanitize_source(params.source.as_deref());
     let now = now_millis();
     let mut accepted = 0usize;
@@ -1554,9 +1566,13 @@ async fn external_findings(
         // payload only so a reporter needs no adapter to talk to this route.
         let _ = &f.time;
         let ts = now;
-        st.store
-            .record_external_finding(&org, &actor, finding_input(&source, &f, severity, ts));
-        accepted += 1;
+        if st
+            .store
+            .record_external_finding(&org, &actor, finding_input(&source, &f, severity, ts))
+            .is_ok()
+        {
+            accepted += 1;
+        }
     }
     (StatusCode::OK, Json(ExternalFindingsResponse { accepted })).into_response()
 }

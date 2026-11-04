@@ -119,18 +119,20 @@ async fn our_own_detections_carry_no_source() {
     // A finding sets `source`; a threshold this plane trips itself must not,
     // or the field would stop meaning anything.
     let (_state, store) = test_state();
-    store.record_external_finding(
-        "acme",
-        "key:abc123",
-        FindingInput {
-            source: "idryx",
-            detector: "data_exfiltration",
-            severity: tokenfuse_core::Severity::Critical,
-            subject: "agent://meridian.example/treasury/cashflow-forecaster",
-            summary: "large outbound transfer to an unknown sink",
-            ts_millis: 1_000,
-        },
-    );
+    store
+        .record_external_finding(
+            "acme",
+            "key:abc123",
+            FindingInput {
+                source: "idryx",
+                detector: "data_exfiltration",
+                severity: tokenfuse_core::Severity::Critical,
+                subject: "agent://meridian.example/treasury/cashflow-forecaster",
+                summary: "large outbound transfer to an unknown sink",
+                ts_millis: 1_000,
+            },
+        )
+        .unwrap();
     let incidents = store.incidents("acme");
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].source.as_deref(), Some("idryx"));
