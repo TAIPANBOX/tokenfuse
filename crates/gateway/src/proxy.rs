@@ -11702,4 +11702,98 @@ pub(crate) mod tests {
         emit(Dependency::Provider, DependencyStage::Send);
         assert_eq!(reporter.flush().await, Flush::Dropped(2));
     }
+
+    /// An upstream whose transport error names the URL it was sent to, query
+    /// string and all, the way reqwest's own message does. The URL here has a
+    /// credential in its query, built at run time so this file holds none.
+    struct LeakyProvider {
+        secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for LeakyProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::NotSent(format!(
+                "error sending request for url (https://llm.example.test/v1/messages?api_key={}): \
+                 tcp connect error: Connection refused",
+                self.secret
+            )))
+        }
+    }
+
+    // Invariant 144: what the Cloud is told about a failed send is a fixed
+    // class, never the text of the transport error. That text carries the
+    // upstream URL, and an upstream URL can carry a credential in its query.
+    // The event on the local bus keeps the full text; the Cloud copy does not.
+    #[tokio::test]
+    async fn the_text_of_a_transport_error_never_goes_to_the_cloud() {
+        use crate::providerreport::{install_for_this_thread, ProviderFailureReporter};
+        let secret = ["QUERY", "SECRET", "123"].concat();
+        let reporter = Arc::new(ProviderFailureReporter::new("http://127.0.0.1:1", "k", "p"));
+        install_for_this_thread(Arc::clone(&reporter));
+        let (events, _path) = recording_exporter("leaky");
+        let st = state_with_provider(Arc::new(LeakyProvider {
+            secret: secret.clone(),
+        }))
+        .with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-leaky")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(reporter.pending_count(), 1);
+        let detail = reporter.pending_detail();
+        assert!(!detail.contains(&secret), "the Cloud copy carried {detail:?}");
+        assert!(!detail.contains("llm.example.test"), "{detail:?}");
+        assert_eq!(detail, "send failed");
+    }
+
+    // Invariant 144: the Cloud counts a provider's HEALTH, so only the
+    // statuses that say the provider is unwell: a 5xx, a 408, a 429. A 400 or
+    // a 404 is how a provider answers a model id the caller chose, and the
+    // caller can provoke it at will, so it stays on the bus as it always did
+    // and is not counted. The model, which the caller also chose, is not sent.
+    #[test]
+    fn only_a_providers_health_statuses_are_counted_for_the_cloud() {
+        use crate::providerreport::{install_for_this_thread, ProviderFailureReporter};
+        let events = crate::events::EventExporter::disabled();
+        let statuses = [
+            (400, false),
+            (401, false),
+            (403, false),
+            (404, false),
+            (413, false),
+            (422, false),
+            (408, true),
+            (429, true),
+            (500, true),
+            (502, true),
+            (503, true),
+            (504, true),
+            (529, true),
+        ];
+        for (code, counted) in statuses {
+            let reporter = Arc::new(ProviderFailureReporter::new("http://127.0.0.1:1", "k", "p"));
+            install_for_this_thread(Arc::clone(&reporter));
+            emit_upstream_refused_via(
+                &events,
+                "run-1",
+                "agent://test.local/a",
+                None,
+                "caller-chosen-model-name",
+                StatusCode::from_u16(code).unwrap(),
+            );
+            assert_eq!(reporter.pending_count(), u64::from(counted), "HTTP {code}");
+            if counted {
+                assert_eq!(reporter.pending_detail(), format!("HTTP {code}"));
+            }
+        }
+    }
 }

@@ -91,6 +91,25 @@ impl ProviderFailureReporter {
             .collect();
     }
 
+    /// What a test reads instead of the Cloud: the count and the detail
+    /// waiting for the next flush.
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> u64 {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_detail(&self) -> String {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .detail
+            .clone()
+    }
+
     /// Send what has been counted since the last flush as one report. The
     /// counter is cleared first, whatever the answer: a failed delivery is
     /// dropped, not retried (see the module comment).
@@ -166,10 +185,7 @@ pub fn provider_label(upstream: Option<&str>) -> String {
         return "stub".to_string();
     };
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest
-        .split(|c| matches!(c, '/' | '?' | '#'))
-        .next()
-        .unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if host.is_empty() {
         "unknown".to_string()

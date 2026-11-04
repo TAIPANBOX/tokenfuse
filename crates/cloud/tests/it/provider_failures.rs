@@ -257,6 +257,29 @@ fn a_provider_already_tracked_keeps_its_own_incident_when_the_cap_is_full() {
 }
 
 #[test]
+fn a_provider_that_stopped_failing_gives_its_slot_back() {
+    // The cap is on providers being counted, not on every label ever seen:
+    // sixty-four old labels whose windows have emptied must not push a real
+    // provider into the shared bucket, where its incident would carry a name
+    // nobody recognises.
+    let s = store(3);
+    for i in 0..MAX_PROVIDERS_PER_ORG {
+        s.note_provider_failures_at("acme", &format!("old{i}.example.test"), 1, "", T0);
+    }
+    let later = T0 + 11 * MINUTE;
+    let inc = s
+        .note_provider_failures_at("acme", "real.example.test", 3, "", later)
+        .expect("three failures of a real provider reach the threshold");
+    assert_eq!(inc.id, "dependency_failed:provider:real.example.test");
+    assert!(
+        s.incidents("acme")
+            .iter()
+            .all(|i| !i.id.ends_with(&format!(":{PROVIDER_OVERFLOW_BUCKET}"))),
+        "the real provider was counted in the shared bucket"
+    );
+}
+
+#[test]
 fn an_absurd_count_is_clamped_and_cannot_overflow() {
     let s = store(3);
     let first = s
@@ -306,6 +329,7 @@ fn test_state() -> (AppState, Arc<Store>) {
         ("adminkey", "admin", None),
         ("ingestkey", "ingest", None),
         ("sitekey", "ingest", Some("gw-1")),
+        ("sitekey2", "ingest", Some("gw-2")),
         ("viewerkey", "viewer", None),
     ] {
         keys.insert(
@@ -522,4 +546,23 @@ async fn a_provider_name_cannot_carry_markup_into_an_incident() {
         !id.contains('<') && !id.contains('>') && !id.contains(' '),
         "{id}"
     );
+}
+
+#[tokio::test]
+async fn a_key_bound_to_one_site_cannot_add_to_another_sites_count() {
+    let (state, store) = test_state();
+    for _ in 0..2 {
+        post(&state, Some("sitekey"), report(PROVIDER, 1)).await;
+    }
+    for _ in 0..2 {
+        post(&state, Some("sitekey2"), report(PROVIDER, 1)).await;
+    }
+    assert!(
+        store.incidents("acme").is_empty(),
+        "two sites each under the threshold added up to an incident"
+    );
+    post(&state, Some("sitekey"), report(PROVIDER, 1)).await;
+    let all = incidents(&state).await;
+    assert_eq!(all.len(), 1, "the first site's own third failure opens its own incident");
+    assert_eq!(all[0]["id"], "dependency_failed:provider:api.example.test@gw-1");
 }
