@@ -117,6 +117,19 @@ answers a call carrying `x-fuse-run-id` with `503 seed_pending` (retryable,
 `x-fuse-would-block` in shadow and warn. Each run it touches that way is one
 `dependency_failed` on the bus (`dependency: control_plane`, `stage: seed`).
 
+**A provider that keeps failing is one incident (invariant 144).** The gateway
+puts a `dependency_failed` on the bus for every call its provider fails, and
+every call is its own run, so an outage is thousands of events and no one row.
+The gateway also counts those failures and, every two seconds, sends the count
+to `POST /v1/provider-failures` with the same Cloud key (`ingest` or `admin`);
+what cannot be delivered is dropped, not queued, and the per-call event on the
+bus is unchanged. The control plane folds a provider's failures into one
+incident, `dependency_failed:provider:<host of TOKENFUSE_UPSTREAM>`, once
+`TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES` (default 3) calls have failed in
+ten minutes. It is on the console and `GET /v1/incidents`, with the failures
+folded as `occurrences`; it names a provider and no agent, so it is not on the
+agent-event bus.
+
 Enable it on any gateway, with a key the control plane lists for that gateway
 (`secret:org:ingest:site-name` in `TOKENFUSE_CLOUD_KEYS`; there is no built-in key):
 

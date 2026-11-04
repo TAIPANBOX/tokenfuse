@@ -29,6 +29,7 @@ mod oidc;
 mod openapi;
 mod pairing;
 mod pii_found;
+mod provider_failures;
 mod reads;
 mod replay;
 mod run_models;

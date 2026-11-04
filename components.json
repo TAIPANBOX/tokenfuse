@@ -429,6 +429,9 @@
           "TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS": {
             "required": false
           },
+          "TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES": {
+            "required": false
+          },
           "TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD": {
             "required": false
           },

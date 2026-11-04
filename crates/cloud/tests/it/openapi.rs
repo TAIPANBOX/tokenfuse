@@ -34,6 +34,8 @@ fn spec_covers_every_endpoint() {
     let paths = json["paths"].as_object().expect("paths object");
     for p in [
         "/v1/ingest",
+        // invariant 144: a gateway's report of failed provider calls.
+        "/v1/provider-failures",
         "/v1/runs",
         "/v1/summary",
         "/v1/alerts",

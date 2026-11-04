@@ -1582,6 +1582,9 @@ async fn serve() {
                     },
                 );
             }
+            // Invariant 144: count the provider's failures and report them to
+            // the Cloud, which folds them into one incident per provider.
+            tokenfuse_gateway::providerreport::install(&base, &key, upstream_url.as_deref());
             let cloud = Arc::new(
                 tokenfuse_gateway::cloudsink::CloudSink::new(base, key)
                     .with_unit_owners(state.identity.unit_owners())

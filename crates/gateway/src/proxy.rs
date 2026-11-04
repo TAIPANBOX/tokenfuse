@@ -223,6 +223,14 @@ fn emit_dependency_failed_via(
     effect: DependencyEffect,
     detail: &str,
 ) {
+    // Invariant 144: a provider's failure is also counted for the Cloud's one
+    // incident per provider. Only the provider's: the policy plane and the
+    // control plane are other dependencies with other incidents. Counted
+    // whether or not the event below is written, because the exporter skips a
+    // call with no agent and the provider failed all the same.
+    if matches!(dependency, Dependency::Provider) {
+        crate::providerreport::note_provider_failure(detail);
+    }
     let outcome = events.emit(
         EventType::DependencyFailed,
         now_millis(),
@@ -252,8 +260,12 @@ fn is_the_providers_refusal(status: StatusCode) -> bool {
 /// since tokenfuse#260, one `dependency_failed` on the bus at stage
 /// `response` for the statuses `is_the_providers_refusal` names, so an
 /// operator's notifier hears about a provider refusing every call. `detail`
-/// carries the status and the model, the two things a person reads first;
-/// heraldyx's own window keeps a throttling burst to one mail. Emitted where
+/// carries the status and the model, the two things a person reads first.
+/// Each call is its own run, so a notifier that keys its window on the run
+/// mails a throttling burst once per call, not once; for it to be one mail the
+/// notifier has to key this event on `data.dependency`. The Cloud's one
+/// incident per provider (invariant 144) is the row that is one either way.
+/// Emitted where
 /// the status is first known on both managed paths, so a streamed refusal
 /// does not wait for the guard.
 fn emit_upstream_refused_via(
@@ -11647,5 +11659,47 @@ pub(crate) mod tests {
             "a deployment with a delegation issuer configured is not held to \
              the contradiction check by default"
         );
+    }
+
+    // Invariant 144: a provider's failure is counted for the Cloud's one
+    // incident per provider, and another dependency's is not. The reporter's
+    // Cloud is a port nothing listens on, so a flush answers `Dropped(n)` with
+    // the count it held, which is all this test needs to read.
+    #[tokio::test]
+    async fn only_a_provider_failure_is_counted_for_the_cloud_incident() {
+        use crate::providerreport::{install_for_this_thread, Flush, ProviderFailureReporter};
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let reporter = Arc::new(ProviderFailureReporter::new(
+            &format!("http://127.0.0.1:{port}"),
+            "k",
+            "p",
+        ));
+        install_for_this_thread(Arc::clone(&reporter));
+        let events = crate::events::EventExporter::disabled();
+        let emit = |dependency, stage| {
+            emit_dependency_failed_via(
+                &events,
+                Some("run-1"),
+                "agent://test.local/a",
+                None,
+                dependency,
+                stage,
+                DependencyEffect::CallFailed,
+                "provider answered HTTP 503 for model m",
+            )
+        };
+        emit(Dependency::PolicyPlane, DependencyStage::Decide);
+        emit(Dependency::ControlPlane, DependencyStage::Seed);
+        assert_eq!(
+            reporter.flush().await,
+            Flush::Nothing,
+            "the policy plane and the control plane are other dependencies"
+        );
+        emit(Dependency::Provider, DependencyStage::Response);
+        emit(Dependency::Provider, DependencyStage::Send);
+        assert_eq!(reporter.flush().await, Flush::Dropped(2));
     }
 }

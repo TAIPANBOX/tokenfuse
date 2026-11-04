@@ -1080,6 +1080,18 @@ pub struct IncidentConfig {
     /// whose "zero is unset" rule is exactly wrong for a knob whose zero means
     /// off.
     pub stall_after_ms: i64,
+    /// `dependency_failed` for a provider (invariant 144) opens once a
+    /// provider has failed at least this many calls within
+    /// `provider_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES`). One
+    /// failure is a bad minute, a handful in a row is a provider that is down
+    /// or throttling, and the gateway's per-call events cannot tell the two
+    /// apart because each is its own run.
+    pub provider_failures: u64,
+    /// Window for the `dependency_failed` count, ten minutes like the
+    /// `sustained_loop` repeat window. Counted in ten-second buckets, and a
+    /// bucket whose start is a whole window old is dropped, so a count never
+    /// includes a failure older than the window.
+    pub provider_window_ms: i64,
 }
 
 impl Default for IncidentConfig {
@@ -1095,6 +1107,8 @@ impl Default for IncidentConfig {
             fanout_multiple: 4,
             fanout_window_ms: 600_000,
             stall_after_ms: 300_000,
+            provider_failures: 3,
+            provider_window_ms: 600_000,
         }
     }
 }
@@ -1224,6 +1238,33 @@ const MAX_UNIT_MONTH_KEYS: usize = 4_096;
 /// silently zero a real site's counters mid-incident, while the overflow
 /// bucket stays visible. Far above any real fleet's site count.
 const MAX_GATEWAYS_PER_ORG: usize = 1_024;
+
+/// Invariant 144. The longest provider label kept, in characters.
+pub const PROVIDER_LABEL_MAX_CHARS: usize = 128;
+
+/// Invariant 144. Distinct providers tracked per org. A gateway names one
+/// upstream, so a real org has a handful; a label is whatever the pushing key
+/// sent, so a hostile or broken one could otherwise open an incident per
+/// string. A NEW provider past the cap folds into [`PROVIDER_OVERFLOW_BUCKET`]
+/// rather than evicting a real one: evicting would silently reset a real
+/// outage's count, while the overflow bucket stays visible.
+pub const MAX_PROVIDERS_PER_ORG: usize = 64;
+
+/// Invariant 144. Where a provider past [`MAX_PROVIDERS_PER_ORG`] is counted.
+pub const PROVIDER_OVERFLOW_BUCKET: &str = "other";
+
+/// Invariant 144. The most failures one report entry is allowed to add. A
+/// count is a number the pushing key chose; clamped, a single hostile entry
+/// cannot turn the incident's `occurrences` into a number nobody can read.
+pub const MAX_PROVIDER_FAILURES_PER_REPORT: u64 = 1_000_000;
+
+/// Invariant 144. Failures are counted in buckets this wide, so a provider
+/// that fails a thousand calls a second keeps six dozen numbers in memory
+/// across a ten-minute window, not a thousand a second.
+const PROVIDER_BUCKET_MS: i64 = 10_000;
+
+/// Invariant 144. The longest `detail` kept in an incident's summary.
+const PROVIDER_DETAIL_MAX_CHARS: usize = 160;
 
 /// Default alert-fraction threshold (mirrors `TOKENFUSE_CLOUD_ALERT_PCT`'s
 /// documented default in `main.rs`), used by [`Store::with_incident_config`]
@@ -1443,6 +1484,13 @@ struct Inner {
     /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
     /// threshold against (ephemeral — the `Incident` is the durable record).
     incident_tracker: HashMap<(String, String), VecDeque<i64>>,
+    /// org → provider label → `(bucket start, failures)` in ten-second
+    /// buckets, oldest first, for the `dependency_failed` count (invariant
+    /// 144). Ephemeral like the other trackers: the `Incident` is the durable
+    /// record, and a restart costs at most one window of counting. Bounded by
+    /// [`MAX_PROVIDERS_PER_ORG`] labels per org and by the window over the
+    /// bucket width per label.
+    provider_failures: HashMap<String, HashMap<String, VecDeque<(i64, u64)>>>,
     /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
     /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
     /// the windowed distinct-run count the detector thresholds against
@@ -2719,6 +2767,121 @@ impl Store {
             }
             let _ = self.events.send(StreamEvent::Incident(inc));
         }
+    }
+
+    /// `dependency_failed` for a provider (invariant 144): fold a gateway's
+    /// report of `count` failed provider calls into one incident per provider.
+    /// See [`Store::note_provider_failures_at`].
+    pub fn note_provider_failures(
+        &self,
+        org: &str,
+        provider: &str,
+        count: u64,
+        detail: &str,
+    ) -> Option<Incident> {
+        self.note_provider_failures_at(org, provider, count, detail, now_millis())
+    }
+
+    /// [`Store::note_provider_failures`] with an explicit `now_ms`. Returns the
+    /// incident when this report left the provider at or over
+    /// `provider_failures` failed calls within `provider_window_ms`, `None`
+    /// when it did not, the label names no provider, or `count` is zero.
+    ///
+    /// ONE incident per provider, id `dependency_failed:provider:<label>`: the
+    /// first report to reach the threshold opens it with the window's count as
+    /// its `occurrences`, and later reports add their `count`, so a storm of a
+    /// thousand failing calls is one row. The gateway's per-call events stay as
+    /// they are; each is its own run and heraldyx keys on the run, which is why
+    /// the console needed a row that is not.
+    ///
+    /// Arrival time, never the reporter's: the window is this plane's clock.
+    /// Org-scoped, no run and no agent, so it is not exported to the agent
+    /// event bus: the envelope requires a subject (SPEC.md 6.1) and a
+    /// provider is not one, the same accepted boundary `spend_spike` has. It
+    /// is broadcast on the stream, and so reaches the push pipeline, like any
+    /// other incident.
+    pub fn note_provider_failures_at(
+        &self,
+        org: &str,
+        provider: &str,
+        count: u64,
+        detail: &str,
+        now_ms: i64,
+    ) -> Option<Incident> {
+        let label = provider_label(provider)?;
+        let count = count.min(MAX_PROVIDER_FAILURES_PER_REPORT);
+        if count == 0 {
+            return None;
+        }
+        let threshold = self.incident_cfg.provider_failures.max(1);
+        let window_ms = self.incident_cfg.provider_window_ms.max(1);
+        let fired = {
+            let mut guard = self.inner.write().unwrap();
+            let inner = &mut *guard;
+            let per_org = inner.provider_failures.entry(org.to_string()).or_default();
+            let key = if per_org.contains_key(&label) || per_org.len() < MAX_PROVIDERS_PER_ORG {
+                label
+            } else {
+                PROVIDER_OVERFLOW_BUCKET.to_string()
+            };
+            let buckets = per_org.entry(key.clone()).or_default();
+            while buckets
+                .front()
+                .is_some_and(|(start, _)| now_ms.saturating_sub(*start) >= window_ms)
+            {
+                buckets.pop_front();
+            }
+            let bucket = now_ms - now_ms.rem_euclid(PROVIDER_BUCKET_MS);
+            let same_bucket = buckets.back().is_some_and(|(start, _)| *start == bucket);
+            if same_bucket {
+                if let Some((_, failures)) = buckets.back_mut() {
+                    *failures = failures.saturating_add(count);
+                }
+            } else {
+                buckets.push_back((bucket, count));
+            }
+            let in_window = buckets
+                .iter()
+                .fold(0u64, |sum, (_, failures)| sum.saturating_add(*failures));
+            if in_window < threshold {
+                return None;
+            }
+            let scope = format!("provider:{key}");
+            let prior = inner
+                .incidents
+                .get(org)
+                .and_then(|m| m.get(&incident_id("dependency_failed", &scope)))
+                .map(|i| i.occurrences);
+            let mut inc = upsert_incident(
+                &mut inner.incidents,
+                org,
+                "dependency_failed",
+                // Fixed: the event type of this name is `high` on the wire
+                // (contracts/tokenfuse-constants.json), and a count past the
+                // threshold does not make a provider more down.
+                tokenfuse_core::Severity::High,
+                &scope,
+                None,
+                None,
+                now_ms,
+            );
+            if let Some(stored) = inner
+                .incidents
+                .get_mut(org)
+                .and_then(|m| m.get_mut(&inc.id))
+            {
+                stored.occurrences = match prior {
+                    Some(before) => before.saturating_add(count),
+                    None => in_window,
+                };
+                stored.summary = Some(provider_summary(&key, in_window, window_ms, detail));
+                inc = stored.clone();
+            }
+            inner.dirty = true;
+            inc
+        };
+        let _ = self.events.send(StreamEvent::Incident(fired.clone()));
+        Some(fired)
     }
 
     /// `run_stalled` (invariant 60): the one detector that fires on ABSENCE,
@@ -4166,6 +4329,49 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// A provider label safe to put in an incident id and in front of an operator
+/// (invariant 144): trimmed, cut to [`PROVIDER_LABEL_MAX_CHARS`] characters,
+/// and every character outside `A-Z a-z 0-9 . _ : -` replaced by `_`. `None`
+/// for a blank label, which names no provider and so opens nothing. The label
+/// comes from the pushing key and is never trusted: it ends up in a stored id,
+/// a summary and a dashboard.
+pub fn provider_label(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(
+        t.chars()
+            .take(PROVIDER_LABEL_MAX_CHARS)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The sentence a provider `dependency_failed` incident carries (invariant
+/// 144): which provider, how many failed calls the window holds, and the most
+/// recent detail the gateway sent, control characters removed and cut to
+/// [`PROVIDER_DETAIL_MAX_CHARS`] characters.
+fn provider_summary(provider: &str, failures: u64, window_ms: i64, detail: &str) -> String {
+    let minutes = (window_ms / 60_000).max(1);
+    let detail: String = detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(PROVIDER_DETAIL_MAX_CHARS)
+        .collect();
+    if detail.is_empty() {
+        format!("{provider} failed {failures} calls in the last {minutes} min")
+    } else {
+        format!("{provider} failed {failures} calls in the last {minutes} min; last: {detail}")
+    }
 }
 
 /// The stable incident id / dedup key, `"{kind}:{run_or_agent}"`. Org-scoped
