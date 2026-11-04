@@ -11729,6 +11729,10 @@ pub(crate) mod tests {
         };
         emit(Dependency::PolicyPlane, DependencyStage::Decide);
         emit(Dependency::ControlPlane, DependencyStage::Seed);
+        // Even at a stage that is a provider's failure when the provider is
+        // the dependency, another dependency's is not counted.
+        emit(Dependency::PolicyPlane, DependencyStage::Send);
+        emit(Dependency::ControlPlane, DependencyStage::Stream);
         assert_eq!(
             reporter.flush().await,
             Flush::Nothing,

@@ -147,6 +147,7 @@ Feature: A provider that keeps failing is one incident
 
   # @test:a_provider_incident_over_the_reserve_is_filed_in_other_and_never_lost
   # @test:a_failure_folded_into_other_names_its_label_and_is_not_hidden_by_an_old_acknowledgement
+  # @test:the_shared_other_bucket_is_never_evicted_to_make_room
   Scenario: A failure over a limit is filed in other, with its label, and is never lost
     Given an org whose provider reserve is full of active incidents
     When a new provider fails
@@ -164,6 +165,7 @@ Feature: A provider that keeps failing is one incident
   # @test:old_and_acknowledged_provider_incidents_free_their_place
   # @test:recent_provider_incidents_hold_their_place_even_when_acknowledged
   # @test:unacknowledged_provider_incidents_hold_their_place_however_old
+  # @test:an_acknowledged_incident_seen_just_inside_the_window_still_holds_its_place
   Scenario: Only active provider incidents count toward a site's limit
     Given a site holding sixty-four provider incidents
     Then when they are old and acknowledged a new provider gets its own incident

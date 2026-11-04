@@ -536,6 +536,61 @@ fn recent_provider_incidents_hold_their_place_even_when_acknowledged() {
 }
 
 #[test]
+fn an_acknowledged_incident_seen_just_inside_the_window_still_holds_its_place() {
+    // The label trackers count in ten-second buckets and drop one whose start
+    // is a whole window old, so a label can be out of the tracker while its
+    // incident was seen a moment ago. The incident is what the limit counts.
+    let s = store(1);
+    let seen = T0 + 5_000;
+    fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, seen);
+    acknowledge_everything(&s);
+    let inc = s
+        .note_provider_failures_from_at(
+            "acme",
+            Some("gw-1"),
+            "fresh.example.test",
+            1,
+            "",
+            seen + 10 * MINUTE - 1,
+        )
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:other@gw-1");
+}
+
+#[test]
+fn the_shared_other_bucket_is_never_evicted_to_make_room() {
+    let s = store(1);
+    let sites = MAX_PROVIDER_INCIDENTS_PER_ORG / MAX_PROVIDERS_PER_ORG;
+    for site in 0..sites {
+        fill_site(&s, &format!("gw-{site}"), MAX_PROVIDERS_PER_ORG, T0);
+    }
+    // A 65th label on gw-0 is filed in the site's shared bucket.
+    let other = s
+        .note_provider_failures_from_at("acme", Some("gw-0"), "extra.example.test", 1, "", T0 + 1)
+        .unwrap();
+    assert_eq!(other.id, "dependency_failed:provider:other@gw-0");
+    assert!(s.ack_incident("acme", &other.id));
+    // An hour on, the shared bucket is finished (old and acknowledged) and the
+    // rest of the reserve is still unacknowledged. A new site's provider finds
+    // the reserve full, and the only finished incident in it is the bucket.
+    let inc = s
+        .note_provider_failures_from_at(
+            "acme",
+            Some("gw-new"),
+            "late.example.test",
+            1,
+            "",
+            T0 + 60 * MINUTE,
+        )
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:other@gw-new");
+    assert!(
+        s.incidents("acme").iter().any(|i| i.id == other.id),
+        "the shared bucket was evicted to make room"
+    );
+}
+
+#[test]
 fn unacknowledged_provider_incidents_hold_their_place_however_old() {
     let s = store(1);
     fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, T0);
