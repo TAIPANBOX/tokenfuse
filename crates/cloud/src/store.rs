@@ -2890,14 +2890,37 @@ impl Store {
             if in_window < threshold {
                 return None;
             }
-            let scope = match &site {
-                Some(site) => format!("provider:{key}@{site}"),
-                None => format!("provider:{key}"),
-            };
-            let prior = inner
-                .incidents
-                .get(org)
-                .and_then(|m| m.get(&incident_id("dependency_failed", &scope)))
+            // The window trackers above forget a label when its window empties;
+            // the incident it opened does not. So the number of provider
+            // incidents is bounded here, on the incidents themselves: past the
+            // cap a NEW provider is filed in the shared bucket, which is always
+            // admissible, and a label that rotates cannot open one incident per
+            // string.
+            let incidents = inner.incidents.entry(org.to_string()).or_default();
+            let mut key = key;
+            let mut scope = provider_scope(&key, site.as_deref());
+            if key != PROVIDER_OVERFLOW_BUCKET
+                && !incidents.contains_key(&incident_id("dependency_failed", &scope))
+                && provider_incidents_of_site(incidents, site.as_deref()) >= MAX_PROVIDERS_PER_ORG
+            {
+                key = PROVIDER_OVERFLOW_BUCKET.to_string();
+                scope = provider_scope(&key, site.as_deref());
+            }
+            // And a provider incident never displaces another kind: at the
+            // org's cap it makes room by removing an older provider incident,
+            // and with none to remove it is not opened.
+            if !incidents.contains_key(&incident_id("dependency_failed", &scope))
+                && incidents.len() >= MAX_INCIDENTS_PER_ORG
+                && !evict_oldest_provider_incident(incidents)
+            {
+                tracing::warn!(
+                    org,
+                    "a provider incident was not opened: the org's incident table is full of other kinds"
+                );
+                return None;
+            }
+            let prior = incidents
+                .get(&incident_id("dependency_failed", &scope))
                 .map(|i| i.occurrences);
             let mut inc = upsert_incident(
                 &mut inner.incidents,
@@ -4407,6 +4430,55 @@ pub fn provider_label(raw: &str) -> Option<String> {
             })
             .collect(),
     )
+}
+
+/// Invariant 144. The incident-id prefix of every provider incident.
+const PROVIDER_ID_PREFIX: &str = "dependency_failed:provider:";
+
+/// Invariant 144. The scope of a provider incident, `provider:<key>` with
+/// `@<site>` appended for a key bound to a site. A label cannot contain `@`
+/// (see [`provider_label`]), so the two halves never run together.
+fn provider_scope(key: &str, site: Option<&str>) -> String {
+    match site {
+        Some(site) => format!("provider:{key}@{site}"),
+        None => format!("provider:{key}"),
+    }
+}
+
+/// Invariant 144. How many provider incidents one reporting site has, the
+/// shared bucket not counted. Read from the incidents themselves, because the
+/// window trackers forget a label when its window empties and the incident
+/// does not.
+fn provider_incidents_of_site(incidents: &HashMap<String, Incident>, site: Option<&str>) -> usize {
+    incidents
+        .keys()
+        .filter(|id| {
+            let Some(rest) = id.strip_prefix(PROVIDER_ID_PREFIX) else {
+                return false;
+            };
+            let (label, id_site) = match rest.split_once('@') {
+                Some((label, site)) => (label, Some(site)),
+                None => (rest, None),
+            };
+            id_site == site && label != PROVIDER_OVERFLOW_BUCKET
+        })
+        .count()
+}
+
+/// Invariant 144. Remove the provider incident that was seen longest ago, for
+/// room to open another; `false` when the org has none. A provider incident
+/// may displace another provider incident and nothing else: a flood of
+/// provider labels must not push out a budget or an identity incident.
+fn evict_oldest_provider_incident(incidents: &mut HashMap<String, Incident>) -> bool {
+    let oldest = incidents
+        .iter()
+        .filter(|(id, _)| id.starts_with(PROVIDER_ID_PREFIX))
+        .min_by_key(|(_, inc)| inc.last_seen_millis)
+        .map(|(id, _)| id.clone());
+    match oldest {
+        Some(id) => incidents.remove(&id).is_some(),
+        None => false,
+    }
 }
 
 /// The sentence a provider `dependency_failed` incident carries (invariant

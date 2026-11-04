@@ -130,6 +130,20 @@ Feature: A provider that keeps failing is one incident
     Then it opens its own incident, not the shared bucket
     And one site's flood of labels does not touch another site's cap
 
+  # @test:rotating_labels_cannot_create_an_unbounded_number_of_provider_incidents
+  # @test:the_incident_cap_is_per_site_too
+  Scenario: A label that rotates cannot open an incident per string
+    Given a caller that reports a new provider label every eleven minutes, so each label's window has emptied before the next
+    Then the provider incidents stop at sixty-four and a shared other, per site
+
+  # @test:a_flood_of_provider_incidents_never_evicts_an_incident_of_another_kind
+  # @test:a_provider_incident_is_not_opened_over_a_table_full_of_other_kinds
+  Scenario: Provider incidents never push out incidents of another kind
+    Given an org whose incident table is nearly full of budget and identity incidents
+    When a flood of provider labels opens provider incidents
+    Then every incident of another kind is still there
+    And with the table full of other kinds a provider incident is not opened at all
+
   # @test:a_storm_of_failures_is_one_report_with_the_count
   # @test:nothing_counted_sends_nothing
   # @test:a_flush_clears_the_count_so_the_next_report_is_only_what_is_new
