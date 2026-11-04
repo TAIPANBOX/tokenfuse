@@ -419,7 +419,9 @@ the upstream's word and the text still reaches the model.
 tool the provider ran. These are read from the answer, buffered and streamed, and
 never from `messages[]`, because the answer is the one place they arrive that the
 caller has not had in its hands. They label the run before that answer's own tool
-calls are judged, so a shell asked for in the answer that searched is refused.
+calls are judged, so a shell asked for in the answer that searched is refused. On a
+stream the label lands as the block is seen, because a client that has the text can
+close the connection and the end of the stream then never comes.
 
 The record is the existing `taint_raised`: stage `mcp_tool_call` with `from_tools:
 ["mcp:scopyx"]` for the broker, stage `model_tool_call` with the tool's name for the

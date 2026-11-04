@@ -103,6 +103,34 @@ impl Provider for QueueProvider {
     }
 }
 
+/// Sends the search and the text and then never finishes, which is what a stream
+/// looks like from here when the client has what it wanted and the rest never comes.
+struct StallingProvider;
+
+#[async_trait]
+impl Provider for StallingProvider {
+    async fn send(
+        &self,
+        _headers: HeaderMap,
+        _body: Bytes,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let opened = STREAMED_SEARCH
+            .split("event: message_delta")
+            .next()
+            .expect("the stream has a head");
+        let stream = async_stream::try_stream! {
+            yield Bytes::copy_from_slice(opened.as_bytes());
+            futures::future::pending::<()>().await;
+        };
+        Ok(ProviderResponse {
+            status: 200,
+            content_type: Some("text/event-stream".to_string()),
+            body: Box::pin(stream),
+            usage: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
 fn events_path(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tf-observed-act-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -718,6 +746,36 @@ async fn a_streamed_search_the_provider_ran_labels_the_run() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("found it"), "{body}");
     assert_eq!(may_run_a_shell(&gw, "run-stream").await["decision"], "deny");
+}
+
+/// The label cannot wait for the end of the stream: the client decides whether that
+/// end ever comes. The check runs with the stream still open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_leaves_a_stream_early_does_not_leave_the_label_behind() {
+    let (mut st, _) = gateway(enforcing(), &[], "stream-left");
+    st.provider = Arc::new(StallingProvider);
+    let gw = spawn(tokenfuse_gateway::app(st)).await;
+
+    let mut resp = reqwest::Client::new()
+        .post(format!("{gw}/v1/messages"))
+        .header("x-fuse-run-id", "run-left")
+        .header("x-fuse-budget-usd", "5")
+        .header("x-fuse-agent-id", "agent://acme.example/reader")
+        .json(&json!({"model": MODEL, "max_tokens": 100, "stream": true, "messages": plain_conversation()}))
+        .send()
+        .await
+        .unwrap();
+    let mut seen = String::new();
+    while !seen.contains("found it") {
+        let chunk = resp.chunk().await.unwrap().expect("the text arrives");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(
+        may_run_a_shell(&gw, "run-left").await["decision"],
+        "deny",
+        "the stream has not ended and the client already has the text"
+    );
+    drop(resp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

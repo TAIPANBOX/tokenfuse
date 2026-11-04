@@ -140,6 +140,12 @@ Feature: A run's label comes from what it did, not from what it called it
     Then the agent gets the stream
     And the run carries the web label
 
+  # @test:a_client_that_leaves_a_stream_early_does_not_leave_the_label_behind
+  Scenario: Leaving a stream early does not leave the label behind
+    When the agent has the text of a streamed answer that searched
+    And the stream has not ended
+    Then the run already carries the web label
+
   # @test:a_streamed_tool_call_after_a_provider_search_is_judged_with_its_label
   Scenario: A streamed shell after a provider search is judged after the search
     When a streamed answer records a provider search and asks to run a shell
