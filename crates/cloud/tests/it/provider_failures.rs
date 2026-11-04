@@ -572,6 +572,73 @@ fn a_failure_folded_into_other_names_its_label_and_is_not_hidden_by_an_old_ackno
     assert!(again.summary.unwrap().contains("extra2.example.test"));
 }
 
+// --- the provider reserve cannot be reached from outside ---------------------
+
+fn finding_for(identity: &str) -> serde_json::Value {
+    serde_json::json!({
+        "detector": "dependency_failed",
+        "identity": identity,
+        "severity": "high",
+        "summary": "claims to be a provider incident"
+    })
+}
+
+#[tokio::test]
+async fn a_finding_from_outside_cannot_file_in_the_provider_reserve() {
+    let (state, store) = test_state();
+    let (status, _) = post_to(
+        &state,
+        "/v1/findings?source=idryx",
+        Some("adminkey"),
+        serde_json::json!([finding_for("provider:evil.example.test")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        store.incidents("acme").is_empty(),
+        "a finding filed an incident in the id space the provider detector owns"
+    );
+    // A finding of that detector that names no provider is an ordinary one.
+    let (status, body) = post_to(
+        &state,
+        "/v1/findings?source=idryx",
+        Some("adminkey"),
+        serde_json::json!([finding_for("agent://acme.example/biller")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["accepted"], 1);
+}
+
+#[test]
+fn findings_in_the_provider_id_space_do_not_get_the_reserve_exemption() {
+    // The exemption from the org's incident cap is for the incidents this
+    // plane's own detector files. A caller that can name the id must not be
+    // able to use it to open an unbounded number of incidents, or to push out
+    // incidents of another kind.
+    let s = store(3);
+    for i in 0..(MAX_INCIDENTS_PER_ORG + 20) {
+        let subject = format!("provider:spoof{i}.example.test");
+        let _ = s.record_external_finding(
+            "acme",
+            "key:test",
+            FindingInput {
+                source: "idryx",
+                detector: "dependency_failed",
+                severity: tokenfuse_core::Severity::High,
+                subject: &subject,
+                summary: "",
+                ts_millis: T0,
+            },
+        );
+    }
+    assert!(
+        s.incidents("acme").len() <= MAX_INCIDENTS_PER_ORG,
+        "{} incidents from findings that named the provider id space",
+        s.incidents("acme").len()
+    );
+}
+
 // --- one reporting site never adds to another's count -------------------------
 
 #[test]
@@ -708,6 +775,28 @@ async fn post(
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
     post_raw(state, key, body.to_string().into_bytes()).await
+}
+
+async fn post_to(
+    state: &AppState,
+    path: &str,
+    key: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::post(path).header("content-type", "application/json");
+    if let Some(k) = key {
+        req = req.header("authorization", format!("Bearer {k}"));
+    }
+    let resp = app(state.clone())
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 fn report(provider: &str, count: u64) -> serde_json::Value {
