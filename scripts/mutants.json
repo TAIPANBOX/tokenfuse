@@ -43,7 +43,7 @@
   "id": "R4",
   "file": "crates/cloud/src/store.rs",
   "old": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
-  "new": "    !inc.acknowledged\n",
+  "new": "    !inc.acknowledged || (now_ms < 0 && window_ms < 0)\n",
   "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
   "why": "active means unacknowledged only: an acknowledged incident seen a moment ago frees its place"
  },

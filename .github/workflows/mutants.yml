@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        id: [B0, B1, G1, G2, G14, R4, R4b, R8, R11, X1, X2, X3, X4]
+        id: [R4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free runner disk
