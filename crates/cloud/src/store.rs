@@ -1210,7 +1210,7 @@ const MAX_TRACKER_KEYS: usize = 20_000;
 /// incidents, growing the autosaved snapshot and slowing `/v1/incidents`
 /// (unpaginated) and `/v1/compliance` (folds every incident). On overflow the
 /// incident with the OLDEST `last_seen_millis` is evicted — see `upsert_incident`.
-const MAX_INCIDENTS_PER_ORG: usize = 10_000;
+pub const MAX_INCIDENTS_PER_ORG: usize = 10_000;
 
 /// Hard cap on the number of distinct run_ids retained in each org's
 /// [`SavingsAcc::breaks`] dedup set (see that field's doc). Reuses the same
@@ -1238,6 +1238,10 @@ const MAX_UNIT_MONTH_KEYS: usize = 4_096;
 /// silently zero a real site's counters mid-incident, while the overflow
 /// bucket stays visible. Far above any real fleet's site count.
 const MAX_GATEWAYS_PER_ORG: usize = 1_024;
+
+/// Invariant 144. One reporting site's providers: label → `(bucket start,
+/// failures)` in ten-second buckets, oldest first.
+type ProviderWindows = HashMap<String, VecDeque<(i64, u64)>>;
 
 /// Invariant 144. The longest provider label kept, in characters.
 pub const PROVIDER_LABEL_MAX_CHARS: usize = 128;
@@ -1496,7 +1500,7 @@ struct Inner {
     /// Bounded by [`MAX_PROVIDERS_PER_ORG`] labels per (org, site), by the
     /// window over the bucket width per label, and a label whose window has
     /// emptied is removed before the cap is looked at.
-    provider_failures: HashMap<String, HashMap<String, HashMap<String, VecDeque<(i64, u64)>>>>,
+    provider_failures: HashMap<String, HashMap<String, ProviderWindows>>,
     /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
     /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
     /// the windowed distinct-run count the detector thresholds against

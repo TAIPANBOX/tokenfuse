@@ -15,10 +15,10 @@ use tower::ServiceExt;
 
 use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::store::{
-    provider_label, MAX_PROVIDERS_PER_ORG, MAX_PROVIDER_FAILURES_PER_REPORT,
+    provider_label, MAX_INCIDENTS_PER_ORG, MAX_PROVIDERS_PER_ORG, MAX_PROVIDER_FAILURES_PER_REPORT,
     PROVIDER_LABEL_MAX_CHARS, PROVIDER_OVERFLOW_BUCKET,
 };
-use tokenfuse_cloud::{app, AppState, IncidentConfig, Principal, Store};
+use tokenfuse_cloud::{app, AppState, FindingInput, IncidentConfig, Principal, Store};
 
 const T0: i64 = 1_800_000_000_000;
 const MINUTE: i64 = 60_000;
@@ -318,6 +318,120 @@ fn a_summary_with_no_detail_still_reads() {
         inc.summary.unwrap(),
         "api.example.test failed 1 calls in the last 10 min"
     );
+}
+
+// --- the number of provider incidents is bounded, and they evict nothing else ---
+
+const PROVIDER_ID_PREFIX: &str = "dependency_failed:provider:";
+
+fn provider_incidents(s: &Store, org: &str) -> usize {
+    s.incidents(org)
+        .iter()
+        .filter(|i| i.id.starts_with(PROVIDER_ID_PREFIX))
+        .count()
+}
+
+/// `n` incidents of another kind, filed the way a service in the stack files
+/// them.
+fn fill_with_other_incidents(s: &Store, n: usize) {
+    for i in 0..n {
+        let subject = format!("agent://acme.example/a{i}");
+        s.record_external_finding(
+            "acme",
+            "key:test",
+            FindingInput {
+                source: "idryx",
+                detector: "agent_shadow_tool",
+                severity: tokenfuse_core::Severity::High,
+                subject: &subject,
+                summary: "",
+                ts_millis: T0,
+            },
+        );
+    }
+}
+
+#[test]
+fn rotating_labels_cannot_create_an_unbounded_number_of_provider_incidents() {
+    // Each label fails once and then never again, eleven minutes after the
+    // last, so its window has emptied and given its slot back by the time the
+    // next arrives. The labels never overlap; the incidents they opened stay.
+    let s = store(1);
+    let labels = MAX_PROVIDERS_PER_ORG * 3;
+    for i in 0..labels {
+        let at = T0 + i as i64 * 11 * MINUTE;
+        s.note_provider_failures_at("acme", &format!("p{i}.example.test"), 1, "", at);
+    }
+    let n = provider_incidents(&s, "acme");
+    assert!(
+        n <= MAX_PROVIDERS_PER_ORG + 1,
+        "{n} provider incidents from {labels} rotating labels"
+    );
+    assert!(
+        s.incidents("acme")
+            .iter()
+            .any(|i| i.id == format!("{PROVIDER_ID_PREFIX}{PROVIDER_OVERFLOW_BUCKET}")),
+        "the labels past the cap are still counted, in the shared bucket"
+    );
+}
+
+#[test]
+fn the_incident_cap_is_per_site_too() {
+    let s = store(1);
+    for i in 0..(MAX_PROVIDERS_PER_ORG * 2) {
+        let at = T0 + i as i64 * 11 * MINUTE;
+        s.note_provider_failures_from_at(
+            "acme",
+            Some("noisy"),
+            &format!("p{i}.example.test"),
+            1,
+            "",
+            at,
+        );
+    }
+    let late = T0 + MAX_PROVIDERS_PER_ORG as i64 * 3 * 11 * MINUTE;
+    let inc = s
+        .note_provider_failures_from_at("acme", Some("quiet"), "real.example.test", 1, "", late)
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:real.example.test@quiet");
+}
+
+#[test]
+fn a_flood_of_provider_incidents_never_evicts_an_incident_of_another_kind() {
+    let s = store(1);
+    let others = MAX_INCIDENTS_PER_ORG - 5;
+    fill_with_other_incidents(&s, others);
+    for i in 0..100 {
+        let at = T0 + i as i64 * 11 * MINUTE;
+        s.note_provider_failures_at("acme", &format!("flood{i}.example.test"), 1, "", at);
+    }
+    let all = s.incidents("acme");
+    let elsewhere = all
+        .iter()
+        .filter(|i| !i.id.starts_with(PROVIDER_ID_PREFIX))
+        .count();
+    assert_eq!(
+        elsewhere, others,
+        "provider incidents evicted incidents of another kind"
+    );
+    assert!(all.len() <= MAX_INCIDENTS_PER_ORG);
+    assert!(
+        provider_incidents(&s, "acme") > 0,
+        "the provider incidents had room for five and got it"
+    );
+}
+
+#[test]
+fn a_provider_incident_is_not_opened_over_a_table_full_of_other_kinds() {
+    let s = store(1);
+    fill_with_other_incidents(&s, MAX_INCIDENTS_PER_ORG);
+    let opened = s.note_provider_failures_at("acme", PROVIDER, 1, "", T0);
+    assert!(
+        opened.is_none(),
+        "a provider incident displaced another kind"
+    );
+    assert_eq!(s.incidents("acme").len(), MAX_INCIDENTS_PER_ORG);
+    assert_eq!(provider_incidents(&s, "acme"), 0);
 }
 
 // --- one reporting site never adds to another's count -------------------------
