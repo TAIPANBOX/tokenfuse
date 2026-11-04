@@ -1873,6 +1873,65 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- invariant 143: the label an enforcement point reports comes from the act ------
+#
+# The script gate holds the shape: no name can reach the route or the report, the
+# classification follows the server, and the report sits before the answer can leave.
+# What the label then does is held by tests/it/observed_act.rs.
+run_case "act-label: a tool member on the route" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/observedact.rs", "    pub source: String,\n", "    pub source: String,\n    pub tool: String,\n")')" \
+	"ObservedAct carries"
+
+run_case "act-label: the route left open to members it does not read" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/observedact.rs", "#[serde(deny_unknown_fields)]\n", "")')" \
+	"not closed"
+
+run_case "act-label: the route reads the name map" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/observedact.rs", "    let delta = st.accumulate_taint(", "    let _ = tokenfuse_core::taint::labels_for_tools(&[], &st.firewall.sources);\n    let delta = st.accumulate_taint(")')" \
+	"reads a name"
+
+run_case "act-label: a comment naming the name map is not reading it" pass \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/observedact.rs", "    let delta = st.accumulate_taint(", "    // labels_for_tools has no part in this.\n    let delta = st.accumulate_taint(")')"
+
+run_case "act-label: the report takes the tool" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    up: &ClassifiedUpstream,\n) -> Result<(), String> {", "    up: &ClassifiedUpstream,\n    tool: &str,\n) -> Result<(), String> {")')" \
+	"takes the tool"
+
+run_case "act-label: the classification read by the name a request chose" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "st.upstream_labels.get(&upstream_key(upstream_url))", "st.upstream_labels.get(upstream_url)")')" \
+	"looked up by the server"
+
+run_case "act-label: nothing reports what the upstream answered" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "if let Err(msg) = report_observed_act(st, ctx, up).await {", "if let Err(msg) = Ok::<(), String>(()) {")')" \
+	"never reports"
+
+run_case "act-label: the report after the checks that can return the answer" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    // The act the agent cannot rename", "    if method == \"tools/list\" && st.scan != ScanMode::Off { return out; }\n    // The act the agent cannot rename")')" \
+	"belongs between"
+
+run_case "act-label: a call naming no run is no longer refused" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "if observed.is_some() && record_run_id(ctx).is_none() {", "if false {")')" \
+	"NAMES NO RUN"
+
+run_case "act-label: the route gone, so the gate measured nothing" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'import os; os.remove("crates/gateway/src/observedact.rs")')" \
+	"measured nothing"
+
+run_case "act-label: the report renamed away, so the gate measured nothing" fail \
+	"./scripts/taint-comes-from-the-act.sh" \
+	"$(py 'edit_all("crates/gateway/src/mcpbroker.rs", "async fn report_observed_act(", "async fn tell_the_gateway(")')" \
+	"measured nothing"
+
 # --- invariant 122: a brokered gateway never forwards the caller's provider key ---
 #
 # The script gate holds the copy loop in HttpProvider::send (the skip is taken only when the

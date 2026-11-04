@@ -74,6 +74,7 @@ mod shadow_tool_pruning;
 mod streamed_tool_calls_are_judged;
 
 mod delegation_origins;
+mod observed_act;
 mod spend_reports_survive_a_stop;
 mod static_key_allow_list;
 mod static_key_allow_list_startup;

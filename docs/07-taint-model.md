@@ -117,7 +117,7 @@ live upstream.
 
 | Spec | State |
 |---|---|
-| B.2 source classification | Built, as a JSON policy file. Multiple labels per source, per the spec's `labels: [...]`. Matching is on tool NAME only: `mcp_server` and `args.path` globs are not built. |
+| B.2 source classification | Built, as a JSON policy file. Multiple labels per source, per the spec's `labels: [...]`. Matching is on tool NAME, and since 2026-11-04 on the upstream a broker reached (`mcp_server`, as `TOKENFUSE_MCP_UPSTREAM_LABELS`; see "A fourth taint source" below). `args.path` globs are not built. |
 | B.3 P1, P2 monotonic accumulation | Built. |
 | B.3 P3 subagent inherits the parent's taint | Built 2026-08-26. Resolved on every request by walking the declared parent chain, so a parent that becomes untrusted AFTER its child started is picked up on the child's next call. |
 | B.3 P4 a new run is a clean set | Built, by the same keying. |
@@ -376,6 +376,62 @@ recalls memory through a tool the source map does not name is classified
 (invariant 96). A memory that the model paraphrases before it is used carries
 the label all the same, which is the conservative direction. Nothing here
 distinguishes a memory the user wrote from one the agent wrote itself.
+
+### A fourth taint source: the act itself
+
+Built 2026-11-04 (CLAUDE.md invariant 143). Every source above reads something the
+caller wrote. A run's history is its own conversation, so a fetch reported under a
+name the map trusts carried that name's labels, and a fetch left out carried none.
+The name said what the run did, and the agent chose the name.
+
+Two witnesses do not depend on it.
+
+**The broker.** It made the connection, so it knows which server answered.
+
+```
+TOKENFUSE_MCP_UPSTREAMS="scopyx=http://scopyx:4300"
+TOKENFUSE_MCP_UPSTREAM_LABELS="scopyx=web"
+TOKENFUSE_MCP_TAINT_GATEWAY=http://gateway:4100
+```
+
+After a classified upstream answers a `tools/call`, and before the answer leaves the
+broker, the broker reports to `POST /v1/fuse/observed-act` and the gateway puts the
+labels on the run. The agent then holds a page its run is already labelled for, so
+there is no moment to act in. The tool name takes no part: it is not an argument to
+the report, and the route's closed body has no member for it. The name map still
+applies, so a run carries the union, and a name is what remains where nothing saw
+the act.
+
+| the agent | before | now |
+|---|---|---|
+| reports the fetch under a name the map trusts | the trusted name's labels | the upstream's labels as well |
+| leaves the fetch out of the conversation | nothing | the upstream's labels |
+| names no `x-fuse-run-id` on the read | allowed, unlabelled | refused, nothing forwarded |
+| reaches the server by the default route | n/a | classified by server, so labelled |
+
+An answer whose label the gateway did not take is withheld, and that is not the
+taint gate's fail mode: the page is in the broker by then, and the choice is whether
+it reaches a run nothing labelled. A firewall that is off answers `governed: false`
+and the answer returns. Any answer labels, `isError` included, because that flag is
+the upstream's word and the text still reaches the model.
+
+**The provider.** A `server_tool_use` or `mcp_tool_use` block in an answer records a
+tool the provider ran. These are read from the answer, buffered and streamed, and
+never from `messages[]`, because the answer is the one place they arrive that the
+caller has not had in its hands. They label the run before that answer's own tool
+calls are judged, so a shell asked for in the answer that searched is refused.
+
+The record is the existing `taint_raised`: stage `mcp_tool_call` with `from_tools:
+["mcp:scopyx"]` for the broker, stage `model_tool_call` with the tool's name for the
+provider. No URL reaches either path.
+
+What it does not do. A label follows an act that passed through an enforcement
+point, and a process with its own socket passes through none. `x-fuse-run-id` is the
+caller's header, so a harness naming another run of its own moves the label there;
+invariant 118 bounds that to one principal's runs. A provider's built-in search is
+labelled and not controlled: it ran on the provider's infrastructure, nothing can
+refuse it, and no domain policy reaches it. The OpenAI wire carries its built-in
+search as `annotations` citations and no tool block, so it is not read here.
 
 ### The release valve, and where the other two gates actually live
 

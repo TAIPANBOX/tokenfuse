@@ -52,6 +52,7 @@ fn broker(extra: &[(&str, String)]) -> Command {
         "TOKENFUSE_MCP_TAINT_GATEWAY",
         KEY_FILE,
         "TOKENFUSE_MCP_TAINT_FAILMODE",
+        "TOKENFUSE_MCP_UPSTREAM_LABELS",
         "TOKENFUSE_AGENT_TOKENS",
         "TOKENFUSE_DELEGATION_ISSUER",
         "TOKENFUSE_DELEGATION_JWKS",
@@ -215,6 +216,65 @@ async fn agent_tokens_and_a_taint_gateway_without_the_brokers_key_stop_the_broke
         result.unwrap();
     }
     let _ = std::fs::remove_file(&jwks);
+}
+
+/// Invariant 143: a label lives on a gateway's run, so a classification with no
+/// gateway to tell cannot do what it says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_classified_upstream_with_no_gateway_stops_the_broker() {
+    let child = spawn(broker(&[(
+        "TOKENFUSE_MCP_UPSTREAM_LABELS",
+        "default=web".to_string(),
+    )]));
+    tokio::task::spawn_blocking(move || {
+        assert_refused(
+            child,
+            "a classified upstream and no gateway",
+            &[
+                "TOKENFUSE_MCP_UPSTREAM_LABELS",
+                "TOKENFUSE_MCP_TAINT_GATEWAY",
+            ],
+        )
+    })
+    .await
+    .unwrap();
+}
+
+/// A dropped entry would silently unclassify the server it was written for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_classification_naming_no_upstream_stops_the_broker() {
+    let child = spawn(broker(&[
+        ("TOKENFUSE_MCP_UPSTREAM_LABELS", "scopyx=web".to_string()),
+        (
+            "TOKENFUSE_MCP_TAINT_GATEWAY",
+            "http://127.0.0.1:4100".to_string(),
+        ),
+    ]));
+    tokio::task::spawn_blocking(move || {
+        assert_refused(
+            child,
+            "a classification naming no upstream",
+            &["TOKENFUSE_MCP_UPSTREAM_LABELS", "scopyx"],
+        )
+    })
+    .await
+    .unwrap();
+}
+
+/// The guard on both: the same classification with a gateway named starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_classification_with_a_gateway_starts_the_broker() {
+    let child = spawn(broker(&[
+        ("TOKENFUSE_MCP_UPSTREAM_LABELS", "default=web".to_string()),
+        (
+            "TOKENFUSE_MCP_TAINT_GATEWAY",
+            "http://127.0.0.1:4100".to_string(),
+        ),
+    ]));
+    let seen = tokio::task::spawn_blocking(move || listens(child))
+        .await
+        .unwrap();
+    assert!(seen, "a classification with a gateway named must start");
 }
 
 /// The guard on the other side: the same configuration with the broker's own

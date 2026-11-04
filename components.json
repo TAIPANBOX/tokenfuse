@@ -271,6 +271,9 @@
           "TOKENFUSE_MCP_UPSTREAM": {
             "required": false
           },
+          "TOKENFUSE_MCP_UPSTREAM_LABELS": {
+            "required": false
+          },
           "TOKENFUSE_MCP_UPSTREAMS": {
             "required": false
           },
