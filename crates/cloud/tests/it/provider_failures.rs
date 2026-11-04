@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use tokenfuse_cloud::keys::digest;
 use tokenfuse_cloud::store::{
     provider_label, MAX_INCIDENTS_PER_ORG, MAX_PROVIDERS_PER_ORG, MAX_PROVIDER_FAILURES_PER_REPORT,
-    PROVIDER_LABEL_MAX_CHARS, PROVIDER_OVERFLOW_BUCKET,
+    MAX_PROVIDER_INCIDENTS_PER_ORG, PROVIDER_LABEL_MAX_CHARS, PROVIDER_OVERFLOW_BUCKET,
 };
 use tokenfuse_cloud::{app, AppState, FindingInput, IncidentConfig, Principal, Store};
 
@@ -423,24 +423,153 @@ fn a_flood_of_provider_incidents_never_evicts_an_incident_of_another_kind() {
         elsewhere, others,
         "provider incidents evicted incidents of another kind"
     );
-    assert!(all.len() <= MAX_INCIDENTS_PER_ORG);
     assert!(
-        provider_incidents(&s, "acme") > 0,
-        "the provider incidents had room for five and got it"
+        provider_incidents(&s, "acme") > 5,
+        "the provider incidents have a reserve of their own and were not held to the five places left among the others"
     );
 }
 
 #[test]
-fn a_provider_incident_is_not_opened_over_a_table_full_of_other_kinds() {
+fn a_provider_incident_is_still_opened_when_the_table_is_full_of_other_kinds() {
+    // Provider incidents have a reserve of their own, so a full table of other
+    // kinds neither blocks them nor loses them.
     let s = store(1);
     fill_with_other_incidents(&s, MAX_INCIDENTS_PER_ORG);
     let opened = s.note_provider_failures_at("acme", PROVIDER, 1, "", T0);
-    assert!(
-        opened.is_none(),
-        "a provider incident displaced another kind"
+    assert!(opened.is_some(), "a provider incident was refused room");
+    assert_eq!(provider_incidents(&s, "acme"), 1);
+    assert_eq!(s.incidents("acme").len(), MAX_INCIDENTS_PER_ORG + 1);
+}
+
+#[test]
+fn a_flood_of_other_incidents_never_evicts_a_provider_incident() {
+    let s = store(1);
+    for i in 0..10 {
+        // Older than every incident filed below, so the oldest-first rule
+        // would take them first.
+        let at = T0 - 3_600_000 + i as i64;
+        s.note_provider_failures_at("acme", &format!("old{i}.example.test"), 1, "", at);
+    }
+    fill_with_other_incidents(&s, MAX_INCIDENTS_PER_ORG + 50);
+    assert_eq!(
+        provider_incidents(&s, "acme"),
+        10,
+        "incidents of other kinds evicted provider incidents"
     );
-    assert_eq!(s.incidents("acme").len(), MAX_INCIDENTS_PER_ORG);
-    assert_eq!(provider_incidents(&s, "acme"), 0);
+    let elsewhere = s.incidents("acme").len() - 10;
+    assert_eq!(
+        elsewhere, MAX_INCIDENTS_PER_ORG,
+        "the other kinds keep their own cap"
+    );
+}
+
+#[test]
+fn a_provider_incident_over_the_reserve_is_filed_in_other_and_never_lost() {
+    let s = store(1);
+    let sites = MAX_PROVIDER_INCIDENTS_PER_ORG / MAX_PROVIDERS_PER_ORG;
+    for site in 0..sites {
+        let site = format!("gw-{site}");
+        for i in 0..MAX_PROVIDERS_PER_ORG {
+            let label = format!("p{i}.example.test");
+            s.note_provider_failures_from_at("acme", Some(&site), &label, 1, "", T0);
+        }
+    }
+    assert_eq!(
+        provider_incidents(&s, "acme"),
+        MAX_PROVIDER_INCIDENTS_PER_ORG
+    );
+    let inc = s
+        .note_provider_failures_from_at("acme", Some("gw-new"), "late.example.test", 1, "", T0 + 1)
+        .expect("a failure over the reserve is not lost");
+    assert_eq!(inc.id, "dependency_failed:provider:other@gw-new");
+    assert!(inc.summary.unwrap().contains("late.example.test"));
+}
+
+fn fill_site(s: &Store, site: &str, n: usize, at: i64) {
+    for i in 0..n {
+        let label = format!("p{i}.example.test");
+        s.note_provider_failures_from_at("acme", Some(site), &label, 1, "", at);
+    }
+}
+
+fn acknowledge_everything(s: &Store) {
+    for inc in s.incidents("acme") {
+        assert!(s.ack_incident("acme", &inc.id));
+    }
+}
+
+#[test]
+fn old_and_acknowledged_provider_incidents_free_their_place() {
+    let s = store(1);
+    fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, T0);
+    acknowledge_everything(&s);
+    let inc = s
+        .note_provider_failures_from_at(
+            "acme",
+            Some("gw-1"),
+            "fresh.example.test",
+            1,
+            "",
+            T0 + 11 * MINUTE,
+        )
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:fresh.example.test@gw-1");
+}
+
+#[test]
+fn recent_provider_incidents_hold_their_place_even_when_acknowledged() {
+    let s = store(1);
+    fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, T0);
+    acknowledge_everything(&s);
+    let inc = s
+        .note_provider_failures_from_at(
+            "acme",
+            Some("gw-1"),
+            "fresh.example.test",
+            1,
+            "",
+            T0 + MINUTE,
+        )
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:other@gw-1");
+}
+
+#[test]
+fn unacknowledged_provider_incidents_hold_their_place_however_old() {
+    let s = store(1);
+    fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, T0);
+    let inc = s
+        .note_provider_failures_from_at(
+            "acme",
+            Some("gw-1"),
+            "fresh.example.test",
+            1,
+            "",
+            T0 + 60 * MINUTE,
+        )
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:other@gw-1");
+}
+
+#[test]
+fn a_failure_folded_into_other_names_its_label_and_is_not_hidden_by_an_old_acknowledgement() {
+    let s = store(1);
+    fill_site(&s, "gw-1", MAX_PROVIDERS_PER_ORG, T0);
+    let first = s
+        .note_provider_failures_from_at("acme", Some("gw-1"), "extra1.example.test", 1, "", T0 + 1)
+        .unwrap();
+    assert_eq!(first.id, "dependency_failed:provider:other@gw-1");
+    assert!(first.summary.unwrap().contains("extra1.example.test"));
+    assert!(s.ack_incident("acme", &first.id));
+    let again = s
+        .note_provider_failures_from_at("acme", Some("gw-1"), "extra2.example.test", 1, "", T0 + 2)
+        .unwrap();
+    assert_eq!(again.id, first.id);
+    assert!(
+        !again.acknowledged,
+        "a new failure hid behind an old acknowledgement"
+    );
+    assert!(again.summary.unwrap().contains("extra2.example.test"));
 }
 
 // --- one reporting site never adds to another's count -------------------------

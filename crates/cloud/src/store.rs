@@ -4435,6 +4435,12 @@ pub fn provider_label(raw: &str) -> Option<String> {
 /// Invariant 144. The incident-id prefix of every provider incident.
 const PROVIDER_ID_PREFIX: &str = "dependency_failed:provider:";
 
+/// Invariant 144. How many provider incidents one org may hold, the shared
+/// `other` buckets not counted. A reserve of its own: provider incidents do not
+/// count against [`MAX_INCIDENTS_PER_ORG`], and incidents of other kinds do not
+/// count against this.
+pub const MAX_PROVIDER_INCIDENTS_PER_ORG: usize = 1_024;
+
 /// Invariant 144. The scope of a provider incident, `provider:<key>` with
 /// `@<site>` appended for a key bound to a site. A label cannot contain `@`
 /// (see [`provider_label`]), so the two halves never run together.
