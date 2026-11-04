@@ -3230,7 +3230,7 @@ mod tests {
     fn upstreams() -> BTreeMap<String, String> {
         BTreeMap::from([
             ("scopyx".to_string(), "http://scopyx:4300".to_string()),
-            ("typryx".to_string(), "http://typryx:4320/mcp".to_string()),
+            ("archive".to_string(), "http://archive:4390/mcp".to_string()),
         ])
     }
 
@@ -3248,7 +3248,7 @@ mod tests {
     #[test]
     fn a_classification_is_held_by_the_server_and_not_by_the_name() {
         let held = upstream_labels_from(
-            Some("scopyx=web|file, typryx=internal"),
+            Some("scopyx=web|file, archive=internal"),
             "http://d:1",
             &upstreams(),
         )
@@ -3258,7 +3258,7 @@ mod tests {
         assert_eq!(scopyx.labels, vec!["file", "web"]);
         assert!(held.contains_key(&upstream_key("http://scopyx:4300/")));
         assert_eq!(
-            held[&upstream_key("http://typryx:4320/mcp")].labels,
+            held[&upstream_key("http://archive:4390/mcp")].labels,
             vec!["internal"]
         );
 
@@ -3292,8 +3292,8 @@ mod tests {
     fn one_bad_entry_refuses_the_whole_classification() {
         for (spec, names) in [
             ("scopyx=web,nosuch=web", "nosuch"),
-            ("scopyx=web,typryx", "typryx"),
-            ("scopyx=web,typryx=", "typryx"),
+            ("scopyx=web,archive", "archive"),
+            ("scopyx=web,archive=", "archive"),
             ("scopyx=||", "scopyx"),
             ("=web", "\"\""),
         ] {
@@ -3335,7 +3335,7 @@ mod tests {
             seed
         };
         let alphabet = [
-            "scopyx", "typryx", "default", "nosuch", "=", "|", ",", " ", "web", "",
+            "scopyx", "archive", "default", "nosuch", "=", "|", ",", " ", "web", "",
         ];
         for case in 0..200 {
             let spec: String = (0..(next() % 9))
@@ -3349,7 +3349,7 @@ mod tests {
                 .any(|e| match e.split_once('=') {
                     None => true,
                     Some((name, labels)) => {
-                        !["scopyx", "typryx", "default"].contains(&name.trim())
+                        !["scopyx", "archive", "default"].contains(&name.trim())
                             || labels.split('|').all(|l| l.trim().is_empty())
                     }
                 });
