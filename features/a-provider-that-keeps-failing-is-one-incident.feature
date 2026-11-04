@@ -98,9 +98,37 @@ Feature: A provider that keeps failing is one incident
     And the summary names the provider and the detail has no control characters and at most a hundred and sixty
 
   # @test:only_a_provider_failure_is_counted_for_the_cloud_incident
+  # @test:only_a_providers_health_statuses_are_counted_for_the_cloud
   Scenario: Only the provider's failures are counted at the gateway
     Given dependency_failed events for the policy plane, the control plane and the provider
     Then only the provider's are counted for the report
+    And of a provider's refusals only a 5xx, a 408 and a 429 are, not the 400 or 404 a caller can provoke with a model id of its own
+
+  # @test:the_text_of_a_transport_error_never_goes_to_the_cloud
+  Scenario: The Cloud is told a fixed class and never the text of the error
+    Given a send that fails with an error message naming the upstream URL with a credential in its query
+    Then the Cloud's copy says send failed and carries neither the URL nor the credential
+    And the caller's model is not sent either
+
+  # @test:a_site_bound_report_is_filed_under_its_site
+  # @test:two_sites_reporting_one_provider_are_two_incidents_that_never_add_up
+  # @test:a_key_bound_to_no_site_is_counted_apart_from_every_site
+  # @test:a_key_bound_to_one_site_cannot_add_to_another_sites_count
+  # @test:the_site_comes_from_the_key_and_never_from_the_body
+  Scenario: A key bound to one site cannot add to another site's count
+    Given two keys bound to two different sites, each reporting two failures of one provider
+    Then nothing opens, because the sites are counted apart
+    And each site's own third failure opens an incident filed under that site
+    And a body that names another site is filed under the site of the key
+
+  # @test:a_provider_that_stopped_failing_gives_its_slot_back
+  # @test:the_provider_cap_is_per_site_so_one_site_cannot_crowd_out_another
+  # @test:a_site_name_is_sanitised_and_a_blank_one_is_no_site
+  Scenario: Labels that stopped failing do not crowd out a real provider
+    Given sixty-four providers that failed once and then stopped, past the window
+    When a real provider fails three times
+    Then it opens its own incident, not the shared bucket
+    And one site's flood of labels does not touch another site's cap
 
   # @test:a_storm_of_failures_is_one_report_with_the_count
   # @test:nothing_counted_sends_nothing

@@ -121,10 +121,10 @@ answers a call carrying `x-fuse-run-id` with `503 seed_pending` (retryable,
 puts a `dependency_failed` on the bus for every call its provider fails, and
 every call is its own run, so an outage is thousands of events and no one row.
 The gateway also counts those failures and, every two seconds, sends the count
-to `POST /v1/provider-failures` with the same Cloud key (`ingest` or `admin`);
+to `POST /v1/provider-failures` with the same Cloud key (`ingest` or `admin`), as a fixed class (`send failed`, `HTTP 503`) and never the text of the error, which can carry the upstream URL; only a 5xx, 408 or 429 counts as the provider being unwell;
 what cannot be delivered is dropped, not queued, and the per-call event on the
 bus is unchanged. The control plane folds a provider's failures into one
-incident, `dependency_failed:provider:<host of TOKENFUSE_UPSTREAM>`, once
+incident, `dependency_failed:provider:<host of TOKENFUSE_UPSTREAM>` (with `@<site>` appended when the key is bound to a site, so one site's key cannot add to another's count), once
 `TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES` (default 3) calls have failed in
 ten minutes. It is on the console and `GET /v1/incidents`, with the failures
 folded as `occurrences`; it names a provider and no agent, so it is not on the

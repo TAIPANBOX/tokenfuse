@@ -228,8 +228,15 @@ fn emit_dependency_failed_via(
     // control plane are other dependencies with other incidents. Counted
     // whether or not the event below is written, because the exporter skips a
     // call with no agent and the provider failed all the same.
+    //
+    // What the Cloud is told is the fixed class of the failure, never `detail`:
+    // that is the text of a transport error, which carries the URL the call
+    // went to, and an upstream URL can carry a credential in its query. The
+    // local event below keeps the full text for the operator.
     if matches!(dependency, Dependency::Provider) {
-        crate::providerreport::note_provider_failure(detail);
+        if let Some(class) = cloud_failure_class(stage) {
+            crate::providerreport::note_provider_failure(class);
+        }
     }
     let outcome = events.emit(
         EventType::DependencyFailed,
@@ -240,6 +247,30 @@ fn emit_dependency_failed_via(
         dependency_failed_data(dependency, stage, effect, detail),
     );
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
+}
+
+/// The fixed words the Cloud is told for a provider failure at `stage`
+/// (invariant 144). Exhaustive on purpose: a stage added later has to decide
+/// whether it is a provider failure the Cloud counts. `Response` is `None`
+/// here because the status decides it, and only `emit_upstream_refused_via`
+/// has the status; the policy plane's and the control plane's stages are not
+/// the provider's.
+fn cloud_failure_class(stage: DependencyStage) -> Option<&'static str> {
+    match stage {
+        DependencyStage::Send => Some("send failed"),
+        DependencyStage::Stream => Some("stream broke"),
+        DependencyStage::ResponseBody => Some("response body unreadable"),
+        DependencyStage::Response | DependencyStage::Decide | DependencyStage::Seed => None,
+    }
+}
+
+/// Whether a provider's non-2xx says the PROVIDER is unwell, which is what the
+/// Cloud counts (invariant 144): a 5xx, a 408, a 429. A 400 or a 404 is how a
+/// provider answers a model id the caller chose, and a caller can provoke
+/// either at will, so it stays on the bus (`is_the_providers_refusal`) and is
+/// not counted toward an incident about the provider.
+fn is_the_providers_ill_health(status: StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 429)
 }
 
 /// Whether a provider's non-2xx is the PROVIDER's failure, worth an operator's
@@ -276,6 +307,11 @@ fn emit_upstream_refused_via(
     model: &str,
     status: StatusCode,
 ) {
+    // Counted for the Cloud by the status alone: the model is the caller's
+    // own string and is not sent (invariant 144).
+    if is_the_providers_ill_health(status) {
+        crate::providerreport::note_provider_failure(&format!("HTTP {}", status.as_u16()));
+    }
     emit_dependency_failed_via(
         events,
         Some(run_id),
@@ -11698,9 +11734,14 @@ pub(crate) mod tests {
             Flush::Nothing,
             "the policy plane and the control plane are other dependencies"
         );
-        emit(Dependency::Provider, DependencyStage::Response);
         emit(Dependency::Provider, DependencyStage::Send);
-        assert_eq!(reporter.flush().await, Flush::Dropped(2));
+        emit(Dependency::Provider, DependencyStage::Stream);
+        emit(Dependency::Provider, DependencyStage::ResponseBody);
+        assert_eq!(reporter.flush().await, Flush::Dropped(3));
+        // The Response stage is counted by the status, in
+        // `emit_upstream_refused_via`, and not here.
+        emit(Dependency::Provider, DependencyStage::Response);
+        assert_eq!(reporter.flush().await, Flush::Nothing);
     }
 
     /// An upstream whose transport error names the URL it was sent to, query

@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.20.3-brightgreen)
-![tests](https://img.shields.io/badge/tests-2506-brightgreen)
+![tests](https://img.shields.io/badge/tests-2516-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -769,7 +769,7 @@ A `deny` returns `403` with `x-fuse-wardryx: deny`. A `hold` returns `403` with 
 | `TOKENFUSE_CLOUD_REPLAY_EVENTS` | unset | Path to an agent-event NDJSON file the control plane reads (never writes) to reconstruct a run for `/v1/replay/{run}`. Unset ⇒ replay reports `configured:false`. |
 | `TOKENFUSE_CLOUD_INCIDENT_BUDGET_BLOCKS` | `3` | A run hits ≥ this many budget-protection blocks (`budget_exhausted`). |
 | `TOKENFUSE_CLOUD_INCIDENT_LOOP_REPEATS` | `3` | ≥ this many `loop_detected` decisions for one run (`sustained_loop`). |
-| `TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES` | `3` | A provider has failed ≥ this many calls within ten minutes, as the gateways report them to `POST /v1/provider-failures`: one `dependency_failed` incident per provider (`dependency_failed:provider:<name>`), on the console and `GET /v1/incidents` and not on the agent-event bus. |
+| `TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES` | `3` | A provider has failed ≥ this many calls within ten minutes, as the gateways report them to `POST /v1/provider-failures`: one `dependency_failed` incident per provider and reporting site (`dependency_failed:provider:<name>`, with `@<site>` for a site-bound key), on the console and `GET /v1/incidents` and not on the agent-event bus. |
 | `TOKENFUSE_CLOUD_INCIDENT_SPEND_PER_MIN_USD` | `5.0` | The floor for `spend_spike`: an org's last-minute burn below this rate is never a spike, whatever its own baseline. |
 | `TOKENFUSE_CLOUD_INCIDENT_SPIKE_MULTIPLE` | `4` (floor `2`) | How many times its own recent baseline an org's last minute has to be before `spend_spike` calls it a spike. |
 | `TOKENFUSE_CLOUD_INCIDENT_FANOUT_RUNS` | `20` | The floor for `fanout_explosion`: one `agent_id` driving fewer distinct runs than this in the window is never an explosion. |

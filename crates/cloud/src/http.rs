@@ -844,7 +844,10 @@ async fn provider_failures(
     uri: Uri,
     body: Bytes,
 ) -> Response {
-    let Mutator { org, .. } = match st.authorize_ingest("POST", uri.path(), &body, &headers) {
+    // The site is the one the key is bound to (invariant 65), read from the
+    // credential and never from the body, so a key bound to one site cannot
+    // report for another.
+    let Mutator { org, site, .. } = match st.authorize_ingest("POST", uri.path(), &body, &headers) {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
@@ -860,8 +863,13 @@ async fn provider_failures(
         if crate::store::provider_label(&f.provider).is_some() && f.count > 0 {
             accepted += 1;
         }
-        st.store
-            .note_provider_failures(&org, &f.provider, f.count, &f.detail);
+        st.store.note_provider_failures_from(
+            &org,
+            site.as_deref(),
+            &f.provider,
+            f.count,
+            &f.detail,
+        );
     }
     (StatusCode::OK, Json(ProviderFailuresResponse { accepted })).into_response()
 }

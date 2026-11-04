@@ -320,6 +320,88 @@ fn a_summary_with_no_detail_still_reads() {
     );
 }
 
+// --- one reporting site never adds to another's count -------------------------
+
+#[test]
+fn a_site_bound_report_is_filed_under_its_site() {
+    let s = store(3);
+    let inc = s
+        .note_provider_failures_from_at("acme", Some("gw-1"), PROVIDER, 3, "HTTP 503", T0)
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:api.example.test@gw-1");
+    let summary = inc.summary.unwrap();
+    assert!(summary.contains("reported by site gw-1"), "{summary}");
+}
+
+#[test]
+fn two_sites_reporting_one_provider_are_two_incidents_that_never_add_up() {
+    let s = store(3);
+    s.note_provider_failures_from_at("acme", Some("gw-1"), PROVIDER, 2, "", T0);
+    let second = s.note_provider_failures_from_at("acme", Some("gw-2"), PROVIDER, 2, "", T0 + 1);
+    assert!(
+        second.is_none(),
+        "two failures from each of two sites are not four from one"
+    );
+    assert!(s.incidents("acme").is_empty());
+    s.note_provider_failures_from_at("acme", Some("gw-1"), PROVIDER, 1, "", T0 + 2);
+    s.note_provider_failures_from_at("acme", Some("gw-2"), PROVIDER, 1, "", T0 + 3);
+    let mut ids: Vec<String> = s.incidents("acme").into_iter().map(|i| i.id).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "dependency_failed:provider:api.example.test@gw-1".to_string(),
+            "dependency_failed:provider:api.example.test@gw-2".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_key_bound_to_no_site_is_counted_apart_from_every_site() {
+    let s = store(3);
+    s.note_provider_failures_from_at("acme", Some("gw-1"), PROVIDER, 2, "", T0);
+    assert!(s
+        .note_provider_failures_at("acme", PROVIDER, 2, "", T0 + 1)
+        .is_none());
+    let inc = s
+        .note_provider_failures_at("acme", PROVIDER, 1, "", T0 + 2)
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:api.example.test");
+    assert!(!inc.summary.unwrap().contains("reported by site"));
+}
+
+#[test]
+fn the_provider_cap_is_per_site_so_one_site_cannot_crowd_out_another() {
+    let s = store(3);
+    for i in 0..(MAX_PROVIDERS_PER_ORG * 2) {
+        s.note_provider_failures_from_at(
+            "acme",
+            Some("noisy"),
+            &format!("p{i}.example.test"),
+            1,
+            "",
+            T0,
+        );
+    }
+    let inc = s
+        .note_provider_failures_from_at("acme", Some("quiet"), "real.example.test", 3, "", T0)
+        .unwrap();
+    assert_eq!(inc.id, "dependency_failed:provider:real.example.test@quiet");
+}
+
+#[test]
+fn a_site_name_is_sanitised_and_a_blank_one_is_no_site() {
+    let s = store(1);
+    let inc = s
+        .note_provider_failures_from_at("acme", Some("gw 1/<x>\r\n"), PROVIDER, 1, "", T0)
+        .unwrap();
+    assert!(inc.id.ends_with("@gw_1__x_"), "unexpected id {:?}", inc.id);
+    let blank = s
+        .note_provider_failures_from_at("acme", Some("   "), "other.example.test", 1, "", T0)
+        .unwrap();
+    assert_eq!(blank.id, "dependency_failed:provider:other.example.test");
+}
+
 // --- the route --------------------------------------------------------------
 
 fn test_state() -> (AppState, Arc<Store>) {
@@ -571,5 +653,24 @@ async fn a_key_bound_to_one_site_cannot_add_to_another_sites_count() {
     assert_eq!(
         all[0]["id"],
         "dependency_failed:provider:api.example.test@gw-1"
+    );
+}
+
+#[tokio::test]
+async fn the_site_comes_from_the_key_and_never_from_the_body() {
+    let (state, _) = test_state();
+    for _ in 0..3 {
+        let body = serde_json::json!({
+            "site": "gw-2",
+            "failures": [{ "provider": PROVIDER, "count": 1, "site": "gw-2" }]
+        });
+        let (status, _) = post(&state, Some("sitekey"), body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let all = incidents(&state).await;
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0]["id"], "dependency_failed:provider:api.example.test@gw-1",
+        "a report from the gw-1 key was filed under a site its body named"
     );
 }
