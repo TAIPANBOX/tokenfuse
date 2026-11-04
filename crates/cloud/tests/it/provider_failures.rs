@@ -389,6 +389,15 @@ fn the_incident_cap_is_per_site_too() {
             at,
         );
     }
+    let noisy = s
+        .incidents("acme")
+        .iter()
+        .filter(|i| i.id.ends_with("@noisy"))
+        .count();
+    assert!(
+        noisy <= MAX_PROVIDERS_PER_ORG + 1,
+        "{noisy} incidents from one site's rotating labels"
+    );
     let late = T0 + MAX_PROVIDERS_PER_ORG as i64 * 3 * 11 * MINUTE;
     let inc = s
         .note_provider_failures_from_at("acme", Some("quiet"), "real.example.test", 1, "", late)
