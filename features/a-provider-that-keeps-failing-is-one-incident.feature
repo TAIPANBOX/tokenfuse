@@ -137,12 +137,30 @@ Feature: A provider that keeps failing is one incident
     Then the provider incidents stop at sixty-four and a shared other, per site
 
   # @test:a_flood_of_provider_incidents_never_evicts_an_incident_of_another_kind
-  # @test:a_provider_incident_is_not_opened_over_a_table_full_of_other_kinds
-  Scenario: Provider incidents never push out incidents of another kind
-    Given an org whose incident table is nearly full of budget and identity incidents
+  # @test:a_flood_of_other_incidents_never_evicts_a_provider_incident
+  # @test:a_provider_incident_is_still_opened_when_the_table_is_full_of_other_kinds
+  Scenario: Provider incidents have a reserve of their own that competes with no other kind
+    Given an org whose incident table is nearly or entirely full of budget and identity incidents
     When a flood of provider labels opens provider incidents
-    Then every incident of another kind is still there
-    And with the table full of other kinds a provider incident is not opened at all
+    Then every incident of another kind is still there, and provider incidents are still opened
+    And when a flood of other incidents arrives, no provider incident is evicted
+
+  # @test:a_provider_incident_over_the_reserve_is_filed_in_other_and_never_lost
+  # @test:a_failure_folded_into_other_names_its_label_and_is_not_hidden_by_an_old_acknowledgement
+  Scenario: A failure over a limit is filed in other, with its label, and is never lost
+    Given an org whose provider reserve is full of active incidents
+    When a new provider fails
+    Then it is filed in the shared other bucket of its site with its own label in the summary
+    And an acknowledgement of other is cleared by the new failure
+
+  # @test:old_and_acknowledged_provider_incidents_free_their_place
+  # @test:recent_provider_incidents_hold_their_place_even_when_acknowledged
+  # @test:unacknowledged_provider_incidents_hold_their_place_however_old
+  Scenario: Only active provider incidents count toward a site's limit
+    Given a site holding sixty-four provider incidents
+    Then when they are old and acknowledged a new provider gets its own incident
+    And when they are recent, even acknowledged, a new provider is filed in other
+    And when they are unacknowledged, however old, a new provider is filed in other
 
   # @test:a_storm_of_failures_is_one_report_with_the_count
   # @test:nothing_counted_sends_nothing

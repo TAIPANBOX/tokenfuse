@@ -2869,6 +2869,7 @@ impl Store {
                 }
                 !buckets.is_empty()
             });
+            let reported = label.clone();
             let key = if per_site.contains_key(&label) || per_site.len() < MAX_PROVIDERS_PER_ORG {
                 label
             } else {
@@ -2890,35 +2891,35 @@ impl Store {
             if in_window < threshold {
                 return None;
             }
-            // The window trackers above forget a label when its window empties;
-            // the incident it opened does not. So the number of provider
-            // incidents is bounded here, on the incidents themselves: past the
-            // cap a NEW provider is filed in the shared bucket, which is always
-            // admissible, and a label that rotates cannot open one incident per
-            // string.
+            // One simple structure (invariant 144). Provider incidents have a
+            // reserve of their own, `MAX_PROVIDER_INCIDENTS_PER_ORG` for the
+            // org, which competes with no other kind in either direction
+            // (`upsert_incident` leaves them out of its cap and its eviction).
+            // Within it a site may have `MAX_PROVIDERS_PER_ORG` ACTIVE ones, and
+            // an old, acknowledged one is not active: it gives its place back.
+            // A NEW provider past either limit is filed in the shared `other`
+            // bucket, which nothing counts and nothing evicts, so a failure over
+            // a limit is never lost. The window trackers above forget a label
+            // when its window empties and the incident does not, which is why
+            // the limit is held on the incidents.
             let incidents = inner.incidents.entry(org.to_string()).or_default();
             let mut key = key;
             let mut scope = provider_scope(&key, site.as_deref());
             if key != PROVIDER_OVERFLOW_BUCKET
                 && !incidents.contains_key(&incident_id("dependency_failed", &scope))
-                && provider_incidents_of_site(incidents, site.as_deref()) >= MAX_PROVIDERS_PER_ORG
             {
-                key = PROVIDER_OVERFLOW_BUCKET.to_string();
-                scope = provider_scope(&key, site.as_deref());
+                let (here, all) =
+                    provider_incident_counts(incidents, site.as_deref(), now_ms, window_ms);
+                let over_site = here >= MAX_PROVIDERS_PER_ORG;
+                let over_reserve = !over_site
+                    && all >= MAX_PROVIDER_INCIDENTS_PER_ORG
+                    && !evict_oldest_finished_provider_incident(incidents, now_ms, window_ms);
+                if over_site || over_reserve {
+                    key = PROVIDER_OVERFLOW_BUCKET.to_string();
+                    scope = provider_scope(&key, site.as_deref());
+                }
             }
-            // And a provider incident never displaces another kind: at the
-            // org's cap it makes room by removing an older provider incident,
-            // and with none to remove it is not opened.
-            if !incidents.contains_key(&incident_id("dependency_failed", &scope))
-                && incidents.len() >= MAX_INCIDENTS_PER_ORG
-                && !evict_oldest_provider_incident(incidents)
-            {
-                tracing::warn!(
-                    org,
-                    "a provider incident was not opened: the org's incident table is full of other kinds"
-                );
-                return None;
-            }
+            let into_other = key == PROVIDER_OVERFLOW_BUCKET;
             let prior = incidents
                 .get(&incident_id("dependency_failed", &scope))
                 .map(|i| i.occurrences);
@@ -2944,9 +2945,15 @@ impl Store {
                     Some(before) => before.saturating_add(count),
                     None => in_window,
                 };
+                if into_other {
+                    // A new failure must not hide behind an old acknowledgement
+                    // of whatever else was filed here.
+                    stored.acknowledged = false;
+                }
                 stored.summary = Some(provider_summary(
-                    &key,
+                    &reported,
                     site.as_deref(),
+                    into_other,
                     in_window,
                     window_ms,
                     detail,
@@ -4451,34 +4458,63 @@ fn provider_scope(key: &str, site: Option<&str>) -> String {
     }
 }
 
-/// Invariant 144. How many provider incidents one reporting site has, the
-/// shared bucket not counted. Read from the incidents themselves, because the
-/// window trackers forget a label when its window empties and the incident
-/// does not.
-fn provider_incidents_of_site(incidents: &HashMap<String, Incident>, site: Option<&str>) -> usize {
-    incidents
-        .keys()
-        .filter(|id| {
-            let Some(rest) = id.strip_prefix(PROVIDER_ID_PREFIX) else {
-                return false;
-            };
-            let (label, id_site) = match rest.split_once('@') {
-                Some((label, site)) => (label, Some(site)),
-                None => (rest, None),
-            };
-            id_site == site && label != PROVIDER_OVERFLOW_BUCKET
-        })
-        .count()
+/// Invariant 144. Whether `id` is a provider incident's.
+fn is_provider_incident_id(id: &str) -> bool {
+    id.starts_with(PROVIDER_ID_PREFIX)
 }
 
-/// Invariant 144. Remove the provider incident that was seen longest ago, for
-/// room to open another; `false` when the org has none. A provider incident
-/// may displace another provider incident and nothing else: a flood of
-/// provider labels must not push out a budget or an identity incident.
-fn evict_oldest_provider_incident(incidents: &mut HashMap<String, Incident>) -> bool {
+/// Invariant 144. Whether `id` is the shared `other` bucket's, which no cap
+/// counts and nothing evicts, so a failure over a cap always has somewhere to go.
+fn is_overflow_provider_id(id: &str) -> bool {
+    id.strip_prefix(PROVIDER_ID_PREFIX)
+        .and_then(|rest| rest.split('@').next())
+        .is_some_and(|label| label == PROVIDER_OVERFLOW_BUCKET)
+}
+
+/// Invariant 144. A provider incident counts toward a limit while it is
+/// unacknowledged, or was seen within the window. An old, acknowledged one is
+/// finished with and gives its place back.
+fn provider_incident_is_active(inc: &Incident, now_ms: i64, window_ms: i64) -> bool {
+    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms
+}
+
+/// Invariant 144. `(active provider incidents of this site, provider incidents
+/// of the org)`, the shared `other` buckets in neither.
+fn provider_incident_counts(
+    incidents: &HashMap<String, Incident>,
+    site: Option<&str>,
+    now_ms: i64,
+    window_ms: i64,
+) -> (usize, usize) {
+    let (mut here, mut all) = (0, 0);
+    for (id, inc) in incidents {
+        if !is_provider_incident_id(id) || is_overflow_provider_id(id) {
+            continue;
+        }
+        all += 1;
+        let id_site = id.rsplit_once('@').map(|(_, site)| site);
+        if id_site == site && provider_incident_is_active(inc, now_ms, window_ms) {
+            here += 1;
+        }
+    }
+    (here, all)
+}
+
+/// Invariant 144. Make room in the provider reserve by removing the finished
+/// provider incident (old and acknowledged) seen longest ago; `false` when
+/// there is none. Never an active incident and never one of another kind.
+fn evict_oldest_finished_provider_incident(
+    incidents: &mut HashMap<String, Incident>,
+    now_ms: i64,
+    window_ms: i64,
+) -> bool {
     let oldest = incidents
         .iter()
-        .filter(|(id, _)| id.starts_with(PROVIDER_ID_PREFIX))
+        .filter(|(id, inc)| {
+            is_provider_incident_id(id)
+                && !is_overflow_provider_id(id)
+                && !provider_incident_is_active(inc, now_ms, window_ms)
+        })
         .min_by_key(|(_, inc)| inc.last_seen_millis)
         .map(|(id, _)| id.clone());
     match oldest {
@@ -4494,6 +4530,7 @@ fn evict_oldest_provider_incident(incidents: &mut HashMap<String, Incident>) -> 
 fn provider_summary(
     provider: &str,
     site: Option<&str>,
+    filed_under_other: bool,
     failures: u64,
     window_ms: i64,
     detail: &str,
@@ -4507,6 +4544,9 @@ fn provider_summary(
     let mut out = format!("{provider} failed {failures} calls in the last {minutes} min");
     if let Some(site) = site {
         out.push_str(&format!(", reported by site {site}"));
+    }
+    if filed_under_other {
+        out.push_str(", filed under other");
     }
     if !detail.is_empty() {
         out.push_str(&format!("; last: {detail}"));
@@ -4817,13 +4857,28 @@ fn upsert_incident(
     // `RecencyIndex` machinery the run/tracker caps use) is enough here: this
     // only runs when the map is already AT the cap and a genuinely new id
     // arrives, not on every call.
-    if !per_org.contains_key(&id) && per_org.len() >= MAX_INCIDENTS_PER_ORG {
-        if let Some(evict_id) = per_org
-            .iter()
-            .min_by_key(|(_, inc)| inc.last_seen_millis)
-            .map(|(k, _)| k.clone())
-        {
-            per_org.remove(&evict_id);
+    //
+    // Provider incidents (invariant 144) are outside this cap and outside its
+    // eviction: they have a reserve of their own, so a stream of them cannot
+    // push out an incident of another kind, and a stream of those cannot push
+    // out a provider incident. The caller holds the provider reserve.
+    if !is_provider_incident_id(&id)
+        && !per_org.contains_key(&id)
+        && per_org.len() >= MAX_INCIDENTS_PER_ORG
+    {
+        let others = per_org
+            .keys()
+            .filter(|k| !is_provider_incident_id(k))
+            .count();
+        if others >= MAX_INCIDENTS_PER_ORG {
+            if let Some(evict_id) = per_org
+                .iter()
+                .filter(|(k, _)| !is_provider_incident_id(k))
+                .min_by_key(|(_, inc)| inc.last_seen_millis)
+                .map(|(k, _)| k.clone())
+            {
+                per_org.remove(&evict_id);
+            }
         }
     }
     let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {
