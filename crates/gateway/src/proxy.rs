@@ -11750,7 +11750,10 @@ pub(crate) mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(reporter.pending_count(), 1);
         let detail = reporter.pending_detail();
-        assert!(!detail.contains(&secret), "the Cloud copy carried {detail:?}");
+        assert!(
+            !detail.contains(&secret),
+            "the Cloud copy carried {detail:?}"
+        );
         assert!(!detail.contains("llm.example.test"), "{detail:?}");
         assert_eq!(detail, "send failed");
     }

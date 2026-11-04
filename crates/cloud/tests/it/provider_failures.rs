@@ -563,6 +563,13 @@ async fn a_key_bound_to_one_site_cannot_add_to_another_sites_count() {
     );
     post(&state, Some("sitekey"), report(PROVIDER, 1)).await;
     let all = incidents(&state).await;
-    assert_eq!(all.len(), 1, "the first site's own third failure opens its own incident");
-    assert_eq!(all[0]["id"], "dependency_failed:provider:api.example.test@gw-1");
+    assert_eq!(
+        all.len(),
+        1,
+        "the first site's own third failure opens its own incident"
+    );
+    assert_eq!(
+        all[0]["id"],
+        "dependency_failed:provider:api.example.test@gw-1"
+    );
 }
