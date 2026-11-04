@@ -64,7 +64,10 @@ flowchart TB
   VCX ==>|"delegation_issued / denied / revoked"| BUS
   TF ==>|"agent-event NDJSON"| BUS{{"agent-event bus + Agent Passport"}}
   WX ==> BUS
-  Agent -->|"web fetch"| SCX["Scopyx: governed web egress"]
+  Agent -->|"web fetch: MCP tools/call"| BRK["TokenFuse MCP broker: the scopyx key from its vault, the run labelled from the act"]
+  BRK -->|"last hop"| SCX["Scopyx: governed web egress"]
+  BRK -->|"observed act"| TF
+  Agent -.->|"or direct, key in a header"| SCX
   SCX -->|"POST /v1/decide"| WX
   SCX ==>|"web_fetch / web_blocked"| BUS
   ENG["Engram: memory"] -->|"reflect via base_url"| TF
@@ -75,6 +78,7 @@ flowchart TB
   QX ==>|"crypto events"| BUS
   BUS ==> VX["Verdryx: quality / drift"]
   VX ==>|"quality events"| BUS
+  VX ==>|"slo_burn: error budget spent, so hold"| WX
   TF -->|"outcome-tagged traces"| VX
   MX["Mockryx: pre-prod safety rehearsal"] -->|"hostile scenarios"| TF
   MX ==>|"sim events"| BUS
@@ -85,7 +89,7 @@ flowchart TB
   HX -->|"one mail, a view and never an action"| OPS["your mailbox"]
   HX ==>|"alert_sent"| HJ[("heraldyx's own hash-chained journal, not this bus")]
   YOU(["you, in a browser over your own tunnel"]) --> GX[["Genaryx: the console over all of it"]]
-  GX -->|"signed commands: the kill, an approval, a policy"| CL
+  GX -->|"commands: the kill, an approval, a policy"| CL
   GX -->|"signed commands"| WX
   GX ==>|"console_command"| BUS
   GX -.->|"reads it"| IDX
@@ -269,7 +273,7 @@ One case is neither settled nor released: a call the gateway has already handed 
 <sub>One shared core, enabled as config-gated capability packs.</sub>
 </div>
 
-Everything below is **implemented on `main` and tested in CI** (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests); see [Project status](#-project-status) for exactly which of it is in the tagged **v1.14.0** release versus landed on `main` since.
+Everything below is **implemented and tested in CI**, and is in the tagged **v1.21.0** release (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests, and [Project status](#-project-status) for the releases).
 
 <div align="center">
 
@@ -647,15 +651,15 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 ## 📋 Project status
 
-**v1.14.0: the current release, functional and shipped, young and not yet battle-tested.**
+**v1.21.0: the current release, functional and shipped, young and not yet battle-tested.**
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-The newest tag, [v1.14.0](docs/releases/v1.14.0.md), is a minor release: the gateway admits nothing a budget governs until it has read its control plane's money state, judges streamed tool calls as it judges buffered ones, puts a refused client key on the event bus, records the PII it lets through on each trace row and in the fleet view, and the Cloud names every model a run used. [v1.13.2](docs/releases/v1.13.2.md) before it is a security patch: rustls 0.23.46 for four RustSec advisories (RUSTSEC-2026-0346 to 0349), and the control-plane page now renders run fields as text, so a run id or model name a caller chose can never become markup on that page. [v1.13.1](docs/releases/v1.13.1.md) before it caps a tool call's arguments at the policy plane's own 12 KiB bound, so a larger call reaches Wardryx flagged as truncated and gets a verdict instead of being left to the failmode, and moves datafusion to 55, which drops the thrift crate. [v1.13.0](docs/releases/v1.13.0.md) before it holds the built-in price book as the vendors' rates read on 2026-10-13, and a model sold at two rates by prompt length (Claude Haiku 5.5, OpenAI's tiered models, Gemini 2.5 Pro and 3.1 Pro Preview) is priced by the prompt each call sent. Each release's notes also say what is not proven.
+The newest tag, [v1.21.0](docs/releases/v1.21.0.md), is a minor release: the agent firewall takes a run's taint label from the act an enforcement point saw, not from the tool name the agent reported, so a read through an upstream the MCP broker classifies labels the run whatever the tool was called (invariant 143), and a provider that keeps failing is one incident in the Cloud console and API instead of one `dependency_failed` event per call (invariant 144); wasmtime moves to 49.0.5 for three advisories. Before it, [v1.20.3](docs/releases/v1.20.3.md) puts a refusal at the `require` agent-token door on the event bus as the open door already did, [v1.20.2](docs/releases/v1.20.2.md) prices `gpt-6.1-terra` at its own row, and [v1.20.1](docs/releases/v1.20.1.md) makes the MCP broker refuse a JSON-RPC batch whole instead of forwarding it unjudged. [v1.20.0](docs/releases/v1.20.0.md) lets a delegation or MCP proof name any of several public origins the operator lists. [v1.19.0](docs/releases/v1.19.0.md) is the security-default release: an unconfigured gateway and broker enforce what they advertise (the governed profile, see [Safe by default](#-safe-by-default)). [v1.18.0](docs/releases/v1.18.0.md) signs the event stream with checkpoints that keyryx custody certifies and lets the Cloud sign its audit manifest through keyryx. [v1.17.0](docs/releases/v1.17.0.md) makes the MCP broker publish the protected resource metadata the MCP authorization specification requires, whenever the agent-token door is on. [v1.16.0](docs/releases/v1.16.0.md) makes a run belong to the principal that opened it and lets the gateway hold its own provider key. [v1.15.0](docs/releases/v1.15.0.md) closes five defects in agent-security defaults. [v1.14.0](docs/releases/v1.14.0.md) holds budgets until the gateway has read its control plane, judges streamed tool calls as it judges buffered ones, and has the Cloud name every model a run used. Every release has its notes in `docs/releases/`.
 
 **v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
-Since v0.4.0, on `main` and in the releases after it (see `docs/releases/`): TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the gateway **refuses to start** rather than answer from a stub and meter invented usage as spend (`TOKENFUSE_ALLOW_STUB=1` keeps the offline loop); the **MCP credential-broker** now refuses to start too, on a non-loopback bind with no `TOKENFUSE_MCP_KEYS` configured (`TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` is the opt-out for a deliberately open bind); the gateway now serves an OpenAI-compatible `/v1/chat/completions` door beside `/v1/messages`, through the same enforcement pipeline, selected by `TOKENFUSE_WIRE` ([docs/26](docs/26-the-openai-door.md)); and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data. Landed after a live cloud range on 2026-08-04: **[safe defaults](#-safe-by-default)** (secret scanning on, unmetered pass-through off), `GET /v1/policy-plane`, and incident severity that comes from the magnitude a detector measured instead of from its name.
+Since v0.4.0, in the releases after it (see `docs/releases/`): TokenFuse is now **free end to end** (the last plan-entitlement gating was removed from Cloud; there is no paid TokenFuse tier); the Cloud control plane **binds to loopback by default**, with `TOKENFUSE_CLOUD_HOST` as the explicit opt-in for a wider bind; the gateway **refuses to start** rather than answer from a stub and meter invented usage as spend (`TOKENFUSE_ALLOW_STUB=1` keeps the offline loop); the **MCP credential-broker** now refuses to start too, on a non-loopback bind with no `TOKENFUSE_MCP_KEYS` configured (`TOKENFUSE_MCP_ALLOW_OPEN_BIND=1` is the opt-out for a deliberately open bind); the gateway now serves an OpenAI-compatible `/v1/chat/completions` door beside `/v1/messages`, through the same enforcement pipeline, selected by `TOKENFUSE_WIRE` ([docs/26](docs/26-the-openai-door.md)); and the dashboard gained a no-install **[live preview](https://taipanbox.github.io/tokenfuse/preview/)** with sample data. Landed after a live cloud range on 2026-08-04: **[safe defaults](#-safe-by-default)** (secret scanning on, unmetered pass-through off), `GET /v1/policy-plane`, and incident severity that comes from the magnitude a detector measured instead of from its name.
 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
@@ -721,7 +725,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Is it free?** Yes, all of it. TokenFuse is open source (Apache-2.0) and free to self-host, with no seat limits and no time limit: the CLI, the local proxy, `tokenfuse mcp-scan` and its GitHub Action, and the **Cloud** control plane and dashboard (fleet spend, alerts, central budgets, the kill-switch). There is no paid TokenFuse tier. A separate commercial product provides the **secured, managed enterprise control room** over the whole stack (authenticated remote access over a tunnel, unified fleet control, hardware-signed actions); TokenFuse itself stays free and open.
 
-**Is it production-ready?** It is 1.14.0: the surface is written and held (`COMPATIBILITY.md`), it is CI-tested and it was run on real boxes, clusters and providers before the 1.0.0 tag (`docs/releases/v1.0.0.md`), but it is not audited or battle-hardened. Start in shadow mode and evaluate.
+**Is it production-ready?** It is 1.21.0: the surface is written and held (`COMPATIBILITY.md`), it is CI-tested and it was run on real boxes, clusters and providers before the 1.0.0 tag (`docs/releases/v1.0.0.md`), but it is not audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
@@ -903,6 +907,12 @@ make services agree with each other are decided by the local orchestrators
 | [19 · Wave-2 governance](docs/19-wave2-governance.md) | Model router, the Wardryx policy hook (PEP/PDP split), Cloud replay + the regulator evidence pack, and per-instance Parquet trace segments: the design notes behind the "Wave-2 configuration" section above |
 | [20 · Identity map](docs/20-identity-map.md) | Key ↔ agent ↔ business-unit binding, strict mode, and monthly unit budgets: the design + build plan behind the "Identity map" section above |
 | [21 · Tool runs](docs/21-tool-runs.md) | What counts as a tool run (Anthropic/OpenAI, streaming/non-streaming), the nullable `tool_calls` trace column, and why v1 is observed-only with no budgets |
+| [22 · Key lifecycle](docs/22-key-lifecycle.md) | `GET /v1/keys`: a read-only report on the shape a gateway's client keys are in |
+| [23 · MCP broker v2](docs/23-mcp-broker-v2.md) | Named upstreams, a policy gate and tool-call audit for the credential-broker |
+| [24 · MCP proof door](docs/24-mcp-proof-door.md) | CIMD client ids and DPoP proofs as the broker's door credential, instead of a shared secret |
+| [25 · Delegation door](docs/25-the-delegation-door.md) | Who a call is acting for, whether anybody checked, and what happens when the authority is withdrawn |
+| [26 · OpenAI door](docs/26-the-openai-door.md) | The OpenAI-compatible `/v1/chat/completions` door: the same enforcement, a second wire shape |
+| [27 · Governed profile](docs/27-the-governed-profile.md) | `TOKENFUSE_PROFILE`: what an unconfigured gateway does, `governed` or `observe` |
 
 ---
 
