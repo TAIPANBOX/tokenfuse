@@ -1,0 +1,106 @@
+[
+ {
+  "id": "B0",
+  "file": "crates/cloud/src/store.rs",
+  "old": "pub const PROVIDER_OVERFLOW_BUCKET",
+  "new": "pub const PROVIDER_OVERFLOW_BUCKET",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "baseline cloud (all 48 + findings): must pass"
+ },
+ {
+  "id": "B1",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "pub const FLUSH_EVERY",
+  "new": "pub const FLUSH_EVERY",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "baseline gateway: must pass"
+ },
+ {
+  "id": "G1",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "    if matches!(dependency, Dependency::Provider) {\n        if let Some(class)",
+  "new": "    if matches!(dependency, Dependency::Provider | Dependency::PolicyPlane) {\n        if let Some(class)",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the policy plane is counted as the provider"
+ },
+ {
+  "id": "G2",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "crate::providerreport::note_provider_failure(class);",
+  "new": "crate::providerreport::note_provider_failure(&format!(\"{class} {detail}\"));",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the error text goes to the Cloud"
+ },
+ {
+  "id": "G14",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": ".bearer_auth(&self.key)",
+  "new": ".bearer_auth(format!(\"{}x\", self.key))",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the report carries the wrong key"
+ },
+ {
+  "id": "R4",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
+  "new": "    !inc.acknowledged\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "active means unacknowledged only: an acknowledged incident seen a moment ago frees its place"
+ },
+ {
+  "id": "R4b",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
+  "new": "    now_ms.saturating_sub(inc.last_seen_millis) < window_ms || inc.occurrences > u64::MAX\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "active means recent only: an old unacknowledged incident frees its place"
+ },
+ {
+  "id": "R8",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                && !is_overflow_provider_id(id)\n                && !provider_incident_is_active(inc, now_ms, window_ms)",
+  "new": "                && !provider_incident_is_active(inc, now_ms, window_ms)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "the shared other bucket can be evicted"
+ },
+ {
+  "id": "R11",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                stored.summary = Some(provider_summary(\n                    &reported,",
+  "new": "                stored.summary = Some(provider_summary(\n                    &format!(\"{key}{}\", &reported[..0]),",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "the summary of an incident filed in other loses the label"
+ },
+ {
+  "id": "X1",
+  "file": "crates/cloud/src/store.rs",
+  "old": "        if is_reserved_incident_id(detector, subject) {",
+  "new": "        if false && is_reserved_incident_id(detector, subject) {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "record_external_finding accepts the reserved id space"
+ },
+ {
+  "id": "X2",
+  "file": "crates/cloud/src/http.rs",
+  "old": ".any(|f| crate::store::is_reserved_incident_id(&f.detector, &f.identity))",
+  "new": ".any(|_| false)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "the findings route does not check the report first"
+ },
+ {
+  "id": "X3",
+  "file": "crates/cloud/src/store.rs",
+  "old": "        ts,\n        false,\n    )\n}",
+  "new": "        ts,\n        true,\n    )\n}",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "the provider path evicts like the generic one"
+ },
+ {
+  "id": "X4",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    is_provider_incident_id(&incident_id(detector, subject))",
+  "new": "    is_provider_incident_id(&incident_id(subject, detector))",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures findings",
+  "why": "the reserved id is computed from swapped arguments"
+ }
+]
