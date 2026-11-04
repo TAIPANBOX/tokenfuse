@@ -271,6 +271,8 @@ event while delegation verification was off.
 #293, #294 and #295 by #310 (`3787ccd`, invariants 52 to 54); #296 by #307 (`169a83e`, the
 `run_stalled` detector, invariant 60); #305 above is still open. None of it is in a tagged
 release: the launchers pin v1.0.2, whose gateway carries none of these fixes.
+Later (2026-11-04, from `git tag --contains` and the issue tracker): the fixes
+named above are first in v1.0.3, and issues 292 to 297 and 305 are all closed.
 
 **What this run did not prove.** Managed agent runtimes (Bedrock Agents, Vertex Agent Engine)
 were not exercised, nor were managed clusters, arm64, or more than one node or agent per
