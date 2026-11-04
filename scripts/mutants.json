@@ -1,0 +1,362 @@
+[
+ {
+  "id": "B0",
+  "file": "crates/cloud/src/store.rs",
+  "old": "pub const PROVIDER_OVERFLOW_BUCKET",
+  "new": "pub const PROVIDER_OVERFLOW_BUCKET",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "baseline cloud: no mutation, must pass"
+ },
+ {
+  "id": "B1",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "pub const FLUSH_EVERY",
+  "new": "pub const FLUSH_EVERY",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "baseline gateway: no mutation, must pass"
+ },
+ {
+  "id": "S1",
+  "file": "crates/cloud/src/store.rs",
+  "old": "            if in_window < threshold {",
+  "new": "            if in_window <= threshold {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "threshold off by one"
+ },
+ {
+  "id": "S2",
+  "file": "crates/cloud/src/store.rs",
+  "old": "now_ms.saturating_sub(*start) >= window_ms)",
+  "new": "now_ms.saturating_sub(*start) >= window_ms * 1_000_000)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "window never expires"
+ },
+ {
+  "id": "S3",
+  "file": "crates/cloud/src/store.rs",
+  "old": "let count = count.min(MAX_PROVIDER_FAILURES_PER_REPORT);",
+  "new": "let count = count.min(10 * MAX_PROVIDER_FAILURES_PER_REPORT);",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "count clamp weakened"
+ },
+ {
+  "id": "S4",
+  "file": "crates/cloud/src/store.rs",
+  "old": "Some(before) => before.saturating_add(count),",
+  "new": "Some(before) => before.saturating_add(1),",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "later reports add one, not their count"
+ },
+ {
+  "id": "S5",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                    None => in_window,",
+  "new": "                    None => count,",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "a new incident opens with this report's count, not the window's"
+ },
+ {
+  "id": "S6",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                !buckets.is_empty()\n",
+  "new": "                true\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "expired labels keep their tracker slot"
+ },
+ {
+  "id": "S7",
+  "file": "crates/cloud/src/store.rs",
+  "old": "matches!(c, '.' | '_' | ':' | '-') {",
+  "new": "matches!(c, '.' | '_' | ':' | '-' | '<' | '>' | ' ') {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "label sanitiser lets markup and spaces through"
+ },
+ {
+  "id": "S8",
+  "file": "crates/cloud/src/store.rs",
+  "old": ".take(PROVIDER_LABEL_MAX_CHARS)",
+  "new": ".take(PROVIDER_LABEL_MAX_CHARS * 100)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "label length unbounded"
+ },
+ {
+  "id": "S9",
+  "file": "crates/cloud/src/store.rs",
+  "old": "        .filter(|c| !c.is_control())\n        .take(PROVIDER_DETAIL_MAX_CHARS)",
+  "new": "        .filter(|c| *c != '\\u{0}')\n        .take(PROVIDER_DETAIL_MAX_CHARS)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "summary keeps control characters"
+ },
+ {
+  "id": "S10",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    if t.is_empty() {\n        return None;\n    }",
+  "new": "    if t.len() > 10_000 {\n        return None;\n    }",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "a blank label names a provider"
+ },
+ {
+  "id": "S11",
+  "file": "crates/cloud/src/store.rs",
+  "old": "        let site = site.and_then(provider_label);",
+  "new": "        let site = site.and_then(provider_label).filter(|_| false);",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the reporting site is ignored"
+ },
+ {
+  "id": "S12",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                tokenfuse_core::Severity::High,\n                &scope,",
+  "new": "                tokenfuse_core::Severity::Medium,\n                &scope,",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "severity lowered"
+ },
+ {
+  "id": "S13",
+  "file": "crates/cloud/src/store.rs",
+  "old": "let threshold = self.incident_cfg.provider_failures.max(1);",
+  "new": "let threshold = self.incident_cfg.provider_failures.max(2);",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "a threshold of one is impossible"
+ },
+ {
+  "id": "R1",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                let over_site = here >= MAX_PROVIDERS_PER_ORG;",
+  "new": "                let over_site = here >= 10 * MAX_PROVIDERS_PER_ORG;",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the per-site limit is ten times too high"
+ },
+ {
+  "id": "R2",
+  "file": "crates/cloud/src/store.rs",
+  "old": "        if id_site == site && provider_incident_is_active(inc, now_ms, window_ms) {",
+  "new": "        if (id_site == site || id_site != site) && provider_incident_is_active(inc, now_ms, window_ms) {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the per-site limit counts every site together"
+ },
+ {
+  "id": "R3",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
+  "new": "    now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "active means recent only: an old unacknowledged incident is forgotten"
+ },
+ {
+  "id": "R4",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms\n",
+  "new": "    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms * 0\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "active means unacknowledged only: an old acknowledged incident holds its place forever"
+ },
+ {
+  "id": "R5",
+  "file": "crates/cloud/src/store.rs",
+  "old": "    if !is_provider_incident_id(&id)\n        && !per_org.contains_key(&id)",
+  "new": "    if !per_org.contains_key(&id)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "provider incidents count against the cap of the other kinds and can evict them"
+ },
+ {
+  "id": "R6",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                .filter(|(k, _)| !is_provider_incident_id(k))\n                .min_by_key",
+  "new": "                .min_by_key",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "an incident of another kind may evict a provider incident"
+ },
+ {
+  "id": "R7",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                    && all >= MAX_PROVIDER_INCIDENTS_PER_ORG\n",
+  "new": "                    && all >= 10 * MAX_PROVIDER_INCIDENTS_PER_ORG\n",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the provider reserve is ten times too large"
+ },
+ {
+  "id": "R8",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                && !is_overflow_provider_id(id)\n                && !provider_incident_is_active(inc, now_ms, window_ms)",
+  "new": "                && !provider_incident_is_active(inc, now_ms, window_ms)",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the shared other bucket can be evicted"
+ },
+ {
+  "id": "R9",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                && !provider_incident_is_active(inc, now_ms, window_ms)\n        })\n        .min_by_key",
+  "new": "                && (!provider_incident_is_active(inc, now_ms, window_ms) || inc.occurrences > 0)\n        })\n        .min_by_key",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "an active incident can be evicted from the reserve"
+ },
+ {
+  "id": "R10",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                if into_other {\n                    // A new failure must not hide behind an old acknowledgement\n                    // of whatever else was filed here.\n                    stored.acknowledged = false;\n                }",
+  "new": "                if false {\n                    stored.acknowledged = false;\n                }",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "a failure filed in other stays hidden behind an old acknowledgement"
+ },
+ {
+  "id": "R11",
+  "file": "crates/cloud/src/store.rs",
+  "old": "                stored.summary = Some(provider_summary(\n                    &reported,",
+  "new": "                stored.summary = Some(provider_summary(\n                    &scope,",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the summary of an incident filed in other loses the label"
+ },
+ {
+  "id": "H1",
+  "file": "crates/cloud/src/http.rs",
+  "old": "    if parsed.failures.len() > PROVIDER_FAILURES_MAX_ENTRIES {",
+  "new": "    if parsed.failures.len() >= PROVIDER_FAILURES_MAX_ENTRIES {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "entry cap off by one"
+ },
+ {
+  "id": "H2",
+  "file": "crates/cloud/src/http.rs",
+  "old": "pub const PROVIDER_FAILURES_MAX_BODY: usize = 16 * 1024;",
+  "new": "pub const PROVIDER_FAILURES_MAX_BODY: usize = 64 * 1024 * 1024;",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "body limit removed in effect"
+ },
+ {
+  "id": "H3",
+  "file": "crates/cloud/src/http.rs",
+  "old": "            site.as_deref(),\n            &f.provider,",
+  "new": "            site.as_deref().filter(|_| false),\n            &f.provider,",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the key's site is dropped in the handler"
+ },
+ {
+  "id": "H4",
+  "file": "crates/cloud/src/http.rs",
+  "old": "is_some() && f.count > 0 {",
+  "new": "is_some() {",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "a zero count is accepted"
+ },
+ {
+  "id": "H5",
+  "file": "crates/cloud/src/http.rs",
+  "old": "    // report for another.\n    let Mutator { org, site, .. } = match st.authorize_ingest(",
+  "new": "    // report for another.\n    let Mutator { org, site, .. } = match st.authorize_mutation(",
+  "run": "cargo test -p tokenfuse-cloud --test it -- provider_failures",
+  "why": "the route needs admin, not ingest"
+ },
+ {
+  "id": "G1",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "    if matches!(dependency, Dependency::Provider) {\n        if let Some(class)",
+  "new": "    if matches!(dependency, Dependency::Provider | Dependency::PolicyPlane) {\n        if let Some(class)",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the policy plane is counted as the provider"
+ },
+ {
+  "id": "G2",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "crate::providerreport::note_provider_failure(class);",
+  "new": "crate::providerreport::note_provider_failure(detail);",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the error text goes to the Cloud"
+ },
+ {
+  "id": "G3",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "    status.is_server_error() || matches!(status.as_u16(), 408 | 429)\n}\n\n/// Whether a provider's non-2xx is the PROVIDER's failure",
+  "new": "    is_the_providers_refusal(status)\n}\n\n/// Whether a provider's non-2xx is the PROVIDER's failure",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a 400 or 404 is counted"
+ },
+ {
+  "id": "G4",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "note_provider_failure(&format!(\"HTTP {}\", status.as_u16()));",
+  "new": "note_provider_failure(&format!(\"HTTP {} {model}\", status.as_u16()));",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the caller's model goes to the Cloud"
+ },
+ {
+  "id": "G5",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "        DependencyStage::Send => Some(\"send failed\"),",
+  "new": "        DependencyStage::Send => None,",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a failed send is not counted"
+ },
+ {
+  "id": "G6",
+  "file": "crates/gateway/src/proxy.rs",
+  "old": "        DependencyStage::Stream => Some(\"stream broke\"),",
+  "new": "        DependencyStage::Stream => None,",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a broken stream is not counted"
+ },
+ {
+  "id": "G7",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "pending.count = pending.count.saturating_add(1);",
+  "new": "pending.count = pending.count.saturating_add(2);",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "each failure counts twice"
+ },
+ {
+  "id": "G8",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "                std::mem::take(&mut pending.count),",
+  "new": "                pending.count,",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a flush does not clear the count"
+ },
+ {
+  "id": "G9",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "            if pending.count == 0 {\n                return Flush::Nothing;",
+  "new": "            if pending.count == u64::MAX {\n                return Flush::Nothing;",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "an empty flush posts anyway"
+ },
+ {
+  "id": "G10",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": ".take(DETAIL_MAX_CHARS)",
+  "new": ".take(DETAIL_MAX_CHARS * 100)",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "detail length unbounded"
+ },
+ {
+  "id": "G11",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "            .filter(|c| !c.is_control())\n            .take(DETAIL_MAX_CHARS)",
+  "new": "            .filter(|c| *c != '\\u{0}')\n            .take(DETAIL_MAX_CHARS)",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "detail keeps control characters"
+ },
+ {
+  "id": "G12",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);",
+  "new": "    let host = authority;",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a credential in the upstream URL stays in the label"
+ },
+ {
+  "id": "G13",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": "Ok(resp) if resp.status().is_success() => Flush::Sent(count),",
+  "new": "Ok(resp) if resp.status().as_u16() < 500 => Flush::Sent(count),",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "a refusal counts as delivered"
+ },
+ {
+  "id": "G14",
+  "file": "crates/gateway/src/providerreport.rs",
+  "old": ".bearer_auth(&self.key)",
+  "new": ".bearer_auth(\"wrong\")",
+  "run": "cargo test -p tokenfuse-gateway --lib -- providerreport:: only_a_provider_failure_is_counted_for_the_cloud_incident the_text_of_a_transport_error_never_goes_to_the_cloud only_a_providers_health_statuses_are_counted_for_the_cloud",
+  "why": "the report carries the wrong key"
+ }
+]
