@@ -1,0 +1,49 @@
+name: CI
+on:
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+jobs:
+  test:
+    name: mutant
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [B0, B1, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13, S14, H1, H2, H3, H4, H5, G1, G2, G3, G4, G5, G6, G7, G8, G9, G10, G11, G12, G13, G14]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free runner disk
+        run: |
+          nohup bash -c '
+            for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+              sudo rm -rf "$d" &
+            done
+            wait
+            touch "$RUNNER_TEMP/disk-freed"
+          ' >/dev/null 2>&1 &
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1
+      - name: Mutate and run the tests that should notice
+        run: |
+          set +e
+          out=$(python3 scripts/mutate.py ${{ matrix.id }}) || { echo "RESULT ${{ matrix.id }} NOT-APPLIED"; echo "$out"; exit 0; }
+          echo "$out" | head -1
+          cmd=$(echo "$out" | sed -n 2p)
+          for _ in $(seq 1 150); do [ -e "$RUNNER_TEMP/disk-freed" ] && break; sleep 2; done
+          $cmd 2>&1 | tee run.txt
+          if grep -q 'test result: FAILED' run.txt; then
+            echo "RESULT ${{ matrix.id }} KILLED by: $(grep -E '^test .* FAILED' run.txt | sed 's/^test //; s/ \.\.\. FAILED//' | tr '\n' ' ')"
+          elif grep -qE 'could not compile|^error' run.txt; then
+            echo "RESULT ${{ matrix.id }} ERROR (did not compile)"
+          else
+            echo "RESULT ${{ matrix.id }} SURVIVED (all passed)"
+          fi
+          exit 0
