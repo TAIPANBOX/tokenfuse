@@ -167,6 +167,7 @@ const INCIDENT_LABELS: Record<string, string> = {
   fanout_explosion: "Fan-out explosion",
   budget_threshold: "Near budget",
   run_stalled: "Run stalled",
+  dependency_failed: "Provider failing",
 };
 const incidentLabel = (kind: string) => INCIDENT_LABELS[kind] || kind;
 

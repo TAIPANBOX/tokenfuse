@@ -43,6 +43,7 @@ pub mod pricebook;
 pub mod pricebookreport;
 pub mod pricefile;
 pub mod provider;
+pub mod providerreport;
 pub mod proxy;
 #[cfg(feature = "cluster")]
 pub mod raft_ledger;

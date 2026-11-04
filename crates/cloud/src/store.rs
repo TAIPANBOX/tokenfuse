@@ -1080,6 +1080,18 @@ pub struct IncidentConfig {
     /// whose "zero is unset" rule is exactly wrong for a knob whose zero means
     /// off.
     pub stall_after_ms: i64,
+    /// `dependency_failed` for a provider (invariant 144) opens once a
+    /// provider has failed at least this many calls within
+    /// `provider_window_ms` (`TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES`). One
+    /// failure is a bad minute, a handful in a row is a provider that is down
+    /// or throttling, and the gateway's per-call events cannot tell the two
+    /// apart because each is its own run.
+    pub provider_failures: u64,
+    /// Window for the `dependency_failed` count, ten minutes like the
+    /// `sustained_loop` repeat window. Counted in ten-second buckets, and a
+    /// bucket whose start is a whole window old is dropped, so a count never
+    /// includes a failure older than the window.
+    pub provider_window_ms: i64,
 }
 
 impl Default for IncidentConfig {
@@ -1095,6 +1107,8 @@ impl Default for IncidentConfig {
             fanout_multiple: 4,
             fanout_window_ms: 600_000,
             stall_after_ms: 300_000,
+            provider_failures: 3,
+            provider_window_ms: 600_000,
         }
     }
 }
@@ -1196,7 +1210,7 @@ const MAX_TRACKER_KEYS: usize = 20_000;
 /// incidents, growing the autosaved snapshot and slowing `/v1/incidents`
 /// (unpaginated) and `/v1/compliance` (folds every incident). On overflow the
 /// incident with the OLDEST `last_seen_millis` is evicted — see `upsert_incident`.
-const MAX_INCIDENTS_PER_ORG: usize = 10_000;
+pub const MAX_INCIDENTS_PER_ORG: usize = 10_000;
 
 /// Hard cap on the number of distinct run_ids retained in each org's
 /// [`SavingsAcc::breaks`] dedup set (see that field's doc). Reuses the same
@@ -1224,6 +1238,40 @@ const MAX_UNIT_MONTH_KEYS: usize = 4_096;
 /// silently zero a real site's counters mid-incident, while the overflow
 /// bucket stays visible. Far above any real fleet's site count.
 const MAX_GATEWAYS_PER_ORG: usize = 1_024;
+
+/// Invariant 144. One reporting site's providers: label → `(bucket start,
+/// failures)` in ten-second buckets, oldest first.
+type ProviderWindows = HashMap<String, VecDeque<(i64, u64)>>;
+
+/// Invariant 144. The longest provider label kept, in characters.
+pub const PROVIDER_LABEL_MAX_CHARS: usize = 128;
+
+/// Invariant 144. Distinct providers tracked per (org, site), counting only
+/// those with a failure inside the window. A gateway names one upstream, so a
+/// real site has a handful; a label is whatever the pushing key sent, so a
+/// hostile or broken one could otherwise open an incident per string. A NEW
+/// provider past the cap folds into [`PROVIDER_OVERFLOW_BUCKET`] rather than
+/// evicting a real one: evicting would silently reset a real outage's count,
+/// while the overflow bucket stays visible. A label whose window has emptied
+/// has given its slot back, so the cap cannot be filled with labels that
+/// stopped failing and push a real provider into the shared bucket.
+pub const MAX_PROVIDERS_PER_ORG: usize = 64;
+
+/// Invariant 144. Where a provider past [`MAX_PROVIDERS_PER_ORG`] is counted.
+pub const PROVIDER_OVERFLOW_BUCKET: &str = "other";
+
+/// Invariant 144. The most failures one report entry is allowed to add. A
+/// count is a number the pushing key chose; clamped, a single hostile entry
+/// cannot turn the incident's `occurrences` into a number nobody can read.
+pub const MAX_PROVIDER_FAILURES_PER_REPORT: u64 = 1_000_000;
+
+/// Invariant 144. Failures are counted in buckets this wide, so a provider
+/// that fails a thousand calls a second keeps six dozen numbers in memory
+/// across a ten-minute window, not a thousand a second.
+const PROVIDER_BUCKET_MS: i64 = 10_000;
+
+/// Invariant 144. The longest `detail` kept in an incident's summary.
+const PROVIDER_DETAIL_MAX_CHARS: usize = 160;
 
 /// Default alert-fraction threshold (mirrors `TOKENFUSE_CLOUD_ALERT_PCT`'s
 /// documented default in `main.rs`), used by [`Store::with_incident_config`]
@@ -1443,6 +1491,16 @@ struct Inner {
     /// [`INCIDENT_TRACKER_CAP`]; the small occurrence counter the detectors
     /// threshold against (ephemeral — the `Incident` is the durable record).
     incident_tracker: HashMap<(String, String), VecDeque<i64>>,
+    /// org → reporting site → provider label → `(bucket start, failures)` in
+    /// ten-second buckets, oldest first, for the `dependency_failed` count
+    /// (invariant 144). The site is the one the pushing key is bound to, `""`
+    /// for a key bound to none, so a key bound to one site never adds to
+    /// another's count. Ephemeral like the other trackers: the `Incident` is
+    /// the durable record, and a restart costs at most one window of counting.
+    /// Bounded by [`MAX_PROVIDERS_PER_ORG`] labels per (org, site), by the
+    /// window over the bucket width per label, and a label whose window has
+    /// emptied is removed before the cap is looked at.
+    provider_failures: HashMap<String, HashMap<String, ProviderWindows>>,
     /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
     /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
     /// the windowed distinct-run count the detector thresholds against
@@ -1679,6 +1737,29 @@ impl Default for Store {
         Self::new()
     }
 }
+
+/// Invariant 144. Whether a finding with this detector and subject would be
+/// filed under an incident id in the space the provider detector owns,
+/// `dependency_failed:provider:`. That space has a reserve of its own that
+/// the org's incident cap does not count, so only the detector that holds the
+/// reserve may file in it: `POST /v1/findings` lets a caller choose the id, and
+/// is refused there.
+pub fn is_reserved_incident_id(detector: &str, subject: &str) -> bool {
+    is_provider_incident_id(&incident_id(detector, subject))
+}
+
+/// A finding named an incident id in the space the provider detector reserves
+/// (see [`is_reserved_incident_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedIncidentId;
+
+impl std::fmt::Display for ReservedIncidentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("that detector and identity name an incident this plane files itself")
+    }
+}
+
+impl std::error::Error for ReservedIncidentId {}
 
 /// One externally detected finding, as [`Store::record_external_finding`]
 /// takes it. A struct rather than eight positional arguments: every field here
@@ -2721,6 +2802,182 @@ impl Store {
         }
     }
 
+    /// `dependency_failed` for a provider (invariant 144): fold a gateway's
+    /// report of `count` failed provider calls into one incident per
+    /// (site, provider). The site is the one the pushing key is bound to, read
+    /// by the HTTP layer from the key and never from the body (`None` for a key
+    /// bound to none). See [`Store::note_provider_failures_from_at`].
+    pub fn note_provider_failures_from(
+        &self,
+        org: &str,
+        site: Option<&str>,
+        provider: &str,
+        count: u64,
+        detail: &str,
+    ) -> Option<Incident> {
+        self.note_provider_failures_from_at(org, site, provider, count, detail, now_millis())
+    }
+
+    /// [`Store::note_provider_failures_from_at`] for a key bound to no site.
+    pub fn note_provider_failures_at(
+        &self,
+        org: &str,
+        provider: &str,
+        count: u64,
+        detail: &str,
+        now_ms: i64,
+    ) -> Option<Incident> {
+        self.note_provider_failures_from_at(org, None, provider, count, detail, now_ms)
+    }
+
+    /// [`Store::note_provider_failures_from`] with an explicit `now_ms`.
+    /// Returns the incident when this report left the (site, provider) at or
+    /// over `provider_failures` failed calls within `provider_window_ms`,
+    /// `None` when it did not, the label names no provider, or `count` is zero.
+    ///
+    /// ONE incident per provider per reporting site, id
+    /// `dependency_failed:provider:<label>` for a key bound to no site and
+    /// `dependency_failed:provider:<label>@<site>` for one that is: the first
+    /// report to reach the threshold opens it with the window's count as its
+    /// `occurrences`, and later reports add their `count`, so a storm of a
+    /// thousand failing calls is one row. A key bound to one site cannot add to
+    /// another's count, or open an incident there, because the two are counted
+    /// apart: the site comes from the key (invariant 65), as it does for
+    /// `/v1/ingest`, and a report cannot name another. The gateway's per-call
+    /// events stay as they are; each is its own run and a notifier that keys
+    /// on the run mails each, which is why the console needed a row that is
+    /// not.
+    ///
+    /// Arrival time, never the reporter's: the window is this plane's clock.
+    /// Org-scoped, no run and no agent, so it is not exported to the agent
+    /// event bus: the envelope requires a subject (SPEC.md 6.1) and a
+    /// provider is not one, the same accepted boundary `spend_spike` has. It
+    /// is broadcast on the stream, and so reaches the push pipeline, like any
+    /// other incident.
+    pub fn note_provider_failures_from_at(
+        &self,
+        org: &str,
+        site: Option<&str>,
+        provider: &str,
+        count: u64,
+        detail: &str,
+        now_ms: i64,
+    ) -> Option<Incident> {
+        let label = provider_label(provider)?;
+        let site = site.and_then(provider_label);
+        let count = count.min(MAX_PROVIDER_FAILURES_PER_REPORT);
+        if count == 0 {
+            return None;
+        }
+        let threshold = self.incident_cfg.provider_failures.max(1);
+        let window_ms = self.incident_cfg.provider_window_ms.max(1);
+        let fired = {
+            let mut guard = self.inner.write().unwrap();
+            let inner = &mut *guard;
+            let per_site = inner
+                .provider_failures
+                .entry(org.to_string())
+                .or_default()
+                .entry(site.clone().unwrap_or_default())
+                .or_default();
+            // Give back the slot of every label whose window has emptied BEFORE
+            // the cap is looked at, or labels that stopped failing would fill
+            // it and push a real provider into the shared bucket.
+            per_site.retain(|_, buckets| {
+                while buckets
+                    .front()
+                    .is_some_and(|(start, _)| now_ms.saturating_sub(*start) >= window_ms)
+                {
+                    buckets.pop_front();
+                }
+                !buckets.is_empty()
+            });
+            let reported = label.clone();
+            let key = if per_site.contains_key(&label) || per_site.len() < MAX_PROVIDERS_PER_ORG {
+                label
+            } else {
+                PROVIDER_OVERFLOW_BUCKET.to_string()
+            };
+            let buckets = per_site.entry(key.clone()).or_default();
+            let bucket = now_ms - now_ms.rem_euclid(PROVIDER_BUCKET_MS);
+            let same_bucket = buckets.back().is_some_and(|(start, _)| *start == bucket);
+            if same_bucket {
+                if let Some((_, failures)) = buckets.back_mut() {
+                    *failures = failures.saturating_add(count);
+                }
+            } else {
+                buckets.push_back((bucket, count));
+            }
+            let in_window = buckets
+                .iter()
+                .fold(0u64, |sum, (_, failures)| sum.saturating_add(*failures));
+            if in_window < threshold {
+                return None;
+            }
+            // One simple structure (invariant 144). Provider incidents have a
+            // reserve of their own, `MAX_PROVIDER_INCIDENTS_PER_ORG` for the
+            // org, which competes with no other kind in either direction
+            // (`upsert_incident` leaves them out of its cap and its eviction).
+            // Within it a site may have `MAX_PROVIDERS_PER_ORG` ACTIVE ones, and
+            // an old, acknowledged one is not active: it gives its place back.
+            // A NEW provider past either limit is filed in the shared `other`
+            // bucket, which nothing counts and nothing evicts, so a failure over
+            // a limit is never lost. The window trackers above forget a label
+            // when its window empties and the incident does not, which is why
+            // the limit is held on the incidents.
+            let incidents = inner.incidents.entry(org.to_string()).or_default();
+            let mut key = key;
+            let mut scope = provider_scope(&key, site.as_deref());
+            if key != PROVIDER_OVERFLOW_BUCKET
+                && !incidents.contains_key(&incident_id("dependency_failed", &scope))
+            {
+                let (here, all) =
+                    provider_incident_counts(incidents, site.as_deref(), now_ms, window_ms);
+                let over_site = here >= MAX_PROVIDERS_PER_ORG;
+                let over_reserve = !over_site
+                    && all >= MAX_PROVIDER_INCIDENTS_PER_ORG
+                    && !evict_oldest_finished_provider_incident(incidents, now_ms, window_ms);
+                if over_site || over_reserve {
+                    key = PROVIDER_OVERFLOW_BUCKET.to_string();
+                    scope = provider_scope(&key, site.as_deref());
+                }
+            }
+            let into_other = key == PROVIDER_OVERFLOW_BUCKET;
+            let prior = incidents
+                .get(&incident_id("dependency_failed", &scope))
+                .map(|i| i.occurrences);
+            let mut inc = upsert_provider_incident(&mut inner.incidents, org, &scope, now_ms);
+            if let Some(stored) = inner
+                .incidents
+                .get_mut(org)
+                .and_then(|m| m.get_mut(&inc.id))
+            {
+                stored.occurrences = match prior {
+                    Some(before) => before.saturating_add(count),
+                    None => in_window,
+                };
+                if into_other {
+                    // A new failure must not hide behind an old acknowledgement
+                    // of whatever else was filed here.
+                    stored.acknowledged = false;
+                }
+                stored.summary = Some(provider_summary(
+                    &reported,
+                    site.as_deref(),
+                    into_other,
+                    in_window,
+                    window_ms,
+                    detail,
+                ));
+                inc = stored.clone();
+            }
+            inner.dirty = true;
+            inc
+        };
+        let _ = self.events.send(StreamEvent::Incident(fired.clone()));
+        Some(fired)
+    }
+
     /// `run_stalled` (invariant 60): the one detector that fires on ABSENCE,
     /// so no ingest can raise it. Driven on the wall clock by the interval
     /// task `main` spawns (see [`Store::stall_sweep_tick`]); see
@@ -3443,7 +3700,7 @@ impl Store {
         org: &str,
         reported_by: &str,
         f: FindingInput<'_>,
-    ) -> Incident {
+    ) -> Result<Incident, ReservedIncidentId> {
         let FindingInput {
             source,
             detector,
@@ -3452,6 +3709,11 @@ impl Store {
             summary,
             ts_millis,
         } = f;
+        // Refused before anything is taken or written: see
+        // [`is_reserved_incident_id`].
+        if is_reserved_incident_id(detector, subject) {
+            return Err(ReservedIncidentId);
+        }
         let agent_id = subject.starts_with("agent://").then(|| subject.to_string());
         let mut inner = self.inner.write().unwrap();
         let inc = upsert_incident(
@@ -3483,10 +3745,10 @@ impl Store {
                 source,
             );
             inner.dirty = true;
-            return out;
+            return Ok(out);
         }
         inner.dirty = true;
-        inc
+        Ok(inc)
     }
 
     /// Atomically decide whether to push for an incident and, if so, stamp its
@@ -4168,6 +4430,146 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// A provider label safe to put in an incident id and in front of an operator
+/// (invariant 144): trimmed, cut to [`PROVIDER_LABEL_MAX_CHARS`] characters,
+/// and every character outside `A-Z a-z 0-9 . _ : -` replaced by `_`. `None`
+/// for a blank label, which names no provider and so opens nothing. The label
+/// comes from the pushing key and is never trusted: it ends up in a stored id,
+/// a summary and a dashboard.
+pub fn provider_label(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(
+        t.chars()
+            .take(PROVIDER_LABEL_MAX_CHARS)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Invariant 144. The incident-id prefix of every provider incident.
+const PROVIDER_ID_PREFIX: &str = "dependency_failed:provider:";
+
+/// Invariant 144. How many provider incidents one org may hold, the shared
+/// `other` buckets not counted. A reserve of its own: provider incidents do not
+/// count against [`MAX_INCIDENTS_PER_ORG`], and incidents of other kinds do not
+/// count against this.
+pub const MAX_PROVIDER_INCIDENTS_PER_ORG: usize = 1_024;
+
+/// Invariant 144. The scope of a provider incident, `provider:<key>` with
+/// `@<site>` appended for a key bound to a site. A label cannot contain `@`
+/// (see [`provider_label`]), so the two halves never run together.
+fn provider_scope(key: &str, site: Option<&str>) -> String {
+    match site {
+        Some(site) => format!("provider:{key}@{site}"),
+        None => format!("provider:{key}"),
+    }
+}
+
+/// Invariant 144. Whether `id` is a provider incident's.
+fn is_provider_incident_id(id: &str) -> bool {
+    id.starts_with(PROVIDER_ID_PREFIX)
+}
+
+/// Invariant 144. Whether `id` is the shared `other` bucket's, which no cap
+/// counts and nothing evicts, so a failure over a cap always has somewhere to go.
+fn is_overflow_provider_id(id: &str) -> bool {
+    id.strip_prefix(PROVIDER_ID_PREFIX)
+        .and_then(|rest| rest.split('@').next())
+        .is_some_and(|label| label == PROVIDER_OVERFLOW_BUCKET)
+}
+
+/// Invariant 144. A provider incident counts toward a limit while it is
+/// unacknowledged, or was seen within the window. An old, acknowledged one is
+/// finished with and gives its place back.
+fn provider_incident_is_active(inc: &Incident, now_ms: i64, window_ms: i64) -> bool {
+    !inc.acknowledged || now_ms.saturating_sub(inc.last_seen_millis) < window_ms
+}
+
+/// Invariant 144. `(active provider incidents of this site, provider incidents
+/// of the org)`, the shared `other` buckets in neither.
+fn provider_incident_counts(
+    incidents: &HashMap<String, Incident>,
+    site: Option<&str>,
+    now_ms: i64,
+    window_ms: i64,
+) -> (usize, usize) {
+    let (mut here, mut all) = (0, 0);
+    for (id, inc) in incidents {
+        if !is_provider_incident_id(id) || is_overflow_provider_id(id) {
+            continue;
+        }
+        all += 1;
+        let id_site = id.rsplit_once('@').map(|(_, site)| site);
+        if id_site == site && provider_incident_is_active(inc, now_ms, window_ms) {
+            here += 1;
+        }
+    }
+    (here, all)
+}
+
+/// Invariant 144. Make room in the provider reserve by removing the finished
+/// provider incident (old and acknowledged) seen longest ago; `false` when
+/// there is none. Never an active incident and never one of another kind.
+fn evict_oldest_finished_provider_incident(
+    incidents: &mut HashMap<String, Incident>,
+    now_ms: i64,
+    window_ms: i64,
+) -> bool {
+    let oldest = incidents
+        .iter()
+        .filter(|(id, inc)| {
+            is_provider_incident_id(id)
+                && !is_overflow_provider_id(id)
+                && !provider_incident_is_active(inc, now_ms, window_ms)
+        })
+        .min_by_key(|(_, inc)| inc.last_seen_millis)
+        .map(|(id, _)| id.clone());
+    match oldest {
+        Some(id) => incidents.remove(&id).is_some(),
+        None => false,
+    }
+}
+
+/// The sentence a provider `dependency_failed` incident carries (invariant
+/// 144): which provider, how many failed calls the window holds, and the most
+/// recent detail the gateway sent, control characters removed and cut to
+/// [`PROVIDER_DETAIL_MAX_CHARS`] characters.
+fn provider_summary(
+    provider: &str,
+    site: Option<&str>,
+    filed_under_other: bool,
+    failures: u64,
+    window_ms: i64,
+    detail: &str,
+) -> String {
+    let minutes = (window_ms / 60_000).max(1);
+    let detail: String = detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(PROVIDER_DETAIL_MAX_CHARS)
+        .collect();
+    let mut out = format!("{provider} failed {failures} calls in the last {minutes} min");
+    if let Some(site) = site {
+        out.push_str(&format!(", reported by site {site}"));
+    }
+    if filed_under_other {
+        out.push_str(", filed under other");
+    }
+    if !detail.is_empty() {
+        out.push_str(&format!("; last: {detail}"));
+    }
+    out
+}
+
 /// The stable incident id / dedup key, `"{kind}:{run_or_agent}"`. Org-scoped
 /// detectors (e.g. `spend_spike`) pass an empty scope.
 fn incident_id(kind: &str, scope: &str) -> String {
@@ -4456,6 +4858,53 @@ fn upsert_incident(
     agent_id: Option<String>,
     ts: i64,
 ) -> Incident {
+    upsert_incident_with(
+        incidents, org, kind, severity, scope, run_id, agent_id, ts, true,
+    )
+}
+
+/// The provider detector's own path (invariant 144), reachable only from
+/// `note_provider_failures_from_at`. It files in the space reserved for
+/// provider incidents and evicts nothing: the caller has already made room
+/// within the reserve, which the org's incident cap neither counts nor
+/// evicts from. Everything else files through [`upsert_incident`], which
+/// leaves that space out of its count and its eviction and which no caller
+/// outside this detector can reach with an id in it (`record_external_finding`
+/// refuses one).
+fn upsert_provider_incident(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    scope: &str,
+    ts: i64,
+) -> Incident {
+    upsert_incident_with(
+        incidents,
+        org,
+        "dependency_failed",
+        // Fixed: the event type of this name is `high` on the wire
+        // (contracts/tokenfuse-constants.json), and a count past the threshold
+        // does not make a provider more down.
+        tokenfuse_core::Severity::High,
+        scope,
+        None,
+        None,
+        ts,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_incident_with(
+    incidents: &mut HashMap<String, HashMap<String, Incident>>,
+    org: &str,
+    kind: &str,
+    severity: tokenfuse_core::Severity,
+    scope: &str,
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    ts: i64,
+    evicts: bool,
+) -> Incident {
     let id = incident_id(kind, scope);
     let per_org = incidents.entry(org.to_string()).or_default();
     // C1: bound `per_org`'s cardinality: a `run_id` is caller-chosen, so nothing
@@ -4471,13 +4920,25 @@ fn upsert_incident(
     // `RecencyIndex` machinery the run/tracker caps use) is enough here: this
     // only runs when the map is already AT the cap and a genuinely new id
     // arrives, not on every call.
-    if !per_org.contains_key(&id) && per_org.len() >= MAX_INCIDENTS_PER_ORG {
-        if let Some(evict_id) = per_org
-            .iter()
-            .min_by_key(|(_, inc)| inc.last_seen_millis)
-            .map(|(k, _)| k.clone())
-        {
-            per_org.remove(&evict_id);
+    //
+    // Provider incidents (invariant 144) are outside this cap and outside its
+    // eviction: they have a reserve of their own, so a stream of them cannot
+    // push out an incident of another kind, and a stream of those cannot push
+    // out a provider incident. The caller holds the provider reserve.
+    if evicts && !per_org.contains_key(&id) && per_org.len() >= MAX_INCIDENTS_PER_ORG {
+        let others = per_org
+            .keys()
+            .filter(|k| !is_provider_incident_id(k))
+            .count();
+        if others >= MAX_INCIDENTS_PER_ORG {
+            if let Some(evict_id) = per_org
+                .iter()
+                .filter(|(k, _)| !is_provider_incident_id(k))
+                .min_by_key(|(_, inc)| inc.last_seen_millis)
+                .map(|(k, _)| k.clone())
+            {
+                per_org.remove(&evict_id);
+            }
         }
     }
     let inc = per_org.entry(id.clone()).or_insert_with(|| Incident {

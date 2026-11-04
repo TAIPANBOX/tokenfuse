@@ -223,6 +223,21 @@ fn emit_dependency_failed_via(
     effect: DependencyEffect,
     detail: &str,
 ) {
+    // Invariant 144: a provider's failure is also counted for the Cloud's one
+    // incident per provider. Only the provider's: the policy plane and the
+    // control plane are other dependencies with other incidents. Counted
+    // whether or not the event below is written, because the exporter skips a
+    // call with no agent and the provider failed all the same.
+    //
+    // What the Cloud is told is the fixed class of the failure, never `detail`:
+    // that is the text of a transport error, which carries the URL the call
+    // went to, and an upstream URL can carry a credential in its query. The
+    // local event below keeps the full text for the operator.
+    if matches!(dependency, Dependency::Provider) {
+        if let Some(class) = cloud_failure_class(stage) {
+            crate::providerreport::note_provider_failure(class);
+        }
+    }
     let outcome = events.emit(
         EventType::DependencyFailed,
         now_millis(),
@@ -232,6 +247,30 @@ fn emit_dependency_failed_via(
         dependency_failed_data(dependency, stage, effect, detail),
     );
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
+}
+
+/// The fixed words the Cloud is told for a provider failure at `stage`
+/// (invariant 144). Exhaustive on purpose: a stage added later has to decide
+/// whether it is a provider failure the Cloud counts. `Response` is `None`
+/// here because the status decides it, and only `emit_upstream_refused_via`
+/// has the status; the policy plane's and the control plane's stages are not
+/// the provider's.
+fn cloud_failure_class(stage: DependencyStage) -> Option<&'static str> {
+    match stage {
+        DependencyStage::Send => Some("send failed"),
+        DependencyStage::Stream => Some("stream broke"),
+        DependencyStage::ResponseBody => Some("response body unreadable"),
+        DependencyStage::Response | DependencyStage::Decide | DependencyStage::Seed => None,
+    }
+}
+
+/// Whether a provider's non-2xx says the PROVIDER is unwell, which is what the
+/// Cloud counts (invariant 144): a 5xx, a 408, a 429. A 400 or a 404 is how a
+/// provider answers a model id the caller chose, and a caller can provoke
+/// either at will, so it stays on the bus (`is_the_providers_refusal`) and is
+/// not counted toward an incident about the provider.
+fn is_the_providers_ill_health(status: StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 429)
 }
 
 /// Whether a provider's non-2xx is the PROVIDER's failure, worth an operator's
@@ -252,8 +291,12 @@ fn is_the_providers_refusal(status: StatusCode) -> bool {
 /// since tokenfuse#260, one `dependency_failed` on the bus at stage
 /// `response` for the statuses `is_the_providers_refusal` names, so an
 /// operator's notifier hears about a provider refusing every call. `detail`
-/// carries the status and the model, the two things a person reads first;
-/// heraldyx's own window keeps a throttling burst to one mail. Emitted where
+/// carries the status and the model, the two things a person reads first.
+/// Each call is its own run, so a notifier that keys its window on the run
+/// mails a throttling burst once per call, not once; for it to be one mail the
+/// notifier has to key this event on `data.dependency`. The Cloud's one
+/// incident per provider (invariant 144) is the row that is one either way.
+/// Emitted where
 /// the status is first known on both managed paths, so a streamed refusal
 /// does not wait for the guard.
 fn emit_upstream_refused_via(
@@ -264,6 +307,11 @@ fn emit_upstream_refused_via(
     model: &str,
     status: StatusCode,
 ) {
+    // Counted for the Cloud by the status alone: the model is the caller's
+    // own string and is not sent (invariant 144).
+    if is_the_providers_ill_health(status) {
+        crate::providerreport::note_provider_failure(&format!("HTTP {}", status.as_u16()));
+    }
     emit_dependency_failed_via(
         events,
         Some(run_id),
@@ -11647,5 +11695,153 @@ pub(crate) mod tests {
             "a deployment with a delegation issuer configured is not held to \
              the contradiction check by default"
         );
+    }
+
+    // Invariant 144: a provider's failure is counted for the Cloud's one
+    // incident per provider, and another dependency's is not. The reporter's
+    // Cloud is a port nothing listens on, so a flush answers `Dropped(n)` with
+    // the count it held, which is all this test needs to read.
+    #[tokio::test]
+    async fn only_a_provider_failure_is_counted_for_the_cloud_incident() {
+        use crate::providerreport::{install_for_this_thread, Flush, ProviderFailureReporter};
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let reporter = Arc::new(ProviderFailureReporter::new(
+            &format!("http://127.0.0.1:{port}"),
+            "k",
+            "p",
+        ));
+        install_for_this_thread(Arc::clone(&reporter));
+        let events = crate::events::EventExporter::disabled();
+        let emit = |dependency, stage| {
+            emit_dependency_failed_via(
+                &events,
+                Some("run-1"),
+                "agent://test.local/a",
+                None,
+                dependency,
+                stage,
+                DependencyEffect::CallFailed,
+                "provider answered HTTP 503 for model m",
+            )
+        };
+        emit(Dependency::PolicyPlane, DependencyStage::Decide);
+        emit(Dependency::ControlPlane, DependencyStage::Seed);
+        // Even at a stage that is a provider's failure when the provider is
+        // the dependency, another dependency's is not counted.
+        emit(Dependency::PolicyPlane, DependencyStage::Send);
+        emit(Dependency::ControlPlane, DependencyStage::Stream);
+        assert_eq!(
+            reporter.flush().await,
+            Flush::Nothing,
+            "the policy plane and the control plane are other dependencies"
+        );
+        emit(Dependency::Provider, DependencyStage::Send);
+        emit(Dependency::Provider, DependencyStage::Stream);
+        emit(Dependency::Provider, DependencyStage::ResponseBody);
+        assert_eq!(reporter.flush().await, Flush::Dropped(3));
+        // The Response stage is counted by the status, in
+        // `emit_upstream_refused_via`, and not here.
+        emit(Dependency::Provider, DependencyStage::Response);
+        assert_eq!(reporter.flush().await, Flush::Nothing);
+    }
+
+    /// An upstream whose transport error names the URL it was sent to, query
+    /// string and all, the way reqwest's own message does. The URL here has a
+    /// credential in its query, built at run time so this file holds none.
+    struct LeakyProvider {
+        secret: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for LeakyProvider {
+        async fn send(
+            &self,
+            _headers: HeaderMap,
+            _body: Bytes,
+        ) -> Result<ProviderResponse, ProviderError> {
+            Err(ProviderError::NotSent(format!(
+                "error sending request for url (https://llm.example.test/v1/messages?api_key={}): \
+                 tcp connect error: Connection refused",
+                self.secret
+            )))
+        }
+    }
+
+    // Invariant 144: what the Cloud is told about a failed send is a fixed
+    // class, never the text of the transport error. That text carries the
+    // upstream URL, and an upstream URL can carry a credential in its query.
+    // The event on the local bus keeps the full text; the Cloud copy does not.
+    #[tokio::test]
+    async fn the_text_of_a_transport_error_never_goes_to_the_cloud() {
+        use crate::providerreport::{install_for_this_thread, ProviderFailureReporter};
+        let secret = ["QUERY", "SECRET", "123"].concat();
+        let reporter = Arc::new(ProviderFailureReporter::new("http://127.0.0.1:1", "k", "p"));
+        install_for_this_thread(Arc::clone(&reporter));
+        let (events, _path) = recording_exporter("leaky");
+        let st = state_with_provider(Arc::new(LeakyProvider {
+            secret: secret.clone(),
+        }))
+        .with_events(events);
+        let req = Request::post("/v1/messages")
+            .header("x-fuse-run-id", "run-leaky")
+            .header("x-fuse-agent-id", "agent://test.local/rehearsal")
+            .header("x-fuse-budget-usd", "5.0")
+            .body(Body::from(body(500)))
+            .unwrap();
+        let resp = call(st, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(reporter.pending_count(), 1);
+        let detail = reporter.pending_detail();
+        assert!(
+            !detail.contains(&secret),
+            "the Cloud copy carried {detail:?}"
+        );
+        assert!(!detail.contains("llm.example.test"), "{detail:?}");
+        assert_eq!(detail, "send failed");
+    }
+
+    // Invariant 144: the Cloud counts a provider's HEALTH, so only the
+    // statuses that say the provider is unwell: a 5xx, a 408, a 429. A 400 or
+    // a 404 is how a provider answers a model id the caller chose, and the
+    // caller can provoke it at will, so it stays on the bus as it always did
+    // and is not counted. The model, which the caller also chose, is not sent.
+    #[test]
+    fn only_a_providers_health_statuses_are_counted_for_the_cloud() {
+        use crate::providerreport::{install_for_this_thread, ProviderFailureReporter};
+        let events = crate::events::EventExporter::disabled();
+        let statuses = [
+            (400, false),
+            (401, false),
+            (403, false),
+            (404, false),
+            (413, false),
+            (422, false),
+            (408, true),
+            (429, true),
+            (500, true),
+            (502, true),
+            (503, true),
+            (504, true),
+            (529, true),
+        ];
+        for (code, counted) in statuses {
+            let reporter = Arc::new(ProviderFailureReporter::new("http://127.0.0.1:1", "k", "p"));
+            install_for_this_thread(Arc::clone(&reporter));
+            emit_upstream_refused_via(
+                &events,
+                "run-1",
+                "agent://test.local/a",
+                None,
+                "caller-chosen-model-name",
+                StatusCode::from_u16(code).unwrap(),
+            );
+            assert_eq!(reporter.pending_count(), u64::from(counted), "HTTP {code}");
+            if counted {
+                assert_eq!(reporter.pending_detail(), format!("HTTP {code}"));
+            }
+        }
     }
 }

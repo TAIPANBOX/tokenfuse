@@ -120,6 +120,14 @@ async fn main() {
         .max(2),
         fanout_window_ms: defaults.fanout_window_ms,
         stall_after_ms,
+        // Invariant 144: failed provider calls within the window before a
+        // provider's `dependency_failed` incident opens. Same rule as the
+        // other counts here: unset, zero or junk is the default.
+        provider_failures: env_u64(
+            "TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES",
+            defaults.provider_failures,
+        ),
+        provider_window_ms: defaults.provider_window_ms,
     };
 
     // Agent-event NDJSON export (agent-passport SPEC.md §6): TOKENFUSE_EVENTS_PATH,

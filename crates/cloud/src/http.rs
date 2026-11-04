@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{
@@ -54,7 +54,7 @@ use crate::store::{
         description = "Fleet-wide control plane: per-org spend, kill-switch and central budgets."
     ),
     paths(
-        ingest, runs, run_spend, spend, agents, units, owners, gateways, savings, summary, alerts, series, kill, kills, set_budget,
+        ingest, provider_failures, runs, run_spend, spend, agents, units, owners, gateways, savings, summary, alerts, series, kill, kills, set_budget,
         budgets, set_unit_budget, unit_budgets, incidents, ack_incident, compliance,
         compliance_evidence, audit, audit_verify, audit_manifest, replay, pair_new, pair,
         register_apns, register_activity,
@@ -89,6 +89,9 @@ use crate::store::{
         ReplayEvent,
         IngestBody,
         IngestResponse,
+        ProviderFailuresBody,
+        ProviderFailure,
+        ProviderFailuresResponse,
         BudgetBody,
         BudgetResponse,
         UnitBudgetResponse,
@@ -428,6 +431,10 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi_doc))
         .route("/v1/ingest", post(ingest))
+        .route(
+            "/v1/provider-failures",
+            post(provider_failures).layer(DefaultBodyLimit::max(PROVIDER_FAILURES_MAX_BODY)),
+        )
         .route("/v1/runs", get(runs))
         .route("/v1/run-spend", get(run_spend))
         .route("/v1/spend", get(spend))
@@ -488,6 +495,43 @@ struct IngestBody {
 
 #[derive(Serialize, ToSchema)]
 struct IngestResponse {
+    accepted: usize,
+}
+
+/// The most bytes `POST /v1/provider-failures` reads (invariant 144). A report
+/// is a handful of short entries; the route-level limit is checked before the
+/// body is collected, so a caller that has not authenticated yet can still
+/// make this plane hold no more than this.
+pub const PROVIDER_FAILURES_MAX_BODY: usize = 16 * 1024;
+
+/// The most entries one report may carry. A gateway names one upstream and
+/// sends one; this leaves room for a fleet-wide collector and no more.
+pub const PROVIDER_FAILURES_MAX_ENTRIES: usize = 64;
+
+#[derive(Deserialize, ToSchema)]
+struct ProviderFailuresBody {
+    #[serde(default)]
+    failures: Vec<ProviderFailure>,
+}
+
+/// One provider's failed calls since the last report.
+#[derive(Deserialize, ToSchema)]
+struct ProviderFailure {
+    /// Who failed, usually the host of the gateway's upstream. Sanitised to
+    /// `A-Z a-z 0-9 . _ : -` and cut to 128 characters before it is used.
+    provider: String,
+    /// How many provider calls failed. Zero is nothing; a value past one
+    /// million counts as one million.
+    count: u64,
+    /// The most recent failure in words, for the incident's summary. Control
+    /// characters are removed and it is cut to 160 characters.
+    #[serde(default)]
+    detail: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ProviderFailuresResponse {
+    /// Entries that named a provider and a non-zero count.
     accepted: usize,
 }
 
@@ -773,6 +817,61 @@ async fn ingest(State(st): State<AppState>, headers: HeaderMap, uri: Uri, body: 
     let accepted = parsed.records.len();
     st.store.ingest_from(&org, site.as_deref(), &parsed.records);
     (StatusCode::OK, Json(IngestResponse { accepted })).into_response()
+}
+
+/// A gateway's report of provider calls that failed (invariant 144), folded
+/// into ONE `dependency_failed` incident per provider once a provider has
+/// failed `TOKENFUSE_CLOUD_INCIDENT_PROVIDER_FAILURES` calls within ten
+/// minutes. Same credential as `/v1/ingest` (`admin` or `ingest`), a body of at
+/// most 16 KiB and 64 entries. The incident is on the console and the API
+/// (`GET /v1/incidents`) and nowhere on the agent-event bus: it names a
+/// provider and no agent.
+#[utoipa::path(
+    post, path = "/v1/provider-failures",
+    request_body = ProviderFailuresBody,
+    responses(
+        (status = 200, description = "failures counted", body = ProviderFailuresResponse),
+        (status = 400, description = "malformed json, or more entries than allowed", body = ErrorResponse),
+        (status = 401, description = "unauthorized", body = ErrorResponse),
+        (status = 403, description = "admin or ingest role required", body = ErrorResponse),
+        (status = 413, description = "body larger than 16 KiB"),
+    ),
+    tag = "telemetry"
+)]
+async fn provider_failures(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    // The site is the one the key is bound to (invariant 65), read from the
+    // credential and never from the body, so a key bound to one site cannot
+    // report for another.
+    let Mutator { org, site, .. } = match st.authorize_ingest("POST", uri.path(), &body, &headers) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let parsed: ProviderFailuresBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(_) => return bad_json(),
+    };
+    if parsed.failures.len() > PROVIDER_FAILURES_MAX_ENTRIES {
+        return error(StatusCode::BAD_REQUEST, "too many failures in one report");
+    }
+    let mut accepted = 0usize;
+    for f in &parsed.failures {
+        if crate::store::provider_label(&f.provider).is_some() && f.count > 0 {
+            accepted += 1;
+        }
+        st.store.note_provider_failures_from(
+            &org,
+            site.as_deref(),
+            &f.provider,
+            f.count,
+            &f.detail,
+        );
+    }
+    (StatusCode::OK, Json(ProviderFailuresResponse { accepted })).into_response()
 }
 
 /// The caller org's aggregated runs.
@@ -1434,6 +1533,18 @@ async fn external_findings(
                 .into_response()
         }
     };
+    // A finding may not name an incident id in the space the provider detector
+    // reserves (invariant 144). Checked for the whole report before any of it
+    // is recorded, so a refused report records nothing.
+    if findings
+        .iter()
+        .any(|f| crate::store::is_reserved_incident_id(&f.detector, &f.identity))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "that detector and identity name an incident this plane files itself",
+        );
+    }
     let source = sanitize_source(params.source.as_deref());
     let now = now_millis();
     let mut accepted = 0usize;
@@ -1455,9 +1566,13 @@ async fn external_findings(
         // payload only so a reporter needs no adapter to talk to this route.
         let _ = &f.time;
         let ts = now;
-        st.store
-            .record_external_finding(&org, &actor, finding_input(&source, &f, severity, ts));
-        accepted += 1;
+        if st
+            .store
+            .record_external_finding(&org, &actor, finding_input(&source, &f, severity, ts))
+            .is_ok()
+        {
+            accepted += 1;
+        }
     }
     (StatusCode::OK, Json(ExternalFindingsResponse { accepted })).into_response()
 }
