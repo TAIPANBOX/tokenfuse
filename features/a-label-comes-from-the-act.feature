@@ -173,6 +173,12 @@ Feature: A run's label comes from what it did, not from what it called it
     When a stream closes with a whole message that carries a citation
     Then the agent gets the text and the run carries the web label
 
+  # @test:a_tool_call_in_a_closing_message_chunk_is_held_and_judged
+  Scenario: A shell asked for in a closing message is held and refused
+    Given a run the stream has already labelled
+    When the stream closes with a whole message asking for a shell
+    Then the call does not reach the agent and the refusal says why
+
   # @test:a_classified_upstream_is_told_the_run_and_an_unclassified_one_is_not
   Scenario: The server the run read through hears which run it was
     Given a server the operator classified and a server nobody classified

@@ -82,6 +82,11 @@ const OPENAI_CLOSING_MESSAGE: &str = "data: {\"id\":\"c4\",\"object\":\"chat.com
 data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"found it\",\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
 data: [DONE]\n\n";
 
+/// A citation in a delta, then a shell asked for in the closing message.
+const OPENAI_CLOSING_SHELL: &str = "data: {\"id\":\"c5\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}]}\n\n\
+data: {\"id\":\"c5\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_sh4\",\"type\":\"function\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
 /// Answers each call with the next body in its queue, the usage read as the
 /// network path reads it.
 struct QueueProvider {
@@ -922,6 +927,18 @@ async fn a_citation_in_a_closing_message_chunk_labels_the_run() {
         may_run_a_shell(&gw, "run-cited-closing").await["decision"],
         "deny"
     );
+}
+
+/// The stream's own reader looked only in `delta`, so a call in a closing message went
+/// to the client unheld and unjudged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_call_in_a_closing_message_chunk_is_held_and_judged() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_CLOSING_SHELL], "openai-closing-shell");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (_, body) = openai_call(&gw, "run-closing-shell", true).await;
+    assert!(!body.contains("call_sh4"), "{body}");
+    assert!(body.contains("taint_blocked"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
