@@ -69,6 +69,9 @@ pub struct ToolCallHold {
     anthropic_blocks: Vec<serde_json::Value>,
     /// Blocks recording a tool the provider ran, opened the same way.
     provider_blocks: Vec<serde_json::Value>,
+    /// `url_citation` annotations an OpenAI delta carried: that wire's record of the
+    /// same thing, with no block to open.
+    openai_citations: Vec<serde_json::Value>,
     /// OpenAI tool calls by (choice index, tool call index): the id, and the
     /// name as its fragments arrived (a provider may split a name; OpenAI
     /// sends it whole in the first delta).
@@ -126,7 +129,11 @@ impl ToolCallHold {
     /// avoid.
     pub fn take_provider_tools(&mut self) -> Vec<String> {
         let blocks = std::mem::take(&mut self.provider_blocks);
-        tokenfuse_core::taint::provider_tools_in(&serde_json::json!({ "content": blocks }))
+        let citations = std::mem::take(&mut self.openai_citations);
+        tokenfuse_core::taint::provider_tools_in(&serde_json::json!({
+            "content": blocks,
+            "choices": [{"message": {"annotations": citations}}],
+        }))
     }
 
     /// One complete event: read it, then forward it or hold it.
@@ -170,6 +177,19 @@ impl ToolCallHold {
                     .get("index")
                     .and_then(|i| i.as_u64())
                     .unwrap_or(pos as u64);
+                // A citation is a search the provider already ran: read, never held.
+                if let Some(notes) = choice
+                    .get("delta")
+                    .and_then(|d| d.get("annotations"))
+                    .and_then(|a| a.as_array())
+                {
+                    self.openai_citations.extend(
+                        notes
+                            .iter()
+                            .filter(|n| tokenfuse_core::taint::is_provider_citation(n))
+                            .cloned(),
+                    );
+                }
                 let Some(calls) = choice
                     .get("delta")
                     .and_then(|d| d.get("tool_calls"))
@@ -458,6 +478,14 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         assert_eq!(hold.take_provider_tools(), vec!["web_search"]);
         assert!(hold.take_provider_tools().is_empty());
         assert!(hold.finish().provider_tools.is_empty());
+    }
+
+    #[test]
+    fn a_citation_in_a_closing_message_chunk_is_read_too() {
+        let input = "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"message\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\"}}]}}]}\n\n";
+        let (forwarded, held) = run(input.as_bytes(), &[7]);
+        assert_eq!(forwarded, input.as_bytes(), "it already happened");
+        assert_eq!(held.provider_tools, vec!["web_search"]);
     }
 
     #[test]

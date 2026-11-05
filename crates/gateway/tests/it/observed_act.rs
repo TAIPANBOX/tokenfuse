@@ -364,13 +364,24 @@ async fn page_server_noting_the_run() -> (String, Arc<Mutex<Vec<Option<String>>>
     (spawn(router).await, runs)
 }
 
-/// Answers every call with a 307, which keeps the method and the body.
+/// Answers every call with a 307, which keeps the method and the body, and a body of
+/// its own that reads like an answer, so a 3xx cannot pass as one.
 async fn redirecting_server(to: String) -> String {
     let router = Router::new().route(
         "/",
-        post(move || {
+        post(move |Json(req): Json<Value>| {
             let to = to.clone();
-            async move { (StatusCode::TEMPORARY_REDIRECT, [("location", to)]) }
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", to)],
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": req.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {"content": [{"type": "text", "text": PAGE}]},
+                    })),
+                )
+            }
         }),
     );
     spawn(router).await
