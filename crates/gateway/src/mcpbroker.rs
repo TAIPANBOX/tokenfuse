@@ -1804,6 +1804,13 @@ async fn ask_gateway(
     }
 }
 
+/// The client the broker reaches its upstreams and the planes beside it with.
+pub fn upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .build()
+        .expect("a client with nothing configured but its redirects builds")
+}
+
 /// The upstream this call reaches, when the operator classified it.
 fn classified<'a>(st: &'a BrokerState, upstream_url: &str) -> Option<&'a ClassifiedUpstream> {
     if st.upstream_labels.is_empty() {

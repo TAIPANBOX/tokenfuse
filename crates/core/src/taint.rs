@@ -148,6 +148,16 @@ pub fn tool_names_in(v: &serde_json::Value) -> Vec<String> {
 /// provider's infrastructure, and there is nothing left to refuse.
 pub const PROVIDER_TOOL_BLOCKS: [&str; 2] = ["server_tool_use", "mcp_tool_use"];
 
+/// The name a citation on the OpenAI wire is read as. That wire records a search the
+/// provider ran as a citation on the answer's text and no tool block, so there is no
+/// name of the provider's to read, and this is the one the source map already carries.
+pub const OPENAI_SEARCH_TOOL: &str = "web_search";
+
+/// Whether an entry of an OpenAI answer's `annotations` cites a page the provider read.
+pub fn is_provider_citation(annotation: &serde_json::Value) -> bool {
+    annotation.get("type").and_then(|t| t.as_str()) == Some("url_citation")
+}
+
 /// Whether a content block records a tool the provider ran.
 pub fn is_provider_tool_block(block: &serde_json::Value) -> bool {
     block
@@ -159,10 +169,14 @@ pub fn is_provider_tool_block(block: &serde_json::Value) -> bool {
 /// The tools the provider ran for this ANSWER, by the name the provider gave them
 /// (CLAUDE.md invariant 143).
 ///
-/// Reads the top-level `content[]` of a response and nothing else. `messages[]` is
-/// deliberately not read: a conversation is written by the caller, and a provider's
-/// answer is the one place these blocks arrive that the caller has not had in its
-/// hands, which is what makes the label an observation rather than a claim.
+/// Reads the top-level `content[]` of an Anthropic response and the
+/// `choices[].message.annotations[]` of an OpenAI one, and nothing else. `messages[]`
+/// is deliberately not read: a conversation is written by the caller, and a provider's
+/// answer is the one place these arrive that the caller has not had in its hands, which
+/// is what makes the label an observation rather than a claim.
+///
+/// However many pages an OpenAI answer cites, it is one search here: a citation says a
+/// page was read and not how many searches found it, and the label is the same.
 pub fn provider_tools_in(v: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
@@ -171,6 +185,17 @@ pub fn provider_tools_in(v: &serde_json::Value) -> Vec<String> {
                 out.push(name.to_string());
             }
         }
+    }
+    let cited = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("message")?.get("annotations")?.as_array())
+        .flatten()
+        .any(is_provider_citation);
+    if cited {
+        out.push(OPENAI_SEARCH_TOOL.to_string());
     }
     out
 }

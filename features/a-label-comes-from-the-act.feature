@@ -174,3 +174,9 @@ Feature: A run's label comes from what it did, not from what it called it
     When a run calls each of them through the broker
     Then the classified server is told the run, so its record joins the rest of it
     And the other server hears nothing about the run
+
+  # @test:a_redirect_from_an_upstream_is_not_followed
+  Scenario: An upstream cannot send the call to another host
+    Given a call on its way out carries the secrets the broker wrote and the run
+    When the upstream answers with a redirect that keeps the body
+    Then the broker does not follow it, and the second host hears nothing

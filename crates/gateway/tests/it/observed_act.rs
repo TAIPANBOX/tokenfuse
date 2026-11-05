@@ -24,7 +24,9 @@ use tokenfuse_core::{Ledger, Mode, Policy, SecretVault};
 use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::events::EventExporter;
 use tokenfuse_gateway::firewall::FirewallConfig;
-use tokenfuse_gateway::mcpbroker::{app, upstream_labels_from, BrokerState, ScanMode};
+use tokenfuse_gateway::mcpbroker::{
+    app, upstream_client, upstream_labels_from, BrokerState, ScanMode,
+};
 use tokenfuse_gateway::provider::{Provider, ProviderError, ProviderResponse, UsageSlot};
 use tokenfuse_gateway::state::AppState;
 use tokenfuse_gateway::wardryx::Wardryx;
@@ -244,7 +246,7 @@ async fn broker(setup: BrokerSetup<'_>) -> String {
         keys: ClientKeys::default(),
         clients: Default::default(),
         require_proof: false,
-        client: reqwest::Client::new(),
+        client: upstream_client(),
         events: Arc::new(events),
         taint_gateway: setup.gateway,
         taint_failclosed: false,
@@ -360,6 +362,18 @@ async fn page_server_noting_the_run() -> (String, Arc<Mutex<Vec<Option<String>>>
         }),
     );
     (spawn(router).await, runs)
+}
+
+/// Answers every call with a 307, which keeps the method and the body.
+async fn redirecting_server(to: String) -> String {
+    let router = Router::new().route(
+        "/",
+        post(move || {
+            let to = to.clone();
+            async move { (StatusCode::TEMPORARY_REDIRECT, [("location", to)]) }
+        }),
+    );
+    spawn(router).await
 }
 
 fn plain_conversation() -> Value {
@@ -648,6 +662,24 @@ async fn a_classified_upstream_is_told_the_run_and_an_unclassified_one_is_not() 
     let out = read(&brk, Some("run-told"), "lookup").await;
     assert_eq!(out["result"]["content"][0]["text"], PAGE, "{out}");
     assert_eq!(*untold.lock().unwrap(), vec![None]);
+}
+
+/// A 307 keeps the body, and by then the broker has written the secrets into it and
+/// the run onto it, so following one hands both to whichever host the answer names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redirect_from_an_upstream_is_not_followed() {
+    let (elsewhere, reached) = page_server_noting_the_run().await;
+    let up = redirecting_server(format!("{elsewhere}/")).await;
+    let (stub, _, _) = stub_gateway(StatusCode::OK, r#"{"recorded":true}"#);
+    let gw = spawn(stub).await;
+    let brk = classified_broker(&up, &gw).await;
+
+    let out = read(&brk, Some("run-redirected"), "fetch_url").await;
+    assert!(out.get("error").is_some(), "{out}");
+    assert!(
+        reached.lock().unwrap().is_empty(),
+        "the second host was reached"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

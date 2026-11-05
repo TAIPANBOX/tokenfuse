@@ -432,8 +432,8 @@ point, and a process with its own socket passes through none. `x-fuse-run-id` is
 caller's header, so a harness naming another run of its own moves the label there;
 invariant 118 bounds that to one principal's runs. A provider's built-in search is
 labelled and not controlled: it ran on the provider's infrastructure, nothing can
-refuse it, and no domain policy reaches it. The OpenAI wire carries its built-in
-search as `annotations` citations and no tool block, so it is not read here.
+refuse it, and no domain policy reaches it. On the OpenAI wire the same search arrives
+as a `url_citation` annotation and no tool block, and it labels the run as `web_search`.
 
 ### The release valve, and where the other two gates actually live
 
