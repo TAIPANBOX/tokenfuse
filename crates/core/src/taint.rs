@@ -708,6 +708,58 @@ mod tests {
         assert!(provider_tools_in(&request).is_empty());
     }
 
+    /// The OpenAI wire's answer when the provider searched: citations on the text,
+    /// and no tool block.
+    fn cited(annotations: serde_json::Value) -> serde_json::Value {
+        json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":"found it","annotations":annotations
+        }}]})
+    }
+
+    #[test]
+    fn a_citation_on_the_openai_wire_is_a_search_the_provider_ran() {
+        let page = json!({"type":"url_citation","url_citation":{"url":"https://example.org/"}});
+        assert_eq!(provider_tools_in(&cited(json!([page]))), vec!["web_search"]);
+    }
+
+    #[test]
+    fn many_citations_in_one_answer_are_one_search() {
+        let page = json!({"type":"url_citation","url_citation":{"url":"https://example.org/"}});
+        let answer = json!({"choices":[
+            {"index":0,"message":{"annotations":[page, page]}},
+            {"index":1,"message":{"annotations":[page]}}
+        ]});
+        assert_eq!(provider_tools_in(&answer), vec!["web_search"]);
+    }
+
+    #[test]
+    fn a_note_that_cites_no_page_is_not_a_search() {
+        assert!(provider_tools_in(&cited(json!([{"type":"file_citation"}]))).is_empty());
+        assert!(provider_tools_in(&cited(json!([]))).is_empty());
+    }
+
+    #[test]
+    fn a_citation_in_the_callers_messages_is_not_read() {
+        // The same rule as a block in the history: the caller wrote it.
+        let request = json!({"messages":[{"role":"assistant","content":"x",
+            "annotations":[{"type":"url_citation","url_citation":{"url":"https://example.org/"}}]
+        }]});
+        assert!(provider_tools_in(&request).is_empty());
+    }
+
+    #[test]
+    fn provider_tools_in_survives_hostile_choices() {
+        for shape in [
+            json!({"choices": "not-an-array"}),
+            json!({"choices": [1, "x", null, true]}),
+            json!({"choices": [{"message": 5}]}),
+            json!({"choices": [{"message": {"annotations": "x"}}]}),
+            json!({"choices": [{"message": {"annotations": [1, null, {"type": 5}]}}]}),
+        ] {
+            assert!(provider_tools_in(&shape).is_empty(), "{shape}");
+        }
+    }
+
     #[test]
     fn provider_tools_in_survives_hostile_shapes() {
         assert!(provider_tools_in(&json!({})).is_empty());

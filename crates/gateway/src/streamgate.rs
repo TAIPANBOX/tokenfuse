@@ -440,6 +440,26 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         assert_eq!(held.provider_tools, vec!["web_search"]);
     }
 
+    /// OpenAI's record of a search the provider ran: a citation in a delta, no tool call.
+    const CITATION: &str = "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\"}}]}}]}\n\n";
+
+    #[test]
+    fn a_streamed_citation_is_named_at_the_end_and_never_held() {
+        let (forwarded, held) = run(CITATION.as_bytes(), &[7]);
+        assert_eq!(forwarded, CITATION.as_bytes(), "it already happened");
+        assert_eq!(held.provider_tools, vec!["web_search"]);
+        assert!(held.tools.is_empty());
+    }
+
+    #[test]
+    fn a_streamed_citation_is_handed_over_once_and_as_soon_as_it_is_seen() {
+        let mut hold = ToolCallHold::new();
+        hold.push(CITATION.as_bytes());
+        assert_eq!(hold.take_provider_tools(), vec!["web_search"]);
+        assert!(hold.take_provider_tools().is_empty());
+        assert!(hold.finish().provider_tools.is_empty());
+    }
+
     #[test]
     fn a_tool_the_provider_ran_is_handed_over_once_and_as_soon_as_it_is_seen() {
         let input = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"s1\",\"name\":\"web_search\",\"input\":{}}}\n\n";
