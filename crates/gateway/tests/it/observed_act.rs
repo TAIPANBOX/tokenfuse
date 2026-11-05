@@ -77,6 +77,11 @@ data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-hai
 data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
 data: [DONE]\n\n";
 
+/// Some providers close a stream with a whole `message` rather than a `delta`.
+const OPENAI_CLOSING_MESSAGE: &str = "data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"found it\"}}]}\n\n\
+data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"found it\",\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
 /// Answers each call with the next body in its queue, the usage read as the
 /// network path reads it.
 struct QueueProvider {
@@ -902,6 +907,19 @@ async fn a_streamed_citation_on_the_openai_wire_labels_the_run() {
     assert!(body.contains("found it"), "{body}");
     assert_eq!(
         may_run_a_shell(&gw, "run-cited-stream").await["decision"],
+        "deny"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_citation_in_a_closing_message_chunk_labels_the_run() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_CLOSING_MESSAGE], "openai-closing");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (status, body) = openai_call(&gw, "run-cited-closing", true).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        may_run_a_shell(&gw, "run-cited-closing").await["decision"],
         "deny"
     );
 }

@@ -168,6 +168,11 @@ Feature: A run's label comes from what it did, not from what it called it
     When a citation arrives in a delta of a stream
     Then the agent gets the text and the run carries the web label
 
+  # @test:a_citation_in_a_closing_message_chunk_labels_the_run
+  Scenario: A citation in a closing message labels the run
+    When a stream closes with a whole message that carries a citation
+    Then the agent gets the text and the run carries the web label
+
   # @test:a_classified_upstream_is_told_the_run_and_an_unclassified_one_is_not
   Scenario: The server the run read through hears which run it was
     Given a server the operator classified and a server nobody classified

@@ -481,14 +481,6 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
     }
 
     #[test]
-    fn a_citation_in_a_closing_message_chunk_is_read_too() {
-        let input = "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"message\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\"}}]}}]}\n\n";
-        let (forwarded, held) = run(input.as_bytes(), &[7]);
-        assert_eq!(forwarded, input.as_bytes(), "it already happened");
-        assert_eq!(held.provider_tools, vec!["web_search"]);
-    }
-
-    #[test]
     fn a_tool_the_provider_ran_is_handed_over_once_and_as_soon_as_it_is_seen() {
         let input = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"s1\",\"name\":\"web_search\",\"input\":{}}}\n\n";
         let mut hold = ToolCallHold::new();
