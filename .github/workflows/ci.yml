@@ -207,6 +207,9 @@ jobs:
       - name: a label comes from the act, not from a name
         run: ./scripts/taint-comes-from-the-act.sh
 
+      - name: no pipe ends in a grep that leaves early
+        run: ./scripts/no-reader-leaves-a-pipe-early.sh
+
   python-sdk:
     name: python sdk
     runs-on: ubuntu-24.04
@@ -431,9 +434,9 @@ jobs:
           # Any doubt runs the job: a base we cannot diff against (a first push,
           # a force-push, a shallow clone) is a reason to run, never to skip.
           relevant=true; reason="could not diff against base '$BASE'; running to be safe"
-          if [ -n "$BASE" ] && ! printf '%s' "$BASE" | grep -Eq '^0+$' && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+          if [ -n "$BASE" ] && ! grep -Eq '^0+$' <<<"$BASE" && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             if files=$(git diff --name-only "$BASE" "$GITHUB_SHA"); then
-              if printf '%s\n' "$files" | grep -Eq '^(crates/radar/|\.github/workflows/ci\.yml$|scripts/apt-snapshot-probe\.sh$)'; then
+              if grep -Eq '^(crates/radar/|\.github/workflows/ci\.yml$|scripts/apt-snapshot-probe\.sh$)' <<<"$files"; then
                 relevant=true; reason="radar, this workflow or the apt probe changed"
               else
                 relevant=false; reason="nothing under crates/radar, this workflow or the apt probe changed ($(printf '%s\n' "$files" | grep -c .) file(s) elsewhere)"

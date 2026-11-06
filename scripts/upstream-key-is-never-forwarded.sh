@@ -68,18 +68,18 @@ if [ -z "$send_body" ]; then
 fi
 
 guard='if self.upstream_key.is_some() && PROVIDER_CREDENTIAL_HEADERS.contains(name) {'
-if ! printf '%s\n' "$send_body" | grep -qF -- "$guard"; then
+if ! grep -qF -- "$guard" <<<"$send_body"; then
 	printf 'FAIL: the copy loop in HttpProvider::send no longer skips the caller'\''s provider credential when the gateway holds the key.\n'
 	printf '      expected, inside send: %s\n' "$guard"
 	fail=1
 fi
 
-if ! printf '%s\n' "$send_body" | grep -qF -- 'if let Some(key) = &self.upstream_key {'; then
+if ! grep -qF -- 'if let Some(key) = &self.upstream_key {' <<<"$send_body"; then
 	printf 'FAIL: HttpProvider::send no longer sends the gateway'\''s own key from self.upstream_key.\n'
 	fail=1
 fi
 
-if ! printf '%s\n' "$send_body" | grep -qF -- 'let (name, value) = key.header();'; then
+if ! grep -qF -- 'let (name, value) = key.header();' <<<"$send_body"; then
 	printf 'FAIL: HttpProvider::send no longer takes the upstream header from key.header().\n'
 	fail=1
 fi

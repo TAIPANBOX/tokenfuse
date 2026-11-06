@@ -84,11 +84,11 @@ if [ "$members" != "labels run_id source " ]; then
 	printf '      A member here is something a caller can write: a name that arrives at this route is the defect.\n'
 	fail=1
 fi
-if ! production "$act" | grep -qF "deny_unknown_fields"; then
+if ! grep -qF "deny_unknown_fields" <<<"$(production "$act")"; then
 	printf 'FAIL: ObservedAct is not closed, so a tool name sent here would be dropped and look read.\n'
 	fail=1
 fi
-if production "$act" | grep -qE 'labels_for_tools|firewall\.sources'; then
+if grep -qE 'labels_for_tools|firewall\.sources' <<<"$(production "$act")"; then
 	printf 'FAIL: %s reads a name: the name map has no part in an observed act.\n' "$act"
 	fail=1
 fi
@@ -98,7 +98,7 @@ if [ -z "$report" ]; then
 	printf 'FAIL: %s has no `async fn report_observed_act(`, so this gate measured nothing.\n' "$broker"
 	exit 1
 fi
-if printf '%s\n' "$report" | grep -qE '\btool\b'; then
+if grep -qE '\btool\b' <<<"$report"; then
 	printf 'FAIL: report_observed_act takes the tool, and the label must not be able to depend on it.\n'
 	fail=1
 fi
@@ -108,7 +108,7 @@ if [ -z "$classified" ]; then
 	printf 'FAIL: %s has no `fn classified<`, so this gate measured nothing.\n' "$broker"
 	exit 1
 fi
-if ! printf '%s\n' "$classified" | grep -qF "upstream_key(" || printf '%s\n' "$classified" | grep -qF "ctx"; then
+if ! grep -qF "upstream_key(" <<<"$classified" || grep -qF "ctx" <<<"$classified"; then
 	printf 'FAIL: a classification is looked up by the server a call reaches, not by the route it named.\n'
 	fail=1
 fi
