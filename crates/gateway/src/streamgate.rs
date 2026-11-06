@@ -177,41 +177,50 @@ impl ToolCallHold {
                     .get("index")
                     .and_then(|i| i.as_u64())
                     .unwrap_or(pos as u64);
-                // A citation is a search the provider already ran: read, never held.
-                if let Some(notes) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("annotations"))
-                    .and_then(|a| a.as_array())
-                {
-                    self.openai_citations.extend(
-                        notes
-                            .iter()
-                            .filter(|n| tokenfuse_core::taint::is_provider_citation(n))
-                            .cloned(),
-                    );
-                }
-                let Some(calls) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("tool_calls"))
-                    .and_then(|t| t.as_array())
-                else {
-                    continue;
-                };
-                for (k, tc) in calls.iter().enumerate() {
-                    carried = true;
-                    let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(k as u64);
-                    let entry = self.openai_calls.entry((ci, ti)).or_default();
-                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                        if !id.is_empty() {
-                            entry.0 = Some(id.to_string());
-                        }
-                    }
-                    if let Some(part) = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
+                // Some providers close a stream with a whole `message` rather than a
+                // `delta`, and a call left unread there would reach the client unjudged.
+                for side in ["delta", "message"] {
+                    // A citation is a search the provider already ran: read, never held.
+                    if let Some(notes) = choice
+                        .get(side)
+                        .and_then(|d| d.get("annotations"))
+                        .and_then(|a| a.as_array())
                     {
-                        entry.1.push_str(part);
+                        self.openai_citations.extend(
+                            notes
+                                .iter()
+                                .filter(|n| tokenfuse_core::taint::is_provider_citation(n))
+                                .cloned(),
+                        );
+                    }
+                    let Some(calls) = choice
+                        .get(side)
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(|t| t.as_array())
+                    else {
+                        continue;
+                    };
+                    for (k, tc) in calls.iter().enumerate() {
+                        carried = true;
+                        let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(k as u64);
+                        let entry = self.openai_calls.entry((ci, ti)).or_default();
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            if !id.is_empty() {
+                                entry.0 = Some(id.to_string());
+                            }
+                        }
+                        if let Some(part) = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            // A delta may split a name; a message states it whole, and may
+                            // repeat a call the deltas already named.
+                            if side == "message" {
+                                entry.1.clear();
+                            }
+                            entry.1.push_str(part);
+                        }
                     }
                 }
             }
