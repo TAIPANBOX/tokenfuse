@@ -103,7 +103,9 @@
 //! stream is (invariant 43) — recorded with `decision = "allow"` but
 //! `input_tokens = output_tokens = 0`. We detect that shape
 //! (zero tokens, non-zero cost) and mark it `x_cost_basis = "estimated"`;
-//! everything else lands on `"settled"`.
+//! everything else lands on `"settled"`. A settlement whose usage stopped short
+//! of its final event is written in the same shape on purpose, because its
+//! output side is the request's cap and not a figure (invariant 43).
 
 use crate::sqlq::{query, str_at};
 use datafusion::arrow::array::{Array, Int64Array};

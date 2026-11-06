@@ -2109,6 +2109,7 @@ async fn handle_call(
         st.retained.clone(),
         run_id.clone(),
         estimate,
+        crate::estimate::output_cap_tokens(parsed.max_tokens, parsed.completions),
         CallAttribution {
             model: parsed.model.clone(),
             agent_id: agent_id.clone(),
@@ -4500,6 +4501,7 @@ pub(crate) mod tests {
                 usage: Arc::new(Mutex::new(self.usage.map(|usage| ParsedUsage {
                     usage,
                     truncated: false,
+                    complete: true,
                 }))),
             })
         }
@@ -8027,6 +8029,7 @@ pub(crate) mod tests {
             st.retained.clone(),
             "run-cancel".into(),
             Microusd::from_usd(0.5),
+            1_000,
             CallAttribution {
                 model: "test-model".into(),
                 ..Default::default()
@@ -10868,6 +10871,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     truncated: false,
+                    complete: true,
                 }))),
             })
         }

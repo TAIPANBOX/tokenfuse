@@ -45,6 +45,7 @@ impl Provider for StubOkProvider {
         let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
             usage,
             truncated: false,
+            complete: true,
         })));
         let chunk = Bytes::from_static(br#"{"stub":true}"#);
         let stream = futures::stream::once(async move { Ok(chunk) });
@@ -133,6 +134,7 @@ impl Provider for CapturingProvider {
         let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
             usage,
             truncated: false,
+            complete: true,
         })));
         let chunk = Bytes::from_static(b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
         let stream = futures::stream::once(async move { Ok(chunk) });

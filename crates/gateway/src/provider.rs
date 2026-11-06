@@ -1,7 +1,7 @@
 //! The upstream LLM provider abstraction and its real HTTP implementation.
 //!
 //! A provider forwards a request and returns a **streaming** body plus a slot
-//! that is filled with the token [`Usage`] once the stream is fully consumed.
+//! that is filled with the token [`Usage`] once the stream ends or breaks.
 //! Streaming is essential: the gateway passes bytes through to the caller as
 //! they arrive (SSE passthrough) and only settles the real cost at end-of-stream
 //! (Phase 0 spike #1). Usage is parsed out of the same bytes as they flow by.
@@ -22,13 +22,23 @@ use tokenfuse_core::Usage;
 /// real-looking but silently short `usage`, or none at all, when the whole
 /// usage block landed past the cut. Callers must not price `usage` when
 /// `truncated` is set; see `crate::settle::settle_amount`.
+///
+/// `complete = true` means the provider's last word on usage arrived, so the
+/// output count is the figure it bills. False is the default, and the state of
+/// a body that stopped short: `usage` then holds what the provider said so far,
+/// an input count that looks like a whole answer beside an output count that is
+/// an opening figure or a running total. See [`UsageParser::finish`] for what
+/// counts as the last word, and `crate::settle::settle_amount` for what a call
+/// is charged without it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParsedUsage {
     pub usage: Usage,
     pub truncated: bool,
+    pub complete: bool,
 }
 
-/// Shared slot filled with the final usage once a provider stream ends.
+/// Shared slot filled with what the parser read once a provider stream ends or
+/// breaks, which [`ParsedUsage::complete`] says is the last word or not.
 pub type UsageSlot = Arc<Mutex<Option<ParsedUsage>>>;
 
 /// A streaming response from the upstream.
@@ -37,7 +47,7 @@ pub struct ProviderResponse {
     pub content_type: Option<String>,
     /// Body chunks to pass through to the caller.
     pub body: BoxStream<'static, Result<Bytes, ProviderError>>,
-    /// Filled with the parsed usage once `body` is fully consumed.
+    /// Filled with the parsed usage once `body` ends or breaks.
     pub usage: UsageSlot,
 }
 
@@ -220,11 +230,26 @@ impl UsageParser {
         self.buf.extend_from_slice(&chunk[..take]);
     }
 
+    /// What the body held when this was called, which is the end of the body or the moment it
+    /// broke (`HttpProvider::send` calls it on both).
+    ///
+    /// [`ParsedUsage::complete`] says whether that was the provider's last word on usage:
+    /// - a whole JSON document, because there is no later event to wait for;
+    /// - an output figure on an event that does not say the message is still open
+    ///   ([`UsageReport::Final`]), which holds when the body breaks right after it;
+    /// - any output figure at all once the stream closed cleanly (`[DONE]`, `message_stop`),
+    ///   because a clean close says nothing follows.
+    ///
+    /// Anything else is a body that stopped short. Anthropic's `message_start` is never the
+    /// last word, whatever its `output_tokens` says: a real one says 1.
     pub fn finish(&self) -> ParsedUsage {
         let text = String::from_utf8_lossy(&self.buf);
         let mut usage = Usage::default();
         let mut netting = OpenAiNetting::default();
         let mut tool_calls = ToolCallCounter::default();
+        let mut report = UsageReport::None;
+        let mut closed = false;
+        let mut whole_document = false;
 
         let sse = split_sse_events(&text);
         if sse.saw_data_field {
@@ -233,10 +258,12 @@ impl UsageParser {
             // sentinel; an event that does not parse is skipped and its siblings are not.
             for event in &sse.events {
                 if event.trim() == "[DONE]" {
+                    closed = true;
                     continue;
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(event) {
-                    merge_usage(&mut usage, &mut netting, &v);
+                    report = report.max(merge_usage(&mut usage, &mut netting, &v));
+                    closed |= v.get("type").and_then(|t| t.as_str()) == Some("message_stop");
                     tool_calls.observe_streaming(&v);
                 }
             }
@@ -244,14 +271,60 @@ impl UsageParser {
             // Non-streaming response: the whole body is one JSON object.
             merge_usage(&mut usage, &mut netting, &v);
             tool_calls.observe_non_streaming(&v);
+            whole_document = true;
         }
 
         usage.tool_calls = tool_calls.finish();
         ParsedUsage {
             usage,
             truncated: self.truncated,
+            complete: whole_document
+                || report == UsageReport::Final
+                || (closed && report == UsageReport::Running),
         }
     }
+}
+
+/// What one event said about the output count, ordered so that the strongest report of a body
+/// is the `max` of its events'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UsageReport {
+    /// No output figure: no usage at all, the opening counters of `message_start`, or a usage
+    /// object naming only the prompt side.
+    None,
+    /// An output figure on an event that says the message is still open: a total so far.
+    Running,
+    /// An output figure on an event that does not.
+    Final,
+}
+
+impl UsageReport {
+    fn of(has_output_figure: bool, still_open: bool) -> Self {
+        match (has_output_figure, still_open) {
+            (false, _) => UsageReport::None,
+            (true, true) => UsageReport::Running,
+            (true, false) => UsageReport::Final,
+        }
+    }
+}
+
+/// Whether an event says the message has not ended: a `message_delta` whose `stop_reason` is an
+/// explicit null, or a chunk with a choice whose `finish_reason` is. A key that is absent says
+/// nothing either way and is not read as open: only the event's own word moves this.
+fn says_still_open(v: &serde_json::Value) -> bool {
+    let delta_is_open = v
+        .get("delta")
+        .and_then(|d| d.get("stop_reason"))
+        .is_some_and(|r| r.is_null());
+    let a_choice_is_open = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .is_some_and(|choices| {
+            choices
+                .iter()
+                .any(|c| c.get("finish_reason").is_some_and(|r| r.is_null()))
+        });
+    delta_is_open || a_choice_is_open
 }
 
 /// Accumulates the model-emitted tool-call count across a response body (I1,
@@ -393,8 +466,10 @@ fn is_openai_shape(u: &serde_json::Value) -> bool {
     .any(|k| u.get(*k).is_some())
 }
 
-fn merge_usage(usage: &mut Usage, net: &mut OpenAiNetting, v: &serde_json::Value) {
-    // Anthropic message_start: { "message": { "usage": { ... } } }
+/// Folds one event's usage into `usage`, and says what the event reported about the output.
+fn merge_usage(usage: &mut Usage, net: &mut OpenAiNetting, v: &serde_json::Value) -> UsageReport {
+    // Anthropic message_start: { "message": { "usage": { ... } } }. Priced, and never a report:
+    // this is the opening of the message, and the output count on it is an opening count.
     if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
         apply_anthropic(usage, u);
     }
@@ -403,13 +478,23 @@ fn merge_usage(usage: &mut Usage, net: &mut OpenAiNetting, v: &serde_json::Value
     // `None` for a non-object (including `null`) to both `apply_*` below, so
     // deleting this filter changes no test in `provider`'s module (checked
     // 2026-09-07). No test can pin it for that reason; keep it anyway.
-    if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-        if is_openai_shape(u) {
-            apply_openai(usage, net, u);
-        } else {
-            apply_anthropic(usage, u);
-        }
-    }
+    let Some(u) = v.get("usage").filter(|u| u.is_object()) else {
+        return UsageReport::None;
+    };
+    // The figures each vendor's output count is read from. `total_tokens` is one of OpenAI's
+    // because the output is read from it too (invariant 80). A key holding anything but a count
+    // is not a figure.
+    let output_keys: &[&str] = if is_openai_shape(u) {
+        apply_openai(usage, net, u);
+        &["completion_tokens", "total_tokens"]
+    } else {
+        apply_anthropic(usage, u);
+        &["output_tokens"]
+    };
+    let has_output_figure = output_keys
+        .iter()
+        .any(|k| u.get(*k).is_some_and(|n| n.is_u64()));
+    UsageReport::of(has_output_figure, says_still_open(v))
 }
 
 /// Last-non-zero-wins: streamed events arrive oldest-first, and the final
@@ -883,13 +968,18 @@ impl Provider for HttpProvider {
         let usage_writer = Arc::clone(&usage);
         let upstream = resp.bytes_stream();
 
-        // Pass each chunk through unchanged while tapping it for usage. On end
-        // of stream, publish the parsed usage into the shared slot.
+        // Pass each chunk through unchanged while tapping it for usage. When the body ends, or
+        // breaks, publish the parsed usage into the shared slot: a provider that reported its
+        // usage and then lost the connection still reported it (invariant 47), and what a body
+        // that stopped short is charged is `ParsedUsage::complete`'s question, not this loop's.
         let body = async_stream::try_stream! {
             let mut parser = UsageParser::new();
             futures::pin_mut!(upstream);
             while let Some(chunk) = upstream.next().await {
-                let chunk = chunk.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+                let chunk = chunk.map_err(|e| {
+                    *usage_writer.lock().unwrap() = Some(parser.finish());
+                    ProviderError::Upstream(e.to_string())
+                })?;
                 parser.feed(&chunk);
                 yield chunk;
             }
@@ -990,9 +1080,14 @@ impl Provider for StubProvider {
             // (`Usage::carries_priced_tokens`, invariant 43): a body with no
             // usage block still parses and carries `tool_calls: Some(0)`, and
             // comparing against `Usage::default()` read that as usage.
+            // The declared usage is whole by definition; the parsed one says for itself.
             let parsed = parser.finish();
-            let usage = if parsed.usage.carries_priced_tokens() { parsed.usage } else { usage };
-            *writer.lock().unwrap() = Some(ParsedUsage { usage, truncated: parsed.truncated });
+            let (usage, complete) = if parsed.usage.carries_priced_tokens() {
+                (parsed.usage, parsed.complete)
+            } else {
+                (usage, true)
+            };
+            *writer.lock().unwrap() = Some(ParsedUsage { usage, truncated: parsed.truncated, complete });
         };
 
         Ok(ProviderResponse {
@@ -2087,7 +2182,8 @@ mod tests {
                 &default_price_book(),
                 "claude-sonnet",
                 Some(parsed),
-                Microusd(777)
+                Microusd(777),
+                1_000
             ),
             (
                 Microusd(777),
@@ -2110,6 +2206,7 @@ mod tests {
                 tool_calls: Some(1),
             },
             truncated: false,
+            complete: true,
         };
         let mut seed: u64 = 0x2026_0918;
         for _ in 0..200 {
@@ -2340,5 +2437,172 @@ mod tests {
         assert_eq!(u.input_tokens, 822);
         assert_eq!(u.cache_read_tokens, 128);
         assert_eq!(u.output_tokens, 1000);
+    }
+
+    // -- the provider's last word on usage (tokenfuse#308, invariant 43) -----------------------
+
+    const OPENING: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n";
+    const FINAL_DELTA: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":200}}\n\n";
+    const OPEN_DELTA: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":40}}\n\n";
+    const STOP: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+
+    fn complete(parts: &[&str]) -> bool {
+        let mut p = UsageParser::new();
+        p.feed(parts.concat().as_bytes());
+        p.finish().complete
+    }
+
+    #[test]
+    fn the_opening_counters_are_never_the_last_word_even_closed_cleanly() {
+        assert!(!complete(&[OPENING]));
+        assert!(
+            !complete(&[OPENING, STOP]),
+            "a clean close makes an output figure final; it cannot supply one"
+        );
+        assert!(!complete(&[OPENING, DONE]));
+    }
+
+    #[test]
+    fn the_final_delta_is_the_last_word_with_or_without_the_close_behind_it() {
+        assert!(complete(&[OPENING, FINAL_DELTA]));
+        assert!(complete(&[OPENING, FINAL_DELTA, STOP]));
+    }
+
+    #[test]
+    fn a_delta_with_no_stop_reason_key_is_the_last_word() {
+        assert!(complete(&[
+            OPENING,
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":200}}\n\n"
+        ]));
+    }
+
+    #[test]
+    fn a_delta_that_says_the_message_is_open_is_a_running_figure_until_the_close() {
+        assert!(!complete(&[OPENING, OPEN_DELTA]));
+        assert!(complete(&[OPENING, OPEN_DELTA, STOP]));
+        assert!(complete(&[OPENING, OPEN_DELTA, DONE]));
+        assert!(
+            complete(&[OPENING, OPEN_DELTA, FINAL_DELTA]),
+            "the running figure before it does not take the final one back"
+        );
+    }
+
+    #[test]
+    fn a_final_figure_stays_final_when_a_running_one_arrives_after_it() {
+        assert!(complete(&[OPENING, FINAL_DELTA, OPEN_DELTA]));
+    }
+
+    #[test]
+    fn an_openai_usage_is_the_last_word_only_with_an_output_figure() {
+        let prompt_only = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950}}\n\n";
+        assert!(!complete(&[prompt_only]));
+        assert!(!complete(&[prompt_only, DONE]));
+        let details_only =
+            "data: {\"usage\":{\"prompt_tokens_details\":{\"cached_tokens\":128}}}\n\n";
+        assert!(!complete(&[details_only, DONE]));
+        let with_completion =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":5}}\n\n";
+        assert!(complete(&[with_completion]));
+        let with_total =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"total_tokens\":8}}\n\n";
+        assert!(
+            complete(&[with_total]),
+            "invariant 80 reads the output from the total, so the total is an output figure"
+        );
+    }
+
+    #[test]
+    fn a_zero_output_figure_is_a_figure() {
+        assert!(complete(&[
+            OPENING,
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n"
+        ]));
+        assert!(complete(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":0}}\n\n"
+        ]));
+    }
+
+    #[test]
+    fn an_openai_usage_on_an_open_choice_is_a_running_figure_until_the_close() {
+        let running = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":40}}\n\n";
+        assert!(!complete(&[running]));
+        assert!(complete(&[running, DONE]));
+        let closing = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":950,\"completion_tokens\":41}}\n\n";
+        assert!(complete(&[running, closing]));
+    }
+
+    /// `n > 1`: one choice finished and another did not is a message that has not ended.
+    #[test]
+    fn one_open_choice_among_finished_ones_keeps_the_figure_running() {
+        let mixed = "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"},{\"index\":1,\"finish_reason\":null}],\"usage\":{\"completion_tokens\":40}}\n\n";
+        assert!(!complete(&[mixed]));
+    }
+
+    #[test]
+    fn a_whole_json_document_is_complete_whatever_it_reports() {
+        assert!(complete(&[r#"{"usage":{"input_tokens":10}}"#]));
+        assert!(complete(&[r#"{"usage":{"prompt_tokens":10}}"#]));
+        assert!(complete(&[r#"{"choices":[]}"#]));
+    }
+
+    #[test]
+    fn a_body_that_says_nothing_readable_is_not_complete() {
+        assert!(!complete(&[""]));
+        assert!(!complete(&["not json at all, an upstream error page"]));
+        assert!(!complete(&[r#"{"usage":{"input_tokens":10"#]));
+    }
+
+    #[test]
+    fn a_key_holding_anything_but_a_count_is_not_an_output_figure() {
+        for value in ["null", "\"many\"", "-1", "1.5", "[]", "{}", "true"] {
+            let anthropic = format!("data: {{\"usage\":{{\"output_tokens\":{value}}}}}\n\n");
+            assert!(!complete(&[OPENING, &anthropic, STOP]), "{value}");
+            let openai = format!("data: {{\"usage\":{{\"completion_tokens\":{value}}}}}\n\n");
+            assert!(!complete(&[&openai, DONE]), "{value}");
+        }
+    }
+
+    /// The property #309 stands on: a body can break at any byte, and the parser must claim the
+    /// last word exactly from the byte the final event's JSON closes on, and never before. A cut
+    /// through an event leaves JSON that does not parse, which is skipped; the unterminated last
+    /// event is dispatched (`split_sse_events`), so the closing brace is the boundary and not
+    /// the blank line after it.
+    #[test]
+    fn a_stream_cut_at_any_byte_is_complete_exactly_from_its_final_event_on() {
+        let anthropic = [OPENING, OPEN_DELTA, FINAL_DELTA, STOP].concat();
+        let anthropic_boundary = OPENING.len() + OPEN_DELTA.len() + FINAL_DELTA.trim_end().len();
+        let usage_chunk =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":5}}\n\n";
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":null}],\"usage\":null}\n\n";
+        let openai = [content, usage_chunk, DONE].concat();
+        let openai_boundary = content.len() + usage_chunk.trim_end().len();
+        for (stream, boundary) in [(anthropic, anthropic_boundary), (openai, openai_boundary)] {
+            for cut in 0..=stream.len() {
+                let mut p = UsageParser::new();
+                p.feed(&stream.as_bytes()[..cut]);
+                assert_eq!(p.finish().complete, cut >= boundary, "cut at byte {cut}");
+            }
+        }
+    }
+
+    /// The stub writes its slot the way the network path does: the usage it read says for
+    /// itself, and the usage it declares is whole.
+    #[tokio::test]
+    async fn the_stub_says_what_it_read_and_its_declared_usage_is_whole() {
+        for (body, want) in [
+            (r#"{"choices":[]}"#, true),
+            (r#"{"usage":{"input_tokens":3}}"#, true),
+            ("data: {\"usage\":{\"input_tokens\":3}}\n\n", false),
+        ] {
+            let stub = StubProvider {
+                body_override: Some(body.to_string()),
+                ..Default::default()
+            };
+            let resp = stub.send(HeaderMap::new(), Bytes::new()).await.unwrap();
+            let _: Vec<_> = resp.body.collect().await;
+            let got = resp.usage.lock().unwrap().unwrap();
+            assert_eq!(got.complete, want, "{body}");
+        }
     }
 }

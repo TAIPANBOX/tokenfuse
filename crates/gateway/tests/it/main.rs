@@ -82,6 +82,7 @@ mod stub_wire_mismatch;
 mod the_estimate_never_goes_negative;
 mod the_gateway_holds_the_provider_key;
 mod unmapped_tool_after_untrusted;
+mod usage_that_stops_short;
 mod version_and_help;
 mod wardryx;
 mod wire_door;

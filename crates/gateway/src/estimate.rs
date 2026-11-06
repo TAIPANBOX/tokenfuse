@@ -22,14 +22,24 @@ pub(crate) const CHARS_PER_TOKEN: u64 = 4;
 /// Default assumed output tokens when the request does not cap `max_tokens`.
 const DEFAULT_MAX_TOKENS: u64 = 1_024;
 
-/// Estimate the cost of a call from the request body length, the caller's
-/// output cap, and how many completions are being asked for.
+/// The most output a request can be billed: its cap, or the one assumed when it
+/// names none, for every completion it asked for. One figure with two readers:
+/// the estimate below, and what a call whose usage stopped short of its final
+/// event is charged for its output (`settle::settle_amount`, invariant 43).
 ///
 /// `completions` is 1 on the Anthropic wire, which has no such parameter. On
 /// OpenAI it is `n`, and every one of those completions is generated and
-/// billed, so the output half of the estimate multiplies. A count of zero is
-/// read as one: no wire asks for nothing, and treating it as free is how a run
-/// that should have been refused gets served.
+/// billed, so the output half multiplies. A count of zero is read as one: no
+/// wire asks for nothing, and treating it as free is how a run that should have
+/// been refused gets served.
+pub fn output_cap_tokens(max_tokens: Option<u64>, completions: u64) -> u64 {
+    max_tokens
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .saturating_mul(completions.max(1))
+}
+
+/// Estimate the cost of a call from the request body length, the caller's
+/// output cap, and how many completions are being asked for.
 pub fn estimate_cost(
     prices: &PriceBook,
     model: &str,
@@ -38,9 +48,7 @@ pub fn estimate_cost(
     completions: u64,
 ) -> Option<Microusd> {
     let input_tokens = (body_len as u64) / CHARS_PER_TOKEN;
-    let output_tokens = max_tokens
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .saturating_mul(completions.max(1));
+    let output_tokens = output_cap_tokens(max_tokens, completions);
 
     let usage = Usage {
         input_tokens,
@@ -103,6 +111,19 @@ mod tests {
     fn missing_max_tokens_falls_back_to_default() {
         let est = estimate_cost(&book(), "m", 0, None, 1).unwrap();
         assert!(est > Microusd::ZERO);
+    }
+
+    #[test]
+    fn the_output_cap_is_the_request_cap_for_every_completion() {
+        assert_eq!(output_cap_tokens(Some(1_000), 1), 1_000);
+        assert_eq!(output_cap_tokens(Some(1_000), 4), 4_000);
+        assert_eq!(output_cap_tokens(None, 1), DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            output_cap_tokens(Some(1_000), 0),
+            1_000,
+            "zero reads as one"
+        );
+        assert_eq!(output_cap_tokens(Some(u64::MAX), 2), u64::MAX, "saturates");
     }
 
     #[test]

@@ -48,6 +48,10 @@ fn codex_f05_inv45_details_only_chunk_is_not_discarded() {
 #[tokio::test]
 async fn codex_f06_multiline_sse_usage_is_not_silently_partial() {
     // One valid SSE event can contain several data fields joined with LF.
+    //
+    // The request's cap is 2000, not the review's 1000: a stream whose final event is lost now
+    // charges the output at the cap (invariant 43), and with the cap equal to the reported 1000
+    // this probe read 15030 either way and could not go red. `gates-have-teeth.sh` caught that.
     let bytes=b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec();
     let (st, l) = state(
         Arc::new(BytesProvider {
@@ -63,7 +67,7 @@ async fn codex_f06_multiline_sse_usage_is_not_silently_partial() {
         .header("x-fuse-run-id", "multiline")
         .header("x-fuse-budget-usd", "10")
         .body(Body::from(
-            r#"{"model":"claude-sonnet","max_tokens":1000,"stream":true}"#,
+            r#"{"model":"claude-sonnet","max_tokens":2000,"stream":true}"#,
         ))
         .unwrap();
     let r = tokenfuse_gateway::app(st).oneshot(request).await.unwrap();
@@ -339,7 +343,17 @@ async fn codex_held_stream_drop_before_first_poll_settles_once() {
     println!("before={before:?} after={after:?}");
 }
 
-async fn real_broken_http(stream: bool) -> (tokenfuse_core::RunSnapshot, Microusd) {
+/// The review's fixture: every byte of the usage arrived, and the body broke one byte short.
+const USAGE_THEN_BROKEN: &[u8] = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":500}}"#;
+/// The same break with nothing priced read yet. Until #309 the fixture above settled on the
+/// estimate as well, because the slot was filled only after the read loop; the estimate
+/// assertions moved here, to the body they are true of.
+const NOTHING_THEN_BROKEN: &[u8] = br#"{"id":"chatcmpl-1","choices":[{"index":0,"message":"#;
+
+async fn real_broken_http(
+    stream: bool,
+    body: &'static [u8],
+) -> (tokenfuse_core::RunSnapshot, Microusd) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -351,7 +365,6 @@ async fn real_broken_http(stream: bool) -> (tokenfuse_core::RunSnapshot, Microus
         // before this task answers with the fixed response below.
         #[allow(clippy::unused_io_amount)]
         socket.read(&mut request).await.unwrap();
-        let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":500}}"#;
         let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + 1);
         socket.write_all(headers.as_bytes()).await.unwrap();
         socket.write_all(body).await.unwrap();
@@ -387,12 +400,30 @@ async fn real_broken_http(stream: bool) -> (tokenfuse_core::RunSnapshot, Microus
 
 #[tokio::test]
 async fn codex_f04_real_http_2xx_body_error_must_not_silently_settle_zero() {
-    let (snapshot, estimate) = real_broken_http(false).await;
+    let (snapshot, estimate) = real_broken_http(false, NOTHING_THEN_BROKEN).await;
     assert_eq!(snapshot.spent, estimate, "invariant 43 and review fallback requirement: upstream answered 200 but its body broke; usage is unavailable, so reserve estimate must not become a zero settlement");
 }
 
 #[tokio::test]
 async fn codex_held_real_http_stream_error_releases_and_uses_estimate() {
-    let (snapshot, estimate) = real_broken_http(true).await;
+    let (snapshot, estimate) = real_broken_http(true, NOTHING_THEN_BROKEN).await;
     assert_eq!(snapshot.spent, estimate);
+}
+
+/// tokenfuse#309, the real-HTTP twin of `codex_f04_buffered_body_error_preserves_reported_usage`:
+/// that test's double published before it broke, and `HttpProvider` did not.
+#[tokio::test]
+async fn codex_f04_real_http_2xx_body_error_settles_the_usage_already_received() {
+    let (snapshot, _) = real_broken_http(false, USAGE_THEN_BROKEN).await;
+    assert_eq!(
+        snapshot.spent,
+        Microusd(7500),
+        "invariant 47 money rule: reported generated usage must be settled even if delivery fails"
+    );
+}
+
+#[tokio::test]
+async fn codex_held_real_http_stream_error_settles_the_usage_already_received() {
+    let (snapshot, _) = real_broken_http(true, USAGE_THEN_BROKEN).await;
+    assert_eq!(snapshot.spent, Microusd(7500));
 }

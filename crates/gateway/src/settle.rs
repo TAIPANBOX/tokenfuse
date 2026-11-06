@@ -13,8 +13,9 @@
 //! zero on both (F04/3.5). Invariant 50.
 //!
 //! The states are what happened on the wire. How much is charged for an answered call is
-//! [`settle_amount`]'s basis, unchanged: parsed usage as parsed, else the estimate on a 2xx and
-//! zero on a refusal (invariants 43 and 47). A call the provider held when the caller left is
+//! [`settle_amount`]'s basis: parsed usage as parsed, usage that stopped short of its final event
+//! at the reported input and the output cap, else the estimate on a 2xx and zero on a refusal
+//! (invariants 43 and 47). A call the provider held when the caller left is
 //! neither settled nor released: it is RETAINED, listed in [`Retained`], and stays outstanding
 //! until somebody reconciles it (D7, `@decided 2026-09-18`).
 
@@ -51,6 +52,11 @@ pub enum CostBasis {
     /// [`Usage::default`], never the partial numbers that were parsed - see
     /// `settle_amount`'s doc for why.
     EstimateTruncated,
+    /// The body stopped short of the provider's last word on usage: the input
+    /// side as reported, the output side at the request's cap. Like
+    /// `EstimateTruncated`, the `Usage` returned alongside carries no token
+    /// counts, so the row reads as estimated, which half of it is.
+    PartialUsage,
 }
 
 /// Decides what a settlement charges and why, from the parsed usage (if any)
@@ -86,19 +92,51 @@ pub enum CostBasis {
 /// cost of also losing whatever partial counts a truncated body happened to
 /// carry - a real loss, but the alternative is a wrong label on a downstream
 /// billing export, which is worse.
+///
+/// **A body that stopped short of the provider's last word is charged the input
+/// side as reported and the output side at `unmeasured_output`**, the request's
+/// cap on a 2xx (`ParsedUsage::complete`, tokenfuse#308, `@decided 2026-11-05`).
+/// The opening counters alone would price the output the provider generated at
+/// nothing; the estimate would throw away a prompt the provider has already
+/// measured, and can sit below it, because the estimate cannot know a cache
+/// write's rate. The cap is the most the provider can bill for the output, so
+/// this is the upper bound of the bill, and it carries no margin: the margin is
+/// for the tokenizer the gateway does not have, and a cap is exact.
+///
+/// `unmeasured_output` is zero on a refusal, as `unmeasured` is: a refused call
+/// generated nothing to assume, so what it reported is what it is charged, and
+/// that is `Parsed` as it always was (invariant 47's money rule). The record is
+/// the truncated case's: no token counts beside a cost that is half assumed,
+/// for the same reason and with the same loss. `tool_calls` rides along, being
+/// an observation rather than a count.
 pub fn settle_amount(
     prices: &PriceBook,
     model: &str,
     parsed: Option<ParsedUsage>,
     unmeasured: Microusd,
+    unmeasured_output: u64,
 ) -> (Microusd, Usage, CostBasis) {
     let truncated = parsed.as_ref().is_some_and(|p| p.truncated);
+    let complete = parsed.as_ref().is_some_and(|p| p.complete);
     let usage = parsed.map(|p| p.usage).unwrap_or_default();
     if truncated {
         // Never priced, no matter what partial numbers survived the cut, and
         // never RECORDED either - see this function's doc and
         // `CostBasis::EstimateTruncated`'s.
         return (unmeasured, Usage::default(), CostBasis::EstimateTruncated);
+    }
+    if !complete && unmeasured_output > 0 && usage.carries_priced_tokens() {
+        let capped = Usage {
+            output_tokens: usage.output_tokens.max(unmeasured_output),
+            ..usage
+        };
+        if let Some(cost) = prices.cost(model, &capped) {
+            let record = Usage {
+                tool_calls: usage.tool_calls,
+                ..Usage::default()
+            };
+            return (cost, record, CostBasis::PartialUsage);
+        }
     }
     match prices.cost(model, &usage) {
         Some(cost) if usage.carries_priced_tokens() => (cost, usage, CostBasis::Parsed),
@@ -128,8 +166,9 @@ pub enum CallOutcome {
     /// A non-2xx status line arrived. Charges what the provider reported, else zero
     /// (invariant 47).
     Refused,
-    /// A 2xx status line arrived. Charges what the body reported, else the estimate
-    /// (invariant 43), whether the body completed, broke, or was abandoned by the caller.
+    /// A 2xx status line arrived. Charges what the body reported, with the output at the
+    /// request's cap when it stopped short of its final event, else the estimate (invariant 43),
+    /// whether the body completed, broke, or was abandoned by the caller.
     Started,
 }
 
@@ -401,6 +440,9 @@ pub struct SettleGuard {
     /// The pre-flight estimate both reservations were taken at; equal to `run.amount` once the
     /// run half is held (asserted in debug builds).
     estimate: Microusd,
+    /// The most output the request can be billed (`estimate::output_cap_tokens`): what a 2xx
+    /// whose usage stopped short of its final event is charged for its output (invariant 43).
+    output_cap_tokens: u64,
     attribution: CallAttribution,
     state: CallOutcome,
     /// The leaf's step from the run reservation; 0 until `hold_run`.
@@ -424,6 +466,7 @@ impl SettleGuard {
         retained: Arc<Retained>,
         run_id: String,
         estimate: Microusd,
+        output_cap_tokens: u64,
         attribution: CallAttribution,
         unit_reservation: Option<UnitReservation>,
     ) -> Self {
@@ -436,6 +479,7 @@ impl SettleGuard {
             retained,
             run_id,
             estimate,
+            output_cap_tokens,
             attribution,
             state: CallOutcome::NotDispatched,
             step: 0,
@@ -662,13 +706,18 @@ impl SettleGuard {
             .usage
             .as_ref()
             .and_then(|slot| slot.lock().unwrap().take());
-        let unmeasured = if unmeasured_is_estimate {
-            self.estimate
+        let (unmeasured, unmeasured_output) = if unmeasured_is_estimate {
+            (self.estimate, self.output_cap_tokens)
         } else {
-            Microusd::ZERO
+            (Microusd::ZERO, 0)
         };
-        let (actual, usage, basis) =
-            settle_amount(&self.prices, &self.attribution.model, parsed, unmeasured);
+        let (actual, usage, basis) = settle_amount(
+            &self.prices,
+            &self.attribution.model,
+            parsed,
+            unmeasured,
+            unmeasured_output,
+        );
         if basis == CostBasis::EstimateTruncated {
             // Verbatim the existing warn (settle.rs:228-235 at e25835c) and counter.
             tracing::warn!(
@@ -680,6 +729,15 @@ impl SettleGuard {
                  fallback amount above instead"
             );
             self.keystats.record_truncated_settlement();
+        }
+        if basis == CostBasis::PartialUsage {
+            tracing::warn!(
+                model = %self.attribution.model,
+                output_cap_tokens = self.output_cap_tokens,
+                settled_microusd = actual.0,
+                "the response stopped short of its final usage event; the input side \
+                 settled as reported and the output side at the request's cap"
+            );
         }
         if let Some(r) = run {
             self.ledger.settle(r, actual);
@@ -832,6 +890,7 @@ mod tests {
             retained,
             "r".into(),
             estimate,
+            1_000,
             CallAttribution {
                 model: model.into(),
                 unit: unit.into(),
@@ -851,6 +910,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let mut g = guard(
             &ledger,
@@ -948,6 +1008,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let mut g = guard(
             &ledger,
@@ -985,6 +1046,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let units = Arc::new(UnitLedger::new(std::collections::HashMap::from([(
             "treasury".to_string(),
@@ -1029,6 +1091,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let sink = Arc::new(CapturingSink::default());
         let mut g = guard(
@@ -1101,8 +1164,10 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
-        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        let (actual, usage, basis) =
+            settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0), 1_000);
         assert_eq!(actual, Microusd::from_usd(3.0));
         assert_eq!(usage.input_tokens, 1_000_000);
         assert_eq!(basis, CostBasis::Parsed);
@@ -1114,8 +1179,10 @@ mod tests {
         let parsed = Some(ParsedUsage {
             usage: Usage::default(),
             truncated: false,
+            complete: true,
         });
-        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        let (actual, usage, basis) =
+            settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0), 1_000);
         assert_eq!(
             actual,
             Microusd::from_usd(1.0),
@@ -1137,9 +1204,10 @@ mod tests {
                 ..Default::default()
             },
             truncated: true,
+            complete: false,
         });
         let estimate = Microusd::from_usd(1.0);
-        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate);
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate, 1_000);
         assert_eq!(
             actual, estimate,
             "a truncated body's partial usage must never be priced, even though it parsed"
@@ -1171,9 +1239,10 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let estimate = Microusd::from_usd(1.0);
-        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate);
+        let (actual, usage, basis) = settle_amount(&prices, "m", parsed, estimate, 1_000);
         assert_eq!(
             actual, estimate,
             "no priced token was parsed, so the estimate is what this settles on, not zero"
@@ -1198,10 +1267,11 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let estimate = Microusd::from_usd(0.004);
         let (actual, _, basis) =
-            settle_amount(&prices, "amazon.nova-2-lite-v1:0", parsed, estimate);
+            settle_amount(&prices, "amazon.nova-2-lite-v1:0", parsed, estimate, 1_000);
         assert_eq!(actual, estimate);
         assert_eq!(basis, CostBasis::EstimateNoUsage);
     }
@@ -1218,8 +1288,10 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
-        let (actual, _, basis) = settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0));
+        let (actual, _, basis) =
+            settle_amount(&prices, "m", parsed, Microusd::from_usd(1.0), 1_000);
         assert_eq!(basis, CostBasis::Parsed);
         assert_eq!(actual, Microusd::from_usd(0.3));
     }
@@ -1228,7 +1300,8 @@ mod tests {
     fn settle_amount_on_no_slot_write_at_all_is_estimate_no_usage() {
         // The cancel/drop path: nothing was ever written to the slot.
         let prices = PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0));
-        let (actual, usage, basis) = settle_amount(&prices, "m", None, Microusd::from_usd(1.0));
+        let (actual, usage, basis) =
+            settle_amount(&prices, "m", None, Microusd::from_usd(1.0), 1_000);
         assert_eq!(actual, Microusd::from_usd(1.0));
         assert_eq!(usage, Usage::default());
         assert_eq!(basis, CostBasis::EstimateNoUsage);
@@ -1245,6 +1318,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: true,
+            complete: false,
         });
         let keystats = Arc::new(KeyStats::default());
         let sink = Arc::new(CapturingSink::default());
@@ -1287,6 +1361,207 @@ mod tests {
         );
     }
 
+    // -- usage that stopped short of its final event (tokenfuse#308, invariant 43) -------------
+
+    /// `m` at 3 and 15 USD per Mtok: 1000 input is 3000 microusd, 1000 output 15000.
+    fn book_of_m() -> PriceBook {
+        PriceBook::new().with("m", ModelPrice::per_mtok_usd(3.0, 15.0, 0.0, 0.0))
+    }
+
+    fn stopped_short(input_tokens: u64, output_tokens: u64) -> Option<ParsedUsage> {
+        Some(ParsedUsage {
+            usage: Usage {
+                input_tokens,
+                output_tokens,
+                tool_calls: Some(2),
+                ..Default::default()
+            },
+            truncated: false,
+            complete: false,
+        })
+    }
+
+    #[test]
+    fn usage_that_stopped_short_is_the_reported_input_and_the_output_cap() {
+        let (actual, _, basis) = settle_amount(
+            &book_of_m(),
+            "m",
+            stopped_short(1_000, 1),
+            Microusd::from_usd(1.0),
+            1_000,
+        );
+        assert_eq!(
+            actual,
+            Microusd(18_000),
+            "3000 input, 15000 output at the cap"
+        );
+        assert_eq!(basis, CostBasis::PartialUsage);
+    }
+
+    /// The cap is what is assumed, not a ceiling on what was reported: a figure above it came
+    /// from the provider, and settling under it would be the under-charge this exists to end.
+    #[test]
+    fn a_reported_output_above_the_cap_is_kept() {
+        let (actual, _, basis) = settle_amount(
+            &book_of_m(),
+            "m",
+            stopped_short(1_000, 5_000),
+            Microusd::from_usd(1.0),
+            1_000,
+        );
+        assert_eq!(actual, Microusd(78_000));
+        assert_eq!(basis, CostBasis::PartialUsage);
+    }
+
+    /// `focusexport::to_row` reads a row's basis from its shape: token counts beside a cost read
+    /// as settled, which half of this amount is not.
+    #[test]
+    fn usage_that_stopped_short_records_no_token_counts_and_keeps_the_observation() {
+        let (_, usage, _) = settle_amount(
+            &book_of_m(),
+            "m",
+            stopped_short(1_000, 1),
+            Microusd::from_usd(1.0),
+            1_000,
+        );
+        assert_eq!(
+            usage,
+            Usage {
+                tool_calls: Some(2),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_refusal_has_no_cap_to_assume_so_what_it_reported_stays_parsed() {
+        let parsed = stopped_short(1_000, 1);
+        let (actual, usage, basis) = settle_amount(&book_of_m(), "m", parsed, Microusd::ZERO, 0);
+        assert_eq!(actual, Microusd(3_015));
+        assert_eq!(usage, parsed.unwrap().usage);
+        assert_eq!(basis, CostBasis::Parsed);
+    }
+
+    #[test]
+    fn complete_usage_is_never_capped() {
+        let parsed = stopped_short(1_000, 1).map(|p| ParsedUsage {
+            complete: true,
+            ..p
+        });
+        let (actual, _, basis) =
+            settle_amount(&book_of_m(), "m", parsed, Microusd::from_usd(1.0), 1_000);
+        assert_eq!(actual, Microusd(3_015));
+        assert_eq!(basis, CostBasis::Parsed);
+    }
+
+    #[test]
+    fn a_truncated_body_stays_on_the_estimate_however_far_its_usage_got() {
+        let parsed = stopped_short(1_000, 1).map(|p| ParsedUsage {
+            truncated: true,
+            ..p
+        });
+        let estimate = Microusd::from_usd(1.0);
+        let (actual, usage, basis) = settle_amount(&book_of_m(), "m", parsed, estimate, 1_000);
+        assert_eq!(actual, estimate);
+        assert_eq!(usage, Usage::default());
+        assert_eq!(basis, CostBasis::EstimateTruncated);
+    }
+
+    #[test]
+    fn a_body_that_reported_nothing_priced_stays_on_the_estimate() {
+        let estimate = Microusd::from_usd(1.0);
+        let (actual, usage, basis) =
+            settle_amount(&book_of_m(), "m", stopped_short(0, 0), estimate, 1_000);
+        assert_eq!(actual, estimate);
+        assert_eq!(usage.tool_calls, Some(2));
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+    }
+
+    #[test]
+    fn usage_that_stopped_short_on_a_model_with_no_price_is_the_estimate() {
+        let estimate = Microusd::from_usd(1.0);
+        let (actual, _, basis) = settle_amount(
+            &PriceBook::new(),
+            "unpriced",
+            stopped_short(1_000, 1),
+            estimate,
+            1_000,
+        );
+        assert_eq!(actual, estimate);
+        assert_eq!(basis, CostBasis::EstimateNoUsage);
+    }
+
+    /// The guard's half: both ledgers, the row, and the line an operator reads. It is a charge
+    /// resting on an assumption, so it says so; it is not a truncation, so that counter stays.
+    #[test]
+    fn a_stopped_short_settlement_says_so_at_warn_and_is_not_counted_as_truncated() {
+        let _serial = crate::testlog::log_lock();
+        let buf = crate::testlog::captured_log();
+        let start = buf.lock().unwrap().len();
+
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = stopped_short(1_000, 1);
+        let keystats = Arc::new(KeyStats::default());
+        let sink = Arc::new(CapturingSink::default());
+        let mut g = guard(
+            &ledger,
+            prices,
+            sink.clone(),
+            "m",
+            Microusd::from_usd(1.0),
+            "",
+            Arc::new(UnitLedger::default()),
+            None,
+            Arc::new(Retained::default()),
+            keystats.clone(),
+        );
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(200, usage);
+        g.complete();
+
+        assert_eq!(ledger.snapshot("r").unwrap().spent, Microusd(18_000));
+        assert_eq!(keystats.snapshot().truncated_settlements.settlements, 0);
+        let rec = sink
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a row was written");
+        assert_eq!((rec.input_tokens, rec.output_tokens), (0, 0));
+        assert_eq!(rec.cost_microusd, 18_000);
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()[start..]).into_owned();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("stopped short of its final usage event"),
+            "{text}"
+        );
+        assert!(text.contains("output_cap_tokens=1000"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_call_that_stopped_short_is_not_given_the_cap_by_the_guard() {
+        let (ledger, prices, usage, reservation) = setup();
+        *usage.lock().unwrap() = stopped_short(1_000, 1);
+        let mut g = guard(
+            &ledger,
+            prices,
+            Arc::new(CapturingSink::default()),
+            "m",
+            Microusd::from_usd(1.0),
+            "",
+            Arc::new(UnitLedger::default()),
+            None,
+            Arc::new(Retained::default()),
+            Arc::new(KeyStats::default()),
+        );
+        g.hold_run(reservation);
+        g.dispatching();
+        g.answered(429, usage);
+        g.complete();
+        assert_eq!(ledger.snapshot("r").unwrap().spent, Microusd(3_015));
+    }
+
     #[test]
     fn a_parsed_result_under_the_cap_does_not_touch_the_truncation_counter() {
         let (ledger, prices, usage, reservation) = setup();
@@ -1296,6 +1571,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         let keystats = Arc::new(KeyStats::default());
         let mut g = guard(
@@ -1330,6 +1606,7 @@ mod tests {
         *usage.lock().unwrap() = Some(ParsedUsage {
             usage: Usage::default(),
             truncated: false,
+            complete: true,
         });
         let keystats = Arc::new(KeyStats::default());
         let mut g = guard(
@@ -1401,6 +1678,7 @@ mod tests {
             rig.retained.clone(),
             "r".into(),
             Microusd::from_usd(1.0),
+            1_000,
             CallAttribution {
                 model: "m".into(),
                 unit: "treasury".into(),
@@ -1752,6 +2030,7 @@ mod tests {
                 r.retained.clone(),
                 "r".into(),
                 Microusd::from_usd(1.0),
+                1_000,
                 CallAttribution {
                     model: "m".into(),
                     unit: "treasury".into(),
@@ -1806,6 +2085,7 @@ mod tests {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         });
         g.dispatching();
         g.answered(200, r.slot.clone());
@@ -1881,6 +2161,7 @@ mod tests {
                         ..Default::default()
                     },
                     truncated: false,
+                    complete: true,
                 }),
                 not_sent: false,
             },
@@ -1899,6 +2180,7 @@ mod tests {
                         ..Default::default()
                     },
                     truncated: false,
+                    complete: true,
                 }),
                 not_sent: false,
             },
@@ -1911,6 +2193,7 @@ mod tests {
                         ..Default::default()
                     },
                     truncated: true,
+                    complete: false,
                 }),
                 not_sent: false,
             },

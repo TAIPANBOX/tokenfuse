@@ -1061,7 +1061,8 @@ run_case "settlement-owns-the-call: a retained reservation released instead" fai
 # cargo test. The mutant is the fault the review found, one data line parsed on
 # its own: a `data` field REPLACES the buffer instead of appending to it, so a
 # usage object split across two lines never parses and the review's own probe
-# must go red with the output cost gone (30 for 15030).
+# must go red with the output charged at the request's cap (30030 for 15030,
+# invariant 43; it read 30 for 15030 before a stream could be charged the cap).
 run_case "usage-is-read-from-events: a data field replaces the buffer instead of appending" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact codex_money_review::codex_f06_multiline_sse_usage_is_not_silently_partial" \
 	"$(py 'edit("crates/gateway/src/provider.rs", "data.push_str(value);", "data.clear(); data.push_str(value);")')" \
