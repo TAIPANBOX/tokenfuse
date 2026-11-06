@@ -83,6 +83,7 @@ Feature: One owner for a call's reservations, and what each outcome is charged
 
   # @test:codex_f04_buffered_body_error_preserves_reported_usage
   # @test:a_2xx_whose_body_breaks_after_reporting_usage_settles_that_usage
+  # @test:codex_f04_real_http_2xx_body_error_settles_the_usage_already_received
   Scenario: A 2xx whose body breaks after the usage was reported
     Given a provider that answers 200, reports usage, and then breaks the body
     When the break reaches the gateway

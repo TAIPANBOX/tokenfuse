@@ -58,6 +58,7 @@ impl Provider for ScriptedProvider {
                 ..Default::default()
             },
             truncated: false,
+            complete: true,
         })));
         let chunk = Bytes::from_static(answer);
         Ok(ProviderResponse {

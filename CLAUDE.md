@@ -2918,6 +2918,61 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `features/a-stream-without-usage-settles-on-the-estimate.feature`, five,
     each bound.)*
 
+    **A priced count is not the provider's last word, and a settlement rests on
+    the last word.** The rule above asked whether a count was parsed, and an
+    Anthropic stream that ends cleanly after `message_start` has one: the input,
+    beside an opening `output_tokens` that a real stream sets to 1. It settled
+    `Parsed` on those opening counters and the output the provider generated
+    cost the run nothing (tokenfuse#308, found by a read-only review 2026-09-18).
+    `ParsedUsage::complete` carries the question, and it is about an event, not
+    a count, because a test for a zero output figure passes that real stream.
+    `UsageParser::finish` says it is complete for a whole JSON document (nothing
+    can follow); for an output figure on an event that does not say the message
+    is open (`UsageReport::Final`: Anthropic's `output_tokens` at the top level,
+    OpenAI's `completion_tokens` or `total_tokens`, invariant 80's reason); and
+    for any output figure once the stream closed cleanly (`[DONE]`,
+    `message_stop`). An event says it is open with `delta.stop_reason: null`, or
+    a choice with `finish_reason: null`, and a figure riding such an event is
+    `Running`, which a break does not promote and a clean close does. The close
+    is load-bearing: a server that puts its last usage on a chunk with an open
+    choice would otherwise be charged the cap on every call. `message_start`
+    never reports, whatever it says.
+
+    `@decided 2026-11-05`: a call whose usage stopped short is charged the input
+    side as reported and the output side at the request's cap
+    (`CostBasis::PartialUsage`), and not the estimate whole. The cap is
+    `estimate::output_cap_tokens`, the one the reservation was priced from:
+    `max_tokens`, or the assumed 1024, times `n`. `@claude` 2026-11-05, on why
+    that choice is the safe direction: the provider cannot bill more output than
+    the cap, so with a named cap this is the upper bound of the bill, where the
+    whole estimate can sit under what the provider already reported (200,000
+    tokens written to the one-hour cache on `claude-sonnet`: reported 1.20 USD,
+    estimated 0.71). It carries no margin, because the margin is for the
+    tokenizer the gateway does not have and a cap is exact, so the ordinary case
+    settles a little under the estimate. A reported output above the cap is
+    kept. The row is the truncated row: no token counts beside the cost, so
+    `focusexport::to_row` labels it `estimated`, with `tool_calls` kept, at the
+    same price of losing the counts that did arrive. One warn line per
+    settlement names the model, the cap and the amount; it is not a truncation
+    and `truncated_settlements` does not move. Unchanged: nothing priced is
+    still `EstimateNoUsage`, which is why the plain OpenAI twin of #308, a
+    stream with `include_usage` set and no usage chunk at all, was already right
+    and stays on the estimate; a truncated body is still the estimate.
+
+    Where it says nothing: a request naming no `max_tokens` is capped at the
+    assumed 1024, which the provider may exceed, as the estimate may. A
+    `message_delta` with no `stop_reason` key reads as final, because an absent
+    key says nothing and the fixtures of two vendors omit it; a provider that
+    streams several of them with the key absent and then breaks settles on the
+    figure so far. The caller who abandons a stream stays on the estimate: the
+    parser is dropped with the body and nothing is published.
+    *(tests: `tests/it/usage_that_stops_short.rs`, nineteen through the real
+    `HttpProvider` and a `tokio` listener; in `provider::tests`, the parser's
+    matrix and `a_stream_cut_at_any_byte_is_complete_exactly_from_its_final_event_on`;
+    in `settle::tests`, `settle_amount`'s and the guard's. Red first, mutants
+    and the test that kills each: in the pull request. Scenarios:
+    `features/usage-that-stops-short.feature`, each bound.)*
+
 44. **The surface `compat/1.0.json` promises is present in the code, and `COMPATIBILITY.md` is rendered from it, never typed.** SemVer's item 5: version 1.0.0 defines the public API, so a 1.0 is a promise about a surface, and a promise nobody can point at is a mood. This repository already published the strings another repository must agree with (`contracts/tokenfuse-constants.json`, invariant 14) and gated its environment names both ways (`crates/gateway/tests/it/manifest.rs`); the manifest is their union with everything else an operator or an agent depends on without reading the code, written in the 1.0.0 release commit (2026-09-14) and held from it on. From 1.0.0, removing or renaming a frozen name is a new major.
 
     What is frozen, in the manifest's fifteen kinds: the two shipped binaries (`cli.binaries`) and the gateway's fifteen subcommands and flags plus the Cloud's `--openapi` (`cli.subcommands`); the two listen defaults (`listen.defaults`); 83 environment names, 62 of the gateway's and all 21 of the Cloud's (`env`); the gateway's ten routes (`http.routes`), thirteen request headers (`http.request_headers`) and sixteen response headers (`http.response_headers`); the Cloud's 33 routes and five headers (`http.cloud_routes`, `http.cloud_headers`); the nine BreakerReason wire strings (`breaker.reasons`); the nineteen agent-event types this emitter writes (`agentevent.types`); the sixteen trace Parquet columns (`formats.trace_parquet`) and the constants file's own schema id (`formats.constants`); the three image names (`images`); and the Python SDK's fifteen public names from its `__all__` (`sdk.python`). The status word on a 402/403 and the severity of each event type are not in the manifest because the constants file already carries them, generated, and invariant 14's gate holds that file against the source.
@@ -2938,6 +2993,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     *(tests: `pricing::tests::a_one_hour_cache_write_is_priced_at_the_one_hour_rate` (281,716 against 176,436 micro-USD), `a_mixed_cache_write_prices_each_ttl_once`, `a_one_hour_subset_past_the_total_never_prices_negative`, `the_one_hour_write_rate_defaults_to_anthropics_ratio_and_can_be_named`, `a_one_hour_only_usage_carries_priced_tokens`; `provider::tests::parses_the_one_hour_cache_write_subset_from_a_message_start`, `a_cache_write_without_a_ttl_breakdown_is_all_five_minute`; red first as a compile failure on the unfixed tree (no such field). Mutants, each caught by name: the subset priced at the 5-minute rate (three tests), the subset not taken out of the total (three), the constructor's ratio dropped (four). Scenarios: `features/a-one-hour-cache-write-is-priced-at-its-own-rate.feature`, seven, each bound. `scripts/constants.sh` holds the published column.)*
 
 47. **A reachable provider that refuses the call is on the bus too.** Invariant 24 covered a dependency that could not be reached; a provider that answered with a 429 or a 400 (a rate limit, a retired model id) passed its status through and settled zero, both right (#167), and wrote nothing: `dependency_failed` fired from the transport-error arm only, so a notifier never heard about a provider refusing every call. Measured 2026-09-07 on v0.4.3 with a stub answering 429/400/200: three drills, every status right, every expected mail missed, and the drill could not tell a notifier that was down from a gateway that was silent (tokenfuse#260). Now one `dependency_failed` per refusal at the new stage `response` (the answer arrived, and it was a refusal; `DependencyStage::Response`, wire `response`), effect `call_failed`, `detail` naming the status and the model, emitted by `emit_upstream_refused_via` where the status is first known on both managed paths (`buffered_managed` after its settle, `stream_managed` at entry, so a streamed refusal does not wait for the guard; a refused stream whose error body then breaks is one event, the stream arm stays quiet on it). **Which statuses are the provider's, `is_the_providers_refusal`:** every 5xx (529 included), 429, 408, and 404 and 400 (how providers answer a retired or unknown model id: Anthropic 404, Bedrock's door 400); a 401 or 403 is the caller's own forwarded credential and a 413, 415 or 422 the caller's own payload, and those page nobody. `@claude` 2026-09-14, the review's finding: every non-2xx would have paged the operator's notifier at `high` for a tenant with a bad key. The severity is the type's fixed `high`; heraldyx's window keeps a throttling burst to one mail. heraldyx's renderer gives every stage but `stream` the "could not be reached, nothing was charged" sentence, which is false for a refusal that reported usage, so heraldyx gains a `response` sentence and agent-passport's SPEC paragraph on `stage` gains the word, both in changes beside this one; until heraldyx ships it, a refusal renders with the unreachable sentence.
+
+    **Reported usage survives the delivery failing, and that holds for the real client.** The money rule beside this one, that what a provider reported is settled even if delivery fails, was true of a double that published before it broke and not of `HttpProvider`, which filled the slot only after its read loop: a 2xx whose body broke after the usage arrived settled on the estimate (tokenfuse#309). `send` now publishes what the parser holds on the error path too. That alone would have been worse than the estimate, because a body broken after `message_start` then settles `Parsed` on the opening counters, which is invariant 43's half-usage case, and a server reporting a running total on every chunk settles on the count so far; so this stands on `ParsedUsage::complete` and a break after the final event is the only break that settles as reported. A refusal has no generation to assume: `charge` hands `settle_amount` no cap on a non-2xx, so what it reported stays `Parsed` and the rest stays zero. *(tests: `codex_f04_real_http_2xx_body_error_settles_the_usage_already_received` and its streaming twin, `a_break_after_the_final_usage_event_settles_on_that_usage`, `a_break_after_only_the_opening_counters_charges_the_output_cap`, `an_openai_break_on_a_running_total_charges_the_output_cap`, `a_refusal_that_stopped_short_charges_what_it_reported_and_no_cap`. The two `real_broken_http` tests that pinned the estimate now run on a body that broke before any usage, which is what they were true of.)*
 
     Where it says nothing: a refusal on the unmanaged pass-through (no run id) and on a managed run that resolved no agent id (`event_agent_id` empty, `Exporter::emit` skips it) are still unrecorded, for invariant 24's reason (no subject to record it against). The money rules are untouched: zero for a refusal that reports nothing, the reported usage for one that generated something.
     *(tests: `proxy::tests::a_reachable_provider_that_refuses_is_recorded_on_the_bus`, `a_reachable_provider_that_refuses_a_stream_is_recorded_on_the_bus`, `a_refusal_with_usage_is_still_billed_and_now_recorded`, all three red on the unfixed tree (`exactly one event, got []`); `a_refused_stream_that_then_breaks_is_recorded_once` (red with the stream arm's guard reverted: `left: 2 right: 1`); `a_callers_own_4xx_is_not_recorded_as_the_providers_failure` (401, 403, 413, 422 nothing; 404, 408, 500, 529 one each; red with the class widened to every non-2xx); and `a_healthy_call_reports_no_dependency_failure` as the guard. Mutants, each caught by name: the buffered emission removed (two red), the streaming emission removed (one), the condition inverted so a healthy call emits (the guard red). Scenarios: `features/a-reachable-provider-that-refuses-is-on-the-bus.feature`, six, each bound.)*

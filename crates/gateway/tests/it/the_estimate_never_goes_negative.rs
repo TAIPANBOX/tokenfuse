@@ -42,6 +42,7 @@ impl Provider for CountingProvider {
         let slot: UsageSlot = Arc::new(Mutex::new(Some(ParsedUsage {
             usage,
             truncated: false,
+            complete: true,
         })));
         let chunk = Bytes::from_static(br#"{"stub":true}"#);
         let stream = futures::stream::once(async move { Ok(chunk) });
