@@ -38,7 +38,7 @@ check_sites() {
 	[ -z "$lines" ] && return 0
 	while IFS= read -r line; do
 		seen=$((seen + 1))
-		if ! printf '%s\n' "$line" | grep -q 'digest('; then
+		if ! grep -q 'digest(' <<<"$line"; then
 			echo "FAIL: $what is looked up or stored by something other than a digest: $line" >&2
 			fail=1
 		fi
@@ -58,7 +58,7 @@ fi
 while IFS=: read -r lineno _; do
 	seen=$((seen + 1))
 	first_arg=$(sed -n "$((lineno + 1))p" "$keys_rs")
-	if ! printf '%s\n' "$first_arg" | grep -q 'digest('; then
+	if ! grep -q 'digest(' <<<"$first_arg"; then
 		echo "FAIL: parse_keys keys the map by something other than a digest, at $keys_rs:$lineno" >&2
 		fail=1
 	fi
