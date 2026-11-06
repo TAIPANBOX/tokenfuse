@@ -1,0 +1,44 @@
+name: mutants (throwaway)
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: mutants-${{ github.event.pull_request.number }}-${{ matrix.mutant }}
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: "-D warnings"
+jobs:
+  test:
+    name: ${{ matrix.mutant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: ["control", "complete-always-true", "complete-always-false", "whole-document-not-complete", "close-does-not-promote-running", "close-alone-is-complete", "done-is-not-a-close", "message-stop-is-not-a-close", "nothing-says-still-open", "open-delta-not-read", "open-choice-not-read", "open-choice-all-not-any", "message-start-reports-final", "total-is-not-a-figure", "any-key-is-a-figure", "last-event-decides", "complete-not-asked", "zero-cap-not-asked", "priced-not-asked", "cap-replaces-a-higher-report", "no-cap-on-the-output", "the-whole-estimate", "record-keeps-the-counts", "record-loses-the-observation", "refusal-gets-the-cap", "break-publishes-nothing", "cap-ignores-completions", "cap-ignores-max-tokens", "zero-completions-is-free", "partial-settlement-is-silent", "stub-declared-usage-incomplete", "stub-parsed-usage-always-complete"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1
+          save-if: false
+      - name: Plant and test
+        run: |
+          set +e
+          if [ "${{ matrix.mutant }}" != control ]; then
+            python3 .github/mutants/mutate.py "${{ matrix.mutant }}" || exit 3
+          fi
+          cargo test -p tokenfuse-gateway --lib --test it --no-fail-fast > "$RUNNER_TEMP/out.txt" 2>&1
+          if grep -q "test result: FAILED" "$RUNNER_TEMP/out.txt"; then verdict=KILLED
+          elif grep -q "test result: ok" "$RUNNER_TEMP/out.txt"; then verdict=SURVIVED
+          else verdict=ERROR; tail -40 "$RUNNER_TEMP/out.txt"; fi
+          echo "VERDICT ${{ matrix.mutant }} $verdict"
+          grep -E "^test .* \.\.\. FAILED$" "$RUNNER_TEMP/out.txt" | sed 's/^test /KILLER /; s/ \.\.\. FAILED$//'
+          grep -E "^test result:" "$RUNNER_TEMP/out.txt"
+          exit 0
