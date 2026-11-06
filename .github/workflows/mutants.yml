@@ -3,8 +3,6 @@ on:
   pull_request:
 permissions:
   contents: read
-concurrency:
-  group: mutants-${{ github.event.pull_request.number }}-${{ matrix.mutant }}
 env:
   CARGO_TERM_COLOR: never
   RUSTFLAGS: "-D warnings"
