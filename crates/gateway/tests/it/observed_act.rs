@@ -24,7 +24,9 @@ use tokenfuse_core::{Ledger, Mode, Policy, SecretVault};
 use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::events::EventExporter;
 use tokenfuse_gateway::firewall::FirewallConfig;
-use tokenfuse_gateway::mcpbroker::{app, upstream_labels_from, BrokerState, ScanMode};
+use tokenfuse_gateway::mcpbroker::{
+    app, upstream_client, upstream_labels_from, BrokerState, ScanMode,
+};
 use tokenfuse_gateway::provider::{Provider, ProviderError, ProviderResponse, UsageSlot};
 use tokenfuse_gateway::state::AppState;
 use tokenfuse_gateway::wardryx::Wardryx;
@@ -61,6 +63,30 @@ event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n
 event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n\
 event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
+/// A buffered OpenAI answer in which the provider searched: a citation on the text,
+/// and no tool block.
+const OPENAI_SEARCHED: &str = r#"{"id":"c1","object":"chat.completion","model":"claude-haiku-5-5","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"found it","annotations":[{"type":"url_citation","url_citation":{"url":"https://example.org/","title":"x","start_index":0,"end_index":8}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+
+/// The same, with a shell asked for in the answer that searched.
+const OPENAI_SEARCHED_THEN_SHELL: &str = r#"{"id":"c2","object":"chat.completion","model":"claude-haiku-5-5","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"annotations":[{"type":"url_citation","url_citation":{"url":"https://example.org/","title":"x","start_index":0,"end_index":8}}],"tool_calls":[{"id":"call_sh2","type":"function","function":{"name":"run_shell","arguments":"{}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+
+/// The streamed form: the citation arrives in a delta of its own.
+const OPENAI_STREAMED_SEARCH: &str = "data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"found it\"}}]}\n\n\
+data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}]}\n\n\
+data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"c3\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
+/// Some providers close a stream with a whole `message` rather than a `delta`.
+const OPENAI_CLOSING_MESSAGE: &str = "data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"found it\"}}]}\n\n\
+data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"found it\",\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
+/// A citation in a delta, then a shell asked for in the closing message.
+const OPENAI_CLOSING_SHELL: &str = "data: {\"id\":\"c5\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"delta\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\",\"title\":\"x\",\"start_index\":0,\"end_index\":8}}]}}]}\n\n\
+data: {\"id\":\"c5\",\"object\":\"chat.completion.chunk\",\"model\":\"claude-haiku-5-5\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_sh4\",\"type\":\"function\",\"function\":{\"name\":\"run_shell\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+data: [DONE]\n\n";
+
 /// Answers each call with the next body in its queue, the usage read as the
 /// network path reads it.
 struct QueueProvider {
@@ -92,7 +118,7 @@ impl Provider for QueueProvider {
         };
         Ok(ProviderResponse {
             status: 200,
-            content_type: Some(if body.starts_with("event:") {
+            content_type: Some(if body.starts_with("event:") || body.starts_with("data:") {
                 "text/event-stream".to_string()
             } else {
                 "application/json".to_string()
@@ -230,7 +256,7 @@ async fn broker(setup: BrokerSetup<'_>) -> String {
         keys: ClientKeys::default(),
         clients: Default::default(),
         require_proof: false,
-        client: reqwest::Client::new(),
+        client: upstream_client(),
         events: Arc::new(events),
         taint_gateway: setup.gateway,
         taint_failclosed: false,
@@ -299,6 +325,76 @@ async fn model_call(gateway_url: &str, run: &str, messages: Value, stream: bool)
         .unwrap();
     let status = resp.status().as_u16();
     (status, resp.text().await.unwrap())
+}
+
+/// One metered call on the OpenAI door.
+async fn openai_call(gateway_url: &str, run: &str, stream: bool) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header("x-fuse-run-id", run)
+        .header("x-fuse-budget-usd", "5")
+        .header("x-fuse-agent-id", "agent://acme.example/reader")
+        .json(&json!({
+            "model": MODEL, "max_tokens": 100, "stream": stream,
+            "messages": [{"role": "user", "content": "find it"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.text().await.unwrap())
+}
+
+/// A server that answers like [`page_server`] and remembers the run each call named.
+async fn page_server_noting_the_run() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let noted = Arc::clone(&runs);
+    let router = Router::new().route(
+        "/",
+        post(move |headers: HeaderMap, Json(req): Json<Value>| {
+            let noted = Arc::clone(&noted);
+            async move {
+                noted.lock().unwrap().push(
+                    headers
+                        .get("x-fuse-run-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                );
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "result": {
+                        "isError": false,
+                        "content": [{"type": "text", "text": PAGE}],
+                    },
+                }))
+            }
+        }),
+    );
+    (spawn(router).await, runs)
+}
+
+/// Answers every call with a 307, which keeps the method and the body, and a body of
+/// its own that reads like an answer, so a 3xx cannot pass as one.
+async fn redirecting_server(to: String) -> String {
+    let router = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let to = to.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", to)],
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": req.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {"content": [{"type": "text", "text": PAGE}]},
+                    })),
+                )
+            }
+        }),
+    );
+    spawn(router).await
 }
 
 fn plain_conversation() -> Value {
@@ -558,6 +654,55 @@ async fn an_unclassified_upstream_is_not_reported() {
     );
 }
 
+/// A fetch plane records the run it served, so its record joins the rest of the run.
+/// A server nobody classified is somebody else's, and hears nothing about this run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_classified_upstream_is_told_the_run_and_an_unclassified_one_is_not() {
+    let (st, _) = gateway(enforcing(), &[], "told-the-run");
+    let gw = spawn(tokenfuse_gateway::app(st)).await;
+    let (up, told) = page_server_noting_the_run().await;
+    let brk = classified_broker(&up, &gw).await;
+
+    let out = read(&brk, Some("run-told"), "fetch_url").await;
+    assert_eq!(out["result"]["content"][0]["text"], PAGE, "{out}");
+    assert_eq!(*told.lock().unwrap(), vec![Some("run-told".to_string())]);
+
+    let (stub, _, _) = stub_gateway(StatusCode::OK, r#"{"recorded":true}"#);
+    let gw = spawn(stub).await;
+    let (other, _) = page_server(false).await;
+    let (up, untold) = page_server_noting_the_run().await;
+    let brk = broker(BrokerSetup {
+        upstream: "http://127.0.0.1:1".to_string(),
+        named: BTreeMap::from([("scopyx".to_string(), up), ("elsewhere".to_string(), other)]),
+        gateway: Some(gw),
+        labels: Some("elsewhere=web"),
+        events: None,
+    })
+    .await;
+
+    let out = read(&brk, Some("run-told"), "lookup").await;
+    assert_eq!(out["result"]["content"][0]["text"], PAGE, "{out}");
+    assert_eq!(*untold.lock().unwrap(), vec![None]);
+}
+
+/// A 307 keeps the body, and by then the broker has written the secrets into it and
+/// the run onto it, so following one hands both to whichever host the answer names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redirect_from_an_upstream_is_not_followed() {
+    let (elsewhere, reached) = page_server_noting_the_run().await;
+    let up = redirecting_server(format!("{elsewhere}/")).await;
+    let (stub, _, _) = stub_gateway(StatusCode::OK, r#"{"recorded":true}"#);
+    let gw = spawn(stub).await;
+    let brk = classified_broker(&up, &gw).await;
+
+    let out = read(&brk, Some("run-redirected"), "fetch_url").await;
+    assert!(out.get("error").is_some(), "{out}");
+    assert!(
+        reached.lock().unwrap().is_empty(),
+        "the second host was reached"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_act_on_another_callers_run_is_refused() {
     let (st, _) = gateway(enforcing(), &[SEARCHED_NOTHING], "foreign");
@@ -725,6 +870,75 @@ async fn a_search_the_provider_ran_labels_the_run() {
     assert_eq!(raised[0]["data"]["stage"], "model_tool_call");
     assert_eq!(raised[0]["data"]["from_tools"], json!(["web_search"]));
     assert_eq!(raised[0]["data"]["added"], json!(["web"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_citation_on_the_openai_wire_labels_the_run() {
+    let (st, path) = gateway(enforcing(), &[OPENAI_SEARCHED], "openai-cited");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (status, body) = openai_call(&gw, "run-cited", false).await;
+    assert_eq!(
+        status, 200,
+        "nothing to refuse: it already happened: {body}"
+    );
+    assert!(body.contains("found it"), "{body}");
+    assert_eq!(may_run_a_shell(&gw, "run-cited").await["decision"], "deny");
+
+    let raised = on_bus(&path, "taint_raised");
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert_eq!(raised[0]["data"]["stage"], "model_tool_call");
+    assert_eq!(raised[0]["data"]["from_tools"], json!(["web_search"]));
+    assert_eq!(raised[0]["data"]["added"], json!(["web"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_call_in_the_same_answer_as_a_citation_is_judged_with_its_label() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_SEARCHED_THEN_SHELL], "openai-both");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (status, body) = openai_call(&gw, "run-both-openai", false).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(!body.contains("call_sh2"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_streamed_citation_on_the_openai_wire_labels_the_run() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_STREAMED_SEARCH], "openai-stream");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (status, body) = openai_call(&gw, "run-cited-stream", true).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("found it"), "{body}");
+    assert_eq!(
+        may_run_a_shell(&gw, "run-cited-stream").await["decision"],
+        "deny"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_citation_in_a_closing_message_chunk_labels_the_run() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_CLOSING_MESSAGE], "openai-closing");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (status, body) = openai_call(&gw, "run-cited-closing", true).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        may_run_a_shell(&gw, "run-cited-closing").await["decision"],
+        "deny"
+    );
+}
+
+/// The stream's own reader looked only in `delta`, so a call in a closing message went
+/// to the client unheld and unjudged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tool_call_in_a_closing_message_chunk_is_held_and_judged() {
+    let (st, _) = gateway(enforcing(), &[OPENAI_CLOSING_SHELL], "openai-closing-shell");
+    let gw = spawn(tokenfuse_gateway::app(st.with_wire(Wire::OpenAi))).await;
+
+    let (_, body) = openai_call(&gw, "run-closing-shell", true).await;
+    assert!(!body.contains("call_sh4"), "{body}");
+    assert!(body.contains("taint_blocked"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

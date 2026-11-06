@@ -69,6 +69,9 @@ pub struct ToolCallHold {
     anthropic_blocks: Vec<serde_json::Value>,
     /// Blocks recording a tool the provider ran, opened the same way.
     provider_blocks: Vec<serde_json::Value>,
+    /// `url_citation` annotations an OpenAI delta carried: that wire's record of the
+    /// same thing, with no block to open.
+    openai_citations: Vec<serde_json::Value>,
     /// OpenAI tool calls by (choice index, tool call index): the id, and the
     /// name as its fragments arrived (a provider may split a name; OpenAI
     /// sends it whole in the first delta).
@@ -126,7 +129,11 @@ impl ToolCallHold {
     /// avoid.
     pub fn take_provider_tools(&mut self) -> Vec<String> {
         let blocks = std::mem::take(&mut self.provider_blocks);
-        tokenfuse_core::taint::provider_tools_in(&serde_json::json!({ "content": blocks }))
+        let citations = std::mem::take(&mut self.openai_citations);
+        tokenfuse_core::taint::provider_tools_in(&serde_json::json!({
+            "content": blocks,
+            "choices": [{"message": {"annotations": citations}}],
+        }))
     }
 
     /// One complete event: read it, then forward it or hold it.
@@ -170,28 +177,50 @@ impl ToolCallHold {
                     .get("index")
                     .and_then(|i| i.as_u64())
                     .unwrap_or(pos as u64);
-                let Some(calls) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("tool_calls"))
-                    .and_then(|t| t.as_array())
-                else {
-                    continue;
-                };
-                for (k, tc) in calls.iter().enumerate() {
-                    carried = true;
-                    let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(k as u64);
-                    let entry = self.openai_calls.entry((ci, ti)).or_default();
-                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                        if !id.is_empty() {
-                            entry.0 = Some(id.to_string());
-                        }
-                    }
-                    if let Some(part) = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
+                // Some providers close a stream with a whole `message` rather than a
+                // `delta`, and a call left unread there would reach the client unjudged.
+                for side in ["delta", "message"] {
+                    // A citation is a search the provider already ran: read, never held.
+                    if let Some(notes) = choice
+                        .get(side)
+                        .and_then(|d| d.get("annotations"))
+                        .and_then(|a| a.as_array())
                     {
-                        entry.1.push_str(part);
+                        self.openai_citations.extend(
+                            notes
+                                .iter()
+                                .filter(|n| tokenfuse_core::taint::is_provider_citation(n))
+                                .cloned(),
+                        );
+                    }
+                    let Some(calls) = choice
+                        .get(side)
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(|t| t.as_array())
+                    else {
+                        continue;
+                    };
+                    for (k, tc) in calls.iter().enumerate() {
+                        carried = true;
+                        let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(k as u64);
+                        let entry = self.openai_calls.entry((ci, ti)).or_default();
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            if !id.is_empty() {
+                                entry.0 = Some(id.to_string());
+                            }
+                        }
+                        if let Some(part) = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            // A delta may split a name; a message states it whole, and may
+                            // repeat a call the deltas already named.
+                            if side == "message" {
+                                entry.1.clear();
+                            }
+                            entry.1.push_str(part);
+                        }
                     }
                 }
             }
@@ -438,6 +467,26 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         let (forwarded, held) = run(input.as_bytes(), &[7]);
         assert_eq!(forwarded, input.as_bytes(), "it already happened");
         assert_eq!(held.provider_tools, vec!["web_search"]);
+    }
+
+    /// OpenAI's record of a search the provider ran: a citation in a delta, no tool call.
+    const CITATION: &str = "data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"annotations\":[{\"type\":\"url_citation\",\"url_citation\":{\"url\":\"https://example.org/\"}}]}}]}\n\n";
+
+    #[test]
+    fn a_streamed_citation_is_named_at_the_end_and_never_held() {
+        let (forwarded, held) = run(CITATION.as_bytes(), &[7]);
+        assert_eq!(forwarded, CITATION.as_bytes(), "it already happened");
+        assert_eq!(held.provider_tools, vec!["web_search"]);
+        assert!(held.tools.is_empty());
+    }
+
+    #[test]
+    fn a_streamed_citation_is_handed_over_once_and_as_soon_as_it_is_seen() {
+        let mut hold = ToolCallHold::new();
+        hold.push(CITATION.as_bytes());
+        assert_eq!(hold.take_provider_tools(), vec!["web_search"]);
+        assert!(hold.take_provider_tools().is_empty());
+        assert!(hold.finish().provider_tools.is_empty());
     }
 
     #[test]

@@ -71,7 +71,7 @@ call on the OpenAI door is the one refused. Against a listed model, raise
 | CrewAI | `crewai` 1.15.21 (Python 3.10 to 3.13) | OpenAI | `LLM(base_url=...)` | `LLM(extra_headers=...)`, handed down to LiteLLM | `crewai_recipe.py` |
 | AutoGen | `autogen-ext` 0.7.5 (maintenance mode) | OpenAI | `OpenAIChatCompletionClient(base_url=...)` | `default_headers=` | `autogen_openai_door.py` |
 | Semantic Kernel | `semantic-kernel` 1.44.1 | OpenAI | an injected `AsyncOpenAI(base_url=...)` client | `default_headers=` on that client | `semantic_kernel_recipe.py` |
-| LiteLLM | `litellm` 1.100.1 | both | `api_base=` | `extra_headers=`; the same two keys in a proxy's `litellm_params` | `litellm_recipe.py` |
+| LiteLLM | `litellm` 1.100.4 | both | `api_base=` | `extra_headers=`; the same two keys in a proxy's `litellm_params` | `litellm_recipe.py` |
 | Haystack | `haystack-ai` 3.1.1 | OpenAI | `OpenAIChatGenerator(api_base_url=...)` | `http_client_kwargs={"headers": ...}` | `haystack_recipe.py` |
 | Claude Code | the CLI | Messages | `ANTHROPIC_BASE_URL` | `ANTHROPIC_CUSTOM_HEADERS` (`Name: Value`, one per line) | see below |
 
