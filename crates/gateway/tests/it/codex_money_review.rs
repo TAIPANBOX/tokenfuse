@@ -48,6 +48,10 @@ fn codex_f05_inv45_details_only_chunk_is_not_discarded() {
 #[tokio::test]
 async fn codex_f06_multiline_sse_usage_is_not_silently_partial() {
     // One valid SSE event can contain several data fields joined with LF.
+    //
+    // The request's cap is 2000, not the review's 1000: a stream whose final event is lost now
+    // charges the output at the cap (invariant 43), and with the cap equal to the reported 1000
+    // this probe read 15030 either way and could not go red. `gates-have-teeth.sh` caught that.
     let bytes=b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"message_delta\",\ndata: \"usage\":{\"output_tokens\":1000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec();
     let (st, l) = state(
         Arc::new(BytesProvider {
@@ -63,7 +67,7 @@ async fn codex_f06_multiline_sse_usage_is_not_silently_partial() {
         .header("x-fuse-run-id", "multiline")
         .header("x-fuse-budget-usd", "10")
         .body(Body::from(
-            r#"{"model":"claude-sonnet","max_tokens":1000,"stream":true}"#,
+            r#"{"model":"claude-sonnet","max_tokens":2000,"stream":true}"#,
         ))
         .unwrap();
     let r = tokenfuse_gateway::app(st).oneshot(request).await.unwrap();
