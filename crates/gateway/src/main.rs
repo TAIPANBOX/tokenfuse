@@ -597,7 +597,7 @@ async fn mcp_broker() {
     let checkpoints = tokenfuse_gateway::checkpoints::from_env(&events).await;
     // The delegation issuer, or nothing, in which case every chain the PDP is
     // asked about stays a claim and says so.
-    let broker_client = reqwest::Client::new();
+    let broker_client = tokenfuse_gateway::mcpbroker::upstream_client();
     let chain_proof = tokenfuse_gateway::chainproof::from_env(&broker_client).await;
     if chain_proof.is_some() {
         tracing::info!("delegation door: ON, chains reaching the PDP are verified here");

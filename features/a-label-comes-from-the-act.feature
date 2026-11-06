@@ -150,3 +150,44 @@ Feature: A run's label comes from what it did, not from what it called it
   Scenario: A streamed shell after a provider search is judged after the search
     When a streamed answer records a provider search and asks to run a shell
     Then the tool call does not reach the agent
+
+  # @test:a_citation_on_the_openai_wire_labels_the_run
+  Scenario: A search on the OpenAI wire labels the run
+    Given a run that has touched nothing
+    When the provider's answer cites a page it searched, with no tool block
+    Then the agent gets the answer
+    And the run carries the web label
+
+  # @test:a_tool_call_in_the_same_answer_as_a_citation_is_judged_with_its_label
+  Scenario: A shell asked for in the answer that cited is refused
+    When one answer carries a citation and asks for a shell
+    Then the shell is refused and its call does not reach the agent
+
+  # @test:a_streamed_citation_on_the_openai_wire_labels_the_run
+  Scenario: A streamed citation labels the run
+    When a citation arrives in a delta of a stream
+    Then the agent gets the text and the run carries the web label
+
+  # @test:a_citation_in_a_closing_message_chunk_labels_the_run
+  Scenario: A citation in a closing message labels the run
+    When a stream closes with a whole message that carries a citation
+    Then the agent gets the text and the run carries the web label
+
+  # @test:a_tool_call_in_a_closing_message_chunk_is_held_and_judged
+  Scenario: A shell asked for in a closing message is held and refused
+    Given a run the stream has already labelled
+    When the stream closes with a whole message asking for a shell
+    Then the call does not reach the agent and the refusal says why
+
+  # @test:a_classified_upstream_is_told_the_run_and_an_unclassified_one_is_not
+  Scenario: The server the run read through hears which run it was
+    Given a server the operator classified and a server nobody classified
+    When a run calls each of them through the broker
+    Then the classified server is told the run, so its record joins the rest of it
+    And the other server hears nothing about the run
+
+  # @test:a_redirect_from_an_upstream_is_not_followed
+  Scenario: An upstream cannot send the call to another host
+    Given a call on its way out carries the secrets the broker wrote and the run
+    When the upstream answers with a redirect that keeps the body
+    Then the broker does not follow it, and the second host hears nothing

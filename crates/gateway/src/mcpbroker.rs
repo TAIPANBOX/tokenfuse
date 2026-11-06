@@ -1804,6 +1804,19 @@ async fn ask_gateway(
     }
 }
 
+/// The client the broker reaches its upstreams and the planes beside it with.
+///
+/// It follows no redirect. A 307 keeps the body, which by then holds the secrets the
+/// broker wrote into it, and reqwest strips only five headers on a cross-host redirect,
+/// so following one hands the secrets, the client key and the run to whichever host the
+/// answer names (invariant 143).
+pub fn upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a client with nothing configured but its redirects builds")
+}
+
 /// The upstream this call reaches, when the operator classified it.
 fn classified<'a>(st: &'a BrokerState, upstream_url: &str) -> Option<&'a ClassifiedUpstream> {
     if st.upstream_labels.is_empty() {
@@ -2429,6 +2442,16 @@ async fn process_into(
     if let Some(v) = &ctx.protocol_version {
         forward = forward.header(crate::mcpsession::PROTOCOL_VERSION_HEADER, v);
     }
+    // The run, to a server the operator classified and to nothing else (invariant 143).
+    // A classified server is a plane of this deployment, and this is what joins its own
+    // record to the run. A server nobody classified is somebody else's.
+    if observed.is_some() {
+        if let Some(run) =
+            record_run_id(ctx).and_then(|r| reqwest::header::HeaderValue::from_str(r).ok())
+        {
+            forward = forward.header("x-fuse-run-id", run);
+        }
+    }
     let upstream = match forward.body(payload).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -2452,6 +2475,19 @@ async fn process_into(
                 "mcp broker: the upstream named a session id a header cannot carry; not relayed"
             );
         }
+    }
+    // Not followed, and not an answer either, whatever its body looks like:
+    // `error_for_status_ref` below passes a 3xx.
+    if upstream.status().is_redirection() {
+        if out.notification {
+            out.status = Some(axum::http::StatusCode::BAD_GATEWAY);
+        }
+        let status = upstream.status();
+        return rpc_error(
+            &id,
+            -32000,
+            &format!("upstream error: answered {status}, and this broker follows no redirect"),
+        );
     }
     if let Err(e) = upstream.error_for_status_ref() {
         let status = upstream.status();
