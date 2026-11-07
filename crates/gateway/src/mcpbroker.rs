@@ -861,29 +861,27 @@ fn unjudgeable(req: &Value) -> Option<&'static str> {
 /// `" (reason)"` when the PDP gave a reason, else empty -- so a block message
 /// reads cleanly whether or not Wardryx explained itself.
 fn reason_suffix(reason: &Option<String>) -> String {
-    match reason {
+    match reason.as_deref().map(cleaned_reason) {
         Some(r) if !r.is_empty() => format!(" ({r})"),
         _ => String::new(),
     }
 }
 
-/// The longest hold reason a refusal quotes, in characters. The reason is
-/// text a policy service wrote and a model reads, so it is capped.
+/// The longest reason a refusal quotes, in characters. A reason is text a
+/// policy service wrote and a model reads, so it is capped.
 const HOLD_REASON_MAX_CHARS: usize = 200;
 
-/// `" (reason)"` for a hold, like [`reason_suffix`], but the reason is one
-/// line with control and invisible characters removed and is cut to
-/// [`HOLD_REASON_MAX_CHARS`] characters with an ellipsis.
-fn hold_reason_suffix(reason: &Option<String>) -> String {
-    let Some(r) = reason else {
-        return String::new();
-    };
-    let kept: String = r
+/// `text` as one line a refusal can quote: control and hidden characters
+/// removed (the list the detector and the sanitiser share), whitespace
+/// collapsed, and at most [`HOLD_REASON_MAX_CHARS`] characters, cut with an
+/// ellipsis. Used for the PDP's reason and for the approval id alike.
+fn cleaned_reason(text: &str) -> String {
+    let kept: String = text
         .chars()
         .filter_map(|c| {
             if c.is_whitespace() {
                 Some(' ')
-            } else if c.is_control() || is_invisible(c) {
+            } else if c.is_control() || tokenfuse_core::injection::is_invisible(c) {
                 None
             } else {
                 Some(c)
@@ -891,24 +889,12 @@ fn hold_reason_suffix(reason: &Option<String>) -> String {
         })
         .collect();
     let one_line = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.is_empty() {
-        return String::new();
+    if one_line.chars().count() <= HOLD_REASON_MAX_CHARS {
+        return one_line;
     }
     let mut cut: String = one_line.chars().take(HOLD_REASON_MAX_CHARS).collect();
-    if one_line.chars().count() > HOLD_REASON_MAX_CHARS {
-        cut.push('…');
-    }
-    format!(" ({cut})")
-}
-
-/// Zero-width and bidirectional-control characters: invisible to a reader, and
-/// able to reorder the text around them.
-fn is_invisible(c: char) -> bool {
-    let u = c as u32;
-    (0x200b..=0x200f).contains(&u)
-        || (0x202a..=0x202e).contains(&u)
-        || (0x2066..=0x2069).contains(&u)
-        || u == 0xfeff
+    cut.push('…');
+    cut
 }
 
 /// RPC code for a refused call to a tool whose definition changed after it
@@ -2337,6 +2323,8 @@ async fn process_into(
                                 let appr = outcome
                                     .approval_id
                                     .as_deref()
+                                    .map(cleaned_reason)
+                                    .filter(|a| !a.is_empty())
                                     .map(|a| format!(" (approval {a})"))
                                     .unwrap_or_default();
                                 return rpc_error(
@@ -2344,7 +2332,7 @@ async fn process_into(
                                     -32004,
                                     &format!(
                                         "blocked: tool {tool:?} requires approval{appr}{}",
-                                        hold_reason_suffix(&outcome.reason)
+                                        reason_suffix(&outcome.reason)
                                     ),
                                 );
                             }
