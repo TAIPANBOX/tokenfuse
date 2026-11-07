@@ -98,13 +98,21 @@ type Signal = &'static str;
 /// `the_detector_and_the_sanitiser_read_one_list_of_invisible_characters`
 /// asserts the two actually agree rather than that somebody remembered.
 const INVISIBLE: &[(char, char)] = &[
+    ('\u{00ad}', '\u{00ad}'),
+    ('\u{061c}', '\u{061c}'),
+    ('\u{180e}', '\u{180e}'),
     ('\u{200b}', '\u{200f}'),
     ('\u{202a}', '\u{202e}'),
     ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{2069}'),
     ('\u{feff}', '\u{feff}'),
+    ('\u{e0000}', '\u{e007f}'),
 ];
 
-fn is_invisible(c: char) -> bool {
+/// Whether `c` is a character a reader cannot see, or one that reorders the
+/// text around it. The one predicate for [`INVISIBLE`]: the detector, the
+/// sanitiser and the MCP broker's refusal text all ask it.
+pub fn is_invisible(c: char) -> bool {
     INVISIBLE.iter().any(|(lo, hi)| c >= *lo && c <= *hi)
 }
 

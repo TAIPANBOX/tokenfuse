@@ -44,6 +44,9 @@ Decisions:
 - **enforce + allow**: the call proceeds (secrets injected, forwarded).
 - **enforce + deny**: JSON-RPC error `-32004`, naming the tool and the PDP's
   reason. The tool never runs.
+- The reason, and the approval id, are cleaned before a refusal quotes them:
+  control and hidden characters (the list in `tokenfuse_core::injection`) are
+  removed, whitespace is collapsed, and the reason is cut to 200 characters.
 - **enforce + hold**: JSON-RPC error `-32004` stating approval is required
   (with the approval id when the PDP gave one, and the PDP's reason). The
   reason is cleaned before it is quoted: control and invisible characters are
