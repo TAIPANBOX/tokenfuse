@@ -593,9 +593,8 @@ async fn wardryx_enforce_hold_removes_invisible_characters_from_reason_and_appro
         message.contains("needs a human"),
         "the reason is missing or altered: {message}"
     );
-    let hidden = |c: char| {
-        c.is_control() || matches!(c, '\u{200b}' | '\u{2066}' | '\u{ad}' | '\u{e0041}')
-    };
+    let hidden =
+        |c: char| c.is_control() || matches!(c, '\u{200b}' | '\u{2066}' | '\u{ad}' | '\u{e0041}');
     assert!(!message.chars().any(hidden), "{message:?}");
 }
 
