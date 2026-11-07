@@ -85,22 +85,20 @@ pub const SUSPECTED_INJECTION: &str = "suspected_injection";
 type Signal = &'static str;
 
 /// The invisible and direction-changing characters this module calls hidden
-/// text: zero-width spaces and joiners, the bidirectional overrides, the word
-/// joiner and invisible operators, and the byte-order mark.
+/// text: zero-width spaces and joiners, the bidirectional overrides and
+/// isolates, the word joiner and invisible operators, the byte-order mark, and
+/// the Unicode tag characters. The `hidden_text` pattern fires on these, and
+/// only on these.
 ///
-/// **One list, read twice.** The `hidden_text` pattern is BUILT from these
-/// ranges, and [`sanitise`] reads the same array to decide what to make
-/// visible in an excerpt. Two hand-written lists of the same characters is the
-/// defect this estate has closed three separate times, and here it would fail
-/// in the quiet direction: a character the detector fires on but the sanitiser
-/// does not know about reaches the record raw, which is precisely the class
-/// this list exists to keep out of it.
+/// **The sanitiser may be wider than the detector, never narrower.** The
+/// `hidden_text` pattern is BUILT from these ranges. [`is_invisible`], which
+/// [`sanitise`] reads, covers these and also [`CLEANED_ONLY`]. A character the
+/// sanitiser cleans and the detector never fires on costs nothing. The other
+/// way round would let a hidden character reach the record raw, which is the
+/// class this list exists to keep out of it.
 /// `the_detector_and_the_sanitiser_read_one_list_of_invisible_characters`
-/// asserts the two actually agree rather than that somebody remembered.
+/// asserts that every character here is both detected and cleaned.
 const INVISIBLE: &[(char, char)] = &[
-    ('\u{00ad}', '\u{00ad}'),
-    ('\u{061c}', '\u{061c}'),
-    ('\u{180e}', '\u{180e}'),
     ('\u{200b}', '\u{200f}'),
     ('\u{202a}', '\u{202e}'),
     ('\u{2060}', '\u{2064}'),
@@ -109,11 +107,26 @@ const INVISIBLE: &[(char, char)] = &[
     ('\u{e0000}', '\u{e007f}'),
 ];
 
+/// Characters the sanitiser removes from any text that reaches a reader, but
+/// which raise no signal: the soft hyphen (`&shy;` is common on ordinary web
+/// pages), the Arabic letter mark (ordinary Arabic text) and the Mongolian
+/// vowel separator. A signal on them would make the firewall judge an agent's
+/// ordinary reading as an injection and take its tools away, so the detector
+/// never reads this list.
+const CLEANED_ONLY: &[(char, char)] = &[
+    ('\u{00ad}', '\u{00ad}'),
+    ('\u{061c}', '\u{061c}'),
+    ('\u{180e}', '\u{180e}'),
+];
+
 /// Whether `c` is a character a reader cannot see, or one that reorders the
-/// text around it. The one predicate for [`INVISIBLE`]: the detector, the
-/// sanitiser and the MCP broker's refusal text all ask it.
+/// text around it: [`INVISIBLE`] and [`CLEANED_ONLY`]. [`sanitise`] and the
+/// MCP broker's refusal text ask this. The detector asks only [`INVISIBLE`].
 pub fn is_invisible(c: char) -> bool {
-    INVISIBLE.iter().any(|(lo, hi)| c >= *lo && c <= *hi)
+    INVISIBLE
+        .iter()
+        .chain(CLEANED_ONLY)
+        .any(|(lo, hi)| c >= *lo && c <= *hi)
 }
 
 /// [`INVISIBLE`] as a regex character class, so the pattern cannot fall out of
@@ -1210,9 +1223,10 @@ mod tests {
     fn the_detector_and_the_sanitiser_read_one_list_of_invisible_characters() {
         // Two hand-written lists of the same characters is the defect this
         // estate keeps closing. The `hidden_text` pattern is BUILT from
-        // `INVISIBLE`, and so is the sanitiser, so a character added to one is
-        // added to both in the same edit. This asserts they actually agree
-        // rather than that somebody remembered.
+        // `INVISIBLE`, and the sanitiser reads `INVISIBLE` too (plus
+        // `CLEANED_ONLY`), so every character here must be detected AND
+        // cleaned. This asserts that rather than that somebody remembered. The
+        // sanitiser may be wider than the detector, never narrower.
         for (lo, hi) in INVISIBLE {
             for c in [*lo, *hi] {
                 let doc = format!("ordinary text{c}more ordinary text");
@@ -1234,19 +1248,37 @@ mod tests {
 
     #[test]
     fn a_fixed_list_of_hidden_characters_is_detected_and_neutralised() {
-        // Written out by hand rather than read from INVISIBLE, so shrinking that
-        // list fails here: a tag character, a bidi isolate, a soft hyphen, an
-        // Arabic letter mark and a Mongolian vowel separator.
-        for c in ['\u{e0041}', '\u{2066}', '\u{ad}', '\u{61c}', '\u{180e}'] {
+        // Written out by hand rather than read from the lists, so shrinking
+        // either list fails here. The detector fires on a tag character and a
+        // bidi isolate; the sanitiser removes all five.
+        for c in ['\u{e0041}', '\u{2066}'] {
             let doc = format!("ordinary text{c}more ordinary text");
             assert!(
                 scan(&doc).contains(&"hidden_text"),
                 "U+{:04X} is not detected",
                 c as u32
             );
+        }
+        for c in ['\u{e0041}', '\u{2066}', '\u{ad}', '\u{61c}', '\u{180e}'] {
+            let doc = format!("ordinary text{c}more ordinary text");
             assert!(
                 !sanitise(&doc).contains(c),
                 "U+{:04X} survives the sanitiser",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn a_soft_hyphen_or_arabic_letter_mark_raises_no_signal() {
+        // Both are removed from excerpts and reasons, but both occur in ordinary
+        // text: a signal on either would take an agent's tools away for reading
+        // a normal page.
+        for c in ['\u{ad}', '\u{61c}'] {
+            let doc = format!("ordinary text{c}more ordinary text");
+            assert!(
+                !scan(&doc).contains(&"hidden_text"),
+                "U+{:04X} raises hidden_text",
                 c as u32
             );
         }
