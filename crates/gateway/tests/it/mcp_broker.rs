@@ -513,8 +513,14 @@ async fn wardryx_enforce_hold_says_why_and_keeps_the_approval_id() {
     assert_eq!(resp["error"]["code"], json!(-32004), "{resp}");
     let message = resp["error"]["message"].as_str().unwrap();
     assert!(message.contains("requires approval"), "{message}");
-    assert!(message.contains("appr-7"), "the approval id is lost: {message}");
-    assert!(message.contains("needs a human"), "the reason is missing: {message}");
+    assert!(
+        message.contains("appr-7"),
+        "the approval id is lost: {message}"
+    );
+    assert!(
+        message.contains("needs a human"),
+        "the reason is missing: {message}"
+    );
     assert!(
         !message.chars().any(char::is_control),
         "a control character reached the model: {message:?}"
