@@ -456,6 +456,76 @@ async fn wardryx_enforce_deny_blocks_the_tool_call() {
     );
 }
 
+/// A stub PDP that answers `hold` with a reason and an approval id, the shape
+/// Wardryx sends when a policy holds a call for a person to approve.
+async fn stub_pdp_hold(reason: String) -> String {
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(_req): Json<Value>| {
+            let reason = reason.clone();
+            async move {
+                Json(json!({
+                    "decision": "hold",
+                    "policy_version": "test-v1",
+                    "reason": reason,
+                    "approval_id": "appr-7",
+                }))
+            }
+        }),
+    );
+    spawn_server(router).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wardryx_enforce_hold_says_why_and_keeps_the_approval_id() {
+    // A hold is a refusal the caller can act on, so its text carries the PDP's
+    // reason and the approval id, and the code stays -32004 because CI and
+    // clients read it. The reason is untrusted text that reaches a model:
+    // control characters are stripped and the length is capped.
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let hostile = format!("needs a human\u{7}\u{1b}[2J ok {}", "x".repeat(500));
+    let pdp = stub_pdp_hold(hostile).await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/tool-user")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": { "name": "shell_exec", "arguments": { "cmd": "ls" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["error"]["code"], json!(-32004), "{resp}");
+    let message = resp["error"]["message"].as_str().unwrap();
+    assert!(message.contains("requires approval"), "{message}");
+    assert!(message.contains("appr-7"), "the approval id is lost: {message}");
+    assert!(message.contains("needs a human"), "the reason is missing: {message}");
+    assert!(
+        !message.chars().any(char::is_control),
+        "a control character reached the model: {message:?}"
+    );
+    assert!(
+        message.chars().count() < 400,
+        "the reason is not capped: {} characters",
+        message.chars().count()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wardryx_enforce_allow_forwards_the_tool_call() {
     let upstream = spawn_server(Router::new().route("/", post(stub))).await;
