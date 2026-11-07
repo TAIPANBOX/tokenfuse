@@ -44,8 +44,13 @@ Decisions:
 - **enforce + allow**: the call proceeds (secrets injected, forwarded).
 - **enforce + deny**: JSON-RPC error `-32004`, naming the tool and the PDP's
   reason. The tool never runs.
+- The reason, and the approval id, are cleaned before a refusal quotes them:
+  control and hidden characters (the list in `tokenfuse_core::injection`) are
+  removed, whitespace is collapsed, and the reason is cut to 200 characters.
 - **enforce + hold**: JSON-RPC error `-32004` stating approval is required
-  (with the approval id when the PDP gave one). The broker cannot run the
+  (with the approval id when the PDP gave one, and the PDP's reason). The
+  reason is cleaned before it is quoted: control and invisible characters are
+  removed, and it is cut to 200 characters. The broker cannot run the
   interactive approval ceremony, so a hold is a refusal-with-reason here; the
   approval row Wardryx created can be granted and the call retried with
   `x-fuse-approval-token`, which the broker forwards to the PDP.

@@ -861,10 +861,40 @@ fn unjudgeable(req: &Value) -> Option<&'static str> {
 /// `" (reason)"` when the PDP gave a reason, else empty -- so a block message
 /// reads cleanly whether or not Wardryx explained itself.
 fn reason_suffix(reason: &Option<String>) -> String {
-    match reason {
+    match reason.as_deref().map(cleaned_reason) {
         Some(r) if !r.is_empty() => format!(" ({r})"),
         _ => String::new(),
     }
+}
+
+/// The longest reason a refusal quotes, in characters. A reason is text a
+/// policy service wrote and a model reads, so it is capped.
+const HOLD_REASON_MAX_CHARS: usize = 200;
+
+/// `text` as one line a refusal can quote: control and hidden characters
+/// removed (the list the detector and the sanitiser share), whitespace
+/// collapsed, and at most [`HOLD_REASON_MAX_CHARS`] characters, cut with an
+/// ellipsis. Used for the PDP's reason and for the approval id alike.
+fn cleaned_reason(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .filter_map(|c| {
+            if c.is_whitespace() {
+                Some(' ')
+            } else if c.is_control() || tokenfuse_core::injection::is_invisible(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect();
+    let one_line = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= HOLD_REASON_MAX_CHARS {
+        return one_line;
+    }
+    let mut cut: String = one_line.chars().take(HOLD_REASON_MAX_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// RPC code for a refused call to a tool whose definition changed after it
@@ -2293,12 +2323,17 @@ async fn process_into(
                                 let appr = outcome
                                     .approval_id
                                     .as_deref()
+                                    .map(cleaned_reason)
+                                    .filter(|a| !a.is_empty())
                                     .map(|a| format!(" (approval {a})"))
                                     .unwrap_or_default();
                                 return rpc_error(
                                     &id,
                                     -32004,
-                                    &format!("blocked: tool {tool:?} requires approval{appr}"),
+                                    &format!(
+                                        "blocked: tool {tool:?} requires approval{appr}{}",
+                                        reason_suffix(&outcome.reason)
+                                    ),
                                 );
                             }
                             WardryxDecision::Allow => {}
