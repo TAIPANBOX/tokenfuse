@@ -532,6 +532,119 @@ async fn wardryx_enforce_hold_says_why_and_keeps_the_approval_id() {
     );
 }
 
+/// A stub PDP that answers with `body` exactly as given, so a test chooses the
+/// reason and approval id the policy plane sends.
+async fn stub_pdp_answer(body: Value) -> String {
+    let router = Router::new().route(
+        "/v1/decide",
+        post(move |Json(_req): Json<Value>| {
+            let body = body.clone();
+            async move { Json(body) }
+        }),
+    );
+    spawn_server(router).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wardryx_enforce_hold_removes_invisible_characters_from_reason_and_approval_id() {
+    // The reason and the approval id both reach a model, so hidden characters
+    // come out of both: a tag character, a bidi isolate, a zero-width space and
+    // a soft hyphen.
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let pdp = stub_pdp_answer(json!({
+        "decision": "hold",
+        "policy_version": "test-v1",
+        "reason": "needs\u{e0041}\u{2066} a\u{ad} human",
+        "approval_id": "appr-\u{200b}7",
+    }))
+    .await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/tool-user")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": { "name": "shell_exec", "arguments": { "cmd": "ls" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["error"]["code"], json!(-32004), "{resp}");
+    let message = resp["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("(approval appr-7)"),
+        "the approval id is not cleaned: {message}"
+    );
+    assert!(
+        message.contains("needs a human"),
+        "the reason is missing or altered: {message}"
+    );
+    let hidden = |c: char| {
+        c.is_control() || matches!(c, '\u{200b}' | '\u{2066}' | '\u{ad}' | '\u{e0041}')
+    };
+    assert!(!message.chars().any(hidden), "{message:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wardryx_enforce_deny_removes_invisible_characters_from_its_reason() {
+    // A deny reason reaches the model the same way a hold reason does, so the
+    // same hidden characters come out of it.
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let pdp = stub_pdp_answer(json!({
+        "decision": "deny",
+        "policy_version": "test-v1",
+        "reason": "no\u{e0041}\u{2066} shell\u{ad} access",
+    }))
+    .await;
+    let broker_url = spawn_server(broker_cfg(
+        upstream,
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        Default::default(),
+        a_wardryx(WardryxMode::Enforce, pdp),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp: Value = reqwest::Client::new()
+        .post(&broker_url)
+        .header("x-fuse-agent-id", "agent://acme.example/tool-user")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "shell_exec", "arguments": { "cmd": "ls" } }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["error"]["code"], json!(-32004), "{resp}");
+    let message = resp["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("no shell access"),
+        "the reason is missing or altered: {message}"
+    );
+    let hidden = |c: char| c.is_control() || matches!(c, '\u{2066}' | '\u{ad}' | '\u{e0041}');
+    assert!(!message.chars().any(hidden), "{message:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wardryx_enforce_allow_forwards_the_tool_call() {
     let upstream = spawn_server(Router::new().route("/", post(stub))).await;
