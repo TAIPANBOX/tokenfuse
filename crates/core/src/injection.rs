@@ -261,10 +261,9 @@ pub fn scan(text: &str) -> Vec<Signal> {
     if text.is_empty() {
         return Vec::new();
     }
-    let p = patterns();
     let mut hits = std::collections::BTreeSet::new();
     for copy in copies(text) {
-        hits.extend(p.set.matches(&copy).into_iter().map(|i| p.signals[i]));
+        hits.extend(signals_in(&copy));
     }
     hits.into_iter().collect()
 }
@@ -367,23 +366,47 @@ pub fn excerpts(text: &str, redaction: Redaction) -> Vec<Excerpt> {
     if text.is_empty() {
         return Vec::new();
     }
-    // Each copy is excerpted on its own, so offsets and quoted text agree within
-    // a copy. An excerpt that adds no signal kind to those already kept is
-    // dropped, so every kept excerpt adds a kind and the count stays bounded.
-    let mut kept: Vec<Excerpt> = Vec::new();
-    for copy in copies(text) {
-        for excerpt in excerpts_in(&copy, redaction) {
-            let adds_a_kind = excerpt
-                .signals
-                .iter()
-                .any(|s| !kept.iter().any(|k| k.signals.contains(s)));
-            if adds_a_kind {
-                kept.push(excerpt);
-            }
+    // The copy with the cleaned-only characters removed is the one quoted: DLP
+    // sees a secret split by a soft hyphen whole there. The spaced copy would
+    // quote that secret broken and past DLP, so a finding that fires only there
+    // keeps its signal, and its excerpt carries a fixed marker and no text.
+    let copies = copies(text);
+    let mut kept = excerpts_in(&copies[0], redaction);
+    if let Some(spaced) = copies.get(1) {
+        let quoted: Vec<Signal> = kept
+            .iter()
+            .flat_map(|e| e.signals.iter().copied())
+            .collect();
+        let withheld: Vec<Signal> = signals_in(spaced)
+            .into_iter()
+            .filter(|s| !quoted.contains(s))
+            .collect();
+        if !withheld.is_empty() {
+            kept.push(Excerpt {
+                signals: withheld,
+                text: WITHHELD_EXCERPT.to_string(),
+                clipped: false,
+            });
         }
     }
     kept
 }
+
+/// Every signal kind the patterns find in `text`, sorted and distinct.
+fn signals_in(text: &str) -> Vec<Signal> {
+    let p = patterns();
+    p.set
+        .matches(text)
+        .into_iter()
+        .map(|i| p.signals[i])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The quoted text of an excerpt that stands in for a finding found only with
+/// the soft hyphens read as spaces. No part of the document is quoted there.
+const WITHHELD_EXCERPT: &str = "[excerpt withheld: found with separators removed]";
 
 /// [`excerpts`] over one copy of the text.
 fn excerpts_in(text: &str, redaction: Redaction) -> Vec<Excerpt> {
@@ -455,12 +478,12 @@ fn char_len(s: &str) -> usize {
 }
 
 /// The copies of `text` the patterns run on. Text with no [`CLEANED_ONLY`]
-/// character is run once, as it is. Otherwise it is run twice: with those
+/// character is run once, as it is. Otherwise the first copy has those
 /// characters taken out, which joins a soft hyphen inside a word
-/// (`ig\u{ad}nore`), and with each replaced by a space, which keeps one between
-/// words (`ignore\u{ad}all`) from gluing them. The union only tightens the
-/// gate. None of these characters is in the detector's class, so neither copy
-/// changes a `hidden_text` finding.
+/// (`ig\u{ad}nore`), and the second has each replaced by a space, which keeps
+/// one between words (`ignore\u{ad}all`) from gluing them. [`scan`] takes the
+/// union; [`excerpts`] quotes only the first. None of these characters is in
+/// the detector's class, so neither copy changes a `hidden_text` finding.
 fn copies(text: &str) -> Vec<std::borrow::Cow<'_, str>> {
     if !text.chars().any(is_cleaned_only) {
         return vec![std::borrow::Cow::Borrowed(text)];
