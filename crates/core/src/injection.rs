@@ -261,10 +261,11 @@ pub fn scan(text: &str) -> Vec<Signal> {
     if text.is_empty() {
         return Vec::new();
     }
+    let text = without_cleaned_only(text);
     let p = patterns();
     let mut hits: Vec<Signal> = p
         .set
-        .matches(text)
+        .matches(&text)
         .into_iter()
         .map(|i| p.signals[i])
         .collect::<std::collections::BTreeSet<_>>()
@@ -372,6 +373,10 @@ pub fn excerpts(text: &str, redaction: Redaction) -> Vec<Excerpt> {
     if text.is_empty() {
         return Vec::new();
     }
+    // Matched and quoted on the same copy, so the offsets below and the quoted
+    // text agree, and so excerpts find exactly what scan finds.
+    let text = without_cleaned_only(text);
+    let text: &str = &text;
     let p = patterns();
     let flagged: Vec<usize> = p.set.matches(text).into_iter().collect();
     if flagged.is_empty() {
@@ -434,6 +439,23 @@ pub fn excerpts(text: &str, redaction: Redaction) -> Vec<Excerpt> {
 
 fn char_len(s: &str) -> usize {
     s.chars().count()
+}
+
+/// `text` with the [`CLEANED_ONLY`] characters taken out, borrowed when there
+/// are none. The patterns run on this copy: a soft hyphen inside a word
+/// (`ig\u{ad}nore`) would otherwise split a phrase past them. Those characters
+/// are not in the detector's class, so taking them out changes no `hidden_text`
+/// finding.
+fn without_cleaned_only(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_cleaned_only) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let kept: String = text.chars().filter(|c| !is_cleaned_only(*c)).collect();
+    std::borrow::Cow::Owned(kept)
+}
+
+fn is_cleaned_only(c: char) -> bool {
+    CLEANED_ONLY.iter().any(|(lo, hi)| c >= *lo && c <= *hi)
 }
 
 /// The secrets, and optionally the people, in the whole document.
