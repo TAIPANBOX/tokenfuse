@@ -261,18 +261,12 @@ pub fn scan(text: &str) -> Vec<Signal> {
     if text.is_empty() {
         return Vec::new();
     }
-    let text = without_cleaned_only(text);
     let p = patterns();
-    let mut hits: Vec<Signal> = p
-        .set
-        .matches(&text)
-        .into_iter()
-        .map(|i| p.signals[i])
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    hits.sort_unstable();
-    hits
+    let mut hits = std::collections::BTreeSet::new();
+    for copy in copies(text) {
+        hits.extend(p.set.matches(&copy).into_iter().map(|i| p.signals[i]));
+    }
+    hits.into_iter().collect()
 }
 
 /// How many characters of a document one excerpt may carry.
@@ -373,10 +367,29 @@ pub fn excerpts(text: &str, redaction: Redaction) -> Vec<Excerpt> {
     if text.is_empty() {
         return Vec::new();
     }
-    // Matched and quoted on the same copy, so the offsets below and the quoted
-    // text agree, and so excerpts find exactly what scan finds.
-    let text = without_cleaned_only(text);
-    let text: &str = &text;
+    // Each copy is excerpted on its own, so offsets and quoted text agree within
+    // a copy. An excerpt that adds no signal kind to those already kept is
+    // dropped, so every kept excerpt adds a kind and the count stays bounded.
+    let mut kept: Vec<Excerpt> = Vec::new();
+    for copy in copies(text) {
+        for excerpt in excerpts_in(&copy, redaction) {
+            let adds_a_kind = excerpt
+                .signals
+                .iter()
+                .any(|s| !kept.iter().any(|k| k.signals.contains(s)));
+            if adds_a_kind {
+                kept.push(excerpt);
+            }
+        }
+    }
+    kept
+}
+
+/// [`excerpts`] over one copy of the text.
+fn excerpts_in(text: &str, redaction: Redaction) -> Vec<Excerpt> {
+    if text.is_empty() {
+        return Vec::new();
+    }
     let p = patterns();
     let flagged: Vec<usize> = p.set.matches(text).into_iter().collect();
     if flagged.is_empty() {
@@ -441,17 +454,26 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// `text` with the [`CLEANED_ONLY`] characters taken out, borrowed when there
-/// are none. The patterns run on this copy: a soft hyphen inside a word
-/// (`ig\u{ad}nore`) would otherwise split a phrase past them. Those characters
-/// are not in the detector's class, so taking them out changes no `hidden_text`
-/// finding.
-fn without_cleaned_only(text: &str) -> std::borrow::Cow<'_, str> {
+/// The copies of `text` the patterns run on. Text with no [`CLEANED_ONLY`]
+/// character is run once, as it is. Otherwise it is run twice: with those
+/// characters taken out, which joins a soft hyphen inside a word
+/// (`ig\u{ad}nore`), and with each replaced by a space, which keeps one between
+/// words (`ignore\u{ad}all`) from gluing them. The union only tightens the
+/// gate. None of these characters is in the detector's class, so neither copy
+/// changes a `hidden_text` finding.
+fn copies(text: &str) -> Vec<std::borrow::Cow<'_, str>> {
     if !text.chars().any(is_cleaned_only) {
-        return std::borrow::Cow::Borrowed(text);
+        return vec![std::borrow::Cow::Borrowed(text)];
     }
-    let kept: String = text.chars().filter(|c| !is_cleaned_only(*c)).collect();
-    std::borrow::Cow::Owned(kept)
+    let removed: String = text.chars().filter(|c| !is_cleaned_only(*c)).collect();
+    let spaced: String = text
+        .chars()
+        .map(|c| if is_cleaned_only(c) { ' ' } else { c })
+        .collect();
+    vec![
+        std::borrow::Cow::Owned(removed),
+        std::borrow::Cow::Owned(spaced),
+    ]
 }
 
 fn is_cleaned_only(c: char) -> bool {
