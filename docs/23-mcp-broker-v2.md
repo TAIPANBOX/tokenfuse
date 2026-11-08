@@ -127,14 +127,38 @@ Consequences worth naming rather than burying:
   keys on. The JSON-RPC form of the same decision is error `-32007`, since
   stdio has no status line. An operator who wants both must use the HTTP
   transport with `X-Fuse-Agent-Id`, or run the gate in shadow.
-- **`tools/list` is unaffected.** The gate only covers `tools/call`, so the
-  poisoning and rug-pull scan still answers an unidentified caller: refusing it
-  would remove a control that works in the name of adding one.
+- **`tools/list` is never refused for want of an identity.** The gate only
+  covers `tools/call`, so the poisoning and rug-pull scan still answers an
+  unidentified caller: refusing it would remove a control that works in the
+  name of adding one. A listing that names no agent is also not narrowed (see
+  the next section).
 - A header that is present but blank names nobody, and is read as absent
   everywhere here, including for the `agent_id` on an emitted event.
 
 The broker holds no signer and mutates no plane: it can refuse a call, never
 perform one.
+
+### What `tools/list` shows
+
+With the gate enforcing and the caller named, the broker leaves out of a
+`tools/list` answer the tools Wardryx's `deny_tool` forbids that agent by name,
+and nothing else (CLAUDE.md invariant 146). It asks `POST /v1/filter-tools`
+about the names the listing carries, through the same cache and TTL as the
+model path's shadow measurement, within `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`.
+
+- **A tool with no grant stays listed.** Its call is the one Wardryx holds for
+  approval (`when_no_grant: hold`, refused here as `-32004` with the reason),
+  and a person can only be asked about a tool the agent can see. A tool an
+  `allow_tool` list leaves out also stays listed: only `deny_tool` removes.
+- **Shadow narrows nothing** and writes `_tokenfuse.tools_would_hide`, the
+  count enforce would leave out. Off asks nothing.
+- **No answer, no narrowing.** A Wardryx that cannot be reached, refuses the
+  question or predates the route leaves the listing whole in every failmode,
+  with a warning in the log (the missing route once per process). The list is
+  what an agent is shown and never the boundary: each `tools/call` is still
+  judged at the gate, where the failmode applies.
+- **No agent, no question.** stdio, or an HTTP call with no `X-Fuse-Agent-Id`
+  and no agent token, gets the upstream's listing as it came.
 
 ### Labels from the upstream
 

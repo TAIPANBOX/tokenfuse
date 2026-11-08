@@ -1395,8 +1395,9 @@ async fn serve() {
     // forwarded request is never modified in any mode.
     //
     // process-local: applies to the model request path only; the MCP broker
-    // forwards no model request and declares no tools of its own, so it has
-    // nothing to measure and does not read this variable.
+    // forwards no model request and does not read this variable. What the
+    // broker does with wardryx's filter-tools answer on a `tools/list` follows
+    // TOKENFUSE_WARDRYX_MODE instead (invariant 146).
     let tools_prune = tokenfuse_gateway::defaults::tools_prune_mode_from_env();
     tracing::info!(?tools_prune, "shadow tool-pruning measurement");
     state = state.with_tools_prune(tools_prune);
