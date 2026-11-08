@@ -10,7 +10,7 @@
 //! future, the capture `shadow_tool_pruning` explains in its module doc.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -24,6 +24,9 @@ use tokenfuse_gateway::clientkeys::ClientKeys;
 use tokenfuse_gateway::mcpbroker::{process, BrokerState, CallContext, ScanMode};
 use tokenfuse_gateway::wardryx::{FailMode, Wardryx, WardryxMode};
 use tracing::instrument::WithSubscriber;
+use tracing::span::{Attributes, Id, Record};
+use tracing::subscriber::Interest;
+use tracing::{Event, Metadata};
 
 const AGENT: &str = "agent://acme/triage";
 const OTHER: &str = "agent://acme/billing";
@@ -56,6 +59,41 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
+/// A dispatcher kept registered for the life of the test binary, so tracing
+/// never works out a callsite's interest from one thread's default alone.
+///
+/// tracing-core 0.1.36 rebuilds interest from the CURRENT thread's default
+/// while only one dispatcher is registered (`has_just_one`). With one test's
+/// capture the only one alive, a callsite another test's thread hit first was
+/// cached as never, and the capture read an empty log: CI run 42453738943 of
+/// the throwaway mutation branch for this file, on its unmutated control job.
+/// A second, permanent dispatcher that answers "sometimes" keeps every
+/// callsite checked per event against the thread's own default. It is nobody's
+/// default and receives nothing.
+struct Keeper;
+
+impl tracing::Subscriber for Keeper {
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, _: &Event<'_>) {}
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+fn keep_interest_per_event() {
+    static KEEPER: OnceLock<tracing::Dispatch> = OnceLock::new();
+    let _ = KEEPER.get_or_init(|| tracing::Dispatch::new(Keeper));
+}
+
 struct LogCapture {
     buf: Arc<Mutex<Vec<u8>>>,
     dispatch: tracing::Dispatch,
@@ -63,6 +101,7 @@ struct LogCapture {
 
 impl LogCapture {
     fn new() -> Self {
+        keep_interest_per_event();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(Captured(Arc::clone(&buf)))
