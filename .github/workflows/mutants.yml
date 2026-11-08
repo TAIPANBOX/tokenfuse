@@ -1,0 +1,61 @@
+# Throwaway: mutation run for tokenfuse#516 (invariant 146). Never merged.
+name: mutants
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: mutant ${{ matrix.mutant }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant:
+          - control
+          - rule-ignored
+          - shadow-narrows
+          - outage-hides-all
+          - cache-bypassed
+          - failure-cached
+          - asks-without-agent
+          - off-asks
+          - route-said-each-time
+          - cache-key-loses-agent
+          - keeps-the-wrong-ones
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free runner disk
+        run: |
+          for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do sudo rm -rf "$d" & done
+          wait
+          df -h /
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1
+          save-if: false
+      - name: Apply the mutant
+        run: python3 scripts/mutant.py "${{ matrix.mutant }}"
+      - name: Run the tools/list tests
+        run: |
+          cargo test -p tokenfuse-gateway --test it -- broker_tools_list 2>&1 | tee out.txt || true
+          grep -E '^test broker_tools_list::.* FAILED$' out.txt || true
+          if grep -q 'test result: FAILED' out.txt; then
+            echo "VERDICT ${{ matrix.mutant }} KILLED"
+          elif grep -q 'test result: ok' out.txt; then
+            echo "VERDICT ${{ matrix.mutant }} SURVIVED"
+          else
+            echo "VERDICT ${{ matrix.mutant }} ERROR"
+          fi
