@@ -105,18 +105,21 @@ struct Policy {
 
 impl Policy {
     fn rule_for(&self, name: &str) -> Option<&'static str> {
-        let listed = |list: &[&str]| list.iter().any(|n| *n == name);
         let starts = |prefix: Option<&str>| prefix.is_some_and(|p| name.starts_with(p));
-        if listed(&self.deny_tool[..]) || starts(self.deny_prefix) {
+        if holds(&self.deny_tool, name) || starts(self.deny_prefix) {
             Some("deny_tool")
-        } else if listed(&self.allow_tool_refuses[..]) || starts(self.allow_tool_prefix) {
+        } else if holds(&self.allow_tool_refuses, name) || starts(self.allow_tool_prefix) {
             Some("allow_tool")
-        } else if listed(&self.other_rule[..]) {
+        } else if holds(&self.other_rule, name) {
             Some("when_no_grant")
         } else {
             None
         }
     }
+}
+
+fn holds<'a>(list: &[&'a str], name: &'a str) -> bool {
+    list.contains(&name)
 }
 
 fn denies_wire_transfer() -> Policy {
@@ -193,7 +196,7 @@ async fn decide(State(pdp): State<Pdp>, Json(body): Json<Value>) -> Json<Value> 
     let tool = body["tool_call"]["name"].as_str().unwrap_or_default();
     let answer = if policy.rule_for(tool) == Some("deny_tool") {
         json!({ "decision": "deny", "reason": "denied by name", "policy_version": "stub-v1" })
-    } else if policy.no_grant.iter().any(|t| *t == tool) {
+    } else if policy.no_grant.contains(&tool) {
         json!({
             "decision": "hold",
             "reason": "no grant covers this tool",
