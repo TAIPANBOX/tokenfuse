@@ -478,7 +478,7 @@ cosign verify ghcr.io/taipanbox/tokenfuse:v1.24.0 \
 gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.24.0 -R TAIPANBOX/tokenfuse
 ```
 
-The v1.24.0 gateway image's digest is `sha256:bc9ee4b657bbb332f7c8a345beeaaa1e071f05f6af2ce46882d0601a153eb7c5`. `cosign verify` on the tag checks that digest. Pin `ghcr.io/taipanbox/tokenfuse@sha256:192cfc7138eea6911d3c563427cdb996dac52c77e7f04f6ae71f84b6a6dc4535` if you want the bytes fixed rather than the tag.
+The v1.24.0 gateway image's digest is `sha256:bc9ee4b657bbb332f7c8a345beeaaa1e071f05f6af2ce46882d0601a153eb7c5`. `cosign verify` on the tag checks that digest. Pin `ghcr.io/taipanbox/tokenfuse@sha256:bc9ee4b657bbb332f7c8a345beeaaa1e071f05f6af2ce46882d0601a153eb7c5` if you want the bytes fixed rather than the tag.
 
 Releases before v0.5.0 carry checksums only. Verified on 2026-09-13 from a machine that built nothing: `sha256sum -c` OK on a downloaded binary, and `gh attestation verify` on the binary and on the image both returned a SLSA provenance v1 statement signed by this workflow at `refs/tags/v0.5.0`. The release assets are plain binaries, not archives: `tokenfuse-<target>` and `tokenfuse-cloud-<target>`.
 
