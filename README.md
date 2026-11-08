@@ -10,7 +10,7 @@
 
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
-![release](https://img.shields.io/badge/release-v1.22.0-brightgreen)
+![release](https://img.shields.io/badge/release-v1.23.0-brightgreen)
 ![tests](https://img.shields.io/badge/tests-2599-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -26,7 +26,7 @@ TokenFuse is a **drop-in proxy** between your AI agents and their LLM providers.
 
 > **⚡ Try it in one command**, no signup, no account:
 > ```bash
-> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.22.0
+> docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.23.0
 > ```
 > `TOKENFUSE_ALLOW_STUB=1` is what makes this offline: with no provider behind
 > it, the gateway answers from a built-in stub and meters a fixed 1000/500
@@ -273,7 +273,7 @@ One case is neither settled nor released: a call the gateway has already handed 
 <sub>One shared core, enabled as config-gated capability packs.</sub>
 </div>
 
-Everything below is **implemented and tested in CI**, and is in the tagged **v1.22.0** release (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests, and [Project status](#-project-status) for the releases).
+Everything below is **implemented and tested in CI**, and is in the tagged **v1.23.0** release (see [PROGRESS.md](PROGRESS.md) for the per-component status and tests, and [Project status](#-project-status) for the releases).
 
 <div align="center">
 
@@ -321,7 +321,7 @@ TokenFuse is a **proxy**: start it, then point your agent at it instead of the p
 Published to GitHub Container Registry, so it runs anywhere with Docker, nothing to compile:
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.22.0
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.23.0
 ```
 
 A working gateway on **http://localhost:4100**, answering from a built-in fake
@@ -360,7 +360,7 @@ Tell TokenFuse where the provider is with `TOKENFUSE_UPSTREAM`, then send your a
 docker run -p 4100:4100 \
   -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.22.0
+  ghcr.io/taipanbox/tokenfuse:v1.23.0
 ```
 
 `TOKENFUSE_PROFILE=observe` in that command is the choice to run **without client
@@ -409,7 +409,7 @@ curl http://localhost:4100/v1/messages \
 docker run -p 4100:4100 -e TOKENFUSE_MODE=shadow \
   -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.22.0
+  ghcr.io/taipanbox/tokenfuse:v1.23.0
 ```
 
 `TOKENFUSE_MODE` = `enforce` (default under the governed profile) · `shadow` (default under `observe`) · `warn`.
@@ -420,7 +420,7 @@ docker run -p 4100:4100 -e TOKENFUSE_MODE=shadow \
 docker run -p 4100:4100 -e TOKENFUSE_MODE=enforce -e TOKENFUSE_MAX_RUN_BUDGET_USD=25 \
   -e TOKENFUSE_PROFILE=observe \
   -e TOKENFUSE_UPSTREAM=https://api.anthropic.com/v1/messages \
-  ghcr.io/taipanbox/tokenfuse:v1.22.0
+  ghcr.io/taipanbox/tokenfuse:v1.23.0
 ```
 
 A clamped call's response carries `x-fuse-budget-clamped: <ceiling>` (absent when nothing was clamped) and the first clamp of each run is logged once. A caller may still ask for less than the ceiling. An open run never moves up on a caller's declaration, so a later call cannot widen it, to the ceiling or otherwise (invariant 135); the answer to a call whose raise was refused carries `x-fuse-budget: raise-refused; kept=<usd>`, naming the budget the run kept, on both doors and on a stream too. A budget an operator set in the Cloud is the operator's own word and is not clamped, and it moves the run either way. Unset (the default) changes nothing. A value the gateway cannot read (`0`, `-1`, `1e9`, `abc`) exits 2 at startup rather than starting with no ceiling. It is one figure per run, not a per-agent limit: tying a budget to an agent identity needs client keys.
@@ -461,7 +461,7 @@ curl -s localhost:4100/v1/price-book
 Every release from v0.5.0 on is signed keyless with Sigstore and carries a build-provenance attestation and an SBOM. The image tag is pinned on purpose: there is no `:latest`, so what you run is what a release page describes. With `cosign` and `gh` installed:
 
 ```bash
-tag=v1.22.0
+tag=v1.23.0
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-identity "https://github.com/TAIPANBOX/tokenfuse/.github/workflows/release.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
@@ -472,13 +472,13 @@ gh attestation verify tokenfuse-x86_64-unknown-linux-musl -R TAIPANBOX/tokenfuse
 The image:
 
 ```bash
-cosign verify ghcr.io/taipanbox/tokenfuse:v1.22.0 \
+cosign verify ghcr.io/taipanbox/tokenfuse:v1.23.0 \
   --certificate-identity-regexp '^https://github.com/TAIPANBOX/tokenfuse/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.22.0 -R TAIPANBOX/tokenfuse
+gh attestation verify oci://ghcr.io/taipanbox/tokenfuse:v1.23.0 -R TAIPANBOX/tokenfuse
 ```
 
-The v1.22.0 gateway image's digest is `sha256:48bc2eff2d00e76036b6b4f3eb6bd09e29081a41468c7faf2093f8f46bc6c2ac`. `cosign verify` on the tag checks that digest. Pin `ghcr.io/taipanbox/tokenfuse@sha256:48bc2eff2d00e76036b6b4f3eb6bd09e29081a41468c7faf2093f8f46bc6c2ac` if you want the bytes fixed rather than the tag.
+The v1.23.0 gateway image's digest is `sha256:192cfc7138eea6911d3c563427cdb996dac52c77e7f04f6ae71f84b6a6dc4535`. `cosign verify` on the tag checks that digest. Pin `ghcr.io/taipanbox/tokenfuse@sha256:192cfc7138eea6911d3c563427cdb996dac52c77e7f04f6ae71f84b6a6dc4535` if you want the bytes fixed rather than the tag.
 
 Releases before v0.5.0 carry checksums only. Verified on 2026-09-13 from a machine that built nothing: `sha256sum -c` OK on a downloaded binary, and `gh attestation verify` on the binary and on the image both returned a SLSA provenance v1 statement signed by this workflow at `refs/tags/v0.5.0`. The release assets are plain binaries, not archives: `tokenfuse-<target>` and `tokenfuse-cloud-<target>`.
 
@@ -651,11 +651,11 @@ Design decisions and the data model: [docs/02-architecture.md](docs/02-architect
 
 ## 📋 Project status
 
-**v1.22.0: the current release, functional and shipped, young and not yet battle-tested.**
+**v1.23.0: the current release, functional and shipped, young and not yet battle-tested.**
 
 The full request path (budget enforcement, SSE passthrough, loop detection, hierarchical budgets), the intelligence/ops layer (semantic cache, WASM policies, backtesting, Parquet + `tokenfuse sql`, OTel, `tokenfuse top`, Python SDK), the security packs (agent firewall/taint, DLP, MCP scanner + credential-broker, CI Action), eBPF Radar, the raft **HA cluster** (durable storage, membership, auth, TLS), and the **hosted Cloud** (control plane + dashboard, telemetry, fleet-wide kill-switch, central budgets) are all implemented, tested in CI, and published as container images.
 
-The newest tag, [v1.22.0](docs/releases/v1.22.0.md), is a minor release: a run's label reaches the OpenAI wire and the fetch plane, so a search the provider ran labels the run and a classified upstream is told the run in `x-fuse-run-id`, the MCP broker follows no redirect, and a call whose usage stops short is charged what it cost rather than what its opening counters said. Before it, [v1.21.0](docs/releases/v1.21.0.md) has the agent firewall take a run's taint label from the act an enforcement point saw, not from the tool name the agent reported, so a read through an upstream the MCP broker classifies labels the run whatever the tool was called (invariant 143), and a provider that keeps failing is one incident in the Cloud console and API instead of one `dependency_failed` event per call (invariant 144); wasmtime moves to 49.0.5 for three advisories. Before it, [v1.20.3](docs/releases/v1.20.3.md) puts a refusal at the `require` agent-token door on the event bus as the open door already did, [v1.20.2](docs/releases/v1.20.2.md) prices `gpt-6.1-terra` at its own row, and [v1.20.1](docs/releases/v1.20.1.md) makes the MCP broker refuse a JSON-RPC batch whole instead of forwarding it unjudged. [v1.20.0](docs/releases/v1.20.0.md) lets a delegation or MCP proof name any of several public origins the operator lists. [v1.19.0](docs/releases/v1.19.0.md) is the security-default release: an unconfigured gateway and broker enforce what they advertise (the governed profile, see [Safe by default](#-safe-by-default)). [v1.18.0](docs/releases/v1.18.0.md) signs the event stream with checkpoints that keyryx custody certifies and lets the Cloud sign its audit manifest through keyryx. [v1.17.0](docs/releases/v1.17.0.md) makes the MCP broker publish the protected resource metadata the MCP authorization specification requires, whenever the agent-token door is on. [v1.16.0](docs/releases/v1.16.0.md) makes a run belong to the principal that opened it and lets the gateway hold its own provider key. [v1.15.0](docs/releases/v1.15.0.md) closes five defects in agent-security defaults. [v1.14.0](docs/releases/v1.14.0.md) holds budgets until the gateway has read its control plane, judges streamed tool calls as it judges buffered ones, and has the Cloud name every model a run used. Every release has its notes in `docs/releases/`.
+The newest tag, [v1.23.0](docs/releases/v1.23.0.md), is a minor release: a held MCP tool call says why it was held, the injection detector sees Unicode tag characters and bidi isolates, and every refusal text is cleaned before a model reads it. Before it, [v1.22.0](docs/releases/v1.22.0.md) carries a run's label to the OpenAI wire and the fetch plane, so a search the provider ran labels the run and a classified upstream is told the run in `x-fuse-run-id`, the MCP broker follows no redirect, and a call whose usage stops short is charged what it cost rather than what its opening counters said. Before it, [v1.21.0](docs/releases/v1.21.0.md) has the agent firewall take a run's taint label from the act an enforcement point saw, not from the tool name the agent reported, so a read through an upstream the MCP broker classifies labels the run whatever the tool was called (invariant 143), and a provider that keeps failing is one incident in the Cloud console and API instead of one `dependency_failed` event per call (invariant 144); wasmtime moves to 49.0.5 for three advisories. Before it, [v1.20.3](docs/releases/v1.20.3.md) puts a refusal at the `require` agent-token door on the event bus as the open door already did, [v1.20.2](docs/releases/v1.20.2.md) prices `gpt-6.1-terra` at its own row, and [v1.20.1](docs/releases/v1.20.1.md) makes the MCP broker refuse a JSON-RPC batch whole instead of forwarding it unjudged. [v1.20.0](docs/releases/v1.20.0.md) lets a delegation or MCP proof name any of several public origins the operator lists. [v1.19.0](docs/releases/v1.19.0.md) is the security-default release: an unconfigured gateway and broker enforce what they advertise (the governed profile, see [Safe by default](#-safe-by-default)). [v1.18.0](docs/releases/v1.18.0.md) signs the event stream with checkpoints that keyryx custody certifies and lets the Cloud sign its audit manifest through keyryx. [v1.17.0](docs/releases/v1.17.0.md) makes the MCP broker publish the protected resource metadata the MCP authorization specification requires, whenever the agent-token door is on. [v1.16.0](docs/releases/v1.16.0.md) makes a run belong to the principal that opened it and lets the gateway hold its own provider key. [v1.15.0](docs/releases/v1.15.0.md) closes five defects in agent-security defaults. [v1.14.0](docs/releases/v1.14.0.md) holds budgets until the gateway has read its control plane, judges streamed tool calls as it judges buffered ones, and has the Cloud name every model a run used. Every release has its notes in `docs/releases/`.
 
 **v0.4.0** ("live-validation fixes, fail-closed hardening", 2026-07-15) shipped everything built since v0.3.0: the web dashboard restyled around the "fuse" identity, the MCP scanner's live `--url` mode, JSON reports, `--fail-on` exit codes and composite GitHub Action, `tokenfuse focus-export` (Parquet traces → a FinOps FOCUS-format CSV, blocked calls included as $0 rows), the opt-in agent-event NDJSON exporter (`TOKENFUSE_EVENTS_PATH`) and the `x-fuse-on-behalf-of` delegation-chain header (the shared [Agent Passport](https://github.com/TAIPANBOX/agent-passport) spec), plus the fail-closed fixes a real-infrastructure validation campaign shook out ([VALIDATION.md](VALIDATION.md)).
 
@@ -664,7 +664,7 @@ Since v0.4.0, in the releases after it (see `docs/releases/`): TokenFuse is now 
 It has **not** yet had a production hardening pass or a security audit; treat it as an early, capable release you can evaluate today, not a turnkey enterprise product. Run it in **shadow mode** first.
 
 ```bash
-docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.22.0   # gateway, offline
+docker run -p 4100:4100 -e TOKENFUSE_ALLOW_STUB=1 -e TOKENFUSE_PROFILE=observe ghcr.io/taipanbox/tokenfuse:v1.23.0   # gateway, offline
 cd cloud && docker compose up                                                    # + Cloud dashboard (:3000)
 ```
 
