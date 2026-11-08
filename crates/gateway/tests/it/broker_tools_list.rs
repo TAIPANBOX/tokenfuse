@@ -1,5 +1,6 @@
-//! The MCP broker's `tools/list` shows an agent every tool except the ones
-//! wardryx's `deny_tool` forbids it by name (invariant 146).
+//! The MCP broker's `tools/list` shows an agent every tool except the ones its
+//! policy refuses outright: named by wardryx's `deny_tool`, or left out of an
+//! `allow_tool` list, both refusals no approval lifts (invariant 146).
 //!
 //! A tool the agent merely holds no grant for stays listed: its call is the one
 //! wardryx holds for a person, and a person can only be asked about a tool the
@@ -125,34 +126,52 @@ impl LogCapture {
 
 // --- a stub wardryx: /v1/filter-tools worked out from a policy, /v1/decide beside it ---
 
-/// What the stub refuses one agent, and under which rule. `other_rule` is
-/// reported under a rule wardryx does not have today, because a later rule
-/// must not be read as `deny_tool` either.
+/// What the stub refuses one agent, and under which rule. `unknown_rule` is
+/// reported under a rule `/v1/filter-tools` does not name today, and `no_rule`
+/// with no rule at all: neither may be read as a refusal no approval lifts.
 #[derive(Clone, Default)]
 struct Policy {
     deny_tool: Vec<&'static str>,
-    allow_tool_refuses: Vec<&'static str>,
-    other_rule: Vec<&'static str>,
+    /// The `allow_tool` list: when it names anything, every tool it does not
+    /// name is refused under `allow_tool`, as wardryx refuses it.
+    allow_tool: Vec<&'static str>,
+    unknown_rule: Vec<&'static str>,
+    no_rule: Vec<&'static str>,
     /// Every name starting with this is refused by `deny_tool`, for the sweep.
     deny_prefix: Option<&'static str>,
     /// Every name starting with this is refused by `allow_tool`, for the sweep.
-    allow_tool_prefix: Option<&'static str>,
+    outside_prefix: Option<&'static str>,
+    /// Every name starting with this is refused under an unknown rule.
+    unknown_prefix: Option<&'static str>,
+    /// Every name starting with this is refused with no rule named.
+    no_rule_prefix: Option<&'static str>,
     /// Tools no grant covers: `/v1/filter-tools` names none of them, and
     /// `/v1/decide` holds a call of one for a person (wardryx rule 15).
     no_grant: Vec<&'static str>,
 }
 
+/// What the stub's `/v1/filter-tools` says about one tool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Allowed,
+    /// Refused, under the rule named, or under none.
+    Refused(Option<&'static str>),
+}
+
 impl Policy {
-    fn rule_for(&self, name: &str) -> Option<&'static str> {
+    fn answer(&self, name: &str) -> Answer {
         let starts = |prefix: Option<&str>| prefix.is_some_and(|p| name.starts_with(p));
+        let outside = !self.allow_tool.is_empty() && !holds(&self.allow_tool, name);
         if holds(&self.deny_tool, name) || starts(self.deny_prefix) {
-            Some("deny_tool")
-        } else if holds(&self.allow_tool_refuses, name) || starts(self.allow_tool_prefix) {
-            Some("allow_tool")
-        } else if holds(&self.other_rule, name) {
-            Some("when_no_grant")
+            Answer::Refused(Some("deny_tool"))
+        } else if outside || starts(self.outside_prefix) {
+            Answer::Refused(Some("allow_tool"))
+        } else if holds(&self.unknown_rule, name) || starts(self.unknown_prefix) {
+            Answer::Refused(Some("when_no_grant"))
+        } else if holds(&self.no_rule, name) || starts(self.no_rule_prefix) {
+            Answer::Refused(None)
         } else {
-            None
+            Answer::Allowed
         }
     }
 }
@@ -219,12 +238,14 @@ async fn filter_tools(State(pdp): State<Pdp>, Json(body): Json<Value>) -> Respon
     let mut denied = Vec::new();
     for name in body["tool_names"].as_array().into_iter().flatten() {
         let name = name.as_str().unwrap_or_default();
-        let Some(rule) = policy.rule_for(name) else {
-            allowed.push(json!(name));
-            continue;
-        };
-        let entry = json!({ "name": name, "policy": "stub", "rule": rule });
-        denied.push(entry);
+        match policy.answer(name) {
+            Answer::Allowed => allowed.push(json!(name)),
+            Answer::Refused(Some(rule)) => {
+                let entry = json!({ "name": name, "policy": "stub", "rule": rule });
+                denied.push(entry);
+            }
+            Answer::Refused(None) => denied.push(json!({ "name": name, "policy": "stub" })),
+        }
     }
     let answer = json!({ "allowed": allowed, "denied": denied, "policy_version": "stub-v1" });
     Json(answer).into_response()
@@ -233,8 +254,9 @@ async fn filter_tools(State(pdp): State<Pdp>, Json(body): Json<Value>) -> Respon
 async fn decide(State(pdp): State<Pdp>, Json(body): Json<Value>) -> Json<Value> {
     let policy = pdp.policy(body["agent_id"].as_str().unwrap_or_default());
     let tool = body["tool_call"]["name"].as_str().unwrap_or_default();
-    let answer = if policy.rule_for(tool) == Some("deny_tool") {
-        json!({ "decision": "deny", "reason": "denied by name", "policy_version": "stub-v1" })
+    let refused = policy.answer(tool);
+    let answer = if matches!(refused, Answer::Refused(Some("deny_tool" | "allow_tool"))) {
+        json!({ "decision": "deny", "reason": "refused outright", "policy_version": "stub-v1" })
     } else if policy.no_grant.contains(&tool) {
         json!({
             "decision": "hold",
@@ -431,16 +453,14 @@ async fn a_tool_the_agent_holds_no_grant_for_stays_listed_and_its_call_is_held()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tool_refused_under_any_other_rule_stays_listed() {
+async fn a_tool_outside_the_allow_tool_list_is_not_listed() {
     let policy = Policy {
-        deny_tool: vec!["wire_transfer"],
-        allow_tool_refuses: vec!["deploy"],
-        other_rule: vec!["ship"],
+        allow_tool: vec!["lookup"],
         ..Default::default()
     };
     let pdp = Pdp::with(AGENT, policy);
     let pdp_url = pdp.serve().await;
-    let up = Upstream::new(listing(&["lookup", "deploy", "ship", "wire_transfer"]));
+    let up = Upstream::new(listing(&["lookup", "deploy"]));
     let up_url = up.serve().await;
     let st = broker(&up_url, hook(WardryxMode::Enforce, &pdp_url, NO_REUSE));
 
@@ -448,8 +468,86 @@ async fn a_tool_refused_under_any_other_rule_stays_listed() {
 
     assert_eq!(
         listed(&answer),
-        ["lookup", "deploy", "ship"],
-        "only deny_tool takes a tool out of the list: {answer}"
+        ["lookup"],
+        "a tool the allow_tool list leaves out is refused whatever is approved: {answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_the_allow_tool_list_names_stays_listed() {
+    let policy = Policy {
+        allow_tool: vec!["lookup", "deploy", "send_email"],
+        ..Default::default()
+    };
+    let pdp = Pdp::with(AGENT, policy);
+    let pdp_url = pdp.serve().await;
+    let up = Upstream::new(listing(&["lookup", "deploy", "send_email", "shell"]));
+    let up_url = up.serve().await;
+    let st = broker(&up_url, hook(WardryxMode::Enforce, &pdp_url, NO_REUSE));
+
+    let answer = list(&st, &as_agent(AGENT)).await;
+
+    assert_eq!(
+        listed(&answer),
+        ["lookup", "deploy", "send_email"],
+        "every tool the allow_tool list names stays, in order, and only the rest goes: {answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_the_allow_tool_list_names_with_no_grant_stays_listed_and_its_call_is_held() {
+    let policy = Policy {
+        allow_tool: vec!["lookup", "deploy"],
+        no_grant: vec!["deploy"],
+        ..Default::default()
+    };
+    let pdp = Pdp::with(AGENT, policy);
+    let pdp_url = pdp.serve().await;
+    let up = Upstream::new(listing(&["lookup", "deploy", "shell"]));
+    let up_url = up.serve().await;
+    let st = broker(&up_url, hook(WardryxMode::Enforce, &pdp_url, NO_REUSE));
+    let ctx = as_agent(AGENT);
+
+    let answer = list(&st, &ctx).await;
+
+    assert_eq!(
+        listed(&answer),
+        ["lookup", "deploy"],
+        "a listed tool no grant covers stays, the one outside the list goes: {answer}"
+    );
+    let call = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "deploy", "arguments": {} }
+    });
+    let refused = process(&st, call, &ctx).await;
+    let message = refused["error"]["message"].to_string();
+    assert!(
+        message.contains("requires approval") && message.contains("appr-7"),
+        "the call of the listed tool is held for a person, with its approval: {refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_refused_under_an_unknown_rule_or_none_stays_listed() {
+    let policy = Policy {
+        deny_tool: vec!["wire_transfer"],
+        unknown_rule: vec!["ship"],
+        no_rule: vec!["audit"],
+        outside_prefix: Some("out_"),
+        ..Default::default()
+    };
+    let pdp = Pdp::with(AGENT, policy);
+    let pdp_url = pdp.serve().await;
+    let names = ["lookup", "ship", "audit", "wire_transfer", "out_shell"];
+    let up_url = Upstream::new(listing(&names)).serve().await;
+    let st = broker(&up_url, hook(WardryxMode::Enforce, &pdp_url, NO_REUSE));
+
+    let answer = list(&st, &as_agent(AGENT)).await;
+
+    assert_eq!(
+        listed(&answer),
+        ["lookup", "ship", "audit"],
+        "only deny_tool and allow_tool take a tool out of the list: {answer}"
     );
 }
 
@@ -679,7 +777,7 @@ impl Seeded {
 /// One element of a generated `tools` array: a tool with a name from a small
 /// pool, so names repeat, or something an upstream should never send.
 fn element(rng: &mut Seeded) -> Value {
-    const NAMES: [&str; 6] = ["lookup", "deny_a", "deny_b", "nogrant_c", "x", ""];
+    const NAMES: [&str; 6] = ["lookup", "deny_a", "out_c", "later_d", "quiet_e", ""];
     let name = NAMES[rng.below(NAMES.len() as u64) as usize];
     match rng.below(8) {
         0 => json!(name),
@@ -693,20 +791,23 @@ fn element(rng: &mut Seeded) -> Value {
 }
 
 /// What the broker should answer for `tools`: every element but a tool whose
-/// string name the stub's `deny_tool` refuses, in the same order.
+/// string name the stub refuses under `deny_tool` or `allow_tool`, in order.
 fn expected(tools: &[Value]) -> Vec<Value> {
+    let outright = |n: &str| n.starts_with("deny_") || n.starts_with("out_");
     tools
         .iter()
-        .filter(|t| !t["name"].as_str().is_some_and(|n| n.starts_with("deny_")))
+        .filter(|t| !t["name"].as_str().is_some_and(outright))
         .cloned()
         .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hostile_listings_never_panic_and_only_tools_denied_by_name_leave() {
+async fn hostile_listings_never_panic_and_only_tools_refused_outright_leave() {
     let policy = Policy {
         deny_prefix: Some("deny_"),
-        allow_tool_prefix: Some("nogrant_"),
+        outside_prefix: Some("out_"),
+        unknown_prefix: Some("later_"),
+        no_rule_prefix: Some("quiet_"),
         ..Default::default()
     };
     let pdp = Pdp::with(AGENT, policy);
@@ -720,9 +821,11 @@ async fn hostile_listings_never_panic_and_only_tools_denied_by_name_leave() {
         let mut rng = Seeded(0x9E37_79B9_7F4A_7C15 ^ seed);
         let count = rng.below(10);
         let mut tools: Vec<Value> = (0..count).map(|_| element(&mut rng)).collect();
-        // One tool deny_tool names, so every seed has something to leave out.
-        let at = rng.below(tools.len() as u64 + 1) as usize;
-        tools.insert(at, json!({ "name": "deny_z" }));
+        // One tool under each rule that hides it, so every seed leaves both out.
+        for name in ["deny_z", "out_z"] {
+            let at = rng.below(tools.len() as u64 + 1) as usize;
+            tools.insert(at, json!({ "name": name }));
+        }
         let sent = json!({ "jsonrpc": "2.0", "result": { "tools": tools.clone() } });
         up.answer_list_with(sent);
 
@@ -731,7 +834,7 @@ async fn hostile_listings_never_panic_and_only_tools_denied_by_name_leave() {
         assert_eq!(
             answer["result"]["tools"],
             Value::Array(expected(&tools)),
-            "seed {seed}: only a tool deny_tool names leaves the listing"
+            "seed {seed}: only a tool refused outright leaves the listing"
         );
     }
 
