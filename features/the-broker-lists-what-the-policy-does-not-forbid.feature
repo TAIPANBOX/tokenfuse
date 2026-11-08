@@ -1,12 +1,15 @@
-Feature: The MCP broker lists what the policy does not forbid
+Feature: The MCP broker lists what the policy does not refuse outright
 
   The broker used to hand an agent every tool the upstream MCP server listed,
   whatever the agent's policy said. It now leaves out of a tools/list answer
-  the tools wardryx's deny_tool rule forbids that agent by name, and nothing
-  else. A tool the agent merely holds no grant for stays in the list, because
-  its call is the one held for the owner's approval, and the owner can only be
-  asked about a tool the agent can see. The list is what an agent is shown and
-  never the boundary: every call is still judged at the gate.
+  the tools wardryx refuses that agent outright: the ones its deny_tool rule
+  names and the ones an allow_tool list leaves out, two refusals no approval
+  lifts. Nothing else is left out. A tool the agent merely holds no grant for
+  stays in the list, because its call is the one held for the owner's
+  approval, and the owner can only be asked about a tool the agent can see. An
+  entry under a rule the broker does not know, or under no rule, stays too.
+  The list is what an agent is shown and never the boundary: every call is
+  still judged at the gate.
 
   # @test:a_tool_the_policy_denies_by_name_is_not_listed
   Scenario: A tool the policy denies by name is not listed
@@ -16,6 +19,20 @@ Feature: The MCP broker lists what the policy does not forbid
     Then the answer lists lookup and send_email, in that order
     And wardryx was asked once, about that agent and the three listed names
 
+  # @test:a_tool_outside_the_allow_tool_list_is_not_listed
+  Scenario: A tool outside the allow_tool list is not listed
+    Given wardryx enforces a policy whose allow_tool list names only lookup
+    And the upstream lists lookup and deploy
+    When the agent asks the broker for tools/list
+    Then the answer lists lookup alone
+
+  # @test:a_tool_the_allow_tool_list_names_stays_listed
+  Scenario: Every tool the allow_tool list names stays listed
+    Given the allow_tool list names lookup, deploy and send_email
+    And the upstream lists those three and shell
+    When the agent asks the broker for tools/list
+    Then lookup, deploy and send_email are listed in order, and shell is not
+
   # @test:a_tool_the_agent_holds_no_grant_for_stays_listed_and_its_call_is_held
   Scenario: A tool with no grant stays listed and its call is held for a person
     Given wardryx enforces a policy under which no grant covers deploy
@@ -23,11 +40,20 @@ Feature: The MCP broker lists what the policy does not forbid
     Then deploy is listed
     And when the agent calls deploy, the call is held for approval and the refusal names the approval
 
-  # @test:a_tool_refused_under_any_other_rule_stays_listed
-  Scenario: Only deny_tool takes a tool out of the list
-    Given wardryx refuses wire_transfer under deny_tool, deploy under allow_tool and ship under another rule
+  # @test:a_tool_the_allow_tool_list_names_with_no_grant_stays_listed_and_its_call_is_held
+  Scenario: A tool the allow_tool list names but no grant covers stays listed and is held
+    Given the allow_tool list names lookup and deploy, and no grant covers deploy
+    And the upstream lists lookup, deploy and shell
     When the agent asks the broker for tools/list
-    Then deploy and ship are listed and wire_transfer is not
+    Then lookup and deploy are listed and shell is not
+    And when the agent calls deploy, the call is held for approval and the refusal names the approval
+
+  # @test:a_tool_refused_under_an_unknown_rule_or_none_stays_listed
+  Scenario: Only deny_tool and allow_tool take a tool out of the list
+    Given wardryx refuses wire_transfer under deny_tool and out_shell under allow_tool
+    And it refuses ship under a rule the broker does not know, and audit under no rule
+    When the agent asks the broker for tools/list
+    Then lookup, ship and audit are listed, and wire_transfer and out_shell are not
 
   # @test:shadow_lists_every_tool_and_says_how_many_it_would_leave_out
   Scenario: Shadow leaves everything in and says what enforce would leave out
@@ -85,10 +111,11 @@ Feature: The MCP broker lists what the policy does not forbid
     When each agent asks for tools/list
     Then each answer follows that agent's own policy, and wardryx was asked twice
 
-  # @test:hostile_listings_never_panic_and_only_tools_denied_by_name_leave
-  Scenario: A hostile listing loses only the tools denied by name
+  # @test:hostile_listings_never_panic_and_only_tools_refused_outright_leave
+  Scenario: A hostile listing loses only the tools refused outright
     Given an upstream answers with generated tool arrays holding malformed elements, over 120 seeds
+    And wardryx refuses some names under deny_tool, some under allow_tool, some under an unknown rule and some under none
     And with answers that carry no tools array at all
     When the agent asks for tools/list
-    Then only an element whose string name deny_tool refuses is left out, the rest keep their order
+    Then only an element whose string name deny_tool or allow_tool refuses is left out, the rest keep their order
     And an answer with no tools array goes back exactly as it came

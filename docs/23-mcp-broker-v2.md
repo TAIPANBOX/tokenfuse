@@ -141,15 +141,18 @@ perform one.
 ### What `tools/list` shows
 
 With the gate enforcing and the caller named, the broker leaves out of a
-`tools/list` answer the tools Wardryx's `deny_tool` forbids that agent by name,
-and nothing else (CLAUDE.md invariant 146). It asks `POST /v1/filter-tools`
-about the names the listing carries, through the same cache and TTL as the
-model path's shadow measurement, within `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`.
+`tools/list` answer the tools Wardryx refuses that agent outright: the ones its
+`deny_tool` names and the ones an `allow_tool` list leaves out, two refusals no
+approval lifts. Nothing else is left out (CLAUDE.md invariant 146). It asks
+`POST /v1/filter-tools` about the names the listing carries, through the same
+cache and TTL as the model path's shadow measurement, within
+`TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS`.
 
 - **A tool with no grant stays listed.** Its call is the one Wardryx holds for
   approval (`when_no_grant: hold`, refused here as `-32004` with the reason),
-  and a person can only be asked about a tool the agent can see. A tool an
-  `allow_tool` list leaves out also stays listed: only `deny_tool` removes.
+  and a person can only be asked about a tool the agent can see. An entry
+  under a rule the broker does not know, or under none, also stays listed:
+  only `deny_tool` and `allow_tool` remove.
 - **Shadow narrows nothing** and writes `_tokenfuse.tools_would_hide`, the
   count enforce would leave out. Off asks nothing.
 - **No answer, no narrowing.** A Wardryx that cannot be reached, refuses the

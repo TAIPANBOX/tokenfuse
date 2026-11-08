@@ -692,15 +692,32 @@ impl WardryxClient {
 }
 
 /// The rule `/v1/filter-tools` names for a tool wardryx's `deny_tool` refuses
-/// (wardryx invariant 21). The one rule the MCP broker leaves a tool out of a
-/// `tools/list` for (invariant 146).
+/// (wardryx invariant 21).
 pub const DENY_TOOL_RULE: &str = "deny_tool";
+
+/// The rule `/v1/filter-tools` names for a tool an `allow_tool` list leaves out
+/// (wardryx invariant 21, and its `allow_tool` rule: no approval lifts it).
+pub const ALLOW_TOOL_RULE: &str = "allow_tool";
+
+/// The rules under which the MCP broker leaves a tool out of a `tools/list`
+/// (invariant 146): the two refusals no approval lifts. Any other rule, and an
+/// entry naming none, leaves the tool listed.
+pub const OUTRIGHT_RULES: [&str; 2] = [DENY_TOOL_RULE, ALLOW_TOOL_RULE];
+
+/// Whether `/v1/filter-tools` refused this tool under a rule in
+/// [`OUTRIGHT_RULES`]: a refusal no approval lifts (invariant 146).
+fn refused_outright(denied: &DeniedTool) -> bool {
+    denied
+        .rule
+        .as_deref()
+        .is_some_and(|rule| OUTRIGHT_RULES.contains(&rule))
+}
 
 /// What wardryx said about the tools of one MCP `tools/list` (invariant 146).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListAnswer {
-    /// Wardryx answered, and these are the names its `deny_tool` refuses.
-    /// Empty is a real answer: nothing to leave out.
+    /// Wardryx answered, and these are the names it refuses outright, under a
+    /// rule in [`OUTRIGHT_RULES`]. Empty is a real answer: nothing to leave out.
     Hide(BTreeSet<String>),
     /// No answer came back, so nothing is known to be forbidden.
     NoAnswer,
@@ -717,8 +734,9 @@ pub struct DeniedTool {
 /// The result of a `filter_tools` call: which of the requested tool names
 /// wardryx's `deny_tool` and `allow_tool` rules would remove, and which they
 /// would keep. On the model path it is a measurement and never changes the
-/// forwarded request (invariant 61); the MCP broker leaves the `deny_tool`
-/// entries out of a `tools/list` answer and nothing else (invariant 146).
+/// forwarded request (invariant 61); the MCP broker leaves the `deny_tool` and
+/// `allow_tool` entries out of a `tools/list` answer and nothing else
+/// (invariant 146).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterOutcome {
     pub allowed: Vec<String>,
@@ -1335,23 +1353,24 @@ impl Wardryx {
         }
     }
 
-    /// The tools of one MCP `tools/list` that wardryx's `deny_tool` refuses
-    /// `agent_id` by name (invariant 146), asked of `/v1/filter-tools` through
-    /// the same cache as [`Self::measure_shadow_prune`], within the tool path's
-    /// timeout because the MCP broker asks it.
+    /// The tools of one MCP `tools/list` that wardryx refuses `agent_id`
+    /// outright (invariant 146), asked of `/v1/filter-tools` through the same
+    /// cache as [`Self::measure_shadow_prune`], within the tool path's timeout
+    /// because the MCP broker asks it.
     ///
-    /// Only an entry whose rule is [`DENY_TOOL_RULE`] is returned. Wardryx's
-    /// answer also names the tools an `allow_tool` list leaves out, and a later
-    /// wardryx may name more rules; none of those is a tool forbidden by name,
-    /// and an entry with no rule at all is not one either. A tool the agent
-    /// holds no grant for is the one whose call wardryx holds for a person, and
-    /// a person can only be asked about a tool the agent can see.
+    /// Only an entry whose rule is in [`OUTRIGHT_RULES`] is returned: a tool
+    /// `deny_tool` names, or one an `allow_tool` list leaves out, both refused
+    /// whatever a person approves. A rule a later wardryx may add, and an entry
+    /// naming no rule, are not known to be such a refusal and are not returned.
+    /// A tool the agent holds no grant for is never in the answer at all: its
+    /// call is the one wardryx holds for a person, and a person can only be
+    /// asked about a tool the agent can see.
     ///
     /// [`ListAnswer::NoAnswer`] on every failure, which is never cached. A 404
     /// (a wardryx that predates the route) is said once per process, as on the
     /// model path; any other failure is said each time, as a failed decide is,
     /// since it is usually transient and a listing is asked once per session.
-    pub async fn tools_denied_by_name(
+    pub async fn tools_refused_outright(
         &self,
         agent_id: &str,
         run_id: &str,
@@ -1365,7 +1384,7 @@ impl Wardryx {
                 outcome
                     .denied
                     .into_iter()
-                    .filter(|d| d.rule.as_deref() == Some(DENY_TOOL_RULE))
+                    .filter(refused_outright)
                     .map(|d| d.name)
                     .collect(),
             ),

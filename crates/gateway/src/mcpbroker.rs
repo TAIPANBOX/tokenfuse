@@ -15,8 +15,9 @@
 //! 3. **Live poisoning + rug-pull scan** - on `tools/list`, run the
 //!    tool-description scanner and diff against a pinned lockfile. Then, with
 //!    Wardryx enforcing and the caller named, leave out of the listing the
-//!    tools Wardryx's `deny_tool` forbids that agent by name, and nothing else
-//!    (invariant 146, see `narrow_listing`).
+//!    tools Wardryx refuses that agent outright (`deny_tool`, or outside an
+//!    `allow_tool` list), and nothing else (invariant 146, see
+//!    `narrow_listing`).
 //! 4. **DLP** - block raw secrets in outgoing args and **redact** secrets in tool
 //!    responses so a result can't leak a credential into the model's context.
 //!
@@ -2025,11 +2026,12 @@ fn count_named(answer: &Value, hide: &BTreeSet<String>) -> usize {
     tools.iter().filter(|t| named_in(t, hide)).count()
 }
 
-/// Narrow a `tools/list` answer to what the policy does not forbid (invariant
-/// 146). Wardryx's `deny_tool` decides, through
-/// [`Wardryx::tools_denied_by_name`]: under enforce those tools are left out,
-/// under shadow every tool stays and `_tokenfuse.tools_would_hide` says how
-/// many would go, and off asks nothing.
+/// Narrow a `tools/list` answer to what the policy does not refuse outright
+/// (invariant 146). Wardryx decides, through [`Wardryx::tools_refused_outright`]:
+/// a tool `deny_tool` names or an `allow_tool` list leaves out, refused whatever
+/// a person approves. Under enforce those tools are left out, under shadow
+/// every tool stays and `_tokenfuse.tools_would_hide` says how many would go,
+/// and off asks nothing.
 ///
 /// A tool the agent holds no grant for stays listed, because its call is the
 /// one wardryx holds for a person (`when_no_grant`), and a person can only be
@@ -2052,7 +2054,7 @@ async fn narrow_listing(st: &BrokerState, ctx: &CallContext, answer: &mut Value)
     // The run id the policy gate sends for this agent, so both questions name
     // the same subject.
     let run = format!("mcp:{agent}");
-    let asked = st.wardryx.tools_denied_by_name(agent, &run, &names);
+    let asked = st.wardryx.tools_refused_outright(agent, &run, &names);
     let hide = match asked.await {
         ListAnswer::Hide(hide) => hide,
         ListAnswer::NoAnswer => return,
@@ -2064,7 +2066,7 @@ async fn narrow_listing(st: &BrokerState, ctx: &CallContext, answer: &mut Value)
                 agent = %agent,
                 tools = ?hide,
                 left_out,
-                "mcp broker: tools/list leaves out the tools the policy denies by name"
+                "mcp broker: tools/list leaves out the tools the policy refuses outright"
             );
         }
         return;
@@ -2075,7 +2077,7 @@ async fn narrow_listing(st: &BrokerState, ctx: &CallContext, answer: &mut Value)
             agent = %agent,
             tools = ?hide,
             would,
-            "mcp broker: shadow, tools/list would leave out the tools the policy denies by name"
+            "mcp broker: shadow, tools/list would leave out the tools the policy refuses outright"
         );
     }
     if let Some(obj) = answer.as_object_mut() {
