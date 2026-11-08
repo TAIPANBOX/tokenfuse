@@ -11,7 +11,7 @@
 > The kill-switch isn't a dashboard button you press after the fact - it's an HTTP 402 the gateway returns mid-run, before the provider bills you.
 
 ![release](https://img.shields.io/badge/release-v1.23.0-brightgreen)
-![tests](https://img.shields.io/badge/tests-2599-brightgreen)
+![tests](https://img.shields.io/badge/tests-2615-brightgreen)
 ![image](https://img.shields.io/badge/ghcr.io-tokenfuse-blue?logo=docker)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![core](https://img.shields.io/badge/core-Rust-orange)
@@ -747,7 +747,7 @@ Request header `x-fuse-task-type` names the task class (e.g. `cheap`, `hard`). R
 | Env var | Values / default | Meaning |
 |---|---|---|
 | `TOKENFUSE_WARDRYX_URL` | URL (unset ⇒ hook off) | The PDP's `/v1/decide` base URL. Unset forces `off` regardless of mode. |
-| `TOKENFUSE_WARDRYX_MODE` | `off` (default under `observe`; `enforce` under the governed profile once `TOKENFUSE_WARDRYX_URL` is set) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. |
+| `TOKENFUSE_WARDRYX_MODE` | `off` (default under `observe`; `enforce` under the governed profile once `TOKENFUSE_WARDRYX_URL` is set) · `shadow` · `enforce` | `shadow` reports `would-allow`/`would-deny`/`would-hold` and never blocks; `enforce` blocks. On the MCP broker, `enforce` also leaves out of a `tools/list` answer the tools wardryx refuses the named agent outright, under `deny_tool` or outside an `allow_tool` list, and only those (a tool with no grant stays listed, so its call can be held for approval); `shadow` lists everything and writes `_tokenfuse.tools_would_hide`; a wardryx that does not answer leaves the list whole. |
 | `TOKENFUSE_WARDRYX_FAILMODE` | `closed` (default under `enforce`) · `open` (default otherwise) | Behaviour when the PDP is unreachable: fail-open allows, fail-closed denies. Unset under `enforce` it is `closed`, so an outage of the policy plane refuses what the policy would judge; an explicit `open` still works and is said once at startup. |
 | `TOKENFUSE_WARDRYX_KEY` | bearer token (optional) | Sent to the PDP. |
 | `TOKENFUSE_WARDRYX_TIMEOUT_MS` | default `50` | Per-decision timeout on the model path. When set, it is also the MCP broker's timeout on a `tools/call` unless the next variable is set. |

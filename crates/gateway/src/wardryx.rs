@@ -71,7 +71,7 @@
 //! window matters more than the round-trip savings.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -633,23 +633,25 @@ impl WardryxClient {
         Ok((outcome, wire.cacheable))
     }
 
-    /// `POST {base_url}/v1/filter-tools`, same key and timeout as `decide`
-    /// (see this struct's doc). Applies wardryx's `deny_tool` rule to each
-    /// name in `tool_names` alone, in shadow, W2a: measurement only, never
-    /// enforcement. A 404 is reported as its own error kind rather than a
-    /// generic transport/decode failure, since it means this wardryx
+    /// `POST {base_url}/v1/filter-tools`, same key as `decide`, within the
+    /// caller's `timeout`: the shared one for the model path's measurement,
+    /// the tool path's for the MCP broker's listing (invariant 146). Applies
+    /// wardryx's `deny_tool` and `allow_tool` rules to each name in
+    /// `tool_names` alone. A 404 is reported as its own error kind rather than
+    /// a generic transport/decode failure, since it means this wardryx
     /// predates the route; any other status outside 2xx is
     /// [`WardryxError::Refused`], the same kind `decide` reports.
     async fn filter_tools(
         &self,
         req: &FilterToolsWireRequest<'_>,
+        timeout: Duration,
     ) -> Result<FilterOutcome, WardryxError> {
         let endpoint = format!("{}/v1/filter-tools", self.base_url.trim_end_matches('/'));
         let payload = serde_json::to_vec(req).map_err(|e| WardryxError::Decode(e.to_string()))?;
         let mut builder = self
             .http
             .post(&endpoint)
-            .timeout(self.timeout)
+            .timeout(timeout)
             .header("content-type", "application/json")
             .body(payload);
         if let Some(key) = &self.key {
@@ -689,6 +691,38 @@ impl WardryxClient {
     }
 }
 
+/// The rule `/v1/filter-tools` names for a tool wardryx's `deny_tool` refuses
+/// (wardryx invariant 21).
+pub const DENY_TOOL_RULE: &str = "deny_tool";
+
+/// The rule `/v1/filter-tools` names for a tool an `allow_tool` list leaves out
+/// (wardryx invariant 21, and its `allow_tool` rule: no approval lifts it).
+pub const ALLOW_TOOL_RULE: &str = "allow_tool";
+
+/// The rules under which the MCP broker leaves a tool out of a `tools/list`
+/// (invariant 146): the two refusals no approval lifts. Any other rule, and an
+/// entry naming none, leaves the tool listed.
+pub const OUTRIGHT_RULES: [&str; 2] = [DENY_TOOL_RULE, ALLOW_TOOL_RULE];
+
+/// Whether `/v1/filter-tools` refused this tool under a rule in
+/// [`OUTRIGHT_RULES`]: a refusal no approval lifts (invariant 146).
+fn refused_outright(denied: &DeniedTool) -> bool {
+    denied
+        .rule
+        .as_deref()
+        .is_some_and(|rule| OUTRIGHT_RULES.contains(&rule))
+}
+
+/// What wardryx said about the tools of one MCP `tools/list` (invariant 146).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListAnswer {
+    /// Wardryx answered, and these are the names it refuses outright, under a
+    /// rule in [`OUTRIGHT_RULES`]. Empty is a real answer: nothing to leave out.
+    Hide(BTreeSet<String>),
+    /// No answer came back, so nothing is known to be forbidden.
+    NoAnswer,
+}
+
 /// One tool wardryx's policy would deny, from `/v1/filter-tools`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeniedTool {
@@ -698,9 +732,11 @@ pub struct DeniedTool {
 }
 
 /// The result of a `filter_tools` call: which of the requested tool names
-/// wardryx's `deny_tool` rule would remove, and which it would keep. This is
-/// a measurement of what the POLICY says, never an instruction this gateway
-/// acts on in W2a: nothing here changes the forwarded request.
+/// wardryx's `deny_tool` and `allow_tool` rules would remove, and which they
+/// would keep. On the model path it is a measurement and never changes the
+/// forwarded request (invariant 61); the MCP broker leaves the `deny_tool` and
+/// `allow_tool` entries out of a `tools/list` answer and nothing else
+/// (invariant 146).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterOutcome {
     pub allowed: Vec<String>,
@@ -963,6 +999,10 @@ pub struct Wardryx {
     /// other than 404). One line for the process lifetime, distinct from the
     /// 404 warning above.
     warned_filter_other: AtomicBool,
+    /// Whether the MCP broker's listing path has already said that this
+    /// wardryx has no `/v1/filter-tools` route (invariant 146). Its own flag,
+    /// because the line says what the BROKER then does.
+    warned_list_not_found: AtomicBool,
     /// The per-call timeout for a decide that carries a [`ToolCall`], the MCP
     /// broker's question. `TOKENFUSE_MCP_WARDRYX_TIMEOUT_MS` when set, else
     /// the shared `TOKENFUSE_WARDRYX_TIMEOUT_MS` when the operator set it,
@@ -985,6 +1025,7 @@ impl Wardryx {
             filter_cache: FilterCache::new(Duration::from_millis(DEFAULT_CACHE_TTL_MS)),
             warned_filter_not_found: AtomicBool::new(false),
             warned_filter_other: AtomicBool::new(false),
+            warned_list_not_found: AtomicBool::new(false),
             tool_timeout: Duration::from_millis(DEFAULT_TOOL_TIMEOUT_MS),
         }
     }
@@ -1009,6 +1050,7 @@ impl Wardryx {
             filter_cache: FilterCache::new(cache_ttl),
             warned_filter_not_found: AtomicBool::new(false),
             warned_filter_other: AtomicBool::new(false),
+            warned_list_not_found: AtomicBool::new(false),
             tool_timeout: timeout,
         }
     }
@@ -1257,44 +1299,36 @@ impl Wardryx {
         tool_defs: &[(String, usize)],
     ) -> ShadowPruneMeasurement {
         let none = ShadowPruneMeasurement::default();
+        // No client, nothing to ask, and the cache only ever holds what a
+        // client answered, so there is nothing in it either.
+        let Some(client) = &self.client else {
+            return none;
+        };
         let tool_names: Vec<String> = tool_defs.iter().map(|(n, _)| n.clone()).collect();
 
-        let outcome = if let Some(cached) = self.filter_cache.get(agent_id, &tool_names) {
-            cached
-        } else {
-            let Some(client) = &self.client else {
+        let asked = self
+            .filter_through_cache(agent_id, run_id, &tool_names, client.timeout)
+            .await;
+        let outcome = match asked {
+            Ok(outcome) => outcome,
+            Err(WardryxError::FilterRouteNotFound) => {
+                if !self.warned_filter_not_found.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "wardryx has no /v1/filter-tools route (this wardryx predates it); \
+                         shadow tool pruning measures nothing"
+                    );
+                }
                 return none;
-            };
-            let wire = FilterToolsWireRequest {
-                agent_id,
-                run_id,
-                tool_names: &tool_names,
-            };
-            match client.filter_tools(&wire).await {
-                Ok(outcome) => {
-                    self.filter_cache
-                        .put(agent_id, &tool_names, outcome.clone());
-                    outcome
+            }
+            Err(e) => {
+                if !self.warned_filter_other.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        error = %e,
+                        "wardryx filter-tools call failed; shadow tool pruning measures \
+                         nothing for this failure kind"
+                    );
                 }
-                Err(WardryxError::FilterRouteNotFound) => {
-                    if !self.warned_filter_not_found.swap(true, Ordering::SeqCst) {
-                        tracing::warn!(
-                            "wardryx has no /v1/filter-tools route (this wardryx predates it); \
-                             shadow tool pruning measures nothing"
-                        );
-                    }
-                    return none;
-                }
-                Err(e) => {
-                    if !self.warned_filter_other.swap(true, Ordering::SeqCst) {
-                        tracing::warn!(
-                            error = %e,
-                            "wardryx filter-tools call failed; shadow tool pruning measures \
-                             nothing for this failure kind"
-                        );
-                    }
-                    return none;
-                }
+                return none;
             }
         };
 
@@ -1317,6 +1351,91 @@ impl Wardryx {
             // sum (invariant 61, the money path's round-once rule).
             pruned_schema_tokens_est: Some(pruned_bytes / crate::estimate::CHARS_PER_TOKEN),
         }
+    }
+
+    /// The tools of one MCP `tools/list` that wardryx refuses `agent_id`
+    /// outright (invariant 146), asked of `/v1/filter-tools` through the same
+    /// cache as [`Self::measure_shadow_prune`], within the tool path's timeout
+    /// because the MCP broker asks it.
+    ///
+    /// Only an entry whose rule is in [`OUTRIGHT_RULES`] is returned: a tool
+    /// `deny_tool` names, or one an `allow_tool` list leaves out, both refused
+    /// whatever a person approves. A rule a later wardryx may add, and an entry
+    /// naming no rule, are not known to be such a refusal and are not returned.
+    /// A tool the agent holds no grant for is never in the answer at all: its
+    /// call is the one wardryx holds for a person, and a person can only be
+    /// asked about a tool the agent can see.
+    ///
+    /// [`ListAnswer::NoAnswer`] on every failure, which is never cached. A 404
+    /// (a wardryx that predates the route) is said once per process, as on the
+    /// model path; any other failure is said each time, as a failed decide is,
+    /// since it is usually transient and a listing is asked once per session.
+    pub async fn tools_refused_outright(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        tool_names: &[String],
+    ) -> ListAnswer {
+        let asked = self
+            .filter_through_cache(agent_id, run_id, tool_names, self.tool_timeout)
+            .await;
+        match asked {
+            Ok(outcome) => ListAnswer::Hide(
+                outcome
+                    .denied
+                    .into_iter()
+                    .filter(refused_outright)
+                    .map(|d| d.name)
+                    .collect(),
+            ),
+            Err(WardryxError::FilterRouteNotFound) => {
+                if !self.warned_list_not_found.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "wardryx has no /v1/filter-tools route (this wardryx predates it); \
+                         the MCP broker lists every tool its upstream names"
+                    );
+                }
+                ListAnswer::NoAnswer
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "wardryx filter-tools call failed; the MCP broker lists every tool its \
+                     upstream names in this answer"
+                );
+                ListAnswer::NoAnswer
+            }
+        }
+    }
+
+    /// One `/v1/filter-tools` question through the filter cache: an answer
+    /// cached inside the TTL is served again, a fresh answer is stored, and a
+    /// failure is never stored. Shared by the model path's measurement and the
+    /// MCP broker's listing, so the two cannot cache differently.
+    async fn filter_through_cache(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        tool_names: &[String],
+        timeout: Duration,
+    ) -> Result<FilterOutcome, WardryxError> {
+        if let Some(cached) = self.filter_cache.get(agent_id, tool_names) {
+            return Ok(cached);
+        }
+        let Some(client) = &self.client else {
+            return Err(WardryxError::Transport(
+                "wardryx hook has no client configured".to_string(),
+            ));
+        };
+        let wire = FilterToolsWireRequest {
+            agent_id,
+            run_id,
+            tool_names,
+        };
+        let outcome = client.filter_tools(&wire, timeout).await?;
+        let kept = outcome.clone();
+        self.filter_cache.put(agent_id, tool_names, kept);
+        Ok(outcome)
     }
 
     /// Synthesize an outcome for "no verdict came back", per `failmode`:
