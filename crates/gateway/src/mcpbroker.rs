@@ -13,7 +13,11 @@
 //!    configured. The broker holds no signer and mutates nothing: a deny/hold
 //!    is a JSON-RPC refusal. Each gated call emits one `tool_call` audit event.
 //! 3. **Live poisoning + rug-pull scan** - on `tools/list`, run the
-//!    tool-description scanner and diff against a pinned lockfile.
+//!    tool-description scanner and diff against a pinned lockfile. Then, with
+//!    Wardryx enforcing and the caller named, leave out of the listing the
+//!    tools Wardryx refuses that agent outright (`deny_tool`, or outside an
+//!    `allow_tool` list), and nothing else (invariant 146, see
+//!    `narrow_listing`).
 //! 4. **DLP** - block raw secrets in outgoing args and **redact** secrets in tool
 //!    responses so a result can't leak a credential into the model's context.
 //!
@@ -50,7 +54,7 @@
 //! [`something_on_the_door`]), unless the operator opts in with
 //! `TOKENFUSE_MCP_ALLOW_OPEN_BIND`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -65,7 +69,7 @@ use tokenfuse_core::mcp::{self, Lock};
 use tokenfuse_core::{dlp, inject_secrets, DlpMode, SecretVault};
 
 use crate::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
-use crate::wardryx::{DecideContext, ToolCall, Wardryx, WardryxDecision, WardryxMode};
+use crate::wardryx::{DecideContext, ListAnswer, ToolCall, Wardryx, WardryxDecision, WardryxMode};
 use tokenfuse_core::agent_event::{
     dependency_failed_data, Dependency, DependencyEffect, DependencyStage,
 };
@@ -1972,6 +1976,118 @@ fn record_gateway_unanswered(
     crate::events::log_outcome(EventType::DependencyFailed, outcome);
 }
 
+/// The `_tokenfuse` member a shadow broker writes on a `tools/list` answer: how
+/// many listed tools an enforcing broker would leave out (invariant 146).
+const WOULD_HIDE_MEMBER: &str = "tools_would_hide";
+
+/// The names a `tools/list` answer lists, in its order and each once, for the
+/// policy question (invariant 146). Only `result.tools[]`, which is what an MCP
+/// client reads, and only an element whose `name` is a string: anything else
+/// cannot be called by name, so it is not asked about and is never left out.
+fn listed_tool_names(answer: &Value) -> Vec<String> {
+    let Some(tools) = answer.pointer("/result/tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .filter(|name| seen.insert(*name))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether one element of `result.tools[]` is a tool `hide` names.
+fn named_in(tool: &Value, hide: &BTreeSet<String>) -> bool {
+    tool.get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| hide.contains(name))
+}
+
+/// Leave every tool `hide` names out of `answer`'s `result.tools[]`, keeping the
+/// order of the rest, and say how many went.
+fn leave_out(answer: &mut Value, hide: &BTreeSet<String>) -> usize {
+    let Some(tools) = answer
+        .pointer_mut("/result/tools")
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|t| !named_in(t, hide));
+    before - tools.len()
+}
+
+/// How many elements of `answer`'s `result.tools[]` a name in `hide` names.
+fn count_named(answer: &Value, hide: &BTreeSet<String>) -> usize {
+    let Some(tools) = answer.pointer("/result/tools").and_then(Value::as_array) else {
+        return 0;
+    };
+    tools.iter().filter(|t| named_in(t, hide)).count()
+}
+
+/// Narrow a `tools/list` answer to what the policy does not refuse outright
+/// (invariant 146). Wardryx decides, through [`Wardryx::tools_refused_outright`]:
+/// a tool `deny_tool` names or an `allow_tool` list leaves out, refused whatever
+/// a person approves. Under enforce those tools are left out, under shadow
+/// every tool stays and `_tokenfuse.tools_would_hide` says how many would go,
+/// and off asks nothing.
+///
+/// A tool the agent holds no grant for stays listed, because its call is the
+/// one wardryx holds for a person (`when_no_grant`), and a person can only be
+/// asked about a tool the agent can see. With no agent id there is no subject
+/// to ask about, so the answer goes back as the upstream sent it; stdio is
+/// always that case. An answer wardryx could not give leaves the list whole in
+/// every failmode: the list is what an agent may try and decides nothing, and
+/// every call is still judged at the gate, where the failmode applies.
+async fn narrow_listing(st: &BrokerState, ctx: &CallContext, answer: &mut Value) {
+    if st.wardryx.mode == WardryxMode::Off {
+        return;
+    }
+    let Some(agent) = attributed_agent(ctx) else {
+        return;
+    };
+    let names = listed_tool_names(answer);
+    if names.is_empty() {
+        return;
+    }
+    // The run id the policy gate sends for this agent, so both questions name
+    // the same subject.
+    let run = format!("mcp:{agent}");
+    let asked = st.wardryx.tools_refused_outright(agent, &run, &names);
+    let hide = match asked.await {
+        ListAnswer::Hide(hide) => hide,
+        ListAnswer::NoAnswer => return,
+    };
+    if st.wardryx.mode == WardryxMode::Enforce {
+        if !hide.is_empty() {
+            let left_out = leave_out(answer, &hide);
+            tracing::info!(
+                agent = %agent,
+                tools = ?hide,
+                left_out,
+                "mcp broker: tools/list leaves out the tools the policy refuses outright"
+            );
+        }
+        return;
+    }
+    let would = count_named(answer, &hide);
+    if would > 0 {
+        tracing::info!(
+            agent = %agent,
+            tools = ?hide,
+            would,
+            "mcp broker: shadow, tools/list would leave out the tools the policy refuses outright"
+        );
+    }
+    if let Some(obj) = answer.as_object_mut() {
+        let entry = obj.entry("_tokenfuse").or_insert_with(|| json!({}));
+        if let Some(t) = entry.as_object_mut() {
+            t.insert(WOULD_HIDE_MEMBER.into(), json!(would));
+        }
+    }
+}
+
 /// Broker a single JSON-RPC request and return the response - shared by the HTTP
 /// and stdio transports. Injects secrets, scans, forwards, and redacts.
 ///
@@ -2655,6 +2771,13 @@ async fn process_into(
                 );
             }
         }
+    }
+
+    // 2b. What the agent is shown (invariant 146). After the scans, which judge
+    // the whole listing the upstream sent: a poisoned or changed tool is the
+    // server's fault whether or not this agent would see it.
+    if method == "tools/list" {
+        narrow_listing(st, ctx, &mut out).await;
     }
 
     // Shadow mode: surface what the Wardryx gate WOULD have done, having let
