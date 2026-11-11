@@ -444,6 +444,14 @@
         "output_per_mtok_microusd": 55000000
       },
       {
+        "cache_read_per_mtok_microusd": 220000,
+        "cache_write_1h_per_mtok_microusd": 17600000,
+        "cache_write_per_mtok_microusd": 11000000,
+        "input_per_mtok_microusd": 8800000,
+        "model": "anthropic.claude-fable-5-2",
+        "output_per_mtok_microusd": 44000000
+      },
+      {
         "cache_read_per_mtok_microusd": 110000,
         "cache_write_1h_per_mtok_microusd": 2200000,
         "cache_write_per_mtok_microusd": 1375000,
@@ -626,6 +634,14 @@
         "input_per_mtok_microusd": 10000000,
         "model": "claude-fable-5-1",
         "output_per_mtok_microusd": 50000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 200000,
+        "cache_write_1h_per_mtok_microusd": 16000000,
+        "cache_write_per_mtok_microusd": 10000000,
+        "input_per_mtok_microusd": 8000000,
+        "model": "claude-fable-5-2",
+        "output_per_mtok_microusd": 40000000
       },
       {
         "cache_read_per_mtok_microusd": 80000,
