@@ -86,6 +86,16 @@ struct Claude {
 /// because the site could not be fetched directly from this machine. Only
 /// the ids whose page showed all five rates are here; each matched the list.
 const CLAUDE: &[Claude] = &[
+    // Claude Fable 5.2: 8 / 40, cache hits 0.20, writes 10 / 16. Read from
+    // the pricing page's model table on 2026-11-11, where it is listed above
+    // "Additional models" as a current model; the regional rate is list plus
+    // 10 percent as the page states.
+    Claude {
+        rate: (8.00, 40.00, 0.20, 10.00),
+        list: &["claude-fable-5-2"],
+        regional: &["anthropic.claude-fable-5-2"],
+        long: None,
+    },
     // Claude Fable 5.1: 10 / 50, cache hits 0.25 (0.025x), writes 12.50 / 20.
     Claude {
         rate: (10.00, 50.00, 0.25, 12.50),

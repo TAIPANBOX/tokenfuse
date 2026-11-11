@@ -6978,7 +6978,10 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     2026-10-13 (every rate in the book re-confirmed): Sonnet 5.5 its own row, 2 / 10 / 0.10 / 2.50
     / 4; Haiku 5.5 new, `claude-haiku-5-5`, `anthropic/claude-haiku-5.5` at list,
     `anthropic.claude-haiku-5-5` at list plus 10 percent on both tiers, 0.10 / 0.50 / 0.01 / 0.125
-    / 0.20 up to 100,000 prompt tokens and 0.50 / 2.50 / 0.05 / 0.625 / 1 above. OpenAI, Standard
+    / 0.20 up to 100,000 prompt tokens and 0.50 / 2.50 / 0.05 / 0.625 / 1 above. Claude Fable 5.2 was added 2026-11-11 from the same page,
+    where it is listed as a current model: `claude-fable-5-2` at list, 8 / 40 / 0.20 / 10 / 16, and
+    `anthropic.claude-fable-5-2` at list plus 10 percent, 8.80 / 44 / 0.22 / 11 / 17.60; before that
+    it was billed at the fallback's 15 / 75. OpenAI, Standard
     tier, fourteen ids (gpt-6-astra, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol,
     gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4 each with a > 272K tier; gpt-5.4-mini; gpt-4o,
     gpt-4o-mini, o1 re-confirmed), the 1-hour column the write rate, a "-" write column the input
