@@ -1342,9 +1342,15 @@ mod tests {
             ..Default::default()
         };
         assert!(book.is_known("claude-fable-5-2"));
-        assert_eq!(book.cost("claude-fable-5-2", &call), Some(Microusd(1_200_000)));
+        assert_eq!(
+            book.cost("claude-fable-5-2", &call),
+            Some(Microusd(1_200_000))
+        );
         assert!(book.is_known("anthropic.claude-fable-5-2"));
-        assert_eq!(book.cost("anthropic.claude-fable-5-2", &call), Some(Microusd(1_320_000)));
+        assert_eq!(
+            book.cost("anthropic.claude-fable-5-2", &call),
+            Some(Microusd(1_320_000))
+        );
         let p = book.price("claude-fable-5-2").unwrap();
         let cache = p.cache_read_per_mtok.0;
         assert_eq!(cache, 200_000);
