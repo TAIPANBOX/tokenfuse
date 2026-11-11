@@ -86,6 +86,16 @@ struct Claude {
 /// because the site could not be fetched directly from this machine. Only
 /// the ids whose page showed all five rates are here; each matched the list.
 const CLAUDE: &[Claude] = &[
+    // Claude Fable 5.2: 8 / 40, cache hits 0.20, writes 10 / 16. Read from
+    // the pricing page's model table on 2026-11-11, where it is listed above
+    // "Additional models" as a current model; the regional rate is list plus
+    // 10 percent as the page states.
+    Claude {
+        rate: (8.00, 40.00, 0.20, 10.00),
+        list: &["claude-fable-5-2"],
+        regional: &["anthropic.claude-fable-5-2"],
+        long: None,
+    },
     // Claude Fable 5.1: 10 / 50, cache hits 0.25 (0.025x), writes 12.50 / 20.
     Claude {
         rate: (10.00, 50.00, 0.25, 12.50),
@@ -774,6 +784,7 @@ mod tests {
     /// pages cited in `default_price_book` (read 2026-10-07). Deliberately
     /// NOT computed from the table under test: an expectation taken from the
     /// thing it checks cannot fail (invariant 14).
+    const FABLE_5_2: Rates = (8_000_000, 40_000_000, 200_000, 10_000_000, 16_000_000);
     const FABLE_5_1: Rates = (10_000_000, 50_000_000, 250_000, 12_500_000, 20_000_000);
     const FABLE_5: Rates = (10_000_000, 50_000_000, 1_000_000, 12_500_000, 20_000_000);
     const OPUS_5_5: Rates = (4_000_000, 20_000_000, 200_000, 5_000_000, 8_000_000);
@@ -785,6 +796,7 @@ mod tests {
     // Haiku 5.5's base rate, prompts up to 100,000 tokens (read 2026-10-13).
     const HAIKU_5_5: Rates = (100_000, 500_000, 10_000, 125_000, 200_000);
     // Regional / multi-region endpoint: list plus 10 percent, by hand.
+    const FABLE_5_2_R: Rates = (8_800_000, 44_000_000, 220_000, 11_000_000, 17_600_000);
     const FABLE_5_1_R: Rates = (11_000_000, 55_000_000, 275_000, 13_750_000, 22_000_000);
     const FABLE_5_R: Rates = (11_000_000, 55_000_000, 1_100_000, 13_750_000, 22_000_000);
     const OPUS_5_5_R: Rates = (4_400_000, 22_000_000, 220_000, 5_500_000, 8_800_000);
@@ -799,6 +811,7 @@ mod tests {
         vec![
             // Claude API ids (also the Google Cloud and Foundry id for the
             // dateless models).
+            ("claude-fable-5-2", FABLE_5_2),
             ("claude-fable-5-1", FABLE_5_1),
             ("claude-fable-5", FABLE_5),
             ("claude-opus-5-5", OPUS_5_5),
@@ -822,6 +835,7 @@ mod tests {
             ("claude-sonnet-4-5@20250929", SONNET_4_6_R),
             ("claude-haiku-4-5@20251001", HAIKU_4_5_R),
             // Amazon Bedrock Messages-API ids: endpoint not visible in the id.
+            ("anthropic.claude-fable-5-2", FABLE_5_2_R),
             ("anthropic.claude-fable-5-1", FABLE_5_1_R),
             ("anthropic.claude-fable-5", FABLE_5_R),
             ("anthropic.claude-opus-5-5", OPUS_5_5_R),
@@ -1310,6 +1324,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(book.cost("gpt-6.1-sol", &usage), Some(Microusd(1_215_000)));
+    }
+
+    /// Claude Fable 5.2 is a current Anthropic model (its pricing page lists it
+    /// above "Additional models", read 2026-11-11), so it is priced at its own
+    /// row and not at the fallback's 15 / 75. Short call, 100000 input and
+    /// 10000 output at 8 / 40: 800,000 + 400,000 = 1,200,000 micro-USD. At the
+    /// fallback the same call is 1,500,000 + 750,000 = 2,250,000. The Bedrock
+    /// id is list plus 10 percent (8.80 / 44): 880,000 + 440,000 = 1,320,000.
+    /// Cache read 0.20, writes 10 / 16.
+    #[test]
+    fn claude_fable_5_2_is_priced_at_its_own_row_not_the_fallback() {
+        let book = default_price_book();
+        let call = Usage {
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        };
+        assert!(book.is_known("claude-fable-5-2"));
+        assert_eq!(
+            book.cost("claude-fable-5-2", &call),
+            Some(Microusd(1_200_000))
+        );
+        assert!(book.is_known("anthropic.claude-fable-5-2"));
+        assert_eq!(
+            book.cost("anthropic.claude-fable-5-2", &call),
+            Some(Microusd(1_320_000))
+        );
+        let p = book.price("claude-fable-5-2").unwrap();
+        let cache = p.cache_read_per_mtok.0;
+        assert_eq!(cache, 200_000);
+        assert_eq!(p.cache_write_per_mtok.0, 10_000_000);
+        assert_eq!(p.cache_write_1h_per_mtok.0, 16_000_000);
     }
 
     /// gpt-6.1-terra is a current OpenAI model (its page lists it, read
