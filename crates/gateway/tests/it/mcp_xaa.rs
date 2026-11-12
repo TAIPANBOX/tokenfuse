@@ -399,6 +399,31 @@ async fn a_bearer_credential_alongside_a_dpop_header_is_refused() {
     assert_eq!(resp.status(), 401);
 }
 
+/// A delegation in its own header (invariant 147) is a second credential too:
+/// the XAA door never reads it, so it refuses rather than quietly dropping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bearer_credential_alongside_a_delegation_header_is_refused() {
+    let issuer = Key::new();
+    let upstream = spawn_server(Router::new().route("/", post(stub))).await;
+    let broker_url = spawn_server(xaa_router(upstream, &issuer)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let now = tokenfuse_gateway::sink::now_millis() / 1000;
+    let good = access_token(&issuer, now, json!({"aud": RESOURCE}));
+    let resp = call(
+        &broker_url,
+        &[
+            ("authorization", &format!("Bearer {good}")),
+            (
+                tokenfuse_gateway::chainproof::DELEGATION_HEADER,
+                "anything-at-all",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(resp.status(), 401);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declared_chain_that_disagrees_with_the_xaa_token_is_refused() {
     let issuer = Key::new();

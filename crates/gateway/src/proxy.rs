@@ -1054,20 +1054,14 @@ async fn handle_call(
     // a cap of three capped a number the caller chose. The rule lives in
     // `chainproof` because the MCP broker applies the same one.
     let chain_now = crate::sink::now_millis() / 1000;
-    let resolved = crate::chainproof::resolve(
+    let resolved = crate::chainproof::resolve_at_door(
         &st.chain_proof,
         // An agent token admitted this call: the `Authorization` it came in is
-        // the door credential, never a delegation chain as well.
-        if caller.agent.is_some() {
-            None
-        } else {
-            crate::chainproof::dpop_credential(
-                headers.get("authorization").and_then(|v| v.to_str().ok()),
-            )
-        },
-        headers
-            .get(crate::mcpdoor::PROOF_HEADER)
-            .and_then(|v| v.to_str().ok()),
+        // the door credential, never a delegation chain as well. A person's
+        // delegation rides beside it in its own header, held to that token's
+        // key and agent (invariant 147).
+        caller.agent.as_ref(),
+        &crate::chainproof::presented(&headers),
         "POST",
         // The door this call actually arrived on, not a literal. Until
         // 2026-09-27 this named `/v1/messages` regardless of `wire`: on a

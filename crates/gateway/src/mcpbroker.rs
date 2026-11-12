@@ -1414,6 +1414,32 @@ async fn handle(
                 Ok(d) => d,
                 Err(resp) => return resp,
             };
+            // The token proves the agent and acts for nobody; a person's
+            // delegation rides beside it in its own header, held to the
+            // token's key and agent, and is then the chain (invariant 147).
+            // Without one, a declared chain stays a claim, as it is beside a
+            // client key.
+            let resolved = crate::chainproof::resolve_at_door(
+                &st.chain_proof,
+                Some(&agent),
+                &crate::chainproof::presented(&headers),
+                "POST",
+                uri.path(),
+                &declared,
+                now,
+                crate::revocations::hook(&st.revocations, now),
+                &st.agent_tokens,
+            );
+            let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
+            let (on_behalf_of, delegation_proof) = match resolved {
+                crate::chainproof::Chain::Refused(why) => {
+                    crate::chainproof::log_delegation_refusal("mcp_broker", why);
+                    return delegation_refused(&st);
+                }
+                crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
+                crate::chainproof::Chain::Claimed(chain) => (chain, None),
+            };
+            let chain_proven = delegation_proof.is_some();
             let token = crate::chainproof::dpop_credential(header("authorization").as_deref())
                 .map(str::to_string);
             // The token the policy plane is shown (invariant 140), within the cap.
@@ -1422,15 +1448,15 @@ async fn handle(
             let pdp_proof = crate::agenttoken::proof_for_pdp(&headers);
             let ctx = CallContext {
                 agent_id: Some(agent.subject.clone()),
-                // The token proves the agent, not a delegation: a declared
-                // chain stays a claim, as it is beside a client key.
-                proven_actor: None,
+                // The agent a proven delegation names last, which is the
+                // token's own agent by construction; none without one.
+                proven_actor,
                 event_agent_id: Some(agent.subject.clone()),
                 upstream: header("x-fuse-mcp-upstream"),
                 run_id: header("x-fuse-run-id"),
-                on_behalf_of: declared,
-                chain_proven: false,
-                delegation_proof: None,
+                on_behalf_of,
+                chain_proven,
+                delegation_proof,
                 // The proof of possession was verified at this door.
                 attestation_method: Some(crate::attestation::from_door(true).to_string()),
                 approval_token: header("x-fuse-approval-token"),
@@ -1454,7 +1480,9 @@ async fn handle(
             // not a fall-back opportunity, it is confusion or a probe, and
             // `mcpdoor`'s own composition rule (invariant 30) already treats
             // "presented a proof, judged by it" the same way one door over.
-            if header(CLIENT_KEY_HEADER).is_some() || header(crate::mcpdoor::PROOF_HEADER).is_some()
+            if header(CLIENT_KEY_HEADER).is_some()
+                || header(crate::mcpdoor::PROOF_HEADER).is_some()
+                || headers.contains_key(crate::chainproof::DELEGATION_HEADER)
             {
                 tracing::warn!(
                     "mcp broker: refused a call presenting an XAA bearer token alongside \
@@ -1620,10 +1648,13 @@ async fn handle(
     // Who this caller acts FOR, and whether anybody proved it. The rule is in
     // `chainproof` because the LLM proxy applies the same one, and a rule
     // written twice becomes two rules.
-    let resolved = crate::chainproof::resolve(
+    let resolved = crate::chainproof::resolve_at_door(
         &st.chain_proof,
-        crate::chainproof::dpop_credential(header("authorization").as_deref()),
-        header(crate::mcpdoor::PROOF_HEADER).as_deref(),
+        // No agent token admitted this call, so a delegation in the second
+        // header is refused there (invariant 147) and `Authorization` is read
+        // as it always was.
+        None,
+        &crate::chainproof::presented(&headers),
         "POST",
         uri.path(),
         &declared,
