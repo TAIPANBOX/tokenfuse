@@ -255,7 +255,70 @@ for the broker set `TOKENFUSE_MCP_AGENT_TOKENS_STATIC_KEYS` the same way against
 list when it has.
 
 What it does not do: a delegation token is still not a door credential, so
-under `require` a delegated call is refused. The key set is read at startup, so
+under `require` a delegation alone is refused; section 8 carries one beside the
+agent's own token. The key set is read at startup, so
 a vouchryx key rotation needs a restart. The replay cache is per process.
 Nothing here has run against a live vouchryx; the tests mint what vouchryx
 mints (`tokenfuse_delegation::testing::agent_token`).
+
+## 8. A person's delegation beside the agent's token
+
+Section 7 left one call without a door: an agent acting for a person under
+`require`. The agent's token is the door credential and acts for nobody, the
+person's delegation from vouchryx is not a door credential, and the request had
+one `Authorization` header for two tokens, so the call was refused.
+
+The delegation now travels in a header of its own (CLAUDE.md invariant 147):
+
+| Header | Holds |
+|---|---|
+| `Authorization: DPoP <agent token>` | the door credential, as in section 7 |
+| `DPoP` | the agent token's proof, naming it in `ath` |
+| `x-fuse-delegation` | the person's delegation token, the compact JWS with no scheme |
+| `x-fuse-delegation-dpop` | the delegation's own proof: signed with the same key, for this request's method and URL, naming the delegation in `ath` |
+
+`chainproof::resolve_at_door`, which both doors call, proves the chain from the
+delegation when all of these hold, and refuses the call otherwise:
+
+- it verifies as any delegation does (section 1): signature, issuer, audience,
+  expiry, binding and proof;
+- its proof names it in `ath`. Required here, where a delegation in
+  `Authorization` is checked only when its proof carries one, because no client
+  predates this path;
+- it is bound to the same key as the agent token (`cnf.jkt` equal), so both
+  were issued to one holder;
+- its last actor is the agent the agent token proves, so it authorises this
+  agent and no other;
+- its proof is new to the replay cache of section 7, which the agent token's
+  proofs share;
+- the revocation list names none of its parties, so withdrawing the person at
+  vouchryx stops the agent acting for them within one poll (section 3);
+- a declared `x-fuse-on-behalf-of`, when sent, agrees with it (section 1).
+
+The policy plane then gets `on_behalf_of` from the delegation with
+`chain_proven: true`, beside `identity_source: agent-token` and the agent's own
+token (section 7), so `require_root_principal`, `max_chain_depth` and
+`deny_if_chain_unproven` judge the person's chain rather than a claim. The
+record carries the delegation's `delegation_proof` (section 5).
+
+What the second header is not:
+
+- **Not a door credential.** Under `require` a delegation with no agent token is
+  refused as before: in `Authorization` it gets `401 agent_token_required`.
+- **Not read beside anything else.** Beside a static key, a client's proof of
+  possession or no credential, `x-fuse-delegation` has no agent to be held to,
+  and is refused rather than dropped, because dropping it would turn a proof the
+  caller sent into an unproven claim. The XAA door refuses it as a second
+  credential.
+- **Not read with no issuer configured**, like every chain then (section 1).
+- **Not sent twice.** Either header repeated is refused.
+
+Every refusal is the same `401 delegation_refused`, and the operator's log names
+the cause: `NotTheAgentsKey`, `NotTheAgentsChain`, `Unanchored`, or the
+delegation crate's own refusal. Neither header leaves the process: the provider
+request and the MCP upstream request are built from lists that name neither.
+
+A client signs two proofs per request with the agent's key, each with its own
+`jti`: one naming the agent token (`DPoP`), one naming the delegation
+(`x-fuse-delegation-dpop`). A proxy in front of the gateway must forward both new
+headers.

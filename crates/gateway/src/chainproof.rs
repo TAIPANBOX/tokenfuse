@@ -321,10 +321,30 @@ pub fn resolve_at_door(
     revoked: impl Fn(&str, &str, i64) -> bool,
     tokens: &crate::agenttoken::Tokens,
 ) -> Chain {
-    // Red-first stub: today's behaviour through the new entry point.
-    match agent {
-        Some(_) => Chain::Claimed(declared.to_vec()),
-        None => resolve(
+    let Some(proving) = cfg.as_ref() else {
+        return Chain::Claimed(declared.to_vec());
+    };
+    match (agent, presented.delegation) {
+        // Two delegations, or two proofs, is a caller asking which one this
+        // code believes; the answer is neither.
+        (Some(_), Some(_)) if presented.repeated => {
+            Chain::Refused(ChainRefusal::BadToken(Refusal::Malformed))
+        }
+        (Some(agent), Some(token)) => beside_agent(
+            proving,
+            agent,
+            token,
+            presented.delegation_proof,
+            method,
+            url,
+            declared,
+            now,
+            revoked,
+            tokens,
+        ),
+        (Some(_), None) => Chain::Claimed(declared.to_vec()),
+        (None, Some(_)) => Chain::Refused(ChainRefusal::Unanchored),
+        (None, None) => resolve(
             cfg,
             presented.authorization,
             presented.proof,
@@ -336,6 +356,54 @@ pub fn resolve_at_door(
             tokens,
         ),
     }
+}
+
+/// A delegation that rides beside the agent token which admitted the call.
+#[allow(clippy::too_many_arguments)]
+fn beside_agent(
+    proving: &Proving,
+    agent: &VerifiedAgent,
+    token: &str,
+    proof: Option<&str>,
+    method: &str,
+    url: &str,
+    declared: &[String],
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+    tokens: &crate::agenttoken::Tokens,
+) -> Chain {
+    // An agent token is admitted only with that door on, so this has a replay
+    // cache; without one a proof could not be held to one use.
+    let Some(tokens) = tokens.as_ref() else {
+        return Chain::Refused(ChainRefusal::Unanchored);
+    };
+    let verified = match verify(proving, token, proof, method, url, now, revoked) {
+        Ok(v) => v,
+        Err(why) => return Chain::Refused(why),
+    };
+    // RFC 9449 4.2, required here and not only when present: this path is new,
+    // so no client predates it, and without `ath` the proof could have been
+    // made for any token bound to the same key.
+    let ath = tokenfuse_dpop::access_token_hash(token);
+    if verified.proof_ath.as_deref() != Some(ath.as_str()) {
+        return Chain::Refused(ChainRefusal::BadToken(Refusal::WrongKey));
+    }
+    if verified.jkt != agent.jkt {
+        return Chain::Refused(ChainRefusal::NotTheAgentsKey);
+    }
+    // `chain_of` puts the current actor LAST (see `proven_actor`). Compared
+    // exactly: the agent token's subject is canonical (the door refused it
+    // otherwise), and a near match is somebody else.
+    if verified.chain.last() != Some(&agent.subject) {
+        return Chain::Refused(ChainRefusal::NotTheAgentsChain);
+    }
+    if !tokens.first_use(&verified.proof_jti, now) {
+        return Chain::Refused(ChainRefusal::Replayed);
+    }
+    if !declared.is_empty() && !same_chain(declared, &verified.chain) {
+        return Chain::Refused(ChainRefusal::Contradicted);
+    }
+    proven(proving, verified)
 }
 
 /// Verify a delegation token and its proof for this request.

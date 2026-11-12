@@ -2320,6 +2320,47 @@ run_case "no-reader-leaves-a-pipe-early: no workflow step is read" fail \
 	"$(py 'edit("scripts/no-reader-leaves-a-pipe-early.sh", "elif path.startswith(\".github/workflows/\") and", "elif path.startswith(\".github/flows/\") and")')" \
 	'measured NOTHING'
 
+# --- invariant 147: a person's delegation beside the agent token -----------
+#
+# Product mutants, held by cargo test: each is a way the chain door would take
+# a delegation the agent token cannot vouch for, or drop the one it can. Every
+# planted text still uses what it disables, so it compiles under CI's
+# `RUSTFLAGS=-D warnings`.
+run_case "delegation-beside: the key check removed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact chainproof::beside_agent_tests::a_delegation_bound_to_another_key_than_the_agent_token_is_refused" \
+	"$(py 'edit("crates/gateway/src/chainproof.rs", "    if verified.jkt != agent.jkt {", "    if false && verified.jkt != agent.jkt {")')" \
+	"a_delegation_bound_to_another_key_than_the_agent_token_is_refused ... FAILED"
+
+run_case "delegation-beside: the actor check removed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact chainproof::beside_agent_tests::a_delegation_whose_last_actor_is_not_the_agent_is_refused" \
+	"$(py 'edit("crates/gateway/src/chainproof.rs", "    if verified.chain.last() != Some(&agent.subject) {", "    if false && verified.chain.last() != Some(&agent.subject) {")')" \
+	"a_delegation_whose_last_actor_is_not_the_agent_is_refused ... FAILED"
+
+run_case "delegation-beside: the proof's ath not required" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact chainproof::beside_agent_tests::a_delegation_proof_must_name_the_delegation" \
+	"$(py 'edit("crates/gateway/src/chainproof.rs", "    if verified.proof_ath.as_deref() != Some(ath.as_str()) {", "    if false && verified.proof_ath.as_deref() != Some(ath.as_str()) {")')" \
+	"a_delegation_proof_must_name_the_delegation ... FAILED"
+
+run_case "delegation-beside: the replay check removed" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact chainproof::beside_agent_tests::a_delegation_proof_is_single_use_beside_an_agent_token" \
+	"$(py 'edit("crates/gateway/src/chainproof.rs", "ChainRefusal::NotTheAgentsChain);\n    }\n    if !tokens.first_use(", "ChainRefusal::NotTheAgentsChain);\n    }\n    if false && !tokens.first_use(")')" \
+	"a_delegation_proof_is_single_use_beside_an_agent_token ... FAILED"
+
+run_case "delegation-beside: the revocation hook not passed at the LLM door" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegation_beside_agent_token::a_revoked_person_stops_the_agent_acting_for_them" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        crate::revocations::hook(&st.revocations, chain_now),", "        crate::revocations::hook(&st.revocations.clone().filter(|_| false), chain_now),")')" \
+	"a_revoked_person_stops_the_agent_acting_for_them ... FAILED"
+
+run_case "delegation-beside: the header with no agent token read as a claim" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact chainproof::beside_agent_tests::a_delegation_header_with_no_agent_token_is_refused" \
+	"$(py 'edit("crates/gateway/src/chainproof.rs", "        (None, Some(_)) => Chain::Refused(ChainRefusal::Unanchored),", "        (None, Some(_)) => Chain::Claimed(declared.to_vec()),")')" \
+	"a_delegation_header_with_no_agent_token_is_refused ... FAILED"
+
+run_case "delegation-beside: the broker tells the policy plane nothing was proven" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_agent_token::the_broker_tells_the_pdp_a_persons_delegation_beside_the_agent_token_is_proven" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "                on_behalf_of,\n                chain_proven,\n", "                on_behalf_of,\n                chain_proven: false && chain_proven,\n")')" \
+	"the_broker_tells_the_pdp_a_persons_delegation_beside_the_agent_token_is_proven ... FAILED"
+
 # --- every gate in scripts/ has a case here ---------------------------------
 #
 # This harness is a hand-written list of cases, which is the shape that goes

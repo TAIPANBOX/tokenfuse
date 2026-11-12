@@ -1480,7 +1480,9 @@ async fn handle(
             // not a fall-back opportunity, it is confusion or a probe, and
             // `mcpdoor`'s own composition rule (invariant 30) already treats
             // "presented a proof, judged by it" the same way one door over.
-            if header(CLIENT_KEY_HEADER).is_some() || header(crate::mcpdoor::PROOF_HEADER).is_some()
+            if header(CLIENT_KEY_HEADER).is_some()
+                || header(crate::mcpdoor::PROOF_HEADER).is_some()
+                || headers.contains_key(crate::chainproof::DELEGATION_HEADER)
             {
                 tracing::warn!(
                     "mcp broker: refused a call presenting an XAA bearer token alongside \
