@@ -89,11 +89,9 @@ jobs:
       - name: Test
         # The output is kept: the stated-numbers gate below counts the tests from
         # THIS run instead of running the whole suite a second time to count it.
-        # --no-fail-fast: a red-first commit shows every test binary that fails,
-        # not only the first one cargo reached; a green run is unchanged.
         run: |
           set -o pipefail
-          cargo test --all --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/cargo-test-all.txt"
+          cargo test --all 2>&1 | tee "$RUNNER_TEMP/cargo-test-all.txt"
       - name: Test (cluster feature, raft-backed ledger)
         run: cargo test -p tokenfuse-gateway --features cluster --test cluster_backend
       - name: tokenfuse-core stays dependency-minimal
