@@ -25,6 +25,7 @@ mod check_tool_call_answers_its_callers_runs;
 mod closure_reaches_the_cloud;
 mod codex_money_review;
 mod declared_tools_are_read;
+mod delegation_beside_agent_token;
 mod delegation_htu_matches_wire;
 mod dlp_shadow_on_the_bus;
 mod event_checkpoints;

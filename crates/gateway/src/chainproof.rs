@@ -44,7 +44,26 @@
 
 use std::sync::Arc;
 
-use tokenfuse_delegation::{verify_delegation, DelegationConfig, KeySource, Refusal};
+use axum::http::HeaderMap;
+use tokenfuse_delegation::{
+    verify_delegation, DelegationConfig, KeySource, Refusal, VerifiedAgent, VerifiedDelegation,
+};
+
+/// The header a person's delegation token travels in BESIDE an agent token
+/// (CLAUDE.md invariant 147).
+///
+/// `Authorization` already holds the agent's own token, which is the door
+/// credential and acts for nobody (invariant 123), so a call that also acts
+/// for a person needs a second slot for the token that says so. Read only when
+/// an agent token admitted the call; anywhere else it is refused rather than
+/// ignored, see [`resolve_at_door`].
+pub const DELEGATION_HEADER: &str = "x-fuse-delegation";
+
+/// The RFC 9449 proof made for the token in [`DELEGATION_HEADER`]: signed by
+/// the key the agent token is bound to, for this request's method and URL, and
+/// naming the delegation in `ath`. A header of its own because `DPoP` already
+/// carries the agent token's proof, and one proof names one token.
+pub const DELEGATION_PROOF_HEADER: &str = "x-fuse-delegation-dpop";
 
 /// The most entries a declared chain may carry: agent-passport SPEC 5.1's
 /// "Maximum chain depth is 32 entries", read from the delegation crate rather
@@ -153,6 +172,58 @@ pub enum ChainRefusal {
     /// With agent tokens on, the proof's `jti` was used before inside its
     /// window: every proof this process verifies is then single-use.
     Replayed,
+    /// A delegation in [`DELEGATION_HEADER`] on a call no agent token
+    /// admitted: there is no agent for it to be checked against.
+    Unanchored,
+    /// A delegation beside an agent token, bound to a different key than the
+    /// agent token is: the two were not issued to one holder.
+    NotTheAgentsKey,
+    /// A delegation beside an agent token whose last actor is not the agent
+    /// the token proves: it authorises somebody else to act.
+    NotTheAgentsChain,
+}
+
+/// What one request presented to the chain door, read from its headers once,
+/// so the two doors cannot read them two ways.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Presented<'a> {
+    /// A `DPoP`-scheme credential in `Authorization` ([`dpop_credential`]).
+    pub authorization: Option<&'a str>,
+    /// The RFC 9449 `DPoP` header.
+    pub proof: Option<&'a str>,
+    /// [`DELEGATION_HEADER`]. A header the caller sent is `Some` even when
+    /// its value is blank or not text: a credential slot somebody filled is
+    /// never read as one nobody filled.
+    pub delegation: Option<&'a str>,
+    /// [`DELEGATION_PROOF_HEADER`], read the same way.
+    pub delegation_proof: Option<&'a str>,
+    /// Either delegation header arrived more than once.
+    pub repeated: bool,
+}
+
+/// Read [`Presented`] from a request's headers.
+pub fn presented(headers: &HeaderMap) -> Presented<'_> {
+    Presented {
+        authorization: dpop_credential(text(headers, "authorization")),
+        proof: text(headers, crate::mcpdoor::PROOF_HEADER),
+        delegation: filled(headers, DELEGATION_HEADER),
+        delegation_proof: filled(headers, DELEGATION_PROOF_HEADER),
+        repeated: [DELEGATION_HEADER, DELEGATION_PROOF_HEADER]
+            .iter()
+            .any(|name| headers.get_all(*name).iter().count() > 1),
+    }
+}
+
+/// A header's value as text, `None` when absent or not text.
+fn text<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// A header the caller sent, trimmed, `""` when its value is not text.
+fn filled<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers
+        .get(name)
+        .map(|v| v.to_str().map(str::trim).unwrap_or_default())
 }
 
 /// Read a `DPoP`-scheme credential out of an `Authorization` header.
@@ -191,26 +262,9 @@ pub fn resolve(
         return Chain::Claimed(declared.to_vec());
     };
 
-    let url = proving.expected_url(proof, url);
-    let verified = match verify_delegation(&proving.cfg, token, proof, method, &url, now, revoked) {
+    let verified = match verify(proving, token, proof, method, url, now, revoked) {
         Ok(v) => v,
-        // Every refusal is the same answer on the wire, for the reason
-        // `mcpdoor::DoorRefusal` gives: which of them it was is an oracle a
-        // caller must not be handed. Matched exhaustively rather than with a
-        // wildcard, so a variant added to `Refusal` later fails to compile here
-        // instead of silently joining this arm.
-        Err(
-            reason @ (Refusal::Malformed
-            | Refusal::BadSignature
-            | Refusal::Issuer
-            | Refusal::Audience
-            | Refusal::Expired
-            | Refusal::NotBound
-            | Refusal::NoProof
-            | Refusal::WrongKey
-            | Refusal::Revoked
-            | Refusal::NotYetValid),
-        ) => return Chain::Refused(ChainRefusal::BadToken(reason)),
+        Err(why) => return Chain::Refused(why),
     };
 
     // With agent tokens on (invariant 123), every proof this process verifies
@@ -232,6 +286,93 @@ pub fn resolve(
     if !declared.is_empty() && !same_chain(declared, &verified.chain) {
         return Chain::Refused(ChainRefusal::Contradicted);
     }
+    proven(proving, verified)
+}
+
+/// Resolve one request's chain at a door, given the agent token that admitted
+/// the call, if one did. Both doors call this and nothing else.
+///
+/// # The rule (CLAUDE.md invariant 147)
+///
+/// - **No issuer configured: nothing changes.** Every chain is a claim, as
+///   [`resolve`] has always answered.
+/// - **An agent token admitted the call and a delegation rides beside it**
+///   in [`DELEGATION_HEADER`]: the delegation is verified with its own proof
+///   ([`DELEGATION_PROOF_HEADER`]), and must be bound to the agent token's key,
+///   name the agent as its last actor, name itself in the proof's `ath`, use
+///   its proof once, and pass the revocation list for every party it names.
+///   Then the chain is the delegation's and it is proven.
+/// - **An agent token admitted the call and no delegation rides beside it**:
+///   the declared chain stays a claim, as it always did. `Authorization` held
+///   the door credential, which acts for nobody.
+/// - **A delegation in [`DELEGATION_HEADER`] with no agent token** is refused.
+///   There is no agent to check it against, and ignoring it would hand the
+///   policy plane an unproven chain from a caller who sent a proof.
+/// - **Otherwise** [`resolve`] reads `Authorization`, as before.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_at_door(
+    cfg: &ChainProof,
+    agent: Option<&VerifiedAgent>,
+    presented: &Presented<'_>,
+    method: &str,
+    url: &str,
+    declared: &[String],
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+    tokens: &crate::agenttoken::Tokens,
+) -> Chain {
+    // Red-first stub: today's behaviour through the new entry point.
+    match agent {
+        Some(_) => Chain::Claimed(declared.to_vec()),
+        None => resolve(
+            cfg,
+            presented.authorization,
+            presented.proof,
+            method,
+            url,
+            declared,
+            now,
+            revoked,
+            tokens,
+        ),
+    }
+}
+
+/// Verify a delegation token and its proof for this request.
+fn verify(
+    proving: &Proving,
+    token: &str,
+    proof: Option<&str>,
+    method: &str,
+    url: &str,
+    now: i64,
+    revoked: impl Fn(&str, &str, i64) -> bool,
+) -> Result<VerifiedDelegation, ChainRefusal> {
+    let url = proving.expected_url(proof, url);
+    match verify_delegation(&proving.cfg, token, proof, method, &url, now, revoked) {
+        Ok(v) => Ok(v),
+        // Every refusal is the same answer on the wire, for the reason
+        // `mcpdoor::DoorRefusal` gives: which of them it was is an oracle a
+        // caller must not be handed. Matched exhaustively rather than with a
+        // wildcard, so a variant added to `Refusal` later fails to compile here
+        // instead of silently joining this arm.
+        Err(
+            reason @ (Refusal::Malformed
+            | Refusal::BadSignature
+            | Refusal::Issuer
+            | Refusal::Audience
+            | Refusal::Expired
+            | Refusal::NotBound
+            | Refusal::NoProof
+            | Refusal::WrongKey
+            | Refusal::Revoked
+            | Refusal::NotYetValid),
+        ) => Err(ChainRefusal::BadToken(reason)),
+    }
+}
+
+/// The proven chain a verified delegation stands for, with what proved it.
+fn proven(proving: &Proving, verified: VerifiedDelegation) -> Chain {
     // `iss` comes from the CONFIG rather than from the token, because
     // `verify_delegation` matched the token's `iss` against it exactly. Reading
     // it back off the token would record what the token claimed; reading it off
@@ -316,6 +457,27 @@ pub(crate) fn log_delegation_refusal(door: &'static str, why: ChainRefusal) {
             tracing::warn!(
                 door,
                 "refused a delegation token: its proof was used before"
+            );
+        }
+        ChainRefusal::Unanchored => {
+            tracing::warn!(
+                door,
+                "refused a delegation token: x-fuse-delegation came on a call no agent token \
+                 admitted"
+            );
+        }
+        ChainRefusal::NotTheAgentsKey => {
+            tracing::warn!(
+                door,
+                "refused a delegation token: it is bound to another key than the agent token \
+                 beside it"
+            );
+        }
+        ChainRefusal::NotTheAgentsChain => {
+            tracing::warn!(
+                door,
+                "refused a delegation token: its last actor is not the agent its agent token \
+                 proves"
             );
         }
     }
@@ -992,5 +1154,331 @@ mod origin_list_tests {
         assert!(origins_from_values("", "https://a.example,")
             .unwrap_err()
             .contains("TOKENFUSE_DELEGATION_ORIGINS"));
+    }
+}
+
+/// A person's delegation beside the agent token that admitted the call
+/// (CLAUDE.md invariant 147).
+#[cfg(test)]
+mod beside_agent_tests {
+    use super::*;
+    use crate::agenttoken::{AgentTokens, Mode, Tokens};
+    use serde_json::json;
+    use tokenfuse_delegation::testing::{agent_token, cfg, never, proof_at, proof_for, token, Key};
+
+    const ORIGIN: &str = "https://tokenfuse.acme.example";
+    const PATH: &str = "/v1/messages";
+    const NOW: i64 = 1_800_000_000;
+
+    struct Fixture {
+        issuer: Key,
+        holder: Key,
+        proving: ChainProof,
+        tokens: Tokens,
+        agent: VerifiedAgent,
+    }
+
+    fn url() -> String {
+        format!("{ORIGIN}{PATH}")
+    }
+
+    /// An agent token verified at the door, exactly as `agenttoken::admit`
+    /// verifies one, so the agent the delegation is held to is a real one.
+    fn fixture() -> Fixture {
+        let (issuer, holder) = (Key::new(), Key::new());
+        let config = cfg(&issuer);
+        let agent_tok = agent_token(&issuer, &holder, NOW, json!({}));
+        let agent_proof = proof_for(&holder, NOW, "POST", &url(), "p-agent", &agent_tok);
+        let agent = tokenfuse_delegation::verify_agent_token(
+            &config,
+            &agent_tok,
+            Some(&agent_proof),
+            "POST",
+            &url(),
+            NOW,
+            never,
+        )
+        .expect("the fixture's agent token verifies");
+        Fixture {
+            issuer,
+            holder,
+            proving: Some(Arc::new(Proving {
+                cfg: config,
+                origins: vec![ORIGIN.to_string()],
+            })),
+            tokens: Some(Arc::new(AgentTokens::new(Mode::Require))),
+            agent,
+        }
+    }
+
+    /// The fixture's delegation (`user://acme/alice`, then `agent://acme/runbook`,
+    /// then the agent token's own `agent://acme/triage`) bound to `holder`.
+    fn delegation(f: &Fixture, holder: &Key, over: serde_json::Value) -> String {
+        token(&f.issuer, holder, NOW, over)
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    fn at_door(
+        f: &Fixture,
+        agent: Option<&VerifiedAgent>,
+        h: &HeaderMap,
+        declared: &[String],
+        revoked: impl Fn(&str, &str, i64) -> bool,
+    ) -> Chain {
+        resolve_at_door(
+            &f.proving,
+            agent,
+            &presented(h),
+            "POST",
+            PATH,
+            declared,
+            NOW,
+            revoked,
+            &f.tokens,
+        )
+    }
+
+    fn beside(f: &Fixture, tok: &str, proof: &str) -> Chain {
+        let h = headers(&[(DELEGATION_HEADER, tok), (DELEGATION_PROOF_HEADER, proof)]);
+        at_door(f, Some(&f.agent), &h, &[], never)
+    }
+
+    /// THE ONE THIS IS FOR. Under `require`, the agent's token admitted the
+    /// call, and the person's delegation beside it is what the chain becomes:
+    /// proven, the person at the root and the agent last, with the
+    /// delegation's own proof on the record.
+    #[test]
+    fn a_delegation_beside_an_agent_token_is_proven_and_names_the_person() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({"jti": "deleg-1"}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-deleg", &tok);
+        let Chain::Proven { chain, proof } = beside(&f, &tok, &pf) else {
+            panic!("a delegation beside its agent token did not resolve as proven");
+        };
+        assert_eq!(
+            chain,
+            vec![
+                "user://acme/alice",
+                "agent://acme/runbook",
+                "agent://acme/triage"
+            ]
+        );
+        assert_eq!(proof.jti, "deleg-1", "the record names the delegation");
+        assert_eq!(proof.jkt, f.agent.jkt, "bound to the agent token's key");
+    }
+
+    /// Bound to another key: the two tokens were not issued to one holder, so
+    /// the delegation is somebody else's, whoever signed its proof.
+    #[test]
+    fn a_delegation_bound_to_another_key_than_the_agent_token_is_refused() {
+        let f = fixture();
+        let other = Key::new();
+        let tok = delegation(&f, &other, json!({}));
+        let pf = proof_for(&other, NOW, "POST", &url(), "p-other", &tok);
+        assert_eq!(
+            beside(&f, &tok, &pf),
+            Chain::Refused(ChainRefusal::NotTheAgentsKey)
+        );
+    }
+
+    /// A delegation that authorises another agent cannot be borrowed by this
+    /// one, even bound to its key.
+    #[test]
+    fn a_delegation_whose_last_actor_is_not_the_agent_is_refused() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({"act": {"sub": "agent://acme/other"}}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-leaf", &tok);
+        assert_eq!(
+            beside(&f, &tok, &pf),
+            Chain::Refused(ChainRefusal::NotTheAgentsChain)
+        );
+        // A person calling with no agent in the chain at all names nobody.
+        let tok = delegation(&f, &f.holder, json!({"act": null}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-noact", &tok);
+        assert_eq!(
+            beside(&f, &tok, &pf),
+            Chain::Refused(ChainRefusal::NotTheAgentsChain)
+        );
+    }
+
+    /// The person's authority withdrawn at vouchryx ends the agent's right to
+    /// act for them here: the revocation list is asked about every party.
+    #[test]
+    fn a_revoked_delegation_beside_an_agent_token_is_refused() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-rev", &tok);
+        let h = headers(&[
+            (DELEGATION_HEADER, tok.as_str()),
+            (DELEGATION_PROOF_HEADER, pf.as_str()),
+        ]);
+        let person_revoked = |_: &str, party: &str, _: i64| party == "user://acme/alice";
+        assert_eq!(
+            at_door(&f, Some(&f.agent), &h, &[], person_revoked),
+            Chain::Refused(ChainRefusal::BadToken(Refusal::Revoked))
+        );
+    }
+
+    /// The delegation's proof must name the delegation: a proof with no `ath`,
+    /// or one naming the agent token, could have been made for any token bound
+    /// to the same key. No proof at all is no proof.
+    #[test]
+    fn a_delegation_proof_must_name_the_delegation() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let agent_tok = agent_token(&f.issuer, &f.holder, NOW, json!({}));
+        let unnamed = proof_at(&f.holder, NOW, "POST", &url(), "p-unnamed");
+        let names_agent = proof_for(&f.holder, NOW, "POST", &url(), "p-agent2", &agent_tok);
+        for pf in [unnamed, names_agent] {
+            assert_eq!(
+                beside(&f, &tok, &pf),
+                Chain::Refused(ChainRefusal::BadToken(Refusal::WrongKey))
+            );
+        }
+        let h = headers(&[(DELEGATION_HEADER, tok.as_str())]);
+        assert_eq!(
+            at_door(&f, Some(&f.agent), &h, &[], never),
+            Chain::Refused(ChainRefusal::BadToken(Refusal::NoProof))
+        );
+    }
+
+    /// The delegation's proof is single-use, as every proof is with agent
+    /// tokens on.
+    #[test]
+    fn a_delegation_proof_is_single_use_beside_an_agent_token() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-once", &tok);
+        assert!(matches!(beside(&f, &tok, &pf), Chain::Proven { .. }));
+        assert_eq!(
+            beside(&f, &tok, &pf),
+            Chain::Refused(ChainRefusal::Replayed),
+            "the same proof a second time"
+        );
+    }
+
+    /// A declared chain that disagrees with the delegation is refused, exactly
+    /// as it is for a delegation in `Authorization` (invariant 31).
+    #[test]
+    fn a_declared_chain_that_contradicts_the_delegation_beside_an_agent_token_is_refused() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-decl", &tok);
+        let h = headers(&[
+            (DELEGATION_HEADER, tok.as_str()),
+            (DELEGATION_PROOF_HEADER, pf.as_str()),
+        ]);
+        let declared = vec![
+            "user://acme/mallory".to_string(),
+            "agent://acme/triage".to_string(),
+        ];
+        assert_eq!(
+            at_door(&f, Some(&f.agent), &h, &declared, never),
+            Chain::Refused(ChainRefusal::Contradicted)
+        );
+    }
+
+    /// With no agent token the second header has nothing to be held to, and a
+    /// proof sent where nothing reads it is refused, not silently a claim.
+    /// With no issuer configured nothing is read at all, as before.
+    #[test]
+    fn a_delegation_header_with_no_agent_token_is_refused() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-alone", &tok);
+        let h = headers(&[
+            (DELEGATION_HEADER, tok.as_str()),
+            (DELEGATION_PROOF_HEADER, pf.as_str()),
+        ]);
+        assert_eq!(
+            at_door(&f, None, &h, &[], never),
+            Chain::Refused(ChainRefusal::Unanchored)
+        );
+        let declared = vec!["user://acme/alice".to_string()];
+        let unconfigured = resolve_at_door(
+            &None,
+            None,
+            &presented(&h),
+            "POST",
+            PATH,
+            &declared,
+            NOW,
+            never,
+            &None,
+        );
+        assert_eq!(unconfigured, Chain::Claimed(declared));
+    }
+
+    /// Two delegations, or two proofs, is a caller asking which one this code
+    /// believes.
+    #[test]
+    fn a_repeated_delegation_header_is_refused() {
+        let f = fixture();
+        let tok = delegation(&f, &f.holder, json!({}));
+        let pf = proof_for(&f.holder, NOW, "POST", &url(), "p-twice", &tok);
+        for h in [
+            headers(&[
+                (DELEGATION_HEADER, tok.as_str()),
+                (DELEGATION_HEADER, tok.as_str()),
+                (DELEGATION_PROOF_HEADER, pf.as_str()),
+            ]),
+            headers(&[
+                (DELEGATION_HEADER, tok.as_str()),
+                (DELEGATION_PROOF_HEADER, pf.as_str()),
+                (DELEGATION_PROOF_HEADER, pf.as_str()),
+            ]),
+        ] {
+            assert_eq!(
+                at_door(&f, Some(&f.agent), &h, &[], never),
+                Chain::Refused(ChainRefusal::BadToken(Refusal::Malformed))
+            );
+        }
+    }
+
+    /// A header the caller filled is never read as one nobody filled: blank or
+    /// not text, it is a delegation that does not verify.
+    #[test]
+    fn a_filled_delegation_slot_is_never_read_as_empty() {
+        let mut h = headers(&[(DELEGATION_HEADER, "  ")]);
+        assert_eq!(presented(&h).delegation, Some(""));
+        h.insert(
+            DELEGATION_HEADER,
+            axum::http::HeaderValue::from_bytes(b"\xfftoken").unwrap(),
+        );
+        assert_eq!(presented(&h).delegation, Some(""));
+        let f = fixture();
+        assert_eq!(
+            at_door(&f, Some(&f.agent), &h, &[], never),
+            Chain::Refused(ChainRefusal::BadToken(Refusal::Malformed))
+        );
+        assert!(
+            presented(&headers(&[
+                (DELEGATION_PROOF_HEADER, "a"),
+                (DELEGATION_PROOF_HEADER, "b"),
+            ]))
+            .repeated
+        );
+    }
+
+    /// The must-not-fire case: an agent token's call with no delegation beside
+    /// it keeps its declared chain as a claim, exactly as before.
+    #[test]
+    fn with_no_delegation_beside_it_an_agent_tokens_chain_stays_a_claim() {
+        let f = fixture();
+        let declared = vec![
+            "user://acme/alice".to_string(),
+            "agent://acme/triage".to_string(),
+        ];
+        assert_eq!(
+            at_door(&f, Some(&f.agent), &HeaderMap::new(), &declared, never),
+            Chain::Claimed(declared)
+        );
     }
 }

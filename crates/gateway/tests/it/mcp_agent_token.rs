@@ -11,10 +11,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use tokenfuse_delegation::testing::{agent_token, cfg, proof_for, Key, AGENT};
+use tokenfuse_delegation::testing::{agent_token, cfg, proof_for, token, Key, AGENT};
 
 use tokenfuse_gateway::agenttoken::{AgentTokens, Mode, BROKER_STATIC_KEYS_VAR};
-use tokenfuse_gateway::chainproof::Proving;
+use tokenfuse_gateway::chainproof::{Proving, DELEGATION_HEADER, DELEGATION_PROOF_HEADER};
 use tokenfuse_gateway::clientkeys::{ClientKeys, CLIENT_KEY_HEADER};
 use tokenfuse_gateway::mcpbroker::{app, BrokerState, ScanMode};
 use tokenfuse_gateway::mcpdoor::PROOF_HEADER;
@@ -380,4 +380,90 @@ async fn the_broker_sends_no_agent_token_for_a_static_key_call() {
         .expect("the PDP was asked");
     assert!(asked.get("agent_token").is_none(), "{asked}");
     assert!(asked.get("agent_dpop_proof").is_none(), "{asked}");
+}
+
+impl Broker {
+    /// The person's delegation bound to `holder`, with its own proof for the
+    /// broker's `/`, signed by `holder` and naming it.
+    fn delegation_headers(&self, holder: &Key, jti: &str) -> Vec<(&'static str, String)> {
+        let now = tokenfuse_gateway::sink::now_millis() / 1000;
+        let tok = token(&self.issuer, holder, now, json!({}));
+        let pf = proof_for(holder, now, "POST", &format!("{BROKER_ORIGIN}/"), jti, &tok);
+        vec![(DELEGATION_HEADER, tok), (DELEGATION_PROOF_HEADER, pf)]
+    }
+}
+
+/// THE ONE THIS IS FOR, at the MCP door (invariant 147). Under `require` the
+/// agent's token admits the call and the person's delegation beside it
+/// reaches the policy plane as a proven chain, the person first and the agent
+/// last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_broker_tells_the_pdp_a_persons_delegation_beside_the_agent_token_is_proven() {
+    let seen = Seen::default();
+    let pdp = spawn(
+        Router::new()
+            .route("/v1/decide", post(decide))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Require);
+    b.wardryx = Some(pdp);
+    let url = b.serve(upstream).await;
+    let (_, mut h) = b.token_headers("pd-agent");
+    h.extend(b.delegation_headers(&b.holder, "pd-deleg"));
+    let resp = tools_call(&url, &h).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["ok"], json!(true), "{body}");
+    let asked = seen
+        .bodies
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the PDP was asked");
+    assert_eq!(asked["chain_proven"], json!(true), "{asked}");
+    assert_eq!(
+        asked["on_behalf_of"],
+        json!([
+            "user://acme/alice",
+            "agent://acme/runbook",
+            "agent://acme/triage"
+        ]),
+        "{asked}"
+    );
+    assert_eq!(asked["agent_id"], AGENT, "{asked}");
+    assert_eq!(asked["identity_source"], "agent-token", "{asked}");
+}
+
+/// A delegation bound to another key than the agent token is refused at the
+/// MCP door, and nothing reaches the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_broker_refuses_a_delegation_bound_to_another_key_beside_the_agent_token() {
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let b = Broker::new(Mode::Require);
+    let url = b.serve(upstream).await;
+    let (_, mut h) = b.token_headers("pk-agent");
+    h.extend(b.delegation_headers(&Key::new(), "pk-deleg"));
+    let resp = tools_call(&url, &h).await;
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "delegation_refused", "{body}");
+}
+
+/// Beside a static key the second header has no agent to be held to, and is
+/// refused at the MCP door too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_broker_refuses_a_delegation_header_beside_a_static_key() {
+    let upstream = spawn(Router::new().route("/", post(echo))).await;
+    let mut b = Broker::new(Mode::Accept);
+    b.keys = "sk-b:bkey";
+    let url = b.serve(upstream).await;
+    let mut h = vec![(CLIENT_KEY_HEADER, "sk-b".to_string())];
+    h.extend(b.delegation_headers(&b.holder, "ps-deleg"));
+    let resp = tools_call(&url, &h).await;
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "delegation_refused", "{body}");
 }
