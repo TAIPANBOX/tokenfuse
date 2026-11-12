@@ -84,7 +84,9 @@ fn agent(g: &Gate, path: &str, jti: &str) -> Vec<(&'static str, String)> {
 }
 
 /// The person's delegation bound to `holder`, and its own proof for `path`
-/// signed by `holder` and naming it.
+/// signed by `holder` and naming it. The chain is [`CHAIN`]: RFC 8693 nests
+/// `act` current-first, so the agent token's agent is the OUTER actor. `over`
+/// replaces claims, `act` included.
 fn delegation(
     g: &Gate,
     holder: &Key,
@@ -93,7 +95,13 @@ fn delegation(
     over: Value,
 ) -> Vec<(&'static str, String)> {
     let at = now();
-    let tok = token(&g.issuer, holder, at, over);
+    let mut claims = json!({"act": {"sub": CHAIN[2], "act": {"sub": CHAIN[1]}}});
+    if let Value::Object(o) = over {
+        for (k, v) in o {
+            claims[k] = v;
+        }
+    }
+    let tok = token(&g.issuer, holder, at, claims);
     let pf = proof_for(holder, at, "POST", &format!("{ORIGIN}{path}"), jti, &tok);
     vec![(DELEGATION_HEADER, tok), (DELEGATION_PROOF_HEADER, pf)]
 }

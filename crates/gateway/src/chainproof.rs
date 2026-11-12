@@ -1279,10 +1279,20 @@ mod beside_agent_tests {
         }
     }
 
-    /// The fixture's delegation (`user://acme/alice`, then `agent://acme/runbook`,
-    /// then the agent token's own `agent://acme/triage`) bound to `holder`.
+    /// The person's delegation bound to `holder`: `user://acme/alice` delegated
+    /// to `agent://acme/runbook`, which delegated on to the agent token's own
+    /// `agent://acme/triage`. RFC 8693 nests `act` current-first, so the agent
+    /// token's agent is the OUTER actor. `over` replaces claims, `act` included.
     fn delegation(f: &Fixture, holder: &Key, over: serde_json::Value) -> String {
-        token(&f.issuer, holder, NOW, over)
+        let mut claims = json!({
+            "act": {"sub": "agent://acme/triage", "act": {"sub": "agent://acme/runbook"}}
+        });
+        if let serde_json::Value::Object(o) = over {
+            for (k, v) in o {
+                claims[k] = v;
+            }
+        }
+        token(&f.issuer, holder, NOW, claims)
     }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {

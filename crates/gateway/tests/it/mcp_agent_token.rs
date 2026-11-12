@@ -384,10 +384,12 @@ async fn the_broker_sends_no_agent_token_for_a_static_key_call() {
 
 impl Broker {
     /// The person's delegation bound to `holder`, with its own proof for the
-    /// broker's `/`, signed by `holder` and naming it.
+    /// broker's `/`, signed by `holder` and naming it. RFC 8693 nests `act`
+    /// current-first, so the agent token's agent is the OUTER actor.
     fn delegation_headers(&self, holder: &Key, jti: &str) -> Vec<(&'static str, String)> {
         let now = tokenfuse_gateway::sink::now_millis() / 1000;
-        let tok = token(&self.issuer, holder, now, json!({}));
+        let act = json!({"sub": AGENT, "act": {"sub": "agent://acme/runbook"}});
+        let tok = token(&self.issuer, holder, now, json!({ "act": act }));
         let pf = proof_for(holder, now, "POST", &format!("{BROKER_ORIGIN}/"), jti, &tok);
         vec![(DELEGATION_HEADER, tok), (DELEGATION_PROOF_HEADER, pf)]
     }
