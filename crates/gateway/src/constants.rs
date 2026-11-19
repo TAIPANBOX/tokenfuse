@@ -291,9 +291,20 @@ fn price_book() -> serde_json::Value {
 /// `tokenfuse-focus` reader) until invariant 81 published them here. Columns
 /// are appended, never reordered or renamed, so a reader that knows an older
 /// prefix keeps reading it.
+///
+/// `spec_1_5` is the `--spec 1.5` shape beside it (invariant 148): FOCUS 1.5
+/// release-candidate names, one row per token kind. Additive: a reader of
+/// `columns` is untouched, and the names follow the release candidate until
+/// the ratified text says otherwise.
 fn focus_export() -> serde_json::Value {
     json!({
         "columns": crate::focusexport::columns(),
+        "spec_1_5": {
+            "flag": "--spec 1.5",
+            "status": "FOCUS 1.5 release candidate (completed 2026-11-02, ratification 2026-12-03)",
+            "rows": "one per token kind of a call: input uncached, input cache read, input cache write, output",
+            "columns": crate::focusexport::columns_1_5(),
+        },
     })
 }
 
@@ -621,8 +632,67 @@ mod tests {
                 "x_identity_reason",
                 "x_price_basis",
                 "x_pii_findings",
+                "x_cache_read_tokens",
+                "x_cache_write_tokens",
+                "x_cache_write_1h_tokens",
+                "x_reasoning_tokens",
             ]
         );
+    }
+
+    /// Invariant 148: the `--spec 1.5` columns are published beside the
+    /// default ones, written out here for the same reason as above.
+    #[test]
+    fn the_focus_1_5_columns_are_published_beside_the_default_ones() {
+        let doc = document();
+        let published: Vec<&str> = doc["focus_export"]["spec_1_5"]["columns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ARTIFACT_PATH} publishes no focus_export.spec_1_5.columns"))
+            .iter()
+            .map(|c| c.as_str().expect("a column name is a string"))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                "BilledCost",
+                "EffectiveCost",
+                "BillingCurrency",
+                "ChargePeriodStart",
+                "ChargePeriodEnd",
+                "ChargeCategory",
+                "ChargeDescription",
+                "ProviderName",
+                "PublisherName",
+                "InvoiceIssuerName",
+                "ServiceName",
+                "ServiceCategory",
+                "ResourceId",
+                "ResourceName",
+                "SubAccountId",
+                "SubAccountName",
+                "ConsumedQuantity",
+                "ConsumedUnit",
+                "SkuPriceDetails",
+                "PrincipalId",
+                "CredentialId",
+                "RequesterDetails",
+                "x_run_id",
+                "x_parent_run_id",
+                "x_model",
+                "x_blocked",
+                "x_cost_basis",
+                "x_block_reason",
+                "x_outcome",
+                "x_unit",
+                "x_tool_calls",
+                "x_identity_reason",
+                "x_price_basis",
+                "x_pii_findings",
+                "x_reasoning_tokens",
+                "x_cache_write_1h_tokens",
+            ]
+        );
+        assert_eq!(doc["focus_export"]["spec_1_5"]["flag"], "--spec 1.5");
     }
 
     /// Rendering is deterministic, or the gate is a coin toss.

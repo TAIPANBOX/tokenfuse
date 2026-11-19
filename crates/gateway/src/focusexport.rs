@@ -65,6 +65,13 @@
 //!     the scanner found and let through in shadow or mask, `kind=count` pairs
 //!     joined by `,` (so the field is quoted); `""` when nothing was found or
 //!     the row predates the column. Never a matched span.
+//!   - `x_cache_read_tokens`, `x_cache_write_tokens`, `x_cache_write_1h_tokens`,
+//!     `x_reasoning_tokens`: the trace's four columns of invariant 148, the
+//!     cache and reasoning counts an admitted call was priced with. Blank on a
+//!     row not priced from parsed counts and on a row written before the
+//!     columns existed; a real zero renders as `0`. `x_tokens_in` stays the
+//!     uncached input and `x_tokens_out` the whole billed output, reasoning
+//!     included, exactly as before.
 //!   - `ChargePeriodStart` / `ChargePeriodEnd`: the trace records exactly one
 //!     timestamp per call (`ts_millis`, the settle time) — there is no
 //!     separate call-start timestamp — so both columns get the SAME instant.
@@ -119,10 +126,14 @@ pub struct Args {
     pub out: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// `--spec <version>`: `None` (or `1.2`) is the default export, one row
+    /// per call, unchanged; `1.5` is the FOCUS 1.5 release-candidate shape,
+    /// one row per token kind (see [`HEADER_1_5`]). Anything else is refused.
+    pub spec: Option<String>,
 }
 
 /// Parse `--traces <dir-or-glob>`, `--out <file.csv>`, `--from <rfc3339>`,
-/// `--to <rfc3339>`.
+/// `--to <rfc3339>`, `--spec <version>`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut out = Args::default();
     let mut it = args.iter();
@@ -132,10 +143,32 @@ pub fn parse_args(args: &[String]) -> Args {
             "--out" => out.out = it.next().cloned(),
             "--from" => out.from = it.next().cloned(),
             "--to" => out.to = it.next().cloned(),
+            "--spec" => out.spec = it.next().cloned(),
             _ => {}
         }
     }
     out
+}
+
+/// Which shape `--spec` asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spec {
+    /// The default export: one row per call, [`HEADER`].
+    Default,
+    /// FOCUS 1.5 release-candidate names: one row per token kind,
+    /// [`HEADER_1_5`].
+    Focus15,
+}
+
+fn spec_of(arg: Option<&str>) -> Result<Spec, String> {
+    match arg.map(str::trim) {
+        None | Some("1.2") => Ok(Spec::Default),
+        Some("1.5") => Ok(Spec::Focus15),
+        Some(other) => Err(format!(
+            "unknown --spec '{other}': this export writes the default shape (no --spec, or 1.2) \
+             or FOCUS 1.5 release-candidate names (--spec 1.5)"
+        )),
+    }
 }
 
 /// One `calls` row as loaded from the trace, before FOCUS projection.
@@ -170,10 +203,17 @@ struct FocusRecord {
     /// The PII the scanner let through (`CallRecord::pii_findings`,
     /// invariant 106): `kind=count` pairs; `""` when nothing was found.
     pii_findings: String,
+    /// Invariant 148: the cache and reasoning counts the call was priced
+    /// with, `None` on a row not priced from parsed counts and on a row
+    /// written before the columns existed.
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    cache_write_1h_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
 }
 
 /// The FOCUS 1.2-style column header, in the order the architect specified.
-const HEADER: [&str; 31] = [
+const HEADER: [&str; 35] = [
     "BilledCost",
     "EffectiveCost",
     "BillingCurrency",
@@ -211,6 +251,56 @@ const HEADER: [&str; 31] = [
     // the scanner let through.
     "x_price_basis",
     "x_pii_findings",
+    // Invariant 148: appended after them, same rule: the cache and reasoning
+    // counts the call was priced with, blank where the trace holds none.
+    "x_cache_read_tokens",
+    "x_cache_write_tokens",
+    "x_cache_write_1h_tokens",
+    "x_reasoning_tokens",
+];
+
+/// The `--spec 1.5` header: FOCUS 1.5 release-candidate names (release
+/// candidate completed 2026-11-02, ratification set for 2026-12-03), one row
+/// per token kind of a call. A name here follows the release candidate and
+/// moves with the ratified text if that differs. The `x_` columns are this
+/// gateway's own, as in the default export.
+const HEADER_1_5: [&str; 36] = [
+    "BilledCost",
+    "EffectiveCost",
+    "BillingCurrency",
+    "ChargePeriodStart",
+    "ChargePeriodEnd",
+    "ChargeCategory",
+    "ChargeDescription",
+    "ProviderName",
+    "PublisherName",
+    "InvoiceIssuerName",
+    "ServiceName",
+    "ServiceCategory",
+    "ResourceId",
+    "ResourceName",
+    "SubAccountId",
+    "SubAccountName",
+    "ConsumedQuantity",
+    "ConsumedUnit",
+    "SkuPriceDetails",
+    "PrincipalId",
+    "CredentialId",
+    "RequesterDetails",
+    "x_run_id",
+    "x_parent_run_id",
+    "x_model",
+    "x_blocked",
+    "x_cost_basis",
+    "x_block_reason",
+    "x_outcome",
+    "x_unit",
+    "x_tool_calls",
+    "x_identity_reason",
+    "x_price_basis",
+    "x_pii_findings",
+    "x_reasoning_tokens",
+    "x_cache_write_1h_tokens",
 ];
 
 /// The prefix a row refused for identity is filed under, ahead of the key id
@@ -222,6 +312,11 @@ pub(crate) const KEY_RESOURCE_PREFIX: &str = "key:";
 /// publishes it so a consumer reads the columns instead of retyping them.
 pub(crate) fn columns() -> &'static [&'static str] {
     &HEADER
+}
+
+/// The `--spec 1.5` header, published beside the default one.
+pub(crate) fn columns_1_5() -> &'static [&'static str] {
+    &HEADER_1_5
 }
 
 /// Load, project, and write the FOCUS CSV. Returns `Err` with a clear message
@@ -236,6 +331,7 @@ pub async fn run(args: &Args) -> Result<(), String> {
         .out
         .clone()
         .ok_or_else(|| "missing --out <file.csv>".to_string())?;
+    let spec = spec_of(args.spec.as_deref())?;
 
     let from_ms = match &args.from {
         Some(s) => Some(parse_rfc3339_millis(s).map_err(|e| format!("bad --from: {e}"))?),
@@ -261,7 +357,10 @@ pub async fn run(args: &Args) -> Result<(), String> {
         ));
     }
 
-    let csv = render_csv(&records);
+    let csv = match spec {
+        Spec::Default => render_csv(&records),
+        Spec::Focus15 => render_csv_1_5(&records, &export_price_book()?),
+    };
     std::fs::write(&out_path, &csv).map_err(|e| format!("could not write '{out_path}': {e}"))?;
 
     println!(
@@ -291,7 +390,11 @@ async fn load_records(
          coalesce(key_id, '') as key_id, \
          coalesce(identity_reason, '') as identity_reason, \
          coalesce(price_basis, '') as price_basis, \
-         coalesce(pii_findings, '') as pii_findings \
+         coalesce(pii_findings, '') as pii_findings, \
+         cast(cache_read_tokens as bigint) as cache_read_tokens, \
+         cast(cache_write_tokens as bigint) as cache_write_tokens, \
+         cast(cache_write_1h_tokens as bigint) as cache_write_1h_tokens, \
+         cast(reasoning_tokens as bigint) as reasoning_tokens \
          from calls",
     );
     let mut conds: Vec<String> = Vec::new();
@@ -335,6 +438,18 @@ async fn load_records(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or("tool_calls column type")?;
+        // Invariant 148: genuinely nullable, like `tool_calls`.
+        let counts: Vec<&Int64Array> = (16..20)
+            .map(|c| {
+                b.column(c)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("cache/reasoning column type")
+            })
+            .collect::<Result<_, _>>()?;
+        let count_at = |c: usize, i: usize| -> Option<u64> {
+            (!counts[c].is_null(i)).then(|| counts[c].value(i).max(0) as u64)
+        };
         for i in 0..b.num_rows() {
             out.push(FocusRecord {
                 ts_millis: ts.value(i),
@@ -361,6 +476,10 @@ async fn load_records(
                 identity_reason: str_at(b.column(13).as_ref(), i),
                 price_basis: str_at(b.column(14).as_ref(), i),
                 pii_findings: str_at(b.column(15).as_ref(), i),
+                cache_read_tokens: count_at(0, i),
+                cache_write_tokens: count_at(1, i),
+                cache_write_1h_tokens: count_at(2, i),
+                reasoning_tokens: count_at(3, i),
             });
         }
     }
@@ -451,8 +570,13 @@ fn filed_under(rec: &FocusRecord) -> (String, String) {
     }
 }
 
-/// Project one trace row into the 31 FOCUS column values, in [`HEADER`] order.
-fn to_row(rec: &FocusRecord) -> [String; 31] {
+/// A count as the export writes it: blank for `None`, the number otherwise.
+fn count_field(n: Option<u64>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// Project one trace row into the 35 FOCUS column values, in [`HEADER`] order.
+fn to_row(rec: &FocusRecord) -> [String; 35] {
     let blocked = is_blocked_decision(&rec.decision);
     // Non-empty exactly when `x_blocked` is true: the Breaker reason's own
     // wire string, which is what `decision` holds on a blocked row.
@@ -505,6 +629,10 @@ fn to_row(rec: &FocusRecord) -> [String; 31] {
         rec.identity_reason.clone(),                               // x_identity_reason
         rec.price_basis.clone(),                                   // x_price_basis
         rec.pii_findings.clone(),                                  // x_pii_findings
+        count_field(rec.cache_read_tokens),                        // x_cache_read_tokens
+        count_field(rec.cache_write_tokens),                       // x_cache_write_tokens
+        count_field(rec.cache_write_1h_tokens),                    // x_cache_write_1h_tokens
+        count_field(rec.reasoning_tokens),                         // x_reasoning_tokens
     ]
 }
 
@@ -534,6 +662,412 @@ fn render_csv(records: &[FocusRecord]) -> String {
     for rec in records {
         out.push_str(&csv_row(&to_row(rec)));
         out.push('\n');
+    }
+    out
+}
+
+// -- FOCUS 1.5 (release candidate): one row per token kind ---------------------
+
+/// The price book the `--spec 1.5` split weighs a call's cost with: the built-in
+/// book with `TOKENFUSE_PRICE_BOOK` applied, as `tokenfuse serve` builds it, so a
+/// gateway and its export on one host weigh with the same rates. A set but
+/// unusable file is an error here, as it is at the gateway's start.
+fn export_price_book() -> Result<tokenfuse_core::PriceBook, String> {
+    let mut book = crate::pricebook::default_price_book();
+    if let Some(file) = crate::pricefile::from_env()? {
+        let _ = file.apply(&mut book);
+    }
+    Ok(book)
+}
+
+/// One token kind of a call, as FOCUS 1.5 names it in `SkuPriceDetails`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    /// Input the provider read fresh. On a row written before invariant 148
+    /// the trace cannot say whether any of the call's input was cached, so the
+    /// input row of such a call names no cache action at all (`Unknown`).
+    InputUncached,
+    InputRead,
+    InputWrite,
+    InputUnknown,
+    Output,
+}
+
+impl TokenKind {
+    fn direction(self) -> &'static str {
+        match self {
+            TokenKind::Output => "Output",
+            _ => "Input",
+        }
+    }
+
+    /// `TokenCacheAction`, or `None` where none applies: an output token is
+    /// never read from or written to a prompt cache, and an input count from a
+    /// row that predates the cache columns is of unknown cache state.
+    fn cache_action(self) -> Option<&'static str> {
+        match self {
+            TokenKind::InputUncached => Some("Uncached"),
+            TokenKind::InputRead => Some("Read"),
+            TokenKind::InputWrite => Some("Write"),
+            TokenKind::InputUnknown | TokenKind::Output => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TokenKind::InputUncached | TokenKind::InputUnknown => "input",
+            TokenKind::InputRead => "input cache read",
+            TokenKind::InputWrite => "input cache write",
+            TokenKind::Output => "output",
+        }
+    }
+}
+
+/// The token kinds of one call with their counts, zero counts left out, in a
+/// fixed order: input uncached, cache read, cache write, output. A row written
+/// before invariant 148 (cache columns NULL) gives an input row of unknown
+/// cache state and an output row.
+fn token_kinds(rec: &FocusRecord) -> Vec<(TokenKind, u64)> {
+    let cached_known = rec.cache_read_tokens.is_some() || rec.cache_write_tokens.is_some();
+    let input = if cached_known {
+        TokenKind::InputUncached
+    } else {
+        TokenKind::InputUnknown
+    };
+    [
+        (input, rec.input_tokens),
+        (TokenKind::InputRead, rec.cache_read_tokens.unwrap_or(0)),
+        (TokenKind::InputWrite, rec.cache_write_tokens.unwrap_or(0)),
+        (TokenKind::Output, rec.output_tokens),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .collect()
+}
+
+/// What each kind costs at the book's rate for this call (the prompt-length
+/// tier chosen exactly as settlement chooses it), in microdollar-tokens per
+/// Mtok: only the ratios matter. A 1-hour write is weighed at its own rate.
+fn kind_weights(
+    rec: &FocusRecord,
+    kinds: &[(TokenKind, u64)],
+    book: &tokenfuse_core::PriceBook,
+) -> Vec<u128> {
+    let usage = tokenfuse_core::Usage {
+        input_tokens: rec.input_tokens,
+        output_tokens: rec.output_tokens,
+        cache_read_tokens: rec.cache_read_tokens.unwrap_or(0),
+        cache_write_tokens: rec.cache_write_tokens.unwrap_or(0),
+        cache_write_1h_tokens: rec.cache_write_1h_tokens.unwrap_or(0),
+        ..Default::default()
+    };
+    let Some(p) = book.price_for(&rec.model, &usage) else {
+        return kinds.iter().map(|(_, n)| *n as u128).collect();
+    };
+    let rate = |m: Microusd| m.0.max(0) as u128;
+    let weights: Vec<u128> = kinds
+        .iter()
+        .map(|(kind, n)| {
+            let n = *n as u128;
+            match kind {
+                TokenKind::InputUncached | TokenKind::InputUnknown => n * rate(p.input_per_mtok),
+                TokenKind::InputRead => n * rate(p.cache_read_per_mtok),
+                TokenKind::InputWrite => {
+                    let one_hour = (usage.cache_write_1h_tokens as u128).min(n);
+                    (n - one_hour) * rate(p.cache_write_per_mtok)
+                        + one_hour * rate(p.cache_write_1h_per_mtok)
+                }
+                TokenKind::Output => n * rate(p.output_per_mtok),
+            }
+        })
+        .collect();
+    if weights.iter().all(|w| *w == 0) {
+        kinds.iter().map(|(_, n)| *n as u128).collect()
+    } else {
+        weights
+    }
+}
+
+/// Split `cost` across `weights` in whole microdollars so the parts sum to
+/// `cost` exactly: each part is its floored share, and what flooring left over
+/// goes to the heaviest part (the first, on a tie). The recorded cost of a call
+/// is what the ledger charged; the split only says where it went, and must
+/// never add or lose a microdollar. All weights zero puts the whole cost on
+/// the first part.
+fn allocate(cost: i64, weights: &[u128]) -> Vec<i64> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let total: u128 = weights.iter().sum();
+    let mut parts: Vec<i64> = if total == 0 {
+        vec![0; weights.len()]
+    } else {
+        weights
+            .iter()
+            .map(|w| ((cost as i128) * (*w as i128) / (total as i128)) as i64)
+            .collect()
+    };
+    let heaviest = weights
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, w)| if *w > weights[best] { i } else { best });
+    let rest = cost - parts.iter().sum::<i64>();
+    parts[heaviest] += rest;
+    parts
+}
+
+/// Developer, family and version of a model, when its id says them plainly;
+/// each `None` otherwise, and the export then leaves the key out rather than
+/// guess. A vendor prefix (`openai/gpt-4.1`, `google/gemini-2.5-flash`) is
+/// read past. Recognised shapes: `claude-<tier>-<major>[-<minor>]` and the
+/// older `claude-<major>[-<minor>]-<tier>` (a trailing date is ignored),
+/// `gpt-<version>[-<variant>]`, `gemini-<version>-<tier>`.
+fn model_meta(model: &str) -> (Option<&'static str>, Option<String>, Option<String>) {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let developer = match provider_from_model(&id) {
+        "Unknown" => None,
+        d => Some(d),
+    };
+    let parts: Vec<&str> = id.split('-').filter(|p| !p.is_empty()).collect();
+    let is_short_number = |p: &&str| p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit());
+    let is_date = |p: &&str| p.len() == 8 && p.chars().all(|c| c.is_ascii_digit());
+    let cap = |w: &str| {
+        let mut c = w.chars();
+        c.next()
+            .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+            .unwrap_or_default()
+    };
+    let (family, version) = match parts.as_slice() {
+        ["claude", rest @ ..] => {
+            let tiers = ["haiku", "sonnet", "opus"];
+            let rest: Vec<&str> = rest.iter().copied().filter(|p| !is_date(p)).collect();
+            match rest.as_slice() {
+                [tier, nums @ ..]
+                    if tiers.contains(tier)
+                        && !nums.is_empty()
+                        && nums.iter().all(is_short_number) =>
+                {
+                    (Some(format!("Claude {}", cap(tier))), Some(nums.join(".")))
+                }
+                [nums @ .., tier]
+                    if tiers.contains(tier)
+                        && !nums.is_empty()
+                        && nums.iter().all(is_short_number) =>
+                {
+                    (Some(format!("Claude {}", cap(tier))), Some(nums.join(".")))
+                }
+                _ => (None, None),
+            }
+        }
+        ["gpt", version, variant @ ..]
+            if version.starts_with(|c: char| c.is_ascii_digit())
+                && variant
+                    .iter()
+                    .all(|v| v.chars().all(|c| c.is_ascii_lowercase())) =>
+        {
+            let mut v = (*version).to_string();
+            for w in variant {
+                v.push('-');
+                v.push_str(w);
+            }
+            (Some("GPT".to_string()), Some(v))
+        }
+        ["gemini", version, tier @ ..]
+            if version.starts_with(|c: char| c.is_ascii_digit())
+                && !tier.is_empty()
+                && tier
+                    .iter()
+                    .all(|t| ["flash", "pro", "lite", "ultra", "nano"].contains(t)) =>
+        {
+            let tier: Vec<String> = tier.iter().map(|t| cap(t)).collect();
+            (
+                Some(format!("Gemini {}", tier.join("-"))),
+                Some((*version).to_string()),
+            )
+        }
+        _ => (None, None),
+    };
+    (developer, family, version)
+}
+
+/// `SkuPriceDetails` for one row: `ModelId` always (the id as the trace holds
+/// it, which is the id the call was billed under), `ModelDeveloper`,
+/// `ModelFamily`, `ModelVersion` when [`model_meta`] can read them, and the
+/// token kind when the row is one.
+fn sku_price_details(model: &str, kind: Option<TokenKind>) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert("ModelId".into(), serde_json::Value::from(model));
+    let (developer, family, version) = model_meta(model);
+    if let Some(d) = developer {
+        m.insert("ModelDeveloper".into(), serde_json::Value::from(d));
+    }
+    if let Some(f) = family {
+        m.insert("ModelFamily".into(), serde_json::Value::from(f));
+    }
+    if let Some(v) = version {
+        m.insert("ModelVersion".into(), serde_json::Value::from(v));
+    }
+    if let Some(k) = kind {
+        m.insert(
+            "TokenDirection".into(),
+            serde_json::Value::from(k.direction()),
+        );
+        if let Some(a) = k.cache_action() {
+            m.insert("TokenCacheAction".into(), serde_json::Value::from(a));
+        }
+    }
+    serde_json::Value::Object(m).to_string()
+}
+
+/// `RequesterDetails`: a JSON array of the attributes this gateway records for
+/// the principal and the credential, `{"Name", "Value"}` pairs, empty when
+/// neither is known. The names are this gateway's own: the release candidate
+/// fixes the column and its JSON-array shape, not the keys inside it. The
+/// credential is named by its key id, never by anything that authenticates.
+fn requester_details(principal: &str, credential: &str, unit: &str) -> String {
+    if principal.is_empty() && credential.is_empty() {
+        return String::new();
+    }
+    let pair = |n: &str, v: &str| serde_json::json!({"Name": n, "Value": v});
+    let mut out = Vec::new();
+    if !principal.is_empty() {
+        out.push(pair("PrincipalType", "Agent"));
+        out.push(pair("AgentId", principal));
+    }
+    if !credential.is_empty() {
+        out.push(pair("CredentialType", "ClientKey"));
+        out.push(pair("KeyId", credential));
+    }
+    if !unit.is_empty() {
+        out.push(pair("Unit", unit));
+    }
+    serde_json::Value::Array(out).to_string()
+}
+
+/// Project one trace row into its `--spec 1.5` rows, in [`HEADER_1_5`] order.
+///
+/// An admitted call with token counts becomes one row per token kind: input
+/// uncached, input cache read, input cache write, output, each with its count
+/// in `ConsumedQuantity` (`ConsumedUnit` `Token`) and its share of the call's
+/// recorded cost, weighed at the book's rates for that kind ([`allocate`]: the
+/// shares sum to the recorded cost exactly). Reasoning tokens are output and
+/// stay inside the output row's count, as FOCUS 1.5 says separately metered
+/// reasoning is `Output`; `x_reasoning_tokens` names them there. Per-call
+/// figures that would double if summed (`x_tool_calls`, `x_reasoning_tokens`)
+/// ride the output row alone, `x_cache_write_1h_tokens` the write row alone.
+/// Any other row (a refusal, a cache hit, a call settled on the estimate with
+/// no counts) is one row with no quantity.
+fn to_rows_1_5(rec: &FocusRecord, book: &tokenfuse_core::PriceBook) -> Vec<[String; 36]> {
+    let blocked = is_blocked_decision(&rec.decision);
+    let block_reason = if blocked {
+        rec.decision.clone()
+    } else {
+        String::new()
+    };
+    let (resource, agent) = filed_under(rec);
+    let (cost_microusd, cost_basis) = if blocked {
+        (0i64, "blocked")
+    } else if rec.input_tokens == 0 && rec.output_tokens == 0 && rec.cost_microusd != 0 {
+        (rec.cost_microusd, "estimated")
+    } else {
+        (rec.cost_microusd, "settled")
+    };
+    let ts = ts_millis_to_rfc3339(rec.ts_millis);
+    let provider = provider_from_model(&rec.model).to_string();
+    let requester = requester_details(&agent, &rec.key_id, &rec.unit);
+
+    let kinds = if blocked {
+        Vec::new()
+    } else {
+        token_kinds(rec)
+    };
+    let shares = allocate(cost_microusd, &kind_weights(rec, &kinds, book));
+    let mut slots: Vec<(Option<TokenKind>, Option<u64>, i64)> = kinds
+        .iter()
+        .zip(shares)
+        .map(|((k, n), c)| (Some(*k), Some(*n), c))
+        .collect();
+    if slots.is_empty() {
+        slots.push((None, None, cost_microusd));
+    }
+    let single = slots.len() == 1 && slots[0].0.is_none();
+
+    slots
+        .into_iter()
+        .map(|(kind, quantity, cost)| {
+            let billed = usd_string(cost);
+            let on_output = single || kind == Some(TokenKind::Output);
+            let description = match kind {
+                Some(k) => format!("LLM call model={} {}", rec.model, k.label()),
+                None => format!("LLM call model={}", rec.model),
+            };
+            [
+                billed.clone(),                                            // BilledCost
+                billed,                                                    // EffectiveCost
+                "USD".to_string(),                                         // BillingCurrency
+                ts.clone(),                                                // ChargePeriodStart
+                ts.clone(),                                                // ChargePeriodEnd
+                "Usage".to_string(),                                       // ChargeCategory
+                description,                                               // ChargeDescription
+                provider.clone(),                                          // ProviderName
+                provider.clone(),                                          // PublisherName
+                provider.clone(),                                          // InvoiceIssuerName
+                "LLM inference".to_string(),                               // ServiceName
+                "AI and Machine Learning".to_string(),                     // ServiceCategory
+                resource.clone(),                                          // ResourceId
+                resource.clone(),                                          // ResourceName
+                rec.run_id.clone(),                                        // SubAccountId
+                rec.run_id.clone(),                                        // SubAccountName
+                count_field(quantity),                                     // ConsumedQuantity
+                quantity.map(|_| "Token".to_string()).unwrap_or_default(), // ConsumedUnit
+                sku_price_details(&rec.model, kind),                       // SkuPriceDetails
+                agent.clone(),                                             // PrincipalId
+                rec.key_id.clone(),                                        // CredentialId
+                requester.clone(),                                         // RequesterDetails
+                rec.run_id.clone(),                                        // x_run_id
+                rec.parent_run_id.clone(),                                 // x_parent_run_id
+                rec.model.clone(),                                         // x_model
+                blocked.to_string(),                                       // x_blocked
+                cost_basis.to_string(),                                    // x_cost_basis
+                block_reason.clone(),                                      // x_block_reason
+                rec.outcome.clone(),                                       // x_outcome
+                rec.unit.clone(),                                          // x_unit
+                if on_output {
+                    rec.tool_calls.map(|n| n.to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }, // x_tool_calls
+                rec.identity_reason.clone(),                               // x_identity_reason
+                rec.price_basis.clone(),                                   // x_price_basis
+                rec.pii_findings.clone(),                                  // x_pii_findings
+                if on_output {
+                    count_field(rec.reasoning_tokens)
+                } else {
+                    String::new()
+                }, // x_reasoning_tokens
+                if kind == Some(TokenKind::InputWrite) {
+                    count_field(rec.cache_write_1h_tokens)
+                } else {
+                    String::new()
+                }, // x_cache_write_1h_tokens
+            ]
+        })
+        .collect()
+}
+
+fn render_csv_1_5(records: &[FocusRecord], book: &tokenfuse_core::PriceBook) -> String {
+    let mut out = String::new();
+    out.push_str(&csv_row(&HEADER_1_5));
+    out.push('\n');
+    for rec in records {
+        for row in to_rows_1_5(rec, book) {
+            out.push_str(&csv_row(&row));
+            out.push('\n');
+        }
     }
     out
 }
@@ -833,6 +1367,10 @@ mod tests {
             identity_reason: None,
             pii_findings: None,
             price_basis: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_write_1h_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -896,6 +1434,7 @@ mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: None,
             to: None,
+            spec: None,
         };
         run(&args).await.expect("export should succeed");
 
@@ -906,23 +1445,24 @@ mod tests {
             "ServiceCategory,ResourceId,ResourceName,SubAccountId,SubAccountName,x_run_id,",
             "x_parent_run_id,x_agent_id,x_model,x_tokens_in,x_tokens_out,x_blocked,x_cost_basis,",
             "x_outcome,x_unit,x_tool_calls,x_key_id,x_block_reason,x_identity_reason,x_price_basis,",
-            "x_pii_findings\n",
+            "x_pii_findings,x_cache_read_tokens,x_cache_write_tokens,x_cache_write_1h_tokens,",
+            "x_reasoning_tokens\n",
             "0.345000,0.345000,USD,1970-01-01T00:00:00Z,1970-01-01T00:00:00Z,",
             "LLM call model=claude-sonnet,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-1,agent-1,run-a,run-a,run-a,run-parent-a,agent-1,",
-            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,,,,\n",
+            "claude-sonnet,100,50,false,settled,case_resolved,treasury,2,,,,,,,,,\n",
             "1.000000,1.000000,USD,1970-01-01T00:00:01Z,1970-01-01T00:00:01Z,",
             "LLM call model=gpt-4o,OpenAI,OpenAI,OpenAI,LLM inference,AI and Machine Learning,",
-            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,,,,\n",
+            ",,run-a,run-a,run-a,,,gpt-4o,0,0,false,estimated,,,,,,,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:02Z,1970-01-01T00:00:02Z,",
             "LLM call model=claude-haiku,Anthropic,Anthropic,Anthropic,LLM inference,",
             "AI and Machine Learning,agent-2,agent-2,run-b,run-b,run-b,,agent-2,claude-haiku,",
-            "0,0,false,settled,,,,,,,,\n",
+            "0,0,false,settled,,,,,,,,,,,,\n",
             "0.000000,0.000000,USD,1970-01-01T00:00:03Z,1970-01-01T00:00:03Z,",
             "\"LLM call model=claude-sonnet, pro\"\"tier\",Anthropic,Anthropic,Anthropic,",
             "LLM inference,AI and Machine Learning,\"agent://team,ops\",\"agent://team,ops\",",
             "run-b,run-b,run-b,,\"agent://team,ops\",\"claude-sonnet, pro\"\"tier\",0,0,true,",
-            "blocked,,,,,budget_exceeded,,,\n",
+            "blocked,,,,,budget_exceeded,,,,,,,\n",
         );
         assert_eq!(got, want);
 
@@ -947,6 +1487,7 @@ mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: Some("1970-01-01T00:00:05Z".to_string()),
             to: None,
+            spec: None,
         };
         run(&args).await.expect("export should succeed");
         let got = std::fs::read_to_string(&out).unwrap();
@@ -964,6 +1505,7 @@ mod tests {
             out: Some("/tmp/should-not-be-written.csv".to_string()),
             from: None,
             to: None,
+            spec: None,
         };
         let err = run(&args).await.unwrap_err();
         assert!(err.contains("nonexistent"), "{err}");
@@ -1018,6 +1560,7 @@ mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: None,
             to: None,
+            spec: None,
         };
         run(&args).await.expect("export should succeed");
         let text = std::fs::read_to_string(&out).unwrap();
@@ -1261,6 +1804,7 @@ mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: None,
             to: None,
+            spec: None,
         };
         run(&args)
             .await
@@ -1341,6 +1885,182 @@ mod tests {
                 assert_ne!(col(row, name), claim.as_str(), "{run_id}: {name}");
             }
         }
+    }
+
+    // -- FOCUS 1.5 (invariant 148) ---------------------------------------------
+
+    fn focus_record(model: &str, decision: &str) -> FocusRecord {
+        FocusRecord {
+            ts_millis: 0,
+            run_id: "run-1".into(),
+            model: model.into(),
+            decision: decision.into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_microusd: 0,
+            agent_id: String::new(),
+            parent_run_id: String::new(),
+            outcome: String::new(),
+            unit: String::new(),
+            tool_calls: None,
+            key_id: String::new(),
+            identity_reason: String::new(),
+            price_basis: String::new(),
+            pii_findings: String::new(),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_write_1h_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    fn header_index(name: &str) -> usize {
+        HEADER_1_5
+            .iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("no {name} in HEADER_1_5"))
+    }
+
+    /// The parts always sum to the whole, whatever the weights, over 200
+    /// seeded draws: the split says where the cost went and never adds or
+    /// loses a microdollar. The remainder goes to the heaviest part.
+    #[test]
+    fn the_split_always_sums_to_the_recorded_cost() {
+        assert_eq!(allocate(1552, &[4_200_000, 1_547_500_000]), vec![4, 1548]);
+        assert_eq!(allocate(10, &[1, 1, 1]), vec![4, 3, 3]);
+        assert_eq!(allocate(7, &[0, 0]), vec![7, 0]);
+        assert_eq!(allocate(0, &[5, 9]), vec![0, 0]);
+        assert!(allocate(5, &[]).is_empty());
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let n = 1 + (next() % 4) as usize;
+            let weights: Vec<u128> = (0..n).map(|_| (next() % 1_000_000_000) as u128).collect();
+            let cost = (next() % 100_000_000) as i64;
+            let parts = allocate(cost, &weights);
+            assert_eq!(parts.iter().sum::<i64>(), cost, "{weights:?} {cost}");
+            assert!(parts.iter().all(|p| *p >= 0), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn the_model_id_gives_developer_family_and_version_only_when_it_says_them() {
+        let m = |id: &str| {
+            let (d, f, v) = model_meta(id);
+            (d, f.as_deref().map(str::to_string), v)
+        };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            m("claude-haiku-4-5"),
+            (Some("Anthropic"), some("Claude Haiku"), some("4.5"))
+        );
+        assert_eq!(
+            m("claude-haiku-4-5-20251001"),
+            (Some("Anthropic"), some("Claude Haiku"), some("4.5"))
+        );
+        assert_eq!(
+            m("claude-sonnet-5"),
+            (Some("Anthropic"), some("Claude Sonnet"), some("5"))
+        );
+        assert_eq!(
+            m("claude-3-5-sonnet-20241022"),
+            (Some("Anthropic"), some("Claude Sonnet"), some("3.5"))
+        );
+        assert_eq!(m("gpt-4o"), (Some("OpenAI"), some("GPT"), some("4o")));
+        assert_eq!(
+            m("openai/gpt-4.1-mini"),
+            (Some("OpenAI"), some("GPT"), some("4.1-mini"))
+        );
+        assert_eq!(
+            m("google/gemini-2.5-flash-lite"),
+            (Some("Google"), some("Gemini Flash-Lite"), some("2.5"))
+        );
+        // Recognised developer, unrecognised shape: the developer alone.
+        assert_eq!(m("gemini-3.1-pro-preview"), (Some("Google"), None, None));
+        assert_eq!(
+            m("global.anthropic.claude-haiku-4-5-20251001-v1:0").0,
+            Some("Anthropic")
+        );
+        // Nothing recognised: nothing guessed.
+        assert_eq!(m("mystery-model-1"), (None, None, None));
+    }
+
+    /// A row refused for identity names its credential and no principal, and
+    /// the credential is the key id the trace holds, never anything that
+    /// authenticates. A blocked row is one row with no quantity.
+    #[test]
+    fn principal_and_credential_come_from_the_agent_and_the_key_id() {
+        let book = crate::pricebook::default_price_book();
+        let mut honest = focus_record("claude-haiku-4-5", "allow");
+        honest.agent_id = "agent://acme/a".into();
+        honest.key_id = "key-a".into();
+        honest.unit = "treasury".into();
+        honest.input_tokens = 10;
+        honest.output_tokens = 20;
+        honest.cost_microusd = 110;
+        honest.cache_read_tokens = Some(0);
+        honest.cache_write_tokens = Some(0);
+        honest.cache_write_1h_tokens = Some(0);
+        let rows = to_rows_1_5(&honest, &book);
+        assert_eq!(
+            rows.len(),
+            2,
+            "input and output; zero cache counts make no rows"
+        );
+        for r in &rows {
+            assert_eq!(r[header_index("PrincipalId")], "agent://acme/a");
+            assert_eq!(r[header_index("CredentialId")], "key-a");
+            let details: serde_json::Value =
+                serde_json::from_str(&r[header_index("RequesterDetails")]).unwrap();
+            assert_eq!(
+                details,
+                serde_json::json!([
+                    {"Name": "PrincipalType", "Value": "Agent"},
+                    {"Name": "AgentId", "Value": "agent://acme/a"},
+                    {"Name": "CredentialType", "Value": "ClientKey"},
+                    {"Name": "KeyId", "Value": "key-a"},
+                    {"Name": "Unit", "Value": "treasury"},
+                ])
+            );
+        }
+
+        let mut refused = focus_record("claude-haiku-4-5", "identity_mismatch");
+        refused.agent_id = "agent://acme/victim".into();
+        refused.key_id = "key-imposter".into();
+        let rows = to_rows_1_5(&refused, &book);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r[header_index("PrincipalId")], "");
+        assert_eq!(r[header_index("CredentialId")], "key-imposter");
+        assert_eq!(r[header_index("ConsumedQuantity")], "");
+        assert_eq!(r[header_index("ConsumedUnit")], "");
+        assert_eq!(r[header_index("BilledCost")], "0.000000");
+        assert!(
+            !r.iter().any(|v| v.contains("victim")),
+            "the claimed agent appears nowhere: {r:?}"
+        );
+
+        let nobody = focus_record("claude-haiku-4-5", "allow");
+        assert_eq!(
+            to_rows_1_5(&nobody, &book)[0][header_index("RequesterDetails")],
+            ""
+        );
+    }
+
+    #[test]
+    fn spec_names_the_two_shapes_and_refuses_anything_else() {
+        assert_eq!(spec_of(None), Ok(Spec::Default));
+        assert_eq!(spec_of(Some("1.2")), Ok(Spec::Default));
+        assert_eq!(spec_of(Some("1.5")), Ok(Spec::Focus15));
+        assert!(spec_of(Some("1.4")).unwrap_err().contains("--spec"));
+        assert!(spec_of(Some("")).is_err());
+        let a = parse_args(&["--spec".to_string(), "1.5".to_string()]);
+        assert_eq!(a.spec.as_deref(), Some("1.5"));
     }
 
     #[test]

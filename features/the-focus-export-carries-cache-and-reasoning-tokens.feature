@@ -43,3 +43,36 @@ Feature: The trace and the FOCUS export carry cache and reasoning tokens
   Scenario: An unknown spec is refused
     When the export runs with --spec 9.9
     Then it exits non-zero, names the flag, and writes no file
+
+  # @test:the_reasoning_detail_is_recorded_beside_the_output_never_inside_it
+  Scenario: Reasoning is recorded beside the output, never added to it
+    When a usage reports reasoning tokens on Vertex AI's shape or on OpenAI's
+    Then the reasoning count is recorded and the output count is unchanged
+    And a reported zero is zero, a usage that names none is null
+
+  # @test:the_allow_row_carries_the_counts_that_were_priced_and_null_otherwise
+  Scenario: Only a row priced from token counts carries them
+    When a call is settled from parsed counts
+    Then its row carries the cache read, cache write and one-hour write counts, zeros included
+    And a call settled on the estimate carries null in all four
+
+  # @test:the_split_always_sums_to_the_recorded_cost
+  Scenario: The FOCUS 1.5 split never adds or loses a microdollar
+    When a call's cost is split across its token kinds
+    Then the parts sum to the recorded cost for any weights
+
+  # @test:the_model_id_gives_developer_family_and_version_only_when_it_says_them
+  Scenario: Model developer, family and version only when the id says them
+    When a model id is claude-haiku-4-5, gpt-4o or google/gemini-2.5-flash-lite
+    Then the developer, family and version are read from it
+    And an id the export does not recognise gets no guess
+
+  # @test:principal_and_credential_come_from_the_agent_and_the_key_id
+  Scenario: The principal is the agent and the credential is the key id
+    When a call names its agent and was made with a client key
+    Then PrincipalId is the agent, CredentialId the key id, and RequesterDetails a JSON array naming both
+    And a row refused for identity names its credential and no principal
+
+  # @test:the_focus_1_5_columns_are_published_beside_the_default_ones
+  Scenario: The FOCUS 1.5 columns are published
+    Then contracts/tokenfuse-constants.json publishes focus_export.spec_1_5.columns beside focus_export.columns

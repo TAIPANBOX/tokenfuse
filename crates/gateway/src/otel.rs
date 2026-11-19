@@ -190,6 +190,10 @@ mod tests {
             identity_reason: None,
             pii_findings: None,
             price_basis: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_write_1h_tokens: None,
+            reasoning_tokens: None,
         }
     }
 

@@ -227,10 +227,11 @@ async fn main() {
             std::process::exit(code);
         }
         // `tokenfuse focus-export --traces <dir-or-glob> --out <file.csv>`
-        //     `[--from <rfc3339>] [--to <rfc3339>]` exports the Parquet trace as
-        // a FOCUS 1.2-style CSV (FinOps Open Cost & Usage Specification) so a
-        // bank/FinOps team can load LLM agent spend into the same tooling they
-        // use for cloud spend.
+        //     `[--from <rfc3339>] [--to <rfc3339>] [--spec 1.5]` exports the
+        // Parquet trace as a FOCUS 1.2-style CSV (FinOps Open Cost & Usage
+        // Specification) so a bank/FinOps team can load LLM agent spend into
+        // the same tooling they use for cloud spend; `--spec 1.5` writes the
+        // FOCUS 1.5 release-candidate names, one row per token kind.
         Some("focus-export") => {
             let rest: Vec<String> = args.collect();
             let fargs = tokenfuse_gateway::focusexport::parse_args(&rest);
@@ -326,7 +327,7 @@ fn print_help() {
          \x20 savings       sum the avoided spend recorded at budget-protection blocks\n\
          \x20 compliance    project the control catalog into an auditor-ready evidence pack\n\
          \x20 mcp-scan      scan an MCP tool listing, or a live server, for poisoning\n\
-         \x20 focus-export  export the Parquet trace as a FOCUS 1.2 CSV\n\
+         \x20 focus-export  export the Parquet trace as a FOCUS 1.2 CSV (--spec 1.5: FOCUS 1.5 RC)\n\
          \x20 firewall      report what the agent firewall did over a run\n\
          \x20 outcomes      unit economics per X-Fuse-Outcome tag\n\
          \x20 constants     print the published stack constants\n\

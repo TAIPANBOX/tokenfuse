@@ -33,6 +33,16 @@ pub struct Usage {
     /// by [`ModelPrice::cost`]: this rides alongside the priced token counts
     /// but is not itself priced.
     pub tool_calls: Option<u32>,
+    /// The reasoning tokens the provider reported as a detail of its output
+    /// (`completion_tokens_details.reasoning_tokens` on the OpenAI shape and on
+    /// Vertex AI's OpenAI-compatible endpoint). Informational only, exactly
+    /// like `tool_calls`: [`ModelPrice::cost`] never reads it, because the
+    /// output count already holds every reasoning token the provider bills
+    /// (invariant 80). `None` when the usage named no reasoning count, a
+    /// reported zero is `Some(0)`. Skipped on the wire when `None`, so a
+    /// record without it serialises as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl Usage {

@@ -1737,6 +1737,22 @@ run_case "focus-basis-pii: the export reads the PII column as the basis" fail \
 	"$(py 'edit("crates/gateway/src/focusexport.rs", "price_basis: str_at(b.column(14).as_ref(), i),", "price_basis: str_at(b.column(15).as_ref(), i),")')" \
 	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
 
+# --- invariant 148: cache and reasoning tokens reach the trace and the export ---
+run_case "focus-cache: the allow row never carries the cache read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_carries_cache_and_reasoning::the_export_carries_the_cache_and_reasoning_counts_each_call_was_priced_with" \
+	"$(py 'edit("crates/gateway/src/settle.rs", "cache_read_tokens: priced.then_some(usage.cache_read_tokens),", "cache_read_tokens: None,")')" \
+	"the_export_carries_the_cache_and_reasoning_counts_each_call_was_priced_with ... FAILED"
+
+run_case "focus-cache: the export reads the cache write as the cache read" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact focus_carries_cache_and_reasoning::the_export_carries_the_cache_and_reasoning_counts_each_call_was_priced_with" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "cache_read_tokens: count_at(0, i),", "cache_read_tokens: count_at(1, i),")')" \
+	"the_export_carries_the_cache_and_reasoning_counts_each_call_was_priced_with ... FAILED"
+
+run_case "focus-cache: the 1.5 split drops the rounding remainder" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::the_split_always_sums_to_the_recorded_cost" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "    parts[heaviest] += rest;", "    let _ = (heaviest, rest);")')" \
+	"the_split_always_sums_to_the_recorded_cost ... FAILED"
+
 # --- invariant 110: IBANs, and decimals are not cards -------------------------
 run_case "pii-iban: the checksum skipped" fail \
 	"cargo test -p tokenfuse-core --lib -- --exact dlp::tests::a_wrong_checksum_length_or_country_is_not_an_iban" \

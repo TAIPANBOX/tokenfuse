@@ -787,6 +787,7 @@ pub fn allow_record(
     saved: Microusd,
     ts_millis: i64,
 ) -> CallRecord {
+    let priced = usage.carries_priced_tokens();
     CallRecord {
         ts_millis,
         run_id: run.run_id.clone(),
@@ -810,6 +811,13 @@ pub fn allow_record(
         identity_reason: a.identity_reason.clone(),
         pii_findings: a.pii_findings.clone(),
         price_basis: a.price_basis.clone(),
+        // Invariant 148: the counts the price book priced, on a row priced
+        // from parsed counts; NULL on a row settled on the estimate (whose
+        // usage carries no count) and on a closure (whose evidence is a cost).
+        cache_read_tokens: priced.then_some(usage.cache_read_tokens),
+        cache_write_tokens: priced.then_some(usage.cache_write_tokens),
+        cache_write_1h_tokens: priced.then_some(usage.cache_write_1h_tokens),
+        reasoning_tokens: usage.reasoning_tokens.filter(|_| priced),
     }
 }
 
@@ -898,6 +906,66 @@ mod tests {
             },
             unit_reservation,
         )
+    }
+
+    /// Invariant 148: the `allow` row carries the cache and reasoning counts
+    /// the price book priced, `Some(0)` included, and NULL on a row whose
+    /// usage holds no priced count (an estimate-settled call, a closure).
+    #[test]
+    fn the_allow_row_carries_the_counts_that_were_priced_and_null_otherwise() {
+        let (_ledger, _prices, _usage, reservation) = setup();
+        let a = CallAttribution {
+            model: "m".into(),
+            ..Default::default()
+        };
+        let priced = Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 300,
+            cache_write_tokens: 1000,
+            cache_write_1h_tokens: 600,
+            tool_calls: Some(0),
+            reasoning_tokens: Some(7),
+        };
+        let row = allow_record(&reservation, &a, Microusd(1840), &priced, Microusd::ZERO, 1);
+        assert_eq!(row.cache_read_tokens, Some(300));
+        assert_eq!(row.cache_write_tokens, Some(1000));
+        assert_eq!(row.cache_write_1h_tokens, Some(600));
+        assert_eq!(row.reasoning_tokens, Some(7));
+
+        let no_cache = Usage {
+            input_tokens: 10,
+            ..Usage::default()
+        };
+        let row = allow_record(&reservation, &a, Microusd(10), &no_cache, Microusd::ZERO, 1);
+        assert_eq!(row.cache_read_tokens, Some(0), "priced, and none was read");
+        assert_eq!(row.cache_write_tokens, Some(0));
+        assert_eq!(row.cache_write_1h_tokens, Some(0));
+        assert_eq!(
+            row.reasoning_tokens, None,
+            "no reasoning count was reported"
+        );
+
+        let estimate = Usage {
+            tool_calls: Some(0),
+            reasoning_tokens: Some(5),
+            ..Usage::default()
+        };
+        let row = allow_record(
+            &reservation,
+            &a,
+            Microusd(999),
+            &estimate,
+            Microusd::ZERO,
+            1,
+        );
+        assert_eq!(
+            row.cache_read_tokens, None,
+            "nothing was priced from counts"
+        );
+        assert_eq!(row.cache_write_tokens, None);
+        assert_eq!(row.cache_write_1h_tokens, None);
+        assert_eq!(row.reasoning_tokens, None);
     }
 
     #[test]
