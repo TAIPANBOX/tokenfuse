@@ -1750,7 +1750,7 @@ run_case "focus-cache: the export reads the cache write as the cache read" fail 
 
 run_case "focus-cache: the 1.5 split drops the rounding remainder" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact focusexport::tests::the_split_always_sums_to_the_recorded_cost" \
-	"$(py 'edit("crates/gateway/src/focusexport.rs", "    parts[heaviest] += rest;", "    let _ = (heaviest, rest);")')" \
+	"$(py 'edit("crates/gateway/src/focusexport.rs", "    parts[heaviest] += rest;", "    parts[heaviest] += rest - rest;")')" \
 	"the_split_always_sums_to_the_recorded_cost ... FAILED"
 
 # --- invariant 110: IBANs, and decimals are not cards -------------------------
