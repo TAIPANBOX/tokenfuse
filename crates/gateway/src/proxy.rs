@@ -1221,6 +1221,10 @@ async fn handle_call(
                     identity_reason: Some(mismatch.reason.to_string()),
                     pii_findings: None,
                     price_basis: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
+                    reasoning_tokens: None,
                 });
                 let outcome = st.events.emit(
                     EventType::IdentityMismatch,
@@ -1329,6 +1333,10 @@ async fn handle_call(
             identity_reason: identity_reason.clone(),
             pii_findings: None,
             price_basis: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_write_1h_tokens: None,
+            reasoning_tokens: None,
         });
         let verdict = budget_verdict(
             BreakerReason::Killed,
@@ -1405,6 +1413,10 @@ async fn handle_call(
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
                         price_basis: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
+                        reasoning_tokens: None,
                     });
                     let outcome = st.events.emit(
                         EventType::DlpBlock,
@@ -1577,6 +1589,10 @@ async fn handle_call(
                         identity_reason: identity_reason.clone(),
                         pii_findings: pii_counts.clone(),
                         price_basis: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
+                        reasoning_tokens: None,
                     });
                     return cached_response(&run_id, &hit, st.policy.mode);
                 }
@@ -1667,6 +1683,10 @@ async fn handle_call(
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
                 price_basis: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::PolicyViolation,
@@ -1710,6 +1730,10 @@ async fn handle_call(
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
                 price_basis: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::LoopDetected,
@@ -1780,6 +1804,10 @@ async fn handle_call(
                 identity_reason: identity_reason.clone(),
                 pii_findings: None,
                 price_basis: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             });
             let verdict = budget_verdict(
                 BreakerReason::WasmPolicy,
@@ -1942,6 +1970,10 @@ async fn handle_call(
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
                         price_basis: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
+                        reasoning_tokens: None,
                     });
                     // Wardryx already emits its own `source: wardryx` policy
                     // event, so there is no `st.events.emit` call here (it
@@ -1974,6 +2006,10 @@ async fn handle_call(
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
                         price_basis: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
+                        reasoning_tokens: None,
                     });
                     // Stateless: the connection is not parked. The caller is
                     // expected to resubmit the same request later, carrying
@@ -2062,6 +2098,10 @@ async fn handle_call(
                         identity_reason: identity_reason.clone(),
                         pii_findings: None,
                         price_basis: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        cache_write_1h_tokens: None,
+                        reasoning_tokens: None,
                     });
                     let verdict = budget_verdict(
                         BreakerReason::UnitBudgetExceeded,
@@ -2166,6 +2206,10 @@ async fn handle_call(
                     identity_reason: identity_reason.clone(),
                     pii_findings: None,
                     price_basis: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    cache_write_1h_tokens: None,
+                    reasoning_tokens: None,
                 });
                 let verdict = budget_verdict(
                     BreakerReason::BudgetExceeded,
@@ -2454,6 +2498,10 @@ async fn handle_call(
                 identity_reason: identity_reason.clone(),
                 pii_findings: pii_counts.clone(),
                 price_basis: Some(crate::pricebook::basis(&st.prices, &parsed.model).to_string()),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             },
             unit.clone(),
         )
@@ -3089,6 +3137,10 @@ async fn buffered_managed(
                 identity_reason: guard.identity_reason(),
                 pii_findings: None,
                 price_basis: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             },
             event_agent_id,
             guard.run_id(),
@@ -8080,6 +8132,10 @@ pub(crate) mod tests {
                 identity_reason: None,
                 pii_findings: None,
                 price_basis: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cache_write_1h_tokens: None,
+                reasoning_tokens: None,
             },
             String::new(),
         );
@@ -8624,6 +8680,7 @@ pub(crate) mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: None,
             to: None,
+            spec: None,
         })
         .await
         .expect("the trace the gateway wrote exports");
@@ -8668,6 +8725,7 @@ pub(crate) mod tests {
             out: Some(out.to_str().unwrap().to_string()),
             from: None,
             to: None,
+            spec: None,
         })
         .await
         .expect("the trace the gateway wrote exports");

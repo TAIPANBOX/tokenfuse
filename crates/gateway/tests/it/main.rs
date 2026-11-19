@@ -30,6 +30,7 @@ mod delegation_htu_matches_wire;
 mod dlp_shadow_on_the_bus;
 mod event_checkpoints;
 mod firewall_mode_startup;
+mod focus_carries_cache_and_reasoning;
 mod focus_names_price_basis_and_pii;
 mod governed_profile;
 mod governed_profile_scope;

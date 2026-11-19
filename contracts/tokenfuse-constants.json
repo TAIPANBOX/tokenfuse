@@ -187,8 +187,55 @@
       "x_block_reason",
       "x_identity_reason",
       "x_price_basis",
-      "x_pii_findings"
-    ]
+      "x_pii_findings",
+      "x_cache_read_tokens",
+      "x_cache_write_tokens",
+      "x_cache_write_1h_tokens",
+      "x_reasoning_tokens"
+    ],
+    "spec_1_5": {
+      "columns": [
+        "BilledCost",
+        "EffectiveCost",
+        "BillingCurrency",
+        "ChargePeriodStart",
+        "ChargePeriodEnd",
+        "ChargeCategory",
+        "ChargeDescription",
+        "ProviderName",
+        "PublisherName",
+        "InvoiceIssuerName",
+        "ServiceName",
+        "ServiceCategory",
+        "ResourceId",
+        "ResourceName",
+        "SubAccountId",
+        "SubAccountName",
+        "ConsumedQuantity",
+        "ConsumedUnit",
+        "SkuPriceDetails",
+        "PrincipalId",
+        "CredentialId",
+        "RequesterDetails",
+        "x_run_id",
+        "x_parent_run_id",
+        "x_model",
+        "x_blocked",
+        "x_cost_basis",
+        "x_block_reason",
+        "x_outcome",
+        "x_unit",
+        "x_tool_calls",
+        "x_identity_reason",
+        "x_price_basis",
+        "x_pii_findings",
+        "x_reasoning_tokens",
+        "x_cache_write_1h_tokens"
+      ],
+      "flag": "--spec 1.5",
+      "rows": "one per token kind of a call: input uncached, input cache read, input cache write, output",
+      "status": "FOCUS 1.5 release candidate (completed 2026-11-02, ratification 2026-12-03)"
+    }
   },
   "generated_by": "tokenfuse constants (crates/gateway/src/constants.rs)",
   "price_book": {
@@ -1489,6 +1536,26 @@
         "name": "price_basis",
         "nullable": true,
         "type": "Utf8"
+      },
+      {
+        "name": "cache_read_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "cache_write_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "cache_write_1h_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "reasoning_tokens",
+        "nullable": true,
+        "type": "UInt64"
       }
     ],
     "write_schema": [
@@ -1601,6 +1668,26 @@
         "name": "price_basis",
         "nullable": true,
         "type": "Utf8"
+      },
+      {
+        "name": "cache_read_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "cache_write_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "cache_write_1h_tokens",
+        "nullable": true,
+        "type": "UInt64"
+      },
+      {
+        "name": "reasoning_tokens",
+        "nullable": true,
+        "type": "UInt64"
       }
     ]
   }

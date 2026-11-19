@@ -153,6 +153,41 @@ pub struct CallRecord {
     /// would be one record saying two things.
     #[serde(skip_serializing)]
     pub price_basis: Option<String>,
+    /// The cache-read input tokens the call was priced with (invariant 148):
+    /// Anthropic's `cache_read_input_tokens`, OpenAI's
+    /// `prompt_tokens_details.cached_tokens` (netted out of `input_tokens`,
+    /// invariant 45). `Usage::cache_read_tokens` as settlement handed it to
+    /// the price book, so a reader can recompute the row's cost from the row.
+    /// Set on an `allow` row whose cost was priced from parsed token counts,
+    /// `Some(0)` included; `None` on every other row (a refusal, a cache hit,
+    /// an estimate-settled call, a closure) and on a row written before the
+    /// column existed. Appended last, nullable, and kept off the Cloud wire
+    /// (`#[serde(skip_serializing)]`): the wire record's shape is the Cloud's
+    /// contract, and this change does not move it.
+    #[serde(skip_serializing)]
+    pub cache_read_tokens: Option<u64>,
+    /// Every cache-creation token priced on this call, on either TTL
+    /// (`Usage::cache_write_tokens`: Anthropic's
+    /// `cache_creation_input_tokens`, OpenAI's
+    /// `prompt_tokens_details.cache_write_tokens`). Same rule as
+    /// `cache_read_tokens`.
+    #[serde(skip_serializing)]
+    pub cache_write_tokens: Option<u64>,
+    /// The subset of `cache_write_tokens` written with the 1-hour TTL and
+    /// priced at the 1-hour rate (`Usage::cache_write_1h_tokens`,
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`, invariant 46). Same
+    /// rule as `cache_read_tokens`; `Some(0)` when the provider gave no
+    /// breakdown.
+    #[serde(skip_serializing)]
+    pub cache_write_1h_tokens: Option<u64>,
+    /// The reasoning tokens the provider reported as a detail of the output
+    /// (`Usage::reasoning_tokens`). Informational: `output_tokens` keeps its
+    /// meaning and already counts every reasoning token billed (invariant
+    /// 80), so this is never added to it. `None` when the provider named no
+    /// reasoning count (every Anthropic usage), on every row but a priced
+    /// `allow` row, and on a row written before the column existed.
+    #[serde(skip_serializing)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Current wall-clock time in epoch millis (0 if the clock is before the epoch).
@@ -289,6 +324,14 @@ impl ParquetSink {
             // Invariant 109: the price basis of an admitted call, appended
             // LAST, nullable: NULL is "not an admitted row" or "older row".
             Field::new("price_basis", DataType::Utf8, true),
+            // Invariant 148: the cache and reasoning counts the call was
+            // priced with, appended LAST, in this order, nullable: NULL is
+            // "not priced from parsed counts" or "older row", which no zero
+            // may stand in for.
+            Field::new("cache_read_tokens", DataType::UInt64, true),
+            Field::new("cache_write_tokens", DataType::UInt64, true),
+            Field::new("cache_write_1h_tokens", DataType::UInt64, true),
+            Field::new("reasoning_tokens", DataType::UInt64, true),
         ]))
     }
 
@@ -353,6 +396,12 @@ impl ParquetSink {
             Field::new("pii_findings", DataType::Utf8, true),
             // Invariant 109: same treatment once more.
             Field::new("price_basis", DataType::Utf8, true),
+            // Invariant 148: same treatment once more, so a trace written
+            // before the four columns existed reads back with them NULL.
+            Field::new("cache_read_tokens", DataType::UInt64, true),
+            Field::new("cache_write_tokens", DataType::UInt64, true),
+            Field::new("cache_write_1h_tokens", DataType::UInt64, true),
+            Field::new("reasoning_tokens", DataType::UInt64, true),
         ]))
     }
 
@@ -468,6 +517,31 @@ impl ParquetSink {
                         .map(|r| r.price_basis.clone())
                         .collect::<Vec<Option<String>>>(),
                 )),
+                // Invariant 148: a real NULL for `None`, in schema order.
+                Arc::new(UInt64Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.cache_read_tokens)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.cache_write_tokens)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.cache_write_1h_tokens)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    records
+                        .iter()
+                        .map(|r| r.reasoning_tokens)
+                        .collect::<Vec<_>>(),
+                )),
             ],
         )?;
 
@@ -570,6 +644,10 @@ mod tests {
             identity_reason: None,
             pii_findings: None,
             price_basis: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_write_1h_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -717,6 +795,69 @@ mod tests {
             ]
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Invariant 148: the four counts round-trip through a segment as real
+    /// values and real NULLs, and the Cloud wire record does not carry them.
+    #[tokio::test]
+    async fn the_cache_and_reasoning_counts_round_trip_and_stay_off_the_wire() {
+        use datafusion::arrow::array::Array;
+
+        let dir = std::env::temp_dir().join(format!("tf-sink-counts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let sink = ParquetSink::new(&dir, 1).unwrap();
+            let mut priced = rec("r-priced", 1840);
+            priced.cache_read_tokens = Some(300);
+            priced.cache_write_tokens = Some(1000);
+            priced.cache_write_1h_tokens = Some(600);
+            priced.reasoning_tokens = Some(0);
+            let wire = serde_json::to_value(&priced).unwrap();
+            for key in [
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cache_write_1h_tokens",
+                "reasoning_tokens",
+            ] {
+                assert!(wire.get(key).is_none(), "{key} is kept off the Cloud wire");
+            }
+            sink.record(priced);
+            sink.record(rec("r-unpriced", 0));
+        }
+        let batches = crate::sqlq::query(
+            "select run_id, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, \
+             reasoning_tokens from calls order by run_id",
+            dir.to_str().unwrap(),
+        )
+        .await
+        .expect("read back must succeed");
+        let mut rows: Vec<(String, Vec<Option<u64>>)> = Vec::new();
+        for b in &batches {
+            for i in 0..b.num_rows() {
+                let counts = (1..5)
+                    .map(|c| {
+                        let col = b
+                            .column(c)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .expect("a UInt64 column");
+                        (!col.is_null(i)).then(|| col.value(i))
+                    })
+                    .collect();
+                rows.push((crate::sqlq::str_at(b.column(0).as_ref(), i), counts));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "r-priced".to_string(),
+                    vec![Some(300), Some(1000), Some(600), Some(0)]
+                ),
+                ("r-unpriced".to_string(), vec![None, None, None, None]),
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

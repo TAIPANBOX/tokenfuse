@@ -621,6 +621,19 @@ fn apply_openai(usage: &mut Usage, net: &mut OpenAiNetting, u: &serde_json::Valu
     if net.cache_write > 0 {
         usage.cache_write_tokens = net.cache_write;
     }
+    // The reasoning detail, recorded beside the output and never added to it (the gap rule
+    // above already holds every reasoning token either vendor bills). Last non-zero wins as
+    // for every other figure; a reported zero is kept as `Some(0)` when nothing larger was
+    // seen, because "the provider said none" and "the provider said nothing" differ.
+    if let Some(r) = u
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|x| x.as_u64())
+    {
+        if r > 0 || usage.reasoning_tokens.is_none() {
+            usage.reasoning_tokens = Some(r);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1529,77 @@ mod tests {
         );
     }
 
+    /// Invariant 148: the reasoning detail is recorded beside the output and
+    /// never added to it, on Vertex's shape and on OpenAI's alike; a reported
+    /// zero is `Some(0)`, a usage that names none is `None`, and a later chunk
+    /// that reports zero does not erase a count already seen.
+    #[test]
+    fn the_reasoning_detail_is_recorded_beside_the_output_never_inside_it() {
+        let mut p = UsageParser::new();
+        p.feed(VERTEX_REASONING_USAGE);
+        let u = p.finish().usage;
+        assert_eq!(u.reasoning_tokens, Some(560));
+        assert_eq!(u.output_tokens, 619, "the output is unchanged");
+
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"prompt_tokens":14,"completion_tokens":619,"completion_tokens_details":{"reasoning_tokens":560},"total_tokens":633}}"#);
+        let u = p.finish().usage;
+        assert_eq!(u.reasoning_tokens, Some(560));
+        assert_eq!(u.output_tokens, 619);
+
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"prompt_tokens":14,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":0}}}"#);
+        assert_eq!(
+            p.finish().usage.reasoning_tokens,
+            Some(0),
+            "a reported zero"
+        );
+
+        let mut p = UsageParser::new();
+        p.feed(br#"{"usage":{"prompt_tokens":14,"completion_tokens":5}}"#);
+        assert_eq!(p.finish().usage.reasoning_tokens, None, "nothing reported");
+
+        let mut p = UsageParser::new();
+        p.feed(br#"{"type":"message","usage":{"input_tokens":10,"output_tokens":20}}"#);
+        assert_eq!(
+            p.finish().usage.reasoning_tokens,
+            None,
+            "Anthropic names no reasoning count"
+        );
+
+        let mut p = UsageParser::new();
+        p.feed(b"data: {\"usage\":{\"completion_tokens\":59,\"completion_tokens_details\":{\"reasoning_tokens\":560}}}\n\n");
+        p.feed(b"data: {\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n");
+        p.feed(b"data: [DONE]\n\n");
+        assert_eq!(
+            p.finish().usage.reasoning_tokens,
+            Some(560),
+            "last non-zero wins, as for every other figure"
+        );
+    }
+
+    /// Invariant 148: the reasoning count is informational and prices
+    /// nothing, so a usage with and without it costs the same.
+    #[test]
+    fn the_reasoning_count_prices_nothing() {
+        let mut p = UsageParser::new();
+        p.feed(VERTEX_REASONING_USAGE);
+        let with = p.finish().usage;
+        let without = Usage {
+            reasoning_tokens: None,
+            ..with
+        };
+        assert_eq!(
+            gemini_2_5_flash().cost(&with),
+            gemini_2_5_flash().cost(&without)
+        );
+        assert!(!Usage {
+            reasoning_tokens: Some(9),
+            ..Usage::default()
+        }
+        .carries_priced_tokens());
+    }
+
     #[test]
     fn parses_non_streaming_json_usage() {
         let mut p = UsageParser::new();
@@ -2204,6 +2288,7 @@ mod tests {
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
                 tool_calls: Some(1),
+                reasoning_tokens: None,
             },
             truncated: false,
             complete: true,
