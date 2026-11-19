@@ -111,10 +111,12 @@ async fn the_export_names_the_price_basis_and_the_pii_let_through() {
             .unwrap_or_else(|| panic!("the export has no {name} column: {header:?}"))
     };
     let (basis, pii, run) = (col("x_price_basis"), col("x_pii_findings"), col("x_run_id"));
+    // Appended after x_identity_reason, in this order; invariant 148's four
+    // columns were appended after them later.
     assert_eq!(
-        header.last().map(String::as_str),
-        Some("x_pii_findings"),
-        "appended last, after x_price_basis: {header:?}"
+        &header[basis - 1..=pii],
+        ["x_identity_reason", "x_price_basis", "x_pii_findings"],
+        "appended after x_identity_reason, in order: {header:?}"
     );
     let rows: Vec<Vec<String>> = lines.map(fields).collect();
     let row = |id: &str| {
