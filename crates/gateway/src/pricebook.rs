@@ -426,6 +426,20 @@ const OPENAI: &[(&str, Rates, Option<Rates>)] = &[
         (1_000_000, 5_000_000, 50_000, 1_250_000, 1_250_000),
         Some((2_000_000, 7_500_000, 100_000, 2_500_000, 2_500_000)),
     ),
+    // Read 2026-11-22, Standard tier: gpt-6.2-astra 8 / 40, cached 0.40, 30m
+    // write 10; gpt-6.2-sol 2 / 10, cached 0.10, 30m write 2.50. The page
+    // states no prompt-length tier for either, so neither carries one (the
+    // "12h write" column is not the 1-hour column here, as above).
+    (
+        "gpt-6.2-astra",
+        (8_000_000, 40_000_000, 400_000, 10_000_000, 10_000_000),
+        None,
+    ),
+    (
+        "gpt-6.2-sol",
+        (2_000_000, 10_000_000, 100_000, 2_500_000, 2_500_000),
+        None,
+    ),
     (
         "gpt-6-sol",
         (2_000_000, 10_000_000, 200_000, 2_500_000, 2_500_000),
@@ -1084,6 +1098,17 @@ mod tests {
                 "gpt-6.1-terra",
                 (1_000_000, 5_000_000, 50_000, 1_250_000, 1_250_000),
             ),
+            // Read 2026-11-22: gpt-6.2-astra 8 / 40, cached 0.40, 30m write 10;
+            // gpt-6.2-sol 2 / 10, cached 0.10, 30m write 2.50. The page states
+            // no prompt-length tier for either.
+            (
+                "gpt-6.2-astra",
+                (8_000_000, 40_000_000, 400_000, 10_000_000, 10_000_000),
+            ),
+            (
+                "gpt-6.2-sol",
+                (2_000_000, 10_000_000, 100_000, 2_500_000, 2_500_000),
+            ),
             (
                 "gpt-6-sol",
                 (2_000_000, 10_000_000, 200_000, 2_500_000, 2_500_000),
@@ -1381,6 +1406,44 @@ mod tests {
             assert!(book.is_known(id), "{id}");
             assert_eq!(book.cost(id, &short), Some(Microusd(150_000)), "{id}");
             assert_eq!(book.cost(id, &long), Some(Microusd(607_500)), "{id}");
+        }
+    }
+
+    /// gpt-6.2-astra and gpt-6.2-sol are current OpenAI models (the page lists
+    /// both, read 2026-11-22), so each is priced at its own row and not at the
+    /// fallback's 15 / 75. Until then estate-gates C23 was red
+    /// (`c23.current-model-missing`, 2026-11-20 on) and an unlisted call to
+    /// either was reserved at 15 / 75.
+    ///
+    /// Written out by hand from the page's Standard table. 100000 input and
+    /// 10000 output: astra at 8 / 40 is 800,000 + 400,000 = 1,200,000
+    /// micro-USD, sol at 2 / 10 is 200,000 + 100,000 = 300,000. The page states
+    /// no prompt-length tier for either, so a 300000-input call is the same
+    /// rate over: astra 2,400,000 + 40,000 = 2,440,000 for 1000 output, sol
+    /// 600,000 + 10,000 = 610,000. The OpenRouter name is the same price.
+    #[test]
+    fn gpt_6_2_astra_and_sol_are_priced_at_their_own_rows_not_the_fallback() {
+        let book = default_price_book();
+        let short = Usage {
+            input_tokens: 100_000,
+            output_tokens: 10_000,
+            ..Default::default()
+        };
+        let long = Usage {
+            input_tokens: 300_000,
+            output_tokens: 1_000,
+            ..Default::default()
+        };
+        for (model, short_cost, long_cost) in [
+            ("gpt-6.2-astra", 1_200_000, 2_440_000),
+            ("gpt-6.2-sol", 300_000, 610_000),
+        ] {
+            for id in [model.to_string(), format!("openai/{model}")] {
+                assert!(book.is_known(&id), "{id}");
+                assert_eq!(book.cost(&id, &short), Some(Microusd(short_cost)), "{id}");
+                assert_eq!(book.cost(&id, &long), Some(Microusd(long_cost)), "{id}");
+                assert!(book.long_context(&id).is_none(), "{id} states no tier");
+            }
         }
     }
 
