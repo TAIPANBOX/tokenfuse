@@ -1203,6 +1203,22 @@
         "output_per_mtok_microusd": 5000000
       },
       {
+        "cache_read_per_mtok_microusd": 400000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 10000000,
+        "input_per_mtok_microusd": 8000000,
+        "model": "gpt-6.2-astra",
+        "output_per_mtok_microusd": 40000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "gpt-6.2-sol",
+        "output_per_mtok_microusd": 10000000
+      },
+      {
         "cache_read_per_mtok_microusd": 550000,
         "cache_write_1h_per_mtok_microusd": 11000000,
         "cache_write_per_mtok_microusd": 6875000,
@@ -1369,6 +1385,22 @@
         "input_per_mtok_microusd": 1000000,
         "model": "openai/gpt-6.1-terra",
         "output_per_mtok_microusd": 5000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 400000,
+        "cache_write_1h_per_mtok_microusd": 10000000,
+        "cache_write_per_mtok_microusd": 10000000,
+        "input_per_mtok_microusd": 8000000,
+        "model": "openai/gpt-6.2-astra",
+        "output_per_mtok_microusd": 40000000
+      },
+      {
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2500000,
+        "cache_write_per_mtok_microusd": 2500000,
+        "input_per_mtok_microusd": 2000000,
+        "model": "openai/gpt-6.2-sol",
+        "output_per_mtok_microusd": 10000000
       },
       {
         "cache_read_per_mtok_microusd": 7500000,

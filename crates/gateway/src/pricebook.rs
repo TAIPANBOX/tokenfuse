@@ -426,6 +426,20 @@ const OPENAI: &[(&str, Rates, Option<Rates>)] = &[
         (1_000_000, 5_000_000, 50_000, 1_250_000, 1_250_000),
         Some((2_000_000, 7_500_000, 100_000, 2_500_000, 2_500_000)),
     ),
+    // Read 2026-11-22, Standard tier: gpt-6.2-astra 8 / 40, cached 0.40, 30m
+    // write 10; gpt-6.2-sol 2 / 10, cached 0.10, 30m write 2.50. The page
+    // states no prompt-length tier for either, so neither carries one (the
+    // "12h write" column is not the 1-hour column here, as above).
+    (
+        "gpt-6.2-astra",
+        (8_000_000, 40_000_000, 400_000, 10_000_000, 10_000_000),
+        None,
+    ),
+    (
+        "gpt-6.2-sol",
+        (2_000_000, 10_000_000, 100_000, 2_500_000, 2_500_000),
+        None,
+    ),
     (
         "gpt-6-sol",
         (2_000_000, 10_000_000, 200_000, 2_500_000, 2_500_000),
