@@ -1890,6 +1890,12 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- tokenfuse#364: an MCP upstream gets the operator's credential ---------------
+run_case "upstream-credentials: the broker sends no credential" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::the_broker_sends_each_upstream_its_own_credential_and_never_the_callers" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "    if let Some(credential) = st.upstream_credentials.get(&upstream_key(&upstream_url)) {", "    if let Some(credential) = st.upstream_credentials.get(&upstream_key(&upstream_url)).filter(|_| false) {")')" \
+	"the_broker_sends_each_upstream_its_own_credential_and_never_the_callers ... FAILED"
+
 # --- invariant 143: the label an enforcement point reports comes from the act ------
 #
 # The script gate holds the shape: no name can reach the route or the report, the

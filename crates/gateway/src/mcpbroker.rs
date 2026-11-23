@@ -206,6 +206,10 @@ pub struct BrokerState {
     /// (`TOKENFUSE_MCP_UPSTREAM_LABELS`, invariant 143). Empty by default, and
     /// then nothing here reports anything and nothing is refused for it.
     pub upstream_labels: UpstreamLabels,
+    /// The credential the broker sends to each upstream, read from a file the
+    /// operator mounted (`TOKENFUSE_MCP_UPSTREAM_CREDENTIALS`, tokenfuse#364).
+    /// Empty by default, and then the broker sends no credential, as before.
+    pub upstream_credentials: UpstreamCredentials,
 }
 
 /// The name a classification uses for the default upstream, which has no other.
@@ -297,6 +301,105 @@ pub fn upstream_labels_from(
         held.labels.extend(labels);
         held.labels.sort();
         held.labels.dedup();
+    }
+    Ok(out)
+}
+
+/// The variable naming a credential file per upstream (tokenfuse#364).
+pub const UPSTREAM_CREDENTIALS_VAR: &str = "TOKENFUSE_MCP_UPSTREAM_CREDENTIALS";
+
+/// The longest credential a file may hold: 4 KiB, the agent token's own cap.
+pub const UPSTREAM_CREDENTIAL_CAP_BYTES: usize = 4096;
+
+/// The `Authorization: Bearer` value the broker sends to an upstream, by server
+/// ([`upstream_key`]), never by the name a request selected, as the labels are
+/// held. The value is marked sensitive, so a `Debug` print never shows it.
+pub type UpstreamCredentials = BTreeMap<String, reqwest::header::HeaderValue>;
+
+/// Read `TOKENFUSE_MCP_UPSTREAM_CREDENTIALS`: `name=/path,name=/path`, the name an
+/// upstream of `TOKENFUSE_MCP_UPSTREAMS` or `default` for `TOKENFUSE_MCP_UPSTREAM`.
+/// Each file holds one bearer token on its first line, which the broker sends to
+/// that upstream as `Authorization: Bearer <token>` and nowhere else. It is never
+/// taken from the caller.
+///
+/// ONE bad entry refuses the whole value, as the labels do: an entry dropped here
+/// would leave its upstream answering 401 to every call while the broker looked
+/// configured. A malformed entry, a name no upstream carries, a name given twice,
+/// a file that cannot be read, an empty one, one over 4 KiB and one whose token
+/// is not a valid header value each refuse, naming the variable and the file and
+/// never the token.
+pub fn upstream_credentials_from(
+    spec: Option<&str>,
+    default_upstream: &str,
+    named: &BTreeMap<String, String>,
+    read: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<UpstreamCredentials, String> {
+    let mut out = UpstreamCredentials::new();
+    let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
+        return Ok(out);
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((name, path)) = entry.split_once('=') else {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: entry {entry:?} is not name=/path/to/file"
+            ));
+        };
+        let (name, path) = (name.trim(), path.trim());
+        if path.is_empty() {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: {name:?} names no file"
+            ));
+        }
+        let url = match named.get(name) {
+            Some(url) => url.as_str(),
+            None if name == DEFAULT_UPSTREAM_NAME => default_upstream,
+            None => {
+                return Err(format!(
+                    "{UPSTREAM_CREDENTIALS_VAR}: {name:?} names no configured upstream \
+                     (TOKENFUSE_MCP_UPSTREAMS, or {DEFAULT_UPSTREAM_NAME:?} for \
+                     TOKENFUSE_MCP_UPSTREAM)"
+                ))
+            }
+        };
+        if !seen.insert(name.to_string()) {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: {name:?} is named twice"
+            ));
+        }
+        let raw = read(path).map_err(|e| {
+            format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: the file for {name:?} ({path}) cannot be read: {e}"
+            )
+        })?;
+        if raw.len() > UPSTREAM_CREDENTIAL_CAP_BYTES {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: the file for {name:?} ({path}) is over \
+                 {UPSTREAM_CREDENTIAL_CAP_BYTES} bytes"
+            ));
+        }
+        let token = raw.lines().next().unwrap_or_default().trim();
+        if token.is_empty() {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: the file for {name:?} ({path}) holds no token"
+            ));
+        }
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| {
+                format!(
+                    "{UPSTREAM_CREDENTIALS_VAR}: the token in the file for {name:?} ({path}) \
+                     is not a valid header value"
+                )
+            })?;
+        value.set_sensitive(true);
+        let key = upstream_key(url);
+        if out.contains_key(&key) {
+            return Err(format!(
+                "{UPSTREAM_CREDENTIALS_VAR}: {name:?} is the same server as another entry, \
+                 and one server takes one credential"
+            ));
+        }
+        out.insert(key, value);
     }
     Ok(out)
 }
@@ -3646,5 +3749,97 @@ mod tests {
             None,
             "agent tokens off: a taint gateway asked with the caller's own key, as before"
         );
+    }
+
+    // --- tokenfuse#364: TOKENFUSE_MCP_UPSTREAM_CREDENTIALS ---------------------
+
+    fn named() -> BTreeMap<String, String> {
+        [("tickets".to_string(), "http://tickets:9000".to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    fn read_ok(p: &str) -> std::io::Result<String> {
+        match p {
+            "/a" => Ok("tok-a\n".to_string()),
+            "/t" => Ok("  tok-t  \nsecond line ignored\n".to_string()),
+            "/empty" => Ok("\n".to_string()),
+            "/bad" => Ok("tok\u{7}bell".to_string()),
+            "/huge" => Ok("x".repeat(UPSTREAM_CREDENTIAL_CAP_BYTES + 1)),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            )),
+        }
+    }
+
+    #[test]
+    fn unset_or_blank_credentials_send_nothing() {
+        for spec in [None, Some(""), Some("  ")] {
+            assert!(
+                upstream_credentials_from(spec, "http://d", &named(), read_ok)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn each_upstream_gets_its_own_bearer_token_keyed_by_server() {
+        let c = upstream_credentials_from(
+            Some("default=/a, tickets=/t"),
+            "http://d",
+            &named(),
+            read_ok,
+        )
+        .unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(
+            c[&upstream_key("http://d")].to_str().unwrap(),
+            "Bearer tok-a"
+        );
+        assert_eq!(
+            c[&upstream_key("http://tickets:9000/")].to_str().unwrap(),
+            "Bearer tok-t"
+        );
+        assert!(
+            c.values().all(|v| v.is_sensitive()),
+            "never printed by Debug"
+        );
+    }
+
+    #[test]
+    fn one_bad_entry_refuses_the_whole_value_and_never_names_the_token() {
+        let cases = [
+            ("tickets", "is not name=/path/to/file"),
+            ("tickets=", "names no file"),
+            ("ghost=/a", "names no configured upstream"),
+            ("tickets=/t,tickets=/a", "is named twice"),
+            ("tickets=/missing", "cannot be read"),
+            ("tickets=/empty", "holds no token"),
+            ("tickets=/bad", "is not a valid header value"),
+            ("tickets=/huge", "is over"),
+        ];
+        for (spec, why) in cases {
+            let err = upstream_credentials_from(Some(spec), "http://d", &named(), read_ok)
+                .expect_err(spec);
+            assert!(err.contains(UPSTREAM_CREDENTIALS_VAR), "{spec}: {err}");
+            assert!(err.contains(why), "{spec}: {err}");
+            assert!(
+                !err.contains("tok-"),
+                "{spec}: the token is never named: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_names_for_one_server_are_one_credential_and_refused_twice() {
+        let named: BTreeMap<String, String> = [("same".to_string(), "http://d/".to_string())]
+            .into_iter()
+            .collect();
+        let err =
+            upstream_credentials_from(Some("default=/a,same=/t"), "http://d", &named, read_ok)
+                .unwrap_err();
+        assert!(err.contains("same server"), "{err}");
     }
 }
