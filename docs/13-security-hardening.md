@@ -138,8 +138,11 @@ TokenFuse keys. This is implemented in `crates/cloud/src/oidc.rs`.
   (`TOKENFUSE_CLOUD_OIDC_ORG_CLAIM`, default `org`) is rejected — no org, no
   access. Mutations by an OIDC admin are attributed in the audit trail as
   `oidc:<sub>` (a stable, non-secret id), never the raw token.
-- **Deferred (not built here):** live/networked JWKS fetch, SAML, SCIM, and
-  session cookies. Those are explicitly out of scope for this pass.
+- **Deferred for this verifier (not built here):** a live, networked JWKS
+  fetch, SAML, SCIM, and session cookies. This is the control plane's OIDC
+  bearer check only. The gateway's delegation and agent-token doors are a
+  separate verifier, and they can poll their issuer's key set from a URL
+  (`TOKENFUSE_DELEGATION_JWKS_URL`, CLAUDE.md invariant 127).
 
 ## Deliberate design choices with security consequences
 

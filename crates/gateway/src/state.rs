@@ -43,18 +43,19 @@ pub struct AppState {
     pub cache: Arc<SemanticCache>,
     /// Agent-firewall config (Off by default).
     pub firewall: Arc<FirewallConfig>,
-    /// Secret-scanning (DLP) mode (Off by default).
+    /// Secret-scanning (DLP) mode (`Block` by default since 2026-08-06; see
+    /// `crate::defaults`).
     pub dlp: DlpMode,
     /// Refuse a call that carries no `x-fuse-run-id` instead of passing it
-    /// through unmetered (false by default).
+    /// through unmetered (`true` by default since 2026-08-06, invariant 17;
+    /// `TOKENFUSE_REQUIRE_RUN_ID=0` turns it off).
     ///
-    /// The pass-through is what makes this gateway drop-in safe, and it stays
-    /// the default for that reason. What it also means is that the meter is
-    /// switched on by the caller: omit the header and a real call reaches the
-    /// provider with nothing recorded in the ledger, the trace or the event
-    /// stream. That is the right trade for an evaluation and the wrong one for
-    /// a deployment whose whole claim is that every call is accounted for.
-    /// Setting this turns "unmetered" into a 400 rather than a silence.
+    /// Off, the pass-through is drop-in safe for an evaluation, and the meter
+    /// is switched on by the caller: omit the header and a real call reaches
+    /// the provider with nothing recorded in the ledger, the trace or the
+    /// event stream. That is the wrong trade for a deployment whose whole
+    /// claim is that every call is accounted for, which is why it is on by
+    /// default: "unmetered" is a 400 rather than a silence.
     pub require_run_id: bool,
     /// The governance profile in effect (CLAUDE.md invariant 136). The
     /// constructor's default is `Observe`: the defaults every test written

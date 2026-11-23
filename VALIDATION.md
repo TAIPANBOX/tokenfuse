@@ -334,6 +334,12 @@ refused delegation token is answered with the client-credential `401`, whose tex
 `x-fuse-key`, and the log names every refusal `BadToken`, so a revocation and a key mismatch read
 alike.
 
+Both were fixed after these runs. A call's cost is now summed across its parts and rounded once,
+toward over-charging (CLAUDE.md invariant 67, `pricing::tests::the_measured_gpt_4o_mini_call_ceils_to_four_micro_usd_not_two`:
+the same 13 and 2 tokens now cost 4 micro-USD). A refused delegation proof is answered
+`401 delegation_refused`, which names no client credential, and the log names each cause on its own
+(invariant 68).
+
 ## Method
 
 Disposable Hetzner VPS boxes (deleted after each run) and short-lived cloud instances; code delivered as

@@ -1,5 +1,9 @@
 # 26 - the OpenAI door: the same enforcement, a second wire shape
 
+> **Status:** built. `POST /v1/chat/completions` is
+> served today (`crates/gateway/src/lib.rs`, `TOKENFUSE_WIRE`). The paragraph below
+> records why the door was designed, when it was still planned.
+
 Doc 02 has said since the first planning pass that an OpenAI-compatible
 `/v1/chat/completions` is planned, and the README has said twice that it is not
 built. This is the design that closes that. It is a **second front door on one
