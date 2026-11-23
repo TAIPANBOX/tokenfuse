@@ -1224,7 +1224,7 @@ for p in paths:
 # operator's file, which is a wrong bill nobody would see.
 run_case "price-book: claude-sonnet-5 loses its row and falls back" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate" \
-	"$(py 'edit("crates/gateway/src/pricebook.rs", "list: &[\"claude-sonnet-5\", \"anthropic/claude-sonnet-5\"],", "list: &[\"anthropic/claude-sonnet-5\"],")')" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "            \"claude-sonnet-5\",\n            \"anthropic/claude-sonnet-5\",\n", "            \"anthropic/claude-sonnet-5\",\n")')" \
 	"every_vendor_listed_id_prices_at_its_list_rate ... FAILED"
 
 run_case "price-book: the operator file's rate cap is gone" fail \
