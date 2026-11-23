@@ -439,6 +439,12 @@ impl ToolCallHold {
                 }
                 add(joined.read(), &mut variants);
             }
+            // Statements past the cap were not kept, and the names they gave are
+            // unknown: the empty name stands for them, which no map names, so after
+            // untrusted input the call is refused as unclassified.
+            if c.too_many_statements && !names.iter().any(|n| n.is_empty()) {
+                names.push(String::new());
+            }
             if names.is_empty() {
                 let carries = variants
                     .iter()
@@ -1016,7 +1022,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         };
         let input: String = (0..40).map(message).collect();
         let (_, held) = run(input.as_bytes(), &[input.len()]);
-        assert_eq!(held.tools.len(), MAX_STATEMENTS_PER_CALL, "bounded");
+        assert_eq!(held.tools.len(), MAX_STATEMENTS_PER_CALL + 1, "bounded");
+        assert!(
+            held.tools.contains(&String::new()),
+            "the names past the cap are judged as unknown, never dropped"
+        );
         assert!(held.calls.iter().any(|c| c.args == ToolArgs::OverCap));
         assert!(held.calls.len() <= MAX_STATEMENTS_PER_CALL * (MAX_STATEMENTS_PER_CALL + 3));
     }
