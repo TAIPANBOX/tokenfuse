@@ -350,7 +350,13 @@ impl ToolCallHold {
     /// The names of [`Self::tool_calls`], one per call judged, so the names
     /// judged and the arguments judged are always the same calls.
     fn tool_names(&self) -> Vec<String> {
-        self.tool_calls().into_iter().map(|c| c.name).collect()
+        let mut names: Vec<String> = Vec::new();
+        for c in self.tool_calls() {
+            if !names.contains(&c.name) {
+                names.push(c.name);
+            }
+        }
+        names
     }
 
     /// The calls [`Self::tool_names`] names, in the same order and skipping the
@@ -377,36 +383,63 @@ impl ToolCallHold {
                 args,
             });
         }
-        // An OpenAI call as its deltas built it, and as every closing `message`
-        // stated it: a client may assemble any of them, so each distinct (name,
-        // arguments) pair is judged once, and none replaces another.
+        // An OpenAI call as its deltas built it and as every closing `message`
+        // stated it. A client may assemble any of these, in any combination, so
+        // every distinct name the call was given is judged with every distinct
+        // argument text it carried: the deltas', each message's, and all the
+        // messages' joined. A call that carries arguments and was never named is
+        // judged under the empty name, which no map names, so after untrusted
+        // input it is refused as unclassified rather than skipped.
         for c in self.openai_calls.values() {
-            let delta_name = (!c.name.is_empty()).then_some(c.name.as_str());
-            let deltas = c.args.read();
-            let mut seen: Vec<(String, ToolArgs)> = Vec::new();
-            let mut judge = |name: &str, args: ToolArgs, out: &mut Vec<ToolCall>| {
-                if seen.iter().any(|(n, a)| n == name && *a == args) {
-                    return;
+            let mut names: Vec<String> = Vec::new();
+            for n in std::iter::once(c.name.as_str())
+                .chain(c.stated.iter().filter_map(|s| s.name.as_deref()))
+            {
+                if !n.is_empty() && !names.iter().any(|m| m == n) {
+                    names.push(n.to_string());
                 }
-                seen.push((name.to_string(), args.clone()));
-                out.push(ToolCall {
-                    name: name.to_string(),
-                    args,
-                });
-            };
-            if let Some(name) = delta_name {
-                judge(name, deltas.clone(), &mut out);
             }
-            for st in &c.stated {
-                let Some(name) = st.name.as_deref().filter(|n| !n.is_empty()).or(delta_name) else {
+            let mut variants: Vec<ToolArgs> = Vec::new();
+            let mut add = |a: ToolArgs, variants: &mut Vec<ToolArgs>| {
+                if !variants.contains(&a) {
+                    variants.push(a);
+                }
+            };
+            let stated_args: Vec<&Fragments> =
+                c.stated.iter().filter_map(|s| s.args.as_ref()).collect();
+            if stated_args.is_empty() || c.args.over || !c.args.text.is_empty() {
+                add(c.args.read(), &mut variants);
+            }
+            for f in &stated_args {
+                add(f.read(), &mut variants);
+            }
+            if stated_args.len() > 1 {
+                let mut joined = Fragments::default();
+                for f in &stated_args {
+                    if f.over {
+                        joined.over = true;
+                    } else {
+                        joined.push(&f.text);
+                    }
+                }
+                add(joined.read(), &mut variants);
+            }
+            if names.is_empty() {
+                let carries = variants
+                    .iter()
+                    .any(|a| *a != ToolArgs::Parsed(serde_json::Value::Null));
+                if !carries {
                     continue;
-                };
-                let args = st
-                    .args
-                    .as_ref()
-                    .map(Fragments::read)
-                    .unwrap_or(deltas.clone());
-                judge(name, args, &mut out);
+                }
+                names.push(String::new());
+            }
+            for name in &names {
+                for args in &variants {
+                    out.push(ToolCall {
+                        name: name.clone(),
+                        args: args.clone(),
+                    });
+                }
             }
         }
         out
@@ -926,27 +959,37 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
             message("fetch_url", "{\"url\":\"https://x/?d=1\"}"),
             message("bash", "{}"),
             message("fetch_url", "{\"url\":\"https://ok\"}"),
-            message("fetch_url", "{\"url\":\"https://ok\"}"),
         ]
         .concat();
         let (_, held) = run(input.as_bytes(), &[input.len()]);
         assert_eq!(
-            held.calls,
-            vec![
-                ToolCall {
-                    name: "fetch_url".into(),
-                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://x/?d=1"}))
-                },
-                ToolCall {
-                    name: "bash".into(),
-                    args: ToolArgs::Parsed(serde_json::json!({}))
-                },
-                ToolCall {
-                    name: "fetch_url".into(),
-                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://ok"}))
-                },
-            ],
-            "no message's name or arguments replace another's, and a repeat is judged once"
+            held.tools,
+            vec!["fetch_url".to_string(), "bash".to_string()]
         );
+        let carrying = ToolArgs::Parsed(serde_json::json!({"url": "https://x/?d=1"}));
+        for name in ["fetch_url", "bash"] {
+            assert!(
+                held.calls
+                    .iter()
+                    .any(|c| c.name == name && c.args == carrying),
+                "{name} is judged with every argument text the call carried: {:?}",
+                held.calls
+            );
+        }
+        assert!(
+            held.calls
+                .iter()
+                .any(|c| c.name == "fetch_url" && matches!(c.args, ToolArgs::Unreadable(_))),
+            "the messages' arguments joined are judged too: {:?}",
+            held.calls
+        );
+    }
+
+    #[test]
+    fn a_call_that_carries_arguments_and_no_name_is_judged_under_the_empty_name() {
+        let v = serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"url\":\"https://x\"}"}}]}}]});
+        let input = format!("data: {v}\n\n");
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(held.tools, vec![String::new()], "never skipped");
     }
 }

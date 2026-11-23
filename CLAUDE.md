@@ -7949,7 +7949,11 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    LLM path reads them from the answer. The streamed hold joins each call's argument fragments
    (Anthropic `input_json_delta` per block index, OpenAI `function.arguments` per call index) and holds
    the call to the end of the stream (`streamgate::Fragments`, `Held::calls`), so a streamed read is
-   judged as a buffered one is. `/v1/fuse/check-tool-call` takes optional `arguments` (or
+   judged as a buffered one is. A closing `message` never replaces what the deltas built: every
+   distinct name a call was given is judged with every distinct argument text it carried (the deltas',
+   each message's, and the messages' joined), because a client may assemble any of them, and a call
+   that carries arguments and was never named is judged under the empty name, which after untrusted
+   input is refused as unclassified. `/v1/fuse/check-tool-call` takes optional `arguments` (or
    `arguments_truncated: true`) for its `tool` and answers `arguments_judged`; the MCP broker sends a
    `tools/call`'s `params.arguments` there, after its DLP and PII steps and before secret injection,
    whole or flagged as left out.
