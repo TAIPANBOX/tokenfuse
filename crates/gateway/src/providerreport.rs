@@ -48,7 +48,18 @@ pub enum Flush {
 struct Pending {
     count: u64,
     detail: String,
+    /// Provider answers of 401 or 403, by who made the call (tokenfuse#312):
+    /// `(agent_id, key_id)` to how many, bounded at [`MAX_AUTH_SUBJECTS`].
+    auth: std::collections::BTreeMap<(String, String), u64>,
 }
+
+/// The most distinct callers one report carries refusals for; past it, a new
+/// caller's refusals are added to the empty subject, so none is lost.
+pub const MAX_AUTH_SUBJECTS: usize = 64;
+
+/// The longest agent id or key id sent, in characters. The Cloud cuts at the
+/// same length.
+const SUBJECT_MAX_CHARS: usize = 256;
 
 /// Counts provider failures and reports them to the Cloud.
 pub struct ProviderFailureReporter {
@@ -91,6 +102,26 @@ impl ProviderFailureReporter {
             .collect();
     }
 
+    /// Count one provider answer of 401 or 403 for the caller that made it
+    /// (tokenfuse#312). A provider that refuses a credential is not ill, so this
+    /// is counted apart from [`Self::note`] and never folds into the provider's
+    /// health incident (invariant 144).
+    pub fn note_auth(&self, agent_id: &str, key_id: &str) {
+        let clean = |s: &str| -> String {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(SUBJECT_MAX_CHARS)
+                .collect()
+        };
+        let mut subject = (clean(agent_id), clean(key_id));
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !pending.auth.contains_key(&subject) && pending.auth.len() >= MAX_AUTH_SUBJECTS {
+            subject = (String::new(), String::new());
+        }
+        let n = pending.auth.entry(subject).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+
     /// What a test reads instead of the Cloud: the count and the detail
     /// waiting for the next flush.
     #[cfg(test)]
@@ -99,6 +130,17 @@ impl ProviderFailureReporter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_auth(&self) -> Vec<((String, String), u64)> {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .auth
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     #[cfg(test)]
@@ -114,19 +156,39 @@ impl ProviderFailureReporter {
     /// counter is cleared first, whatever the answer: a failed delivery is
     /// dropped, not retried (see the module comment).
     pub async fn flush(&self) -> Flush {
-        let (count, detail) = {
+        let (count, detail, auth) = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if pending.count == 0 {
+            if pending.count == 0 && pending.auth.is_empty() {
                 return Flush::Nothing;
             }
             (
                 std::mem::take(&mut pending.count),
                 std::mem::take(&mut pending.detail),
+                std::mem::take(&mut pending.auth),
             )
         };
-        let body = serde_json::json!({
-            "failures": [{ "provider": self.provider, "count": count, "detail": detail }]
-        });
+        let auth_total: u64 = auth.values().fold(0u64, |a, n| a.saturating_add(*n));
+        let failures: Vec<serde_json::Value> = if count > 0 {
+            vec![serde_json::json!({ "provider": self.provider, "count": count, "detail": detail })]
+        } else {
+            Vec::new()
+        };
+        let auth_failures: Vec<serde_json::Value> = auth
+            .into_iter()
+            .map(|((agent_id, key_id), n)| {
+                serde_json::json!({
+                    "provider": self.provider,
+                    "agent_id": agent_id,
+                    "key_id": key_id,
+                    "count": n,
+                })
+            })
+            .collect();
+        let mut body = serde_json::json!({ "failures": failures });
+        if !auth_failures.is_empty() {
+            body["auth_failures"] = serde_json::Value::Array(auth_failures);
+        }
+        let count = count.saturating_add(auth_total);
         let payload = match serde_json::to_vec(&body) {
             Ok(p) => p,
             Err(_) => return Flush::Dropped(count),
@@ -220,6 +282,21 @@ pub fn install(
     REPORTER.set(Arc::clone(&reporter)).ok()?;
     reporter.spawn();
     Some(reporter)
+}
+
+/// Count a provider's 401 or 403 for the caller that made it (tokenfuse#312),
+/// if a reporter is installed; any other status is not counted here.
+pub fn note_auth_refusal(status: u16, agent_id: &str, key_id: &str) {
+    if !matches!(status, 401 | 403) {
+        return;
+    }
+    if let Some(reporter) = this_thread_reporter() {
+        reporter.note_auth(agent_id, key_id);
+        return;
+    }
+    if let Some(reporter) = REPORTER.get() {
+        reporter.note_auth(agent_id, key_id);
+    }
 }
 
 /// Count one failed provider call, if a reporter is installed. A no-op
@@ -405,5 +482,34 @@ mod tests {
     fn noting_with_no_reporter_installed_is_a_no_op() {
         // Nothing in this test binary installs the process-wide reporter.
         note_provider_failure("nobody is listening");
+    }
+
+    /// tokenfuse#312: refused credentials go out in `auth_failures`, by caller,
+    /// beside (or without) the provider's failures, and are bounded.
+    #[tokio::test]
+    async fn refused_credentials_are_reported_by_caller_and_bounded() {
+        let (base, received, _) = stub_cloud(200).await;
+        let r = ProviderFailureReporter::new(&base, "sk-ingest", "api.anthropic.com");
+        r.note_auth("agent://a/x", "");
+        r.note_auth("agent://a/x", "");
+        r.note_auth("", "key-7");
+        assert_eq!(r.flush().await, Flush::Sent(3));
+        let (_, body) = received.lock().unwrap()[0].clone();
+        assert_eq!(body["failures"], serde_json::json!([]));
+        let auth = body["auth_failures"].as_array().unwrap();
+        assert_eq!(auth.len(), 2, "{body}");
+        assert!(auth.contains(&serde_json::json!({"provider": "api.anthropic.com", "agent_id": "agent://a/x", "key_id": "", "count": 2})));
+        assert!(auth.contains(&serde_json::json!({"provider": "api.anthropic.com", "agent_id": "", "key_id": "key-7", "count": 1})));
+        for i in 0..(MAX_AUTH_SUBJECTS + 10) {
+            r.note_auth(&format!("agent://a/{i}"), "");
+        }
+        let held = r.pending_auth();
+        assert_eq!(
+            held.len(),
+            MAX_AUTH_SUBJECTS + 1,
+            "bounded, and the overflow kept under the empty subject"
+        );
+        let total: u64 = held.iter().map(|(_, n)| n).sum();
+        assert_eq!(total, (MAX_AUTH_SUBJECTS + 10) as u64, "no refusal is lost");
     }
 }

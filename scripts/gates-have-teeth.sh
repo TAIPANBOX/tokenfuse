@@ -1890,6 +1890,17 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- invariant 149: a refused provider credential is one incident ----------------
+run_case "provider-auth: the gateway never counts a refused credential" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller" \
+	"$(py 'edit("crates/gateway/src/providerreport.rs", "    if !matches!(status, 401 | 403) {", "    if true || !matches!(status, 401 | 403) {")')" \
+	"a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller ... FAILED"
+
+run_case "provider-auth: one event per report, not per incident" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::three_refused_credentials_open_one_incident_and_one_event_under_the_agent" \
+	"$(py 'edit("crates/cloud/src/store.rs", "        let (inc, new) = opened?;\n        if new {", "        let (inc, _new) = opened?;\n        if true {")')" \
+	"three_refused_credentials_open_one_incident_and_one_event_under_the_agent ... FAILED"
+
 # --- invariant 143: the label an enforcement point reports comes from the act ------
 #
 # The script gate holds the shape: no name can reach the route or the report, the

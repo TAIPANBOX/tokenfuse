@@ -1501,6 +1501,12 @@ struct Inner {
     /// window over the bucket width per label, and a label whose window has
     /// emptied is removed before the cap is looked at.
     provider_failures: HashMap<String, HashMap<String, ProviderWindows>>,
+    /// org -> scope (`<provider>:<agent | key:<id> | (unattributed)>`, with
+    /// `@<site>` for a site-bound key) -> ten-second buckets of a provider's
+    /// 401 and 403 answers (tokenfuse#312). Ephemeral like `provider_failures`;
+    /// bounded by [`MAX_AUTH_SCOPES_PER_ORG`], a scope whose window has emptied
+    /// removed before the cap is looked at.
+    provider_auth: HashMap<String, ProviderWindows>,
     /// (org, agent_id) → recent `(run_id, ts)` for the `fanout_explosion`
     /// detector, kept distinct-by-run and bounded to [`INCIDENT_TRACKER_CAP`];
     /// the windowed distinct-run count the detector thresholds against
@@ -2976,6 +2982,180 @@ impl Store {
         };
         let _ = self.events.send(StreamEvent::Incident(fired.clone()));
         Some(fired)
+    }
+
+    /// tokenfuse#312: fold a gateway's count of a provider's 401 and 403
+    /// answers, for one caller, into ONE incident per (provider, caller, site),
+    /// id `provider_auth_refused:<provider>:<caller>[@<site>]`, `medium`, once
+    /// `provider_failures` such answers arrived within `provider_window_ms`
+    /// (the same threshold and window as invariant 144's). The caller is the
+    /// agent when the gateway named one (`agent://...`), else `key:<key_id>`,
+    /// else `(unattributed)`. A provider refusing a credential is not ill, so
+    /// this is counted apart from the provider's health incident.
+    ///
+    /// The incident is on the console and the API like any other. When it is
+    /// opened, and only then, ONE `dependency_failed` goes on the agent-event
+    /// bus under the agent (dependency `provider`, stage `response`, effect
+    /// `call_failed`), so a notifier hears that a fleet's provider key was
+    /// revoked or rotated without one event per call. With no agent it is not
+    /// exported: the envelope needs a subject (SPEC.md 6.1).
+    /// `@decided 2026-11-23`: a credential the provider refuses becomes one
+    /// incident per caller and one existing-type event on the bus, not one per
+    /// call. Arrival time, the site from the key, as invariant 144.
+    pub fn note_provider_auth_failures_from_at(
+        &self,
+        org: &str,
+        site: Option<&str>,
+        provider: &str,
+        agent_id: &str,
+        key_id: &str,
+        count: u64,
+        now_ms: i64,
+    ) -> Option<Incident> {
+        let label = provider_label(provider)?;
+        let site = site.and_then(provider_label);
+        let count = count.min(MAX_PROVIDER_FAILURES_PER_REPORT);
+        if count == 0 {
+            return None;
+        }
+        let clean = |s: &str| -> String {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(AUTH_SUBJECT_MAX_CHARS)
+                .collect()
+        };
+        let agent = Some(clean(agent_id)).filter(|a| a.starts_with("agent://") && a.len() > 8);
+        let key = clean(key_id);
+        let caller = match (&agent, key.is_empty()) {
+            (Some(a), _) => a.clone(),
+            (None, false) => format!("key:{key}"),
+            (None, true) => "(unattributed)".to_string(),
+        };
+        let threshold = self.incident_cfg.provider_failures.max(1);
+        let window_ms = self.incident_cfg.provider_window_ms.max(1);
+        let opened: Option<(Incident, bool)> = {
+            let mut guard = self.inner.write().unwrap();
+            let inner = &mut *guard;
+            let scopes = inner.provider_auth.entry(org.to_string()).or_default();
+            scopes.retain(|_, buckets| {
+                while buckets
+                    .front()
+                    .is_some_and(|(start, _)| now_ms.saturating_sub(*start) >= window_ms)
+                {
+                    buckets.pop_front();
+                }
+                !buckets.is_empty()
+            });
+            let mut scope = format!("{label}:{caller}");
+            if let Some(site) = site.as_deref() {
+                scope.push('@');
+                scope.push_str(site);
+            }
+            let mut agent = agent;
+            if !scopes.contains_key(&scope) && scopes.len() >= MAX_AUTH_SCOPES_PER_ORG {
+                scope = format!("{label}:(other)");
+                agent = None;
+            }
+            let buckets = scopes.entry(scope.clone()).or_default();
+            let bucket = now_ms - now_ms.rem_euclid(PROVIDER_BUCKET_MS);
+            if buckets.back().is_some_and(|(start, _)| *start == bucket) {
+                if let Some((_, n)) = buckets.back_mut() {
+                    *n = n.saturating_add(count);
+                }
+            } else {
+                buckets.push_back((bucket, count));
+            }
+            let in_window = buckets
+                .iter()
+                .fold(0u64, |sum, (_, n)| sum.saturating_add(*n));
+            if in_window < threshold {
+                None
+            } else {
+                let id = incident_id(PROVIDER_AUTH_KIND, &scope);
+                let prior = inner
+                    .incidents
+                    .get(org)
+                    .and_then(|m| m.get(&id))
+                    .map(|i| i.occurrences);
+                let mut inc = upsert_incident(
+                    &mut inner.incidents,
+                    org,
+                    PROVIDER_AUTH_KIND,
+                    tokenfuse_core::Severity::Medium,
+                    &scope,
+                    None,
+                    agent.clone(),
+                    now_ms,
+                );
+                if let Some(stored) = inner
+                    .incidents
+                    .get_mut(org)
+                    .and_then(|m| m.get_mut(&inc.id))
+                {
+                    stored.occurrences = match prior {
+                        Some(before) => before.saturating_add(count),
+                        None => in_window,
+                    };
+                    let minutes = (window_ms / 60_000).max(1);
+                    let mut summary = format!(
+                        "{label} refused the credential of {caller} on {in_window} calls in the last {minutes} min (HTTP 401 or 403)"
+                    );
+                    if let Some(site) = site.as_deref() {
+                        summary.push_str(&format!(", reported by site {site}"));
+                    }
+                    stored.summary = Some(summary);
+                    inc = stored.clone();
+                }
+                inner.dirty = true;
+                Some((inc, prior.is_none()))
+            }
+        };
+        let (inc, new) = opened?;
+        if new {
+            let detail = format!(
+                "provider {label} refused the credential on {} calls in {} min (HTTP 401 or 403)",
+                inc.occurrences,
+                (window_ms / 60_000).max(1)
+            );
+            let data = tokenfuse_core::agent_event::dependency_failed_data(
+                tokenfuse_core::agent_event::Dependency::Provider,
+                tokenfuse_core::agent_event::DependencyStage::Response,
+                tokenfuse_core::agent_event::DependencyEffect::CallFailed,
+                &detail,
+            );
+            let outcome = self.event_exporter.emit(
+                EventType::DependencyFailed,
+                inc.last_seen_millis,
+                inc.agent_id.as_deref(),
+                None,
+                None,
+                data,
+            );
+            log_event_outcome(EventType::DependencyFailed, outcome);
+        }
+        let _ = self.events.send(StreamEvent::Incident(inc.clone()));
+        Some(inc)
+    }
+
+    /// [`Store::note_provider_auth_failures_from_at`] at the current time.
+    pub fn note_provider_auth_failures_from(
+        &self,
+        org: &str,
+        site: Option<&str>,
+        provider: &str,
+        agent_id: &str,
+        key_id: &str,
+        count: u64,
+    ) -> Option<Incident> {
+        self.note_provider_auth_failures_from_at(
+            org,
+            site,
+            provider,
+            agent_id,
+            key_id,
+            count,
+            now_millis(),
+        )
     }
 
     /// `run_stalled` (invariant 60): the one detector that fires on ABSENCE,
@@ -4463,6 +4643,18 @@ const PROVIDER_ID_PREFIX: &str = "dependency_failed:provider:";
 /// count against [`MAX_INCIDENTS_PER_ORG`], and incidents of other kinds do not
 /// count against this.
 pub const MAX_PROVIDER_INCIDENTS_PER_ORG: usize = 1_024;
+
+/// The incident kind for a provider refusing a caller's credential
+/// (tokenfuse#312).
+pub const PROVIDER_AUTH_KIND: &str = "provider_auth_refused";
+
+/// The most (provider, caller, site) scopes one org's refused credentials are
+/// counted under; past it a new caller is counted under `<provider>:(other)`,
+/// so none is lost.
+pub const MAX_AUTH_SCOPES_PER_ORG: usize = 1_024;
+
+/// The longest agent id or key id an auth scope carries, in characters.
+const AUTH_SUBJECT_MAX_CHARS: usize = 256;
 
 /// Invariant 144. The scope of a provider incident, `provider:<key>` with
 /// `@<site>` appended for a key bound to a site. A label cannot contain `@`
@@ -9674,5 +9866,149 @@ mod tests {
             Some(std::time::Duration::from_secs(10))
         );
         assert_eq!(Store::stall_sweep_tick(300_000), Some(STALL_SWEEP_TICK));
+    }
+
+    // --- tokenfuse#312: a provider refusing a caller's credential ------------
+
+    fn auth_store(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tf-cloud-auth-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.ndjson");
+        let _ = std::fs::remove_file(&path);
+        let exporter = Arc::new(EventExporter::open(path.to_str().unwrap()).unwrap());
+        (Store::new().with_event_exporter(exporter), path)
+    }
+
+    fn bus(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[test]
+    fn three_refused_credentials_open_one_incident_and_one_event_under_the_agent() {
+        let (s, path) = auth_store("open");
+        let agent = "agent://acme/rotated";
+        assert!(s
+            .note_provider_auth_failures_from_at(
+                "acme",
+                None,
+                "api.anthropic.com",
+                agent,
+                "",
+                2,
+                T0
+            )
+            .is_none());
+        let inc = s
+            .note_provider_auth_failures_from_at(
+                "acme",
+                None,
+                "api.anthropic.com",
+                agent,
+                "",
+                1,
+                T0 + 5_000,
+            )
+            .expect("the third refusal in the window opens it");
+        assert_eq!(
+            inc.id,
+            "provider_auth_refused:api.anthropic.com:agent://acme/rotated"
+        );
+        assert_eq!(inc.kind, PROVIDER_AUTH_KIND);
+        assert_eq!(inc.severity, tokenfuse_core::Severity::Medium);
+        assert_eq!(inc.occurrences, 3);
+        assert_eq!(inc.agent_id.as_deref(), Some(agent));
+        assert!(inc
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("refused the credential"));
+        // More refusals add to the same row and write no second event.
+        let again = s
+            .note_provider_auth_failures_from_at(
+                "acme",
+                None,
+                "api.anthropic.com",
+                agent,
+                "",
+                4,
+                T0 + 9_000,
+            )
+            .unwrap();
+        assert_eq!(again.id, inc.id);
+        assert_eq!(again.occurrences, 7);
+        let events = bus(&path);
+        assert_eq!(
+            events.len(),
+            1,
+            "one event per incident, not per call: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "dependency_failed");
+        assert_eq!(events[0]["agent_id"], agent);
+        assert_eq!(events[0]["data"]["dependency"], "provider");
+        assert_eq!(events[0]["data"]["stage"], "response");
+        assert_eq!(events[0]["data"]["effect"], "call_failed");
+        // The provider's health incident is not touched.
+        assert!(s
+            .incidents("acme")
+            .iter()
+            .all(|i| !i.id.starts_with("dependency_failed:provider:")));
+    }
+
+    #[test]
+    fn refusals_outside_the_window_do_not_add_up() {
+        let (s, _) = auth_store("window");
+        let w = s.incident_cfg.provider_window_ms;
+        for k in 0..5 {
+            assert!(s
+                .note_provider_auth_failures_from_at(
+                    "acme",
+                    None,
+                    "p",
+                    "agent://a/b",
+                    "",
+                    1,
+                    T0 + k * w
+                )
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_caller_with_no_agent_is_filed_under_its_key_and_not_exported() {
+        let (s, path) = auth_store("key");
+        let inc = s
+            .note_provider_auth_failures_from_at("acme", Some("lab"), "p", "", "key-7", 3, T0)
+            .unwrap();
+        assert_eq!(inc.id, "provider_auth_refused:p:key:key-7@lab");
+        assert_eq!(inc.agent_id, None);
+        assert!(bus(&path).is_empty(), "no subject, no event (SPEC 6.1)");
+        let inc = s
+            .note_provider_auth_failures_from_at("acme", None, "p", "not-an-agent", "", 3, T0)
+            .unwrap();
+        assert_eq!(inc.id, "provider_auth_refused:p:(unattributed)");
+    }
+
+    #[test]
+    fn auth_scopes_are_bounded_and_lose_no_refusal() {
+        let (s, _) = auth_store("bound");
+        for i in 0..MAX_AUTH_SCOPES_PER_ORG {
+            s.note_provider_auth_failures_from_at(
+                "acme",
+                None,
+                "p",
+                &format!("agent://a/{i}"),
+                "",
+                1,
+                T0,
+            );
+        }
+        let inc = s
+            .note_provider_auth_failures_from_at("acme", None, "p", "agent://a/late", "", 3, T0)
+            .unwrap();
+        assert_eq!(inc.id, "provider_auth_refused:p:(other)");
     }
 }

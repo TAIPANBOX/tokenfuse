@@ -91,6 +91,7 @@ use crate::store::{
         IngestResponse,
         ProviderFailuresBody,
         ProviderFailure,
+        ProviderAuthFailure,
         ProviderFailuresResponse,
         BudgetBody,
         BudgetResponse,
@@ -512,6 +513,26 @@ pub const PROVIDER_FAILURES_MAX_ENTRIES: usize = 64;
 struct ProviderFailuresBody {
     #[serde(default)]
     failures: Vec<ProviderFailure>,
+    /// A provider's 401 and 403 answers, by the caller that made them
+    /// (tokenfuse#312). Counted apart from `failures`: a refused credential is
+    /// not the provider's ill health.
+    #[serde(default)]
+    auth_failures: Vec<ProviderAuthFailure>,
+}
+
+/// One caller's refused credentials at one provider since the last report.
+#[derive(Deserialize, ToSchema)]
+struct ProviderAuthFailure {
+    /// As in `failures`.
+    provider: String,
+    /// The agent that made the calls, `agent://...`, or empty.
+    #[serde(default)]
+    agent_id: String,
+    /// The client key id the calls were made with, or empty.
+    #[serde(default)]
+    key_id: String,
+    /// How many calls the provider answered 401 or 403.
+    count: u64,
 }
 
 /// One provider's failed calls since the last report.
@@ -855,7 +876,9 @@ async fn provider_failures(
         Ok(b) => b,
         Err(_) => return bad_json(),
     };
-    if parsed.failures.len() > PROVIDER_FAILURES_MAX_ENTRIES {
+    if parsed.failures.len() > PROVIDER_FAILURES_MAX_ENTRIES
+        || parsed.auth_failures.len() > PROVIDER_FAILURES_MAX_ENTRIES
+    {
         return error(StatusCode::BAD_REQUEST, "too many failures in one report");
     }
     let mut accepted = 0usize;
@@ -870,6 +893,9 @@ async fn provider_failures(
             f.count,
             &f.detail,
         );
+    }
+    for f in &parsed.auth_failures {
+        let _ = (&f.provider, &f.agent_id, &f.key_id, f.count);
     }
     (StatusCode::OK, Json(ProviderFailuresResponse { accepted })).into_response()
 }
