@@ -98,7 +98,15 @@ struct AnthropicCall {
 struct OpenAiCall {
     id: Option<String>,
     name: String,
+    /// The arguments as the deltas built them.
     args: Fragments,
+    /// The arguments a closing `message` stated whole, kept apart from the
+    /// deltas': a client may assemble either, so when the two differ both are
+    /// judged and neither replaces the other.
+    message_args: Option<Fragments>,
+    /// The name a closing `message` stated, kept apart from the deltas' for the
+    /// same reason.
+    message_name: Option<String>,
 }
 
 /// A call's argument fragments, joined until they pass
@@ -122,12 +130,6 @@ impl Fragments {
             return;
         }
         self.text.push_str(part);
-    }
-
-    fn replace(&mut self, whole: &str) {
-        self.over = false;
-        self.text.clear();
-        self.push(whole);
     }
 
     fn read(&self) -> tokenfuse_core::taint::ToolArgs {
@@ -303,21 +305,29 @@ impl ToolCallHold {
                             .and_then(|n| n.as_str())
                         {
                             // A delta may split a name; a message states it whole, and may
-                            // repeat a call the deltas already named.
+                            // repeat a call the deltas already named, or name another.
                             if side == "message" {
-                                entry.name.clear();
-                            }
-                            entry.name.push_str(part);
-                        }
-                        if let Some(part) = function
-                            .and_then(|f| f.get("arguments"))
-                            .and_then(|a| a.as_str())
-                        {
-                            // The same: fragments on a delta, the whole on a message.
-                            if side == "message" {
-                                entry.args.replace(part);
+                                entry.message_name = Some(part.to_string());
                             } else {
-                                entry.args.push(part);
+                                entry.name.push_str(part);
+                            }
+                        }
+                        // Fragments on a delta, the whole on a message. A value that is
+                        // not a string is read as its JSON text, as the buffered path
+                        // reads it (`taint::ToolArgs::from_value`), never dropped.
+                        let part = match function.and_then(|f| f.get("arguments")) {
+                            Some(serde_json::Value::String(p)) => Some(p.clone()),
+                            Some(serde_json::Value::Null) | None => None,
+                            Some(other) => Some(other.to_string()),
+                        };
+                        if let Some(part) = part {
+                            if side == "message" {
+                                entry
+                                    .message_args
+                                    .get_or_insert_with(Fragments::default)
+                                    .push(&part);
+                            } else {
+                                entry.args.push(&part);
                             }
                         }
                     }
@@ -327,24 +337,10 @@ impl ToolCallHold {
         carried
     }
 
-    /// The names, read by the one function the buffered path reads a complete
-    /// answer with, from the same two shapes rebuilt.
+    /// The names of [`Self::tool_calls`], one per call judged, so the names
+    /// judged and the arguments judged are always the same calls.
     fn tool_names(&self) -> Vec<String> {
-        let calls: Vec<serde_json::Value> = self
-            .openai_calls
-            .values()
-            .filter(|c| !c.name.is_empty())
-            .map(|c| {
-                serde_json::json!({"id": c.id, "type": "function", "function": {"name": c.name}})
-            })
-            .collect();
-        let blocks: Vec<&serde_json::Value> =
-            self.anthropic_blocks.iter().map(|c| &c.block).collect();
-        let rebuilt = serde_json::json!({
-            "content": blocks,
-            "choices": [{"message": {"tool_calls": calls}}],
-        });
-        tokenfuse_core::taint::tool_names_in(&rebuilt)
+        self.tool_calls().into_iter().map(|c| c.name).collect()
     }
 
     /// The calls [`Self::tool_names`] names, in the same order and skipping the
@@ -371,11 +367,31 @@ impl ToolCallHold {
                 args,
             });
         }
-        for c in self.openai_calls.values().filter(|c| !c.name.is_empty()) {
-            out.push(ToolCall {
-                name: c.name.clone(),
-                args: c.args.read(),
-            });
+        // An OpenAI call as its deltas built it, and, when a closing `message`
+        // stated a different name or different arguments, as the message stated it
+        // too: a client may assemble either, so both are judged.
+        for c in self.openai_calls.values() {
+            let delta_name = (!c.name.is_empty()).then_some(c.name.as_str());
+            let stated_name = c.message_name.as_deref().filter(|n| !n.is_empty());
+            let deltas = c.args.read();
+            if let Some(name) = delta_name {
+                out.push(ToolCall {
+                    name: name.to_string(),
+                    args: deltas.clone(),
+                });
+            }
+            let stated_args = c.message_args.as_ref().map(Fragments::read);
+            let Some(name) = stated_name.or(delta_name) else {
+                continue;
+            };
+            let args = stated_args.unwrap_or(deltas.clone());
+            let same = delta_name == Some(name) && args == deltas;
+            if !same {
+                out.push(ToolCall {
+                    name: name.to_string(),
+                    args,
+                });
+            }
         }
         out
     }
@@ -816,5 +832,71 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         );
         let (_, held) = run(input.as_bytes(), &[input.len()]);
         assert_eq!(held.calls[0].args, ToolArgs::OverCap);
+    }
+
+    #[test]
+    fn a_closing_message_that_differs_from_the_deltas_is_judged_beside_them() {
+        let delta = |name: Option<&str>, args: &str| {
+            let mut f = serde_json::json!({"arguments": args});
+            if let Some(n) = name {
+                f["name"] = serde_json::Value::from(n);
+            }
+            let v = serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": f}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let message = |name: &str, args: serde_json::Value| {
+            let v = serde_json::json!({"choices": [{"index": 0, "message": {"tool_calls": [{"index": 0, "function": {"name": name, "arguments": args}}]}}]});
+            format!("data: {v}\n\n")
+        };
+        // The deltas carry data; a closing message states clean arguments.
+        let input = [
+            delta(Some("fetch_url"), "{\"url\":\"https://x/?d=1\"}"),
+            message(
+                "fetch_url",
+                serde_json::Value::from("{\"url\":\"https://ok\"}"),
+            ),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://x/?d=1"}))
+                },
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://ok"}))
+                },
+            ],
+            "neither replaces the other"
+        );
+        // A message naming another tool than the deltas: both names are judged.
+        let input = [
+            delta(Some("fetch_url"), "{}"),
+            message("bash", serde_json::Value::from("{}")),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.tools,
+            vec!["fetch_url".to_string(), "bash".to_string()]
+        );
+        // A message that repeats the deltas is one call, and an object as
+        // arguments is read as the buffered path reads it.
+        let input = [
+            delta(Some("fetch_url"), "{\"a\":1}"),
+            message("fetch_url", serde_json::json!({"a": 1})),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![ToolCall {
+                name: "fetch_url".into(),
+                args: ToolArgs::Parsed(serde_json::json!({"a": 1}))
+            }]
+        );
     }
 }

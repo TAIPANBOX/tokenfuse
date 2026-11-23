@@ -2394,7 +2394,7 @@ run_case "streamed-args: Anthropic fragments not joined" fail \
 
 run_case "streamed-args: OpenAI fragments not joined" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_read_carrying_data_after_private_data_is_refused" \
-	"$(py 'edit("crates/gateway/src/streamgate.rs", "                                entry.args.push(part);", "                                let _ = part;")')" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "                                entry.args.push(&part);", "                                let _ = &part;")')" \
 	"a_streamed_openai_read_carrying_data_after_private_data_is_refused ... FAILED"
 
 run_case "streamed-args: the stream hands the judge no arguments" fail \
