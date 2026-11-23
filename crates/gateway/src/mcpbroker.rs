@@ -2727,6 +2727,11 @@ async fn process_into(
     if let Some(v) = &ctx.protocol_version {
         forward = forward.header(crate::mcpsession::PROTOCOL_VERSION_HEADER, v);
     }
+    // The upstream's own credential, from the operator's file and never from the
+    // caller (tokenfuse#364). Keyed by server, so every name that reaches it sends it.
+    if let Some(credential) = st.upstream_credentials.get(&upstream_key(&upstream_url)) {
+        forward = forward.header(reqwest::header::AUTHORIZATION, credential.clone());
+    }
     // The run, to a server the operator classified and to nothing else (invariant 143).
     // A classified server is a plane of this deployment, and this is what joins its own
     // record to the run. A server nobody classified is somebody else's.
