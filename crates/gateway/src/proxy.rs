@@ -796,7 +796,15 @@ async fn handle_call(
     // (success, a 402 Breaker trip, a 403 identity block) - see
     // `KeyStats::record_call`.
     st.keystats.record_call(&key_id);
-    let _ = (&permit_slot, rate_limited);
+    // Per-key limits (`crate::ratelimit`): a call over its principal's rate or
+    // concurrency is refused here, before anything is reserved, opened or
+    // forwarded.
+    if let Some(limiter) = st.key_limits.as_ref() {
+        match limiter.admit(&caller.principal, std::time::Instant::now()) {
+            Ok(p) => *permit_slot = Some(p),
+            Err(refusal) => return rate_limited(&caller.principal, refusal),
+        }
+    }
 
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
