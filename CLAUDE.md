@@ -7968,7 +7968,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    distinct name a call was given is judged with every distinct argument text it carried (the deltas',
    each message's, and the messages' joined), because a client may assemble any of them, and a call
    that carries arguments and was never named is judged under the empty name, which after untrusted
-   input is refused as unclassified. `/v1/fuse/check-tool-call` takes optional `arguments` (or
+   input is refused as unclassified. A fragment whose index no `tool_use` block opened is joined onto the
+   most recent block rather than dropped. Arguments sent as their JSON text, once or twice encoded, are
+   read as the object they hold, so the URL caps see the URL. A 2xx answer the gateway cannot parse is
+   judged as a call nobody named carrying arguments nobody read, so after untrusted input it is refused
+   rather than read as an answer with no calls. The check route judges arguments sent beside `tool` and
+   `tools` against every tool it names. `/v1/fuse/check-tool-call` takes optional `arguments` (or
    `arguments_truncated: true`) for its `tool` and answers `arguments_judged`; the MCP broker sends a
    `tools/call`'s `params.arguments` there, after its DLP and PII steps and before secret injection,
    whole or flagged as left out.

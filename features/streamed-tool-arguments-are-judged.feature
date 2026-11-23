@@ -73,3 +73,21 @@ Feature: A streamed read is judged on what its arguments carry
     Given two OpenAI tool calls whose fragments interleave
     When the stream ends
     Then each call carries its own arguments
+
+  # @test:a_buffered_answer_the_gateway_cannot_parse_is_refused_after_untrusted_input
+  Scenario: An answer the gateway cannot parse is not an answer with no calls
+    Given a run that has read the web
+    When the model's answer carries a tool input nested past the parser's depth
+    Then the answer is refused, and with no untrusted input it is allowed
+
+  # @test:arguments_sent_as_json_text_are_read_as_the_object_they_hold
+  Scenario: Arguments sent as JSON text are read as the object they hold
+    Given arguments sent as a string of JSON, once or twice encoded
+    When they are read
+    Then the URL caps see the URL inside
+
+  # @test:an_orphan_fragment_is_joined_onto_the_last_block_not_dropped
+  Scenario: A fragment no block opened is not dropped
+    Given an argument fragment whose index no tool_use block opened
+    When the stream ends
+    Then it is joined onto the most recent block

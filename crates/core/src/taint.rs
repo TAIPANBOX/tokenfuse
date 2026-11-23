@@ -474,7 +474,7 @@ impl ToolArgs {
             return ToolArgs::Parsed(serde_json::Value::Null);
         }
         match serde_json::from_str(raw) {
-            Ok(v) => ToolArgs::Parsed(v),
+            Ok(v) => ToolArgs::Parsed(unwrap_encoded(v, 2)),
             Err(_) => ToolArgs::Unreadable(raw.to_string()),
         }
     }
@@ -483,11 +483,36 @@ impl ToolArgs {
     /// `arguments`): [`ToolArgs::OverCap`] when their compact JSON is longer
     /// than the cap, counted without serializing past it.
     pub fn from_value(v: &serde_json::Value) -> Self {
-        if fits_the_cap(v) {
-            ToolArgs::Parsed(v.clone())
-        } else {
-            ToolArgs::OverCap
+        if !fits_the_cap(v) {
+            return ToolArgs::OverCap;
         }
+        match v {
+            // Arguments sent as their JSON text (an executor forwarding an
+            // OpenAI `function.arguments` string) are read as that text is.
+            serde_json::Value::String(raw) if looks_like_json(raw) => ToolArgs::from_raw(raw),
+            _ => ToolArgs::Parsed(v.clone()),
+        }
+    }
+}
+
+/// Whether a string is JSON text of an object or an array.
+fn looks_like_json(s: &str) -> bool {
+    matches!(s.trim_start().as_bytes().first(), Some(b'{') | Some(b'['))
+}
+
+/// Arguments encoded twice (a JSON string holding JSON text) are read as the
+/// object they hold, up to `depth` times, so the URL caps see the URL rather
+/// than one string that does not start with `http`. Text that does not parse
+/// stays the string it was, which is still scanned.
+fn unwrap_encoded(v: serde_json::Value, depth: u8) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(ref s) if depth > 0 && looks_like_json(s) => {
+            match serde_json::from_str(s) {
+                Ok(inner) => unwrap_encoded(inner, depth - 1),
+                Err(_) => v,
+            }
+        }
+        other => other,
     }
 }
 
@@ -1599,6 +1624,32 @@ mod tests {
         assert!(
             read_call_verdict(&file, &none, &ToolArgs::OverCap, false, &rules).is_none(),
             "a call that is not a read is not judged on its arguments"
+        );
+    }
+
+    #[test]
+    fn arguments_sent_as_json_text_are_read_as_the_object_they_hold() {
+        let url = format!(
+            "https://x.example/c?{}",
+            (0..20)
+                .map(|i| format!("p{i}=v"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        let object = json!({"url": url});
+        let as_text = serde_json::Value::String(object.to_string());
+        assert_eq!(
+            ToolArgs::from_value(&as_text),
+            ToolArgs::Parsed(object.clone())
+        );
+        let twice = serde_json::Value::String(as_text.to_string()).to_string();
+        assert_eq!(ToolArgs::from_raw(&twice), ToolArgs::Parsed(object.clone()));
+        let found = call_argument_findings(&ToolArgs::from_value(&as_text), false);
+        assert!(found.contains(&"too_many_params".to_string()), "{found:?}");
+        // A plain string argument is not JSON text and stays a string.
+        assert_eq!(
+            ToolArgs::from_value(&json!("hello")),
+            ToolArgs::Parsed(json!("hello"))
         );
     }
 }

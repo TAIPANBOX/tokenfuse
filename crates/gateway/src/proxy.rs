@@ -3103,11 +3103,28 @@ async fn buffered_managed(
     // (`judge_model_tool_calls`, invariant 104).
     let mut firewall_note: Option<String> = None;
     if st.firewall.mode != FirewallMode::Off {
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let parsed_json = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let unreadable_answer = status.is_success() && !bytes.is_empty() && parsed_json.is_err();
+        let resp_json = parsed_json.unwrap_or(serde_json::Value::Null);
         let provider_tools = taint::provider_tools_in(&resp_json);
-        let resp_tools = taint::tool_names_in(&resp_json);
-        let resp_calls = taint::tool_calls_in(&resp_json);
+        let (resp_tools, resp_calls) = if unreadable_answer {
+            // A 2xx this gateway cannot parse (a tool input nested past the
+            // parser's depth, say) may still be a tool call a client reads and
+            // runs, so it is judged as a call nobody named carrying text nobody
+            // read: refused after untrusted input, never read as "no calls".
+            (
+                vec![String::new()],
+                vec![taint::ToolCall {
+                    name: String::new(),
+                    args: taint::ToolArgs::OverCap,
+                }],
+            )
+        } else {
+            (
+                taint::tool_names_in(&resp_json),
+                taint::tool_calls_in(&resp_json),
+            )
+        };
         let verdict = judge_model_tool_calls(
             st,
             &firewall_labels,

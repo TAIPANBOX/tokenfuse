@@ -259,16 +259,18 @@ impl ToolCallHold {
                 == Some("input_json_delta")
             {
                 let index = v.get("index").and_then(|i| i.as_u64());
-                if let (Some(part), Some(call)) = (
-                    delta
-                        .and_then(|d| d.get("partial_json"))
-                        .and_then(|p| p.as_str()),
-                    self.anthropic_blocks
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.index == index),
-                ) {
-                    call.args.push(part);
+                if let Some(part) = delta
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(|p| p.as_str())
+                {
+                    // A fragment whose index no `tool_use` block opened is joined
+                    // onto the most recent block, as a tolerant client would
+                    // join it, rather than dropped and the call read as clean.
+                    let found = self.anthropic_blocks.iter().rposition(|c| c.index == index);
+                    let at = found.or(self.anthropic_blocks.len().checked_sub(1));
+                    if let Some(call) = at.and_then(|i| self.anthropic_blocks.get_mut(i)) {
+                        call.args.push(part);
+                    }
                 }
             }
         }
@@ -428,7 +430,10 @@ impl ToolCallHold {
             if c.too_many_statements {
                 add(ToolArgs::OverCap, &mut variants);
             }
-            if stated_args.len() > 1 {
+            let all_same = stated_args
+                .windows(2)
+                .all(|w| w[0].text == w[1].text && w[0].over == w[1].over);
+            if stated_args.len() > 1 && !all_same {
                 let mut joined = Fragments::default();
                 for f in &stated_args {
                     if f.over {
@@ -1029,5 +1034,42 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         );
         assert!(held.calls.iter().any(|c| c.args == ToolArgs::OverCap));
         assert!(held.calls.len() <= MAX_STATEMENTS_PER_CALL * (MAX_STATEMENTS_PER_CALL + 3));
+    }
+
+    #[test]
+    fn an_orphan_fragment_is_joined_onto_the_last_block_not_dropped() {
+        let start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"fetch_url\",\"input\":{}}}\n\n";
+        let orphan = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":7,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"url\\\":\\\"https://x\\\"}\"}}\n\n";
+        let input = format!("{start}{orphan}");
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![ToolCall {
+                name: "fetch_url".into(),
+                args: ToolArgs::Parsed(serde_json::json!({"url": "https://x"})),
+            }]
+        );
+    }
+
+    #[test]
+    fn identical_closing_messages_are_one_statement_not_a_join() {
+        let message = |args: &str| {
+            let v = serde_json::json!({"choices": [{"index": 0, "message": {"tool_calls": [{"index": 0, "function": {"name": "fetch_url", "arguments": args}}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let input = [
+            message("{\"url\":\"https://ok\"}"),
+            message("{\"url\":\"https://ok\"}"),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![ToolCall {
+                name: "fetch_url".into(),
+                args: ToolArgs::Parsed(serde_json::json!({"url": "https://ok"}))
+            }],
+            "a clean read repeated is not an unreadable join"
+        );
     }
 }

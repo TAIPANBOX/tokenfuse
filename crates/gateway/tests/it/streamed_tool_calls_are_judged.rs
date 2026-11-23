@@ -562,3 +562,41 @@ async fn the_check_refuses_a_read_whose_arguments_carry_data() {
     assert_eq!(clean["decision"], "allow", "{clean}");
     assert_eq!(clean["arguments_judged"], true, "{clean}");
 }
+
+/// A 2xx answer this gateway cannot parse (a tool input nested past the
+/// parser's depth) is a tool call a lenient client may still run: after
+/// untrusted input it is refused, never read as an answer with no calls.
+#[tokio::test]
+async fn a_buffered_answer_the_gateway_cannot_parse_is_refused_after_untrusted_input() {
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let answer: &'static str = Box::leak(
+        format!(
+            r#"{{"id":"msg_9","type":"message","role":"assistant","content":[{{"type":"tool_use","id":"t9","name":"run_shell","input":{{"x":{deep}}}}}],"usage":{{"input_tokens":10,"output_tokens":5}}}}"#
+        )
+        .into_boxed_str(),
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(answer).is_err(),
+        "deeper than the parser reads"
+    );
+    let (st, bus) = gateway(
+        Wire::Anthropic,
+        FirewallMode::Enforce,
+        &[answer, answer],
+        "deep",
+    );
+    let (status, body) = post(&st, Wire::Anthropic, "run-deep", false, Some("web")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        &body[..body.len().min(200)]
+    );
+    assert_eq!(on_bus(&bus, "taint_block").len(), 1);
+    let (status, _) = post(&st, Wire::Anthropic, "run-deep-clean", false, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "with no untrusted input nothing is refused"
+    );
+}
