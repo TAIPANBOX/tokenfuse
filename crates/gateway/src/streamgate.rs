@@ -105,7 +105,15 @@ struct OpenAiCall {
     /// deltas or any message, so every distinct statement is judged and none
     /// replaces another.
     stated: Vec<Stated>,
+    /// More than [`MAX_STATEMENTS_PER_CALL`] messages stated this call; the rest
+    /// were not kept, and the call is judged as over the cap as well.
+    too_many_statements: bool,
 }
+
+/// The most `message` statements of one call the hold keeps. A stream carrying
+/// more is unusual and is judged fail-closed rather than in full, so the work
+/// of judging every name with every argument text stays bounded.
+const MAX_STATEMENTS_PER_CALL: usize = 16;
 
 /// One `message`'s statement of a call: the name and the arguments it carried.
 #[derive(Debug, Default)]
@@ -338,7 +346,11 @@ impl ToolCallHold {
                             }
                         }
                         if side == "message" {
-                            entry.stated.push(stated);
+                            if entry.stated.len() < MAX_STATEMENTS_PER_CALL {
+                                entry.stated.push(stated);
+                            } else {
+                                entry.too_many_statements = true;
+                            }
                         }
                     }
                 }
@@ -412,6 +424,9 @@ impl ToolCallHold {
             }
             for f in &stated_args {
                 add(f.read(), &mut variants);
+            }
+            if c.too_many_statements {
+                add(ToolArgs::OverCap, &mut variants);
             }
             if stated_args.len() > 1 {
                 let mut joined = Fragments::default();
@@ -991,5 +1006,18 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         let input = format!("data: {v}\n\n");
         let (_, held) = run(input.as_bytes(), &[input.len()]);
         assert_eq!(held.tools, vec![String::new()], "never skipped");
+    }
+
+    #[test]
+    fn a_call_stated_by_too_many_messages_is_judged_over_the_cap() {
+        let message = |i: usize| {
+            let v = serde_json::json!({"choices": [{"index": 0, "message": {"tool_calls": [{"index": 0, "function": {"name": format!("t{i}"), "arguments": "{}"}}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let input: String = (0..40).map(message).collect();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(held.tools.len(), MAX_STATEMENTS_PER_CALL, "bounded");
+        assert!(held.calls.iter().any(|c| c.args == ToolArgs::OverCap));
+        assert!(held.calls.len() <= MAX_STATEMENTS_PER_CALL * (MAX_STATEMENTS_PER_CALL + 3));
     }
 }
