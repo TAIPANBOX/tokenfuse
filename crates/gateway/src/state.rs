@@ -122,6 +122,9 @@ pub struct AppState {
     /// is cleared and a run may log once more, which costs a repeated line
     /// and never memory.
     budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
+    /// The (run, parent) pairs a delegation chain let roll up, logged once
+    /// each (invariant 120). Bounded like `budget_clamp_logged`.
+    delegated_parent_logged: Arc<Mutex<HashSet<String>>>,
     /// Runs whose refused budget raise has been said once (invariant 135). Bounded like
     /// `budget_clamp_logged`.
     budget_raise_logged: Arc<Mutex<HashSet<String>>>,
@@ -638,6 +641,7 @@ impl AppState {
             restored_unbudgeted: Arc::new(Mutex::new(HashSet::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
+            delegated_parent_logged: Arc::new(Mutex::new(HashSet::new())),
             budget_raise_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             unclassified_named: Arc::new(Mutex::new(Default::default())),
@@ -768,6 +772,18 @@ impl AppState {
             seen.clear();
         }
         seen.insert(model.to_string())
+    }
+
+    /// Record that `run_id` rolled up into `parent` through a delegation chain
+    /// (invariant 120) and say whether this is the first time this process has
+    /// noted the pair, so the caller logs once per run and parent.
+    pub fn note_delegated_parent(&self, run_id: &str, parent: &str) -> bool {
+        let mut seen = self.delegated_parent_logged.lock().unwrap();
+        let key = format!("{run_id}\n{parent}");
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains(&key) {
+            seen.clear();
+        }
+        seen.insert(key)
     }
 
     /// Record that `run_id`'s budget was clamped to the ceiling and say

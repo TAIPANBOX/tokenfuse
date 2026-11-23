@@ -7884,9 +7884,29 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     names a coordinator key's run as its parent, now gets `403`s. Each key keeps its own run ids, or
     the coordinator's key lists the worker's under `may_parent`.
 
-    **Where it says nothing.** The delegated arm for agent tokens (a verified token chain naming the
-    parent owner's agent) is not built: the agent-token door (invariant 123) admits an agent's own
-    token, which acts for nobody, and a delegation token is not a door credential. A first claim and a second call of the same new run by its owner can race,
+    **The delegated arm for agent tokens.** A parent owned by an agent token's principal
+    (`tok:<agent>`) may be rolled up into by a call that an agent token admitted when the person's
+    delegation beside that token (invariant 147) PROVES a chain that ends at the child's own agent and
+    names the parent's agent, an `agent://` entry compared byte for byte, anywhere before it
+    (`proxy::DelegatedBy::names_as_delegator`, read at both parent checks). The chain is issuer-signed
+    and acyclic (invariant 35), so an ancestor entry is an agent through which the authority passed. A
+    claimed chain, a static key, a parent a key owns and a near match of the owner's agent are refused
+    as before. Who the call acts for is now resolved right after the claim and before the parent is
+    judged (the block that reads `x-fuse-agent-id`, the declared chain and `chainproof::resolve_at_door`
+    moved up unchanged): it reads headers and the door's verdict and touches neither the run nor its
+    parent, so a refusal for the agent id, the chain cap or a bad delegation now answers before
+    `parent_owned_elsewhere`, `seed_pending` and the budget errors, and leaves the ledger untouched. A
+    delegation proof is spent even when the call is then refused for its parent. One info line per run
+    and parent records a delegated roll-up; no bus event, because no registered type describes it.
+    `@claude 2026-11-23`, under delegated authority, open to reversal: any ancestor rather than only the
+    immediate delegator, and no identity-map list for agents (`may_parent` stays keyed by client key).
+    *(test: `tests/it/delegated_parent_by_chain.rs`, seven: three that roll up, red against the unfixed
+    tree, and four guards. Scenarios: `features/a-delegated-run-rolls-up-by-a-proven-chain.feature`.)*
+
+    **Where it says nothing.** Delegation is authority, not consent to a particular budget: any agent
+    a chain passes through can spend from that agent's runs whose ids it learns, for the life of the
+    delegation token. The tool-call check's ownership comparison (invariant 118) does not read the
+    arm. A first claim and a second call of the same new run by its owner can race,
     and the second may be admitted before the first's line is synced, so a crash in that window
     loses the owner. The owner map and the journal are bounded by nothing but the run ids
     authenticated callers send, as the ledger is. A first key that names a run id before its real
