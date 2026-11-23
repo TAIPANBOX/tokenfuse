@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 /// What [`ToolCallHold::finish`] hands back.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Held {
     /// The bytes after the last complete event, when no tool call was ever
     /// opened: safe to forward as they are.
@@ -412,7 +412,7 @@ impl ToolCallHold {
                 }
             }
             let mut variants: Vec<ToolArgs> = Vec::new();
-            let mut add = |a: ToolArgs, variants: &mut Vec<ToolArgs>| {
+            let add = |a: ToolArgs, variants: &mut Vec<ToolArgs>| {
                 if !variants.contains(&a) {
                     variants.push(a);
                 }
