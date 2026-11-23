@@ -7943,26 +7943,40 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    115 that adds no floor to an operator's policy file; the rest of 115 stands. Shadow adds nothing and
    judges as enforce would.
 
-   Where it is wired. The buffered LLM path judges the arguments of the model's tool calls
-   (`taint::tool_arguments_in`, `proxy::judge_model_tool_calls`). The streamed path judges names only,
-   because the hold keeps names and not arguments (`streamgate::tool_names`), and the MCP broker's
-   `tools/call` and `/v1/fuse/check-tool-call` carry no arguments at all. Those two are named gaps in the
-   pull request, not closed here.
+   Where it is wired. Every door judges a call's arguments with one function, on that call's own
+   capability: a read is judged on its own arguments, never on another call's in the same answer
+   (`taint::tool_calls_in` pairs each name with its arguments; `taint::read_call_verdict`). The buffered
+   LLM path reads them from the answer. The streamed hold joins each call's argument fragments
+   (Anthropic `input_json_delta` per block index, OpenAI `function.arguments` per call index) and holds
+   the call to the end of the stream (`streamgate::Fragments`, `Held::calls`), so a streamed read is
+   judged as a buffered one is. `/v1/fuse/check-tool-call` takes optional `arguments` (or
+   `arguments_truncated: true`) for its `tool` and answers `arguments_judged`; the MCP broker sends a
+   `tools/call`'s `params.arguments` there, after its DLP and PII steps and before secret injection,
+   whole or flagged as left out.
+
+   `@claude 2026-11-23`, choices under delegated authority, open to reversal: arguments are judged up
+   to `TOOL_ARGUMENTS_CAP_BYTES`, 64 KiB inclusive, on every door; longer arguments are the finding
+   `arguments_over_cap` and are never judged on a prefix (the hold drops the fragments past the cap, so
+   what it keeps per call is bounded); argument text that does not parse as JSON is scanned as text and
+   is also the finding `arguments_unreadable`, because a client with a lenient parser may run what this
+   gateway could not read. Both findings refuse only where the read rule applies, a network read after
+   private data. The 12 KiB bound sent to the policy plane (invariant 100) is a separate constant.
 
    Tests: `core::taint::tests`, the argument judgement, a seeded sweep of 200 URL shapes against the caps
-   written out again independently, and the rule that labels alone never refuse the read rule;
-   `gateway::firewall::read_tools_carry_no_data_tests`, the starter map, the floors and the operator file;
-   `features/read-tools-carry-no-data.feature`, twenty-one scenarios, each bound. The red commit
-   b7e5309 failed nine tests in `-p tokenfuse-core --lib` on CI, as the supervisor reported; this text
-   does not re-run them. Mutants are described, not run: the cap off by one, the label group ignored,
-   the floor not added, `network_read` left out of the anti-exfiltration deny. Not a script gate: held by
-   `cargo test`.
-   *(not proven: the streamed and MCP argument paths; the cap values, which are a choice; PII findings
-   under `observe`, which are not refused; a read tool with a secret in its arguments when its labels
-   are `web` only, which is judged by no rule of this invariant; and operator files that replace the
-   starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
-   the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
-   refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
+   written out again independently, the rule that labels alone never refuse the read rule, and the cap,
+   unreadable and pairing tests; `gateway::firewall::read_tools_carry_no_data_tests`, the starter map,
+   the floors and the operator file; `gateway::streamgate::tests`, fragments joined at any chunking on
+   both wires, interleaved calls and the cap; `tests/it/streamed_tool_calls_are_judged.rs` and
+   `tests/it/mcp_broker.rs` through the real router and broker; `features/read-tools-carry-no-data.feature`
+   and `features/streamed-tool-arguments-are-judged.feature`, each scenario bound. Not a script gate: held
+   by `cargo test`.
+
+   Scope. The rule reads tool names and arguments; an operator file that replaces the starter policy
+   without the read rule gets the anti-exfiltration and unmapped floors and no argument judgement; PII
+   findings refuse only under `TOKENFUSE_DLP_PII=block`; a read whose labels are `web` only is judged by
+   no rule of this invariant; an unmapped tool such as `fetch` after `secrets` alone is refused by no
+   rule, because anti-exfiltration names no unclassified capability; the hold's total held bytes are
+   bounded by the provider's output, as invariant 104 says.
 
 122. **The gateway holds the provider key, and a caller's own provider credential never leaves the process.**
    Finding F-002 of the agent-security review of 2026-10-17. Until this invariant the gateway forwarded the

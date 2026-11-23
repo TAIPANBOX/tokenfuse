@@ -46,6 +46,11 @@ pub struct Held {
     /// The tool names the held events carry, as `taint::tool_names_in` reads
     /// them from a buffered answer of the same shape.
     pub tools: Vec<String>,
+    /// The same calls with their arguments: each call's fragments joined under
+    /// `taint::TOOL_ARGUMENTS_CAP_BYTES` and read by `taint::ToolArgs::from_raw`,
+    /// so the streamed answer is judged on what each call carries, as the
+    /// buffered one is (invariant 121).
+    pub calls: Vec<tokenfuse_core::taint::ToolCall>,
     /// The tools the provider ran that [`ToolCallHold::take_provider_tools`] had not
     /// already handed over, as `taint::provider_tools_in` reads them from a buffered
     /// answer (invariant 143). Their events are forwarded and never held: nothing
@@ -65,17 +70,73 @@ pub struct ToolCallHold {
     line_start: usize,
     holding: bool,
     held: Vec<u8>,
-    /// Anthropic `tool_use` blocks, as each `content_block_start` opened them.
-    anthropic_blocks: Vec<serde_json::Value>,
+    /// Anthropic `tool_use` blocks, as each `content_block_start` opened them,
+    /// with the `input_json_delta` fragments that followed on the same index.
+    anthropic_blocks: Vec<AnthropicCall>,
     /// Blocks recording a tool the provider ran, opened the same way.
     provider_blocks: Vec<serde_json::Value>,
     /// `url_citation` annotations an OpenAI delta carried: that wire's record of the
     /// same thing, with no block to open.
     openai_citations: Vec<serde_json::Value>,
-    /// OpenAI tool calls by (choice index, tool call index): the id, and the
-    /// name as its fragments arrived (a provider may split a name; OpenAI
-    /// sends it whole in the first delta).
-    openai_calls: BTreeMap<(u64, u64), (Option<String>, String)>,
+    /// OpenAI tool calls by (choice index, tool call index): the id, the name
+    /// as its fragments arrived (a provider may split a name; OpenAI sends it
+    /// whole in the first delta), and the arguments as their fragments arrived.
+    openai_calls: BTreeMap<(u64, u64), OpenAiCall>,
+}
+
+/// One Anthropic `tool_use` block being held.
+#[derive(Debug, Default)]
+struct AnthropicCall {
+    /// The `index` its `content_block_start` named, absent when it named none.
+    index: Option<u64>,
+    block: serde_json::Value,
+    args: Fragments,
+}
+
+/// One OpenAI tool call being held.
+#[derive(Debug, Default)]
+struct OpenAiCall {
+    id: Option<String>,
+    name: String,
+    args: Fragments,
+}
+
+/// A call's argument fragments, joined until they pass
+/// `taint::TOOL_ARGUMENTS_CAP_BYTES`, then dropped and remembered as over the
+/// cap: what is held for judging is bounded per call, and a call over the cap
+/// is never judged on a prefix.
+#[derive(Debug, Default)]
+struct Fragments {
+    text: String,
+    over: bool,
+}
+
+impl Fragments {
+    fn push(&mut self, part: &str) {
+        if self.over {
+            return;
+        }
+        if self.text.len() + part.len() > tokenfuse_core::taint::TOOL_ARGUMENTS_CAP_BYTES {
+            self.over = true;
+            self.text = String::new();
+            return;
+        }
+        self.text.push_str(part);
+    }
+
+    fn replace(&mut self, whole: &str) {
+        self.over = false;
+        self.text.clear();
+        self.push(whole);
+    }
+
+    fn read(&self) -> tokenfuse_core::taint::ToolArgs {
+        if self.over {
+            tokenfuse_core::taint::ToolArgs::OverCap
+        } else {
+            tokenfuse_core::taint::ToolArgs::from_raw(&self.text)
+        }
+    }
 }
 
 impl ToolCallHold {
@@ -111,11 +172,13 @@ impl ToolCallHold {
             self.route(rest, &mut tail);
         }
         let tools = self.tool_names();
+        let calls = self.tool_calls();
         let provider_tools = self.take_provider_tools();
         Held {
             tail,
             held: self.held,
             tools,
+            calls,
             provider_tools,
         }
     }
@@ -162,10 +225,35 @@ impl ToolCallHold {
         if v.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
             if let Some(block) = v.get("content_block") {
                 if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    self.anthropic_blocks.push(block.clone());
+                    self.anthropic_blocks.push(AnthropicCall {
+                        index: v.get("index").and_then(|i| i.as_u64()),
+                        block: block.clone(),
+                        args: Fragments::default(),
+                    });
                     carried = true;
                 } else if tokenfuse_core::taint::is_provider_tool_block(block) {
                     self.provider_blocks.push(block.clone());
+                }
+            }
+        }
+        // The arguments: `input_json_delta` fragments on the block's index, joined
+        // onto the most recent block that index opened.
+        if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+            let delta = v.get("delta");
+            if delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
+                == Some("input_json_delta")
+            {
+                let index = v.get("index").and_then(|i| i.as_u64());
+                if let (Some(part), Some(call)) = (
+                    delta
+                        .and_then(|d| d.get("partial_json"))
+                        .and_then(|p| p.as_str()),
+                    self.anthropic_blocks
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.index == index),
+                ) {
+                    call.args.push(part);
                 }
             }
         }
@@ -206,20 +294,31 @@ impl ToolCallHold {
                         let entry = self.openai_calls.entry((ci, ti)).or_default();
                         if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
                             if !id.is_empty() {
-                                entry.0 = Some(id.to_string());
+                                entry.id = Some(id.to_string());
                             }
                         }
-                        if let Some(part) = tc
-                            .get("function")
+                        let function = tc.get("function");
+                        if let Some(part) = function
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
                         {
                             // A delta may split a name; a message states it whole, and may
                             // repeat a call the deltas already named.
                             if side == "message" {
-                                entry.1.clear();
+                                entry.name.clear();
                             }
-                            entry.1.push_str(part);
+                            entry.name.push_str(part);
+                        }
+                        if let Some(part) = function
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                        {
+                            // The same: fragments on a delta, the whole on a message.
+                            if side == "message" {
+                                entry.args.replace(part);
+                            } else {
+                                entry.args.push(part);
+                            }
                         }
                     }
                 }
@@ -234,16 +333,51 @@ impl ToolCallHold {
         let calls: Vec<serde_json::Value> = self
             .openai_calls
             .values()
-            .filter(|(_, name)| !name.is_empty())
-            .map(|(id, name)| {
-                serde_json::json!({"id": id, "type": "function", "function": {"name": name}})
+            .filter(|c| !c.name.is_empty())
+            .map(|c| {
+                serde_json::json!({"id": c.id, "type": "function", "function": {"name": c.name}})
             })
             .collect();
+        let blocks: Vec<&serde_json::Value> =
+            self.anthropic_blocks.iter().map(|c| &c.block).collect();
         let rebuilt = serde_json::json!({
-            "content": self.anthropic_blocks,
+            "content": blocks,
             "choices": [{"message": {"tool_calls": calls}}],
         });
         tokenfuse_core::taint::tool_names_in(&rebuilt)
+    }
+
+    /// The calls [`Self::tool_names`] names, in the same order and skipping the
+    /// same nameless ones, each with its arguments as the fragments joined. An
+    /// Anthropic block whose start already carried a whole `input` and no
+    /// fragment followed is read from that `input`.
+    fn tool_calls(&self) -> Vec<tokenfuse_core::taint::ToolCall> {
+        use tokenfuse_core::taint::{ToolArgs, ToolCall};
+        let mut out = Vec::new();
+        for c in &self.anthropic_blocks {
+            let Some(name) = c.block.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let args = if c.args.over || !c.args.text.is_empty() {
+                c.args.read()
+            } else {
+                match c.block.get("input") {
+                    Some(input) => ToolArgs::from_value(input),
+                    None => ToolArgs::Parsed(serde_json::Value::Null),
+                }
+            };
+            out.push(ToolCall {
+                name: name.to_string(),
+                args,
+            });
+        }
+        for c in self.openai_calls.values().filter(|c| !c.name.is_empty()) {
+            out.push(ToolCall {
+                name: c.name.clone(),
+                args: c.args.read(),
+            });
+        }
+        out
     }
 
     /// The end of the first complete event in `buf` (just past the blank line
@@ -583,5 +717,104 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
         assert_eq!(data["error"]["code"], "taint_blocked");
         assert_eq!(data["error"]["message"], "x");
         assert!(data["error"]["param"].is_null());
+    }
+
+    // --- invariant 121: the hold keeps each call's arguments ----------------
+
+    use tokenfuse_core::taint::{ToolArgs, ToolCall};
+
+    #[test]
+    fn anthropic_argument_fragments_are_joined_at_any_chunking() {
+        let input = ANTHROPIC_TOOL_STREAM.as_bytes();
+        for size in [1usize, 2, 3, 7, 13, 64, input.len()] {
+            let (_, held) = run(input, &[size]);
+            assert_eq!(
+                held.calls,
+                vec![ToolCall {
+                    name: "write_file".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"path": "/tmp/w8.txt"})),
+                }],
+                "chunk size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_argument_fragments_are_joined_at_any_chunking() {
+        let input = OPENAI_TOOL_STREAM.as_bytes();
+        for size in [1usize, 5, 11, input.len()] {
+            let (_, held) = run(input, &[size]);
+            assert_eq!(
+                held.calls,
+                vec![ToolCall {
+                    name: "write_file".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"path": "/tmp/w8.txt"})),
+                }],
+                "chunk size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_interleaved_openai_calls_keep_their_own_arguments() {
+        let chunk = |i: u64, name: Option<&str>, args: &str| {
+            let mut f = serde_json::json!({"arguments": args});
+            if let Some(n) = name {
+                f["name"] = serde_json::Value::from(n);
+            }
+            let v = serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": f}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let input = [
+            chunk(0, Some("fetch_url"), "{\"url\":"),
+            chunk(1, Some("read_file"), "{\"path\":"),
+            chunk(0, None, "\"https://a\"}"),
+            chunk(1, None, "\"/etc/x\"}"),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://a"}))
+                },
+                ToolCall {
+                    name: "read_file".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"path": "/etc/x"}))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_past_the_cap_are_dropped_and_read_as_over_the_cap() {
+        let cap = tokenfuse_core::taint::TOOL_ARGUMENTS_CAP_BYTES;
+        let frag = |s: &str| {
+            let v = serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"name": "", "arguments": s}}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let open = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"fetch_url\",\"arguments\":\"\"}}]}}]}\n\n";
+        // Exactly at the cap: read.
+        let at = format!("\"{}\"", "a".repeat(cap - 2));
+        let input = format!("{open}{}{}", frag(&at[..cap / 2]), frag(&at[cap / 2..]));
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert!(
+            matches!(held.calls[0].args, ToolArgs::Parsed(_)),
+            "{:?}",
+            held.calls[0].args
+        );
+        // One byte over: never a prefix.
+        let over = format!("\"{}\"", "a".repeat(cap - 1));
+        let input = format!(
+            "{open}{}{}{}",
+            frag(&over[..10]),
+            frag(&over[10..]),
+            frag("x")
+        );
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(held.calls[0].args, ToolArgs::OverCap);
     }
 }
