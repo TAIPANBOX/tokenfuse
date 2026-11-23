@@ -2815,6 +2815,7 @@ fn stream_managed(
     let ev_chain = record_chain;
     let ev_proof = record_proof;
     let provider_refused_at_entry = !status.is_success();
+    crate::providerreport::note_auth_refusal(status.as_u16(), &ev_agent_id, guard.key_id());
     if is_the_providers_refusal(status) {
         emit_upstream_refused_via(
             &ev_events,
@@ -3073,6 +3074,7 @@ async fn buffered_managed(
             Microusd::ZERO
         }
     };
+    crate::providerreport::note_auth_refusal(status.as_u16(), event_agent_id, guard.key_id());
     if is_the_providers_refusal(status) {
         emit_upstream_refused_via(
             &st.events,
