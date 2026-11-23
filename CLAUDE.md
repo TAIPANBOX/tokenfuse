@@ -5756,8 +5756,19 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     to 256 visible ASCII bytes and unique, at most 1 MiB and 4,096 rows, and a
     set but unusable file exits 2 naming the variable. Additive: not in
     `compat/1.0.json`.
+
+    Read again 2026-11-23: every Claude 5 and Fable model gained its Bedrock `global.` profile at list
+    and its `us.`, `eu.`, `jp.` and `au.` profiles at list plus 10 percent (the Bedrock page names the
+    global endpoint for these models and those four inference profiles, and the id
+    `global.anthropic.claude-fable-5-2`; the others follow its form); Fable 5, 5.1 and 5.2 and Opus
+    4.5, 4.6 and 4.7 gained their OpenRouter ids at list; and Gemini 4 on the Gemini API gained its
+    bare ids (`gemini-4-carbon`, `-argon`, `-neon`, `-hydrogen`; Carbon and Argon at the dearer
+    dated rate, from 2026-12-01), read from aistudio.google.com/docs/pricing. Vertex AI's Gemini 4
+    rows are not in the book: its pricing page could not be read that day.
     *(test: `pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate`
-    (expectations written by hand, red first with 52 ids at the fallback),
+    (expectations written by hand, red first with 52 ids at the fallback; 46 more ids added
+    2026-11-23), `gemini_4_on_the_gemini_api_prices_at_its_list_rate`,
+    `haiku_5_5_bedrock_profiles_carry_the_long_prompt_tier`,
     `the_measured_sonnet_5_call_settles_at_list_not_the_fallback` (red: `left:
     Some(Microusd(58110)) right: Some(Microusd(7748))`),
     `a_truly_unknown_id_still_falls_back`,
