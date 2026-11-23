@@ -100,13 +100,18 @@ struct OpenAiCall {
     name: String,
     /// The arguments as the deltas built them.
     args: Fragments,
-    /// The arguments a closing `message` stated whole, kept apart from the
-    /// deltas': a client may assemble either, so when the two differ both are
-    /// judged and neither replaces the other.
-    message_args: Option<Fragments>,
-    /// The name a closing `message` stated, kept apart from the deltas' for the
-    /// same reason.
-    message_name: Option<String>,
+    /// What each closing `message` stated for this call, every one kept: its
+    /// name and its arguments, each a whole statement. A client may assemble the
+    /// deltas or any message, so every distinct statement is judged and none
+    /// replaces another.
+    stated: Vec<Stated>,
+}
+
+/// One `message`'s statement of a call: the name and the arguments it carried.
+#[derive(Debug, Default)]
+struct Stated {
+    name: Option<String>,
+    args: Option<Fragments>,
 }
 
 /// A call's argument fragments, joined until they pass
@@ -294,6 +299,8 @@ impl ToolCallHold {
                         carried = true;
                         let ti = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(k as u64);
                         let entry = self.openai_calls.entry((ci, ti)).or_default();
+                        // A message's statement of this call, complete in itself.
+                        let mut stated = Stated::default();
                         if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
                             if !id.is_empty() {
                                 entry.id = Some(id.to_string());
@@ -307,7 +314,7 @@ impl ToolCallHold {
                             // A delta may split a name; a message states it whole, and may
                             // repeat a call the deltas already named, or name another.
                             if side == "message" {
-                                entry.message_name = Some(part.to_string());
+                                stated.name = Some(part.to_string());
                             } else {
                                 entry.name.push_str(part);
                             }
@@ -322,13 +329,16 @@ impl ToolCallHold {
                         };
                         if let Some(part) = part {
                             if side == "message" {
-                                entry
-                                    .message_args
+                                stated
+                                    .args
                                     .get_or_insert_with(Fragments::default)
                                     .push(&part);
                             } else {
                                 entry.args.push(&part);
                             }
+                        }
+                        if side == "message" {
+                            entry.stated.push(stated);
                         }
                     }
                 }
@@ -367,30 +377,36 @@ impl ToolCallHold {
                 args,
             });
         }
-        // An OpenAI call as its deltas built it, and, when a closing `message`
-        // stated a different name or different arguments, as the message stated it
-        // too: a client may assemble either, so both are judged.
+        // An OpenAI call as its deltas built it, and as every closing `message`
+        // stated it: a client may assemble any of them, so each distinct (name,
+        // arguments) pair is judged once, and none replaces another.
         for c in self.openai_calls.values() {
             let delta_name = (!c.name.is_empty()).then_some(c.name.as_str());
-            let stated_name = c.message_name.as_deref().filter(|n| !n.is_empty());
             let deltas = c.args.read();
-            if let Some(name) = delta_name {
-                out.push(ToolCall {
-                    name: name.to_string(),
-                    args: deltas.clone(),
-                });
-            }
-            let stated_args = c.message_args.as_ref().map(Fragments::read);
-            let Some(name) = stated_name.or(delta_name) else {
-                continue;
-            };
-            let args = stated_args.unwrap_or(deltas.clone());
-            let same = delta_name == Some(name) && args == deltas;
-            if !same {
+            let mut seen: Vec<(String, ToolArgs)> = Vec::new();
+            let mut judge = |name: &str, args: ToolArgs, out: &mut Vec<ToolCall>| {
+                if seen.iter().any(|(n, a)| n == name && *a == args) {
+                    return;
+                }
+                seen.push((name.to_string(), args.clone()));
                 out.push(ToolCall {
                     name: name.to_string(),
                     args,
                 });
+            };
+            if let Some(name) = delta_name {
+                judge(name, deltas.clone(), &mut out);
+            }
+            for st in &c.stated {
+                let Some(name) = st.name.as_deref().filter(|n| !n.is_empty()).or(delta_name) else {
+                    continue;
+                };
+                let args = st
+                    .args
+                    .as_ref()
+                    .map(Fragments::read)
+                    .unwrap_or(deltas.clone());
+                judge(name, args, &mut out);
             }
         }
         out
@@ -897,6 +913,40 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
                 name: "fetch_url".into(),
                 args: ToolArgs::Parsed(serde_json::json!({"a": 1}))
             }]
+        );
+    }
+
+    #[test]
+    fn every_closing_message_is_its_own_statement_and_each_is_judged() {
+        let message = |name: &str, args: &str| {
+            let v = serde_json::json!({"choices": [{"index": 0, "message": {"tool_calls": [{"index": 0, "function": {"name": name, "arguments": args}}]}}]});
+            format!("data: {v}\n\n")
+        };
+        let input = [
+            message("fetch_url", "{\"url\":\"https://x/?d=1\"}"),
+            message("bash", "{}"),
+            message("fetch_url", "{\"url\":\"https://ok\"}"),
+            message("fetch_url", "{\"url\":\"https://ok\"}"),
+        ]
+        .concat();
+        let (_, held) = run(input.as_bytes(), &[input.len()]);
+        assert_eq!(
+            held.calls,
+            vec![
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://x/?d=1"}))
+                },
+                ToolCall {
+                    name: "bash".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({}))
+                },
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(serde_json::json!({"url": "https://ok"}))
+                },
+            ],
+            "no message's name or arguments replace another's, and a repeat is judged once"
         );
     }
 }
