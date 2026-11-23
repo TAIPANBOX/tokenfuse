@@ -185,6 +185,15 @@
           "TOKENFUSE_IDENTITY_STRICT": {
             "required": false
           },
+          "TOKENFUSE_KEY_BURST": {
+            "required": false
+          },
+          "TOKENFUSE_KEY_CONCURRENCY": {
+            "required": false
+          },
+          "TOKENFUSE_KEY_RPS": {
+            "required": false
+          },
           "TOKENFUSE_KEYS": {
             "required": false
           },

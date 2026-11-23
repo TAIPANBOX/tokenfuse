@@ -808,6 +808,9 @@ Shipped in the same change as replay: the Cloud **regulator evidence pack** (`/v
 | Env var | Default | Meaning |
 |---|---|---|
 | `TOKENFUSE_OTLP_ENDPOINT` | unset or empty ⇒ no OTel export | The OTLP endpoint the gateway sends its telemetry to, alongside the Parquet traces. |
+| `TOKENFUSE_KEY_RPS` | unset (off) | Calls per second each caller (client key, agent token, or all unauthenticated callers together) may make on the LLM doors; over it the call is refused `429` with `Retry-After`, before anything is reserved. A value that is not a positive number stops the gateway at start. |
+| `TOKENFUSE_KEY_BURST` | the rate, at least 1 | The most calls a caller's bucket holds at once; needs `TOKENFUSE_KEY_RPS`. |
+| `TOKENFUSE_KEY_CONCURRENCY` | unset (off) | Calls in flight per caller, counted until the answer, streamed or not, has gone out; over it the call is refused `429`. |
 | `TOKENFUSE_MAX_BODY_BYTES` | `16777216` (16 MiB) | The most request-body bytes the gateway accepts; a larger body is refused. A value that is not a number is ignored. |
 | `TOKENFUSE_AGENT_ID_MODE` | `off` | What to do with an `agent_id` the agent-event envelope would reject: `off` records and counts it, `warn` also logs a warning naming it, `enforce` refuses the request with `400` before it reaches a provider. Any other value exits at startup. |
 | `TOKENFUSE_WASM_POLICY` | unset ⇒ no WASM policy | Path to a WASM policy file. Only a binary built with `--features wasm` reads it, and the default release build is not one. |

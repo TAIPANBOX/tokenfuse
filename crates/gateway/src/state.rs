@@ -122,6 +122,9 @@ pub struct AppState {
     /// is cleared and a run may log once more, which costs a repeated line
     /// and never memory.
     budget_clamp_logged: Arc<Mutex<HashSet<String>>>,
+    /// Per-key rate and concurrency limits (`crate::ratelimit`). `None`, the
+    /// default, limits nothing.
+    pub key_limits: Option<Arc<crate::ratelimit::KeyLimiter>>,
     /// Runs whose refused budget raise has been said once (invariant 135). Bounded like
     /// `budget_clamp_logged`.
     budget_raise_logged: Arc<Mutex<HashSet<String>>>,
@@ -638,6 +641,7 @@ impl AppState {
             restored_unbudgeted: Arc::new(Mutex::new(HashSet::new())),
             max_run_budget: None,
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
+            key_limits: None,
             budget_raise_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             unclassified_named: Arc::new(Mutex::new(Default::default())),
@@ -996,6 +1000,15 @@ impl AppState {
     /// `/v1/policy-plane` and `/v1/agent-ids` require of a caller
     /// (`crate::adminkeys`). Chainable. Not set means `AdminGate::Open`,
     /// which is what every existing deployment and test gets on upgrade.
+    /// Wire per-key rate and concurrency limits; limits that are all off leave
+    /// the gateway unlimited, as before.
+    pub fn with_key_limits(mut self, limits: crate::ratelimit::Limits) -> Self {
+        self.key_limits = limits
+            .is_on()
+            .then(|| crate::ratelimit::KeyLimiter::new(limits));
+        self
+    }
+
     pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
         self.admin_gate = gate;
         self

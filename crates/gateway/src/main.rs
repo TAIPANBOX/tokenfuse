@@ -1281,6 +1281,24 @@ async fn serve() {
     governance.push(("admin_routes", admin_label.to_string(), admin_source));
     state = state.with_admin_gate(admin_gate);
 
+    // Per-key rate and concurrency limits (`ratelimit`), off unless set. A value
+    // that cannot be read stops the gateway before it listens.
+    //
+    // process-local: the MCP broker has its own door and its own callers; these
+    // limits bound the LLM doors this process serves.
+    let key_limits = tokenfuse_gateway::defaults::exit_on_refusal(
+        tokenfuse_gateway::ratelimit::limits_from_env(),
+    );
+    if key_limits.is_on() {
+        tracing::info!(
+            rps = ?key_limits.rps,
+            burst = key_limits.burst,
+            concurrency = ?key_limits.concurrency,
+            "per-key limits on the LLM doors"
+        );
+    }
+    state = state.with_key_limits(key_limits);
+
     // Semantic cache: TOKENFUSE_CACHE = off | shadow | on. Default OFF since
     // invariant 63 (issue #319): SemanticCache::get's single global lock and
     // linear walk cost every eligible request whether or not an operator
