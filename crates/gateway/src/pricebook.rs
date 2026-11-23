@@ -896,7 +896,128 @@ mod tests {
             ("anthropic/claude-opus-5", OPUS_5),
             ("anthropic/claude-opus-4.8", OPUS_5),
             ("anthropic/claude-sonnet-4.6", SONNET_4_6),
+            // Read 2026-11-23: Bedrock profiles of the Claude 5 and Fable models.
+            ("global.anthropic.claude-fable-5-2", FABLE_5_2),
+            ("us.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("eu.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("jp.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("au.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("global.anthropic.claude-fable-5-1", FABLE_5_1),
+            ("us.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("eu.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("jp.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("au.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("global.anthropic.claude-fable-5", FABLE_5),
+            ("us.anthropic.claude-fable-5", FABLE_5_R),
+            ("eu.anthropic.claude-fable-5", FABLE_5_R),
+            ("jp.anthropic.claude-fable-5", FABLE_5_R),
+            ("au.anthropic.claude-fable-5", FABLE_5_R),
+            ("global.anthropic.claude-opus-5-5", OPUS_5_5),
+            ("us.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("eu.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("jp.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("au.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("global.anthropic.claude-opus-5", OPUS_5),
+            ("us.anthropic.claude-opus-5", OPUS_5_R),
+            ("eu.anthropic.claude-opus-5", OPUS_5_R),
+            ("jp.anthropic.claude-opus-5", OPUS_5_R),
+            ("au.anthropic.claude-opus-5", OPUS_5_R),
+            ("global.anthropic.claude-sonnet-5-5", SONNET_5_5),
+            ("us.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("eu.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("jp.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("au.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("global.anthropic.claude-sonnet-5", SONNET_5),
+            ("us.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("eu.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("jp.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("au.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("global.anthropic.claude-haiku-5-5", HAIKU_5_5),
+            ("us.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("eu.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("jp.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("au.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            // Read 2026-11-23: OpenRouter ids of Fable and Opus 4.5 to 4.7.
+            ("anthropic/claude-fable-5.2", FABLE_5_2),
+            ("anthropic/claude-fable-5.1", FABLE_5_1),
+            ("anthropic/claude-fable-5", FABLE_5),
+            ("anthropic/claude-opus-4.7", OPUS_5),
+            ("anthropic/claude-opus-4.6", OPUS_5),
+            ("anthropic/claude-opus-4.5", OPUS_5),
         ]
+    }
+
+    /// Gemini 4 on the Gemini API, read 2026-11-23 from
+    /// <https://aistudio.google.com/docs/pricing> and written out by hand:
+    /// Carbon and Argon at the dearer of their dated rates (from 2026-12-01),
+    /// no cache-write charge, so both write columns are the input rate.
+    #[test]
+    fn gemini_4_on_the_gemini_api_prices_at_its_list_rate() {
+        let book = default_price_book();
+        for (id, want) in [
+            (
+                "gemini-4-carbon",
+                (4_000_000, 20_000_000, 200_000, 4_000_000, 4_000_000),
+            ),
+            (
+                "gemini-4-argon",
+                (4_000_000, 20_000_000, 200_000, 4_000_000, 4_000_000),
+            ),
+            (
+                "gemini-4-neon",
+                (3_000_000, 15_000_000, 150_000, 3_000_000, 3_000_000),
+            ),
+            (
+                "gemini-4-hydrogen",
+                (1_500_000, 7_500_000, 75_000, 1_500_000, 1_500_000),
+            ),
+        ] {
+            assert!(book.is_known(id), "{id} has a row");
+            let p = book.price(id).unwrap();
+            assert_eq!(
+                (
+                    p.input_per_mtok.0,
+                    p.output_per_mtok.0,
+                    p.cache_read_per_mtok.0,
+                    p.cache_write_per_mtok.0,
+                    p.cache_write_1h_per_mtok.0
+                ),
+                want,
+                "{id}"
+            );
+        }
+    }
+
+    /// Haiku 5.5's Bedrock profiles carry its long-prompt tier, regional ones at
+    /// list plus 10 percent, written out by hand.
+    #[test]
+    fn haiku_5_5_bedrock_profiles_carry_the_long_prompt_tier() {
+        let book = default_price_book();
+        let tiers: std::collections::HashMap<&str, (u64, i64, i64)> = book
+            .long_context_entries()
+            .into_iter()
+            .map(|(m, t)| {
+                (
+                    m,
+                    (
+                        t.above_prompt_tokens,
+                        t.price.input_per_mtok.0,
+                        t.price.output_per_mtok.0,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tiers["global.anthropic.claude-haiku-5-5"],
+            (100_000, 500_000, 2_500_000)
+        );
+        for pre in ["us", "eu", "jp", "au"] {
+            assert_eq!(
+                tiers[format!("{pre}.anthropic.claude-haiku-5-5").as_str()],
+                (100_000, 550_000, 2_750_000),
+                "{pre}"
+            );
+        }
     }
 
     /// Every id the vendors list resolves by an exact row, at the vendor's
