@@ -2419,7 +2419,7 @@ run_case "streamed-args: unreadable arguments read as none" fail \
 
 run_case "streamed-args: a read judged on the whole answer's capabilities" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_large_argument_on_another_call_does_not_refuse_a_clean_read" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "taint::read_call_verdict(labels, &own, &call.args, pii_blocks, &st.firewall.rules)", "taint::read_call_verdict(labels, &requested, &call.args, pii_blocks, &st.firewall.rules)")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                std::slice::from_ref(&call.name),", "                resp_tools,")')" \
 	"a_large_argument_on_another_call_does_not_refuse_a_clean_read ... FAILED"
 
 run_case "streamed-args: the check ignores the arguments it is sent" fail \
