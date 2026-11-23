@@ -1038,10 +1038,11 @@ async fn serve() {
 
     tracing::info!(?wire, path = %wire.route_path(), "serving one door");
 
-    // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Default is
-    // shadow (safe to drop in: surfaces "would block" without changing
-    // behavior); set enforce to actually return 402 and cut the circuit. A
-    // value it cannot read exits here rather than starting as shadow.
+    // Enforcement mode: TOKENFUSE_MODE = shadow | warn | enforce. Unset, the
+    // governance profile decides (invariant 136): `governed`, the default,
+    // enforces (402 and the circuit cut); `observe` is shadow, which surfaces
+    // "would block" without changing behaviour. A value it cannot read exits
+    // here rather than starting as either.
     let mode = tokenfuse_gateway::defaults::policy_mode_under_env(profile);
     tracing::info!(?mode, "policy mode");
     governance.push((
