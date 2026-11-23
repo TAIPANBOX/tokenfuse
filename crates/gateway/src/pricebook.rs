@@ -1793,6 +1793,12 @@ mod tests {
             ("anthropic.claude-haiku-5-5", 100_000, haiku_r),
             ("anthropic/claude-haiku-5.5", 100_000, haiku),
             ("claude-haiku-5-5", 100_000, haiku),
+            // The Bedrock profiles read on 2026-11-23.
+            ("global.anthropic.claude-haiku-5-5", 100_000, haiku),
+            ("us.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("eu.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("jp.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("au.anthropic.claude-haiku-5-5", 100_000, haiku_r),
             (
                 "google/gemini-2.5-pro",
                 200_000,
@@ -1885,6 +1891,8 @@ mod tests {
             .map(|(id, a, r)| (format!("{OPENROUTER_OPENAI}{id}"), *a, *r))
             .collect();
         want.extend(openrouter);
+        // `long_context_entries` answers in id order.
+        want.sort();
         assert_eq!(got, want);
     }
 
