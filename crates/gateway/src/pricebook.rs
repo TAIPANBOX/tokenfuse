@@ -86,8 +86,11 @@ struct Claude {
 /// Bedrock `global.` profile at list and its `us.`, `eu.`, `jp.` and `au.`
 /// profiles at list plus 10 percent. The Bedrock page names the global
 /// endpoint for these models and the US, EU, JP and AU inference profiles,
-/// and names one profile id outright, `global.anthropic.claude-fable-5-2`; the
-/// other profile ids follow the same `<prefix>.anthropic.<model id>` form.
+/// and names one profile id outright, `global.anthropic.claude-fable-5-2`.
+/// The other profile ids are derived, not read from a table: their form
+/// follows AWS's `<prefix>.anthropic.<model id>` convention, and their price
+/// follows Anthropic's stated rule (global at list, regional and geo profiles
+/// at list plus 10 percent).
 /// Fable 5, 5.1 and 5.2 and Opus 4.5, 4.6 and 4.7 gained their OpenRouter ids
 /// at list: each OpenRouter page showed Anthropic's input and output rates as
 /// its first provider's, and no cache rates, so the cache columns are
@@ -365,13 +368,16 @@ const CLAUDE: &[Claude] = &[
 /// read the same day). No long-prompt tier is listed for any of them, and no
 /// cache-write charge: caching is implicit, so both write columns are the
 /// input rate. Carbon and Argon list 2.00 / 10.00 / 0.10 through 2026-11-30
-/// and 4.00 / 20.00 / 0.20 from 2026-12-01; the row is the dearer, so passing
-/// the date never leaves it under-charging. Vertex AI's own rates for Gemini 4
+/// and 4.00 / 20.00 / 0.20 from 2026-12-01. The row is the price in effect on
+/// the day it was read, the promotional one, and is raised to the standard one
+/// on 2026-12-01: the book has no effective date. `@decided 2026-11-23`: a row
+/// carries the price in effect today, and a dated change is a later edit on
+/// its date. Vertex AI's own rates for Gemini 4
 /// (`google/gemini-4-*`) are not here: its pricing page could not be read on
 /// 2026-11-23, and its Global and Non-global rows may differ from these.
 const GEMINI_API: &[(&str, GeminiRate)] = &[
-    ("gemini-4-carbon", (4_000_000, 20_000_000, 200_000)),
-    ("gemini-4-argon", (4_000_000, 20_000_000, 200_000)),
+    ("gemini-4-carbon", (2_000_000, 10_000_000, 100_000)),
+    ("gemini-4-argon", (2_000_000, 10_000_000, 100_000)),
     ("gemini-4-neon", (3_000_000, 15_000_000, 150_000)),
     ("gemini-4-hydrogen", (1_500_000, 7_500_000, 75_000)),
 ];
@@ -1072,19 +1078,20 @@ mod tests {
 
     /// Gemini 4 on the Gemini API, read 2026-11-23 from
     /// <https://aistudio.google.com/docs/pricing> and written out by hand:
-    /// Carbon and Argon at the dearer of their dated rates (from 2026-12-01),
-    /// no cache-write charge, so both write columns are the input rate.
+    /// Carbon and Argon at the price in effect that day (the promotional rate,
+    /// through 2026-11-30), no cache-write charge, so both write columns are the
+    /// input rate.
     #[test]
     fn gemini_4_on_the_gemini_api_prices_at_its_list_rate() {
         let book = default_price_book();
         for (id, want) in [
             (
                 "gemini-4-carbon",
-                (4_000_000, 20_000_000, 200_000, 4_000_000, 4_000_000),
+                (2_000_000, 10_000_000, 100_000, 2_000_000, 2_000_000),
             ),
             (
                 "gemini-4-argon",
-                (4_000_000, 20_000_000, 200_000, 4_000_000, 4_000_000),
+                (2_000_000, 10_000_000, 100_000, 2_000_000, 2_000_000),
             ),
             (
                 "gemini-4-neon",

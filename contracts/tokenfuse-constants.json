@@ -1144,20 +1144,20 @@
         "output_per_mtok_microusd": 11000000
       },
       {
-        "cache_read_per_mtok_microusd": 200000,
-        "cache_write_1h_per_mtok_microusd": 4000000,
-        "cache_write_per_mtok_microusd": 4000000,
-        "input_per_mtok_microusd": 4000000,
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2000000,
+        "cache_write_per_mtok_microusd": 2000000,
+        "input_per_mtok_microusd": 2000000,
         "model": "gemini-4-argon",
-        "output_per_mtok_microusd": 20000000
+        "output_per_mtok_microusd": 10000000
       },
       {
-        "cache_read_per_mtok_microusd": 200000,
-        "cache_write_1h_per_mtok_microusd": 4000000,
-        "cache_write_per_mtok_microusd": 4000000,
-        "input_per_mtok_microusd": 4000000,
+        "cache_read_per_mtok_microusd": 100000,
+        "cache_write_1h_per_mtok_microusd": 2000000,
+        "cache_write_per_mtok_microusd": 2000000,
+        "input_per_mtok_microusd": 2000000,
         "model": "gemini-4-carbon",
-        "output_per_mtok_microusd": 20000000
+        "output_per_mtok_microusd": 10000000
       },
       {
         "cache_read_per_mtok_microusd": 75000,

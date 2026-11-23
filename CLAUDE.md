@@ -5762,8 +5762,12 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     global endpoint for these models and those four inference profiles, and the id
     `global.anthropic.claude-fable-5-2`; the others follow its form); Fable 5, 5.1 and 5.2 and Opus
     4.5, 4.6 and 4.7 gained their OpenRouter ids at list; and Gemini 4 on the Gemini API gained its
-    bare ids (`gemini-4-carbon`, `-argon`, `-neon`, `-hydrogen`; Carbon and Argon at the dearer
-    dated rate, from 2026-12-01), read from aistudio.google.com/docs/pricing. Vertex AI's Gemini 4
+    bare ids (`gemini-4-carbon`, `-argon`, `-neon`, `-hydrogen`; Carbon and Argon at the price in
+    effect that day, the promotional rate through 2026-11-30, raised to the standard rate on
+    2026-12-01; `@decided 2026-11-23`: a row carries today's price), read from
+    aistudio.google.com/docs/pricing. The Bedrock profile ids other than
+    `global.anthropic.claude-fable-5-2` are derived from AWS's id convention and Anthropic's 10 percent
+    rule, not read from a table. Vertex AI's Gemini 4
     rows are not in the book: its pricing page could not be read that day.
     *(test: `pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate`
     (expectations written by hand, red first with 52 ids at the fallback; 46 more ids added
