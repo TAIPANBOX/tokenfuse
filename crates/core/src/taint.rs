@@ -1642,7 +1642,8 @@ mod tests {
             ToolArgs::from_value(&as_text),
             ToolArgs::Parsed(object.clone())
         );
-        let twice = serde_json::Value::String(as_text.to_string()).to_string();
+        // The arguments text is itself a JSON string holding the object's text.
+        let twice = as_text.to_string();
         assert_eq!(ToolArgs::from_raw(&twice), ToolArgs::Parsed(object.clone()));
         let found = call_argument_findings(&ToolArgs::from_value(&as_text), false);
         assert!(found.contains(&"too_many_params".to_string()), "{found:?}");
