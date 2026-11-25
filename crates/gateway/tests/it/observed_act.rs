@@ -261,6 +261,7 @@ async fn broker(setup: BrokerSetup<'_>) -> String {
         taint_gateway: setup.gateway,
         taint_failclosed: false,
         upstream_labels,
+        upstream_credentials: Default::default(),
         xaa: None,
         agent_tokens: None,
         taint_gateway_key: None,
