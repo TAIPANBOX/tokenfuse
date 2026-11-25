@@ -541,6 +541,41 @@ pub fn cache_mode_from(value: Option<&str>) -> tokenfuse_core::cache::CacheMode 
     }
 }
 
+/// The variable that sets how often shadow walks the cache (tokenfuse#329).
+pub const CACHE_SHADOW_SAMPLE_VAR: &str = "TOKENFUSE_CACHE_SHADOW_SAMPLE_EVERY";
+
+/// Shadow's default: one similarity walk in ten lookups the exact index did not
+/// answer. Measured on tokenfuse#329, a walk on every new prompt held a 4-core
+/// gateway to 527 calls/s at 50 agents against 1082 with the cache off.
+pub const CACHE_SHADOW_SAMPLE_DEFAULT: u32 = 10;
+
+/// `TOKENFUSE_CACHE_SHADOW_SAMPLE_EVERY`: shadow walks the cache's stored
+/// entries for one in this many new prompts (`1` walks every time). Unset or
+/// blank is [`CACHE_SHADOW_SAMPLE_DEFAULT`]. A value that is not an integer
+/// from 1 to 1,000,000 is the default too, with one warn line naming it: like
+/// `TOKENFUSE_CACHE`, this is a measurement setting, which has no stricter
+/// reading to fall back to (invariant 98).
+pub fn cache_shadow_sample_from(value: Option<&str>) -> u32 {
+    let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return CACHE_SHADOW_SAMPLE_DEFAULT;
+    };
+    match v.parse::<u32>() {
+        Ok(n) if (1..=1_000_000).contains(&n) => n,
+        _ => {
+            tracing::warn!(
+                value = %v,
+                "{CACHE_SHADOW_SAMPLE_VAR} must be an integer from 1 to 1000000; using {CACHE_SHADOW_SAMPLE_DEFAULT}"
+            );
+            CACHE_SHADOW_SAMPLE_DEFAULT
+        }
+    }
+}
+
+/// [`cache_shadow_sample_from`] against the process environment.
+pub fn cache_shadow_sample_from_env() -> u32 {
+    cache_shadow_sample_from(std::env::var(CACHE_SHADOW_SAMPLE_VAR).ok().as_deref())
+}
+
 /// [`cache_mode_from`] against the process environment.
 pub fn cache_mode_from_env() -> tokenfuse_core::cache::CacheMode {
     cache_mode_from(std::env::var("TOKENFUSE_CACHE").ok().as_deref())
@@ -1289,5 +1324,17 @@ mod tests {
         use tokenfuse_core::cache::CacheMode;
         assert!(matches!(cache_mode_from(Some("enfroce")), CacheMode::Off));
         assert_eq!(tools_prune_mode_from(Some("enfroce")), ToolsPruneMode::Off);
+    }
+
+    #[test]
+    fn shadow_samples_one_walk_in_ten_unless_told_otherwise() {
+        assert_eq!(cache_shadow_sample_from(None), 10);
+        assert_eq!(cache_shadow_sample_from(Some("  ")), 10);
+        assert_eq!(cache_shadow_sample_from(Some("1")), 1);
+        assert_eq!(cache_shadow_sample_from(Some(" 100 ")), 100);
+        assert_eq!(cache_shadow_sample_from(Some("1000000")), 1_000_000);
+        for bad in ["0", "-3", "ten", "1.5", "1000001"] {
+            assert_eq!(cache_shadow_sample_from(Some(bad)), 10, "{bad}");
+        }
     }
 }

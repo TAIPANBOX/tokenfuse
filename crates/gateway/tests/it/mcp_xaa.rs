@@ -79,6 +79,7 @@ fn state_with_keys(
         taint_gateway: None,
         taint_failclosed: false,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
         xaa,
         agent_tokens: None,
         taint_gateway_key: None,

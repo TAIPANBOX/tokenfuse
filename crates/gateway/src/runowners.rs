@@ -75,6 +75,13 @@ pub fn key_of(principal: &str) -> Option<&str> {
         .filter(|rest| !rest.is_empty())
 }
 
+/// The agent of an agent-token principal (`tok:<agent>`), or `None` for any other.
+pub fn agent_of(principal: &str) -> Option<&str> {
+    principal
+        .strip_prefix(TOKEN_PREFIX)
+        .filter(|rest| !rest.is_empty())
+}
+
 /// Whether `s` is a principal this module can have written: a known namespace and a name.
 pub fn is_principal(s: &str) -> bool {
     [KEY_PREFIX, TOKEN_PREFIX]

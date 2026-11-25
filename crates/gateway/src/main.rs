@@ -686,6 +686,24 @@ async fn mcp_broker() {
         eprintln!("tokenfuse: {refusal}");
         std::process::exit(2);
     }
+    // The credential each upstream takes, from a file per upstream (tokenfuse#364).
+    // A value that cannot be read refuses to start; the token is never logged.
+    let upstream_credentials = tokenfuse_gateway::defaults::exit_on_refusal(
+        tokenfuse_gateway::mcpbroker::upstream_credentials_from(
+            std::env::var(tokenfuse_gateway::mcpbroker::UPSTREAM_CREDENTIALS_VAR)
+                .ok()
+                .as_deref(),
+            &upstream,
+            &named_upstreams,
+            |path| std::fs::read_to_string(path),
+        ),
+    );
+    if !upstream_credentials.is_empty() {
+        tracing::info!(
+            upstreams = upstream_credentials.len(),
+            "mcp broker: sending each configured upstream its own credential"
+        );
+    }
     for up in upstream_labels.values() {
         tracing::info!(upstream = %up.name, labels = ?up.labels, "mcp broker: a read of this upstream labels its run");
     }
@@ -735,6 +753,7 @@ async fn mcp_broker() {
         events,
         taint_gateway,
         upstream_labels,
+        upstream_credentials,
         taint_failclosed: tokenfuse_gateway::defaults::mcp_taint_failclosed_from_env(),
         xaa,
         agent_tokens,
@@ -1308,6 +1327,8 @@ async fn serve() {
         tokenfuse_gateway::embedder::build(),
         tokenfuse_core::cache::CacheConfig {
             mode: cache_mode,
+            // Shadow measures a would-hit rate from a sample (tokenfuse#329).
+            shadow_walk_every: tokenfuse_gateway::defaults::cache_shadow_sample_from_env(),
             ..Default::default()
         },
     )));

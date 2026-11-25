@@ -115,6 +115,7 @@ impl Broker {
             taint_gateway: self.taint_gateway.clone(),
             taint_failclosed: true,
             upstream_labels: Default::default(),
+            upstream_credentials: Default::default(),
             xaa: None,
             agent_tokens: Some(Arc::new(AgentTokens::with_static_keys(
                 self.tokens,

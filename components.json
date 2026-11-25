@@ -90,6 +90,10 @@
           "TOKENFUSE_CACHE_EMBEDDER": {
             "required": false
           },
+          "TOKENFUSE_CACHE_SHADOW_SAMPLE_EVERY": {
+            "required": false,
+            "default": "10"
+          },
           "TOKENFUSE_CHECKPOINTS_DIR": {
             "required": false
           },
@@ -278,6 +282,9 @@
             "required": false
           },
           "TOKENFUSE_MCP_UPSTREAM": {
+            "required": false
+          },
+          "TOKENFUSE_MCP_UPSTREAM_CREDENTIALS": {
             "required": false
           },
           "TOKENFUSE_MCP_UPSTREAM_LABELS": {

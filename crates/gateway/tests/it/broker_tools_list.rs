@@ -343,6 +343,7 @@ fn broker(upstream: &str, wardryx: Wardryx) -> BrokerState {
         agent_tokens: None,
         taint_gateway_key: None,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
     }
 }
 
