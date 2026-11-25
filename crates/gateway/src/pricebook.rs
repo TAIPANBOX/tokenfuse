@@ -81,6 +81,21 @@ struct Claude {
 /// priced at list and a regional Google call is under-priced by 10 percent:
 /// that operator sets the rate in `TOKENFUSE_PRICE_BOOK`.
 ///
+/// **Read again 2026-11-23** (the pricing page and the Bedrock page above, and
+/// each model's OpenRouter page): every Claude 5 and Fable model gained its
+/// Bedrock `global.` profile at list and its `us.`, `eu.`, `jp.` and `au.`
+/// profiles at list plus 10 percent. The Bedrock page names the global
+/// endpoint for these models and the US, EU, JP and AU inference profiles,
+/// and names one profile id outright, `global.anthropic.claude-fable-5-2`.
+/// The other profile ids are derived, not read from a table: their form
+/// follows AWS's `<prefix>.anthropic.<model id>` convention, and their price
+/// follows Anthropic's stated rule (global at list, regional and geo profiles
+/// at list plus 10 percent).
+/// Fable 5, 5.1 and 5.2 and Opus 4.5, 4.6 and 4.7 gained their OpenRouter ids
+/// at list: each OpenRouter page showed Anthropic's input and output rates as
+/// its first provider's, and no cache rates, so the cache columns are
+/// Anthropic's list.
+///
 /// **OpenRouter.** Rates from each model's page on openrouter.ai
 /// (`https://openrouter.ai/<id>`), read 2026-10-07 through the search index
 /// because the site could not be fetched directly from this machine. Only
@@ -92,36 +107,86 @@ const CLAUDE: &[Claude] = &[
     // 10 percent as the page states.
     Claude {
         rate: (8.00, 40.00, 0.20, 10.00),
-        list: &["claude-fable-5-2"],
-        regional: &["anthropic.claude-fable-5-2"],
+        list: &[
+            "claude-fable-5-2",
+            "anthropic/claude-fable-5.2",
+            "global.anthropic.claude-fable-5-2",
+        ],
+        regional: &[
+            "anthropic.claude-fable-5-2",
+            "us.anthropic.claude-fable-5-2",
+            "eu.anthropic.claude-fable-5-2",
+            "jp.anthropic.claude-fable-5-2",
+            "au.anthropic.claude-fable-5-2",
+        ],
         long: None,
     },
     // Claude Fable 5.1: 10 / 50, cache hits 0.25 (0.025x), writes 12.50 / 20.
     Claude {
         rate: (10.00, 50.00, 0.25, 12.50),
-        list: &["claude-fable-5-1"],
-        regional: &["anthropic.claude-fable-5-1"],
+        list: &[
+            "claude-fable-5-1",
+            "anthropic/claude-fable-5.1",
+            "global.anthropic.claude-fable-5-1",
+        ],
+        regional: &[
+            "anthropic.claude-fable-5-1",
+            "us.anthropic.claude-fable-5-1",
+            "eu.anthropic.claude-fable-5-1",
+            "jp.anthropic.claude-fable-5-1",
+            "au.anthropic.claude-fable-5-1",
+        ],
         long: None,
     },
     // Claude Fable 5: 10 / 50, cache hits 1, writes 12.50 / 20.
     Claude {
         rate: (10.00, 50.00, 1.00, 12.50),
-        list: &["claude-fable-5"],
-        regional: &["anthropic.claude-fable-5"],
+        list: &[
+            "claude-fable-5",
+            "anthropic/claude-fable-5",
+            "global.anthropic.claude-fable-5",
+        ],
+        regional: &[
+            "anthropic.claude-fable-5",
+            "us.anthropic.claude-fable-5",
+            "eu.anthropic.claude-fable-5",
+            "jp.anthropic.claude-fable-5",
+            "au.anthropic.claude-fable-5",
+        ],
         long: None,
     },
     // Claude Opus 5.5: 4 / 20, cache hits 0.20 (0.05x), writes 5 / 8.
     Claude {
         rate: (4.00, 20.00, 0.20, 5.00),
-        list: &["claude-opus-5-5", "anthropic/claude-opus-5.5"],
-        regional: &["anthropic.claude-opus-5-5"],
+        list: &[
+            "claude-opus-5-5",
+            "anthropic/claude-opus-5.5",
+            "global.anthropic.claude-opus-5-5",
+        ],
+        regional: &[
+            "anthropic.claude-opus-5-5",
+            "us.anthropic.claude-opus-5-5",
+            "eu.anthropic.claude-opus-5-5",
+            "jp.anthropic.claude-opus-5-5",
+            "au.anthropic.claude-opus-5-5",
+        ],
         long: None,
     },
     // Claude Opus 5: 5 / 25, cache hits 0.50, writes 6.25 / 10.
     Claude {
         rate: (5.00, 25.00, 0.50, 6.25),
-        list: &["claude-opus-5", "anthropic/claude-opus-5"],
-        regional: &["anthropic.claude-opus-5"],
+        list: &[
+            "claude-opus-5",
+            "anthropic/claude-opus-5",
+            "global.anthropic.claude-opus-5",
+        ],
+        regional: &[
+            "anthropic.claude-opus-5",
+            "us.anthropic.claude-opus-5",
+            "eu.anthropic.claude-opus-5",
+            "jp.anthropic.claude-opus-5",
+            "au.anthropic.claude-opus-5",
+        ],
         long: None,
     },
     // Claude Opus 4.8: as Opus 5.
@@ -134,14 +199,18 @@ const CLAUDE: &[Claude] = &[
     // Claude Opus 4.7: as Opus 5.
     Claude {
         rate: (5.00, 25.00, 0.50, 6.25),
-        list: &["claude-opus-4-7"],
+        list: &["claude-opus-4-7", "anthropic/claude-opus-4.7"],
         regional: &["anthropic.claude-opus-4-7"],
         long: None,
     },
     // Claude Opus 4.6: as Opus 5. Bedrock profiles: global, us, eu, jp, apac.
     Claude {
         rate: (5.00, 25.00, 0.50, 6.25),
-        list: &["claude-opus-4-6", "global.anthropic.claude-opus-4-6-v1"],
+        list: &[
+            "claude-opus-4-6",
+            "anthropic/claude-opus-4.6",
+            "global.anthropic.claude-opus-4-6-v1",
+        ],
         regional: &[
             "anthropic.claude-opus-4-6-v1",
             "us.anthropic.claude-opus-4-6-v1",
@@ -159,6 +228,7 @@ const CLAUDE: &[Claude] = &[
         list: &[
             "claude-opus-4-5",
             "claude-opus-4-5-20251101",
+            "anthropic/claude-opus-4.5",
             "global.anthropic.claude-opus-4-5-20251101-v1:0",
         ],
         regional: &[
@@ -175,8 +245,18 @@ const CLAUDE: &[Claude] = &[
     // row shared Sonnet 5's 0.20.
     Claude {
         rate: (2.00, 10.00, 0.10, 2.50),
-        list: &["claude-sonnet-5-5", "anthropic/claude-sonnet-5.5"],
-        regional: &["anthropic.claude-sonnet-5-5"],
+        list: &[
+            "claude-sonnet-5-5",
+            "anthropic/claude-sonnet-5.5",
+            "global.anthropic.claude-sonnet-5-5",
+        ],
+        regional: &[
+            "anthropic.claude-sonnet-5-5",
+            "us.anthropic.claude-sonnet-5-5",
+            "eu.anthropic.claude-sonnet-5-5",
+            "jp.anthropic.claude-sonnet-5-5",
+            "au.anthropic.claude-sonnet-5-5",
+        ],
         long: None,
     },
     // Claude Sonnet 5: 2 / 10, cache hits 0.20, writes 2.50 / 4. The page's footnote: the 2 / 10
@@ -184,8 +264,18 @@ const CLAUDE: &[Claude] = &[
     // scheduled for 2026-09-01 "will not occur". tokenfuse#305 assumed 3 / 15.
     Claude {
         rate: (2.00, 10.00, 0.20, 2.50),
-        list: &["claude-sonnet-5", "anthropic/claude-sonnet-5"],
-        regional: &["anthropic.claude-sonnet-5"],
+        list: &[
+            "claude-sonnet-5",
+            "anthropic/claude-sonnet-5",
+            "global.anthropic.claude-sonnet-5",
+        ],
+        regional: &[
+            "anthropic.claude-sonnet-5",
+            "us.anthropic.claude-sonnet-5",
+            "eu.anthropic.claude-sonnet-5",
+            "jp.anthropic.claude-sonnet-5",
+            "au.anthropic.claude-sonnet-5",
+        ],
         long: None,
     },
     // Claude Sonnet 4.6: 3 / 15, cache hits 0.30, writes 3.75 / 6. Bedrock:
@@ -232,8 +322,18 @@ const CLAUDE: &[Claude] = &[
     // percent on both tiers).
     Claude {
         rate: (0.10, 0.50, 0.01, 0.125),
-        list: &["claude-haiku-5-5", "anthropic/claude-haiku-5.5"],
-        regional: &["anthropic.claude-haiku-5-5"],
+        list: &[
+            "claude-haiku-5-5",
+            "anthropic/claude-haiku-5.5",
+            "global.anthropic.claude-haiku-5-5",
+        ],
+        regional: &[
+            "anthropic.claude-haiku-5-5",
+            "us.anthropic.claude-haiku-5-5",
+            "eu.anthropic.claude-haiku-5-5",
+            "jp.anthropic.claude-haiku-5-5",
+            "au.anthropic.claude-haiku-5-5",
+        ],
         long: Some((100_000, (0.50, 2.50, 0.05, 0.625))),
     },
     // Claude Haiku 4.5: 1 / 5, cache hits 0.10, writes 1.25 / 2. Bedrock
@@ -255,6 +355,31 @@ const CLAUDE: &[Claude] = &[
         ],
         long: None,
     },
+];
+
+/// Gemini 4 on the Gemini API, by the bare id that API takes (its
+/// OpenAI-compatible endpoint takes `model: "gemini-4-argon"`): micro-USD per
+/// Mtok, `(id, (input, output, cached input))`, the Standard tier.
+///
+/// Rates: <https://ai.google.dev/gemini-api/docs/pricing>, which redirects to
+/// <https://aistudio.google.com/docs/pricing>, read 2026-11-23. Ids:
+/// the same page and Vertex AI's "Model versions" page
+/// (<https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions>,
+/// read the same day). No long-prompt tier is listed for any of them, and no
+/// cache-write charge: caching is implicit, so both write columns are the
+/// input rate. Carbon and Argon list 2.00 / 10.00 / 0.10 through 2026-11-30
+/// and 4.00 / 20.00 / 0.20 from 2026-12-01. The row is the price in effect on
+/// the day it was read, the promotional one, and is raised to the standard one
+/// on 2026-12-01: the book has no effective date. `@decided 2026-11-23`: a row
+/// carries the price in effect today, and a dated change is a later edit on
+/// its date. Vertex AI's own rates for Gemini 4
+/// (`google/gemini-4-*`) are not here: its pricing page could not be read on
+/// 2026-11-23, and its Global and Non-global rows may differ from these.
+const GEMINI_API: &[(&str, GeminiRate)] = &[
+    ("gemini-4-carbon", (2_000_000, 10_000_000, 100_000)),
+    ("gemini-4-argon", (2_000_000, 10_000_000, 100_000)),
+    ("gemini-4-neon", (3_000_000, 15_000_000, 150_000)),
+    ("gemini-4-hydrogen", (1_500_000, 7_500_000, 75_000)),
 ];
 
 /// A Gemini rate: input, output, cached input, micro-USD per Mtok.
@@ -307,8 +432,8 @@ type GeminiRate = (i64, i64, i64);
 ///
 /// Not here: Gemini 3 Flash Preview, whose output rate the page does not
 /// show, the Live, image, text-to-speech and embedding models, the
-/// retired Gemini 2.0 and 1.x models, and the bare ids the Gemini API takes,
-/// whose own price list was not read.
+/// retired Gemini 2.0 and 1.x models. The bare ids the Gemini API takes are
+/// in [`GEMINI_API`].
 const GEMINI: &[(&str, GeminiRate, Option<GeminiRate>)] = &[
     // Gemini 3.8 Flash: standard 1.50 / 7.50, cached 0.15 global;
     // 1.65 / 8.25, cached 0.165 non-global.
@@ -683,6 +808,10 @@ pub fn default_price_book() -> PriceBook {
             }
         }
     }
+    // Google, on the Gemini API (see `GEMINI_API`).
+    for (id, (i, o, r)) in GEMINI_API {
+        book.insert(*id, gemini(*i, *o, *r));
+    }
     // Google, on Vertex AI's OpenAI-compatible endpoint (see `GEMINI`).
     for (id, (i, o, r), long) in GEMINI {
         book.insert(*id, gemini(*i, *o, *r));
@@ -896,7 +1025,129 @@ mod tests {
             ("anthropic/claude-opus-5", OPUS_5),
             ("anthropic/claude-opus-4.8", OPUS_5),
             ("anthropic/claude-sonnet-4.6", SONNET_4_6),
+            // Read 2026-11-23: Bedrock profiles of the Claude 5 and Fable models.
+            ("global.anthropic.claude-fable-5-2", FABLE_5_2),
+            ("us.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("eu.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("jp.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("au.anthropic.claude-fable-5-2", FABLE_5_2_R),
+            ("global.anthropic.claude-fable-5-1", FABLE_5_1),
+            ("us.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("eu.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("jp.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("au.anthropic.claude-fable-5-1", FABLE_5_1_R),
+            ("global.anthropic.claude-fable-5", FABLE_5),
+            ("us.anthropic.claude-fable-5", FABLE_5_R),
+            ("eu.anthropic.claude-fable-5", FABLE_5_R),
+            ("jp.anthropic.claude-fable-5", FABLE_5_R),
+            ("au.anthropic.claude-fable-5", FABLE_5_R),
+            ("global.anthropic.claude-opus-5-5", OPUS_5_5),
+            ("us.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("eu.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("jp.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("au.anthropic.claude-opus-5-5", OPUS_5_5_R),
+            ("global.anthropic.claude-opus-5", OPUS_5),
+            ("us.anthropic.claude-opus-5", OPUS_5_R),
+            ("eu.anthropic.claude-opus-5", OPUS_5_R),
+            ("jp.anthropic.claude-opus-5", OPUS_5_R),
+            ("au.anthropic.claude-opus-5", OPUS_5_R),
+            ("global.anthropic.claude-sonnet-5-5", SONNET_5_5),
+            ("us.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("eu.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("jp.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("au.anthropic.claude-sonnet-5-5", SONNET_5_5_R),
+            ("global.anthropic.claude-sonnet-5", SONNET_5),
+            ("us.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("eu.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("jp.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("au.anthropic.claude-sonnet-5", SONNET_5_R),
+            ("global.anthropic.claude-haiku-5-5", HAIKU_5_5),
+            ("us.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("eu.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("jp.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            ("au.anthropic.claude-haiku-5-5", HAIKU_5_5_R),
+            // Read 2026-11-23: OpenRouter ids of Fable and Opus 4.5 to 4.7.
+            ("anthropic/claude-fable-5.2", FABLE_5_2),
+            ("anthropic/claude-fable-5.1", FABLE_5_1),
+            ("anthropic/claude-fable-5", FABLE_5),
+            ("anthropic/claude-opus-4.7", OPUS_5),
+            ("anthropic/claude-opus-4.6", OPUS_5),
+            ("anthropic/claude-opus-4.5", OPUS_5),
         ]
+    }
+
+    /// Gemini 4 on the Gemini API, read 2026-11-23 from
+    /// <https://aistudio.google.com/docs/pricing> and written out by hand:
+    /// Carbon and Argon at the price in effect that day (the promotional rate,
+    /// through 2026-11-30), no cache-write charge, so both write columns are the
+    /// input rate.
+    #[test]
+    fn gemini_4_on_the_gemini_api_prices_at_its_list_rate() {
+        let book = default_price_book();
+        for (id, want) in [
+            (
+                "gemini-4-carbon",
+                (2_000_000, 10_000_000, 100_000, 2_000_000, 2_000_000),
+            ),
+            (
+                "gemini-4-argon",
+                (2_000_000, 10_000_000, 100_000, 2_000_000, 2_000_000),
+            ),
+            (
+                "gemini-4-neon",
+                (3_000_000, 15_000_000, 150_000, 3_000_000, 3_000_000),
+            ),
+            (
+                "gemini-4-hydrogen",
+                (1_500_000, 7_500_000, 75_000, 1_500_000, 1_500_000),
+            ),
+        ] {
+            assert!(book.is_known(id), "{id} has a row");
+            let p = book.price(id).unwrap();
+            assert_eq!(
+                (
+                    p.input_per_mtok.0,
+                    p.output_per_mtok.0,
+                    p.cache_read_per_mtok.0,
+                    p.cache_write_per_mtok.0,
+                    p.cache_write_1h_per_mtok.0
+                ),
+                want,
+                "{id}"
+            );
+        }
+    }
+
+    /// Haiku 5.5's Bedrock profiles carry its long-prompt tier, regional ones at
+    /// list plus 10 percent, written out by hand.
+    #[test]
+    fn haiku_5_5_bedrock_profiles_carry_the_long_prompt_tier() {
+        let book = default_price_book();
+        let tiers: std::collections::HashMap<&str, (u64, i64, i64)> = book
+            .long_context_entries()
+            .into_iter()
+            .map(|(m, t)| {
+                (
+                    m,
+                    (
+                        t.above_prompt_tokens,
+                        t.price.input_per_mtok.0,
+                        t.price.output_per_mtok.0,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tiers["global.anthropic.claude-haiku-5-5"],
+            (100_000, 500_000, 2_500_000)
+        );
+        for pre in ["us", "eu", "jp", "au"] {
+            assert_eq!(
+                tiers[format!("{pre}.anthropic.claude-haiku-5-5").as_str()],
+                (100_000, 550_000, 2_750_000),
+                "{pre}"
+            );
+        }
     }
 
     /// Every id the vendors list resolves by an exact row, at the vendor's
@@ -1542,6 +1793,12 @@ mod tests {
             ("anthropic.claude-haiku-5-5", 100_000, haiku_r),
             ("anthropic/claude-haiku-5.5", 100_000, haiku),
             ("claude-haiku-5-5", 100_000, haiku),
+            // The Bedrock profiles read on 2026-11-23.
+            ("global.anthropic.claude-haiku-5-5", 100_000, haiku),
+            ("us.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("eu.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("jp.anthropic.claude-haiku-5-5", 100_000, haiku_r),
+            ("au.anthropic.claude-haiku-5-5", 100_000, haiku_r),
             (
                 "google/gemini-2.5-pro",
                 200_000,
@@ -1634,6 +1891,8 @@ mod tests {
             .map(|(id, a, r)| (format!("{OPENROUTER_OPENAI}{id}"), *a, *r))
             .collect();
         want.extend(openrouter);
+        // `long_context_entries` answers in id order.
+        want.sort();
         assert_eq!(got, want);
     }
 

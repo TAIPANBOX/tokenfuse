@@ -25,6 +25,28 @@ secrets the broker is about to inject, to a server the operator did not name
 is exactly the mistake the refusal prevents. The stdio transport has no
 per-message header channel, so it always uses the default upstream.
 
+### An upstream's own credential
+
+An MCP server that answers only callers holding its own token can sit behind
+the broker directly (tokenfuse#364). `TOKENFUSE_MCP_UPSTREAM_CREDENTIALS` names
+a mounted file per upstream:
+
+```
+TOKENFUSE_MCP_UPSTREAM_CREDENTIALS="default=/run/secrets/files-mcp, github=/run/secrets/github-mcp"
+```
+
+Each file holds one bearer token on its first line (at most 4 KiB). The broker
+sends it to that upstream as `Authorization: Bearer <token>` on every message,
+whatever name the request used to reach that server, and to no other server.
+It never forwards the caller's own `Authorization`. One bad entry refuses the
+whole value and the broker exits 2 before it listens: a malformed entry, a name
+no upstream carries, a name given twice, two names for one server, a file that
+cannot be read, an empty one, one over the cap, a token that is not a valid
+header value. The message names the variable and the file, never the token.
+The broker's client follows no redirect, so the credential cannot be carried to
+a host the answer names. The token is read once at start, so a rotation needs a
+restart.
+
 ## 2. The second PEP: Wardryx on `tools/call`
 
 Every `tools/call` is now put to the same Wardryx PDP the LLM path uses
