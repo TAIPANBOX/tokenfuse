@@ -94,6 +94,14 @@
       {
         "severity": "medium",
         "type": "dlp_shadow"
+      },
+      {
+        "severity": "medium",
+        "type": "rate_limited"
+      },
+      {
+        "severity": "low",
+        "type": "price_fallback"
       }
     ]
   },

@@ -363,6 +363,67 @@ pub enum EventType {
     /// `data` is [`dlp_shadow_data`]: `{summary, counts, mode, unit}`, kinds
     /// and how often, never a matched span in any member.
     DlpShadow,
+
+    /// The gateway answered `429` because a caller went past its own per-key
+    /// rate or concurrency limit (invariant 148). Written at most once per
+    /// source per minute; the refusals in between are counted in
+    /// `unreported_since_last`, so a caller in a tight loop is a count, not a
+    /// flood.
+    ///
+    /// `medium`, fixed, by agent-passport SPEC 6.2: the call was refused, not
+    /// forwarded, and the limit protects the gateway rather than a budget,
+    /// which `budget_exhausted` already speaks for.
+    ///
+    /// `data` is [`rate_limited_data`].
+    RateLimited,
+
+    /// The gateway priced a call at its fallback rates because the model has
+    /// no row in its price book. Written once per model per process; a call
+    /// that names no agent writes none and is counted instead (SPEC 6.1).
+    ///
+    /// `low`, fixed, by agent-passport SPEC 6.2: the call was served and
+    /// charged, possibly at the wrong price, which an operator corrects in
+    /// the price book.
+    ///
+    /// `data` is [`price_fallback_data`].
+    PriceFallback,
+}
+
+/// `data` for [`EventType::RateLimited`] (agent-passport SPEC 6.2). `limit` is
+/// `rps` or `concurrency`, the SPEC's words; `key_id` is the key's identifier,
+/// never its value; `principal` is the agent the call named, empty when it
+/// named none.
+pub fn rate_limited_data(
+    key_id: &str,
+    principal: &str,
+    limit: &str,
+    limit_value: f64,
+    retry_after_secs: u64,
+    unreported_since_last: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": key_id,
+        "principal": principal,
+        "limit": limit,
+        "limit_value": limit_value,
+        "retry_after_secs": retry_after_secs,
+        "unreported_since_last": unreported_since_last,
+    })
+}
+
+/// `data` for [`EventType::PriceFallback`] (agent-passport SPEC 6.2). `door`
+/// is `anthropic` or `openai`; `fallback_rates` are the rates the call was
+/// priced at, in the published price book's column names.
+pub fn price_fallback_data(
+    model: &str,
+    door: &str,
+    fallback_rates: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "door": door,
+        "fallback_rates": fallback_rates,
+    })
 }
 
 /// `data` for [`EventType::CallRetained`] (agent-passport SPEC 6.2), in one
@@ -959,6 +1020,8 @@ impl EventType {
             EventType::CallRetained => "call_retained",
             EventType::RetainedClosed => "retained_closed",
             EventType::DlpShadow => "dlp_shadow",
+            EventType::RateLimited => "rate_limited",
+            EventType::PriceFallback => "price_fallback",
         }
     }
 
@@ -969,9 +1032,9 @@ impl EventType {
     /// `taint_block` / `identity_mismatch` (docs/20) / `run_killed` /
     /// `unit_cap_exceeded` / `policy_deny` / `dependency_failed` = `high`;
     /// `budget_threshold` / `breaker_tripped` / `taint_shadow` / `run_stalled` /
-    /// `call_retained` / `dlp_shadow` = `medium`;
+    /// `call_retained` / `dlp_shadow` / `rate_limited` = `medium`;
     /// `taint_cleared` / `retained_closed` = `high`;
-    /// `tool_call` / `taint_raised` = `low`.
+    /// `tool_call` / `taint_raised` / `price_fallback` = `low`.
     ///
     /// `breaker_tripped` was `critical` until 2026-08-03, which meant every
     /// enforced 402 paged a human at the top band. A refused call is this
@@ -1032,12 +1095,19 @@ impl EventType {
             | EventType::CallRetained
             // And the DLP scanner's finding on a prompt it let through, at
             // the band of the two other shadow findings beside it.
-            | EventType::DlpShadow => Severity::Medium,
+            | EventType::DlpShadow
+            // And a call refused for its own per-key limit: refused, not
+            // forwarded, and the limit protects the gateway, not a budget.
+            | EventType::RateLimited => Severity::Medium,
             // A per-action audit signal, not an alert: the allow/deny/hold is
             // in `data.decision`, so allowed calls do not page like incidents.
             // Taint acquisition sits here for the same reason: a run reading
             // the web is normal, and only what it does next may not be.
-            EventType::ToolCall | EventType::TaintRaised => Severity::Low,
+            // And a call priced at the fallback: served and charged, possibly
+            // at the wrong price, which the price book corrects.
+            EventType::ToolCall | EventType::TaintRaised | EventType::PriceFallback => {
+                Severity::Low
+            }
         }
     }
 }
@@ -1801,6 +1871,8 @@ mod tests {
             (EventType::CallRetained, "call_retained"),
             (EventType::RetainedClosed, "retained_closed"),
             (EventType::DlpShadow, "dlp_shadow"),
+            (EventType::RateLimited, "rate_limited"),
+            (EventType::PriceFallback, "price_fallback"),
         ];
         for (t, s) in cases {
             assert_eq!(t.as_wire_str(), s);
@@ -1820,6 +1892,36 @@ mod tests {
             EventType::RetainedClosed.severity(),
             EventType::TaintCleared.severity()
         );
+    }
+
+    /// agent-passport SPEC 6.2: a refusal for a per-key limit is `medium` and a
+    /// fallback price is `low`, and each `data` carries exactly the SPEC's
+    /// members.
+    #[test]
+    fn rate_limited_and_price_fallback_are_on_the_wire_at_their_fixed_bands() {
+        assert_eq!(EventType::RateLimited.as_wire_str(), "rate_limited");
+        assert_eq!(EventType::RateLimited.severity(), Severity::Medium);
+        assert_eq!(EventType::PriceFallback.as_wire_str(), "price_fallback");
+        assert_eq!(EventType::PriceFallback.severity(), Severity::Low);
+        let r = rate_limited_data("ops", "agent://acme/a", "rps", 2.0, 1, 7);
+        let mut keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "key_id",
+                "limit",
+                "limit_value",
+                "principal",
+                "retry_after_secs",
+                "unreported_since_last"
+            ]
+        );
+        assert_eq!(r["unreported_since_last"], 7);
+        let p = price_fallback_data("m-x", "openai", serde_json::json!({"a": 1}));
+        let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["door", "fallback_rates", "model"]);
     }
 
     /// Invariant 114, agent-passport SPEC 6.2: a finding let through is a

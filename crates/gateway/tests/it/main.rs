@@ -38,6 +38,7 @@ mod governed_profile_scope;
 mod image_user_group;
 mod key_limits;
 mod keys_endpoint;
+mod limits_and_fallback_on_the_bus;
 mod long_prompt_is_priced_at_its_long_rate;
 mod manifest;
 mod mcp_agent_token;

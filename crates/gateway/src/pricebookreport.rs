@@ -125,12 +125,16 @@ pub struct PriceBookReport {
     /// memory, which is emptied past 8,192 ids (`state::CLAMP_LOG_CAP`), so
     /// this counts since that last happened, never more than it can know.
     pub fallback_models_seen_total: usize,
+    /// `price_fallback` events not written because the call named no agent
+    /// (agent-passport SPEC 6.1): the bus skips such a call, and this is
+    /// where the count is seen.
+    pub fallback_events_unreported: u64,
     /// One sentence for an operator reading this by eye.
     pub detail: String,
 }
 
 /// Cut `id` to [`MAX_MODEL_ID_SHOWN`] bytes at a character boundary.
-fn shown(id: &str) -> String {
+pub(crate) fn shown(id: &str) -> String {
     if id.len() <= MAX_MODEL_ID_SHOWN {
         return id.to_string();
     }
@@ -205,13 +209,14 @@ pub fn report(
         long_context_dropped_models,
         fallback_models_seen: seen,
         fallback_models_seen_total: total,
+        fallback_events_unreported: 0,
         detail,
     }
 }
 
 /// `GET /v1/price-book`.
 pub async fn price_book(State(st): State<AppState>) -> Json<PriceBookReport> {
-    Json(report(
+    let mut r = report(
         st.prices.entries().len(),
         st.prices.fallback(),
         st.prices
@@ -221,7 +226,9 @@ pub async fn price_book(State(st): State<AppState>) -> Json<PriceBookReport> {
             .collect(),
         &st.price_book_source,
         st.fallback_models_seen(),
-    ))
+    );
+    r.fallback_events_unreported = st.price_fallback_unreported();
+    Json(r)
 }
 
 #[cfg(test)]

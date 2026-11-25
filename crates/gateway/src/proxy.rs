@@ -802,7 +802,10 @@ async fn handle_call(
     if let Some(limiter) = st.key_limits.as_ref() {
         match limiter.admit(&caller.principal, std::time::Instant::now()) {
             Ok(p) => *permit_slot = Some(p),
-            Err(refusal) => return rate_limited(&caller.principal, refusal),
+            Err(refusal) => {
+                report_rate_limited(&st, &headers, &caller, limiter.limits(), refusal);
+                return rate_limited(&caller.principal, refusal);
+            }
         }
     }
 
@@ -1702,6 +1705,14 @@ async fn handle_call(
         parsed.completions,
     )
     .unwrap_or(Microusd::ZERO);
+    report_price_fallback(
+        &st,
+        wire,
+        &parsed.model,
+        &event_agent_id,
+        &run_id,
+        chain_on_record,
+    );
 
     // `open_run` above just committed (the in-process ledger applies
     // synchronously; the raft ledger's write returned only after a majority
@@ -3976,6 +3987,115 @@ fn rate_limited(principal: &str, refusal: crate::ratelimit::Refusal) -> Response
         .header("x-fuse", "blocked")
         .body(Body::from(body.to_string()))
         .expect("valid response")
+}
+
+/// `rate_limited` on the bus (agent-passport SPEC 6.2): at most one event per
+/// principal per minute, the refusals in between counted in
+/// `unreported_since_last`. The throttle and the envelope's subject come from
+/// the credential only (the agent an agent token proves, else
+/// [`crate::refusedkeys::UNIDENTIFIED_CALLER`]), so a caller cannot multiply
+/// the events by varying a header or file them under another agent. The agent
+/// the call named in `x-fuse-agent-id` is only `data.principal`, the SPEC's
+/// member for it.
+fn report_rate_limited(
+    st: &AppState,
+    headers: &HeaderMap,
+    caller: &Caller,
+    limits: crate::ratelimit::Limits,
+    refusal: crate::ratelimit::Refusal,
+) {
+    let Some(unreported) = st.note_rate_limited(&caller.principal, std::time::Instant::now())
+    else {
+        return;
+    };
+    let proven = caller.agent_id();
+    let named = proven
+        .clone()
+        .or_else(|| header_str(headers, "x-fuse-agent-id"))
+        .unwrap_or_default();
+    let (limit, limit_value) = match refusal.limit {
+        crate::ratelimit::Limit::Rate => ("rps", limits.rps.unwrap_or(0.0)),
+        crate::ratelimit::Limit::Concurrency => {
+            ("concurrency", f64::from(limits.concurrency.unwrap_or(0)))
+        }
+    };
+    let subject = proven
+        .as_deref()
+        .filter(|a| !a.is_empty())
+        .unwrap_or(crate::refusedkeys::UNIDENTIFIED_CALLER);
+    // No run: the call was refused before its run was claimed (invariant 120),
+    // so a run id the caller wrote names nothing this caller was shown to own.
+    let outcome = st.events.emit(
+        EventType::RateLimited,
+        now_millis(),
+        Some(subject),
+        None,
+        None,
+        tokenfuse_core::agent_event::rate_limited_data(
+            &caller.key_id,
+            &named,
+            limit,
+            limit_value,
+            refusal.retry_after_secs,
+            unreported,
+        ),
+    );
+    crate::events::log_outcome(EventType::RateLimited, outcome);
+}
+
+/// `price_fallback` on the bus (agent-passport SPEC 6.2) for a call the
+/// fallback rates priced: once per model per process. A call that names no
+/// agent writes none and is counted instead, on `GET /v1/price-book`
+/// (SPEC 6.1); its model stays unreported, so the next call that names an
+/// agent writes it. Model ids are the caller's, so the events are also capped
+/// for the whole gateway (`AppState::note_price_fallback_event`): past the cap
+/// a model is counted the same way and stays unreported.
+fn report_price_fallback(
+    st: &AppState,
+    wire: Wire,
+    model: &str,
+    event_agent_id: &str,
+    run_id: &str,
+    chain_on_record: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
+) {
+    if crate::pricebook::basis(&st.prices, model) == "known" {
+        return;
+    }
+    if event_agent_id.is_empty() {
+        st.note_price_fallback_unreported();
+        return;
+    }
+    match st.note_price_fallback_event(model, std::time::Instant::now()) {
+        crate::state::FallbackEvent::Write => {}
+        crate::state::FallbackEvent::AlreadyWritten => return,
+        crate::state::FallbackEvent::OverCap => {
+            st.note_price_fallback_unreported();
+            return;
+        }
+    }
+    let rates = st
+        .prices
+        .fallback()
+        .map(|p| serde_json::to_value(crate::pricebookreport::Rates::from(p)))
+        .and_then(Result::ok)
+        .unwrap_or(serde_json::Value::Null);
+    let door = match wire {
+        Wire::Anthropic => "anthropic",
+        Wire::OpenAi => "openai",
+    };
+    let outcome = st.events.emit(
+        EventType::PriceFallback,
+        now_millis(),
+        Some(event_agent_id),
+        Some(run_id),
+        chain_on_record,
+        tokenfuse_core::agent_event::price_fallback_data(
+            &crate::pricebookreport::shown(model),
+            door,
+            rates,
+        ),
+    );
+    crate::events::log_outcome(EventType::PriceFallback, outcome);
 }
 
 fn dlp_block(run_id: &str, summary: &str) -> Response {
