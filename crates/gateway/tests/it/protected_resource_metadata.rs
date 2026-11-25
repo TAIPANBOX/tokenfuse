@@ -86,6 +86,7 @@ impl Door {
             taint_gateway: None,
             taint_failclosed: true,
             upstream_labels: Default::default(),
+            upstream_credentials: Default::default(),
             xaa: self.xaa.then(|| {
                 Arc::new(XaaDoor {
                     cfg: cfg(&self.issuer),

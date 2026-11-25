@@ -172,6 +172,7 @@ fn broker_state(
         taint_gateway: None,
         taint_failclosed: false,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
         // XAA is off in every fixture built through this helper (W3-tokenfuse's
         // own tests build their own state); see `xaa_test_state` there.
         xaa: None,
@@ -212,6 +213,7 @@ fn broker_with_dlp_pii(upstream: String, dlp_pii: tokenfuse_core::DlpMode) -> Ro
         taint_gateway: None,
         taint_failclosed: false,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
         xaa: None,
         agent_tokens: None,
         taint_gateway_key: None,
@@ -1207,6 +1209,7 @@ fn broker_state_with_vault(upstream: String, vault: SecretVault) -> Arc<BrokerSt
         taint_gateway: None,
         taint_failclosed: false,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
         xaa: None,
         agent_tokens: None,
         taint_gateway_key: None,
@@ -1527,6 +1530,7 @@ fn broker_with_taint(upstream: String, gateway: Option<String>, failclosed: bool
         taint_gateway: gateway,
         taint_failclosed: failclosed,
         upstream_labels: Default::default(),
+        upstream_credentials: Default::default(),
         xaa: None,
         agent_tokens: None,
         taint_gateway_key: None,
@@ -5014,6 +5018,79 @@ async fn a_single_request_and_a_clients_response_still_reach_the_upstream() {
     let forwarded = seen.lock().expect("upstream log").clone();
     assert_eq!(forwarded.len(), 2, "{forwarded:?}");
     assert_eq!(forwarded[1], answer, "{forwarded:?}");
+}
+
+// --- tokenfuse#364: the broker sends an upstream its own credential ---------
+
+/// An upstream that answers with the `Authorization` header it received.
+fn auth_echo() -> Router {
+    Router::new().route(
+        "/",
+        post(
+            |headers: axum::http::HeaderMap, Json(req): Json<Value>| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": {"auth": auth}}))
+            },
+        ),
+    )
+}
+
+/// Red until the forward sends it: the operator's file names a token for the
+/// default upstream, the broker sends it as `Authorization: Bearer`, the caller's
+/// own `Authorization` never reaches the upstream, and an upstream with no file
+/// gets no credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broker_sends_each_upstream_its_own_credential_and_never_the_callers() {
+    let a = spawn_server(auth_echo()).await;
+    let b = spawn_server(auth_echo()).await;
+    let named: std::collections::BTreeMap<String, String> =
+        [("tickets".to_string(), b.clone())].into_iter().collect();
+    let state = broker_state(
+        a.clone(),
+        ScanMode::Off,
+        tokenfuse_core::DlpMode::Off,
+        None,
+        named.clone(),
+        Wardryx::disabled(),
+    );
+    let mut state = Arc::try_unwrap(state).ok().expect("one owner");
+    state.upstream_credentials = tokenfuse_gateway::mcpbroker::upstream_credentials_from(
+        Some("default=/run/secrets/a"),
+        &a,
+        &named,
+        |path| {
+            assert_eq!(path, "/run/secrets/a");
+            Ok("tok-for-a\n".to_string())
+        },
+    )
+    .expect("a usable value");
+    let broker_url = spawn_server(app(Arc::new(state))).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let ask = |upstream: Option<&'static str>| {
+        let url = broker_url.clone();
+        async move {
+            let mut req = reqwest::Client::new()
+                .post(format!("{url}/"))
+                .header("authorization", "Bearer the-callers-own")
+                .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}));
+            if let Some(u) = upstream {
+                req = req.header("x-fuse-mcp-upstream", u);
+            }
+            req.send().await.unwrap().json::<Value>().await.unwrap()
+        }
+    };
+    let out = ask(None).await;
+    assert_eq!(out["result"]["auth"], "Bearer tok-for-a", "{out}");
+    let out = ask(Some("tickets")).await;
+    assert_eq!(
+        out["result"]["auth"],
+        Value::Null,
+        "no file, no credential: {out}"
+    );
 }
 
 // --- invariant 121: the arguments go with the tool-call check -------------
