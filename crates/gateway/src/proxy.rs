@@ -12077,7 +12077,7 @@ pub(crate) mod tests {
                 body: RATE_LIMITED,
                 usage: None,
             }));
-            let mut b: serde_json::Value = serde_json::from_slice(&body(500)).unwrap();
+            let mut b: serde_json::Value = serde_json::from_str(&body(500)).unwrap();
             b["stream"] = serde_json::Value::Bool(stream);
             let req = Request::post("/v1/messages")
                 .header("x-fuse-run-id", format!("run-auth-{status}"))
