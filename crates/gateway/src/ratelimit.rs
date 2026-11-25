@@ -188,7 +188,9 @@ pub fn limits_from(
     burst: Option<&str>,
     concurrency: Option<&str>,
 ) -> Result<Limits, String> {
-    let set = |v: Option<&str>| v.map(str::trim).filter(|v| !v.is_empty());
+    fn set(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|v| !v.is_empty())
+    }
     let rps = match set(rps) {
         None => None,
         Some(v) => match v.parse::<f64>() {
