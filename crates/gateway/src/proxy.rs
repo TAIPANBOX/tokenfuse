@@ -4057,7 +4057,23 @@ fn foreign_ancestor_refusal(
     parent: &str,
     by: &DelegatedBy<'_>,
 ) -> Option<Response> {
-    st.run_ancestors(parent)
+    let (above, cut_off) = st.run_ancestors(parent);
+    if cut_off && !principal.is_empty() {
+        // A lineage deeper than the ledger walks cannot be judged whole, and an
+        // unjudged ancestor is not a clean one.
+        return Some(foreign_run_refused(
+            st,
+            headers,
+            ForeignRun {
+                key_id,
+                principal,
+                run_id,
+                owner: "(lineage deeper than the ledger walks)",
+                parent: Some(parent),
+            },
+        ));
+    }
+    above
         .iter()
         .filter(|a| a.as_str() != run_id)
         .find_map(|a| foreign_parent_refusal(st, headers, key_id, principal, run_id, a, by))

@@ -336,22 +336,28 @@ impl TaintStore {
     }
 
     /// The runs above `run_id`, nearest first, as the parent map holds them,
-    /// bounded and cycle-safe like [`inherited`](Self::inherited).
-    pub fn ancestors(&self, run_id: &str) -> Vec<String> {
-        const MAX_DEPTH: usize = 32;
+    /// cycle-safe, and whether the walk stopped at the depth cap with a run
+    /// still unwalked. The cap is the ledger's own (64), so the check and the
+    /// roll-up cover the same runs; a caller must treat a cut-off walk as a
+    /// refusal, never as "nothing foreign above".
+    pub fn ancestors(&self, run_id: &str) -> (Vec<String>, bool) {
+        const MAX_DEPTH: usize = 64;
         let parents = self.parents.lock().unwrap();
         let mut out = Vec::new();
         let mut seen: std::collections::HashSet<String> =
             std::collections::HashSet::from([run_id.to_string()]);
         let mut cursor = parents.get(run_id).cloned();
         while let Some(id) = cursor {
-            if out.len() >= MAX_DEPTH || !seen.insert(id.clone()) {
+            if out.len() >= MAX_DEPTH {
+                return (out, true);
+            }
+            if !seen.insert(id.clone()) {
                 break;
             }
             cursor = parents.get(&id).cloned();
             out.push(id);
         }
-        out
+        (out, false)
     }
 
     /// Every label this run's ancestors carry (docs/07 B.3 P3).
@@ -993,7 +999,7 @@ impl AppState {
     }
 
     /// See [`TaintStore::ancestors`].
-    pub fn run_ancestors(&self, run_id: &str) -> Vec<String> {
+    pub fn run_ancestors(&self, run_id: &str) -> (Vec<String>, bool) {
         self.taint.ancestors(run_id)
     }
 
@@ -1259,5 +1265,22 @@ mod block_ledger_tests {
             st.note_budget_clamp(&format!("run-{i}"));
         }
         assert!(st.budget_clamp_logged.lock().unwrap().len() <= CLAMP_LOG_CAP);
+    }
+
+    #[test]
+    fn a_lineage_deeper_than_the_cap_says_it_was_cut_off() {
+        let t = TaintStore::default();
+        for i in 0..70 {
+            t.note_parent(&format!("r{i}"), &format!("r{}", i + 1));
+        }
+        let (above, cut) = t.ancestors("r0");
+        assert_eq!(above.len(), 64);
+        assert!(
+            cut,
+            "a walk that stopped at the cap with a run unwalked says so"
+        );
+        let (above, cut) = t.ancestors("r10");
+        assert_eq!(above.len(), 60);
+        assert!(!cut);
     }
 }

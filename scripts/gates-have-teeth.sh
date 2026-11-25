@@ -1901,7 +1901,7 @@ run_case "delegated-parent: a claimed chain read as proven" fail \
 
 run_case "delegated-parent: the ancestors above the parent are not judged" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_grandchild_without_the_delegation_is_refused_under_the_owners_run" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "    st.run_ancestors(parent)\n        .iter()", "    Vec::<String>::new()\n        .iter()")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let (above, cut_off) = st.run_ancestors(parent);", "    let (above, cut_off) = (Vec::<String>::new(), false);")')" \
 	"a_grandchild_without_the_delegation_is_refused_under_the_owners_run ... FAILED"
 
 run_case "delegated-parent: any proven chain passes" fail \

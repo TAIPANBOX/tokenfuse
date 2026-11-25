@@ -7916,7 +7916,8 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `@claude 2026-11-23`, under delegated authority, open to reversal: any ancestor rather than only the
     immediate delegator, and no identity-map list for agents (`may_parent` stays keyed by client key).
     Every run above the parent is judged by the same rule at each call (`proxy::foreign_ancestor_refusal`,
-    over the lineage the taint store records whatever the firewall's mode), so a run a delegation once
+    over the lineage the taint store records whatever the firewall's mode, to the ledger's own depth of 64; a lineage cut off at
+    that depth is refused, never read as clean), so a run a delegation once
     let roll up does not become a standing pass: a grandchild opened under it without the delegation is
     refused. Because the chain is resolved before the seed gate, a delegation proof is spent even when
     the call is then answered `503 seed_pending`; a client that retries must sign a fresh proof.
