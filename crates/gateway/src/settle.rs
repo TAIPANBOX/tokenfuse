@@ -562,6 +562,11 @@ impl SettleGuard {
     pub fn identity_reason(&self) -> Option<String> {
         self.attribution.identity_reason.clone()
     }
+    /// The client key id the call was made with, empty when nothing
+    /// authenticated (`tok:<agent>` for an agent token).
+    pub fn key_id(&self) -> &str {
+        &self.attribution.key_id
+    }
     pub fn state(&self) -> CallOutcome {
         self.state
     }

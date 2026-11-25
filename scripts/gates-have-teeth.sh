@@ -1890,6 +1890,17 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(\n            &st,\n            &headers,\n            &key_id,\n            &principal,\n            &run_id,\n            p,\n            &delegated_by,\n        )", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- invariant 149: a refused provider credential is one incident ----------------
+run_case "provider-auth: the gateway never counts a refused credential" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller" \
+	"$(py 'edit("crates/gateway/src/providerreport.rs", "    if !matches!(status, 401 | 403) {", "    if true || !matches!(status, 401 | 403) {")')" \
+	"a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller ... FAILED"
+
+run_case "provider-auth: one event per report, not per incident" fail \
+	"cargo test -p tokenfuse-cloud --lib -- --exact store::tests::three_refused_credentials_open_one_incident_and_one_event_under_the_agent" \
+	"$(py 'edit("crates/cloud/src/store.rs", "        let (inc, new) = opened?;\n        if new {", "        let (inc, _new) = opened?;\n        if true {")')" \
+	"three_refused_credentials_open_one_incident_and_one_event_under_the_agent ... FAILED"
+
 # --- tokenfuse#364: an MCP upstream gets the operator's credential ---------------
 run_case "upstream-credentials: the broker sends no credential" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::the_broker_sends_each_upstream_its_own_credential_and_never_the_callers" \

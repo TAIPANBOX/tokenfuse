@@ -1071,3 +1071,49 @@ async fn the_site_comes_from_the_key_and_never_from_the_body() {
         "a report from the gw-1 key was filed under a site its body named"
     );
 }
+
+// --- tokenfuse#312: a provider refusing a caller's credential ---------------
+
+/// Red until the route reads `auth_failures`: three refused credentials for one
+/// agent, reported by a site's key, are one `provider_auth_refused` incident on
+/// the API, and the provider's health incident is not opened.
+#[tokio::test]
+async fn three_refused_credentials_are_one_auth_incident_on_the_incidents_api() {
+    let (state, _) = test_state();
+    for _ in 0..3 {
+        let body = serde_json::json!({ "auth_failures": [
+            { "provider": PROVIDER, "agent_id": "agent://acme/rotated", "key_id": "", "count": 1 }
+        ]});
+        let (status, answer) = post(&state, Some("sitekey"), body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["accepted"], 1);
+    }
+    let all = incidents(&state).await;
+    assert_eq!(all.len(), 1, "{all:?}");
+    assert_eq!(
+        all[0]["id"],
+        "provider_auth_refused:api.example.test:agent://acme/rotated@gw-1"
+    );
+    assert_eq!(all[0]["kind"], "provider_auth_refused");
+    assert_eq!(all[0]["severity"], "medium");
+    assert_eq!(all[0]["occurrences"], 3);
+    assert_eq!(all[0]["agent_id"], "agent://acme/rotated");
+}
+
+/// More entries than allowed are refused, for refused credentials as for
+/// failures.
+#[tokio::test]
+async fn more_auth_entries_than_allowed_are_refused() {
+    let (state, store) = test_state();
+    let entries: Vec<serde_json::Value> = (0..65)
+        .map(|i| serde_json::json!({ "provider": PROVIDER, "agent_id": format!("agent://a/{i}"), "count": 5 }))
+        .collect();
+    let (status, _) = post(
+        &state,
+        Some("ingestkey"),
+        serde_json::json!({ "auth_failures": entries }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(store.incidents("acme").is_empty());
+}

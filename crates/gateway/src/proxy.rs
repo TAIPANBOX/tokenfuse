@@ -2873,6 +2873,7 @@ fn stream_managed(
     let ev_chain = record_chain;
     let ev_proof = record_proof;
     let provider_refused_at_entry = !status.is_success();
+    crate::providerreport::note_auth_refusal(status.as_u16(), &ev_agent_id, guard.key_id());
     if is_the_providers_refusal(status) {
         emit_upstream_refused_via(
             &ev_events,
@@ -3131,6 +3132,7 @@ async fn buffered_managed(
             Microusd::ZERO
         }
     };
+    crate::providerreport::note_auth_refusal(status.as_u16(), event_agent_id, guard.key_id());
     if is_the_providers_refusal(status) {
         emit_upstream_refused_via(
             &st.events,
@@ -12055,6 +12057,53 @@ pub(crate) mod tests {
             if counted {
                 assert_eq!(reporter.pending_detail(), format!("HTTP {code}"));
             }
+        }
+    }
+
+    /// tokenfuse#312: a provider that refuses the credential is counted for the
+    /// Cloud by who made the call, buffered and streamed, and apart from the
+    /// provider's health; a 429 is not counted as a refused credential.
+    #[tokio::test]
+    async fn a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller() {
+        use crate::providerreport::{install_for_this_thread, ProviderFailureReporter};
+        for (status, stream, counted) in [
+            (401, false, true),
+            (403, true, true),
+            (429, false, false),
+            (200, false, false),
+        ] {
+            let reporter = Arc::new(ProviderFailureReporter::new("http://127.0.0.1:1", "k", "p"));
+            install_for_this_thread(Arc::clone(&reporter));
+            let st = state_with_provider(Arc::new(RefusingProvider {
+                status,
+                body: RATE_LIMITED,
+                usage: None,
+            }));
+            let mut b: serde_json::Value = serde_json::from_str(&body(500)).unwrap();
+            b["stream"] = serde_json::Value::Bool(stream);
+            let req = Request::post("/v1/messages")
+                .header("x-fuse-run-id", format!("run-auth-{status}"))
+                .header("x-fuse-agent-id", "agent://test.local/rotated")
+                .header("x-fuse-budget-usd", "5.0")
+                .body(Body::from(b.to_string()))
+                .unwrap();
+            let resp = call(st, req).await;
+            let _ = to_bytes(resp.into_body(), usize::MAX).await;
+            let auth = reporter.pending_auth();
+            if counted {
+                assert_eq!(
+                    auth,
+                    vec![(("agent://test.local/rotated".to_string(), String::new()), 1)],
+                    "HTTP {status}"
+                );
+            } else {
+                assert!(auth.is_empty(), "HTTP {status}: {auth:?}");
+            }
+            assert_eq!(
+                reporter.pending_count(),
+                u64::from(status == 429),
+                "HTTP {status}: a refused credential is not the provider's ill health"
+            );
         }
     }
 }
