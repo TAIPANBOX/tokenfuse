@@ -47,6 +47,7 @@ pub mod providerreport;
 pub mod proxy;
 #[cfg(feature = "cluster")]
 pub mod raft_ledger;
+pub mod ratelimit;
 pub mod refusedkeys;
 pub mod resourcemeta;
 pub mod retainedjournal;

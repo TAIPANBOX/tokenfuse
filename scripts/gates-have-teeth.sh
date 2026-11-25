@@ -1890,6 +1890,17 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(\n            &st,\n            &headers,\n            &key_id,\n            &principal,\n            &run_id,\n            p,\n            &delegated_by,\n        )", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
 
+# --- invariant 148: per-key limits on the LLM doors -----------------------------
+run_case "key-limits: the door never asks the limiter" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact key_limits::a_key_over_its_rate_is_refused_429_and_another_key_is_not" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if let Some(limiter) = st.key_limits.as_ref() {", "    if let Some(limiter) = st.key_limits.as_ref().filter(|_| false) {")')" \
+	"a_key_over_its_rate_is_refused_429_and_another_key_is_not ... FAILED"
+
+run_case "key-limits: the permit is given back when the headers go out" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact key_limits::a_call_counts_against_concurrency_until_its_body_has_gone_out" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    if let Some(permit) = permit {\n        let (parts, body) = resp.into_parts();", "    if let Some(permit) = permit {\n        drop(permit);\n        let permit = ();\n        let (parts, body) = resp.into_parts();")')" \
+	"a_call_counts_against_concurrency_until_its_body_has_gone_out ... FAILED"
+
 # --- invariant 149: a refused provider credential is one incident ----------------
 run_case "provider-auth: the gateway never counts a refused credential" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact proxy::tests::a_providers_401_or_403_is_counted_for_the_cloud_by_the_caller" \

@@ -707,7 +707,31 @@ fn ceiling_usd_string(ceiling: Microusd) -> String {
 async fn handle(wire: Wire, st: AppState, headers: HeaderMap, body: Bytes) -> Response {
     let mut clamped: Option<Microusd> = None;
     let mut raise_kept: Option<Microusd> = None;
-    let mut resp = handle_call(wire, st, headers, body, &mut clamped, &mut raise_kept).await;
+    let mut permit: Option<crate::ratelimit::Permit> = None;
+    let mut resp = handle_call(
+        wire,
+        st,
+        headers,
+        body,
+        &mut clamped,
+        &mut raise_kept,
+        &mut permit,
+    )
+    .await;
+    // A call is in flight until its answer has gone out, streamed or not: the
+    // permit rides the body and is given back when the body ends or the client
+    // goes away (`crate::ratelimit`).
+    if let Some(permit) = permit {
+        let (parts, body) = resp.into_parts();
+        let mut data = body.into_data_stream();
+        let guarded = async_stream::stream! {
+            let _permit = permit;
+            while let Some(chunk) = futures::StreamExt::next(&mut data).await {
+                yield chunk;
+            }
+        };
+        resp = Response::from_parts(parts, Body::from_stream(guarded));
+    }
     if let Some(ceiling) = clamped {
         if let Ok(v) = HeaderValue::from_str(&ceiling_usd_string(ceiling)) {
             resp.headers_mut().insert("x-fuse-budget-clamped", v);
@@ -729,6 +753,7 @@ async fn handle_call(
     mut body: Bytes,
     clamped: &mut Option<Microusd>,
     raise_kept: &mut Option<Microusd>,
+    permit_slot: &mut Option<crate::ratelimit::Permit>,
 ) -> Response {
     // A process forwards to one upstream endpoint, so it serves the door
     // matching that upstream's shape and refuses the other one loudly, before
@@ -771,6 +796,15 @@ async fn handle_call(
     // (success, a 402 Breaker trip, a 403 identity block) - see
     // `KeyStats::record_call`.
     st.keystats.record_call(&key_id);
+    // Per-key limits (`crate::ratelimit`): a call over its principal's rate or
+    // concurrency is refused here, before anything is reserved, opened or
+    // forwarded.
+    if let Some(limiter) = st.key_limits.as_ref() {
+        match limiter.admit(&caller.principal, std::time::Instant::now()) {
+            Ok(p) => *permit_slot = Some(p),
+            Err(refusal) => return rate_limited(&caller.principal, refusal),
+        }
+    }
 
     let request: serde_json::Value =
         serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
@@ -3888,6 +3922,60 @@ fn wire_mismatch(asked: Wire, serving: Wire) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// `429` for a call over its principal's rate or concurrency
+/// (`crate::ratelimit`), with `Retry-After`. Logged once per principal per
+/// minute, so a client retrying in a loop does not flood the log.
+fn rate_limited(principal: &str, refusal: crate::ratelimit::Refusal) -> Response {
+    type Seen = std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>;
+    static LOGGED: std::sync::OnceLock<Seen> = std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    let first = {
+        let mut seen = LOGGED
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() >= 8192 {
+            seen.clear();
+        }
+        match seen.get(principal) {
+            Some(at) if now.duration_since(*at) < std::time::Duration::from_secs(60) => false,
+            _ => {
+                seen.insert(principal.to_string(), now);
+                true
+            }
+        }
+    };
+    if first {
+        tracing::warn!(
+            principal = %principal,
+            limit = refusal.limit.as_str(),
+            retry_after_secs = refusal.retry_after_secs,
+            "refused: the caller is over its per-key limit (logged once per principal per minute)"
+        );
+    }
+    let body = serde_json::json!({
+        "error": {
+            "type": "rate_limited",
+            "code": "rate_limited",
+            "limit": refusal.limit.as_str(),
+            "retry_after_secs": refusal.retry_after_secs,
+            "message": format!(
+                "this caller is over its per-key {} limit; retry after {} s",
+                refusal.limit.as_str(),
+                refusal.retry_after_secs
+            ),
+            "retryable": true,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .header("retry-after", refusal.retry_after_secs.to_string())
+        .header("x-fuse", "blocked")
+        .body(Body::from(body.to_string()))
+        .expect("valid response")
 }
 
 fn dlp_block(run_id: &str, summary: &str) -> Response {
