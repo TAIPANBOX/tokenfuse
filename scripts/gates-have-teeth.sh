@@ -1887,8 +1887,32 @@ run_case "run-owner-first: the metered door never claims" fail \
 
 run_case "run-owner-first: the declared parent judged only after it is opened" fail \
 	"./scripts/run-owner-is-checked-first.sh" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)", "None::<Response>")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "foreign_parent_refusal(\n            &st,\n            &headers,\n            &key_id,\n            &principal,\n            &run_id,\n            p,\n            &delegated_by,\n        )", "None::<Response>")')" \
 	"PARENT JUDGED ONLY AFTER IT IS OPENED"
+
+# --- invariant 120's delegated arm: a proven chain naming the parent's agent ------
+#
+# Product mutants, held by cargo test: each lets a call roll up into a parent
+# another agent owns without the proof the arm requires.
+run_case "delegated-parent: a claimed chain read as proven" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_claimed_chain_naming_the_parent_owner_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        proven_chain: delegation_proof\n            .is_some()\n            .then_some(on_behalf_of_chain.as_slice()),", "        proven_chain: Some(on_behalf_of_chain.as_slice()),")')" \
+	"a_claimed_chain_naming_the_parent_owner_is_refused ... FAILED"
+
+run_case "delegated-parent: the ancestors above the parent are not judged" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_grandchild_without_the_delegation_is_refused_under_the_owners_run" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    let (above, cut_off) = st.run_ancestors(parent);", "    let (above, cut_off) = (Vec::<String>::new(), false);")')" \
+	"a_grandchild_without_the_delegation_is_refused_under_the_owners_run ... FAILED"
+
+run_case "delegated-parent: any proven chain passes" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_proven_chain_that_does_not_name_the_parent_owner_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "            && before.iter().any(|entry| entry == owner_agent)", "            && !before.is_empty()")')" \
+	"a_proven_chain_that_does_not_name_the_parent_owner_is_refused ... FAILED"
+
+run_case "delegated-parent: a prefix of the owner's agent passes" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_near_match_of_the_owners_agent_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "            && before.iter().any(|entry| entry == owner_agent)", "            && before.iter().any(|entry| owner_agent.starts_with(entry.as_str()))")')" \
+	"a_near_match_of_the_owners_agent_is_refused ... FAILED"
 
 # --- invariant 143: the label an enforcement point reports comes from the act ------
 #
