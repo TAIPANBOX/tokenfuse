@@ -501,7 +501,18 @@ impl SemanticCache {
             }
         }
 
-        let _ = &self.shadow_misses;
+        // Shadow samples the walk (tokenfuse#329): it measures a would-hit rate,
+        // so one walk in `shadow_walk_every` is enough, and a walk over every
+        // stored entry on every new prompt is not free.
+        if self.config.mode == CacheMode::Shadow && self.config.shadow_walk_every > 1 {
+            let n = self
+                .shadow_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % u64::from(self.config.shadow_walk_every) != 0 {
+                return None;
+            }
+        }
+
         // Similarity fallback: this core has not been seen exactly before.
         let mut query = self.embedder.embed(core);
         l2_normalize(&mut query);
