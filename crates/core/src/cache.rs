@@ -508,7 +508,7 @@ impl SemanticCache {
             let n = self
                 .shadow_misses
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % u64::from(self.config.shadow_walk_every) != 0 {
+            if !n.is_multiple_of(u64::from(self.config.shadow_walk_every)) {
                 return None;
             }
         }
