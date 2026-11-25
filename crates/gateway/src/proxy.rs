@@ -810,16 +810,156 @@ async fn handle_call(
             },
         );
     }
+    // Who the call acts for is read here, before the parent is judged, because a
+    // parent another agent's token owns may be rolled up into by a call whose
+    // PROVEN chain names that agent (invariant 120's delegated arm). Nothing in
+    // this block reads or writes the run or its parent: it reads headers and the
+    // door's verdict, and a refusal here leaves the ledger untouched. A
+    // delegation proof is spent here even when the call is refused for its
+    // parent below; the agent token's own proof was already spent at the door,
+    // so a retry needs fresh proofs either way.
+    // Attribution only: which logical agent made this call. Request-scoped like
+    // `model` — it rides along into every CallRecord and never touches the
+    // ledger/budget. Defaults to "" when the header is absent. A call an agent
+    // token admitted is the token's agent, whatever the header says; a header
+    // that says otherwise is refused below.
+    let header_agent = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
+    let agent_id = caller.agent_id().unwrap_or_else(|| header_agent.clone());
+
+    // An id the envelope would reject, handled per the configured mode. See
+    // `crate::agentids` for why the default records rather than refuses: the
+    // emission path is fail-open on purpose, and refusing by default would
+    // break live traffic for a header nobody had looked at yet.
+    //
+    // An EMPTY id is not this check's business. It means the caller sent no
+    // header at all, which `build()` already handles by skipping the event
+    // rather than emitting a broken one, and refusing it here would turn an
+    // optional header into a required one.
+    if !agent_id.is_empty() && !tokenfuse_core::agent_event::is_canonical_agent_id(&agent_id) {
+        match st.agent_id_mode {
+            crate::agentids::AgentIdMode::Off => {}
+            crate::agentids::AgentIdMode::Warn => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    expected = crate::agentids::EXPECTED_GRAMMAR,
+                    "x-fuse-agent-id does not match the envelope grammar; a consumer that \
+                     validates it will quarantine this agent's events"
+                );
+            }
+            crate::agentids::AgentIdMode::Enforce => {
+                return agent_id_refused(&agent_id);
+            }
+        }
+    }
+
+    // Delegation chain (agent-passport SPEC.md §5): captured raw for the
+    // trace, and split into an ordered list for agent-event envelopes.
+    let on_behalf_of_captured = on_behalf_of_header(&headers);
+    let on_behalf_of = on_behalf_of_captured.clone().unwrap_or_default();
+    // SPEC 5.1's entry cap holds here, with or without an issuer configured
+    // (tokenfuse#297): a chain the record cannot hold is refused before it is
+    // resolved, reserved, forwarded or written into any event. The MCP door
+    // reads the same header through the same function. One event, of the
+    // identity family, carrying the LENGTH and not the chain, so the event
+    // itself is one the record will hold. No trace row, like every other 400
+    // here. Whatever the mode: a malformed header is not a money decision.
+    let declared_chain = match crate::chainproof::declared_chain(on_behalf_of_captured.as_deref()) {
+        Ok(chain) => chain,
+        Err(over) => {
+            tracing::warn!(
+                run = %run_id,
+                entries = over.entries,
+                cap = crate::chainproof::MAX_CHAIN_ENTRIES,
+                "refused: x-fuse-on-behalf-of carries more entries than the Agent Passport chain holds"
+            );
+            let outcome = st.events.emit(
+                EventType::IdentityMismatch,
+                now_millis(),
+                Some(&agent_id),
+                Some(&run_id),
+                None,
+                on_behalf_of_over_cap_data(&key_id, &agent_id, over.entries),
+            );
+            crate::events::log_outcome(EventType::IdentityMismatch, outcome);
+            return on_behalf_of_over_cap(over.entries);
+        }
+    };
+
+    // And whether anybody PROVED it. Until 2026-08-26 this comment said "no
+    // enforcement semantics this phase, capture only", which was true and had
+    // stopped being harmless: wardryx had gained rules that read this chain, so
+    // a cap of three capped a number the caller chose. The rule lives in
+    // `chainproof` because the MCP broker applies the same one.
+    let chain_now = crate::sink::now_millis() / 1000;
+    let resolved = crate::chainproof::resolve_at_door(
+        &st.chain_proof,
+        // An agent token admitted this call: the `Authorization` it came in is
+        // the door credential, never a delegation chain as well. A person's
+        // delegation rides beside it in its own header, held to that token's
+        // key and agent (invariant 147).
+        caller.agent.as_ref(),
+        &crate::chainproof::presented(&headers),
+        "POST",
+        // The door this call actually arrived on, not a literal. Until
+        // 2026-09-27 this named `/v1/messages` regardless of `wire`: on a
+        // gateway serving the OpenAI door (`/v1/chat/completions`), shared by
+        // this same `handle` per invariant 55's parameterisation, a proof
+        // correctly naming the real path was refused (`htu` compared against
+        // the wrong URL), and a proof naming `/v1/messages` was wrongly
+        // accepted there instead. `wire` is guaranteed to equal `st.wire` by
+        // this point (the mismatch guard above already refused otherwise),
+        // so `wire.route_path()` is always this request's own door.
+        wire.route_path(),
+        &declared_chain,
+        chain_now,
+        crate::revocations::hook(&st.revocations, chain_now),
+        &st.agent_tokens,
+    );
+    // The agent a PROVEN chain names, before the chain is taken apart. Only a
+    // proven one: see `chainproof::proven_actor` for why a claimed chain is the
+    // same free-form weakness with extra steps.
+    let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
+    let (on_behalf_of_chain, delegation_proof) = match resolved {
+        crate::chainproof::Chain::Refused(why) => {
+            crate::chainproof::log_delegation_refusal("proxy", why);
+            return delegation_refused_response();
+        }
+        crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
+        crate::chainproof::Chain::Claimed(chain) => (chain, None),
+    };
     // A sub-agent's run rolls up into its parent's budget (hierarchical budgets, invariant 49).
     // An empty header is no declaration. Invariant 120: a declared parent must be the caller's
     // own run or one the identity map lets it roll up into, checked here, before the parent can
     // be opened on first sight below and before the ledger adopts it, so a refused parent leaves
     // nothing behind: no hierarchy, no spend on its budget, no inherited labels.
     let parent = header_str(&headers, "x-fuse-parent-run-id").filter(|p| !p.is_empty());
+    let delegated_by = DelegatedBy {
+        caller_agent: caller.agent.as_ref().map(|a| a.subject.as_str()),
+        proven_chain: delegation_proof
+            .is_some()
+            .then_some(on_behalf_of_chain.as_slice()),
+    };
     if let Some(p) = parent.as_deref() {
-        if let Some(refusal) =
-            foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, p)
-        {
+        if let Some(refusal) = foreign_parent_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            p,
+            &delegated_by,
+        ) {
+            return refusal;
+        }
+        if let Some(refusal) = foreign_ancestor_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            p,
+            &delegated_by,
+        ) {
             return refusal;
         }
     }
@@ -969,127 +1109,38 @@ async fn handle_call(
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
     let parent_run_id = opened.parent.clone().unwrap_or_default();
+    // The lineage the ancestor check walks (invariant 120) is recorded whatever the
+    // firewall's mode, so a grandchild is judged even with the firewall off.
+    st.note_taint_parent(&run_id, &parent_run_id);
     // Invariant 120: a call that omits the header still rolls up into the parent the ledger
     // holds, so that parent is checked too. It was accepted when it had no owner (a parent
     // opened at its Cloud budget on first sight) and another principal has opened it since.
     // Nothing of the parent's has been touched yet: the child is open, nothing is reserved.
     if parent.is_none() && !parent_run_id.is_empty() {
-        if let Some(refusal) =
-            foreign_parent_refusal(&st, &headers, &key_id, &principal, &run_id, &parent_run_id)
-        {
+        if let Some(refusal) = foreign_parent_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            &parent_run_id,
+            &delegated_by,
+        ) {
+            return refusal;
+        }
+        if let Some(refusal) = foreign_ancestor_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            &parent_run_id,
+            &delegated_by,
+        ) {
             return refusal;
         }
     }
 
-    // Attribution only: which logical agent made this call. Request-scoped like
-    // `model` — it rides along into every CallRecord and never touches the
-    // ledger/budget. Defaults to "" when the header is absent. A call an agent
-    // token admitted is the token's agent, whatever the header says; a header
-    // that says otherwise is refused below.
-    let header_agent = header_str(&headers, "x-fuse-agent-id").unwrap_or_default();
-    let agent_id = caller.agent_id().unwrap_or_else(|| header_agent.clone());
-
-    // An id the envelope would reject, handled per the configured mode. See
-    // `crate::agentids` for why the default records rather than refuses: the
-    // emission path is fail-open on purpose, and refusing by default would
-    // break live traffic for a header nobody had looked at yet.
-    //
-    // An EMPTY id is not this check's business. It means the caller sent no
-    // header at all, which `build()` already handles by skipping the event
-    // rather than emitting a broken one, and refusing it here would turn an
-    // optional header into a required one.
-    if !agent_id.is_empty() && !tokenfuse_core::agent_event::is_canonical_agent_id(&agent_id) {
-        match st.agent_id_mode {
-            crate::agentids::AgentIdMode::Off => {}
-            crate::agentids::AgentIdMode::Warn => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    expected = crate::agentids::EXPECTED_GRAMMAR,
-                    "x-fuse-agent-id does not match the envelope grammar; a consumer that \
-                     validates it will quarantine this agent's events"
-                );
-            }
-            crate::agentids::AgentIdMode::Enforce => {
-                return agent_id_refused(&agent_id);
-            }
-        }
-    }
-
-    // Delegation chain (agent-passport SPEC.md §5): captured raw for the
-    // trace, and split into an ordered list for agent-event envelopes.
-    let on_behalf_of_captured = on_behalf_of_header(&headers);
-    let on_behalf_of = on_behalf_of_captured.clone().unwrap_or_default();
-    // SPEC 5.1's entry cap holds here, with or without an issuer configured
-    // (tokenfuse#297): a chain the record cannot hold is refused before it is
-    // resolved, reserved, forwarded or written into any event. The MCP door
-    // reads the same header through the same function. One event, of the
-    // identity family, carrying the LENGTH and not the chain, so the event
-    // itself is one the record will hold. No trace row, like every other 400
-    // here. Whatever the mode: a malformed header is not a money decision.
-    let declared_chain = match crate::chainproof::declared_chain(on_behalf_of_captured.as_deref()) {
-        Ok(chain) => chain,
-        Err(over) => {
-            tracing::warn!(
-                run = %run_id,
-                entries = over.entries,
-                cap = crate::chainproof::MAX_CHAIN_ENTRIES,
-                "refused: x-fuse-on-behalf-of carries more entries than the Agent Passport chain holds"
-            );
-            let outcome = st.events.emit(
-                EventType::IdentityMismatch,
-                now_millis(),
-                Some(&agent_id),
-                Some(&run_id),
-                None,
-                on_behalf_of_over_cap_data(&key_id, &agent_id, over.entries),
-            );
-            crate::events::log_outcome(EventType::IdentityMismatch, outcome);
-            return on_behalf_of_over_cap(over.entries);
-        }
-    };
-
-    // And whether anybody PROVED it. Until 2026-08-26 this comment said "no
-    // enforcement semantics this phase, capture only", which was true and had
-    // stopped being harmless: wardryx had gained rules that read this chain, so
-    // a cap of three capped a number the caller chose. The rule lives in
-    // `chainproof` because the MCP broker applies the same one.
-    let chain_now = crate::sink::now_millis() / 1000;
-    let resolved = crate::chainproof::resolve_at_door(
-        &st.chain_proof,
-        // An agent token admitted this call: the `Authorization` it came in is
-        // the door credential, never a delegation chain as well. A person's
-        // delegation rides beside it in its own header, held to that token's
-        // key and agent (invariant 147).
-        caller.agent.as_ref(),
-        &crate::chainproof::presented(&headers),
-        "POST",
-        // The door this call actually arrived on, not a literal. Until
-        // 2026-09-27 this named `/v1/messages` regardless of `wire`: on a
-        // gateway serving the OpenAI door (`/v1/chat/completions`), shared by
-        // this same `handle` per invariant 55's parameterisation, a proof
-        // correctly naming the real path was refused (`htu` compared against
-        // the wrong URL), and a proof naming `/v1/messages` was wrongly
-        // accepted there instead. `wire` is guaranteed to equal `st.wire` by
-        // this point (the mismatch guard above already refused otherwise),
-        // so `wire.route_path()` is always this request's own door.
-        wire.route_path(),
-        &declared_chain,
-        chain_now,
-        crate::revocations::hook(&st.revocations, chain_now),
-        &st.agent_tokens,
-    );
-    // The agent a PROVEN chain names, before the chain is taken apart. Only a
-    // proven one: see `chainproof::proven_actor` for why a claimed chain is the
-    // same free-form weakness with extra steps.
-    let proven_actor = crate::chainproof::proven_actor(&resolved).map(str::to_string);
-    let (on_behalf_of_chain, delegation_proof) = match resolved {
-        crate::chainproof::Chain::Refused(why) => {
-            crate::chainproof::log_delegation_refusal("proxy", why);
-            return delegation_refused_response();
-        }
-        crate::chainproof::Chain::Proven { chain, proof } => (chain, Some(proof)),
-        crate::chainproof::Chain::Claimed(chain) => (chain, None),
-    };
     let chain_proven = delegation_proof.is_some();
     // The identity a security RECORD is filed under. The header when the caller
     // sent one, otherwise the agent a proven chain names.
@@ -2666,7 +2717,7 @@ fn judge_model_tool_calls(
     labels: &Labels,
     provider_tools: &[String],
     resp_tools: &[String],
-    resp_args: &[serde_json::Value],
+    resp_calls: &[taint::ToolCall],
     blocked_row: impl FnOnce() -> CallRecord,
     event_agent_id: &str,
     run_id: &str,
@@ -2694,11 +2745,18 @@ fn judge_model_tool_calls(
         taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
     // A read after private data is judged on what its arguments carry (design 4.2,
-    // invariant 121). `evaluate` never refuses it on its labels alone.
+    // invariant 121). `evaluate` never refuses it on its labels alone. Each call is
+    // judged on its OWN arguments and its own capability: a large write beside a
+    // clean read is not a read carrying data.
     let pii_blocks = st.dlp_pii == DlpMode::Block;
     let verdict = taint::evaluate(labels, &requested, &st.firewall.rules).or_else(|| {
-        resp_args.iter().find_map(|a| {
-            taint::read_argument_verdict(labels, &requested, a, pii_blocks, &st.firewall.rules)
+        resp_calls.iter().find_map(|call| {
+            let own = taint::capabilities_for_tools(
+                std::slice::from_ref(&call.name),
+                &st.firewall.capabilities,
+                &st.firewall.sources,
+            );
+            taint::read_call_verdict(labels, &own, &call.args, pii_blocks, &st.firewall.rules)
         })
     });
     if let Some(verdict) = verdict {
@@ -2914,10 +2972,10 @@ fn stream_managed(
                 &firewall_labels,
                 &held.provider_tools,
                 &held.tools,
-                // The streamed hold keeps tool NAMES only, not their arguments
-                // (streamgate::tool_names), so a streamed read is not yet judged on
-                // what it carries. Named as a gap in invariant 121.
-                &[],
+                // The hold joins each call's argument fragments under the cap
+                // (invariant 121), so a streamed read is judged on what it carries,
+                // by the same function as a buffered one.
+                &held.calls,
                 move || CallRecord { ts_millis: now_millis(), ..blocked_row },
                 &ev_agent_id,
                 &ev_run_id,
@@ -3096,17 +3154,34 @@ async fn buffered_managed(
     // (`judge_model_tool_calls`, invariant 104).
     let mut firewall_note: Option<String> = None;
     if st.firewall.mode != FirewallMode::Off {
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let parsed_json = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let unreadable_answer = status.is_success() && !bytes.is_empty() && parsed_json.is_err();
+        let resp_json = parsed_json.unwrap_or(serde_json::Value::Null);
         let provider_tools = taint::provider_tools_in(&resp_json);
-        let resp_tools = taint::tool_names_in(&resp_json);
-        let resp_args = taint::tool_arguments_in(&resp_json);
+        let (resp_tools, resp_calls) = if unreadable_answer {
+            // A 2xx this gateway cannot parse (a tool input nested past the
+            // parser's depth, say) may still be a tool call a client reads and
+            // runs, so it is judged as a call nobody named carrying text nobody
+            // read: refused after untrusted input, never read as "no calls".
+            (
+                vec![String::new()],
+                vec![taint::ToolCall {
+                    name: String::new(),
+                    args: taint::ToolArgs::OverCap,
+                }],
+            )
+        } else {
+            (
+                taint::tool_names_in(&resp_json),
+                taint::tool_calls_in(&resp_json),
+            )
+        };
         let verdict = judge_model_tool_calls(
             st,
             &firewall_labels,
             &provider_tools,
             &resp_tools,
-            &resp_args,
+            &resp_calls,
             // The call already happened and its real cost was recorded as
             // "allow" above — this second record is the security verdict
             // that blocks the *response* from reaching the caller, so it
@@ -3888,6 +3963,35 @@ struct ForeignRun<'a> {
     parent: Option<&'a str>,
 }
 
+/// What a call proved about whom it acts for, for invariant 120's delegated arm.
+struct DelegatedBy<'a> {
+    /// The agent the agent token that admitted this call names; `None` for any
+    /// other credential, whose agent is a header the caller wrote.
+    caller_agent: Option<&'a str>,
+    /// The chain a vouchryx delegation PROVED for this call, root first; `None`
+    /// for a claimed chain or none.
+    proven_chain: Option<&'a [String]>,
+}
+
+impl DelegatedBy<'_> {
+    /// Whether a parent owned by `owner_agent`'s token may be rolled up into: the
+    /// call came in on an agent token, its proven chain ends at that token's
+    /// agent, and names `owner_agent`, an `agent://` entry, anywhere before it.
+    /// The chain is issuer-signed and acyclic (invariant 35), so an ancestor
+    /// entry is an agent through which the authority passed.
+    fn names_as_delegator(&self, owner_agent: &str) -> bool {
+        let (Some(me), Some(chain)) = (self.caller_agent, self.proven_chain) else {
+            return false;
+        };
+        let Some((last, before)) = chain.split_last() else {
+            return false;
+        };
+        last == me
+            && owner_agent.starts_with("agent://")
+            && before.iter().any(|entry| entry == owner_agent)
+    }
+}
+
 /// Invariant 120: a declared or held parent the caller may not roll up into, refused, or `None`
 /// when the parent is the caller's own, has no owner (a parent no keyed call has named carries no
 /// labels, and its budget is the operator's), or the identity map lists the caller's key under
@@ -3899,6 +4003,7 @@ fn foreign_parent_refusal(
     principal: &str,
     run_id: &str,
     parent: &str,
+    by: &DelegatedBy<'_>,
 ) -> Option<Response> {
     if principal.is_empty() || parent == run_id {
         return None;
@@ -3908,6 +4013,21 @@ fn foreign_parent_refusal(
         .is_some_and(|parent_key| st.identity.may_parent(parent_key, key_id));
     if owner == principal || delegated {
         return None;
+    }
+    if let Some(owner_agent) = crate::runowners::agent_of(&owner) {
+        if by.names_as_delegator(owner_agent) {
+            if st.note_delegated_parent(run_id, parent) {
+                tracing::info!(
+                    run = %run_id,
+                    parent = %parent,
+                    owner = %owner,
+                    principal = %principal,
+                    "a run rolls up into a parent another agent owns: the call's proven delegation \
+                     chain names that agent (invariant 120); logged once per run and parent"
+                );
+            }
+            return None;
+        }
     }
     Some(foreign_run_refused(
         st,
@@ -3920,6 +4040,43 @@ fn foreign_parent_refusal(
             parent: Some(parent),
         },
     ))
+}
+
+/// Invariant 120: every run ABOVE the parent is judged by the same rule as the
+/// parent. A run the caller owns may sit under another principal's run because
+/// a delegation once let it; a grandchild opened later under it rolls up into
+/// that run too, so it is held to the same proof at the time of its own call,
+/// or one delegation would be a standing pass to another principal's budget and
+/// labels.
+fn foreign_ancestor_refusal(
+    st: &AppState,
+    headers: &HeaderMap,
+    key_id: &str,
+    principal: &str,
+    run_id: &str,
+    parent: &str,
+    by: &DelegatedBy<'_>,
+) -> Option<Response> {
+    let (above, cut_off) = st.run_ancestors(parent);
+    if cut_off && !principal.is_empty() {
+        // A lineage deeper than the ledger walks cannot be judged whole, and an
+        // unjudged ancestor is not a clean one.
+        return Some(foreign_run_refused(
+            st,
+            headers,
+            ForeignRun {
+                key_id,
+                principal,
+                run_id,
+                owner: "(lineage deeper than the ledger walks)",
+                parent: Some(parent),
+            },
+        ));
+    }
+    above
+        .iter()
+        .filter(|a| a.as_str() != run_id)
+        .find_map(|a| foreign_parent_refusal(st, headers, key_id, principal, run_id, a, by))
 }
 
 /// The refusal for [`ForeignRun`]: `403 identity_mismatch` with reason `run_owned_elsewhere` or
