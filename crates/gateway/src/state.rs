@@ -335,6 +335,25 @@ impl TaintStore {
             .insert(run_id.to_string(), parent.to_string());
     }
 
+    /// The runs above `run_id`, nearest first, as the parent map holds them,
+    /// bounded and cycle-safe like [`inherited`](Self::inherited).
+    pub fn ancestors(&self, run_id: &str) -> Vec<String> {
+        const MAX_DEPTH: usize = 32;
+        let parents = self.parents.lock().unwrap();
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::from([run_id.to_string()]);
+        let mut cursor = parents.get(run_id).cloned();
+        while let Some(id) = cursor {
+            if out.len() >= MAX_DEPTH || !seen.insert(id.clone()) {
+                break;
+            }
+            cursor = parents.get(&id).cloned();
+            out.push(id);
+        }
+        out
+    }
+
     /// Every label this run's ancestors carry (docs/07 B.3 P3).
     ///
     /// Walked on each request rather than seeded once when the child opens, so
@@ -971,6 +990,11 @@ impl AppState {
     /// See [`TaintStore::note_parent`].
     pub fn note_taint_parent(&self, run_id: &str, parent: &str) {
         self.taint.note_parent(run_id, parent);
+    }
+
+    /// See [`TaintStore::ancestors`].
+    pub fn run_ancestors(&self, run_id: &str) -> Vec<String> {
+        self.taint.ancestors(run_id)
     }
 
     /// See [`TaintStore::inherited`].

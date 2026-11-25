@@ -7915,8 +7915,13 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     and parent records a delegated roll-up; no bus event, because no registered type describes it.
     `@claude 2026-11-23`, under delegated authority, open to reversal: any ancestor rather than only the
     immediate delegator, and no identity-map list for agents (`may_parent` stays keyed by client key).
-    *(test: `tests/it/delegated_parent_by_chain.rs`, seven: three that roll up, red against the unfixed
-    tree, and four guards. Scenarios: `features/a-delegated-run-rolls-up-by-a-proven-chain.feature`.)*
+    Every run above the parent is judged by the same rule at each call (`proxy::foreign_ancestor_refusal`,
+    over the lineage the taint store records whatever the firewall's mode), so a run a delegation once
+    let roll up does not become a standing pass: a grandchild opened under it without the delegation is
+    refused. Because the chain is resolved before the seed gate, a delegation proof is spent even when
+    the call is then answered `503 seed_pending`; a client that retries must sign a fresh proof.
+    *(test: `tests/it/delegated_parent_by_chain.rs`, ten: three that roll up, red against the unfixed
+    tree, a grandchild and a held parent without the delegation, and five guards. Scenarios: `features/a-delegated-run-rolls-up-by-a-proven-chain.feature`.)*
 
     **Where it says nothing.** Delegation is authority, not consent to a particular budget: any agent
     a chain passes through can spend from that agent's runs whose ids it learns, for the life of the

@@ -42,3 +42,21 @@ Feature: A run rolls up into a parent another agent owns when a proven chain nam
     Given a parent run opened with a static client key
     When the triage agent calls with a proven chain
     Then the call is refused for its parent
+
+  # @test:a_grandchild_without_the_delegation_is_refused_under_the_owners_run
+  Scenario: A delegation once given is not a standing pass
+    Given a child run that rolled up into a runbook-owned parent by a proven chain
+    When the same agent opens a grandchild under it without the delegation
+    Then the grandchild is refused
+
+  # @test:a_held_parent_without_the_delegation_is_refused
+  Scenario: The held parent is judged at every call
+    Given a child run that rolled up by a proven chain
+    When its next call carries no delegation
+    Then the call is refused
+
+  # @test:an_owner_that_is_a_prefix_of_a_chain_entry_is_refused
+  Scenario: A prefix is not the owner
+    Given a parent run opened by agent://acme/run
+    When the proven chain names agent://acme/runbook
+    Then the call is refused for its parent

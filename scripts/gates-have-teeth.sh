@@ -1896,8 +1896,13 @@ run_case "run-owner-first: the declared parent judged only after it is opened" f
 # another agent owns without the proof the arm requires.
 run_case "delegated-parent: a claimed chain read as proven" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_claimed_chain_naming_the_parent_owner_is_refused" \
-	"$(py 'edit("crates/gateway/src/proxy.rs", "proven_chain: delegation_proof.is_some().then_some(on_behalf_of_chain.as_slice()),", "proven_chain: Some(on_behalf_of_chain.as_slice()),")')" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "        proven_chain: delegation_proof\n            .is_some()\n            .then_some(on_behalf_of_chain.as_slice()),", "        proven_chain: Some(on_behalf_of_chain.as_slice()),")')" \
 	"a_claimed_chain_naming_the_parent_owner_is_refused ... FAILED"
+
+run_case "delegated-parent: the ancestors above the parent are not judged" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_grandchild_without_the_delegation_is_refused_under_the_owners_run" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "    st.run_ancestors(parent)\n        .iter()", "    Vec::<String>::new()\n        .iter()")')" \
+	"a_grandchild_without_the_delegation_is_refused_under_the_owners_run ... FAILED"
 
 run_case "delegated-parent: any proven chain passes" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact delegated_parent_by_chain::a_proven_chain_that_does_not_name_the_parent_owner_is_refused" \

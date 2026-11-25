@@ -268,3 +268,59 @@ async fn a_key_owned_parent_is_not_delegated_by_a_chain() {
     .await;
     refused_for_parent(status, &body);
 }
+
+/// Red until every ancestor is judged: a run that a delegation once let roll up
+/// under another agent's run does not become a standing pass. A grandchild
+/// opened under it without the delegation is refused.
+#[tokio::test]
+async fn a_grandchild_without_the_delegation_is_refused_under_the_owners_run() {
+    let g = gate(None);
+    open_parent(&g, "parent-9", RUNBOOK).await;
+    let (status, body) = send(
+        &g.st,
+        call("child-9", Some("parent-9"), &child(&g, "c9", via_runbook())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alone = agent_as(&g, &g.holder, AGENT, "c9-alone");
+    let (status, body) = send(&g.st, call("grandchild-9", Some("child-9"), &alone)).await;
+    refused_for_parent(status, &body);
+}
+
+/// The held parent is judged at every call: once the delegation is gone, the
+/// child's next call is refused.
+#[tokio::test]
+async fn a_held_parent_without_the_delegation_is_refused() {
+    let g = gate(None);
+    open_parent(&g, "parent-10", RUNBOOK).await;
+    let (status, body) = send(
+        &g.st,
+        call(
+            "child-10",
+            Some("parent-10"),
+            &child(&g, "c10", via_runbook()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alone = agent_as(&g, &g.holder, AGENT, "c10-alone");
+    let (status, body) = send(&g.st, call("child-10", None, &alone)).await;
+    refused_for_parent(status, &body);
+}
+
+/// Guard: an owner whose agent is a prefix of a chain entry is not that entry.
+#[tokio::test]
+async fn an_owner_that_is_a_prefix_of_a_chain_entry_is_refused() {
+    let g = gate(None);
+    open_parent(&g, "parent-11", "agent://acme/run").await;
+    let (status, body) = send(
+        &g.st,
+        call(
+            "child-11",
+            Some("parent-11"),
+            &child(&g, "c11", via_runbook()),
+        ),
+    )
+    .await;
+    refused_for_parent(status, &body);
+}

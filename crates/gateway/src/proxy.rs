@@ -951,6 +951,17 @@ async fn handle_call(
         ) {
             return refusal;
         }
+        if let Some(refusal) = foreign_ancestor_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            p,
+            &delegated_by,
+        ) {
+            return refusal;
+        }
     }
 
     // A Cloud-managed budget (set by an operator) overrides the client-supplied
@@ -1098,12 +1109,26 @@ async fn handle_call(
     // The relationship the LEDGER holds, never the header: a later call that omits the header
     // still rolls up, and every row this request writes says so (D2).
     let parent_run_id = opened.parent.clone().unwrap_or_default();
+    // The lineage the ancestor check walks (invariant 120) is recorded whatever the
+    // firewall's mode, so a grandchild is judged even with the firewall off.
+    st.note_taint_parent(&run_id, &parent_run_id);
     // Invariant 120: a call that omits the header still rolls up into the parent the ledger
     // holds, so that parent is checked too. It was accepted when it had no owner (a parent
     // opened at its Cloud budget on first sight) and another principal has opened it since.
     // Nothing of the parent's has been touched yet: the child is open, nothing is reserved.
     if parent.is_none() && !parent_run_id.is_empty() {
         if let Some(refusal) = foreign_parent_refusal(
+            &st,
+            &headers,
+            &key_id,
+            &principal,
+            &run_id,
+            &parent_run_id,
+            &delegated_by,
+        ) {
+            return refusal;
+        }
+        if let Some(refusal) = foreign_ancestor_refusal(
             &st,
             &headers,
             &key_id,
@@ -4015,6 +4040,27 @@ fn foreign_parent_refusal(
             parent: Some(parent),
         },
     ))
+}
+
+/// Invariant 120: every run ABOVE the parent is judged by the same rule as the
+/// parent. A run the caller owns may sit under another principal's run because
+/// a delegation once let it; a grandchild opened later under it rolls up into
+/// that run too, so it is held to the same proof at the time of its own call,
+/// or one delegation would be a standing pass to another principal's budget and
+/// labels.
+fn foreign_ancestor_refusal(
+    st: &AppState,
+    headers: &HeaderMap,
+    key_id: &str,
+    principal: &str,
+    run_id: &str,
+    parent: &str,
+    by: &DelegatedBy<'_>,
+) -> Option<Response> {
+    st.run_ancestors(parent)
+        .iter()
+        .filter(|a| a.as_str() != run_id)
+        .find_map(|a| foreign_parent_refusal(st, headers, key_id, principal, run_id, a, by))
 }
 
 /// The refusal for [`ForeignRun`]: `403 identity_mismatch` with reason `run_owned_elsewhere` or
