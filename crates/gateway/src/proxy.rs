@@ -4004,10 +4004,6 @@ fn report_rate_limited(
     limits: crate::ratelimit::Limits,
     refusal: crate::ratelimit::Refusal,
 ) {
-    // Red: the emitter is not called yet.
-    if std::hint::black_box(true) {
-        return;
-    }
     let Some(unreported) = st.note_rate_limited(&caller.principal, std::time::Instant::now())
     else {
         return;
@@ -4062,10 +4058,6 @@ fn report_price_fallback(
     run_id: &str,
     chain_on_record: Option<tokenfuse_core::agent_event::ChainOnRecord<'_>>,
 ) {
-    // Red: the emitter is not called yet.
-    if std::hint::black_box(true) {
-        return;
-    }
     if crate::pricebook::basis(&st.prices, model) == "known" {
         return;
     }
