@@ -3002,6 +3002,7 @@ impl Store {
     /// `@decided 2026-11-23`: a credential the provider refuses becomes one
     /// incident per caller and one existing-type event on the bus, not one per
     /// call. Arrival time, the site from the key, as invariant 144.
+    #[allow(clippy::too_many_arguments)]
     pub fn note_provider_auth_failures_from_at(
         &self,
         org: &str,
