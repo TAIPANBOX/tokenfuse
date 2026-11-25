@@ -1942,6 +1942,17 @@ run_case "delegated-parent: a prefix of the owner's agent passes" fail \
 	"$(py 'edit("crates/gateway/src/proxy.rs", "            && before.iter().any(|entry| entry == owner_agent)", "            && before.iter().any(|entry| owner_agent.starts_with(entry.as_str()))")')" \
 	"a_near_match_of_the_owners_agent_is_refused ... FAILED"
 
+# --- invariant 148: a per-key refusal and a fallback price are on the bus ------
+run_case "rate-limited-event: every refusal written" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact limits_and_fallback_on_the_bus::a_caller_over_its_rate_is_one_rate_limited_event_a_minute" \
+	"$(py 'edit("crates/gateway/src/state.rs", "                *unreported = unreported.saturating_add(1);\n                None", "                *unreported = unreported.saturating_add(1);\n                Some(0)")')" \
+	"a_caller_over_its_rate_is_one_rate_limited_event_a_minute ... FAILED"
+
+run_case "price-fallback-event: written for every call" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact limits_and_fallback_on_the_bus::a_model_with_no_price_row_is_one_price_fallback_per_model" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "crate::state::FallbackEvent::AlreadyWritten => return,", "crate::state::FallbackEvent::AlreadyWritten => {}")')" \
+	"a_model_with_no_price_row_is_one_price_fallback_per_model ... FAILED"
+
 # --- invariant 143: the label an enforcement point reports comes from the act ------
 #
 # The script gate holds the shape: no name can reach the route or the report, the

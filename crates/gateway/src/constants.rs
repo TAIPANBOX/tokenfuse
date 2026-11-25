@@ -97,7 +97,7 @@ const ALL_BREAKER_REASONS: [BreakerReason; 9] = [
 /// Every [`EventType`] this repository can emit, same discipline as
 /// [`ALL_BREAKER_REASONS`]: [`exhaustiveness_guard`] fails to compile when a
 /// variant is added.
-const ALL_EVENT_TYPES: [EventType; 23] = [
+const ALL_EVENT_TYPES: [EventType; 25] = [
     EventType::BudgetExhausted,
     EventType::SustainedLoop,
     EventType::SpendSpike,
@@ -121,6 +121,8 @@ const ALL_EVENT_TYPES: [EventType; 23] = [
     EventType::CallRetained,
     EventType::RetainedClosed,
     EventType::DlpShadow,
+    EventType::RateLimited,
+    EventType::PriceFallback,
 ];
 
 /// The half of the two lists above that the compiler holds.
@@ -170,6 +172,8 @@ fn exhaustiveness_guard(reason: BreakerReason, event: EventType) -> (usize, usiz
         EventType::CallRetained => 20,
         EventType::RetainedClosed => 21,
         EventType::DlpShadow => 22,
+        EventType::RateLimited => 23,
+        EventType::PriceFallback => 24,
     };
     (r, e)
 }
@@ -486,6 +490,10 @@ mod tests {
                 // Invariant 114 (agent-passport SPEC 6.2): a DLP finding the
                 // scanner let through, at the other shadow findings' band.
                 ("dlp_shadow", "medium"),
+                // agent-passport SPEC 6.2: a refusal for a per-key limit,
+                // and a call priced at the fallback.
+                ("rate_limited", "medium"),
+                ("price_fallback", "low"),
             ],
             "the artifact does not publish the agent-event vocabulary this \
              repository emits. If a type was added or a severity moved, update \

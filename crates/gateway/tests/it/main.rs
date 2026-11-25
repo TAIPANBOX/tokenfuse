@@ -37,6 +37,7 @@ mod governed_profile;
 mod governed_profile_scope;
 mod image_user_group;
 mod key_limits;
+mod limits_and_fallback_on_the_bus;
 mod keys_endpoint;
 mod long_prompt_is_priced_at_its_long_rate;
 mod manifest;

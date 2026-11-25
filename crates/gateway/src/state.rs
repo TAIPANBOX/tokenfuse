@@ -128,6 +128,19 @@ pub struct AppState {
     /// The (run, parent) pairs a delegation chain let roll up, logged once
     /// each (invariant 120). Bounded like `budget_clamp_logged`.
     delegated_parent_logged: Arc<Mutex<HashSet<String>>>,
+    /// `rate_limited` on the bus (agent-passport SPEC 6.2): per source, when
+    /// it was last written and how many refusals have not been since.
+    /// Bounded like `budget_clamp_logged`.
+    rate_limited_reported: Arc<Mutex<HashMap<String, (std::time::Instant, u64)>>>,
+    /// `price_fallback` on the bus: the models it was written for, once per
+    /// model per process. Bounded like `fallback_price_logged`.
+    price_fallback_reported: Arc<Mutex<HashSet<String>>>,
+    /// The minute the gateway-wide `price_fallback` cap counts in, and how many
+    /// were written in it.
+    price_fallback_window: Arc<Mutex<(std::time::Instant, u32)>>,
+    /// `price_fallback` events not written because the call named no agent
+    /// (SPEC 6.1), shown on `GET /v1/price-book`.
+    price_fallback_unreported: Arc<std::sync::atomic::AtomicU64>,
     /// Runs whose refused budget raise has been said once (invariant 135). Bounded like
     /// `budget_clamp_logged`.
     budget_raise_logged: Arc<Mutex<HashSet<String>>>,
@@ -214,6 +227,20 @@ pub struct AppState {
     /// missing, with the generation each came back at, so the seed can be
     /// credited to them when it lands (`cloudsink::spawn_seed_retry`).
     replayed_unseeded: Arc<Mutex<Vec<(String, u64)>>>,
+}
+
+/// The most `price_fallback` events one gateway writes in a minute.
+pub const PRICE_FALLBACK_EVENTS_PER_MINUTE: u32 = 60;
+
+/// What [`AppState::note_price_fallback_event`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackEvent {
+    /// Write the event; the model is now marked.
+    Write,
+    /// This process already wrote one for the model.
+    AlreadyWritten,
+    /// The gateway-wide cap for this minute is spent: count, do not write.
+    OverCap,
 }
 
 /// How many runs the once-per-run clamp log remembers before it starts over.
@@ -671,6 +698,10 @@ impl AppState {
             budget_clamp_logged: Arc::new(Mutex::new(HashSet::new())),
             key_limits: None,
             delegated_parent_logged: Arc::new(Mutex::new(HashSet::new())),
+            rate_limited_reported: Arc::new(Mutex::new(HashMap::new())),
+            price_fallback_reported: Arc::new(Mutex::new(HashSet::new())),
+            price_fallback_window: Arc::new(Mutex::new((std::time::Instant::now(), 0))),
+            price_fallback_unreported: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             budget_raise_logged: Arc::new(Mutex::new(HashSet::new())),
             fallback_price_logged: Arc::new(Mutex::new(HashSet::new())),
             unclassified_named: Arc::new(Mutex::new(Default::default())),
@@ -801,6 +832,71 @@ impl AppState {
             seen.clear();
         }
         seen.insert(model.to_string())
+    }
+
+    /// Note one `rate_limited` refusal from `source` at `now`. `Some(n)` when an
+    /// event is due (the first for this source, or the first a minute after
+    /// the last one written), `n` being the refusals not written since; `None`
+    /// when this one is only counted.
+    pub fn note_rate_limited(&self, source: &str, now: std::time::Instant) -> Option<u64> {
+        let mut seen = self.rate_limited_reported.lock().unwrap();
+        if seen.len() >= CLAMP_LOG_CAP && !seen.contains_key(source) {
+            seen.clear();
+        }
+        match seen.get_mut(source) {
+            Some((at, unreported))
+                if now.duration_since(*at) < std::time::Duration::from_secs(60) =>
+            {
+                *unreported = unreported.saturating_add(1);
+                None
+            }
+            Some((at, unreported)) => {
+                let n = *unreported;
+                *at = now;
+                *unreported = 0;
+                Some(n)
+            }
+            None => {
+                seen.insert(source.to_string(), (now, 0));
+                Some(0)
+            }
+        }
+    }
+
+    /// Whether `price_fallback` is to be written for `model` at `now`: once
+    /// per model per process, and at most [`PRICE_FALLBACK_EVENTS_PER_MINUTE`]
+    /// for the whole gateway, because model ids are the caller's to choose. A
+    /// model over the cap is not marked, so a later call can still report it.
+    pub fn note_price_fallback_event(&self, model: &str, now: std::time::Instant) -> FallbackEvent {
+        let mut seen = self.price_fallback_reported.lock().unwrap();
+        if seen.contains(model) {
+            return FallbackEvent::AlreadyWritten;
+        }
+        let mut window = self.price_fallback_window.lock().unwrap();
+        if now.duration_since(window.0) >= std::time::Duration::from_secs(60) {
+            *window = (now, 0);
+        }
+        if window.1 >= PRICE_FALLBACK_EVENTS_PER_MINUTE {
+            return FallbackEvent::OverCap;
+        }
+        window.1 += 1;
+        if seen.len() >= CLAMP_LOG_CAP {
+            seen.clear();
+        }
+        seen.insert(model.to_string());
+        FallbackEvent::Write
+    }
+
+    /// Count one `price_fallback` not written because the call named no agent.
+    pub fn note_price_fallback_unreported(&self) {
+        self.price_fallback_unreported
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many `price_fallback` events were not written for want of an agent.
+    pub fn price_fallback_unreported(&self) -> u64 {
+        self.price_fallback_unreported
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record that `run_id` rolled up into `parent` through a delegation chain
