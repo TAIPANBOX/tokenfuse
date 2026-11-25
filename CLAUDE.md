@@ -5756,8 +5756,23 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     to 256 visible ASCII bytes and unique, at most 1 MiB and 4,096 rows, and a
     set but unusable file exits 2 naming the variable. Additive: not in
     `compat/1.0.json`.
+
+    Read again 2026-11-23: every Claude 5 and Fable model gained its Bedrock `global.` profile at list
+    and its `us.`, `eu.`, `jp.` and `au.` profiles at list plus 10 percent (the Bedrock page names the
+    global endpoint for these models and those four inference profiles, and the id
+    `global.anthropic.claude-fable-5-2`; the others follow its form); Fable 5, 5.1 and 5.2 and Opus
+    4.5, 4.6 and 4.7 gained their OpenRouter ids at list; and Gemini 4 on the Gemini API gained its
+    bare ids (`gemini-4-carbon`, `-argon`, `-neon`, `-hydrogen`; Carbon and Argon at the price in
+    effect that day, the promotional rate through 2026-11-30, raised to the standard rate on
+    2026-12-01; `@decided 2026-11-23`: a row carries today's price), read from
+    aistudio.google.com/docs/pricing. The Bedrock profile ids other than
+    `global.anthropic.claude-fable-5-2` are derived from AWS's id convention and Anthropic's 10 percent
+    rule, not read from a table. Vertex AI's Gemini 4
+    rows are not in the book: its pricing page could not be read that day.
     *(test: `pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate`
-    (expectations written by hand, red first with 52 ids at the fallback),
+    (expectations written by hand, red first with 52 ids at the fallback; 46 more ids added
+    2026-11-23), `gemini_4_on_the_gemini_api_prices_at_its_list_rate`,
+    `haiku_5_5_bedrock_profiles_carry_the_long_prompt_tier`,
     `the_measured_sonnet_5_call_settles_at_list_not_the_fallback` (red: `left:
     Some(Microusd(58110)) right: Some(Microusd(7748))`),
     `a_truly_unknown_id_still_falls_back`,
@@ -7884,9 +7899,35 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     names a coordinator key's run as its parent, now gets `403`s. Each key keeps its own run ids, or
     the coordinator's key lists the worker's under `may_parent`.
 
-    **Where it says nothing.** The delegated arm for agent tokens (a verified token chain naming the
-    parent owner's agent) is not built: the agent-token door (invariant 123) admits an agent's own
-    token, which acts for nobody, and a delegation token is not a door credential. A first claim and a second call of the same new run by its owner can race,
+    **The delegated arm for agent tokens.** A parent owned by an agent token's principal
+    (`tok:<agent>`) may be rolled up into by a call that an agent token admitted when the person's
+    delegation beside that token (invariant 147) PROVES a chain that ends at the child's own agent and
+    names the parent's agent, an `agent://` entry compared byte for byte, anywhere before it
+    (`proxy::DelegatedBy::names_as_delegator`, read at both parent checks). The chain is issuer-signed
+    and acyclic (invariant 35), so an ancestor entry is an agent through which the authority passed. A
+    claimed chain, a static key, a parent a key owns and a near match of the owner's agent are refused
+    as before. Who the call acts for is now resolved right after the claim and before the parent is
+    judged (the block that reads `x-fuse-agent-id`, the declared chain and `chainproof::resolve_at_door`
+    moved up unchanged): it reads headers and the door's verdict and touches neither the run nor its
+    parent, so a refusal for the agent id, the chain cap or a bad delegation now answers before
+    `parent_owned_elsewhere`, `seed_pending` and the budget errors, and leaves the ledger untouched. A
+    delegation proof is spent even when the call is then refused for its parent. One info line per run
+    and parent records a delegated roll-up; no bus event, because no registered type describes it.
+    `@claude 2026-11-23`, under delegated authority, open to reversal: any ancestor rather than only the
+    immediate delegator, and no identity-map list for agents (`may_parent` stays keyed by client key).
+    Every run above the parent is judged by the same rule at each call (`proxy::foreign_ancestor_refusal`,
+    over the lineage the taint store records whatever the firewall's mode, to the ledger's own depth of 64; a lineage cut off at
+    that depth is refused, never read as clean), so a run a delegation once
+    let roll up does not become a standing pass: a grandchild opened under it without the delegation is
+    refused. Because the chain is resolved before the seed gate, a delegation proof is spent even when
+    the call is then answered `503 seed_pending`; a client that retries must sign a fresh proof.
+    *(test: `tests/it/delegated_parent_by_chain.rs`, ten: three that roll up, red against the unfixed
+    tree, a grandchild and a held parent without the delegation, and five guards. Scenarios: `features/a-delegated-run-rolls-up-by-a-proven-chain.feature`.)*
+
+    **Where it says nothing.** Delegation is authority, not consent to a particular budget: any agent
+    a chain passes through can spend from that agent's runs whose ids it learns, for the life of the
+    delegation token. The tool-call check's ownership comparison (invariant 118) does not read the
+    arm. A first claim and a second call of the same new run by its owner can race,
     and the second may be admitted before the first's line is synced, so a crash in that window
     loses the owner. The owner map and the journal are bounded by nothing but the run ids
     authenticated callers send, as the ledger is. A first key that names a run id before its real
@@ -7943,26 +7984,49 @@ is public, so a literal publishes somebody's username to everyone who reads it.
    115 that adds no floor to an operator's policy file; the rest of 115 stands. Shadow adds nothing and
    judges as enforce would.
 
-   Where it is wired. The buffered LLM path judges the arguments of the model's tool calls
-   (`taint::tool_arguments_in`, `proxy::judge_model_tool_calls`). The streamed path judges names only,
-   because the hold keeps names and not arguments (`streamgate::tool_names`), and the MCP broker's
-   `tools/call` and `/v1/fuse/check-tool-call` carry no arguments at all. Those two are named gaps in the
-   pull request, not closed here.
+   Where it is wired. Every door judges a call's arguments with one function, on that call's own
+   capability: a read is judged on its own arguments, never on another call's in the same answer
+   (`taint::tool_calls_in` pairs each name with its arguments; `taint::read_call_verdict`). The buffered
+   LLM path reads them from the answer. The streamed hold joins each call's argument fragments
+   (Anthropic `input_json_delta` per block index, OpenAI `function.arguments` per call index) and holds
+   the call to the end of the stream (`streamgate::Fragments`, `Held::calls`), so a streamed read is
+   judged as a buffered one is. A closing `message` never replaces what the deltas built: every
+   distinct name a call was given is judged with every distinct argument text it carried (the deltas',
+   each message's, and the messages' joined), because a client may assemble any of them, and a call
+   that carries arguments and was never named is judged under the empty name, which after untrusted
+   input is refused as unclassified. A fragment whose index no `tool_use` block opened is joined onto the
+   most recent block rather than dropped. Arguments sent as their JSON text, once or twice encoded, are
+   read as the object they hold, so the URL caps see the URL. A 2xx answer the gateway cannot parse is
+   judged as a call nobody named carrying arguments nobody read, so after untrusted input it is refused
+   rather than read as an answer with no calls. The check route judges arguments sent beside `tool` and
+   `tools` against every tool it names. `/v1/fuse/check-tool-call` takes optional `arguments` (or
+   `arguments_truncated: true`) for its `tool` and answers `arguments_judged`; the MCP broker sends a
+   `tools/call`'s `params.arguments` there, after its DLP and PII steps and before secret injection,
+   whole or flagged as left out.
+
+   `@claude 2026-11-23`, choices under delegated authority, open to reversal: arguments are judged up
+   to `TOOL_ARGUMENTS_CAP_BYTES`, 64 KiB inclusive, on every door; longer arguments are the finding
+   `arguments_over_cap` and are never judged on a prefix (the hold drops the fragments past the cap, so
+   what it keeps per call is bounded); argument text that does not parse as JSON is scanned as text and
+   is also the finding `arguments_unreadable`, because a client with a lenient parser may run what this
+   gateway could not read. Both findings refuse only where the read rule applies, a network read after
+   private data. The 12 KiB bound sent to the policy plane (invariant 100) is a separate constant.
 
    Tests: `core::taint::tests`, the argument judgement, a seeded sweep of 200 URL shapes against the caps
-   written out again independently, and the rule that labels alone never refuse the read rule;
-   `gateway::firewall::read_tools_carry_no_data_tests`, the starter map, the floors and the operator file;
-   `features/read-tools-carry-no-data.feature`, twenty-one scenarios, each bound. The red commit
-   b7e5309 failed nine tests in `-p tokenfuse-core --lib` on CI, as the supervisor reported; this text
-   does not re-run them. Mutants are described, not run: the cap off by one, the label group ignored,
-   the floor not added, `network_read` left out of the anti-exfiltration deny. Not a script gate: held by
-   `cargo test`.
-   *(not proven: the streamed and MCP argument paths; the cap values, which are a choice; PII findings
-   under `observe`, which are not refused; a read tool with a secret in its arguments when its labels
-   are `web` only, which is judged by no rule of this invariant; and operator files that replace the
-   starter policy without the read rule, which get the anti-exfiltration and unmapped floors but not
-   the argument judgement; and an unmapped tool such as `fetch` after `secrets` alone, which no rule
-   refuses, as before this change, because anti-exfiltration names no unclassified capability.)*
+   written out again independently, the rule that labels alone never refuse the read rule, and the cap,
+   unreadable and pairing tests; `gateway::firewall::read_tools_carry_no_data_tests`, the starter map,
+   the floors and the operator file; `gateway::streamgate::tests`, fragments joined at any chunking on
+   both wires, interleaved calls and the cap; `tests/it/streamed_tool_calls_are_judged.rs` and
+   `tests/it/mcp_broker.rs` through the real router and broker; `features/read-tools-carry-no-data.feature`
+   and `features/streamed-tool-arguments-are-judged.feature`, each scenario bound. Not a script gate: held
+   by `cargo test`.
+
+   Scope. The rule reads tool names and arguments; an operator file that replaces the starter policy
+   without the read rule gets the anti-exfiltration and unmapped floors and no argument judgement; PII
+   findings refuse only under `TOKENFUSE_DLP_PII=block`; a read whose labels are `web` only is judged by
+   no rule of this invariant; an unmapped tool such as `fetch` after `secrets` alone is refused by no
+   rule, because anti-exfiltration names no unclassified capability; the hold's total held bytes are
+   bounded by the provider's output, as invariant 104 says.
 
 122. **The gateway holds the provider key, and a caller's own provider credential never leaves the process.**
    Finding F-002 of the agent-security review of 2026-10-17. Until this invariant the gateway forwarded the

@@ -5092,3 +5092,65 @@ async fn the_broker_sends_each_upstream_its_own_credential_and_never_the_callers
         "no file, no credential: {out}"
     );
 }
+
+// --- invariant 121: the arguments go with the tool-call check -------------
+
+/// A gateway's check route that records the payload each check carried.
+fn judge_recording_payloads() -> (Router, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let r = Router::new().route(
+        "/v1/fuse/check-tool-call",
+        post(move |Json(req): Json<Value>| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(req);
+                Json(json!({"decision": "allow", "governed": true}))
+            }
+        }),
+    );
+    (r, seen)
+}
+
+/// Red on the unfixed tree: the broker asked the check about the tool's name
+/// only, so a read carrying the run's private data in its arguments was judged
+/// on nothing. Arguments within the cap go whole; larger ones are flagged as
+/// left out, never cut to a prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_broker_sends_arguments_to_the_check_and_oversized_ones_as_truncated() {
+    let up = spawn_server(marker_router("upstream")).await;
+    let (judge_router, seen) = judge_recording_payloads();
+    let gw = spawn_server(judge_router).await;
+    let broker_url = spawn_server(broker_with_taint(up, Some(gw), false)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let small = json!({"url": "https://example.com/a?q=1"});
+    let big = json!({"blob": "x ".repeat(40_000)});
+    for (id, args) in [(1, small.clone()), (2, big)] {
+        let call = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": "fetch_url", "arguments": args } });
+        let out: Value = reqwest::Client::new()
+            .post(format!("{broker_url}/"))
+            .header("x-fuse-agent-id", "agent://acme.example/sre/rca")
+            .header("x-fuse-run-id", "run-args")
+            .header(CLIENT_KEY_HEADER, "sk-the-callers-own")
+            .json(&call)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(out["result"]["upstream"], "upstream", "{out}");
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[0]["arguments"], small, "{}", seen[0]);
+    assert!(seen[0].get("arguments_truncated").is_none(), "{}", seen[0]);
+    assert!(
+        seen[1].get("arguments").is_none(),
+        "an oversized object is never sent: {}",
+        seen[1].to_string().len()
+    );
+    assert_eq!(seen[1]["arguments_truncated"], true);
+}
