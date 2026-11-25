@@ -4321,6 +4321,22 @@ is public, so a literal publishes somebody's username to everyone who reads it.
     `a_refreshed_entry_is_not_evicted_as_if_it_were_still_the_oldest`
     (the stale old record evicts the refreshed entry too early).)*
 
+    **Shadow samples the walk** (tokenfuse#329). The exact index answers a repeat in constant time,
+    but under varied traffic almost every shadow lookup is a new prompt and falls through to the
+    similarity walk over every live entry of its partition: measured 2026-09-24 on a 4-core box, 527
+    calls/s at 50 agents in shadow against 1082 with the cache off, 86% of CPU in `get`. Shadow
+    measures a would-hit rate, and a sample measures it, so in shadow the walk runs for one in
+    `CacheConfig::shadow_walk_every` lookups the exact index did not answer
+    (`TOKENFUSE_CACHE_SHADOW_SAMPLE_EVERY`, default 10, `1` walks every time; a value that is not an
+    integer from 1 to 1,000,000 is the default with one warn line, as a measurement setting). The exact
+    path is never sampled, `on` always walks, and `put` is unchanged. `@claude 2026-11-23`, under
+    delegated authority, open to reversal: sampling rather than a smaller cap or a locality-sensitive
+    bucket, because it bounds the cost without changing what `on` serves.
+    *(test: `cache::tests::shadow_walks_one_lookup_in_n_and_on_walks_every_one`,
+    `cache::tests::shadow_never_samples_an_exact_repeat`,
+    `defaults::tests::shadow_samples_one_walk_in_ten_unless_told_otherwise`. Scenarios:
+    `features/shadow-samples-the-cache-walk.feature`.)*
+
 65. **A gateway's site is named by the key it pushed with, never by anything in
     the request.** `@decided 2026-09-26`. Measured while designing a two-site
     deployment: `WireRecord` (`crates/gateway/src/cloudsink.rs`) carries no

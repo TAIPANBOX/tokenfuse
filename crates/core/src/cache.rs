@@ -237,6 +237,12 @@ pub struct CacheConfig {
     pub max_per_partition: usize,
     pub entity_guard: bool,
     pub length_ratio_max: f32,
+    /// In `Shadow`, the similarity walk runs for one in this many lookups the
+    /// exact index did not answer (tokenfuse#329). Shadow measures a would-hit
+    /// rate, and a sample measures it; walking every stored entry on every new
+    /// prompt cost half the gateway's throughput at 50 agents. `1` walks every
+    /// time; `On` always walks. The exact-match path is never sampled.
+    pub shadow_walk_every: u32,
 }
 
 impl Default for CacheConfig {
@@ -248,6 +254,7 @@ impl Default for CacheConfig {
             max_per_partition: 10_000,
             entity_guard: true,
             length_ratio_max: 1.5,
+            shadow_walk_every: 1,
         }
     }
 }
@@ -422,6 +429,9 @@ pub struct SemanticCache {
     embedder: Box<dyn Embedder>,
     config: CacheConfig,
     store: RwLock<HashMap<u64, Partition>>,
+    /// Shadow lookups that reached the similarity walk's door, counted to sample
+    /// one in [`CacheConfig::shadow_walk_every`].
+    shadow_misses: std::sync::atomic::AtomicU64,
 }
 
 impl SemanticCache {
@@ -430,6 +440,7 @@ impl SemanticCache {
             embedder,
             config,
             store: RwLock::new(HashMap::new()),
+            shadow_misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -487,6 +498,18 @@ impl SemanticCache {
                         saved_microusd: e.cost_microusd,
                     });
                 }
+            }
+        }
+
+        // Shadow samples the walk (tokenfuse#329): it measures a would-hit rate,
+        // so one walk in `shadow_walk_every` is enough, and a walk over every
+        // stored entry on every new prompt is not free.
+        if self.config.mode == CacheMode::Shadow && self.config.shadow_walk_every > 1 {
+            let n = self
+                .shadow_misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !n.is_multiple_of(u64::from(self.config.shadow_walk_every)) {
+                return None;
             }
         }
 
@@ -1547,5 +1570,61 @@ mod tests {
             "steady-state shadow loop (get+put) at ~10,000 entries/partition: {calls_per_sec:.0} calls/s ({:?} total for {N} calls)",
             elapsed
         );
+    }
+
+    // --- tokenfuse#329: shadow samples the similarity walk ----------------
+
+    fn sampled(mode: CacheMode, every: u32) -> SemanticCache {
+        SemanticCache::new(
+            Box::new(HashEmbedder::default()),
+            CacheConfig {
+                mode,
+                threshold: 0.5,
+                entity_guard: false,
+                shadow_walk_every: every,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Ten new prompts near one stored entry: shadow at one in ten walks for one
+    /// of them; at one in one, and in `On`, for all ten.
+    #[test]
+    fn shadow_walks_one_lookup_in_n_and_on_walks_every_one() {
+        let p = SemanticCache::partition_key("m", "sys", "", "qa", "t");
+        let near = |i: usize| format!("what is the refund policy for order number please {i}x");
+        for (mode, every, walked) in [
+            (CacheMode::Shadow, 10, 1),
+            (CacheMode::Shadow, 1, 10),
+            (CacheMode::On, 10, 10),
+        ] {
+            let c = sampled(mode, every);
+            c.put(
+                p,
+                "what is the refund policy for order number please",
+                b"r".to_vec(),
+                "application/json".into(),
+                100,
+                0,
+            );
+            let hits = (0..10).filter(|&i| c.get(p, &near(i), 1).is_some()).count();
+            assert_eq!(hits, walked, "{mode:?} every {every}");
+        }
+    }
+
+    /// The exact index is O(1) and never sampled.
+    #[test]
+    fn shadow_never_samples_an_exact_repeat() {
+        let p = SemanticCache::partition_key("m", "sys", "", "qa", "t");
+        let c = sampled(CacheMode::Shadow, 10);
+        c.put(
+            p,
+            "the same prompt",
+            b"r".to_vec(),
+            "application/json".into(),
+            100,
+            0,
+        );
+        assert!((0..10).all(|_| c.get(p, "the same prompt", 1).is_some()));
     }
 }
