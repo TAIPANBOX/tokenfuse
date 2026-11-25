@@ -1309,6 +1309,8 @@ async fn serve() {
         tokenfuse_gateway::embedder::build(),
         tokenfuse_core::cache::CacheConfig {
             mode: cache_mode,
+            // Shadow measures a would-hit rate from a sample (tokenfuse#329).
+            shadow_walk_every: tokenfuse_gateway::defaults::cache_shadow_sample_from_env(),
             ..Default::default()
         },
     )));

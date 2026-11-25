@@ -83,6 +83,14 @@ cache:
     - { task_type: "financial-*" }
 ```
 
+## A.7.1. Shadow samples the similarity walk
+
+In shadow the cache only measures a would-hit rate, and a sample measures it. A
+lookup the exact index cannot answer walks every live entry of its partition, so
+under varied traffic shadow walks for one in `TOKENFUSE_CACHE_SHADOW_SAMPLE_EVERY`
+such lookups (default 10; `1` walks every time). The exact path is never sampled
+and `on` always walks (tokenfuse#329, CLAUDE.md invariant 64).
+
 ## A.8. Default decisions (locked in)
 
 Favor conservatism over hit-rate: shadow mode mandatory for the first week → threshold 0.97 with no judge → entity guard always on → tools = L1 only. One false hit costs trust in the entire feature.
