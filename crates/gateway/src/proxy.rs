@@ -2692,7 +2692,7 @@ fn judge_model_tool_calls(
     labels: &Labels,
     provider_tools: &[String],
     resp_tools: &[String],
-    resp_args: &[serde_json::Value],
+    resp_calls: &[taint::ToolCall],
     blocked_row: impl FnOnce() -> CallRecord,
     event_agent_id: &str,
     run_id: &str,
@@ -2720,11 +2720,18 @@ fn judge_model_tool_calls(
         taint::capabilities_for_tools(resp_tools, &st.firewall.capabilities, &st.firewall.sources);
     let mut out = ToolCallVerdict::Allowed;
     // A read after private data is judged on what its arguments carry (design 4.2,
-    // invariant 121). `evaluate` never refuses it on its labels alone.
+    // invariant 121). `evaluate` never refuses it on its labels alone. Each call is
+    // judged on its OWN arguments and its own capability: a large write beside a
+    // clean read is not a read carrying data.
     let pii_blocks = st.dlp_pii == DlpMode::Block;
     let verdict = taint::evaluate(labels, &requested, &st.firewall.rules).or_else(|| {
-        resp_args.iter().find_map(|a| {
-            taint::read_argument_verdict(labels, &requested, a, pii_blocks, &st.firewall.rules)
+        resp_calls.iter().find_map(|call| {
+            let own = taint::capabilities_for_tools(
+                std::slice::from_ref(&call.name),
+                &st.firewall.capabilities,
+                &st.firewall.sources,
+            );
+            taint::read_call_verdict(labels, &own, &call.args, pii_blocks, &st.firewall.rules)
         })
     });
     if let Some(verdict) = verdict {
@@ -2940,10 +2947,10 @@ fn stream_managed(
                 &firewall_labels,
                 &held.provider_tools,
                 &held.tools,
-                // The streamed hold keeps tool NAMES only, not their arguments
-                // (streamgate::tool_names), so a streamed read is not yet judged on
-                // what it carries. Named as a gap in invariant 121.
-                &[],
+                // The hold joins each call's argument fragments under the cap
+                // (invariant 121), so a streamed read is judged on what it carries,
+                // by the same function as a buffered one.
+                &held.calls,
                 move || CallRecord { ts_millis: now_millis(), ..blocked_row },
                 &ev_agent_id,
                 &ev_run_id,
@@ -3122,17 +3129,34 @@ async fn buffered_managed(
     // (`judge_model_tool_calls`, invariant 104).
     let mut firewall_note: Option<String> = None;
     if st.firewall.mode != FirewallMode::Off {
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let parsed_json = serde_json::from_slice::<serde_json::Value>(&bytes);
+        let unreadable_answer = status.is_success() && !bytes.is_empty() && parsed_json.is_err();
+        let resp_json = parsed_json.unwrap_or(serde_json::Value::Null);
         let provider_tools = taint::provider_tools_in(&resp_json);
-        let resp_tools = taint::tool_names_in(&resp_json);
-        let resp_args = taint::tool_arguments_in(&resp_json);
+        let (resp_tools, resp_calls) = if unreadable_answer {
+            // A 2xx this gateway cannot parse (a tool input nested past the
+            // parser's depth, say) may still be a tool call a client reads and
+            // runs, so it is judged as a call nobody named carrying text nobody
+            // read: refused after untrusted input, never read as "no calls".
+            (
+                vec![String::new()],
+                vec![taint::ToolCall {
+                    name: String::new(),
+                    args: taint::ToolArgs::OverCap,
+                }],
+            )
+        } else {
+            (
+                taint::tool_names_in(&resp_json),
+                taint::tool_calls_in(&resp_json),
+            )
+        };
         let verdict = judge_model_tool_calls(
             st,
             &firewall_labels,
             &provider_tools,
             &resp_tools,
-            &resp_args,
+            &resp_calls,
             // The call already happened and its real cost was recorded as
             // "allow" above — this second record is the security verdict
             // that blocks the *response* from reaching the caller, so it

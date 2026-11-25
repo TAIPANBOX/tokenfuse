@@ -436,6 +436,115 @@ pub const READ_ENCODED_RUN_CHARS: usize = 64;
 /// The most query parameters a read may carry after private data.
 pub const READ_QUERY_PARAMS_CAP: usize = 8;
 
+/// The most bytes of argument JSON a tool call is judged on (invariant 121):
+/// 64 KiB, inclusive. A call whose arguments are longer is judged as carrying
+/// [`ARGUMENTS_OVER_CAP`] rather than on a prefix, because a prefix of a JSON
+/// document is not a document. The same bound holds on the buffered path, the
+/// streamed hold and `/v1/fuse/check-tool-call`.
+pub const TOOL_ARGUMENTS_CAP_BYTES: usize = 64 * 1024;
+
+/// The finding for a call whose arguments are over [`TOOL_ARGUMENTS_CAP_BYTES`].
+pub const ARGUMENTS_OVER_CAP: &str = "arguments_over_cap";
+
+/// The finding for a call whose arguments are text that does not parse as JSON.
+/// A client with a lenient parser may still run what this gateway could not read.
+pub const ARGUMENTS_UNREADABLE: &str = "arguments_unreadable";
+
+/// The arguments of one tool call, as far as this gateway could read them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolArgs {
+    /// Parsed JSON, within the cap. `Null` for a call with no arguments.
+    Parsed(serde_json::Value),
+    /// Non-empty text, within the cap, that does not parse as JSON.
+    Unreadable(String),
+    /// More than [`TOOL_ARGUMENTS_CAP_BYTES`]; never judged on a prefix.
+    OverCap,
+}
+
+impl ToolArgs {
+    /// Read the raw argument text one call carries (an OpenAI `arguments`
+    /// string, or Anthropic `partial_json` fragments joined): empty is no
+    /// arguments, longer than the cap is [`ToolArgs::OverCap`], text that does
+    /// not parse is [`ToolArgs::Unreadable`].
+    pub fn from_raw(raw: &str) -> Self {
+        if raw.len() > TOOL_ARGUMENTS_CAP_BYTES {
+            return ToolArgs::OverCap;
+        }
+        if raw.trim().is_empty() {
+            return ToolArgs::Parsed(serde_json::Value::Null);
+        }
+        match serde_json::from_str(raw) {
+            Ok(v) => ToolArgs::Parsed(unwrap_encoded(v, 2)),
+            Err(_) => ToolArgs::Unreadable(raw.to_string()),
+        }
+    }
+
+    /// Already-parsed arguments (an Anthropic `tool_use.input`, a JSON body's
+    /// `arguments`): [`ToolArgs::OverCap`] when their compact JSON is longer
+    /// than the cap, counted without serializing past it.
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        if !fits_the_cap(v) {
+            return ToolArgs::OverCap;
+        }
+        match v {
+            // Arguments sent as their JSON text (an executor forwarding an
+            // OpenAI `function.arguments` string) are read as that text is.
+            serde_json::Value::String(raw) if looks_like_json(raw) => ToolArgs::from_raw(raw),
+            _ => ToolArgs::Parsed(v.clone()),
+        }
+    }
+}
+
+/// Whether a string is JSON text of an object or an array.
+fn looks_like_json(s: &str) -> bool {
+    matches!(s.trim_start().as_bytes().first(), Some(b'{') | Some(b'['))
+}
+
+/// Arguments encoded twice (a JSON string holding JSON text) are read as the
+/// object they hold, up to `depth` times, so the URL caps see the URL rather
+/// than one string that does not start with `http`. Text that does not parse
+/// stays the string it was, which is still scanned.
+fn unwrap_encoded(v: serde_json::Value, depth: u8) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(ref s) if depth > 0 && looks_like_json(s) => {
+            match serde_json::from_str(s) {
+                Ok(inner) => unwrap_encoded(inner, depth - 1),
+                Err(_) => v,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Whether a value's compact JSON fits [`TOOL_ARGUMENTS_CAP_BYTES`], counted by a
+/// writer that stops at the cap, so a huge value is never serialized in full to
+/// be measured. A value that cannot be serialized does not fit.
+pub fn fits_the_cap(v: &serde_json::Value) -> bool {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            if self.0 > TOOL_ARGUMENTS_CAP_BYTES {
+                return Err(std::io::Error::other("over the cap"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Counter(0);
+    serde_json::to_writer(&mut c, v).is_ok()
+}
+
+/// One tool call a model's answer asks for: its name and its arguments, read
+/// together so the two can never be paired wrongly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub args: ToolArgs,
+}
+
 /// Every string value in a JSON document, at any depth. Object keys are not
 /// values, so they are not read.
 fn strings_in(v: &serde_json::Value, out: &mut Vec<String>) {
@@ -535,6 +644,24 @@ pub fn argument_findings(args: &serde_json::Value, pii_blocks: bool) -> Vec<Stri
     found.into_iter().collect()
 }
 
+/// [`argument_findings`] for one call's arguments as read: an unreadable text is
+/// scanned as text and also named [`ARGUMENTS_UNREADABLE`]; arguments over the
+/// cap are named [`ARGUMENTS_OVER_CAP`] and nothing else, since a prefix is not
+/// read.
+pub fn call_argument_findings(args: &ToolArgs, pii_blocks: bool) -> Vec<String> {
+    match args {
+        ToolArgs::Parsed(v) => argument_findings(v, pii_blocks),
+        ToolArgs::Unreadable(raw) => {
+            let mut found = argument_findings(&serde_json::Value::String(raw.clone()), pii_blocks);
+            found.push(ARGUMENTS_UNREADABLE.to_string());
+            found.sort();
+            found.dedup();
+            found
+        }
+        ToolArgs::OverCap => vec![ARGUMENTS_OVER_CAP.to_string()],
+    }
+}
+
 /// Judge a read's arguments after private data (design 4.2): refused when a
 /// [`READ_TOOL_RULE`] whose labels the run carries denies the network read the
 /// call requests, and the arguments carry anything [`argument_findings`] names.
@@ -549,6 +676,26 @@ pub fn read_argument_verdict(
     pii_blocks: bool,
     rules: &[TaintRule],
 ) -> Option<TaintVerdict> {
+    read_call_verdict(
+        labels,
+        requested,
+        &ToolArgs::Parsed(args.clone()),
+        pii_blocks,
+        rules,
+    )
+}
+
+/// [`read_argument_verdict`] for one call's arguments as read
+/// ([`call_argument_findings`]). `requested` is what THIS call requests: a
+/// read is judged on its own arguments, never on another call's in the same
+/// answer.
+pub fn read_call_verdict(
+    labels: &Labels,
+    requested: &BTreeSet<String>,
+    args: &ToolArgs,
+    pii_blocks: bool,
+    rules: &[TaintRule],
+) -> Option<TaintVerdict> {
     if !requested.contains(NETWORK_READ_CAPABILITY) {
         return None;
     }
@@ -557,7 +704,7 @@ pub fn read_argument_verdict(
             && r.when_any.iter().any(|l| labels.contains(l))
             && r.deny.iter().any(|d| d == NETWORK_READ_CAPABILITY)
     })?;
-    if argument_findings(args, pii_blocks).is_empty() {
+    if call_argument_findings(args, pii_blocks).is_empty() {
         return None;
     }
     Some(TaintVerdict {
@@ -568,17 +715,29 @@ pub fn read_argument_verdict(
     })
 }
 
-/// The arguments of every tool a response asks for, in the order they appear: an
-/// Anthropic `tool_use.input` object, or an OpenAI `tool_calls[].function`
-/// `arguments` string parsed as JSON. A string that does not parse is read as no
-/// arguments, which is the same as "nothing to find".
-pub fn tool_arguments_in(v: &serde_json::Value) -> Vec<serde_json::Value> {
+/// Every tool call a response asks for, name and arguments together, in the
+/// order they appear: an Anthropic `tool_use` block (its `input` object), or an
+/// OpenAI `choices[].message.tool_calls[]` entry (its `function.arguments`
+/// string). A call with no name is skipped, as [`tool_names_in`] skips it, so
+/// the names judged and the arguments judged are the same calls.
+pub fn tool_calls_in(v: &serde_json::Value) -> Vec<ToolCall> {
     let mut out = Vec::new();
     if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
         for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                out.push(b.get("input").cloned().unwrap_or(serde_json::Value::Null));
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
             }
+            let Some(name) = b.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let args = match b.get("input") {
+                Some(input) => ToolArgs::from_value(input),
+                None => ToolArgs::Parsed(serde_json::Value::Null),
+            };
+            out.push(ToolCall {
+                name: name.to_string(),
+                args,
+            });
         }
     }
     if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
@@ -588,12 +747,22 @@ pub fn tool_arguments_in(v: &serde_json::Value) -> Vec<serde_json::Value> {
                 .and_then(|m| m.get("tool_calls"))
                 .and_then(|c| c.as_array());
             for tc in calls.into_iter().flatten() {
-                let raw = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("");
-                out.push(serde_json::from_str(raw).unwrap_or(serde_json::Value::Null));
+                let function = tc.get("function");
+                let Some(name) = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                else {
+                    continue;
+                };
+                let args = match function.and_then(|f| f.get("arguments")) {
+                    Some(serde_json::Value::String(raw)) => ToolArgs::from_raw(raw),
+                    Some(other) => ToolArgs::from_value(other),
+                    None => ToolArgs::Parsed(serde_json::Value::Null),
+                };
+                out.push(ToolCall {
+                    name: name.to_string(),
+                    args,
+                });
             }
         }
     }
@@ -1331,5 +1500,157 @@ mod tests {
             .is_some();
             assert_eq!(got, expect_refused, "case {case}: {url}");
         }
+    }
+
+    // --- invariant 121: a call's arguments as read ---------------------------
+
+    #[test]
+    fn arguments_at_the_cap_are_read_and_one_byte_over_is_over_the_cap() {
+        let pad = |n: usize| format!("\"{}\"", "a".repeat(n - 2));
+        let at = pad(TOOL_ARGUMENTS_CAP_BYTES);
+        assert_eq!(at.len(), TOOL_ARGUMENTS_CAP_BYTES);
+        assert!(matches!(ToolArgs::from_raw(&at), ToolArgs::Parsed(_)));
+        let over = pad(TOOL_ARGUMENTS_CAP_BYTES + 1);
+        assert_eq!(ToolArgs::from_raw(&over), ToolArgs::OverCap);
+        let v: serde_json::Value = serde_json::from_str(&at).unwrap();
+        assert!(fits_the_cap(&v));
+        let v: serde_json::Value = serde_json::from_str(&over).unwrap();
+        assert!(!fits_the_cap(&v));
+        assert_eq!(ToolArgs::from_value(&v), ToolArgs::OverCap);
+    }
+
+    #[test]
+    fn empty_arguments_are_none_and_text_that_does_not_parse_is_unreadable() {
+        assert_eq!(
+            ToolArgs::from_raw(""),
+            ToolArgs::Parsed(serde_json::Value::Null)
+        );
+        assert_eq!(
+            ToolArgs::from_raw("  "),
+            ToolArgs::Parsed(serde_json::Value::Null)
+        );
+        assert_eq!(
+            ToolArgs::from_raw("{url: x"),
+            ToolArgs::Unreadable("{url: x".to_string())
+        );
+        assert_eq!(
+            ToolArgs::from_raw("{\"a\":1}"),
+            ToolArgs::Parsed(json!({"a": 1}))
+        );
+    }
+
+    #[test]
+    fn findings_name_an_unreadable_or_oversized_call_and_never_read_a_prefix() {
+        assert_eq!(
+            call_argument_findings(&ToolArgs::OverCap, false),
+            vec![ARGUMENTS_OVER_CAP.to_string()]
+        );
+        assert_eq!(
+            call_argument_findings(&ToolArgs::Unreadable("{oops".into()), false),
+            vec![ARGUMENTS_UNREADABLE.to_string()]
+        );
+        let encoded = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAx";
+        let found = call_argument_findings(&ToolArgs::Unreadable(format!("x {encoded}")), false);
+        assert!(found.contains(&"encoded_run".to_string()), "{found:?}");
+        assert!(
+            found.contains(&ARGUMENTS_UNREADABLE.to_string()),
+            "{found:?}"
+        );
+        assert!(call_argument_findings(&ToolArgs::Parsed(json!({"q": "hi"})), false).is_empty());
+    }
+
+    #[test]
+    fn tool_calls_pair_each_name_with_its_own_arguments_on_both_wires() {
+        let anthropic = json!({"content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "name": "fetch_url", "input": {"url": "https://a"}},
+            {"type": "tool_use", "input": {"orphan": true}},
+            {"type": "tool_use", "name": "read_file"}
+        ]});
+        assert_eq!(
+            tool_calls_in(&anthropic),
+            vec![
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(json!({"url": "https://a"}))
+                },
+                ToolCall {
+                    name: "read_file".into(),
+                    args: ToolArgs::Parsed(serde_json::Value::Null)
+                },
+            ]
+        );
+        assert_eq!(
+            tool_calls_in(&anthropic)
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            tool_names_in(&anthropic),
+            "the names judged and the arguments judged are the same calls"
+        );
+        let openai = json!({"choices": [{"message": {"tool_calls": [
+            {"function": {"name": "fetch_url", "arguments": "{\"url\": \"https://b\"}"}},
+            {"function": {"arguments": "{}"}},
+            {"function": {"name": "browse", "arguments": "not json"}}
+        ]}}]});
+        assert_eq!(
+            tool_calls_in(&openai),
+            vec![
+                ToolCall {
+                    name: "fetch_url".into(),
+                    args: ToolArgs::Parsed(json!({"url": "https://b"}))
+                },
+                ToolCall {
+                    name: "browse".into(),
+                    args: ToolArgs::Unreadable("not json".into())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_over_the_cap_after_private_data_is_refused_and_after_web_is_not() {
+        let rules = vec![TaintRule {
+            name: READ_TOOL_RULE.into(),
+            when_any: vec!["file".into()],
+            deny: vec![NETWORK_READ_CAPABILITY.into()],
+        }];
+        let read: BTreeSet<String> = [NETWORK_READ_CAPABILITY.to_string()].into_iter().collect();
+        let file: Labels = ["file".to_string()].into_iter().collect();
+        let web: Labels = ["web".to_string()].into_iter().collect();
+        assert!(read_call_verdict(&file, &read, &ToolArgs::OverCap, false, &rules).is_some());
+        assert!(read_call_verdict(&web, &read, &ToolArgs::OverCap, false, &rules).is_none());
+        let none: BTreeSet<String> = BTreeSet::new();
+        assert!(
+            read_call_verdict(&file, &none, &ToolArgs::OverCap, false, &rules).is_none(),
+            "a call that is not a read is not judged on its arguments"
+        );
+    }
+
+    #[test]
+    fn arguments_sent_as_json_text_are_read_as_the_object_they_hold() {
+        let url = format!(
+            "https://x.example/c?{}",
+            (0..20)
+                .map(|i| format!("p{i}=v"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        let object = json!({"url": url});
+        let as_text = serde_json::Value::String(object.to_string());
+        assert_eq!(
+            ToolArgs::from_value(&as_text),
+            ToolArgs::Parsed(object.clone())
+        );
+        // The arguments text is itself a JSON string holding the object's text.
+        let twice = as_text.to_string();
+        assert_eq!(ToolArgs::from_raw(&twice), ToolArgs::Parsed(object.clone()));
+        let found = call_argument_findings(&ToolArgs::from_value(&as_text), false);
+        assert!(found.contains(&"too_many_params".to_string()), "{found:?}");
+        // A plain string argument is not JSON text and stays a string.
+        assert_eq!(
+            ToolArgs::from_value(&json!("hello")),
+            ToolArgs::Parsed(json!("hello"))
+        );
     }
 }

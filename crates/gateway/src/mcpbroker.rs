@@ -1776,7 +1776,12 @@ fn upstream_target(ctx: &CallContext, resolved_url: &str) -> String {
 /// **The gateway did not answer**, or answered outside 2xx (a gateway with
 /// client keys refuses a check that carries none with 401). See
 /// [`taint_gate_unanswered`]: recorded, and then the gate's own failmode.
-async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(), String> {
+async fn taint_gate(
+    st: &BrokerState,
+    ctx: &CallContext,
+    tool: &str,
+    arguments: Option<&serde_json::Value>,
+) -> Result<(), String> {
     let Some(base) = st.taint_gateway.as_deref() else {
         return Ok(());
     };
@@ -1792,11 +1797,20 @@ async fn taint_gate(st: &BrokerState, ctx: &CallContext, tool: &str) -> Result<(
     };
 
     let url = format!("{}/v1/fuse/check-tool-call", base.trim_end_matches('/'));
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "run_id": run_id,
         "tool": tool,
         "via": "mcp",
     });
+    // Whole, or flagged as left out: a prefix of a JSON document is not one, and
+    // the gateway judges a flagged call exactly as one over the cap.
+    if let Some(args) = arguments {
+        if tokenfuse_core::taint::fits_the_cap(args) {
+            payload["arguments"] = args.clone();
+        } else {
+            payload["arguments_truncated"] = serde_json::Value::Bool(true);
+        }
+    }
     let answer = match ask_gateway(st, ctx, &url, &payload).await {
         Ok(a) => a,
         Err(what) => return taint_gate_unanswered(st, ctx, run_id, &url, &what),
@@ -2384,7 +2398,11 @@ async fn process_into(
         // before secret injection: a tool a tainted context may not use must
         // not reach a real credential, and the cheapest refusal is the one
         // that happens first.
-        if let Err(msg) = taint_gate(st, ctx, &tool).await {
+        // The arguments go with the question (invariant 121), after the DLP and PII
+        // steps above and before secret injection: the check judges what the agent
+        // wrote, a `{{secret:NAME}}` handle and not the vault's value.
+        let call_args = req.get("params").and_then(|p| p.get("arguments")).cloned();
+        if let Err(msg) = taint_gate(st, ctx, &tool, call_args.as_ref()).await {
             tracing::warn!(tool = %tool, "mcp broker: taint gate refused tool call");
             return rpc_error(&id, -32004, &msg);
         }

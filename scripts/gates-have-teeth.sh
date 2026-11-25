@@ -1224,7 +1224,7 @@ for p in paths:
 # operator's file, which is a wrong bill nobody would see.
 run_case "price-book: claude-sonnet-5 loses its row and falls back" fail \
 	"cargo test -p tokenfuse-gateway --lib -- --exact pricebook::tests::every_vendor_listed_id_prices_at_its_list_rate" \
-	"$(py 'edit("crates/gateway/src/pricebook.rs", "list: &[\"claude-sonnet-5\", \"anthropic/claude-sonnet-5\"],", "list: &[\"anthropic/claude-sonnet-5\"],")')" \
+	"$(py 'edit("crates/gateway/src/pricebook.rs", "            \"claude-sonnet-5\",\n            \"anthropic/claude-sonnet-5\",\n", "            \"anthropic/claude-sonnet-5\",\n")')" \
 	"every_vendor_listed_id_prices_at_its_list_rate ... FAILED"
 
 run_case "price-book: the operator file's rate cap is gone" fail \
@@ -2402,6 +2402,55 @@ run_case "delegation-beside: the broker tells the policy plane nothing was prove
 # stale silently: a gate added without a case looks exactly like a gate with
 # nothing to catch, and that is the whole thing this file exists to deny. So
 # the list is checked against what is actually on disk.
+# --- invariant 121: every door judges a call's own arguments ---------------
+#
+# Product mutants, held by cargo test: each is a way a read carrying the run's
+# private data reaches a client unjudged.
+run_case "streamed-args: Anthropic fragments not joined" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_read_carrying_data_after_private_data_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "                    call.args.push(part);", "                    let _ = (call, part);")')" \
+	"a_streamed_anthropic_read_carrying_data_after_private_data_is_refused ... FAILED"
+
+run_case "streamed-args: OpenAI fragments not joined" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_openai_read_carrying_data_after_private_data_is_refused" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "                                entry.args.push(&part);", "                                let _ = &part;")')" \
+	"a_streamed_openai_read_carrying_data_after_private_data_is_refused ... FAILED"
+
+run_case "streamed-args: the stream hands the judge no arguments" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_streamed_anthropic_read_carrying_data_after_private_data_is_refused" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                &held.calls,", "                &[],")')" \
+	"a_streamed_anthropic_read_carrying_data_after_private_data_is_refused ... FAILED"
+
+run_case "streamed-args: the hold cap made exclusive" fail \
+	"cargo test -p tokenfuse-gateway --lib -- --exact streamgate::tests::arguments_past_the_cap_are_dropped_and_read_as_over_the_cap" \
+	"$(py 'edit("crates/gateway/src/streamgate.rs", "if self.text.len() + part.len() > tokenfuse_core::taint::TOOL_ARGUMENTS_CAP_BYTES {", "if self.text.len() + part.len() >= tokenfuse_core::taint::TOOL_ARGUMENTS_CAP_BYTES {")')" \
+	"arguments_past_the_cap_are_dropped_and_read_as_over_the_cap ... FAILED"
+
+run_case "streamed-args: arguments over the cap carry no finding" fail \
+	"cargo test -p tokenfuse-core --lib -- --exact taint::tests::findings_name_an_unreadable_or_oversized_call_and_never_read_a_prefix" \
+	"$(py 'edit("crates/core/src/taint.rs", "        ToolArgs::OverCap => vec![ARGUMENTS_OVER_CAP.to_string()],", "        ToolArgs::OverCap => vec![],")')" \
+	"findings_name_an_unreadable_or_oversized_call_and_never_read_a_prefix ... FAILED"
+
+run_case "streamed-args: unreadable arguments read as none" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_buffered_read_with_unreadable_arguments_after_private_data_is_refused" \
+	"$(py 'edit("crates/core/src/taint.rs", "            Err(_) => ToolArgs::Unreadable(raw.to_string()),", "            Err(_) => ToolArgs::Parsed(serde_json::Value::Null),")')" \
+	"a_buffered_read_with_unreadable_arguments_after_private_data_is_refused ... FAILED"
+
+run_case "streamed-args: a read judged on the whole answer's capabilities" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::a_large_argument_on_another_call_does_not_refuse_a_clean_read" \
+	"$(py 'edit("crates/gateway/src/proxy.rs", "                std::slice::from_ref(&call.name),", "                resp_tools,")')" \
+	"a_large_argument_on_another_call_does_not_refuse_a_clean_read ... FAILED"
+
+run_case "streamed-args: the check ignores the arguments it is sent" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact streamed_tool_calls_are_judged::the_check_refuses_a_read_whose_arguments_carry_data" \
+	"$(py 'edit("crates/gateway/src/toolcheck.rs", "        req.arguments.as_ref().map(taint::ToolArgs::from_value)", "        None::<taint::ToolArgs>")')" \
+	"the_check_refuses_a_read_whose_arguments_carry_data ... FAILED"
+
+run_case "streamed-args: the broker sends no arguments" fail \
+	"cargo test -p tokenfuse-gateway --test it -- --exact mcp_broker::the_broker_sends_arguments_to_the_check_and_oversized_ones_as_truncated" \
+	"$(py 'edit("crates/gateway/src/mcpbroker.rs", "            payload[\"arguments\"] = args.clone();", "            let _ = args;")')" \
+	"the_broker_sends_arguments_to_the_check_and_oversized_ones_as_truncated ... FAILED"
+
 # The baseline pass stops here: it has taken its baselines and judged nothing, and
 # the run that started it owns the baseline directory and the restore.
 if [ -n "$phase" ]; then
