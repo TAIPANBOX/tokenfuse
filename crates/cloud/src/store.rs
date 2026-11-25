@@ -3026,9 +3026,12 @@ impl Store {
         };
         let agent = Some(clean(agent_id)).filter(|a| a.starts_with("agent://") && a.len() > 8);
         let key = clean(key_id);
+        // `%` and `@` are escaped, so a caller can never read as another
+        // caller at another site in the incident id: `@` alone separates the site.
+        let escape = |s: &str| s.replace('%', "%25").replace('@', "%40");
         let caller = match (&agent, key.is_empty()) {
-            (Some(a), _) => a.clone(),
-            (None, false) => format!("key:{key}"),
+            (Some(a), _) => escape(a),
+            (None, false) => format!("key:{}", escape(&key)),
             (None, true) => "(unattributed)".to_string(),
         };
         let threshold = self.incident_cfg.provider_failures.max(1);
@@ -3117,12 +3120,20 @@ impl Store {
                 inc.occurrences,
                 (window_ms / 60_000).max(1)
             );
-            let data = tokenfuse_core::agent_event::dependency_failed_data(
+            let mut data = tokenfuse_core::agent_event::dependency_failed_data(
                 tokenfuse_core::agent_event::Dependency::Provider,
                 tokenfuse_core::agent_event::DependencyStage::Response,
                 tokenfuse_core::agent_event::DependencyEffect::CallFailed,
                 &detail,
             );
+            // Which org and site the incident belongs to, as the other incident
+            // exports carry the org.
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("org".into(), serde_json::Value::from(inc.org.clone()));
+                if let Some(site) = site.as_deref() {
+                    obj.insert("site".into(), serde_json::Value::from(site));
+                }
+            }
             let outcome = self.event_exporter.emit(
                 EventType::DependencyFailed,
                 inc.last_seen_millis,
@@ -10010,5 +10021,16 @@ mod tests {
             .note_provider_auth_failures_from_at("acme", None, "p", "agent://a/late", "", 3, T0)
             .unwrap();
         assert_eq!(inc.id, "provider_auth_refused:p:(other)");
+    }
+
+    #[test]
+    fn a_caller_cannot_read_as_another_caller_at_another_site() {
+        let (s, path) = auth_store("escape");
+        let inc = s
+            .note_provider_auth_failures_from_at("acme", None, "p", "agent://a/b@gw-1", "", 3, T0)
+            .unwrap();
+        assert_eq!(inc.id, "provider_auth_refused:p:agent://a/b%40gw-1");
+        let events = bus(&path);
+        assert_eq!(events[0]["data"]["org"], "acme");
     }
 }

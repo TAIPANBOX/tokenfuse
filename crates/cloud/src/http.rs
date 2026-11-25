@@ -895,7 +895,17 @@ async fn provider_failures(
         );
     }
     for f in &parsed.auth_failures {
-        let _ = (&f.provider, &f.agent_id, &f.key_id, f.count);
+        if crate::store::provider_label(&f.provider).is_some() && f.count > 0 {
+            accepted += 1;
+        }
+        st.store.note_provider_auth_failures_from(
+            &org,
+            site.as_deref(),
+            &f.provider,
+            &f.agent_id,
+            &f.key_id,
+            f.count,
+        );
     }
     (StatusCode::OK, Json(ProviderFailuresResponse { accepted })).into_response()
 }
