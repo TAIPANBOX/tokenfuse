@@ -1,0 +1,127 @@
+# Weekly mutation run: break the product code on purpose, one fault at a time,
+# and count how many of those faults an existing test catches. Coverage counts
+# lines that ran; this counts lines an assertion can fail on.
+#
+# Measured, not gated: no score is required yet. The tool is cargo-mutants,
+# pinned and built here, in CI only.
+#
+# Time-bounded: the mutants are split into 8 shards that run side by
+# side, and each shard stops after BUDGET_MINUTES. cargo-mutants writes its
+# outcome lists as it goes, so a shard stopped at the deadline still reports
+# what it judged, and the summary says how many shards were cut short.
+#
+# Public repository, standard runners: it costs nothing.
+name: mutation
+
+on:
+  schedule:
+    - cron: "41 1 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: cargo-mutants (shard ${{ matrix.shard }} of 8)
+    # Free only while the repository is public; a private one would meter.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The instrumented build of the whole workspace is larger than the plain
+      # one that already needs this in the test job: drop the bundles we never
+      # use before building.
+      - name: free runner disk
+        run: |
+          for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+            sudo rm -rf "$d" &
+          done
+          wait
+          df -h /
+      - name: toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: mutants
+      - name: install cargo-mutants 27.1.0
+        run: cargo install cargo-mutants --version 27.1.0 --locked --quiet
+      - name: mutate this shard within the time budget
+        env:
+          BUDGET_MINUTES: "300"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/out"
+          code=0
+          timeout "$(( BUDGET_MINUTES * 60 ))" cargo mutants --workspace --no-shuffle \
+            --shard "$SHARD/8" --output "$RUNNER_TEMP/out" --colors never || code=$?
+          echo "$code" > "$RUNNER_TEMP/out/exit-code"
+          # 0 all caught, 2 some missed, 3 some timed out, 124 stopped at the
+          # budget: all are measurements. Anything else (4 = the unmutated tree
+          # failed its own tests) means nothing was judged, and is red.
+          echo "cargo mutants exit $code"
+          case "$code" in 0|2|3|124) ;; *) exit 1 ;; esac
+      - name: keep the outcome lists
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/out/exit-code
+            ${{ runner.temp }}/out/mutants.out/*.txt
+            ${{ runner.temp }}/out/mutants.out/outcomes.json
+          if-no-files-found: warn
+
+  report:
+    needs: [mutants]
+    if: always() && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-*
+          path: shards
+      - name: put the kill count on the run page
+        run: |
+          python3 - shards >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import glob, os, sys
+          d = sys.argv[1]
+          def count(shard, name):
+              p = os.path.join(shard, "mutants.out", name)
+              if not os.path.exists(p):
+                  p = os.path.join(shard, name)
+              return sum(1 for l in open(p) if l.strip()) if os.path.exists(p) else 0
+          shards = sorted(glob.glob(os.path.join(d, "mutants-*")))
+          tot = {"caught": 0, "missed": 0, "timeout": 0, "unviable": 0}
+          rows, cut, empty = [], 0, 0
+          for s in shards:
+              c = {k: count(s, k + ".txt") for k in tot}
+              code = open(os.path.join(s, "exit-code")).read().strip() if os.path.exists(os.path.join(s, "exit-code")) else "?"
+              cut += code == "124"
+              empty += sum(c.values()) == 0
+              for k in tot:
+                  tot[k] += c[k]
+              rows.append((os.path.basename(s).split("-", 1)[1], c, code))
+          n = tot["caught"] + tot["missed"] + tot["timeout"]
+          print("### Mutation testing (cargo-mutants 27.1.0, measured, not gated)\n")
+          print(f"**Killed {tot['caught']} of {n}** viable mutants (missed {tot['missed']}, "
+                f"timed out {tot['timeout']}; unviable {tot['unviable']}).\n")
+          print("| shard | caught | missed | timeout | unviable | exit |")
+          print("|---|---|---|---|---|---|")
+          for name, c, code in sorted(rows, key=lambda r: int(r[0]) if r[0].isdigit() else 0):
+              print(f"| {name} | {c['caught']} | {c['missed']} | {c['timeout']} | {c['unviable']} | {code} |")
+          print(f"\n{len(shards)} of 8 shards reported; {cut} stopped at the time budget (exit 124), so their counts are partial.")
+          if n == 0:
+              print("\nMEASURED NOTHING: no shard judged a mutant.")
+          PY
