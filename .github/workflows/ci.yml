@@ -528,3 +528,50 @@ jobs:
       - name: Build + clippy the real APNs sender
         run: cargo clippy -p tokenfuse-cloud --all-targets --features apns -- -D warnings
 
+  # Line coverage of the whole workspace (cargo-llvm-cov, pinned, built here),
+  # against .coverage-floor, with the total, the slack and the gap to the
+  # target in the job summary. Its own job: the instrumented build is separate
+  # from the plain one above and would double that job's time.
+  coverage:
+    name: coverage floor
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The instrumented build of the whole workspace is larger than the plain
+      # one that already needs this in the test job: drop the bundles we never
+      # use before building.
+      - name: free runner disk
+        run: |
+          for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+            sudo rm -rf "$d" &
+          done
+          wait
+          df -h /
+      - name: toolchain
+        run: |
+          rustup toolchain install
+          rustup component add llvm-tools-preview
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: coverage
+      - name: install cargo-llvm-cov 0.9.2
+        run: cargo install cargo-llvm-cov --version 0.9.2 --locked --quiet
+      - name: cargo llvm-cov
+        run: |
+          cargo llvm-cov --workspace --locked --no-report
+          cargo llvm-cov report --summary-only
+          cargo llvm-cov report --json --summary-only --output-path "$RUNNER_TEMP/llvm-cov.json"
+      - name: coverage is not below the floor
+        run: ./scripts/coverage-floor.sh check "$RUNNER_TEMP/llvm-cov.json"
+      - name: the coverage floor only rises
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF"
+          git show FETCH_HEAD:.coverage-floor > "$RUNNER_TEMP/base-floor" 2>/dev/null || rm -f "$RUNNER_TEMP/base-floor"
+          ./scripts/coverage-floor.sh ratchet "$RUNNER_TEMP/base-floor"
