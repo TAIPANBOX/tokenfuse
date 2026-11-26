@@ -60,6 +60,13 @@ jobs:
         env:
           BUDGET_MINUTES: "300"
           SHARD: ${{ matrix.shard }}
+          # Every test binary runs under an 8 GiB address-space cap. A mutant
+          # that turns a counter into a runaway allocation (trailryx's
+          # rle_levels `+=` -> `*=`, first run 2026-11-26) otherwise eats the
+          # runner's memory and GitHub shuts the machine down, losing the whole
+          # shard. Under the cap the test aborts and the mutant counts as caught.
+          # Builds are not capped: Cargo applies a runner only to what it runs.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "prlimit --as=8589934592 --"
         run: |
           set -u
           mkdir -p "$RUNNER_TEMP/out"
