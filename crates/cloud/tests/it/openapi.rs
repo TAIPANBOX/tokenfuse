@@ -119,6 +119,25 @@ fn spec_schemas_expose_tool_calls() {
     }
 }
 
+/// agent-passport SPEC 5.1 caps the `on_behalf_of` delegation chain at 32
+/// entries, and every consumer schema that declares the chain as an array must
+/// say so (the estate's C13 gate). The replay event carried no `maxItems`, so
+/// the published contract described a chain of any length; the iPhone app's
+/// mirror of this contract was fixed on 2026-11-27 and this keeps the source
+/// in step with it.
+#[test]
+fn replay_event_caps_the_delegation_chain_at_32() {
+    let spec = openapi_spec();
+    let json = serde_json::to_value(&spec).expect("spec serializes");
+    let chain = &json["components"]["schemas"]["ReplayEvent"]["properties"]["on_behalf_of"];
+    assert!(chain.is_object(), "ReplayEvent has no on_behalf_of property");
+    assert_eq!(
+        chain["maxItems"].as_u64(),
+        Some(32),
+        "ReplayEvent.on_behalf_of must carry maxItems 32 (SPEC 5.1), got {chain}"
+    );
+}
+
 #[tokio::test]
 async fn openapi_json_is_served() {
     let resp = app(state())
