@@ -5,8 +5,13 @@
 # Measured, not gated: no score is required yet. The tool is cargo-mutants,
 # pinned and built here, in CI only.
 #
-# Time-bounded: the mutants are split into 8 shards that run side by
-# side, and each shard stops after BUDGET_MINUTES. cargo-mutants writes its
+# Three stages. The baseline job runs the whole test suite on the unmutated
+# tree once. If that fails, nothing can be judged and the run is red. The eight
+# shards start only after it passes, and run side by side with --baseline=skip,
+# so no shard repeats the suite before its first mutant (cargo-mutants documents
+# this for sharded CI). The report job adds the shards into one count.
+#
+# Time-bounded: each shard stops after BUDGET_MINUTES. cargo-mutants writes its
 # outcome lists as it goes, so a shard stopped at the deadline still reports
 # what it judged, and the summary says how many shards were cut short.
 #
@@ -15,30 +20,25 @@ name: mutation
 
 on:
   schedule:
-    - cron: "41 1 * * 0"
+    - cron: "11 8 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  mutants:
-    name: cargo-mutants (shard ${{ matrix.shard }} of 8)
+  baseline:
+    name: unmutated tree passes its tests
     # Free only while the repository is public; a private one would meter.
     if: github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 340
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, ]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The instrumented build of the whole workspace is larger than the plain
-      # one that already needs this in the test job: drop the bundles we never
-      # use before building.
+      # The workspace build is large: drop the preinstalled bundles this job
+      # never uses before it compiles anything.
       - name: free runner disk
         run: |
           for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -54,6 +54,48 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: mutants
+          shared-key: mutation
+          # Only the baseline writes the cache; the shards restore what it built.
+          save-if: ${{ github.job == 'baseline' }}
+      # The shards below pass --baseline=skip, so this is the check cargo-mutants
+      # would otherwise make inside every shard: the unmutated tree must pass.
+      - name: the unmutated tree passes its tests
+        run: cargo test --workspace
+
+  mutants:
+    name: cargo-mutants (shard ${{ matrix.shard }} of 8)
+    needs: baseline
+    # Free only while the repository is public; a private one would meter.
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The workspace build is large: drop the preinstalled bundles this job
+      # never uses before it compiles anything.
+      - name: free runner disk
+        run: |
+          for d in /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"; do
+            sudo rm -rf "$d" &
+          done
+          wait
+          df -h /
+      - name: toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: mutants
+          shared-key: mutation
+          save-if: false
       - name: install cargo-mutants 27.1.0
         run: cargo install cargo-mutants --version 27.1.0 --locked --quiet
       - name: mutate this shard within the time budget
@@ -71,12 +113,15 @@ jobs:
           set -u
           mkdir -p "$RUNNER_TEMP/out"
           code=0
+          # --timeout is fixed because a skipped baseline gives cargo-mutants no
+          # baseline time to derive the per-mutant timeout from; 300 s is its default.
           timeout "$(( BUDGET_MINUTES * 60 ))" cargo mutants --workspace --no-shuffle \
-            --shard "$SHARD/8" --output "$RUNNER_TEMP/out" --colors never || code=$?
+            --shard "$SHARD/8" --baseline=skip --timeout 300 \
+            --output "$RUNNER_TEMP/out" --colors never || code=$?
           echo "$code" > "$RUNNER_TEMP/out/exit-code"
           # 0 all caught, 2 some missed, 3 some timed out, 124 stopped at the
-          # budget: all are measurements. Anything else (4 = the unmutated tree
-          # failed its own tests) means nothing was judged, and is red.
+          # budget: all are measurements. Anything else means nothing was judged
+          # by this shard, and is red.
           echo "cargo mutants exit $code"
           case "$code" in 0|2|3|124) ;; *) exit 1 ;; esac
       - name: keep the outcome lists
@@ -91,9 +136,14 @@ jobs:
           if-no-files-found: warn
 
   report:
-    needs: [mutants]
+    needs: [baseline, mutants]
     if: always() && github.event.repository.private == false
     runs-on: ubuntu-24.04
+    env:
+      BASELINE: ${{ needs.baseline.result }}
+      SHARD_COUNT: "8"
+    # The shards only run after the baseline passes, so a failed baseline means
+    # nothing was judged, and the report stays red.
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -104,6 +154,7 @@ jobs:
           python3 - shards >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import glob, os, sys
           d = sys.argv[1]
+          total_shards = int(os.environ["SHARD_COUNT"])
           def count(shard, name):
               p = os.path.join(shard, "mutants.out", name)
               if not os.path.exists(p):
@@ -121,14 +172,21 @@ jobs:
                   tot[k] += c[k]
               rows.append((os.path.basename(s).split("-", 1)[1], c, code))
           n = tot["caught"] + tot["missed"] + tot["timeout"]
+          score = f"{100 * tot['caught'] / n:.1f}%" if n else "n/a"
           print("### Mutation testing (cargo-mutants 27.1.0, measured, not gated)\n")
-          print(f"**Killed {tot['caught']} of {n}** viable mutants (missed {tot['missed']}, "
+          print(f"**Kill score {score}: killed {tot['caught']} of {n}** viable mutants (missed {tot['missed']}, "
                 f"timed out {tot['timeout']}; unviable {tot['unviable']}).\n")
+          print(f"Unmutated tree (baseline job): {os.environ['BASELINE']}.\n")
           print("| shard | caught | missed | timeout | unviable | exit |")
           print("|---|---|---|---|---|---|")
           for name, c, code in sorted(rows, key=lambda r: int(r[0]) if r[0].isdigit() else 0):
               print(f"| {name} | {c['caught']} | {c['missed']} | {c['timeout']} | {c['unviable']} | {code} |")
-          print(f"\n{len(shards)} of 8 shards reported; {cut} stopped at the time budget (exit 124), so their counts are partial.")
+          print(f"\n{len(shards)} of {total_shards} shards reported; {cut} stopped at the time budget (exit 124), so their counts are partial.")
           if n == 0:
               print("\nMEASURED NOTHING: no shard judged a mutant.")
           PY
+      - name: a failed baseline judges nothing
+        if: needs.baseline.result != 'success'
+        run: |
+          echo "::error::the unmutated tree did not pass its tests; no mutant was judged"
+          exit 1
