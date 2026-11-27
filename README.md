@@ -727,7 +727,7 @@ Rationale ("one product, not three"): [docs/09-product-strategy.md](docs/09-prod
 
 **Is it free?** Yes, all of it. TokenFuse is open source (Apache-2.0) and free to self-host, with no seat limits and no time limit: the CLI, the local proxy, `tokenfuse mcp-scan` and its GitHub Action, and the **Cloud** control plane and dashboard (fleet spend, alerts, central budgets, the kill-switch). There is no paid TokenFuse tier. A separate commercial product provides the **secured, managed enterprise control room** over the whole stack (authenticated remote access over a tunnel, unified fleet control, hardware-signed actions); TokenFuse itself stays free and open.
 
-**Is it production-ready?** It is 1.22.0: the surface is written and held (`COMPATIBILITY.md`), it is CI-tested and it was run on real boxes, clusters and providers before the 1.0.0 tag (`docs/releases/v1.0.0.md`), but it is not audited or battle-hardened. Start in shadow mode and evaluate.
+**Is it production-ready?** It is 1.27.0: the surface is written and held (`COMPATIBILITY.md`), it is CI-tested and it was run on real boxes, clusters and providers before the 1.0.0 tag (`docs/releases/v1.0.0.md`), but it is not audited or battle-hardened. Start in shadow mode and evaluate.
 
 ---
 
