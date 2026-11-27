@@ -296,7 +296,7 @@ fn price_book() -> serde_json::Value {
 /// are appended, never reordered or renamed, so a reader that knows an older
 /// prefix keeps reading it.
 ///
-/// `spec_1_5` is the `--spec 1.5` shape beside it (invariant 148): FOCUS 1.5
+/// `spec_1_5` is the `--spec 1.5` shape beside it (invariant 150): FOCUS 1.5
 /// release-candidate names, one row per token kind. Additive: a reader of
 /// `columns` is untouched, and the names follow the release candidate until
 /// the ratified text says otherwise.

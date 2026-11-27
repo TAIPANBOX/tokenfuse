@@ -1738,7 +1738,7 @@ run_case "focus-basis-pii: the export reads the PII column as the basis" fail \
 	"$(py 'edit("crates/gateway/src/focusexport.rs", "price_basis: str_at(b.column(14).as_ref(), i),", "price_basis: str_at(b.column(15).as_ref(), i),")')" \
 	"the_export_names_the_price_basis_and_the_pii_let_through ... FAILED"
 
-# --- invariant 148: cache and reasoning tokens reach the trace and the export ---
+# --- invariant 150: cache and reasoning tokens reach the trace and the export ---
 run_case "focus-cache: the allow row never carries the cache read" fail \
 	"cargo test -p tokenfuse-gateway --test it -- --exact focus_carries_cache_and_reasoning::the_export_carries_the_cache_and_reasoning_counts_each_call_was_priced_with" \
 	"$(py 'edit("crates/gateway/src/settle.rs", "cache_read_tokens: priced.then_some(usage.cache_read_tokens),", "cache_read_tokens: None,")')" \
