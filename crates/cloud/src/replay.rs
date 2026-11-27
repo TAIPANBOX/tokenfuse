@@ -46,7 +46,10 @@ pub struct ReplayEvent {
     pub agent_id: String,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// The delegation chain, root first. agent-passport SPEC 5.1 caps it at
+    /// 32 entries, and the published schema says so.
     #[serde(default)]
+    #[schema(max_items = 32)]
     pub on_behalf_of: Option<Vec<String>>,
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
