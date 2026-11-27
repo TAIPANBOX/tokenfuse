@@ -111,7 +111,7 @@ async fn the_export_names_the_price_basis_and_the_pii_let_through() {
             .unwrap_or_else(|| panic!("the export has no {name} column: {header:?}"))
     };
     let (basis, pii, run) = (col("x_price_basis"), col("x_pii_findings"), col("x_run_id"));
-    // Appended after x_identity_reason, in this order; invariant 148's four
+    // Appended after x_identity_reason, in this order; invariant 150's four
     // columns were appended after them later.
     assert_eq!(
         &header[basis - 1..=pii],

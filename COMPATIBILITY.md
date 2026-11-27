@@ -326,7 +326,7 @@ Status: frozen at 1.0.0 (2026-09-14): the surface below is the promise of this m
 
 ## Experimental
 
-- tokenfuse focus-export --spec 1.5 (invariant 148): FOCUS 1.5 release-candidate names, one row per token kind (contracts/tokenfuse-constants.json#focus_export.spec_1_5); the names follow the release candidate (completed 2026-11-02, ratification set for 2026-12-03) and may move with the ratified text, so they are not promised by this major; the default export, without --spec, is the promised one
+- tokenfuse focus-export --spec 1.5 (invariant 150): FOCUS 1.5 release-candidate names, one row per token kind (contracts/tokenfuse-constants.json#focus_export.spec_1_5); the names follow the release candidate (completed 2026-11-02, ratification set for 2026-12-03) and may move with the ratified text, so they are not promised by this major; the default export, without --spec, is the promised one
 - raft HA (crates/cluster, the cluster feature, TOKENFUSE_CLUSTER_*): compiled out of every shipped image; the twelve names are read only by a build nobody publishes (components.json's the_ha_capability_is_compiled_out_of_every_shipped_binary)
 - WASM policies (feature wasm, TOKENFUSE_WASM_POLICY): in no shipped image
 - APNs push from the Cloud (feature apns, the five TOKENFUSE_APNS_* names): in no shipped image; the device-pairing routes it serves are frozen because the shipped Cloud answers them

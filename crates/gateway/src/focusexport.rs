@@ -66,7 +66,7 @@
 //!     joined by `,` (so the field is quoted); `""` when nothing was found or
 //!     the row predates the column. Never a matched span.
 //!   - `x_cache_read_tokens`, `x_cache_write_tokens`, `x_cache_write_1h_tokens`,
-//!     `x_reasoning_tokens`: the trace's four columns of invariant 148, the
+//!     `x_reasoning_tokens`: the trace's four columns of invariant 150, the
 //!     cache and reasoning counts an admitted call was priced with. Blank on a
 //!     row not priced from parsed counts and on a row written before the
 //!     columns existed; a real zero renders as `0`. `x_tokens_in` stays the
@@ -683,7 +683,7 @@ fn export_price_book() -> Result<tokenfuse_core::PriceBook, String> {
 /// One token kind of a call, as FOCUS 1.5 names it in `SkuPriceDetails`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenKind {
-    /// Input the provider read fresh. On a row written before invariant 148
+    /// Input the provider read fresh. On a row written before invariant 150
     /// the trace cannot say whether any of the call's input was cached, so the
     /// input row of such a call names no cache action at all (`Unknown`).
     InputUncached,
@@ -725,7 +725,7 @@ impl TokenKind {
 
 /// The token kinds of one call with their counts, zero counts left out, in a
 /// fixed order: input uncached, cache read, cache write, output. A row written
-/// before invariant 148 (cache columns NULL) gives an input row of unknown
+/// before invariant 150 (cache columns NULL) gives an input row of unknown
 /// cache state and an output row.
 fn token_kinds(rec: &FocusRecord) -> Vec<(TokenKind, u64)> {
     let cached_known = rec.cache_read_tokens.is_some() || rec.cache_write_tokens.is_some();
@@ -1887,7 +1887,7 @@ mod tests {
         }
     }
 
-    // -- FOCUS 1.5 (invariant 148) ---------------------------------------------
+    // -- FOCUS 1.5 (invariant 150) ---------------------------------------------
 
     fn focus_record(model: &str, decision: &str) -> FocusRecord {
         FocusRecord {

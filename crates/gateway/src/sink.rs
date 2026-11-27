@@ -153,7 +153,7 @@ pub struct CallRecord {
     /// would be one record saying two things.
     #[serde(skip_serializing)]
     pub price_basis: Option<String>,
-    /// The cache-read input tokens the call was priced with (invariant 148):
+    /// The cache-read input tokens the call was priced with (invariant 150):
     /// Anthropic's `cache_read_input_tokens`, OpenAI's
     /// `prompt_tokens_details.cached_tokens` (netted out of `input_tokens`,
     /// invariant 45). `Usage::cache_read_tokens` as settlement handed it to
