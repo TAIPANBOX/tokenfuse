@@ -130,7 +130,10 @@ fn replay_event_caps_the_delegation_chain_at_32() {
     let spec = openapi_spec();
     let json = serde_json::to_value(&spec).expect("spec serializes");
     let chain = &json["components"]["schemas"]["ReplayEvent"]["properties"]["on_behalf_of"];
-    assert!(chain.is_object(), "ReplayEvent has no on_behalf_of property");
+    assert!(
+        chain.is_object(),
+        "ReplayEvent has no on_behalf_of property"
+    );
     assert_eq!(
         chain["maxItems"].as_u64(),
         Some(32),
